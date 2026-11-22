@@ -48,7 +48,8 @@ jobs:
           packages: "platforms;android-35 build-tools;35.0.0 ndk;27.2.12479018"
       - name: Configure Android NDK Path
         run: echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/27.2.12479018" >> "$GITHUB_ENV"
-      - uses: taiki-e/install-action@cargo-ndk
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --version 4.1.2 --locked
       - name: Build Native Rust JNI Libraries
         run: ./android/scripts/build-native.sh
       - name: Decode Optional Release Keystore
