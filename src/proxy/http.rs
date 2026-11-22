@@ -265,10 +265,16 @@ fn rewrite_http_request(
         {
             continue;
         }
+        if lower_prefix.len() >= 11 && lower_prefix[..11].eq_ignore_ascii_case(b"connection:") {
+            continue;
+        }
+        if lower_prefix.len() >= 11 && lower_prefix[..11].eq_ignore_ascii_case(b"keep-alive:") {
+            continue;
+        }
         out.extend_from_slice(line.as_bytes());
         out.extend_from_slice(b"\r\n");
     }
-    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(b"Connection: close\r\n\r\n");
     out.extend_from_slice(body_prefix);
     out
 }
