@@ -1,0 +1,1081 @@
+use crate::config::RuntimeConfig;
+use crate::desync::EngineContext;
+use crate::platform::windows::set_running_as_service;
+use crate::platform::SystemProxySession;
+use crate::server::{bind_listeners, serve_until_shutdown};
+use anyhow::{bail, Context, Result};
+use std::ffi::c_void;
+use std::ptr;
+use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
+use tokio::sync::watch;
+use tracing::{error, info};
+
+pub const SERVICE_NAME: &str = "vdpi";
+pub const SERVICE_DISPLAY_NAME: &str = "vdpi Anti-DPI Service";
+pub const SERVICE_DESCRIPTION: &str =
+    "Zero-hassle, high-performance anti-DPI local proxy engine (HTTP/HTTPS/SOCKS5 + DoH).";
+
+type ScHandle = *mut c_void;
+type ServiceStatusHandle = *mut c_void;
+type Bool = i32;
+type Dword = u32;
+
+const SC_MANAGER_CONNECT: Dword = 0x0001;
+const SC_MANAGER_ALL_ACCESS: Dword = 0x000F_003F;
+
+const SERVICE_QUERY_CONFIG: Dword = 0x0001;
+const SERVICE_QUERY_STATUS: Dword = 0x0004;
+const SERVICE_STOP: Dword = 0x0020;
+const DELETE: Dword = 0x0001_0000;
+const SERVICE_ALL_ACCESS: Dword = 0x000F_01FF;
+
+const SERVICE_WIN32_OWN_PROCESS: Dword = 0x0000_0010;
+const SERVICE_AUTO_START: Dword = 0x0000_0002;
+const SERVICE_DEMAND_START: Dword = 0x0000_0003;
+const SERVICE_DISABLED: Dword = 0x0000_0004;
+const SERVICE_ERROR_NORMAL: Dword = 0x0000_0001;
+
+const SERVICE_STOPPED: Dword = 0x0000_0001;
+const SERVICE_START_PENDING: Dword = 0x0000_0002;
+const SERVICE_STOP_PENDING: Dword = 0x0000_0003;
+const SERVICE_RUNNING: Dword = 0x0000_0004;
+const SERVICE_CONTINUE_PENDING: Dword = 0x0000_0005;
+const SERVICE_PAUSE_PENDING: Dword = 0x0000_0006;
+const SERVICE_PAUSED: Dword = 0x0000_0007;
+
+const SERVICE_ACCEPT_STOP: Dword = 0x0000_0001;
+const SERVICE_ACCEPT_SHUTDOWN: Dword = 0x0000_0004;
+const SERVICE_ACCEPT_SESSIONCHANGE: Dword = 0x0000_0080;
+
+const SERVICE_CONTROL_STOP: Dword = 0x0000_0001;
+const SERVICE_CONTROL_INTERROGATE: Dword = 0x0000_0004;
+const SERVICE_CONTROL_SHUTDOWN: Dword = 0x0000_0005;
+const SERVICE_CONTROL_SESSIONCHANGE: Dword = 0x0000_000E;
+
+const WTS_SESSION_LOGON: Dword = 0x0000_0005;
+const WTS_SESSION_UNLOCK: Dword = 0x0000_0008;
+
+const SERVICE_CONFIG_DESCRIPTION: Dword = 1;
+const SERVICE_CONFIG_FAILURE_ACTIONS: Dword = 2;
+const SERVICE_CONFIG_DELAYED_AUTO_START_INFO: Dword = 3;
+const SC_ACTION_RESTART: Dword = 1;
+const SC_STATUS_PROCESS_INFO: Dword = 0;
+
+const NO_ERROR: Dword = 0;
+const ERROR_ACCESS_DENIED: Dword = 5;
+const ERROR_CALL_NOT_IMPLEMENTED: Dword = 120;
+const ERROR_SERVICE_ALREADY_RUNNING: Dword = 1056;
+const ERROR_SERVICE_DOES_NOT_EXIST: Dword = 1060;
+const ERROR_SERVICE_NOT_ACTIVE: Dword = 1062;
+const ERROR_FAILED_SERVICE_CONTROLLER_CONNECT: Dword = 1063;
+const ERROR_SERVICE_MARKED_FOR_DELETE: Dword = 1072;
+const ERROR_CANCELLED: Dword = 1223;
+
+const SEE_MASK_NOCLOSEPROCESS: Dword = 0x0000_0040;
+const SW_SHOWNORMAL: i32 = 1;
+const INFINITE: Dword = 0xFFFF_FFFF;
+
+#[repr(C)]
+struct ShellExecuteInfoW {
+    cb_size: Dword,
+    f_mask: Dword,
+    hwnd: *mut c_void,
+    lp_verb: *const u16,
+    lp_file: *const u16,
+    lp_parameters: *const u16,
+    lp_directory: *const u16,
+    n_show: i32,
+    h_inst_app: *mut c_void,
+    lp_id_list: *mut c_void,
+    lp_class: *const u16,
+    hkey_class: *mut c_void,
+    dw_hot_key: Dword,
+    h_icon_or_monitor: *mut c_void,
+    h_process: *mut c_void,
+}
+
+#[repr(C)]
+struct ServiceTableEntryW {
+    lp_service_name: *const u16,
+    lp_service_proc: Option<unsafe extern "system" fn(Dword, *mut *mut u16)>,
+}
+
+#[repr(C)]
+struct ServiceStatus {
+    dw_service_type: Dword,
+    dw_current_state: Dword,
+    dw_controls_accepted: Dword,
+    dw_win32_exit_code: Dword,
+    dw_service_specific_exit_code: Dword,
+    dw_check_point: Dword,
+    dw_wait_hint: Dword,
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+struct ServiceStatusProcess {
+    dw_service_type: Dword,
+    dw_current_state: Dword,
+    dw_controls_accepted: Dword,
+    dw_win32_exit_code: Dword,
+    dw_service_specific_exit_code: Dword,
+    dw_check_point: Dword,
+    dw_wait_hint: Dword,
+    dw_process_id: Dword,
+    dw_service_flags: Dword,
+}
+
+#[repr(C)]
+struct ServiceDescriptionW {
+    lp_description: *mut u16,
+}
+
+#[repr(C)]
+struct ScAction {
+    action_type: Dword,
+    delay: Dword,
+}
+
+#[repr(C)]
+struct ServiceFailureActionsW {
+    dw_reset_period: Dword,
+    lp_reboot_msg: *mut u16,
+    lp_command: *mut u16,
+    c_actions: Dword,
+    lpsa_actions: *mut ScAction,
+}
+
+#[repr(C)]
+struct ServiceDelayedAutoStartInfo {
+    f_delayed_autostart: Bool,
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+struct QueryServiceConfigW {
+    dw_service_type: Dword,
+    dw_start_type: Dword,
+    dw_error_control: Dword,
+    lp_binary_path_name: *mut u16,
+    lp_load_order_group: *mut u16,
+    dw_tag_id: Dword,
+    lp_dependencies: *mut u16,
+    lp_service_start_name: *mut u16,
+    lp_display_name: *mut u16,
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetLastError() -> Dword;
+    fn WaitForSingleObject(h_handle: *mut c_void, dw_milliseconds: Dword) -> Dword;
+    fn GetExitCodeProcess(h_process: *mut c_void, lp_exit_code: *mut Dword) -> Bool;
+    fn CloseHandle(h_object: *mut c_void) -> Bool;
+}
+
+#[link(name = "shell32")]
+extern "system" {
+    fn ShellExecuteExW(p_exec_info: *mut ShellExecuteInfoW) -> Bool;
+}
+
+#[link(name = "advapi32")]
+extern "system" {
+    fn StartServiceCtrlDispatcherW(lp_service_start_table: *const ServiceTableEntryW) -> Bool;
+    fn RegisterServiceCtrlHandlerExW(
+        lp_service_name: *const u16,
+        lp_handler_proc: unsafe extern "system" fn(Dword, Dword, *mut c_void, *mut c_void) -> Dword,
+        lp_context: *mut c_void,
+    ) -> ServiceStatusHandle;
+    fn SetServiceStatus(
+        h_service_status: ServiceStatusHandle,
+        lp_service_status: *const ServiceStatus,
+    ) -> Bool;
+    fn OpenSCManagerW(
+        lp_machine_name: *const u16,
+        lp_database_name: *const u16,
+        dw_desired_access: Dword,
+    ) -> ScHandle;
+    fn CloseServiceHandle(h_sc_object: ScHandle) -> Bool;
+    fn OpenServiceW(
+        h_sc_manager: ScHandle,
+        lp_service_name: *const u16,
+        dw_desired_access: Dword,
+    ) -> ScHandle;
+    fn CreateServiceW(
+        h_sc_manager: ScHandle,
+        lp_service_name: *const u16,
+        lp_display_name: *const u16,
+        dw_desired_access: Dword,
+        dw_service_type: Dword,
+        dw_start_type: Dword,
+        dw_error_control: Dword,
+        lp_binary_path_name: *const u16,
+        lp_load_order_group: *const u16,
+        lpdw_tag_id: *mut Dword,
+        lp_dependencies: *const u16,
+        lp_service_start_name: *const u16,
+        lp_password: *const u16,
+    ) -> ScHandle;
+    fn ChangeServiceConfigW(
+        h_service: ScHandle,
+        dw_service_type: Dword,
+        dw_start_type: Dword,
+        dw_error_control: Dword,
+        lp_binary_path_name: *const u16,
+        lp_load_order_group: *const u16,
+        lpdw_tag_id: *mut Dword,
+        lp_dependencies: *const u16,
+        lp_service_start_name: *const u16,
+        lp_password: *const u16,
+        lp_display_name: *const u16,
+    ) -> Bool;
+    fn ChangeServiceConfig2W(
+        h_service: ScHandle,
+        dw_info_level: Dword,
+        lp_info: *const c_void,
+    ) -> Bool;
+    fn StartServiceW(
+        h_service: ScHandle,
+        dw_num_service_args: Dword,
+        lp_service_arg_vectors: *const *const u16,
+    ) -> Bool;
+    fn ControlService(
+        h_service: ScHandle,
+        dw_control: Dword,
+        lp_service_status: *mut ServiceStatus,
+    ) -> Bool;
+    fn DeleteService(h_service: ScHandle) -> Bool;
+    fn QueryServiceStatusEx(
+        h_service: ScHandle,
+        info_level: Dword,
+        lp_buffer: *mut u8,
+        cb_buf_size: Dword,
+        pcb_bytes_needed: *mut Dword,
+    ) -> Bool;
+    fn QueryServiceConfigW(
+        h_service: ScHandle,
+        lp_service_config: *mut u8,
+        cb_buf_size: Dword,
+        pcb_bytes_needed: *mut Dword,
+    ) -> Bool;
+}
+
+struct ScmHandle(ScHandle);
+
+impl Drop for ScmHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                let _ = CloseServiceHandle(self.0);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopReason {
+    Stop,
+    Shutdown,
+}
+
+struct ControlChannels {
+    stop_tx: watch::Sender<Option<StopReason>>,
+    reconcile_tx: watch::Sender<u64>,
+}
+
+static SERVICE_CONFIG: OnceLock<Mutex<Option<RuntimeConfig>>> = OnceLock::new();
+static SERVICE_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static CONTROL_CHANNELS: OnceLock<Mutex<Option<ControlChannels>>> = OnceLock::new();
+static SERVICE_STATUS_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+
+#[derive(Debug, Clone)]
+pub struct WindowsServiceInfo {
+    pub installed: bool,
+    pub state: &'static str,
+    pub start_type: &'static str,
+    pub pid: Option<u32>,
+    pub binary_path: Option<String>,
+}
+
+/// Returns `true` if the current process has Administrator privileges to manage Windows services.
+pub fn is_elevated() -> bool {
+    let raw = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_ALL_ACCESS) };
+    if raw.is_null() {
+        false
+    } else {
+        unsafe {
+            let _ = CloseServiceHandle(raw);
+        }
+        true
+    }
+}
+
+/// Relaunches the current `vdpi.exe` with the same CLI arguments under UAC elevation (`runas`)
+/// and waits for the elevated process to finish.
+pub fn relaunch_elevated_and_wait() -> Result<()> {
+    let current_exe = std::env::current_exe().context("failed to determine current executable")?;
+    let params: String = std::env::args()
+        .skip(1)
+        .map(|arg| {
+            if arg.is_empty() || arg.contains([' ', '\t', '"']) {
+                format!("\"{}\"", arg.replace('"', "\\\""))
+            } else {
+                arg
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let verb_wide = to_wide_null("runas");
+    let file_wide = to_wide_null(&current_exe.display().to_string());
+    let params_wide = to_wide_null(&params);
+
+    let mut info = ShellExecuteInfoW {
+        cb_size: std::mem::size_of::<ShellExecuteInfoW>() as Dword,
+        f_mask: SEE_MASK_NOCLOSEPROCESS,
+        hwnd: ptr::null_mut(),
+        lp_verb: verb_wide.as_ptr(),
+        lp_file: file_wide.as_ptr(),
+        lp_parameters: if params.is_empty() {
+            ptr::null()
+        } else {
+            params_wide.as_ptr()
+        },
+        lp_directory: ptr::null(),
+        n_show: SW_SHOWNORMAL,
+        h_inst_app: ptr::null_mut(),
+        lp_id_list: ptr::null_mut(),
+        lp_class: ptr::null(),
+        hkey_class: ptr::null_mut(),
+        dw_hot_key: 0,
+        h_icon_or_monitor: ptr::null_mut(),
+        h_process: ptr::null_mut(),
+    };
+
+    let ok = unsafe { ShellExecuteExW(&mut info) };
+    if ok == 0 {
+        let err = unsafe { GetLastError() };
+        if err == ERROR_CANCELLED {
+            bail!(
+                "UAC elevation was cancelled. Administrator privileges are required to manage the '{SERVICE_NAME}' Windows service."
+            );
+        }
+        bail!("ShellExecuteExW(runas) failed with Win32 error {err}");
+    }
+
+    if !info.h_process.is_null() {
+        let mut exit_code: Dword = 0;
+        unsafe {
+            let _ = WaitForSingleObject(info.h_process, INFINITE);
+            let _ = GetExitCodeProcess(info.h_process, &mut exit_code);
+            let _ = CloseHandle(info.h_process);
+        }
+        if exit_code != 0 {
+            bail!("elevated vdpi command exited with status code {exit_code}");
+        }
+    }
+
+    Ok(())
+}
+
+/// Connects the current process to the Windows Service Control Manager (SCM) and blocks
+/// until the service stops.
+pub fn run_windows_service(cfg: RuntimeConfig) -> Result<()> {
+    {
+        let lock = SERVICE_CONFIG.get_or_init(|| Mutex::new(None));
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(cfg);
+    }
+
+    let name_wide = to_wide_null(SERVICE_NAME);
+    let table = [
+        ServiceTableEntryW {
+            lp_service_name: name_wide.as_ptr(),
+            lp_service_proc: Some(service_main),
+        },
+        ServiceTableEntryW {
+            lp_service_name: ptr::null(),
+            lp_service_proc: None,
+        },
+    ];
+
+    let ok = unsafe { StartServiceCtrlDispatcherW(table.as_ptr()) };
+    if ok == 0 {
+        let err = unsafe { GetLastError() };
+        if err == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT {
+            bail!(
+                "--service can only be launched by the Windows Service Control Manager. \
+                 Run 'vdpi start' for interactive mode or 'vdpi install' to install the service."
+            );
+        }
+        bail!("StartServiceCtrlDispatcherW failed with Win32 error {err}");
+    }
+
+    if let Some(lock) = SERVICE_ERROR.get() {
+        if let Some(msg) = lock.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            bail!("{msg}");
+        }
+    }
+
+    Ok(())
+}
+
+unsafe extern "system" fn service_main(_argc: Dword, _argv: *mut *mut u16) {
+    set_running_as_service(true);
+
+    let name_wide = to_wide_null(SERVICE_NAME);
+    let handle = RegisterServiceCtrlHandlerExW(
+        name_wide.as_ptr(),
+        service_control_handler,
+        ptr::null_mut(),
+    );
+    if handle.is_null() {
+        return;
+    }
+    SERVICE_STATUS_HANDLE.store(handle, Ordering::SeqCst);
+
+    report_service_status(handle, SERVICE_START_PENDING, 0, NO_ERROR, 1, 5000);
+
+    let cfg = SERVICE_CONFIG
+        .get()
+        .and_then(|m| m.lock().unwrap_or_else(|e| e.into_inner()).take());
+
+    let run_result = match cfg {
+        Some(cfg) => run_service_runtime(handle, cfg),
+        None => Err(anyhow::anyhow!("missing runtime configuration for service")),
+    };
+
+    if let Some(lock) = CONTROL_CHANNELS.get() {
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    match run_result {
+        Ok(()) => {
+            report_service_status(handle, SERVICE_STOPPED, 0, NO_ERROR, 0, 0);
+        }
+        Err(err) => {
+            error!(error = %err, "vdpi Windows service terminated with error");
+            let lock = SERVICE_ERROR.get_or_init(|| Mutex::new(None));
+            *lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(err.to_string());
+            report_service_status(handle, SERVICE_STOPPED, 0, 1, 0, 0);
+        }
+    }
+}
+
+fn run_service_runtime(handle: ServiceStatusHandle, cfg: RuntimeConfig) -> Result<()> {
+    let (stop_tx, mut stop_rx) = watch::channel::<Option<StopReason>>(None);
+    let (reconcile_tx, mut reconcile_rx) = watch::channel::<u64>(0);
+
+    {
+        let lock = CONTROL_CHANNELS.get_or_init(|| Mutex::new(None));
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(ControlChannels {
+            stop_tx,
+            reconcile_tx,
+        });
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to initialize Tokio runtime for Windows service")?;
+
+    rt.block_on(async move {
+        let ctx = EngineContext::new(cfg.clone())?;
+        let bound = bind_listeners(&ctx)?;
+
+        let primary_addr = bound.primary_addr;
+        let socks_addr = bound.socks_addr;
+
+        let proxy_session = if cfg.system_proxy {
+            Some(SystemProxySession::activate(
+                primary_addr.ip(),
+                primary_addr.port(),
+                socks_addr.map(|a| a.port()),
+                cfg.socks_system_proxy,
+                cfg.env_proxy,
+                &cfg.bypass_domains,
+            )?)
+        } else {
+            None
+        };
+
+        report_service_status(
+            handle,
+            SERVICE_RUNNING,
+            SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_SESSIONCHANGE,
+            NO_ERROR,
+            0,
+            0,
+        );
+
+        info!(
+            primary = %primary_addr,
+            socks = ?socks_addr,
+            "vdpi Windows service is running"
+        );
+
+        let (server_shutdown_tx, server_shutdown_rx) = watch::channel(false);
+
+        if let Some(ref session) = proxy_session {
+            let watchdog_session = session.clone();
+            let mut watchdog_shutdown = server_shutdown_rx.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(15));
+                ticker.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = watchdog_shutdown.changed() => {
+                            if *watchdog_shutdown.borrow() {
+                                break;
+                            }
+                        }
+                        changed = reconcile_rx.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                            let s = watchdog_session.clone();
+                            let _ = tokio::task::spawn_blocking(move || s.reconcile()).await;
+                        }
+                        _ = ticker.tick() => {
+                            let s = watchdog_session.clone();
+                            let _ = tokio::task::spawn_blocking(move || s.reconcile()).await;
+                        }
+                    }
+                }
+            });
+        }
+
+        let server_task = tokio::spawn(serve_until_shutdown(bound, ctx, server_shutdown_rx));
+
+        let reason = loop {
+            if let Some(r) = *stop_rx.borrow() {
+                break r;
+            }
+            if stop_rx.changed().await.is_err() {
+                break StopReason::Stop;
+            }
+        };
+
+        report_service_status(handle, SERVICE_STOP_PENDING, 0, NO_ERROR, 2, 5000);
+        let _ = server_shutdown_tx.send(true);
+
+        if reason == StopReason::Stop {
+            if let Some(session) = proxy_session {
+                let _ = tokio::task::spawn_blocking(move || session.deactivate()).await;
+            }
+        }
+
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
+        Ok(())
+    })
+}
+
+unsafe extern "system" fn service_control_handler(
+    control: Dword,
+    event_type: Dword,
+    _event_data: *mut c_void,
+    _context: *mut c_void,
+) -> Dword {
+    match control {
+        SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
+            let handle = SERVICE_STATUS_HANDLE.load(Ordering::SeqCst);
+            if !handle.is_null() {
+                report_service_status(handle, SERVICE_STOP_PENDING, 0, NO_ERROR, 1, 5000);
+            }
+            let reason = if control == SERVICE_CONTROL_SHUTDOWN {
+                StopReason::Shutdown
+            } else {
+                StopReason::Stop
+            };
+            if let Some(lock) = CONTROL_CHANNELS.get() {
+                if let Some(ref ch) = *lock.lock().unwrap_or_else(|e| e.into_inner()) {
+                    let _ = ch.stop_tx.send(Some(reason));
+                }
+            }
+            NO_ERROR
+        }
+        SERVICE_CONTROL_SESSIONCHANGE => {
+            if event_type == WTS_SESSION_LOGON || event_type == WTS_SESSION_UNLOCK {
+                if let Some(lock) = CONTROL_CHANNELS.get() {
+                    if let Some(ref ch) = *lock.lock().unwrap_or_else(|e| e.into_inner()) {
+                        ch.reconcile_tx.send_modify(|n| *n = n.wrapping_add(1));
+                    }
+                }
+            }
+            NO_ERROR
+        }
+        SERVICE_CONTROL_INTERROGATE => NO_ERROR,
+        _ => ERROR_CALL_NOT_IMPLEMENTED,
+    }
+}
+
+fn report_service_status(
+    handle: ServiceStatusHandle,
+    current_state: Dword,
+    controls_accepted: Dword,
+    win32_exit_code: Dword,
+    check_point: Dword,
+    wait_hint: Dword,
+) {
+    let status = ServiceStatus {
+        dw_service_type: SERVICE_WIN32_OWN_PROCESS,
+        dw_current_state: current_state,
+        dw_controls_accepted: controls_accepted,
+        dw_win32_exit_code: win32_exit_code,
+        dw_service_specific_exit_code: 0,
+        dw_check_point: check_point,
+        dw_wait_hint: wait_hint,
+    };
+    unsafe {
+        let _ = SetServiceStatus(handle, &status);
+    }
+}
+
+/// Stops the `vdpi` Windows service if it is currently installed and running.
+/// Returns `Ok(true)` if the service existed, `Ok(false)` if not installed.
+pub fn stop_windows_service_if_running() -> Result<bool> {
+    let scm = open_scm(SC_MANAGER_CONNECT)?;
+    let name_wide = to_wide_null(SERVICE_NAME);
+    let raw = unsafe { OpenServiceW(scm.0, name_wide.as_ptr(), SERVICE_STOP | SERVICE_QUERY_STATUS) };
+    if raw.is_null() {
+        let err = unsafe { GetLastError() };
+        if err == ERROR_SERVICE_DOES_NOT_EXIST {
+            return Ok(false);
+        }
+        if err == ERROR_ACCESS_DENIED {
+            bail!(
+                "Administrator privileges are required to stop the '{SERVICE_NAME}' Windows service. \
+                 Please accept the UAC prompt or run from an elevated Administrator terminal."
+            );
+        }
+        bail!("OpenServiceW('{SERVICE_NAME}') failed with Win32 error {err}");
+    }
+    let svc = ScmHandle(raw);
+    stop_service_handle(svc.0)?;
+    thread::sleep(Duration::from_millis(150));
+    Ok(true)
+}
+
+/// Installs or updates the `vdpi` Windows service with `AUTO_START` (non-delayed),
+/// `Tcpip` dependency, automatic crash recovery, and starts it immediately.
+pub fn install_or_update_windows_service(bin_path_cmd: &str) -> Result<()> {
+    let scm = open_scm(SC_MANAGER_ALL_ACCESS)?;
+    let name_wide = to_wide_null(SERVICE_NAME);
+    let display_wide = to_wide_null(SERVICE_DISPLAY_NAME);
+    let bin_wide = to_wide_null(bin_path_cmd);
+    let deps_wide: Vec<u16> = "Tcpip\0\0".encode_utf16().collect();
+
+    let svc = {
+        let existing = unsafe { OpenServiceW(scm.0, name_wide.as_ptr(), SERVICE_ALL_ACCESS) };
+        if !existing.is_null() {
+            let guard = ScmHandle(existing);
+            stop_service_handle(guard.0)?;
+            let changed = unsafe {
+                ChangeServiceConfigW(
+                    guard.0,
+                    SERVICE_WIN32_OWN_PROCESS,
+                    SERVICE_AUTO_START,
+                    SERVICE_ERROR_NORMAL,
+                    bin_wide.as_ptr(),
+                    ptr::null(),
+                    ptr::null_mut(),
+                    deps_wide.as_ptr(),
+                    ptr::null(),
+                    ptr::null(),
+                    display_wide.as_ptr(),
+                )
+            };
+            if changed == 0 {
+                let err = unsafe { GetLastError() };
+                if err == ERROR_SERVICE_MARKED_FOR_DELETE {
+                    drop(guard);
+                    create_service_with_retry(
+                        scm.0,
+                        &name_wide,
+                        &display_wide,
+                        &bin_wide,
+                        &deps_wide,
+                    )?
+                } else {
+                    bail!("ChangeServiceConfigW failed with Win32 error {err}");
+                }
+            } else {
+                guard
+            }
+        } else {
+            let err = unsafe { GetLastError() };
+            if err != ERROR_SERVICE_DOES_NOT_EXIST {
+                bail!("OpenServiceW('{SERVICE_NAME}') failed with Win32 error {err}");
+            }
+            create_service_with_retry(scm.0, &name_wide, &display_wide, &bin_wide, &deps_wide)?
+        }
+    };
+
+    configure_service_metadata(svc.0);
+
+    let started = unsafe { StartServiceW(svc.0, 0, ptr::null()) };
+    if started == 0 {
+        let err = unsafe { GetLastError() };
+        if err != ERROR_SERVICE_ALREADY_RUNNING {
+            bail!("StartServiceW('{SERVICE_NAME}') failed with Win32 error {err}");
+        }
+    }
+
+    wait_for_service_running(svc.0, Duration::from_secs(10))?;
+    Ok(())
+}
+
+/// Stops and removes the `vdpi` Windows service. Returns `Ok(true)` if a service was removed.
+pub fn uninstall_windows_service() -> Result<bool> {
+    let scm = open_scm(SC_MANAGER_ALL_ACCESS)?;
+    let name_wide = to_wide_null(SERVICE_NAME);
+    let raw = unsafe {
+        OpenServiceW(
+            scm.0,
+            name_wide.as_ptr(),
+            SERVICE_STOP | SERVICE_QUERY_STATUS | DELETE,
+        )
+    };
+    if raw.is_null() {
+        let err = unsafe { GetLastError() };
+        if err == ERROR_SERVICE_DOES_NOT_EXIST {
+            return Ok(false);
+        }
+        bail!("OpenServiceW('{SERVICE_NAME}') failed with Win32 error {err}");
+    }
+    let svc = ScmHandle(raw);
+
+    stop_service_handle(svc.0)?;
+
+    let deleted = unsafe { DeleteService(svc.0) };
+    if deleted == 0 {
+        let err = unsafe { GetLastError() };
+        if err != ERROR_SERVICE_MARKED_FOR_DELETE {
+            bail!("DeleteService('{SERVICE_NAME}') failed with Win32 error {err}");
+        }
+    }
+
+    drop(svc);
+    thread::sleep(Duration::from_millis(150));
+    Ok(true)
+}
+
+/// Queries the status and configuration of the `vdpi` Windows service without requiring Admin rights.
+pub fn query_windows_service_status() -> WindowsServiceInfo {
+    let not_installed = WindowsServiceInfo {
+        installed: false,
+        state: "NOT INSTALLED",
+        start_type: "N/A",
+        pid: None,
+        binary_path: None,
+    };
+
+    let Ok(scm) = open_scm(SC_MANAGER_CONNECT) else {
+        return not_installed;
+    };
+    let name_wide = to_wide_null(SERVICE_NAME);
+    let raw = unsafe {
+        OpenServiceW(
+            scm.0,
+            name_wide.as_ptr(),
+            SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG,
+        )
+    };
+    if raw.is_null() {
+        return not_installed;
+    }
+    let svc = ScmHandle(raw);
+
+    let (state, pid) = match query_service_status_process(svc.0) {
+        Ok(ssp) => (
+            service_state_label(ssp.dw_current_state),
+            if ssp.dw_process_id != 0 {
+                Some(ssp.dw_process_id)
+            } else {
+                None
+            },
+        ),
+        Err(_) => ("UNKNOWN", None),
+    };
+
+    let (start_type, binary_path) = query_service_config(svc.0).unwrap_or(("UNKNOWN", None));
+
+    WindowsServiceInfo {
+        installed: true,
+        state,
+        start_type,
+        pid,
+        binary_path,
+    }
+}
+
+fn open_scm(access: Dword) -> Result<ScmHandle> {
+    let raw = unsafe { OpenSCManagerW(ptr::null(), ptr::null(), access) };
+    if raw.is_null() {
+        let err = unsafe { GetLastError() };
+        if err == ERROR_ACCESS_DENIED {
+            bail!(
+                "Administrator privileges are required to manage the '{SERVICE_NAME}' Windows service. \
+                 Please accept the UAC prompt or open an elevated Administrator terminal."
+            );
+        }
+        bail!("OpenSCManagerW failed with Win32 error {err}");
+    }
+    Ok(ScmHandle(raw))
+}
+
+fn create_service_with_retry(
+    scm: ScHandle,
+    name_wide: &[u16],
+    display_wide: &[u16],
+    bin_wide: &[u16],
+    deps_wide: &[u16],
+) -> Result<ScmHandle> {
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        let created = unsafe {
+            CreateServiceW(
+                scm,
+                name_wide.as_ptr(),
+                display_wide.as_ptr(),
+                SERVICE_ALL_ACCESS,
+                SERVICE_WIN32_OWN_PROCESS,
+                SERVICE_AUTO_START,
+                SERVICE_ERROR_NORMAL,
+                bin_wide.as_ptr(),
+                ptr::null(),
+                ptr::null_mut(),
+                deps_wide.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+            )
+        };
+        if !created.is_null() {
+            return Ok(ScmHandle(created));
+        }
+        let err = unsafe { GetLastError() };
+        if err == ERROR_SERVICE_MARKED_FOR_DELETE && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(200));
+            continue;
+        }
+        if err == ERROR_SERVICE_MARKED_FOR_DELETE {
+            bail!(
+                "Windows service '{SERVICE_NAME}' is marked for deletion. \
+                 Close Services.msc or Task Manager and run install again."
+            );
+        }
+        bail!("CreateServiceW('{SERVICE_NAME}') failed with Win32 error {err}");
+    }
+}
+
+fn configure_service_metadata(svc: ScHandle) {
+    let mut desc_wide = to_wide_null(SERVICE_DESCRIPTION);
+    let desc = ServiceDescriptionW {
+        lp_description: desc_wide.as_mut_ptr(),
+    };
+    unsafe {
+        let _ = ChangeServiceConfig2W(
+            svc,
+            SERVICE_CONFIG_DESCRIPTION,
+            (&desc as *const ServiceDescriptionW).cast::<c_void>(),
+        );
+    }
+
+    let delayed = ServiceDelayedAutoStartInfo {
+        f_delayed_autostart: 0,
+    };
+    unsafe {
+        let _ = ChangeServiceConfig2W(
+            svc,
+            SERVICE_CONFIG_DELAYED_AUTO_START_INFO,
+            (&delayed as *const ServiceDelayedAutoStartInfo).cast::<c_void>(),
+        );
+    }
+
+    let mut actions = [
+        ScAction {
+            action_type: SC_ACTION_RESTART,
+            delay: 1000,
+        },
+        ScAction {
+            action_type: SC_ACTION_RESTART,
+            delay: 2000,
+        },
+        ScAction {
+            action_type: SC_ACTION_RESTART,
+            delay: 5000,
+        },
+    ];
+    let failure = ServiceFailureActionsW {
+        dw_reset_period: 86_400,
+        lp_reboot_msg: ptr::null_mut(),
+        lp_command: ptr::null_mut(),
+        c_actions: actions.len() as Dword,
+        lpsa_actions: actions.as_mut_ptr(),
+    };
+    unsafe {
+        let _ = ChangeServiceConfig2W(
+            svc,
+            SERVICE_CONFIG_FAILURE_ACTIONS,
+            (&failure as *const ServiceFailureActionsW).cast::<c_void>(),
+        );
+    }
+}
+
+fn stop_service_handle(svc: ScHandle) -> Result<()> {
+    let current = query_service_status_process(svc)?;
+    if current.dw_current_state == SERVICE_STOPPED {
+        return Ok(());
+    }
+
+    if current.dw_current_state != SERVICE_STOP_PENDING {
+        let mut status = ServiceStatus {
+            dw_service_type: 0,
+            dw_current_state: 0,
+            dw_controls_accepted: 0,
+            dw_win32_exit_code: 0,
+            dw_service_specific_exit_code: 0,
+            dw_check_point: 0,
+            dw_wait_hint: 0,
+        };
+        let ok = unsafe { ControlService(svc, SERVICE_CONTROL_STOP, &mut status) };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            if err != ERROR_SERVICE_NOT_ACTIVE {
+                bail!("ControlService(STOP) failed with Win32 error {err}");
+            }
+            return Ok(());
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let ssp = query_service_status_process(svc)?;
+        if ssp.dw_current_state == SERVICE_STOPPED {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for Windows service '{SERVICE_NAME}' to stop");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_service_running(svc: ScHandle, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let ssp = query_service_status_process(svc)?;
+        match ssp.dw_current_state {
+            SERVICE_RUNNING => return Ok(()),
+            SERVICE_STOPPED => {
+                bail!(
+                    "Windows service '{SERVICE_NAME}' stopped immediately after start (exit code {})",
+                    ssp.dw_win32_exit_code
+                );
+            }
+            _ => {
+                if Instant::now() >= deadline {
+                    bail!(
+                        "timed out waiting for Windows service '{SERVICE_NAME}' to enter RUNNING state (current: {})",
+                        service_state_label(ssp.dw_current_state)
+                    );
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+fn query_service_status_process(svc: ScHandle) -> Result<ServiceStatusProcess> {
+    let mut ssp = ServiceStatusProcess {
+        dw_service_type: 0,
+        dw_current_state: 0,
+        dw_controls_accepted: 0,
+        dw_win32_exit_code: 0,
+        dw_service_specific_exit_code: 0,
+        dw_check_point: 0,
+        dw_wait_hint: 0,
+        dw_process_id: 0,
+        dw_service_flags: 0,
+    };
+    let mut bytes_needed: Dword = 0;
+    let ok = unsafe {
+        QueryServiceStatusEx(
+            svc,
+            SC_STATUS_PROCESS_INFO,
+            (&mut ssp as *mut ServiceStatusProcess).cast::<u8>(),
+            std::mem::size_of::<ServiceStatusProcess>() as Dword,
+            &mut bytes_needed,
+        )
+    };
+    if ok == 0 {
+        let err = unsafe { GetLastError() };
+        bail!("QueryServiceStatusEx failed with Win32 error {err}");
+    }
+    Ok(ssp)
+}
+
+fn query_service_config(svc: ScHandle) -> Option<(&'static str, Option<String>)> {
+    let mut bytes_needed: Dword = 0;
+    unsafe {
+        let _ = QueryServiceConfigW(svc, ptr::null_mut(), 0, &mut bytes_needed);
+    }
+    if bytes_needed == 0 {
+        return None;
+    }
+
+    let word_len = (bytes_needed as usize).div_ceil(std::mem::size_of::<u64>());
+    let mut aligned_buf = vec![0u64; word_len];
+    let ok = unsafe {
+        QueryServiceConfigW(
+            svc,
+            aligned_buf.as_mut_ptr().cast::<u8>(),
+            (aligned_buf.len() * std::mem::size_of::<u64>()) as Dword,
+            &mut bytes_needed,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+
+    let cfg = unsafe { &*(aligned_buf.as_ptr().cast::<QueryServiceConfigW>()) };
+    let start_type = match cfg.dw_start_type {
+        SERVICE_AUTO_START => "AUTO_START",
+        SERVICE_DEMAND_START => "DEMAND_START",
+        SERVICE_DISABLED => "DISABLED",
+        _ => "OTHER",
+    };
+    let bin_path = unsafe { wide_ptr_to_string(cfg.lp_binary_path_name) };
+    Some((start_type, bin_path))
+}
+
+fn service_state_label(state: Dword) -> &'static str {
+    match state {
+        SERVICE_STOPPED => "STOPPED",
+        SERVICE_START_PENDING => "START_PENDING",
+        SERVICE_STOP_PENDING => "STOP_PENDING",
+        SERVICE_RUNNING => "RUNNING",
+        SERVICE_CONTINUE_PENDING => "CONTINUE_PENDING",
+        SERVICE_PAUSE_PENDING => "PAUSE_PENDING",
+        SERVICE_PAUSED => "PAUSED",
+        _ => "UNKNOWN",
+    }
+}
+
+fn to_wide_null(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+unsafe fn wide_ptr_to_string(ptr: *const u16) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    let mut len = 0usize;
+    while *ptr.add(len) != 0 {
+        len += 1;
+    }
+    let slice = std::slice::from_raw_parts(ptr, len);
+    Some(String::from_utf16_lossy(slice))
+}

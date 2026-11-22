@@ -7,6 +7,8 @@ pub mod linux;
 pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod windows;
+#[cfg(target_os = "windows")]
+pub mod windows_service;
 
 /// Cross-platform system proxy session handle that configures OS-level HTTP/HTTPS/SOCKS5
 /// settings on startup, reconciles across network changes, and cleanly restores state on exit.
