@@ -2,16 +2,19 @@ use crate::desync::EngineContext;
 use crate::proxy::http::handle_http_client;
 use crate::proxy::socks::{handle_socks4_client, handle_socks5_client};
 use anyhow::{Context, Result};
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use std::io::ErrorKind;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{watch, Semaphore};
+use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
 const PRIMARY_FALLBACK_PORTS: &[u16] = &[18080, 18081, 18082, 28080, 38080, 48080];
 const SOCKS_FALLBACK_PORTS: &[u16] = &[11080, 11081, 11082, 21080, 31080, 41080];
+const MAX_CLIENT_SESSIONS: usize = 256;
 
 pub struct BoundListeners {
     pub primary_listener: TcpListener,
@@ -24,14 +27,18 @@ pub struct BoundListeners {
 /// and optional dedicated SOCKS5 listener, automatically rotating to a free port if the
 /// requested port is already in use or reserved (e.g. Windows Hyper-V/WSL2 excluded ranges).
 pub fn bind_listeners(ctx: &EngineContext) -> Result<BoundListeners> {
-    let (primary_listener, primary_addr) =
-        bind_with_port_rotation(ctx.config.addr, ctx.config.port, PRIMARY_FALLBACK_PORTS, None)
-            .with_context(|| {
-                format!(
-                    "failed to bind primary listener on {}:{}",
-                    ctx.config.addr, ctx.config.port
-                )
-            })?;
+    let (primary_listener, primary_addr) = bind_with_port_rotation(
+        ctx.config.addr,
+        ctx.config.port,
+        PRIMARY_FALLBACK_PORTS,
+        None,
+    )
+    .with_context(|| {
+        format!(
+            "failed to bind primary listener on {}:{}",
+            ctx.config.addr, ctx.config.port
+        )
+    })?;
 
     if ctx.config.port != 0 && primary_addr.port() != ctx.config.port {
         warn!(
@@ -121,12 +128,7 @@ fn bind_with_port_rotation(
                 let bound_addr = listener.local_addr()?;
                 return Ok((listener, bound_addr));
             }
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    ErrorKind::AddrInUse | ErrorKind::PermissionDenied
-                ) =>
-            {
+            Err(e) if matches!(e.kind(), ErrorKind::AddrInUse | ErrorKind::PermissionDenied) => {
                 debug!(%ip, port, error = %e, "port busy or reserved; trying next port");
                 last_err = Some(e);
             }
@@ -159,73 +161,98 @@ fn bind_reuse_tcp(addr: SocketAddr) -> std::io::Result<TcpListener> {
 pub async fn serve_until_shutdown(
     listeners: BoundListeners,
     ctx: EngineContext,
-    mut shutdown_rx: watch::Receiver<bool>,
+    shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let primary_ctx = ctx.clone();
-    let mut primary_stop = shutdown_rx.clone();
-
-    let primary_loop = async move {
-        loop {
-            tokio::select! {
-                _ = primary_stop.changed() => {
-                    if *primary_stop.borrow() {
-                        break;
-                    }
-                }
-                accept_res = listeners.primary_listener.accept() => {
-                    match accept_res {
-                        Ok((stream, peer)) => {
-                            let conn_ctx = primary_ctx.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = dispatch_autodetect(stream, conn_ctx).await {
-                                    debug!(%peer, error = %e, "connection closed with error");
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "accept error on primary listener");
-                            tokio::time::sleep(Duration::from_millis(20)).await;
-                        }
-                    }
-                }
-            }
-        }
-    };
-
-    let socks_loop = async move {
-        if let Some(socks_listener) = listeners.socks_listener {
-            loop {
-                tokio::select! {
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
-                            break;
-                        }
-                    }
-                    accept_res = socks_listener.accept() => {
-                        match accept_res {
-                            Ok((stream, peer)) => {
-                                let conn_ctx = ctx.clone();
-                                tokio::spawn(async move {
-                                    if let Err(e) = dispatch_autodetect(stream, conn_ctx).await {
-                                        debug!(%peer, error = %e, "SOCKS connection closed with error");
-                                    }
-                                });
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "accept error on SOCKS listener");
-                                tokio::time::sleep(Duration::from_millis(20)).await;
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            let _ = shutdown_rx.changed().await;
-        }
-    };
-
-    tokio::join!(primary_loop, socks_loop);
+    serve_with_limit(listeners, ctx, shutdown_rx, MAX_CLIENT_SESSIONS).await;
     Ok(())
+}
+
+async fn serve_with_limit(
+    listeners: BoundListeners,
+    mut ctx: EngineContext,
+    shutdown_rx: watch::Receiver<bool>,
+    limit: usize,
+) {
+    ctx.listener_addrs = [
+        Some(listeners.primary_addr),
+        listeners.socks_addr,
+        ipv4_companion(&listeners.primary_listener, listeners.primary_addr),
+        listeners
+            .socks_listener
+            .as_ref()
+            .zip(listeners.socks_addr)
+            .and_then(|(listener, addr)| ipv4_companion(listener, addr)),
+    ];
+    let slots = Arc::new(Semaphore::new(limit));
+    let primary_loop = serve_listener(
+        listeners.primary_listener,
+        ctx.clone(),
+        shutdown_rx.clone(),
+        slots.clone(),
+    );
+    let socks_loop = async move {
+        if let Some(listener) = listeners.socks_listener {
+            serve_listener(listener, ctx, shutdown_rx, slots).await;
+        }
+    };
+    tokio::join!(primary_loop, socks_loop);
+}
+
+fn ipv4_companion(listener: &TcpListener, addr: SocketAddr) -> Option<SocketAddr> {
+    (addr.is_ipv6()
+        && addr.ip().is_unspecified()
+        && SockRef::from(listener)
+            .only_v6()
+            .is_ok_and(|only_v6| !only_v6))
+    .then(|| SocketAddr::from((Ipv4Addr::UNSPECIFIED, addr.port())))
+}
+
+async fn serve_listener(
+    listener: TcpListener,
+    ctx: EngineContext,
+    mut stop: watch::Receiver<bool>,
+    slots: Arc<Semaphore>,
+) {
+    let mut sessions = JoinSet::new();
+    let shutdown = async { drop(stop.wait_for(|stopped| *stopped).await) };
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => break,
+            Some(result) = sessions.join_next() => {
+                if let Err(e) = result {
+                    warn!(error = %e, "client session task failed");
+                }
+            }
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((stream, peer)) => {
+                        // Close excess sockets rather than queueing unbounded client tasks.
+                        let Ok(slot) = slots.clone().try_acquire_owned() else {
+                            continue;
+                        };
+                        let conn_ctx = ctx.clone();
+                        sessions.spawn(async move {
+                            let _slot = slot;
+                            if let Err(e) = dispatch_autodetect(stream, conn_ctx).await {
+                                debug!(%peer, error = %e, "connection closed with error");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "proxy listener accept error");
+                        tokio::select! {
+                            _ = &mut shutdown => break,
+                            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+    drop(listener);
+    sessions.shutdown().await;
 }
 
 /// Peeks the first byte of an incoming TCP stream to automatically route SOCKS5 (`0x05`),
@@ -248,6 +275,88 @@ pub async fn dispatch_autodetect(stream: TcpStream, ctx: EngineContext) -> Resul
 mod tests {
     use super::*;
     use crate::config::CliArgs;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::time::timeout;
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn test_context(addr: &str) -> EngineContext {
+        let mut config =
+            CliArgs::parse_from_iter(["vdpi", "--addr", addr, "--port", "0", "--no-system-proxy"])
+                .unwrap()
+                .into_runtime_config();
+        config.socks_port = Some(0);
+        EngineContext::new(config).unwrap()
+    }
+
+    #[tokio::test]
+    async fn both_listeners_share_capacity_and_shutdown_closes_active_sessions() {
+        timeout(TEST_TIMEOUT, async {
+            let ctx = test_context("127.0.0.1");
+            let bound = bind_listeners(&ctx).unwrap();
+            let primary = bound.primary_addr;
+            let socks = bound.socks_addr.unwrap();
+            let (stop, rx) = watch::channel(false);
+            let server = tokio::spawn(serve_with_limit(bound, ctx, rx, 1));
+
+            let mut active = TcpStream::connect(primary).await.unwrap();
+            active.write_all(&[5, 1, 0]).await.unwrap();
+            let mut reply = [0; 2];
+            active.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply, [5, 0]);
+
+            let mut overflow = TcpStream::connect(socks).await.unwrap();
+            assert!(matches!(overflow.read(&mut reply).await, Ok(0)));
+            drop(active);
+
+            // Permit release can race the next accept; wait for the other listener to serve.
+            let mut active = loop {
+                let mut stream = TcpStream::connect(socks).await.unwrap();
+                if stream.write_all(&[5, 1, 0]).await.is_ok()
+                    && stream.read_exact(&mut reply).await.is_ok()
+                {
+                    assert_eq!(reply, [5, 0]);
+                    break stream;
+                }
+                tokio::task::yield_now().await;
+            };
+
+            drop(stop);
+            server.await.unwrap();
+            assert_eq!(active.read(&mut reply).await.unwrap(), 0);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_connects_to_both_listeners_including_wildcard_binds() {
+        timeout(TEST_TIMEOUT, async {
+            for ip in ["127.0.0.1", "0.0.0.0"] {
+                let ctx = test_context(ip);
+                let bound = bind_listeners(&ctx).unwrap();
+                let primary = SocketAddr::from((Ipv4Addr::LOCALHOST, bound.primary_addr.port()));
+                let socks =
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, bound.socks_addr.unwrap().port()));
+                let (stop, rx) = watch::channel(false);
+                let server = tokio::spawn(serve_until_shutdown(bound, ctx, rx));
+
+                for target in [primary, socks] {
+                    let mut stream = TcpStream::connect(primary).await.unwrap();
+                    let request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n");
+                    stream.write_all(request.as_bytes()).await.unwrap();
+                    let mut response = Vec::new();
+                    stream.read_to_end(&mut response).await.unwrap();
+                    assert!(response.starts_with(b"HTTP/1.1 502 "));
+                }
+
+                stop.send(true).unwrap();
+                server.await.unwrap().unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn automatically_rotates_primary_and_socks_ports_when_busy() {

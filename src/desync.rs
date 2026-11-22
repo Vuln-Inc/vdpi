@@ -11,7 +11,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{copy_bidirectional_with_sizes, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tracing::debug;
@@ -80,6 +80,7 @@ pub struct EngineContext {
     pub bypass: Arc<BypassPolicy>,
     pub adaptive_cache: Arc<RwLock<HashMap<String, LearnedStrategy>>>,
     pub preferred_isp_stage: Arc<AtomicU8>,
+    pub(crate) listener_addrs: [Option<SocketAddr>; 4],
 }
 
 impl EngineContext {
@@ -97,6 +98,7 @@ impl EngineContext {
             bypass: Arc::new(bypass),
             adaptive_cache: Arc::new(RwLock::new(HashMap::new())),
             preferred_isp_stage: Arc::new(AtomicU8::new(LearnedStrategy::Primary as u8)),
+            listener_addrs: [None; 4],
         })
     }
 
@@ -123,7 +125,7 @@ impl EngineContext {
                 self.config.connect_timeout
             };
 
-            match tokio::time::timeout(attempt_timeout, TcpStream::connect(target)).await {
+            match tokio::time::timeout(attempt_timeout, self.connect_upstream(target)).await {
                 Ok(Ok(stream)) => {
                     let _ = stream.set_nodelay(true);
                     return Ok((stream, target));
@@ -140,6 +142,35 @@ impl EngineContext {
         }
 
         Err(last_err.unwrap_or_else(|| anyhow!("failed to connect to {host}:{port}")))
+    }
+
+    async fn connect_upstream(&self, target: SocketAddr) -> std::io::Result<TcpStream> {
+        let target = match target {
+            SocketAddr::V6(v6) if v6.ip().to_ipv4_mapped().is_some() => {
+                SocketAddr::new(target.ip().to_canonical(), target.port())
+            }
+            _ => target,
+        };
+        if target.ip().is_unspecified() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "upstream address is unspecified",
+            ));
+        }
+        for addr in self.listener_addrs.iter().flatten() {
+            if addr.port() == target.port()
+                && (addr.ip().to_canonical() == target.ip()
+                    || (addr.ip().is_unspecified()
+                        && addr.is_ipv4() == target.is_ipv4()
+                        && (target.ip().is_loopback() || can_bind_locally(target))))
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "upstream points back to a proxy listener",
+                ));
+            }
+        }
+        TcpStream::connect(target).await
     }
 
     /// Relays a bidirectional TCP tunnel between `client` and `remote`, inspecting the initial
@@ -174,7 +205,8 @@ impl EngineContext {
                     return Ok(());
                 }
                 client.write_all(&remote_buf[..n]).await?;
-                let _ = copy_bidirectional_with_sizes(&mut client, &mut remote, 65536, 65536).await;
+                drop(first_buf);
+                copy_bidirectional(&mut client, &mut remote).await?;
                 return Ok(());
             }
         }
@@ -220,7 +252,7 @@ impl EngineContext {
             if !self.bypass.should_desync(effective_host, Some(remote_ip)) {
                 debug!(host = ?effective_host, %remote_ip, "TLS passthrough (bypassed)");
                 remote.write_all(payload).await?;
-                let _ = copy_bidirectional_with_sizes(&mut client, &mut remote, 65536, 65536).await;
+                copy_bidirectional(&mut client, &mut remote).await?;
                 return Ok(());
             }
 
@@ -237,7 +269,7 @@ impl EngineContext {
                 });
                 self.write_tls_strategy(&mut remote, payload, &ch_info, stage)
                     .await?;
-                let _ = copy_bidirectional_with_sizes(&mut client, &mut remote, 65536, 65536).await;
+                copy_bidirectional(&mut client, &mut remote).await?;
                 return Ok(());
             }
 
@@ -254,7 +286,7 @@ impl EngineContext {
                     Some(s) => s,
                     None => {
                         let target = retry_addrs[idx % retry_addrs.len()];
-                        match connect_retry_stream(target, remote_addr).await {
+                        match connect_retry_stream(self, target, remote_addr).await {
                             Some(s) => s,
                             None => continue,
                         }
@@ -327,9 +359,8 @@ impl EngineContext {
 
                         client.write_all(&probe_buf[..n]).await?;
                         client.flush().await?;
-                        let _ =
-                            copy_bidirectional_with_sizes(&mut client, &mut stream, 65536, 65536)
-                                .await;
+                        drop(probe_buf);
+                        copy_bidirectional(&mut client, &mut stream).await?;
                         return Ok(());
                     }
                     _ => {
@@ -360,7 +391,7 @@ impl EngineContext {
         // Non-TLS or plain HTTP traffic
         self.write_initial_flight(&mut remote, payload, known_host, remote_ip)
             .await?;
-        let _ = copy_bidirectional_with_sizes(&mut client, &mut remote, 65536, 65536).await;
+        copy_bidirectional(&mut client, &mut remote).await?;
         Ok(())
     }
 
@@ -514,14 +545,8 @@ impl EngineContext {
             LearnedStrategy::SlowSniSlice => {
                 // Single intact outer TLS record: breaks record header on packet 1, then slices
                 // the SNI hostname itself into 2-byte paced segments with a 20ms midpoint gap.
-                write_targeted_sni_slices(
-                    remote,
-                    payload,
-                    ch_info,
-                    Duration::from_millis(6),
-                    true,
-                )
-                .await?;
+                write_targeted_sni_slices(remote, payload, ch_info, Duration::from_millis(6), true)
+                    .await?;
             }
             LearnedStrategy::DirectPassthrough => {
                 remote.write_all(payload).await?;
@@ -582,16 +607,30 @@ impl EngineContext {
     }
 }
 
-async fn connect_retry_stream(target: SocketAddr, fallback: SocketAddr) -> Option<TcpStream> {
+// A wildcard listener has no concrete interface address. On a matching port,
+// test whether the target belongs to this host without opening a connection.
+fn can_bind_locally(mut addr: SocketAddr) -> bool {
+    addr.set_port(0);
+    let domain = socket2::Domain::for_address(addr);
+    socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
+        .and_then(|socket| socket.bind(&addr.into()))
+        .is_ok()
+}
+
+async fn connect_retry_stream(
+    ctx: &EngineContext,
+    target: SocketAddr,
+    fallback: SocketAddr,
+) -> Option<TcpStream> {
     if let Ok(Ok(s)) =
-        tokio::time::timeout(Duration::from_millis(2200), TcpStream::connect(target)).await
+        tokio::time::timeout(Duration::from_millis(2200), ctx.connect_upstream(target)).await
     {
         let _ = s.set_nodelay(true);
         return Some(s);
     }
     if target != fallback {
         if let Ok(Ok(s)) =
-            tokio::time::timeout(Duration::from_millis(2200), TcpStream::connect(fallback)).await
+            tokio::time::timeout(Duration::from_millis(2200), ctx.connect_upstream(fallback)).await
         {
             let _ = s.set_nodelay(true);
             return Some(s);
@@ -833,7 +872,14 @@ fn raw_send_oob(stream: &TcpStream, data: &[u8]) -> std::io::Result<usize> {
         fn send(sockfd: i32, buf: *const c_void, len: usize, flags: i32) -> isize;
     }
 
-    let n = unsafe { send(stream.as_raw_fd(), data.as_ptr().cast::<c_void>(), data.len(), MSG_OOB) };
+    let n = unsafe {
+        send(
+            stream.as_raw_fd(),
+            data.as_ptr().cast::<c_void>(),
+            data.len(),
+            MSG_OOB,
+        )
+    };
     if n < 0 {
         Err(std::io::Error::last_os_error())
     } else {
@@ -1081,7 +1127,9 @@ mod tests {
                     if count == 4 {
                         // Fake ISP HTTP block-page injection on a TLS port
                         let _ = sock
-                            .write_all(b"HTTP/1.1 302 Found\r\nLocation: http://blocked.isp/\r\n\r\n")
+                            .write_all(
+                                b"HTTP/1.1 302 Found\r\nLocation: http://blocked.isp/\r\n\r\n",
+                            )
                             .await;
                     } else if count == 1 {
                         // TCP RST / immediate EOF

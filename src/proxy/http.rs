@@ -1,8 +1,9 @@
+use super::HANDSHAKE_TIMEOUT;
 use crate::desync::EngineContext;
 use crate::tls::expected_tls_record_len;
 use anyhow::{bail, Result};
 use std::time::Duration;
-use tokio::io::{copy_bidirectional_with_sizes, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::debug;
 
@@ -14,10 +15,12 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
 
     let mut buf = Vec::with_capacity(4096);
     let mut temp = [0u8; 4096];
+    let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+    let mut scan_from = 0;
 
     let header_end = loop {
-        if let Some(pos) = find_header_end(&buf) {
-            break pos;
+        if let Some(pos) = find_header_end(&buf[scan_from..]) {
+            break scan_from + pos;
         }
         if buf.len() >= MAX_HTTP_HEADER_BYTES {
             let _ = client
@@ -27,7 +30,9 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
                 .await;
             bail!("HTTP header exceeded {MAX_HTTP_HEADER_BYTES} bytes");
         }
-        let n = tokio::time::timeout(Duration::from_secs(15), client.read(&mut temp)).await??;
+        scan_from = buf.len().saturating_sub(3);
+        let read_limit = temp.len().min(MAX_HTTP_HEADER_BYTES - buf.len());
+        let n = tokio::time::timeout_at(deadline, client.read(&mut temp[..read_limit])).await??;
         if n == 0 {
             return Ok(());
         }
@@ -100,6 +105,7 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
 
                 if !leftover.is_empty() {
                     let mut initial = leftover.to_vec();
+                    drop(buf);
                     if let Some(expected_len) = expected_tls_record_len(&initial) {
                         if expected_len <= 16896 && initial.len() < expected_len {
                             let start = initial.len();
@@ -124,6 +130,7 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
                         .await;
                 }
 
+                drop(buf);
                 return ctx
                     .relay_tunnel(client, remote, Some(&host), remote_addr)
                     .await;
@@ -150,11 +157,13 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
     };
 
     let rewritten = rewrite_http_request(method, &origin_path, version, header_str, leftover);
+    drop(buf);
     match ctx.connect_target(&host, port).await {
         Ok((mut remote, remote_addr)) => {
             ctx.write_initial_flight(&mut remote, &rewritten, Some(&host), remote_addr.ip())
                 .await?;
-            let _ = copy_bidirectional_with_sizes(&mut client, &mut remote, 65536, 65536).await;
+            drop(rewritten);
+            copy_bidirectional(&mut client, &mut remote).await?;
             Ok(())
         }
         Err(e) => {

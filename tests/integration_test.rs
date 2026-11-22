@@ -67,6 +67,9 @@ async fn spawn_local_tls_echo_server(hostname: &str) -> (SocketAddr, Certificate
                     if let Ok(n) = tls.read(&mut buf).await {
                         let _ = tls.write_all(&buf[..n]).await;
                         let _ = tls.shutdown().await;
+                        // Drain the peer's shutdown before dropping the socket. Windows can
+                        // report a TCP reset if the peer's TLS close_notify is still unread.
+                        let _ = tls.read(&mut buf).await;
                     }
                 }
             });
@@ -268,6 +271,7 @@ async fn end_to_end_all_seven_desync_stages_complete_real_tls_handshake() {
         let mut reply = Vec::new();
         tls.read_to_end(&mut reply).await.unwrap();
         assert_eq!(reply, msg.as_bytes());
+        tls.shutdown().await.unwrap();
         drop(tls);
         relay_task.await.unwrap();
     }
