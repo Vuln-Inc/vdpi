@@ -48,6 +48,14 @@ Every outbound TLS handshake validates the upstream `ServerHello` (`0x16 0x03`) 
 
 ## Installation
 
+### First launch
+
+Open `vdpi.exe` from File Explorer, or run `vdpi` with no arguments in an interactive terminal. Choose **Run directly** to use vdpi immediately, **Install for automatic startup** to register a background service, or **Quit** to leave without starting. Linux desktop launches use Zenity when available.
+
+**Run directly** saves your choice for future launches and prints a reminder that you can install later with `vdpi install`. Use `vdpi launcher` to reopen the chooser, or `vdpi start` to skip it. Commands with explicit flags and unattended shell invocations can start the foreground proxy without a prompt.
+
+The run-only preference is a file named `run-directly` in `%LOCALAPPDATA%\vdpi` on Windows, `~/Library/Application Support/vdpi` on macOS, or `$XDG_CONFIG_HOME/vdpi` (default `~/.config/vdpi`) on Linux.
+
 Download the release archive for your OS from **[Releases](https://github.com/Vuln-Inc/vdpi/releases/latest)**, extract it, and run `vdpi install`.  
 Everything — binary installation, `PATH` registration, background service setup, and OS proxy configuration — is handled natively by `vdpi` itself.
 
@@ -171,7 +179,8 @@ All Discord & Roblox HTTP CONNECT and SOCKS5h checks passed.
 Usage: vdpi [OPTIONS] [COMMAND]
 
 Commands:
-  start      Start the vdpi engine in the foreground (default when no subcommand is given) [aliases: run]
+  start      Start the vdpi engine in the foreground without opening the launcher [aliases: run]
+  launcher   Open the run or install chooser, even if a preference was saved
   install    Install vdpi and enable automatic background startup (Windows Service / LaunchAgent / systemd)
   uninstall  Stop vdpi, remove startup registration, and restore system proxy settings
   status     Display live daemon health, ports, system proxy state, and session environment
