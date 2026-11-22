@@ -319,6 +319,7 @@ Wants=network-online.target\n\
 [Service]\n\
 Type=simple\n\
 ExecStart=\"{}\" {}\n\
+KillMode=mixed\n\
 Restart=always\n\
 RestartSec=2\n\
 LimitNOFILE=65536\n\

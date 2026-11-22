@@ -520,10 +520,10 @@ fn run_service_runtime(handle: ServiceStatusHandle, cfg: RuntimeConfig) -> Resul
 
         let (server_shutdown_tx, server_shutdown_rx) = watch::channel(false);
 
-        if let Some(ref session) = proxy_session {
+        let watchdog = if let Some(ref session) = proxy_session {
             let watchdog_session = session.clone();
             let mut watchdog_shutdown = server_shutdown_rx.clone();
-            tokio::spawn(async move {
+            Some(tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_secs(15));
                 ticker.tick().await;
                 loop {
@@ -546,8 +546,10 @@ fn run_service_runtime(handle: ServiceStatusHandle, cfg: RuntimeConfig) -> Resul
                         }
                     }
                 }
-            });
-        }
+            }))
+        } else {
+            None
+        };
 
         let server_task = tokio::spawn(serve_until_shutdown(bound, ctx, server_shutdown_rx));
 
@@ -562,6 +564,9 @@ fn run_service_runtime(handle: ServiceStatusHandle, cfg: RuntimeConfig) -> Resul
 
         report_service_status(handle, SERVICE_STOP_PENDING, 0, NO_ERROR, 2, 5000);
         let _ = server_shutdown_tx.send(true);
+        if let Some(watchdog) = watchdog {
+            let _ = watchdog.await;
+        }
         clear_runtime_state(std::process::id());
 
         if reason == StopReason::Stop {
