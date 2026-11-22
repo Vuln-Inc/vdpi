@@ -136,7 +136,7 @@ fn print_startup_banner(
         println!("  SOCKS5 (TCP + UDP)  : {sa}");
     }
     println!(
-        "  Desync Engine       : {:?} ({}-byte SNI segments + 5-stage auto-heal)",
+        "  Desync Engine       : {:?} ({}-byte SNI segments + 6-stage OOB/record auto-heal)",
         cfg.mode, cfg.chunk_size
     );
     println!(

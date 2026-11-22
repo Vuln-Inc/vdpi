@@ -24,23 +24,24 @@ Works across ISPs and networks worldwide with instant startup, zero ping penalty
 | :--- | :--- |
 | **Single-Binary Self-Installer** | `vdpi install` and `vdpi uninstall` detect your OS automatically — no external `.bat` or `.sh` scripts required. |
 | **Native OS Background Services** | Installs as a native **Windows Service (`AUTO_START`)**, **macOS `LaunchAgent`**, or **Linux `systemd --user`** unit. |
-| **5-Stage Adaptive Auto-Heal** | Automatically escalates and caches the fastest working wire-paced TLS desync strategy per host and ISP network so even strict stateful DPI boxes and CDNs never break. |
+| **6-Stage Adaptive Auto-Heal** | Automatically escalates across multi-record TLS splitting, TCP `MSG_OOB` urgent byte desync, and 12+ record storms — learning the winning strategy per host and ISP network. |
 | **Full App, Voice & Game Support** | Protocol-autodetecting **HTTP/1.1 + HTTPS `CONNECT` + SOCKS5 (`CONNECT` & `UDP ASSOCIATE`) + SOCKS4a** proxy with native OS proxy and environment bridging. |
 | **Anti-Poisoning DNS Ring** | In-memory TTL-cached **RFC 8484 DoH** with sticky healthy failover across 4 independent networks (`1.1.1.1`, `8.8.8.8`, `94.140.14.140`, `9.9.9.9`), non-port-53 UDP fallback (`1253`, `443`, `5353`), and sinkhole IP filtering. |
 | **100% VPN Coexistence** | Pure userspace proxy (no WinDivert, kernel extensions, or fake-TTL injection) — coexists seamlessly with WireGuard, Cloudflare WARP, OpenVPN, Mullvad, and ProtonVPN. |
 | **Smart Local & Portal Bypass** | Automatically bypasses LAN/private subnets (`localhost`, `10.0.0.0/8`, `192.168.0.0/16`, `*.local`), government/banking portals, and any custom `--bypass` rules. |
 
-### Adaptive 5-Stage TLS Engine
+### Adaptive 6-Stage TLS Engine
 
 Every outbound TLS handshake validates the upstream `ServerHello` (`0x16 0x03`) — rejecting TCP resets, TLS Alerts (`0x15`), and injected ISP block pages — and automatically escalates, caches, and self-heals across networks:
 
 | Stage | Strategy | How It Works |
 | :---: | :--- | :--- |
 | **1** | `ComboMultiRecord` | Splits the TLS `ClientHello` into 4 wire-paced RFC-compliant `0x16` records across the handshake header and SNI midpoint (defeating OS TCP coalescing and shallow DPI). |
-| **2** | `FineFragment` | Keeps a single intact outer TLS record split across 4 wire-paced TCP segments (for strict servers that reject multi-record `ClientHello`s). |
-| **3** | `DeepRecordStorm` | Emits 12+ wire-paced `0x16` records (10 tiny 2-byte lead records exhausting hardware DPI per-flow packet caps before the SNI even hits the wire, followed by SNI-split records) and auto-promotes globally on strict stateful ISPs. |
-| **4** | `SlowSniSlice` | Single intact outer TLS record with 2-byte paced SNI slicing and a 20ms midpoint gap for strict servers behind stateful burst-reassembling DPI. |
-| **5** | `DirectPassthrough` | Falls back cleanly to an unmodified handshake for unblocked strict WAFs and caches the winning strategy per hostname. |
+| **2** | `OobSniDesync` | Injects 1 TCP Out-of-Band (`MSG_OOB`, `URG=1`) decoy byte right at the SNI midpoint. Server TCP stacks (`SO_OOBINLINE=0`) strip the urgent byte seamlessly while full-stream-reassembling stateful DPI boxes see a corrupted hostname and pass the connection through. |
+| **3** | `FineFragment` | Keeps a single intact outer TLS record split across 4 wire-paced TCP segments (for strict servers or firewalls that reject multi-record `ClientHello`s or strip `URG`). |
+| **4** | `DeepRecordStorm` | Emits 12+ wire-paced `0x16` records (10 tiny 2-byte lead records exhausting hardware DPI per-flow packet caps before the SNI even hits the wire, followed by SNI-split records) and auto-promotes globally on strict stateful ISPs. |
+| **5** | `SlowSniSlice` | Single intact outer TLS record with 2-byte paced SNI slicing and a 20ms midpoint gap for strict servers behind stateful burst-reassembling DPI. |
+| **6** | `DirectPassthrough` | Falls back cleanly to an unmodified handshake for unblocked strict WAFs and caches the winning strategy per hostname. |
 
 ---
 
@@ -114,10 +115,10 @@ vdpi uninstall
 
 | DPI / Censorship Mechanism | Automatic `vdpi` Countermeasure |
 | :--- | :--- |
-| **Active Inline & Stateful DPI / TCP Reset Injection** | 5-Stage wire-paced adaptive TLS engine (`ComboMultiRecord` -> `FineFragment` -> `DeepRecordStorm` 12+ record cap exhaustion -> `SlowSniSlice`) with automatic ISP-wide stage promotion |
+| **Active Inline & Stateful Stream-Reassembling DPI** | 6-Stage wire-paced adaptive TLS engine (`ComboMultiRecord` -> `OobSniDesync` (`MSG_OOB` urgent byte) -> `FineFragment` -> `DeepRecordStorm` -> `SlowSniSlice`) with automatic ISP-wide promotion |
 | **Transparent Port-53 DNS Hijacking & Poisoning** | Sticky multi-ASN IP-literal RFC 8484 DoH ring (`1.1.1.1`, `8.8.8.8`, `94.140.14.140`, `9.9.9.9`) + non-port-53 UDP (`1253`, `443`, `5353`) + sinkhole IP rejection |
 | **SNI, HTTP `Host`, IPv6 CNAME & QUIC Filtering** | CNAME-safe IPv4/IPv6 resolution, 3-segment wire-paced HTTP `Host` splitting, and clean TCP TLS fallback for QUIC-throttled networks |
-| **Strict CDNs, Banking & Government Portals** | Built-in LAN/government/banking bypass policy (`--bypass` extensible) + Stage 5 Auto-Heal Passthrough |
+| **Strict CDNs, Banking & Government Portals** | Built-in LAN/government/banking bypass policy (`--bypass` extensible) + Stage 6 Auto-Heal Passthrough |
 
 ---
 
@@ -234,7 +235,7 @@ vdpi/
 │   ├── tls.rs                  # Zero-panic TLS ClientHello SNI parser and record splitter
 │   ├── bypass.rs               # LAN, private subnet, regex, and portal bypass policy
 │   ├── dns.rs                  # Multi-tier RFC 8484 DoH + port-1253 anti-poisoning DNS resolver
-│   ├── desync.rs               # 5-stage wire-paced adaptive auto-heal TLS and HTTP DPI desynchronizer
+│   ├── desync.rs               # 6-stage adaptive OOB, multi-record, and paced SNI DPI desynchronizer
 │   ├── server.rs               # Protocol-autodetecting TCP listener and dual-port SOCKS5 server
 │   ├── service.rs              # Cross-platform self-installer, service manager, status, and doctor
 │   ├── platform/
