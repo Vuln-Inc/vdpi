@@ -12,7 +12,7 @@
 Single self-contained binary. Zero scripts. Zero kernel `.sys` drivers.  
 Works across ISPs and networks worldwide with instant startup, zero ping penalty, full **Discord** & **Roblox** support, and 100% VPN coexistence.
 
-[Features](#features) · [Installation](#installation) · [Network Compatibility](#network-compatibility) · [Diagnostics](#diagnostics) · [CLI Reference](#cli-reference)
+[Features](#features) · [Launcher](#launcher) · [Installation](#installation) · [Network Compatibility](#network-compatibility) · [Diagnostics](#diagnostics) · [CLI Reference](#cli-reference)
 
 </div>
 
@@ -46,17 +46,25 @@ Every outbound TLS handshake validates the upstream `ServerHello` (`0x16 0x03`) 
 
 ---
 
-## Installation
+## Launcher
 
-### First launch
+Open `vdpi.exe` from File Explorer, or run `vdpi` with no arguments in an interactive terminal. The launcher offers three choices:
 
-Open `vdpi.exe` from File Explorer, or run `vdpi` with no arguments in an interactive terminal. Choose **Run directly** to use vdpi immediately, **Install for automatic startup** to register a background service, or **Quit** to leave without starting. Linux desktop launches use Zenity when available.
+- **Run directly:** Start vdpi in the foreground. Closing it stops vdpi and releases its desktop proxy automatically.
+- **Install for automatic startup:** Register a background service that runs independently of the launcher window.
+- **Quit:** Leave without starting or saving a preference.
+
+Windows uses a native dialog for desktop launches. Linux uses Zenity when available. macOS can use a native alert outside a terminal. Interactive terminals use the numbered console menu.
 
 **Run directly** saves your choice for future launches and prints a reminder that you can install later with `vdpi install`. Use `vdpi launcher` to reopen the chooser, or `vdpi start` to skip it. Commands with explicit flags and unattended shell invocations can start the foreground proxy without a prompt.
 
 The run-only preference is a file named `run-directly` in `%LOCALAPPDATA%\vdpi` on Windows, `~/Library/Application Support/vdpi` on macOS, or `$XDG_CONFIG_HOME/vdpi` (default `~/.config/vdpi`) on Linux.
 
-On Windows, foreground vdpi restores the previous system proxy when its console closes. Foreground mode does not export user proxy environment variables, because apps launched while vdpi is running could keep those variables after it exits. An installed background service runs independently of the console window.
+Foreground mode does not export user proxy environment variables, because apps launched while vdpi is running could keep those variables after it exits.
+
+If an older Windows build left a dead proxy behind, open **Settings > Network & internet > Proxy** and disable the manual proxy only if it points to vdpi's old local address. If `HTTP_PROXY` or `HTTPS_PROXY` still points there in your user environment, remove those values and reopen the affected apps.
+
+## Installation
 
 Download the release archive for your OS from **[Releases](https://github.com/Vuln-Inc/vdpi/releases/latest)**, extract it, and run `vdpi install`.  
 Everything — binary installation, `PATH` registration, background service setup, and OS proxy configuration — is handled natively by `vdpi` itself.
