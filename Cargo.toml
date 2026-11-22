@@ -1,0 +1,38 @@
+[package]
+name = "vdpi"
+version = "0.1.0"
+edition = "2021"
+authors = ["Vuln-Inc"]
+description = "Zero-hassle, high-performance anti-DPI engine in Rust for macOS, Windows, and Linux"
+license = "MIT"
+repository = "https://github.com/Vuln-Inc/vdpi"
+homepage = "https://github.com/Vuln-Inc/vdpi"
+readme = "README.md"
+keywords = ["dpi", "proxy", "socks5", "doh", "network"]
+categories = ["command-line-utilities", "network-programming"]
+
+[dependencies]
+anyhow = "1.0"
+bytes = "1.9"
+clap = { version = "4.5", features = ["derive"] }
+regex = "1.11"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "socks"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+socket2 = { version = "0.5", features = ["all"] }
+thiserror = "2.0"
+tokio = { version = "1.43", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+rcgen = "0.13"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
