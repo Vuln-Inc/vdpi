@@ -191,7 +191,11 @@ async fn run_udp_associate_session(
             let Ok(ips) = c2r_ctx.dns.resolve(&dst_host).await else {
                 continue;
             };
-            let Some(target_ip) = ips.first().copied() else {
+            let target_ip = ips
+                .iter()
+                .copied()
+                .find(|ip| ip.is_ipv4() || c2r_out_v6.is_some());
+            let Some(target_ip) = target_ip else {
                 continue;
             };
             let dst_sa = SocketAddr::new(target_ip, dst_port);
