@@ -224,6 +224,10 @@ pub fn build_service_cli_args(cfg: &RuntimeConfig) -> Vec<String> {
     if cfg.dns_ipv4_only {
         args.push("--ipv4-only".to_string());
     }
+    if cfg.connect_timeout != std::time::Duration::from_secs(8) {
+        args.push("--timeout".to_string());
+        args.push(cfg.connect_timeout.as_millis().to_string());
+    }
     if !cfg.system_proxy {
         args.push("--no-system-proxy".to_string());
     } else {
@@ -344,7 +348,9 @@ pub fn install_service(cfg: &RuntimeConfig) -> Result<()> {
 
         if !is_elevated() {
             println!("Requesting Administrator privileges to install the vdpi Windows service...");
-            relaunch_elevated_and_wait()?;
+            let mut args = vec!["install".to_string()];
+            args.extend(build_service_cli_args(cfg));
+            relaunch_elevated_and_wait(&args)?;
             notify_wininet_refresh();
             broadcast_environment_change();
             println!("Installed and started Windows service: {WINDOWS_SERVICE_NAME} (AUTO_START)");
@@ -354,7 +360,7 @@ pub fn install_service(cfg: &RuntimeConfig) -> Result<()> {
         // Stop existing Windows service and any legacy vdpi.exe processes before replacing the binary.
         let _ = crate::platform::windows_service::stop_windows_service_if_running()?;
         cleanup_legacy_windows_startup();
-        stop_other_windows_vdpi_processes();
+        stop_windows_foreground_daemons();
     }
 
     let vdpi_root = vdpi_root_dir()?;
@@ -593,15 +599,26 @@ fn cleanup_legacy_windows_startup() {
 }
 
 #[cfg(target_os = "windows")]
-fn stop_other_windows_vdpi_processes() {
+fn stop_windows_foreground_daemons() {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     let my_pid = std::process::id();
-    let _ = Command::new("taskkill")
-        .creation_flags(CREATE_NO_WINDOW)
-        .args(["/F", "/FI", &format!("PID ne {my_pid}"), "/IM", "vdpi.exe"])
-        .output();
+    // Stop published daemon PIDs only; the unelevated installer is waiting for our exit.
+    for state in read_runtime_states() {
+        if state.pid != my_pid {
+            let _ = Command::new("taskkill")
+                .creation_flags(CREATE_NO_WINDOW)
+                .args([
+                    "/F",
+                    "/PID",
+                    &state.pid.to_string(),
+                    "/FI",
+                    "IMAGENAME eq vdpi.exe",
+                ])
+                .output();
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -722,7 +739,7 @@ pub fn uninstall_service() -> Result<()> {
 
         if !is_elevated() {
             println!("Requesting Administrator privileges to uninstall the vdpi Windows service...");
-            relaunch_elevated_and_wait()?;
+            relaunch_elevated_and_wait(&["uninstall".to_string()])?;
             clear_all_system_proxies()?;
             println!(
                 "Removed Windows service '{WINDOWS_SERVICE_NAME}' and restored {} system proxy settings.",
@@ -733,7 +750,7 @@ pub fn uninstall_service() -> Result<()> {
 
         let removed = crate::platform::windows_service::uninstall_windows_service()?;
         cleanup_legacy_windows_startup();
-        stop_other_windows_vdpi_processes();
+        stop_windows_foreground_daemons();
         if removed {
             println!("Stopped and removed Windows service: {WINDOWS_SERVICE_NAME}");
         } else {

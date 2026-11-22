@@ -313,17 +313,17 @@ pub fn is_elevated() -> bool {
     }
 }
 
-/// Relaunches the current `vdpi.exe` with the same CLI arguments under UAC elevation (`runas`)
+/// Relaunches the current `vdpi.exe` with explicit CLI arguments under UAC elevation (`runas`)
 /// and waits for the elevated process to finish.
-pub fn relaunch_elevated_and_wait() -> Result<()> {
+pub fn relaunch_elevated_and_wait(args: &[String]) -> Result<()> {
     let current_exe = std::env::current_exe().context("failed to determine current executable")?;
-    let params: String = std::env::args()
-        .skip(1)
+    let params: String = args
+        .iter()
         .map(|arg| {
             if arg.is_empty() || arg.contains([' ', '\t', '"']) {
                 format!("\"{}\"", arg.replace('"', "\\\""))
             } else {
-                arg
+                arg.clone()
             }
         })
         .collect::<Vec<_>>()
