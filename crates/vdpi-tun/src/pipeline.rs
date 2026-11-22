@@ -9,10 +9,12 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::sync::{Arc, OnceLock};
+use std::task::{Context as TaskContext, Poll};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch, RwLock, Semaphore};
 use tokio::task::AbortHandle;
@@ -21,6 +23,56 @@ use vdpi::desync::{EngineContext, LearnedStrategy};
 
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const UDP_RECV_BUF_BYTES: usize = 4096;
+
+/// Wraps `netstack_smoltcp::TcpStream` so `poll_shutdown` initiates TCP FIN without
+/// stalling `tokio::io::copy_bidirectional` for 10s-7200s waiting for full socket close.
+struct TunTcpStream(netstack_smoltcp::TcpStream);
+
+impl AsyncRead for TunTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for TunTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        // Trigger smoltcp's FIN transition once, then return Ready so half-closed relays
+        // release their session slots immediately rather than pinning memory/sockets.
+        let _ = Pin::new(&mut self.0).poll_shutdown(cx);
+        Poll::Ready(Ok(()))
+    }
+}
+
+struct PipelineAbortGuard {
+    handles: Vec<AbortHandle>,
+}
+
+impl Drop for PipelineAbortGuard {
+    fn drop(&mut self) {
+        for h in &self.handles {
+            h.abort();
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct TunStats {
@@ -66,10 +118,8 @@ struct UdpNatEntry {
 type UdpNatTable = Arc<RwLock<HashMap<(SocketAddr, bool), UdpNatEntry>>>;
 
 fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_secs()
 }
 
 pub(crate) async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
@@ -78,7 +128,8 @@ pub(crate) async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
 
 /// Validates an inbound IP packet read from TUN *before* feeding it into `netstack-smoltcp`.
 /// Critically, `netstack-smoltcp`'s `udp::ReadHalf` terminates its Stream (returns `None`)
-/// on any IPv4-fragmented or malformed UDP packet; filtering them here keeps UDP & DNS alive.
+/// on any fragmented, IPv6 jumbogram (`payload_length == 0`), or malformed UDP packet;
+/// filtering them here keeps UDP & DNS alive.
 pub fn is_valid_inbound_tun_packet(pkt: &[u8]) -> bool {
     if pkt.len() < 20 {
         return false;
@@ -87,13 +138,22 @@ pub fn is_valid_inbound_tun_packet(pkt: &[u8]) -> bool {
     if version != 4 && version != 6 {
         return false;
     }
+    if version == 6 {
+        if pkt.len() < 40 {
+            return false;
+        }
+        // Reject IPv6 payload_length == 0 (jumbogram / malformed) which etherparse accepts
+        // differently from smoltcp and would terminate netstack-smoltcp's udp::ReadHalf.
+        let payload_len = u16::from_be_bytes([pkt[4], pkt[5]]);
+        if payload_len == 0 || pkt.len() < 40 + usize::from(payload_len) {
+            return false;
+        }
+    }
     let Ok(sliced) = SlicedPacket::from_ip(pkt) else {
         return false;
     };
-    if let Some(etherparse::NetSlice::Ipv4(v4)) = &sliced.net {
-        if v4.header().is_fragmenting_payload() {
-            return false;
-        }
+    if sliced.is_ip_payload_fragmented() {
+        return false;
     }
     if let Some(TransportSlice::Udp(udp)) = &sliced.transport {
         let declared = usize::from(udp.length());
@@ -103,6 +163,29 @@ pub fn is_valid_inbound_tun_packet(pkt: &[u8]) -> bool {
         }
     }
     true
+}
+
+/// Builds a truncated (`TC=1`) UDP/53 DNS reply when the full DoH answer exceeds the TUN MTU,
+/// prompting the client to retry cleanly over TCP/53 instead of timing out.
+fn build_truncated_dns_reply(query: &[u8], full_resp: &[u8]) -> Vec<u8> {
+    if full_resp.len() < 12 {
+        return full_resp.to_vec();
+    }
+    let mut out = Vec::with_capacity(query.len().clamp(12, 512));
+    out.extend_from_slice(&full_resp[..12]);
+    // Set TC (bit 9 of flags = 0x02 in byte 2) and zero AN/NS/AR counts.
+    out[2] |= 0x02;
+    out[6..12].fill(0);
+    // Preserve the question section from the original query when present.
+    if query.len() > 12 {
+        out[4] = query[4];
+        out[5] = query[5];
+        out.extend_from_slice(&query[12..query.len().min(512)]);
+    } else {
+        out[4] = 0;
+        out[5] = 0;
+    }
+    out
 }
 
 /// Detects whether a UDP/443 payload looks like QUIC traffic (including RFC 9000 Long Header
@@ -288,6 +371,7 @@ pub async fn run_tun_pipeline(
     // Task 4: Accept TCP streams from TUN (intercept TCP/53 DNS + relay all others via vdpi)
     let tcp_ctx = ctx.clone();
     let tcp_rdns = Arc::clone(&reverse_dns);
+    let tcp_dns_slots = Arc::clone(&dns_slots);
     let tcp_events = Arc::clone(&events);
     let tcp_stage_tracker = Arc::clone(&observed_stage);
     let tcp_stop_root = internal_stop_rx.clone();
@@ -308,6 +392,7 @@ pub async fn run_tun_pipeline(
                     };
                     let conn_ctx = tcp_ctx.clone();
                     let rdns = Arc::clone(&tcp_rdns);
+                    let conn_dns_slots = Arc::clone(&tcp_dns_slots);
                     let ev = Arc::clone(&tcp_events);
                     let tracker = Arc::clone(&tcp_stage_tracker);
                     let mut conn_stop = tcp_stop_root.clone();
@@ -319,7 +404,7 @@ pub async fn run_tun_pipeline(
                             tokio::select! {
                                 biased;
                                 _ = wait_shutdown(&mut conn_stop) => {}
-                                _ = handle_tcp_dns_stream(stream, conn_ctx, rdns) => {}
+                                _ = handle_tcp_dns_stream(TunTcpStream(stream), conn_ctx, rdns, conn_dns_slots) => {}
                             }
                             return;
                         }
@@ -352,13 +437,13 @@ pub async fn run_tun_pipeline(
                                 match upstream_res {
                                     Ok((remote, effective_dst)) => {
                                         if let Err(e) = conn_ctx
-                                            .relay_stream(stream, remote, known_host.as_deref(), effective_dst)
+                                            .relay_stream(TunTcpStream(stream), remote, known_host.as_deref(), effective_dst)
                                             .await
                                         {
                                             debug!(%effective_dst, host = ?known_host, error = %e, "TUN TCP relay ended");
                                         }
                                         let current = conn_ctx.preferred_stage() as u8;
-                                        let prev = tracker.swap(current, Ordering::Relaxed);
+                                        let prev = tracker.fetch_max(current, Ordering::Relaxed);
                                         if current > prev {
                                             let stage = LearnedStrategy::from_u8(current);
                                             ev.push(
@@ -428,7 +513,13 @@ pub async fn run_tun_pipeline(
                                                     rdns.insert(ip, domain.clone()).await;
                                                 }
                                             }
-                                            let _ = reply_tx.send((resp, dst_addr, src_addr)).await;
+                                            let max_udp = max_udp_payload_for_mtu(clamped_mtu, dst_addr.is_ipv4());
+                                            let wire = if resp.len() > max_udp {
+                                                build_truncated_dns_reply(&payload, &resp)
+                                            } else {
+                                                resp
+                                            };
+                                            let _ = reply_tx.try_send((wire, dst_addr, src_addr));
                                         }
                                         Err(e) => {
                                             debug!(error = %e, "TUN DNS wire query failed");
@@ -477,6 +568,18 @@ pub async fn run_tun_pipeline(
         }
     });
 
+    let _abort_guard = PipelineAbortGuard {
+        handles: vec![
+            stop_bridge.abort_handle(),
+            tun_to_stack.abort_handle(),
+            stack_to_tun.abort_handle(),
+            udp_writer_task.abort_handle(),
+            tcp_accept_task.abort_handle(),
+            udp_read_task.abort_handle(),
+            runner_handle.abort_handle(),
+        ],
+    };
+
     wait_shutdown(&mut internal_stop_rx).await;
 
     stop_bridge.abort();
@@ -519,9 +622,10 @@ async fn resolve_and_connect_ipv4(
 }
 
 async fn handle_tcp_dns_stream(
-    mut stream: netstack_smoltcp::TcpStream,
+    mut stream: TunTcpStream,
     ctx: EngineContext,
     rdns: Arc<ReverseDnsCache>,
+    dns_slots: Arc<Semaphore>,
 ) {
     let mut len_buf = [0u8; 2];
     for _ in 0..8 {
@@ -538,12 +642,16 @@ async fn handle_tcp_dns_stream(
             Ok(Ok(_)) => {}
             _ => break,
         }
-        match ctx
-            .dns
-            .resolve_wire_query(&query, ctx.config.block_quic)
-            .await
-        {
-            Ok((resp, meta)) => {
+        let Ok(_dns_permit) = dns_slots.clone().try_acquire_owned() else {
+            break;
+        };
+        let resolved = tokio::time::timeout(
+            Duration::from_secs(6),
+            ctx.dns.resolve_wire_query(&query, ctx.config.block_quic),
+        )
+        .await;
+        match resolved {
+            Ok(Ok((resp, meta))) => {
                 if let Some((domain, ips)) = meta {
                     for ip in ips {
                         rdns.insert(ip, domain.clone()).await;
@@ -552,13 +660,16 @@ async fn handle_tcp_dns_stream(
                 let Ok(resp_len) = u16::try_from(resp.len()) else {
                     break;
                 };
-                if stream.write_all(&resp_len.to_be_bytes()).await.is_err()
-                    || stream.write_all(&resp).await.is_err()
-                {
+                let write_res = tokio::time::timeout(Duration::from_secs(5), async {
+                    stream.write_all(&resp_len.to_be_bytes()).await?;
+                    stream.write_all(&resp).await
+                })
+                .await;
+                if !matches!(write_res, Ok(Ok(()))) {
                     break;
                 }
             }
-            Err(_) => break,
+            _ => break,
         }
     }
 }
@@ -644,15 +755,22 @@ async fn forward_udp_cone_nat(
                                     let clean_src = SocketAddr::new(canonical_ip, remote_src.port());
                                     rx_last.store(now_secs(), Ordering::Relaxed);
                                     rx_ctx.telemetry.bytes_rx.fetch_add(n as u64, Ordering::Relaxed);
-                                    if rx_reply_tx
-                                        .send((buf[..n].to_vec(), clean_src, src_addr))
-                                        .await
-                                        .is_err()
-                                    {
-                                        break;
+                                    match rx_reply_tx.try_send((buf[..n].to_vec(), clean_src, src_addr)) {
+                                        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                                        Err(mpsc::error::TrySendError::Closed(_)) => break,
                                     }
                                 }
                                 Ok(Ok(_)) => continue,
+                                Ok(Err(e))
+                                    if matches!(
+                                        e.kind(),
+                                        ErrorKind::Interrupted
+                                            | ErrorKind::WouldBlock
+                                            | ErrorKind::ConnectionRefused
+                                    ) =>
+                                {
+                                    continue;
+                                }
                                 Ok(Err(_)) => break,
                                 Err(_) => {
                                     let idle = now_secs().saturating_sub(rx_last.load(Ordering::Relaxed));
@@ -691,7 +809,18 @@ async fn forward_udp_cone_nat(
         }
     };
 
-    if outbound.send_to(&payload, dst_addr).await.is_ok() {
+    // Fast-path non-blocking send with a 25ms bounded fallback on initial readiness
+    // so the first packet on a newly bound socket always sends while preventing HoL stalls.
+    let sent = match outbound.try_send_to(&payload, dst_addr) {
+        Ok(_) => true,
+        Err(ref e) if e.kind() == ErrorKind::WouldBlock => matches!(
+            tokio::time::timeout(Duration::from_millis(25), outbound.send_to(&payload, dst_addr))
+                .await,
+            Ok(Ok(_))
+        ),
+        Err(_) => false,
+    };
+    if sent {
         ctx.telemetry
             .bytes_tx
             .fetch_add(payload.len() as u64, Ordering::Relaxed);

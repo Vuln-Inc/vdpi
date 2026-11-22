@@ -41,19 +41,19 @@ impl TunProfile {
         udp_reply_capacity: 512,
     };
 
-    /// Tuned for iOS `NEPacketTunnelProvider` (~50 MB hard Jetsam memory ceiling).
+    /// Tuned for iOS `NEPacketTunnelProvider` (~50 MB hard Jetsam memory ceiling and 256 RLIMIT_NOFILE).
     pub const LOW_MEMORY: Self = Self {
-        stack_buffer_size: 128,
-        tcp_buffer_size: 96,
-        udp_buffer_size: 96,
-        tcp_recv_buffer_size: 24 * 1024,
-        tcp_send_buffer_size: 24 * 1024,
-        max_tcp_sessions: 80,
-        max_udp_flows: 112,
-        max_dns_inflight: 48,
+        stack_buffer_size: 96,
+        tcp_buffer_size: 64,
+        udp_buffer_size: 64,
+        tcp_recv_buffer_size: 16 * 1024,
+        tcp_send_buffer_size: 16 * 1024,
+        max_tcp_sessions: 48,
+        max_udp_flows: 64,
+        max_dns_inflight: 24,
         max_reverse_dns_entries: 512,
-        channel_capacity: 128,
-        udp_reply_capacity: 128,
+        channel_capacity: 96,
+        udp_reply_capacity: 96,
     };
 }
 

@@ -2,15 +2,23 @@
 members = [".", "crates/vdpi-tun", "crates/vdpi-android", "crates/vdpi-ios"]
 default-members = ["."]
 
-[package]
-name = "vdpi"
+[workspace.package]
 version = "0.3.0"
 edition = "2021"
 authors = ["Vuln-Inc"]
-description = "Zero-hassle, high-performance anti-DPI engine in Rust for macOS, Windows, and Linux"
 license = "MIT"
 repository = "https://github.com/Vuln-Inc/vdpi"
 homepage = "https://github.com/Vuln-Inc/vdpi"
+
+[package]
+name = "vdpi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Zero-hassle, high-performance anti-DPI engine in Rust for macOS, Windows, and Linux"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 readme = "README.md"
 keywords = ["dpi", "proxy", "socks5", "doh", "network"]
 categories = ["command-line-utilities", "network-programming"]
@@ -47,4 +55,6 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
-panic = "abort"
+# Keep unwinding enabled so FFI/JNI std::panic::catch_unwind guards in
+# vdpi-android and vdpi-ios actually prevent panics from aborting mobile hosts.
+panic = "unwind"

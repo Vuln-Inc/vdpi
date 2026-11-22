@@ -4,12 +4,24 @@ struct SettingsView: View {
     @EnvironmentObject private var manager: TunnelManager
     @Environment(\.vdpiPalette) private var palette
 
+    private enum Field: Hashable {
+        case dns
+        case bypass
+    }
+
     @State private var dnsDraft: String = ""
+    @State private var dnsError: String? = nil
     @State private var bypassDraft: String = ""
     @State private var bypassError: String? = nil
     @State private var showResetConfirm = false
+    @FocusState private var focusedField: Field?
 
-    private let dnsPresets = ["1.1.1.1", "8.8.8.8", "9.9.9.9", "94.140.14.140"]
+    private let dnsPresets: [(label: String, value: String)] = [
+        ("Cloudflare", "1.1.1.1"),
+        ("Google", "8.8.8.8"),
+        ("Quad9", "9.9.9.9"),
+        ("AdGuard", "94.140.14.140"),
+    ]
 
     var body: some View {
         ScrollView {
@@ -103,7 +115,7 @@ struct SettingsView: View {
 
                     HairlineRule()
 
-                    HStack {
+                    HStack(spacing: 12) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Chunk Size")
                                 .font(.system(size: 14, weight: .medium))
@@ -113,19 +125,49 @@ struct SettingsView: View {
                                 .foregroundStyle(palette.inkSecondary)
                         }
                         Spacer()
-                        Stepper(
-                            value: Binding(
-                                get: { manager.settings.chunkSize },
-                                set: { val in manager.updateSettings { $0.chunkSize = max(1, min(64, val)) } }
-                            ),
-                            in: 1...64
-                        ) {
+                        HStack(spacing: 6) {
+                            Button {
+                                manager.updateSettings { $0.chunkSize = max(1, $0.chunkSize - 1) }
+                            } label: {
+                                Image(systemName: "minus")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .frame(width: 44, height: 44)
+                                    .foregroundStyle(palette.inkPrimary)
+                                    .background(palette.surfaceRaised)
+                                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                            .strokeBorder(palette.border, lineWidth: 1)
+                                    )
+                            }
+                            .buttonStyle(VdpiPressButtonStyle())
+                            .disabled(manager.settings.chunkSize <= 1)
+                            .accessibilityLabel("Decrease chunk size")
+
                             Text("\(manager.settings.chunkSize) B")
                                 .font(.system(size: 13, weight: .semibold, design: .monospaced))
                                 .monospacedDigit()
                                 .foregroundStyle(palette.inkPrimary)
+                                .frame(minWidth: 44)
+
+                            Button {
+                                manager.updateSettings { $0.chunkSize = min(64, $0.chunkSize + 1) }
+                            } label: {
+                                Image(systemName: "plus")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .frame(width: 44, height: 44)
+                                    .foregroundStyle(palette.inkPrimary)
+                                    .background(palette.surfaceRaised)
+                                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                            .strokeBorder(palette.border, lineWidth: 1)
+                                    )
+                            }
+                            .buttonStyle(VdpiPressButtonStyle())
+                            .disabled(manager.settings.chunkSize >= 64)
+                            .accessibilityLabel("Increase chunk size")
                         }
-                        .fixedSize()
                     }
                     .padding(.horizontal, 14)
                     .padding(.vertical, 10)
@@ -145,42 +187,63 @@ struct SettingsView: View {
                             .font(.system(size: 14, weight: .medium))
                             .foregroundStyle(palette.inkPrimary)
 
-                        TextField("1.1.1.1", text: $dnsDraft)
-                            .font(.system(size: 14, design: .monospaced))
-                            .foregroundStyle(palette.inkPrimary)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled(true)
-                            .keyboardType(.URL)
-                            .submitLabel(.done)
-                            .padding(.horizontal, 12)
-                            .frame(minHeight: 44)
-                            .background(palette.surfaceRaised)
-                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                    .strokeBorder(palette.border, lineWidth: 1)
-                            )
-                            .onSubmit { commitDns() }
-                            .onChange(of: dnsDraft) { newValue in
-                                let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
-                                if !trimmed.isEmpty {
-                                    manager.updateSettings { $0.dnsAddr = trimmed }
-                                }
+                        HStack(spacing: 8) {
+                            TextField("1.1.1.1 or https://dns.google/dns-query", text: $dnsDraft)
+                                .font(.system(size: 14, design: .monospaced))
+                                .foregroundStyle(palette.inkPrimary)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled(true)
+                                .keyboardType(.URL)
+                                .submitLabel(.done)
+                                .focused($focusedField, equals: .dns)
+                                .padding(.horizontal, 12)
+                                .frame(minHeight: 44)
+                                .background(palette.surfaceRaised)
+                                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                        .strokeBorder(
+                                            dnsError != nil
+                                                ? palette.danger
+                                                : (focusedField == .dns ? palette.borderStrong : palette.border),
+                                            lineWidth: 1
+                                        )
+                                )
+                                .onSubmit { commitDns() }
+
+                            Button("Save") {
+                                commitDns()
                             }
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(palette.primaryButtonInk)
+                            .padding(.horizontal, 14)
+                            .frame(minHeight: 44)
+                            .background(palette.primaryButtonBg)
+                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                            .buttonStyle(VdpiPressButtonStyle())
+                        }
+
+                        if let dnsError {
+                            Text(dnsError)
+                                .font(.system(size: 12))
+                                .foregroundStyle(palette.danger)
+                        }
 
                         ScrollView(.horizontal, showsIndicators: false) {
                             HStack(spacing: 8) {
-                                ForEach(dnsPresets, id: \.self) { preset in
-                                    let active = manager.settings.dnsAddr == preset
+                                ForEach(dnsPresets, id: \.value) { preset in
+                                    let active = manager.settings.dnsAddr == preset.value
                                     Button {
-                                        dnsDraft = preset
-                                        manager.updateSettings { $0.dnsAddr = preset }
+                                        focusedField = nil
+                                        dnsError = nil
+                                        dnsDraft = preset.value
+                                        manager.updateSettings { $0.dnsAddr = preset.value }
                                     } label: {
-                                        Text(preset)
+                                        Text("\(preset.label) · \(preset.value)")
                                             .font(.system(size: 12, weight: .medium, design: .monospaced))
                                             .foregroundStyle(active ? palette.primaryButtonInk : palette.inkSecondary)
-                                            .padding(.horizontal, 10)
-                                            .frame(minHeight: 32)
+                                            .padding(.horizontal, 12)
+                                            .frame(minHeight: 44)
                                             .background(active ? palette.primaryButtonBg : palette.surfaceRaised)
                                             .clipShape(Capsule())
                                             .overlay(
@@ -190,7 +253,8 @@ struct SettingsView: View {
                                                 )
                                             )
                                     }
-                                    .buttonStyle(.plain)
+                                    .buttonStyle(VdpiPressButtonStyle())
+                                    .accessibilityAddTraits(active ? .isSelected : [])
                                 }
                             }
                         }
@@ -314,14 +378,14 @@ struct SettingsView: View {
                                         Image(systemName: "xmark")
                                             .font(.system(size: 12, weight: .semibold))
                                             .foregroundStyle(palette.inkMuted)
-                                            .frame(width: 32, height: 32)
+                                            .frame(width: 44, height: 44)
+                                            .contentShape(Rectangle())
                                     }
-                                    .buttonStyle(.plain)
+                                    .buttonStyle(VdpiPressButtonStyle())
                                     .accessibilityLabel("Remove \(domain)")
                                 }
                                 .padding(.leading, 12)
-                                .padding(.trailing, 6)
-                                .padding(.vertical, 4)
+                                .padding(.trailing, 2)
                                 .background(palette.surfaceRaised)
                                 .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
                             }
@@ -347,12 +411,13 @@ struct SettingsView: View {
                             Text(pref.label)
                                 .font(.system(size: 13, weight: selected ? .semibold : .medium))
                                 .frame(maxWidth: .infinity)
-                                .frame(minHeight: 40)
+                                .frame(minHeight: 44)
                                 .foregroundStyle(selected ? palette.primaryButtonInk : palette.inkSecondary)
                                 .background(selected ? palette.primaryButtonBg : palette.surfaceRaised)
                                 .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(VdpiPressButtonStyle())
+                        .accessibilityAddTraits(selected ? .isSelected : [])
                     }
                 }
                 .padding(10)
@@ -377,13 +442,26 @@ struct SettingsView: View {
     }
 
     private func commitDns() {
+        focusedField = nil
         let trimmed = dnsDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        let resolved = trimmed.isEmpty ? "1.1.1.1" : trimmed
-        dnsDraft = resolved
-        manager.updateSettings { $0.dnsAddr = resolved }
+        if trimmed.isEmpty {
+            dnsError = nil
+            dnsDraft = "1.1.1.1"
+            manager.updateSettings { $0.dnsAddr = "1.1.1.1" }
+            return
+        }
+        guard VdpiFormatters.isValidDnsInput(trimmed) else {
+            dnsError = "Enter an IPv4, IPv6, or https:// DoH URL"
+            return
+        }
+        dnsError = nil
+        dnsDraft = trimmed
+        manager.updateSettings { $0.dnsAddr = trimmed }
+        manager.showToast("Updated DNS resolver")
     }
 
     private func addBypassDomain() {
+        focusedField = nil
         guard let normalized = VdpiFormatters.normalizeBypassDomain(bypassDraft) else {
             bypassError = "Enter a valid domain such as example.com or *.example.com"
             return

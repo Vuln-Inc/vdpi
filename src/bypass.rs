@@ -97,6 +97,9 @@ impl BypassPolicy {
                     || (v4.octets()[0] == 100 && (v4.octets()[1] & 0b1100_0000) == 0b0100_0000)
             }
             IpAddr::V6(v6) => {
+                if let Some(mapped_v4) = v6.to_ipv4_mapped() {
+                    return Self::is_non_public_ip(IpAddr::V4(mapped_v4));
+                }
                 v6.is_loopback()
                     || v6.is_unspecified()
                     || (v6.segments()[0] & 0xfe00) == 0xfc00
@@ -113,17 +116,22 @@ impl BypassPolicy {
                 .trim_matches(|c| c == '[' || c == ']')
                 .trim_end_matches('.')
                 .to_ascii_lowercase();
-            if clean.is_empty() {
-                return false;
-            }
-            if let Ok(ip) = clean.parse::<IpAddr>() {
-                return Self::is_non_public_ip(ip);
-            }
-            if self.bypass_regexes.is_match(&clean) {
-                return true;
-            }
-            if let Some(ref include) = self.target_patterns {
-                return !include.is_match(&clean);
+            if !clean.is_empty() {
+                if let Ok(ip) = clean.parse::<IpAddr>() {
+                    if Self::is_non_public_ip(ip) {
+                        return true;
+                    }
+                    if let Some(ref include) = self.target_patterns {
+                        return !include.is_match(&clean);
+                    }
+                    return false;
+                }
+                if self.bypass_regexes.is_match(&clean) {
+                    return true;
+                }
+                if let Some(ref include) = self.target_patterns {
+                    return !include.is_match(&clean);
+                }
             }
         }
 
@@ -131,6 +139,11 @@ impl BypassPolicy {
             if Self::is_non_public_ip(ip) {
                 return true;
             }
+            if let Some(ref include) = self.target_patterns {
+                return !include.is_match(&ip.to_string());
+            }
+        } else if self.target_patterns.is_some() {
+            return true;
         }
 
         false

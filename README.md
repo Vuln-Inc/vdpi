@@ -25,27 +25,27 @@ Download the latest build for your device from **[GitHub Releases](https://githu
 | Platform | Release Asset | Architecture / Requirements | Mode |
 | :--- | :--- | :--- | :--- |
 | **Android** | [`vdpi-android-universal.apk`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-android-universal.apk) | Android 8.0+ (API 26), `arm64-v8a` / `armeabi-v7a` / `x86_64` | Zero-root local `VpnService` + Rust userspace TUN |
-| **Windows** | [`vdpi-windows-x86_64.zip`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-windows-x86_64.zip) | Windows 10 & 11 (`x86_64`) | Native Windows Service + WinINET proxy |
+| **Windows** | [`vdpi-windows-x86_64.zip`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-windows-x86_64.zip) | Windows 10 & 11 (`x86_64`) | Native Windows Service + WinINET + `HTTP_PROXY`/`HTTPS_PROXY` + WinHTTP |
 | **macOS** | [`vdpi-macos-universal.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-macos-universal.tar.gz) | Apple Silicon & Intel (Universal) | `LaunchAgent` + `networksetup` proxy |
 | **Linux** | [`vdpi-linux-x86_64.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-linux-x86_64.tar.gz) / [`vdpi-linux-arm64.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-linux-arm64.tar.gz) | `x86_64` & `arm64` (static `musl`) | `systemd --user` + GNOME / KDE proxy |
-| **iOS** | Build from source (`ios/`) | iOS 16+ (`arm64`) | `NEPacketTunnelProvider` + shared Rust TUN (`VdpiCore.xcframework`) |
+| **iOS / iPadOS** | Build from source (`ios/`); CI publishes `ios-xcframework` artifact (no `.ipa` in Releases) | iOS / iPadOS 16+ (`arm64`) | `NEPacketTunnelProvider` + shared Rust TUN (`VdpiCore.xcframework`) |
 
-> **VPN coexistence note:** On desktop, `vdpi` runs as a pure userspace proxy (`127.0.0.1:8080` / `:1080`) with no kernel drivers, so it coexists alongside WireGuard, Cloudflare WARP, OpenVPN, Mullvad, and ProtonVPN. On Android, `vdpi` uses Android's local `VpnService` API (zero root required), which occupies Android's single active VPN slot.
+> **VPN coexistence note:** On desktop, `vdpi` runs as a pure userspace proxy (`127.0.0.1:8080` / `:1080`) with no kernel drivers, so it coexists alongside WireGuard, Cloudflare WARP, OpenVPN, Mullvad, and ProtonVPN. On **Android** (`VpnService`) and **iOS** (`NEPacketTunnelProvider`), `vdpi` uses the OS's zero-root local VPN API, which occupies the device's single active Personal VPN slot.
 
 ---
 
 ## Android App
 
-`vdpi` for Android runs the exact same Rust 7-stage TLS desync engine and anti-poisoning DoH ring inside an on-device userspace TUN stack (`crates/vdpi-android` + `netstack-smoltcp`) — no root access, no remote VPN servers, and no external traffic relay.
+`vdpi` for Android runs the exact same Rust 7-stage TLS desync engine and anti-poisoning DoH ring inside an on-device userspace TUN stack (`crates/vdpi-tun` + `crates/vdpi-android` + `netstack-smoltcp`) — no root access, no remote VPN servers, and no external traffic relay.
 
 ### Android Capabilities
 
-- **Zero-Root Local TUN Engine:** Captures device traffic locally via `VpnService`, desynchronizes TLS `ClientHello` handshakes in userspace, and relays UDP via a Cone-NAT table for voice and gaming traffic.
-- **Anti-Poisoning DNS & QUIC Fallback:** Intercepts both UDP/53 and RFC 1035 TCP/53 DNS queries through `vdpi`'s multi-provider RFC 8484 DoH ring, and selectively drops QUIC Long-Header Initial packets on UDP/443 so apps cleanly fall back to desynchronized TLS over TCP.
+- **Zero-Root Local TUN Engine:** Captures device traffic locally via `VpnService` (`198.18.0.2/30`, MTU `1400`, DNS `198.18.0.1`), desynchronizes TLS `ClientHello` handshakes in userspace, and relays UDP via a Cone-NAT table for voice and gaming traffic.
+- **Anti-Poisoning DNS, Automatic IPv6 Detection & Clean QUIC Fallback:** Intercepts both UDP/53 and RFC 1035 TCP/53 DNS queries through `vdpi`'s multi-provider RFC 8484 DoH ring, automatically detects whether the underlying Wi-Fi/Cellular interface actually has global unicast IPv6 (`2000::/3`) so IPv4-only networks never blackhole dual-stack sites, and drops all UDP/443 QUIC datagrams (including RFC 9287 greased and short-header frames) for desync-eligible hosts so Chrome and webviews fall back cleanly to HTTP/2 over desynchronized TCP/TLS instead of throwing `ERR_QUIC_PROTOCOL_ERROR`.
 - **Per-App Split Tunneling:** Choose between **Bypass selected** or **Only selected** apps (without requiring `QUERY_ALL_PACKAGES`).
-- **Always-On VPN & Quick Settings Tile:** Supports Android's Always-On VPN setting and a live Quick Settings tile (including lockscreen toggle).
-- **Live Telemetry & In-App Diagnostics:** Real-time 1 Hz counters (active TLS stage, connections, TX/RX bytes, DNS queries, blocked QUIC, active UDP flows), built-in `rustls` TLS 1.3/1.2 connectivity probes, and copyable engine logs.
-- **Modern Native UI:** Jetpack Compose interface with Dark, Light, and System themes, 16 KB page-aligned native libraries, and explicit backup exclusion rules.
+- **Always-On VPN & Quick Settings Tile:** Supports Android's Always-On VPN setting and a live Quick Settings tile (note: do not enable *"Block connections without VPN"* lockdown mode if your device relies on bypass exclusions).
+- **Live Telemetry & In-App Diagnostics:** Real-time 1 Hz counters (active TLS stage, connections, TX/RX bytes, DNS queries, blocked QUIC, active UDP flows), built-in `rustls` TLS 1.3/1.2 connectivity probes, and copyable chronological engine logs.
+- **Modern Native UI:** Jetpack Compose interface with Dark, Light, and System themes, 16 KB page-aligned native libraries, WCAG AA contrast, and explicit backup exclusion rules.
 
 ### Installing on Android
 
@@ -54,8 +54,9 @@ Download the latest build for your device from **[GitHub Releases](https://githu
 3. Tap **Diagnostics** to verify live DoH resolution and TLS bypass checks against your network.
 
 <details>
-<summary>Android notes (signing &amp; OEM battery settings)</summary>
+<summary>Android notes (Private DNS, battery optimization &amp; APK signing)</summary>
 
+- **Private DNS:** If Android's system Private DNS is set to a custom hostname that your ISP blocks, switch Private DNS to *Automatic* or *Off* while using `vdpi` so DNS goes through `vdpi`'s built-in RFC 8484 DoH ring.
 - **Battery optimization:** Some OEMs (Xiaomi/MIUI/HyperOS, Samsung, Oppo, Huawei) aggressively kill background VPN services. Set **vdpi** to *Unrestricted* / *No restrictions* in battery settings if the tunnel stops when the screen turns off.
 - **APK signing:** Release APKs built in CI without repository signing secrets (`VDPI_KEYSTORE_BASE64`, `VDPI_KEYSTORE_PASSWORD`, `VDPI_KEY_ALIAS`, `VDPI_KEY_PASSWORD`) are signed with an ephemeral debug keystore. If a future release switches to a persistent release keystore, uninstall the older APK before installing the new one.
 
@@ -63,19 +64,21 @@ Download the latest build for your device from **[GitHub Releases](https://githu
 
 ---
 
-## iOS App
+## iOS / iPadOS App
 
-`vdpi` for iOS pairs a native SwiftUI app (`VdpiApp`) with a Network Extension (`VdpiPacketTunnel`) powered by the exact same shared Rust TUN engine (`crates/vdpi-tun` + `crates/vdpi-ios` -> `VdpiCore.xcframework`), tuned with a dedicated **Low-Memory profile** to stay well below iOS's 50 MB `NEPacketTunnelProvider` Jetsam ceiling.
+`vdpi` for iOS and iPadOS pairs a native SwiftUI app (`VdpiApp`) with a Network Extension (`VdpiPacketTunnel`) powered by the exact same shared Rust TUN engine (`crates/vdpi-tun` + `crates/vdpi-ios` -> `VdpiCore.xcframework`), tuned with a dedicated **Low-Memory profile** to stay well below iOS's 50 MB `NEPacketTunnelProvider` Jetsam ceiling.
 
 ### iOS Capabilities
 
-- **Shared Rust Userspace TUN Engine:** Uses `NEPacketTunnelFlow` packet bridging (100% public Apple APIs) into `vdpi`'s 7-stage adaptive TLS desync engine, anti-poisoning RFC 8484 DoH ring, selective QUIC Initial fallback, and Cone-NAT UDP relay.
-- **50 MB Jetsam-Safe Memory Profile:** Runs with 2 Tokio workers, bounded 24 KB smoltcp TCP buffers, capped concurrent flows, and Darwin `SO_NOSIGPIPE` protection so background extensions stay rock-solid.
-- **Clean LAN Exclusion & Network Handoff:** Uses RFC 2544 (`198.18.0.0/24`) for the virtual tunnel interface so all RFC 1918 LAN ranges are excluded cleanly, and observes `NWPathMonitor` to flush DNS and TLS caches on Wi-Fi/Cellular switches.
-- **On-Demand VPN & Domain Bypass:** Supports iOS VPN On-Demand (`NEOnDemandRuleConnect`) and custom domain bypass rules.
-- **Live Telemetry, Diagnostics & Logs:** 1 Hz App Group / `NETunnelProviderSession` IPC telemetry, live `rustls` TLS 1.3/1.2 Diagnostics (works even while disconnected), copyable engine logs, and dark/light/system monochrome UI.
+- **Shared Rust Userspace TUN Engine:** Uses `NEPacketTunnelFlow` packet bridging (100% public Apple APIs) into `vdpi`'s 7-stage adaptive TLS desync engine, anti-poisoning RFC 8484 DoH ring, clean UDP/443 QUIC fallback, and Cone-NAT UDP relay.
+- **50 MB Jetsam-Safe & `RLIMIT_NOFILE`-Safe Profile (`LowMemory`):** Runs with 2 Tokio workers, 16 KB `smoltcp` TCP buffers (vs. 64 KB on Android `Standard`), capped concurrent flows (48 TCP / 64 UDP / 24 DNS inflight), drained `autoreleasepool` outbound callbacks, and Darwin `SO_NOSIGPIPE` protection so background extensions stay rock-solid.
+- **Clean RFC 2544 Addressing, LAN Exclusion & Automatic IPv6 Gating:** Uses `198.18.0.2/24` with virtual DNS `198.18.0.1` and distinct remote endpoint `198.19.0.1` (MTU `1400`), excludes all RFC 1918 / loopback / broadcast / link-local / ULA LAN ranges, automatically disables IPv6 tunnel routes on IPv4-only networks via `getifaddrs`, and observes `NWPathMonitor` to flush caches on Wi-Fi/Cellular handoffs.
+- **On-Demand VPN & Domain Bypass:** Supports iOS VPN On-Demand (`NEOnDemandRuleConnect`) and custom domain bypass rules. Note: consumer iOS restricts per-app VPN split-tunneling (`NEAppRule`) to supervised MDM devices, so consumer builds use domain bypass.
+- **Live Telemetry, Diagnostics & Logs:** App Group (`group.com.vulninc.vdpi`) shares settings while `NETunnelProviderSession.sendProviderMessage` IPC handles 1 Hz telemetry, live reloads, cache clears, and in-tunnel `rustls` TLS 1.3/1.2 Diagnostics.
 
-> **Apple Developer signing requirement:** Building `VdpiCore.xcframework` and running XCTests on iOS Simulator work locally or in CI with no paid account. Installing a `NEPacketTunnelProvider` on a physical iPhone requires a paid Apple Developer Program account ($99/yr) to provision the `packet-tunnel-provider` NetworkExtension entitlement.
+> **iOS signing, Simulator & physical-device testing caveats:**
+> - **CI & Simulator:** `VdpiCore.xcframework` builds, unit tests (`VdpiSharedTests`), and unsigned `generic/platform=iOS` Release compilation are verified in GitHub Actions on `macos-latest`. iOS Simulator does **not** execute `NEPacketTunnelProvider` packet routing — live on-device DPI bypass testing requires a physical iPhone/iPad.
+> - **Physical device provisioning:** Installing a `NEPacketTunnelProvider` on a physical iPhone/iPad requires a paid Apple Developer Program account ($99/yr) to provision the `com.apple.developer.networking.networkextension` (`packet-tunnel-provider`) entitlement, and no signed `.ipa` is published to GitHub Releases. Prebuilt `VdpiCore.xcframework.zip` is uploaded as the `ios-xcframework` GitHub Actions artifact.
 
 ---
 
@@ -99,7 +102,9 @@ Open `vdpi.exe` from File Explorer, or run `vdpi` with no arguments in an intera
 - **Install for automatic startup:** Register a background service that runs independently of the launcher window.
 - **Quit:** Leave without starting or saving a preference.
 
-Use **Up/Down** or **Tab** to move, **Enter** to select, and **Esc** to quit (press **1** to run directly or **2** to install; falls back to a numbered prompt when `TERM=dumb`). **Run directly** saves your preference as `run-directly` next to the executable; use `vdpi launcher` to reopen the chooser or `vdpi start` to skip it. Foreground mode does not export user proxy environment variables so apps keep working cleanly after exit.
+Use **Up/Down** or **Tab** to move, **Enter** to select, and **Esc** to quit (press **1** to run directly or **2** to install; falls back to a numbered prompt when `TERM=dumb`). **Run directly** saves your preference as `run-directly` next to the executable; use `vdpi launcher` to reopen the chooser or `vdpi start` to skip it.
+
+> **Windows desktop games & `libcurl` apps (e.g., Roblox):** Browsers (Chrome/Edge) and Discord use Windows WinINET proxy settings, whereas native game clients like `RobloxPlayerBeta.exe` use `libcurl` (which ignores WinINET and reads `HTTP_PROXY`/`HTTPS_PROXY`) or WinHTTP. `vdpi` now leases **both** WinINET and `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` in Windows foreground mode (automatically restoring both when closed, even if the console is killed) and additionally configures WinHTTP in `vdpi install` service mode. If Chrome was **already open** before you started `vdpi` in foreground mode, restart Chrome once so games launched via `roblox-player://` inherit `HTTPS_PROXY` — or run `vdpi install` once so `HTTPS_PROXY` is present from login.
 
 <details>
 <summary>Cleaning up stale proxy settings from older Windows builds</summary>
@@ -168,9 +173,9 @@ vdpi uninstall
 
 | Platform | Binary Path | Startup Service | System Proxy Integration |
 | :--- | :--- | :--- | :--- |
-| **Windows** | `%ProgramFiles%\vdpi\bin\vdpi.exe` (added to System `PATH`) | Native Windows Service (`vdpi`, `AUTO_START`, `Tcpip` dependency, crash auto-restart) | Interactive `HKU` / `HKCU` WinINET Registry + `InternetSetOptionW` + `WM_SETTINGCHANGE` + `WTS_SESSION_LOGON` instant sync |
-| **macOS** | `~/.vdpi/bin/vdpi` (ad-hoc `codesign`, added to shell `PATH`) | `~/Library/LaunchAgents/com.vdpi.plist` (`RunAtLoad` + `KeepAlive`) | `networksetup` (Wi-Fi / Ethernet, VPN-safe) + `launchctl setenv` |
-| **Linux** | `~/.vdpi/bin/vdpi` (static `musl`, symlinked to `~/.local/bin/vdpi`) | `~/.config/systemd/user/vdpi.service` (`systemctl --user`) | GNOME `gsettings` + KDE `kioslaverc` + `systemctl --user set-environment` |
+| **Windows** | `%ProgramFiles%\vdpi\bin\vdpi.exe` (added to System `PATH`) | Native Windows Service (`vdpi`, `AUTO_START`, `Tcpip` dependency, crash auto-restart) | Interactive `HKU` / `HKCU` WinINET Registry + `HTTP_PROXY`/`HTTPS_PROXY` User Env + WinHTTP (`netsh winhttp`) + `WTS_SESSION_LOGON` instant sync |
+| **macOS** | `~/.vdpi/bin/vdpi` (ad-hoc `codesign`, added to shell `PATH`) | `~/Library/LaunchAgents/com.vdpi.plist` (`RunAtLoad` + `KeepAlive`) | `networksetup` (Wi-Fi / Ethernet, VPN-safe) + `launchctl setenv` (`HTTP_PROXY`/`HTTPS_PROXY` unless `--no-env-proxy`) |
+| **Linux** | `~/.vdpi/bin/vdpi` (static `musl`, symlinked to `~/.local/bin/vdpi`) | `~/.config/systemd/user/vdpi.service` (`systemctl --user`) | GNOME `gsettings` + KDE `kioslaverc` + `systemctl --user set-environment` (unless `--no-env-proxy`) |
 
 ---
 
@@ -178,7 +183,7 @@ vdpi uninstall
 
 ### Adaptive 7-Stage TLS Engine
 
-Shared across both desktop and Android, every outbound TLS handshake validates the upstream `ServerHello` (`0x16 0x03`) — rejecting TCP resets, TLS Alerts (`0x15`), and injected ISP block pages — and automatically escalates, caches, and self-heals across networks:
+Shared across desktop, Android, and iOS, every outbound TLS handshake validates the upstream `ServerHello` (`0x16 0x03`) — rejecting TCP resets, TLS Alerts (`0x15`), and injected ISP block pages — and automatically escalates, caches, and self-heals across networks:
 
 | Stage | Strategy | How It Works |
 | :---: | :--- | :--- |
@@ -198,14 +203,14 @@ Shared across both desktop and Android, every outbound TLS handshake validates t
 | :--- | :--- |
 | **Active Inline & Stateful Stream-Reassembling DPI** | 7-Stage wire-paced adaptive TLS engine (`ComboMultiRecord` -> `OobSniDesync` -> `MultiRecordOob` -> `FineFragment` -> `DeepRecordStorm` -> `SlowSniSlice`) with automatic ISP-wide promotion |
 | **Transparent Port-53 DNS Hijacking & Poisoning** | Sticky multi-ASN IP-literal RFC 8484 DoH ring with concurrent failover, negative caching, 30s circuit-breaker to non-port-53 UDP (`1253`, `443`, `5353`), and sinkhole IP rejection |
-| **SNI, HTTP `Host`, IPv6 CNAME & QUIC Filtering** | CNAME-safe IPv4/IPv6 resolution, 3-segment wire-paced HTTP `Host` splitting, and selective QUIC Initial blocking for clean TCP TLS fallback |
-| **Strict CDNs, Banking & Government Portals** | Built-in LAN/government/banking bypass policy (`--bypass` / Android bypass list) + Stage 7 Auto-Heal Passthrough |
+| **SNI, HTTP `Host`, IPv6 CNAME & QUIC Filtering** | CNAME-safe IPv4/IPv6 resolution, automatic mobile IPv6-availability gating, 3-segment wire-paced HTTP `Host` splitting, and full UDP/443 QUIC blocking (RFC 9000 + RFC 9287 greased + short-header) for clean TCP TLS fallback |
+| **Strict CDNs, Banking & Government Portals** | Built-in LAN/government/banking bypass policy (`--bypass` / Android & iOS bypass lists) + Stage 7 Auto-Heal Passthrough |
 
 ---
 
 ## Diagnostics
 
-On **Android**, tap **Diagnostics** from the main Tunnel screen to run live DoH and real `rustls` TLS 1.3/1.2 probes directly through the desync engine, or inspect/copy the live engine event log.
+On **Android** and **iOS**, tap **Diagnostics** from the main Tunnel screen to run live DoH and real `rustls` TLS 1.3/1.2 probes directly through the desync engine, or inspect/copy the live engine event log.
 
 On **Desktop**, run:
 
@@ -335,13 +340,21 @@ Requires macOS with Xcode 16+, `xcodegen` (`brew install xcodegen`), and Rust Ap
 # 1. Cross-compile Rust static libs and package ios/Frameworks/VdpiCore.xcframework
 ./ios/scripts/build-xcframework.sh
 
-# 2. Generate ios/Vdpi.xcodeproj and open in Xcode (or run Simulator tests via xcodebuild)
+# 2. Generate ios/Vdpi.xcodeproj and open in Xcode
 cd ios
 xcodegen generate
 open Vdpi.xcodeproj
+
+# Optional: run unsigned Simulator XCTests and verify generic arm64 Release build from CLI
+xcodebuild test -project Vdpi.xcodeproj -scheme VdpiApp -destination 'platform=iOS Simulator,name=iPhone 16' CODE_SIGN_IDENTITY='-' CODE_SIGNING_REQUIRED=NO DEVELOPMENT_TEAM=''
+xcodebuild build -project Vdpi.xcodeproj -scheme VdpiApp -configuration Release -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO
 ```
 
-Select your Apple Developer Team on both `VdpiApp` and `VdpiPacketTunnel` targets in Xcode (with matching App Group `group.com.vulninc.vdpi` and `Network Extensions -> Packet Tunnel` capabilities) to run on a physical iPhone.
+To sign and install on your own physical iPhone/iPad with your own paid Apple Developer Team, replace the bundle IDs (`com.vulninc.vdpi`, `com.vulninc.vdpi.packet-tunnel`) and App Group (`group.com.vulninc.vdpi`) with your own unique identifiers across all four locations before running `xcodegen generate`:
+1. `ios/project.yml` (`bundleIdPrefix` and both `PRODUCT_BUNDLE_IDENTIFIER` values)
+2. `ios/VdpiApp/VdpiApp.entitlements` (`com.apple.security.application-groups`)
+3. `ios/PacketTunnel/PacketTunnel.entitlements` (`com.apple.security.application-groups`)
+4. `ios/Shared/VdpiAppGroup.swift` (`suiteName` and `extensionBundleId`)
 
 <details>
 <summary>Repository layout</summary>

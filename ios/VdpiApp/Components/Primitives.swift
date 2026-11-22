@@ -28,6 +28,15 @@ struct HairlineRule: View {
     }
 }
 
+struct VdpiPressButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.985 : 1.0)
+            .opacity(configuration.isPressed ? 0.88 : 1.0)
+            .animation(.spring(response: 0.22, dampingFraction: 0.78), value: configuration.isPressed)
+    }
+}
+
 struct SectionOverline: View {
     @Environment(\.vdpiPalette) private var palette
     let title: String
@@ -37,9 +46,11 @@ struct SectionOverline: View {
             .font(.system(size: 11, weight: .semibold, design: .monospaced))
             .tracking(0.9)
             .foregroundStyle(palette.inkMuted)
+            .accessibilityAddTraits(.isHeader)
     }
 }
 
+/// Signature fractured-V geometric brand emblem matching the Android app.
 struct VdpiBrandMark: View {
     @Environment(\.vdpiPalette) private var palette
 
@@ -53,9 +64,37 @@ struct VdpiBrandMark: View {
                 )
                 .frame(width: 30, height: 30)
 
-            Image(systemName: "waveform.path.ecg")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(palette.inkPrimary)
+            Canvas { ctx, size in
+                let w = size.width
+                let h = size.height
+                // Left V stroke (solid)
+                var left = Path()
+                left.move(to: CGPoint(x: w * 0.22, y: h * 0.26))
+                left.addLine(to: CGPoint(x: w * 0.48, y: h * 0.74))
+                ctx.stroke(
+                    left,
+                    with: .color(palette.inkPrimary),
+                    style: StrokeStyle(lineWidth: 2.3, lineCap: .round)
+                )
+                // Right V stroke (fractured into 2 desynced segments)
+                var rightBottom = Path()
+                rightBottom.move(to: CGPoint(x: w * 0.50, y: h * 0.74))
+                rightBottom.addLine(to: CGPoint(x: w * 0.62, y: h * 0.52))
+                ctx.stroke(
+                    rightBottom,
+                    with: .color(palette.inkPrimary),
+                    style: StrokeStyle(lineWidth: 2.3, lineCap: .round)
+                )
+                var rightTop = Path()
+                rightTop.move(to: CGPoint(x: w * 0.69, y: h * 0.39))
+                rightTop.addLine(to: CGPoint(x: w * 0.78, y: h * 0.26))
+                ctx.stroke(
+                    rightTop,
+                    with: .color(palette.signal),
+                    style: StrokeStyle(lineWidth: 2.3, lineCap: .round)
+                )
+            }
+            .frame(width: 22, height: 22)
         }
         .accessibilityHidden(true)
     }
@@ -94,7 +133,7 @@ struct PrimaryActionButton: View {
                     )
             )
         }
-        .buttonStyle(.plain)
+        .buttonStyle(VdpiPressButtonStyle())
         .disabled(isLoading)
     }
 }
@@ -125,7 +164,7 @@ struct GhostActionButton: View {
                     .strokeBorder(palette.border, lineWidth: 1)
             )
         }
-        .buttonStyle(.plain)
+        .buttonStyle(VdpiPressButtonStyle())
     }
 }
 
@@ -157,6 +196,8 @@ struct MetricTile: View {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .strokeBorder(palette.border, lineWidth: 1)
         )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(label): \(value)")
     }
 }
 

@@ -42,8 +42,11 @@ final class TunnelManager: ObservableObject {
     private var vpnManager: NETunnelProviderManager?
     private var appliedSettings: VdpiSettings?
     private var statusObserver: NSObjectProtocol?
+    private var loadTask: Task<Void, Never>?
+    private var lifecycleTask: Task<Void, Never>?
     private var telemetryTask: Task<Void, Never>?
     private var toastTask: Task<Void, Never>?
+    private var isReloading: Bool = false
     private var isSceneActive: Bool = true
 
     init() {
@@ -51,7 +54,7 @@ final class TunnelManager: ObservableObject {
         self.settings = loaded
         self.engineVersion = VdpiNativeBridge.version()
         observeVpnStatus()
-        Task {
+        loadTask = Task {
             await loadOrCreateManager()
         }
     }
@@ -60,6 +63,8 @@ final class TunnelManager: ObservableObject {
         if let observer = statusObserver {
             NotificationCenter.default.removeObserver(observer)
         }
+        loadTask?.cancel()
+        lifecycleTask?.cancel()
         telemetryTask?.cancel()
         toastTask?.cancel()
     }
@@ -114,35 +119,60 @@ final class TunnelManager: ObservableObject {
     }
 
     func connect() {
+        lifecycleTask?.cancel()
         errorMessage = nil
         phase = .connecting
-        VdpiAppGroup.saveSettings(settings)
+        let target = settings
+        VdpiAppGroup.saveSettings(target)
 
-        Task {
+        lifecycleTask = Task {
+            await loadTask?.value
+            guard !Task.isCancelled else { return }
             do {
-                let manager = try await ensureConfiguredManager()
-                appliedSettings = settings
-                pendingReconnect = false
+                let manager = try await ensureConfiguredManager(for: target)
+                guard !Task.isCancelled else { return }
+                appliedSettings = target
+                pendingReconnect = settings.requiresTunnelReload(comparedTo: target)
                 try manager.connection.startVPNTunnel()
                 triggerHaptic(.medium)
             } catch {
+                guard !Task.isCancelled else { return }
                 phase = .error
                 errorMessage = error.localizedDescription
-                triggerHaptic(.rigid)
+                triggerNotificationHaptic(.error)
             }
         }
     }
 
     func disconnect() {
+        lifecycleTask?.cancel()
         errorMessage = nil
         pendingReconnect = false
+
+        guard let manager = vpnManager else {
+            phase = .disconnected
+            return
+        }
+
         phase = .disconnecting
-        vpnManager?.connection.stopVPNTunnel()
         triggerHaptic(.light)
+
+        // Disable On-Demand before stopping so an explicit user disconnect is not
+        // immediately overridden by NEOnDemandRuleConnect on the next packet.
+        lifecycleTask = Task {
+            if manager.isOnDemandEnabled {
+                manager.isOnDemandEnabled = false
+                try? await manager.saveToPreferences()
+                try? await manager.loadFromPreferences()
+            }
+            manager.connection.stopVPNTunnel()
+        }
     }
 
     func applyChangesLive() {
-        VdpiAppGroup.saveSettings(settings)
+        guard !isReloading else { return }
+        let target = settings
+        VdpiAppGroup.saveSettings(target)
         guard phase == .connected,
               let session = vpnManager?.connection as? NETunnelProviderSession
         else {
@@ -150,14 +180,17 @@ final class TunnelManager: ObservableObject {
             return
         }
 
+        isReloading = true
         Task {
-            let reply = await sendMessage(.reloadEngine, via: session)
-            if let reply,
-               let text = String(data: reply, encoding: .utf8),
-               text.contains("\"ok\":true")
+            defer { isReloading = false }
+            let replyData = await sendMessage(.reloadEngine, via: session)
+            if let replyData,
+               let response = ProviderCommandResponse.decodeData(replyData),
+               response.ok
             {
-                appliedSettings = settings
-                pendingReconnect = false
+                appliedSettings = target
+                pendingReconnect = settings.requiresTunnelReload(comparedTo: target)
+                triggerNotificationHaptic(.success)
                 showToast("Applied updated settings")
                 await fetchTelemetryOnce()
             } else {
@@ -174,13 +207,18 @@ final class TunnelManager: ObservableObject {
            let session = vpnManager?.connection as? NETunnelProviderSession
         {
             Task {
-                _ = await sendMessage(.clearCache, via: session)
-                showToast("Cleared TLS & DNS caches")
-                await fetchTelemetryOnce()
+                if let data = await sendMessage(.clearCache, via: session),
+                   let res = ProviderCommandResponse.decodeData(data),
+                   res.ok
+                {
+                    showToast("Cleared TLS & DNS caches")
+                    await fetchTelemetryOnce()
+                } else {
+                    showToast("Could not reach tunnel extension")
+                }
             }
         } else {
-            VdpiNativeBridge.clearCache()
-            showToast("Cleared local caches")
+            showToast("Cache resets automatically when disconnected")
         }
     }
 
@@ -188,13 +226,22 @@ final class TunnelManager: ObservableObject {
         guard !doctorState.running else { return }
         doctorState = DoctorUiState(running: true, report: nil, error: nil)
         let configJson = settings.toNativeConfigJSON()
+        let wasConnected = (phase == .connected)
 
         Task {
-            if phase == .connected,
-               let session = vpnManager?.connection as? NETunnelProviderSession,
-               let data = await sendMessage(.runDoctor(configJson: configJson), via: session),
-               let report = try? JSONDecoder().decode(DoctorReport.self, from: data)
-            {
+            if wasConnected {
+                guard let session = vpnManager?.connection as? NETunnelProviderSession,
+                      let data = await sendMessage(.runDoctor(configJson: configJson), via: session),
+                      let report = try? JSONDecoder().decode(DoctorReport.self, from: data),
+                      !report.checks.isEmpty
+                else {
+                    doctorState = DoctorUiState(
+                        running: false,
+                        report: nil,
+                        error: "Diagnostics timed out or the tunnel extension did not respond."
+                    )
+                    return
+                }
                 doctorState = DoctorUiState(running: false, report: report, error: nil)
                 return
             }
@@ -202,7 +249,15 @@ final class TunnelManager: ObservableObject {
             let report = await Task.detached(priority: .userInitiated) {
                 VdpiNativeBridge.runDoctor(configJson: configJson)
             }.value
-            doctorState = DoctorUiState(running: false, report: report, error: nil)
+            if report.checks.isEmpty {
+                doctorState = DoctorUiState(
+                    running: false,
+                    report: nil,
+                    error: "Native diagnostics returned no probe results."
+                )
+            } else {
+                doctorState = DoctorUiState(running: false, report: report, error: nil)
+            }
         }
     }
 
@@ -226,7 +281,7 @@ final class TunnelManager: ObservableObject {
         ) { [weak self] notification in
             guard let connection = notification.object as? NEVPNConnection else { return }
             let status = connection.status
-            Task { @MainActor [weak self] in
+            MainActor.assumeIsolated {
                 guard let self, connection === self.vpnManager?.connection else { return }
                 self.syncStatus(status)
             }
@@ -251,7 +306,7 @@ final class TunnelManager: ObservableObject {
         }
     }
 
-    private func ensureConfiguredManager() async throws -> NETunnelProviderManager {
+    private func ensureConfiguredManager(for target: VdpiSettings) async throws -> NETunnelProviderManager {
         let manager: NETunnelProviderManager
         if let existing = vpnManager {
             manager = existing
@@ -275,7 +330,7 @@ final class TunnelManager: ObservableObject {
         manager.protocolConfiguration = proto
         manager.localizedDescription = "vdpi"
         manager.isEnabled = true
-        applyOnDemandRules(to: manager, enabled: settings.onDemandEnabled)
+        applyOnDemandRules(to: manager, enabled: target.onDemandEnabled)
 
         try await manager.saveToPreferences()
         try await manager.loadFromPreferences()
@@ -284,9 +339,12 @@ final class TunnelManager: ObservableObject {
     }
 
     private func syncOnDemandPreference() async {
+        await loadTask?.value
         guard let manager = vpnManager else { return }
+        try? await manager.loadFromPreferences()
         applyOnDemandRules(to: manager, enabled: settings.onDemandEnabled)
         try? await manager.saveToPreferences()
+        try? await manager.loadFromPreferences()
     }
 
     private func applyOnDemandRules(to manager: NETunnelProviderManager, enabled: Bool) {
@@ -359,11 +417,17 @@ final class TunnelManager: ObservableObject {
     }
 
     private func fetchTelemetryOnce() async {
-        guard let session = vpnManager?.connection as? NETunnelProviderSession else { return }
+        guard phase == .connected,
+              let session = vpnManager?.connection as? NETunnelProviderSession
+        else { return }
         guard let data = await sendMessage(.snapshot, via: session),
+              !Task.isCancelled,
+              phase == .connected,
               let decoded = try? JSONDecoder().decode(TelemetrySnapshot.self, from: data)
         else { return }
-        telemetry = decoded
+        if telemetry != decoded {
+            telemetry = decoded
+        }
     }
 
     private func sendMessage(
@@ -384,6 +448,13 @@ final class TunnelManager: ObservableObject {
 
     private func triggerHaptic(_ style: UIImpactFeedbackGenerator.FeedbackStyle) {
         let generator = UIImpactFeedbackGenerator(style: style)
+        generator.prepare()
         generator.impactOccurred()
+    }
+
+    private func triggerNotificationHaptic(_ type: UINotificationFeedbackGenerator.FeedbackType) {
+        let generator = UINotificationFeedbackGenerator()
+        generator.prepare()
+        generator.notificationOccurred(type)
     }
 }

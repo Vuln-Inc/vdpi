@@ -60,7 +60,7 @@ pub unsafe extern "C" fn vdpi_ios_start(
 /// - `data` must point to at least `len` readable bytes when `len > 0`.
 #[no_mangle]
 pub unsafe extern "C" fn vdpi_ios_push_packet(data: *const u8, len: usize) -> bool {
-    if data.is_null() || len < 20 {
+    if data.is_null() || !(20..=65535).contains(&len) {
         return false;
     }
     catch_unwind(AssertUnwindSafe(|| {

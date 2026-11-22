@@ -1,10 +1,10 @@
 [package]
 name = "vdpi-android"
-version = "0.3.0"
-edition = "2021"
-authors = ["Vuln-Inc"]
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
 description = "Android TUN + JNI anti-DPI tunnel engine powered by vdpi"
-license = "MIT"
+license.workspace = true
 
 [lib]
 name = "vdpi_android"

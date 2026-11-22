@@ -68,22 +68,55 @@ final class VdpiSharedTests: XCTestCase {
         XCTAssertEqual(VdpiFormatters.formatStageShort(stageNumber: 5, label: "DeepRecordStorm"), "S5 · DeepRecordStorm")
 
         XCTAssertEqual(VdpiFormatters.normalizeBypassDomain("  HTTPS://Discord.COM/app "), "discord.com")
+        XCTAssertEqual(VdpiFormatters.normalizeBypassDomain("*.MyBank.com:443."), "*.mybank.com")
         XCTAssertEqual(VdpiFormatters.normalizeBypassDomain("*.bank.gov.tr"), "*.bank.gov.tr")
         XCTAssertNil(VdpiFormatters.normalizeBypassDomain("not-a-domain"))
         XCTAssertNil(VdpiFormatters.normalizeBypassDomain("   "))
+
+        XCTAssertTrue(VdpiFormatters.isValidDnsInput("1.1.1.1"))
+        XCTAssertTrue(VdpiFormatters.isValidDnsInput("2606:4700:4700::1111"))
+        XCTAssertTrue(VdpiFormatters.isValidDnsInput("https://dns.google/dns-query"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("not-a-dns"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("http://insecure.example/dns-query"))
     }
 
     func testTunnelNetworkSettingsExcludeLanAndHonorIpv4Only() {
-        let dualStack = TunnelNetworkSettingsBuilder.build(settings: VdpiSettings(ipv4Only: false, mtu: 1450))
+        XCTAssertNotEqual(
+            TunnelNetworkSettingsBuilder.tunnelRemoteAddress,
+            TunnelNetworkSettingsBuilder.tunnelDnsServer
+        )
+
+        let dualStack = TunnelNetworkSettingsBuilder.build(
+            settings: VdpiSettings(ipv4Only: false, mtu: 1450),
+            effectiveIpv4Only: false
+        )
         XCTAssertEqual(dualStack.mtu, 1450)
-        XCTAssertEqual(dualStack.dnsSettings?.servers, [TunnelNetworkSettingsBuilder.tunnelDnsServer])
+        XCTAssertEqual(
+            dualStack.dnsSettings?.servers,
+            [TunnelNetworkSettingsBuilder.tunnelDnsServer, TunnelNetworkSettingsBuilder.tunnelIpv6DnsServer]
+        )
         XCTAssertNotNil(dualStack.ipv4Settings)
         XCTAssertNotNil(dualStack.ipv6Settings)
-        XCTAssertGreaterThanOrEqual(dualStack.ipv4Settings?.excludedRoutes?.count ?? 0, 6)
+        XCTAssertGreaterThanOrEqual(dualStack.ipv4Settings?.excludedRoutes?.count ?? 0, 8)
 
-        let v4Only = TunnelNetworkSettingsBuilder.build(settings: VdpiSettings(ipv4Only: true))
+        let v4Only = TunnelNetworkSettingsBuilder.build(
+            settings: VdpiSettings(ipv4Only: true),
+            effectiveIpv4Only: true
+        )
         XCTAssertNotNil(v4Only.ipv4Settings)
         XCTAssertNil(v4Only.ipv6Settings)
+        XCTAssertEqual(v4Only.dnsSettings?.servers, [TunnelNetworkSettingsBuilder.tunnelDnsServer])
+    }
+
+    func testPartialFallbackTelemetryJsonAndCommandResponseDecode() throws {
+        let minimal = try XCTUnwrap("{\"running\":false}".data(using: .utf8))
+        let decoded = try JSONDecoder().decode(TelemetrySnapshot.self, from: minimal)
+        XCTAssertFalse(decoded.running)
+        XCTAssertEqual(decoded.dnsAddr, "1.1.1.1")
+
+        let reply = ProviderCommandResponse(ok: false, error: "quoted \"error\"\nline2")
+        let encoded = try XCTUnwrap(reply.encodeData())
+        XCTAssertEqual(ProviderCommandResponse.decodeData(encoded), reply)
     }
 
     func testNativeRustBridgeLinksAndReturnsVersionAndIdleSnapshot() {

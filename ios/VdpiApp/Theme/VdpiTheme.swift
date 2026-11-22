@@ -37,8 +37,8 @@ public struct VdpiPalette: Equatable, Sendable {
         signalBorder: Color(hex: 0x10B981, alpha: 0.34),
         warning: Color(hex: 0xF59E0B),
         warningTint: Color(hex: 0xF59E0B, alpha: 0.12),
-        danger: Color(hex: 0xEF4444),
-        dangerTint: Color(hex: 0xEF4444, alpha: 0.12)
+        danger: Color(hex: 0xF87171),
+        dangerTint: Color(hex: 0xF87171, alpha: 0.14)
     )
 
     public static let light = VdpiPalette(
@@ -46,8 +46,8 @@ public struct VdpiPalette: Equatable, Sendable {
         canvas: Color(hex: 0xFAFAFA),
         surface: Color(hex: 0xFFFFFF),
         surfaceRaised: Color(hex: 0xF4F4F5),
-        border: Color(hex: 0xE4E4E7),
-        borderStrong: Color(hex: 0xD4D4D8),
+        border: Color(hex: 0xD4D4D8),
+        borderStrong: Color(hex: 0xA1A1AA),
         inkPrimary: Color(hex: 0x09090B),
         inkSecondary: Color(hex: 0x52525B),
         inkMuted: Color(hex: 0x5C5C66),
@@ -55,11 +55,11 @@ public struct VdpiPalette: Equatable, Sendable {
         primaryButtonInk: Color(hex: 0xFAFAFA),
         signal: Color(hex: 0x047857),
         signalTint: Color(hex: 0x047857, alpha: 0.09),
-        signalBorder: Color(hex: 0x047857, alpha: 0.30),
+        signalBorder: Color(hex: 0x047857, alpha: 0.34),
         warning: Color(hex: 0x9A3412),
         warningTint: Color(hex: 0x9A3412, alpha: 0.10),
-        danger: Color(hex: 0xDC2626),
-        dangerTint: Color(hex: 0xDC2626, alpha: 0.09)
+        danger: Color(hex: 0xB91C1C),
+        dangerTint: Color(hex: 0xB91C1C, alpha: 0.10)
     )
 
     public static func resolve(

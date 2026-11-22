@@ -52,7 +52,7 @@ pub async fn handle_socks5_client(mut client: TcpStream, ctx: EngineContext) -> 
         CMD_UDP_ASSOCIATE => {
             let bind_ip = client
                 .local_addr()
-                .map(|a| a.ip())
+                .map(|a| normalize_ip(a.ip()))
                 .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
             let client_udp = Arc::new(UdpSocket::bind(SocketAddr::new(bind_ip, 0)).await?);
             let relay_local_addr = client_udp.local_addr()?;
@@ -145,13 +145,31 @@ async fn read_socks4_request(client: &mut TcpStream) -> Result<(String, Option<S
     Ok((host, known_domain, port))
 }
 
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
+    }
+}
+
 async fn run_udp_associate_session(
     mut tcp_control: TcpStream,
     client_udp: Arc<UdpSocket>,
     ctx: EngineContext,
 ) -> Result<()> {
+    let expected_client_ip = tcp_control.peer_addr().ok().map(|a| normalize_ip(a.ip()));
     let outbound_v4 = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
     let outbound_v6 = UdpSocket::bind("[::]:0").await.ok().map(Arc::new);
+    let own_ports: Vec<u16> = [
+        client_udp.local_addr().ok().map(|a| a.port()),
+        outbound_v4.local_addr().ok().map(|a| a.port()),
+        outbound_v6
+            .as_ref()
+            .and_then(|s| s.local_addr().ok().map(|a| a.port())),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
 
     let last_client_peer: Arc<tokio::sync::RwLock<Option<SocketAddr>>> =
         Arc::new(tokio::sync::RwLock::new(None));
@@ -166,6 +184,11 @@ async fn run_udp_associate_session(
         let mut buf = vec![0u8; 65535];
         loop {
             let (n, src_peer) = c2r_client_udp.recv_from(&mut buf).await?;
+            if let Some(expected_ip) = expected_client_ip {
+                if normalize_ip(src_peer.ip()) != expected_ip {
+                    continue;
+                }
+            }
             {
                 let mut guard = c2r_peer.write().await;
                 *guard = Some(src_peer);
@@ -175,12 +198,16 @@ async fn run_udp_associate_session(
             else {
                 continue;
             };
+            if dst_port == 0 {
+                continue;
+            }
 
-            // If QUIC blocking is enabled, drop QUIC Initial UDP/443 packets for non-bypassed
-            // targets so applications immediately fall back to DPI-bypassed TCP/443 TLS.
+            // If QUIC blocking is enabled, drop all UDP/443 datagrams (including RFC 9287
+            // greased and short-header QUIC) for non-bypassed targets so applications cleanly
+            // fall back to DPI-bypassed TCP/443 TLS.
             if c2r_ctx.config.block_quic
                 && dst_port == 443
-                && payload.len() >= 1100
+                && !payload.is_empty()
                 && c2r_ctx.bypass.should_desync(
                     if is_domain {
                         Some(dst_host.as_str())
@@ -200,10 +227,17 @@ async fn run_udp_associate_session(
             let target_ip = ips
                 .iter()
                 .copied()
+                .map(normalize_ip)
                 .find(|ip| ip.is_ipv4() || c2r_out_v6.is_some());
             let Some(target_ip) = target_ip else {
                 continue;
             };
+            // Reject unspecified targets and self-reflection back into our own UDP relay sockets.
+            if target_ip.is_unspecified()
+                || (target_ip.is_loopback() && own_ports.contains(&dst_port))
+            {
+                continue;
+            }
             let dst_sa = SocketAddr::new(target_ip, dst_port);
 
             match dst_sa {

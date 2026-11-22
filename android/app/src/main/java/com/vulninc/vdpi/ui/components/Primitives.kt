@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
@@ -201,33 +202,40 @@ fun PrecisionSwitch(
     )
 
     val interactiveModifier = if (onCheckedChange != null) {
-        modifier.clickable(
-            interactionSource = remember { MutableInteractionSource() },
-            indication = null,
-            role = Role.Switch,
-        ) {
-            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-            onCheckedChange(!checked)
-        }
+        modifier
+            .defaultMinSize(minWidth = 48.dp, minHeight = 48.dp)
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                role = Role.Switch,
+            ) {
+                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                onCheckedChange(!checked)
+            }
     } else {
         modifier
     }
 
     Box(
-        modifier = interactiveModifier
-            .size(width = 44.dp, height = 26.dp)
-            .clip(CircleShape)
-            .background(trackColor)
-            .border(1.dp, borderColor, CircleShape),
-        contentAlignment = Alignment.CenterStart,
+        modifier = interactiveModifier,
+        contentAlignment = Alignment.Center,
     ) {
         Box(
             modifier = Modifier
-                .offset { IntOffset(thumbOffset.roundToPx(), 0) }
-                .size(20.dp)
+                .size(width = 44.dp, height = 26.dp)
                 .clip(CircleShape)
-                .background(thumbColor),
-        )
+                .background(trackColor)
+                .border(1.dp, borderColor, CircleShape),
+            contentAlignment = Alignment.CenterStart,
+        ) {
+            Box(
+                modifier = Modifier
+                    .offset { IntOffset(thumbOffset.roundToPx(), 0) }
+                    .size(20.dp)
+                    .clip(CircleShape)
+                    .background(thumbColor),
+            )
+        }
     }
 }
 
@@ -272,7 +280,7 @@ fun <T> SegmentedControl(
                     .clip(itemShape)
                     .background(itemBg)
                     .border(
-                        width = if (isSelected) 1.dp else 0.dp,
+                        width = 1.dp,
                         color = itemBorder,
                         shape = itemShape,
                     )

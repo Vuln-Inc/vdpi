@@ -61,29 +61,36 @@ pub async fn run_doctor(cfg: &TunnelConfig) -> DoctorReport {
         }
     };
 
-    // 1. Anti-poisoning DoH / DNS ring check
+    // 1. Anti-poisoning DoH / DNS ring check (bounded timeout so offline networks never stall)
     let dns_start = Instant::now();
-    let dns_check = match ctx.dns.resolve("discord.com").await {
-        Ok(ips) if !ips.is_empty() => DoctorCheck {
+    let dns_check = match tokio::time::timeout(Duration::from_secs(8), ctx.dns.resolve("discord.com")).await {
+        Ok(Ok(ips)) if !ips.is_empty() => DoctorCheck {
             name: "DNS Ring".into(),
             target: format!("{} -> discord.com", ctx.config.dns_addr),
             passed: true,
             latency_ms: dns_start.elapsed().as_millis() as u64,
             detail: format!("resolved {} ({} records)", ips[0], ips.len()),
         },
-        Ok(_) => DoctorCheck {
+        Ok(Ok(_)) => DoctorCheck {
             name: "DNS Ring".into(),
             target: format!("{} -> discord.com", ctx.config.dns_addr),
             passed: false,
             latency_ms: dns_start.elapsed().as_millis() as u64,
             detail: "no usable IP records returned".into(),
         },
-        Err(e) => DoctorCheck {
+        Ok(Err(e)) => DoctorCheck {
             name: "DNS Ring".into(),
             target: format!("{} -> discord.com", ctx.config.dns_addr),
             passed: false,
             latency_ms: dns_start.elapsed().as_millis() as u64,
             detail: e.to_string(),
+        },
+        Err(_) => DoctorCheck {
+            name: "DNS Ring".into(),
+            target: format!("{} -> discord.com", ctx.config.dns_addr),
+            passed: false,
+            latency_ms: dns_start.elapsed().as_millis() as u64,
+            detail: "DNS resolution timed out (8s)".into(),
         },
     };
 
@@ -109,15 +116,29 @@ async fn probe_tls_target(
     let start = Instant::now();
     let target = format!("{host}:{port}");
 
-    let (remote, remote_addr) = match ctx.connect_target(host, port).await {
-        Ok(pair) => pair,
-        Err(e) => {
+    let (remote, remote_addr) = match tokio::time::timeout(
+        Duration::from_secs(10),
+        ctx.connect_target(host, port),
+    )
+    .await
+    {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => {
             return DoctorCheck {
                 name: name.into(),
                 target,
                 passed: false,
                 latency_ms: start.elapsed().as_millis() as u64,
                 detail: format!("connect failed: {e}"),
+            };
+        }
+        Err(_) => {
+            return DoctorCheck {
+                name: name.into(),
+                target,
+                passed: false,
+                latency_ms: start.elapsed().as_millis() as u64,
+                detail: "TCP connect timed out (10s)".into(),
             };
         }
     };
@@ -186,6 +207,7 @@ async fn probe_connected_tls_target(
 
     drop(client_side);
     relay_task.abort();
+    let _ = relay_task.await;
 
     let latency_ms = start.elapsed().as_millis() as u64;
     match read_res {

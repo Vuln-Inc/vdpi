@@ -1,11 +1,15 @@
 /target
+dist/
 Cargo.lock.bak
 .DS_Store
 *.swp
 *.log
+.idea/
+.vscode/
 
 # Android build outputs
 android/.gradle/
+android/.kotlin/
 android/build/
 android/app/build/
 android/local.properties
@@ -20,4 +24,9 @@ ios/Vdpi.xcodeproj/
 ios/Frameworks/
 *.ipa
 *.xcarchive
+*.p12
+*.mobileprovision
+*.cer
+*.xcuserstate
+*.dSYM
 DerivedData/

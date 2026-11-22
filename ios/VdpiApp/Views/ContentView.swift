@@ -32,14 +32,17 @@ struct ContentView: View {
                 .ignoresSafeArea()
 
             VStack(spacing: 0) {
-                Group {
-                    switch selectedTab {
-                    case .tunnel:
-                        TunnelView()
-                    case .settings:
-                        SettingsView()
-                    }
+                ZStack {
+                    TunnelView()
+                        .opacity(selectedTab == .tunnel ? 1 : 0)
+                        .allowsHitTesting(selectedTab == .tunnel)
+                        .accessibilityHidden(selectedTab != .tunnel)
+                    SettingsView()
+                        .opacity(selectedTab == .settings ? 1 : 0)
+                        .allowsHitTesting(selectedTab == .settings)
+                        .accessibilityHidden(selectedTab != .settings)
                 }
+                .frame(maxWidth: 680, maxHeight: .infinity)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
                 HairlineRule()
@@ -73,24 +76,30 @@ struct ContentView: View {
                                     )
                             )
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(VdpiPressButtonStyle())
+                        .accessibilityAddTraits(isSelected ? .isSelected : [])
                     }
                 }
+                .frame(maxWidth: 680)
                 .padding(.horizontal, 16)
                 .padding(.top, 10)
                 .padding(.bottom, 10)
+                .frame(maxWidth: .infinity)
                 .background(palette.surface)
             }
+            .ignoresSafeArea(.keyboard, edges: .bottom)
 
             if let toast = manager.toastMessage {
                 Text(toast)
                     .font(.system(size: 13, weight: .medium))
+                    .multilineTextAlignment(.center)
                     .foregroundStyle(palette.primaryButtonInk)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 10)
                     .background(palette.primaryButtonBg)
                     .clipShape(Capsule())
                     .shadow(color: Color.black.opacity(0.25), radius: 10, y: 4)
+                    .padding(.horizontal, 20)
                     .padding(.bottom, 76)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }

@@ -41,3 +41,22 @@ public enum ProviderMessage: Codable, Equatable, Sendable {
         try? JSONDecoder().decode(ProviderMessage.self, from: data)
     }
 }
+
+/// JSON-encoded reply returned by `PacketTunnelProvider` for control IPC commands.
+public struct ProviderCommandResponse: Codable, Equatable, Sendable {
+    public var ok: Bool
+    public var error: String?
+
+    public init(ok: Bool, error: String? = nil) {
+        self.ok = ok
+        self.error = error
+    }
+
+    public func encodeData() -> Data? {
+        try? JSONEncoder().encode(self)
+    }
+
+    public static func decodeData(_ data: Data) -> ProviderCommandResponse? {
+        try? JSONDecoder().decode(ProviderCommandResponse.self, from: data)
+    }
+}

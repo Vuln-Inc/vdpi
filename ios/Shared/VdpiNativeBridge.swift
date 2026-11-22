@@ -69,6 +69,9 @@ public enum VdpiNativeBridge {
     }
 
     public static func version() -> String {
-        takeOwnedString(vdpi_ios_version()) ?? "0.3.0"
+        if let native = takeOwnedString(vdpi_ios_version()), !native.isEmpty {
+            return native
+        }
+        return (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "0.0.0"
     }
 }

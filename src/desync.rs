@@ -1113,14 +1113,21 @@ async fn write_multi_record_oob(
 async fn send_with_oob(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
     use tokio::io::Interest;
 
-    let mut sent = 0usize;
-    while sent < data.len() {
+    if data.is_empty() {
+        return Ok(());
+    }
+    // Write everything except the final urgent byte as normal TCP payload so a partial
+    // write never emits duplicate TCP URG pointers or drops payload bytes mid-ClientHello.
+    if data.len() > 1 {
+        stream.write_all(&data[..data.len() - 1]).await?;
+    }
+    let oob_byte = &data[data.len() - 1..];
+    loop {
         stream.writable().await?;
-        let slice = &data[sent..];
-        let res = stream.try_io(Interest::WRITABLE, || raw_send_oob(stream, slice));
+        let res = stream.try_io(Interest::WRITABLE, || raw_send_oob(stream, oob_byte));
         match res {
             Ok(0) => bail!("peer closed connection during MSG_OOB send"),
-            Ok(n) => sent += n,
+            Ok(_) => return Ok(()),
             Err(ref e)
                 if matches!(
                     e.kind(),
@@ -1132,7 +1139,6 @@ async fn send_with_oob(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
             Err(e) => return Err(e.into()),
         }
     }
-    Ok(())
 }
 
 #[cfg(target_vendor = "apple")]

@@ -66,6 +66,8 @@ struct TunnelView: View {
                     standbyProfileSection
                 }
             }
+            .animation(.easeInOut(duration: 0.2), value: manager.phase)
+            .animation(.easeInOut(duration: 0.2), value: manager.pendingReconnect)
             .padding(.horizontal, 16)
             .padding(.top, 16)
             .padding(.bottom, 24)
@@ -75,6 +77,7 @@ struct TunnelView: View {
             DiagnosticsSheet()
                 .environmentObject(manager)
                 .environment(\.vdpiPalette, palette)
+                .preferredColorScheme(palette.isDark ? .dark : .light)
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
         }
@@ -82,6 +85,7 @@ struct TunnelView: View {
             EngineLogsSheet()
                 .environmentObject(manager)
                 .environment(\.vdpiPalette, palette)
+                .preferredColorScheme(palette.isDark ? .dark : .light)
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
         }
@@ -135,10 +139,11 @@ struct TunnelView: View {
                 }
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(palette.primaryButtonInk)
-                .padding(.horizontal, 14)
-                .frame(minHeight: 36)
+                .padding(.horizontal, 16)
+                .frame(minHeight: 44)
                 .background(palette.primaryButtonBg)
-                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .buttonStyle(VdpiPressButtonStyle())
             }
             .padding(12)
         }
@@ -312,7 +317,29 @@ private struct DiagnosticsSheet: View {
                                 }
                                 .padding(14)
                             }
-                        } else if let report = manager.doctorState.report {
+                        } else if let doctorError = manager.doctorState.error {
+                            HairlinePanel(
+                                borderColor: palette.danger.opacity(0.45),
+                                backgroundColor: palette.dangerTint
+                            ) {
+                                HStack(alignment: .top, spacing: 10) {
+                                    Image(systemName: "exclamationmark.triangle.fill")
+                                        .foregroundStyle(palette.danger)
+                                        .padding(.top, 2)
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text("Diagnostics failed")
+                                            .font(.system(size: 14, weight: .semibold))
+                                            .foregroundStyle(palette.inkPrimary)
+                                        Text(doctorError)
+                                            .font(.system(size: 12))
+                                            .foregroundStyle(palette.inkSecondary)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                    }
+                                    Spacer()
+                                }
+                                .padding(14)
+                            }
+                        } else if let report = manager.doctorState.report, !report.checks.isEmpty {
                             HairlinePanel {
                                 VStack(spacing: 0) {
                                     ForEach(Array(report.checks.enumerated()), id: \.element.id) { idx, check in
@@ -346,8 +373,20 @@ private struct DiagnosticsSheet: View {
                                             }
                                         }
                                         .padding(14)
+                                        .accessibilityElement(children: .combine)
+                                        .accessibilityLabel(
+                                            "\(check.name), \(check.passed ? "Passed" : "Failed"), \(check.latencyMs) milliseconds, \(check.detail)"
+                                        )
                                     }
                                 }
+                            }
+                        } else {
+                            HairlinePanel {
+                                Text("Tap Run Diagnostics to verify live DoH and TLS desync probes.")
+                                    .font(.system(size: 13))
+                                    .foregroundStyle(palette.inkSecondary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(14)
                             }
                         }
 

@@ -35,6 +35,7 @@ data class NativeEngineConfig(
 
 @Serializable
 data class EngineEvent(
+    val seq: Long = 0L,
     @SerialName("ts_ms") val tsMs: Long = 0L,
     val level: String = "info",
     val tag: String = "tun",

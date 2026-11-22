@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.toggleable
@@ -200,7 +201,7 @@ fun SettingsScreen(
             HairlineRule()
 
             // Chunk size stepper with full 44dp touch targets and bound-disabled feedback
-            val canDecrease = settings.chunkSize > 2
+            val canDecrease = settings.chunkSize > 1
             val canIncrease = settings.chunkSize < 64
             Row(
                 modifier = Modifier
@@ -216,7 +217,7 @@ fun SettingsScreen(
                         color = palette.inkPrimary,
                     )
                     Text(
-                        text = "Initial TLS split segment size",
+                        text = "Initial TLS split segment size (1-64 B)",
                         style = VdpiTextStyles.caption,
                         color = palette.inkSecondary,
                     )
@@ -228,14 +229,17 @@ fun SettingsScreen(
                         enabled = canDecrease,
                         onClick = {
                             haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            onSetChunkSize((settings.chunkSize - 2).coerceAtLeast(2))
+                            onSetChunkSize((settings.chunkSize - 1).coerceAtLeast(1))
                         },
                     )
                     Text(
                         text = "${settings.chunkSize} B",
                         style = VdpiTextStyles.monoMetric,
                         color = palette.inkPrimary,
-                        modifier = Modifier.padding(horizontal = 8.dp),
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                        modifier = Modifier
+                            .widthIn(min = 48.dp)
+                            .padding(horizontal = 4.dp),
                     )
                     StepperButton(
                         label = "+",
@@ -243,7 +247,7 @@ fun SettingsScreen(
                         enabled = canIncrease,
                         onClick = {
                             haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            onSetChunkSize((settings.chunkSize + 2).coerceAtMost(64))
+                            onSetChunkSize((settings.chunkSize + 1).coerceAtMost(64))
                         },
                     )
                 }

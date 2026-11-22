@@ -95,32 +95,34 @@ pub fn engine_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+async fn join_or_abort(mut handle: JoinHandle<()>, budget: Duration) {
+    if tokio::time::timeout(budget, &mut handle).await.is_err() {
+        handle.abort();
+        let _ = handle.await;
+    }
+}
+
 fn stop_active_locked(mgr: &IosTunnelManager) {
     // Drop the inbound sender immediately so no further packets enter the pipeline.
-    if let Ok(mut tx_guard) = mgr.inbound_tx.lock() {
-        *tx_guard = None;
-    }
+    *mgr.inbound_tx.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
-    let active = mgr.active.lock().ok().and_then(|mut g| g.take());
+    let active = mgr
+        .active
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
     if let Some(tunnel) = active {
         let _ = tunnel.shutdown_tx.send(true);
-        let mut pipeline_task = tunnel.pipeline_task;
-        let mut writer_task = tunnel.writer_task;
+        let pipeline_task = tunnel.pipeline_task;
+        let writer_task = tunnel.writer_task;
 
+        // Await both tasks concurrently with bounded timeout and abort-on-timeout without
+        // ever double-polling a completed JoinHandle.
         mgr.runtime.block_on(async {
-            let graceful = tokio::time::timeout(Duration::from_millis(1500), async {
-                let _ = (&mut pipeline_task).await;
-                let _ = (&mut writer_task).await;
-            })
-            .await
-            .is_ok();
-
-            if !graceful {
-                pipeline_task.abort();
-                writer_task.abort();
-                let _ = pipeline_task.await;
-                let _ = writer_task.await;
-            }
+            tokio::join!(
+                join_or_abort(pipeline_task, Duration::from_millis(1200)),
+                join_or_abort(writer_task, Duration::from_millis(1200)),
+            );
         });
 
         mgr.events.push("info", "tunnel", "disconnect completed");
@@ -133,17 +135,18 @@ pub fn start_tunnel(cfg: IosConfig, callback: PacketCallback) -> Result<()> {
     let _lifecycle = mgr
         .lifecycle_lock
         .lock()
-        .map_err(|_| anyhow!("tunnel lifecycle lock poisoned"))?;
+        .unwrap_or_else(|e| e.into_inner());
 
-    stop_active_locked(mgr);
-
+    // Validate configuration and build EngineContext BEFORE stopping any active tunnel
+    // so invalid config never tears down a healthy session.
     let profile = TunProfile::LOW_MEMORY;
     let mtu = cfg.clamped_mtu();
     let mode_label = format!("{:?}", cfg.mode);
     let dns_label = cfg.dns_addr.clone();
     let doh_enabled = cfg.enable_doh;
-
     let ctx = EngineContext::new(cfg.into_runtime_config())?;
+
+    stop_active_locked(mgr);
     let tun_stats = Arc::new(TunStats::default());
     let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>(profile.channel_capacity);
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(profile.channel_capacity);
@@ -203,26 +206,22 @@ pub fn start_tunnel(cfg: IosConfig, callback: PacketCallback) -> Result<()> {
         }
     });
 
-    if let Ok(mut tx_guard) = mgr.inbound_tx.lock() {
-        *tx_guard = Some(inbound_tx);
-    }
-    if let Ok(mut guard) = mgr.active.lock() {
-        *guard = Some(ActiveIosTunnel {
-            ctx,
-            tun_stats,
-            started_at: Instant::now(),
-            shutdown_tx,
-            pipeline_task,
-            writer_task,
-        });
-    }
+    *mgr.inbound_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(inbound_tx);
+    *mgr.active.lock().unwrap_or_else(|e| e.into_inner()) = Some(ActiveIosTunnel {
+        ctx,
+        tun_stats,
+        started_at: Instant::now(),
+        shutdown_tx,
+        pipeline_task,
+        writer_task,
+    });
 
     Ok(())
 }
 
 /// Non-blocking packet injection called from `NEPacketTunnelFlow.readPackets`.
 pub fn push_packet(packet: &[u8]) -> bool {
-    if packet.len() < 20 {
+    if !(20..=65535).contains(&packet.len()) {
         return false;
     }
     let Ok(mgr) = manager() else {
@@ -231,8 +230,9 @@ pub fn push_packet(packet: &[u8]) -> bool {
     let sender = mgr
         .inbound_tx
         .lock()
-        .ok()
-        .and_then(|guard| guard.as_ref().cloned());
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .cloned();
     let Some(tx) = sender else {
         return false;
     };
@@ -243,9 +243,10 @@ pub fn stop_tunnel() {
     let Ok(mgr) = manager() else {
         return;
     };
-    let Ok(_lifecycle) = mgr.lifecycle_lock.lock() else {
-        return;
-    };
+    let _lifecycle = mgr
+        .lifecycle_lock
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     stop_active_locked(mgr);
 }
 

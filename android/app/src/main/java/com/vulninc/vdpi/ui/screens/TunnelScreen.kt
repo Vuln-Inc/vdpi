@@ -54,14 +54,15 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -466,17 +467,17 @@ private fun StatusBeacon(
         contentAlignment = Alignment.Center,
     ) {
         if (pulsing) {
-            val transition = rememberInfiniteTransition(label = "beaconPulse")
-            val pulseScale by transition.animateFloat(
+            val infinite = rememberInfiniteTransition(label = "beacon")
+            val pulseScale = infinite.animateFloat(
                 initialValue = 1f,
-                targetValue = 1.9f,
+                targetValue = 2.6f,
                 animationSpec = infiniteRepeatable(
                     animation = tween(1800, easing = FastOutSlowInEasing),
                     repeatMode = RepeatMode.Restart,
                 ),
                 label = "beaconScale",
             )
-            val pulseAlpha by transition.animateFloat(
+            val pulseAlpha = infinite.animateFloat(
                 initialValue = 0.45f,
                 targetValue = 0f,
                 animationSpec = infiniteRepeatable(
@@ -488,8 +489,12 @@ private fun StatusBeacon(
             Box(
                 modifier = Modifier
                     .size(7.dp)
-                    .scale(pulseScale)
-                    .alpha(pulseAlpha)
+                    .graphicsLayer {
+                        val s = pulseScale.value
+                        scaleX = s
+                        scaleY = s
+                        alpha = pulseAlpha.value
+                    }
                     .clip(CircleShape)
                     .background(color),
             )
@@ -542,16 +547,19 @@ private fun PrimaryTunnelButton(
         modifier = Modifier
             .fillMaxWidth()
             .height(50.dp)
-            .scale(scale)
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+            }
             .clip(shape)
             .background(bgColor)
             .border(
-                width = if (isConnected || isConnecting) 1.dp else 0.dp,
+                width = 1.dp,
                 color = if (isConnected || isConnecting) palette.borderStrong else Color.Transparent,
                 shape = shape,
             )
             .clickable(
-                enabled = !isConnecting,
+                enabled = true,
                 role = Role.Button,
                 interactionSource = interaction,
                 indication = null,
@@ -574,7 +582,7 @@ private fun PrimaryTunnelButton(
             Text(
                 text = when (phase) {
                     TunnelPhase.CONNECTED -> "Disconnect"
-                    TunnelPhase.CONNECTING -> "Starting"
+                    TunnelPhase.CONNECTING -> "Cancel connection"
                     TunnelPhase.ERROR -> "Retry connection"
                     TunnelPhase.DISCONNECTED -> "Connect"
                 },
@@ -748,6 +756,9 @@ private fun DoctorSheetContent(
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
+                            .semantics(mergeDescendants = true) {
+                                contentDescription = "${check.name}, ${if (check.passed) "Passed" else "Failed"}, ${check.latencyMs} ms, ${check.detail}"
+                            }
                             .padding(horizontal = 14.dp, vertical = 12.dp),
                         verticalAlignment = Alignment.Top,
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -756,12 +767,17 @@ private fun DoctorSheetContent(
                             modifier = Modifier.weight(1f),
                             verticalAlignment = Alignment.Top,
                         ) {
-                            Box(
+                            Text(
+                                text = if (check.passed) "PASS" else "FAIL",
+                                style = VdpiTextStyles.monoSmall,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = if (check.passed) palette.signal else palette.danger,
                                 modifier = Modifier
-                                    .padding(top = 6.dp)
-                                    .size(7.dp)
-                                    .clip(CircleShape)
-                                    .background(if (check.passed) palette.signal else palette.danger),
+                                    .padding(top = 2.dp)
+                                    .clip(RoundedCornerShape(4.dp))
+                                    .background(if (check.passed) palette.signalTint else palette.dangerTint)
+                                    .padding(horizontal = 5.dp, vertical = 2.dp),
                             )
                             Spacer(Modifier.width(10.dp))
                             Column {
@@ -836,10 +852,10 @@ private fun EngineLogSheetContent(
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 GhostActionButton(
                     label = "Copy",
-                    enabled = reversed.isNotEmpty(),
+                    enabled = events.isNotEmpty(),
                     onClick = {
-                        val dump = reversed.joinToString("\n") { ev ->
-                            "${formatEventTime(ev.tsMs)} [${ev.tag}] ${ev.message}"
+                        val dump = events.joinToString("\n") { ev ->
+                            "[${formatEventTime(ev.tsMs)}] [${ev.level.uppercase()}] [${ev.tag}] ${ev.message}"
                         }
                         clipboard.setText(AnnotatedString(dump))
                         sheetNotice = "Copied to clipboard"
@@ -880,7 +896,7 @@ private fun EngineLogSheetContent(
                 LazyColumn(modifier = Modifier.padding(12.dp)) {
                     itemsIndexed(
                         items = reversed,
-                        key = { idx, ev -> "${ev.tsMs}-${ev.tag}-$idx" },
+                        key = { idx, ev -> if (ev.seq > 0L) ev.seq else "${ev.tsMs}-${ev.tag}-$idx" },
                     ) { _, ev ->
                         Row(
                             modifier = Modifier

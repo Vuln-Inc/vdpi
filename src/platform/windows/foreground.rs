@@ -1,6 +1,9 @@
 //! Keep the foreground proxy settings tied to a detached process lease. Closing a
 //! Windows console can terminate its processes without running any Rust cleanup.
-use super::{build_windows_proxy_override, notify_wininet_refresh};
+use super::{
+    broadcast_environment_change, build_windows_proxy_override, notify_wininet_refresh,
+};
+use crate::bypass::build_no_proxy_value;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
@@ -24,13 +27,19 @@ const DETACHED_PROCESS: u32 = 0x00000008;
 #[derive(Serialize, Deserialize)]
 struct Request {
     endpoint: SocketAddr,
+    #[serde(default = "default_env_proxy")]
+    env_proxy: bool,
     bypass: Vec<String>,
+}
+
+fn default_env_proxy() -> bool {
+    true
 }
 
 pub struct ForegroundProxy(Child);
 
 impl ForegroundProxy {
-    pub fn activate(endpoint: SocketAddr, bypass: &[String]) -> Result<Self> {
+    pub fn activate(endpoint: SocketAddr, env_proxy: bool, bypass: &[String]) -> Result<Self> {
         let mut guard = Self(
             Command::new(std::env::current_exe()?)
                 .arg(GUARD_ARG)
@@ -46,6 +55,7 @@ impl ForegroundProxy {
             &mut *pipe,
             &Request {
                 endpoint,
+                env_proxy,
                 bypass: bypass.to_vec(),
             },
         )?;
@@ -121,30 +131,82 @@ fn guard_inner() -> Result<()> {
             ),
         ],
     )?;
-    with_proxy_lease(&mut proxy, notify_wininet_refresh, || {
-        let mut output = io::stdout().lock();
-        writeln!(output, "{READY}")?;
-        output.flush()?;
-        drop(output);
-        // No further messages are necessary. Any return (EOF or broken pipe) restores the lease.
-        let _ = input.fill_buf();
-        Ok(())
-    })
+
+    // Also lease HKCU\Environment HTTP_PROXY/HTTPS_PROXY/NO_PROXY so libcurl-based
+    // Windows desktop apps (such as RobloxPlayerBeta.exe) route through vdpi even in
+    // foreground mode, and restore cleanly when the console exits or is killed.
+    let env_key = if request.env_proxy {
+        Key::open(super::USER_ENV_SUBKEY).ok()
+    } else {
+        None
+    };
+    let proxy_url = format!("http://{}", request.endpoint);
+    let no_proxy_csv = build_no_proxy_value(&request.bypass);
+    let mut env_settings = match env_key.as_ref() {
+        Some(key) => Some(Settings::prepare(
+            key,
+            [
+                ("HTTP_PROXY", Some(Value::string(&proxy_url))),
+                ("HTTPS_PROXY", Some(Value::string(&proxy_url))),
+                ("NO_PROXY", Some(Value::string(&no_proxy_csv))),
+            ],
+        )?),
+        None => None,
+    };
+
+    with_proxy_lease_and_env(
+        &mut proxy,
+        env_settings.as_mut(),
+        notify_wininet_refresh,
+        broadcast_environment_change,
+        || {
+            let mut output = io::stdout().lock();
+            writeln!(output, "{READY}")?;
+            output.flush()?;
+            drop(output);
+            // No further messages are necessary. Any return (EOF or broken pipe) restores the lease.
+            let _ = input.fill_buf();
+            Ok(())
+        },
+    )
 }
 
+#[cfg(test)]
 fn with_proxy_lease(
     proxy: &mut Settings<'_>,
     refresh: impl Fn(),
     wait: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
+    with_proxy_lease_and_env(proxy, None, refresh, || {}, wait)
+}
+
+fn with_proxy_lease_and_env(
+    proxy: &mut Settings<'_>,
+    mut env_settings: Option<&mut Settings<'_>>,
+    refresh_inet: impl Fn(),
+    refresh_env: impl Fn(),
+    wait: impl FnOnce() -> Result<()>,
+) -> Result<()> {
     let outcome = (|| -> Result<()> {
         proxy.apply()?;
-        refresh();
+        refresh_inet();
+        if let Some(env) = env_settings.as_deref_mut() {
+            env.apply()?;
+            refresh_env();
+        }
         wait()
     })();
-    let restored = proxy.restore(Some("ProxyServer"));
-    refresh();
-    outcome.and(restored)
+    let env_restored = match env_settings {
+        Some(env) => {
+            let res = env.restore(Some("HTTPS_PROXY"));
+            refresh_env();
+            res
+        }
+        None => Ok(()),
+    };
+    let inet_restored = proxy.restore(Some("ProxyServer"));
+    refresh_inet();
+    outcome.and(inet_restored).and(env_restored)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

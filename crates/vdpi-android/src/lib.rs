@@ -136,15 +136,14 @@ pub fn start_tunnel(owned_fd: std::os::unix::io::OwnedFd, cfg: AndroidConfig) ->
         }
     });
 
-    if let Ok(mut guard) = mgr.active.lock() {
-        *guard = Some(ActiveTunnel {
-            ctx,
-            tun_stats,
-            started_at: Instant::now(),
-            shutdown_tx,
-            task,
-        });
-    }
+    let mut guard = mgr.active.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some(ActiveTunnel {
+        ctx,
+        tun_stats,
+        started_at: Instant::now(),
+        shutdown_tx,
+        task,
+    });
     Ok(())
 }
 
@@ -157,9 +156,10 @@ pub fn stop_tunnel() {
     let Ok(mgr) = manager() else {
         return;
     };
-    let Ok(_lifecycle) = mgr.lifecycle_lock.lock() else {
-        return;
-    };
+    let _lifecycle = mgr
+        .lifecycle_lock
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     stop_active_locked(mgr);
 }
 

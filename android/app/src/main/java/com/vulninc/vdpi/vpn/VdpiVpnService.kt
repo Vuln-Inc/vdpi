@@ -69,11 +69,11 @@ class VdpiVpnService : VpnService() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val transitionMutex = Mutex()
     private val sessionGeneration = AtomicLong(0L)
-    private var transitionJob: Job? = null
-    private var pollJob: Job? = null
-    private var networkCallback: ConnectivityManager.NetworkCallback? = null
-    private var lastNetworkId: Long? = null
-    private var lastHasGlobalIpv6: Boolean? = null
+    @Volatile private var transitionJob: Job? = null
+    @Volatile private var pollJob: Job? = null
+    @Volatile private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    @Volatile private var lastNetworkId: Long? = null
+    @Volatile private var lastHasGlobalIpv6: Boolean? = null
 
     @Volatile
     private var latestStartId: Int = -1
@@ -95,7 +95,8 @@ class VdpiVpnService : VpnService() {
                 return START_NOT_STICKY
             }
             ACTION_START, SERVICE_INTERFACE, null -> {
-                if (prepare(this) != null) {
+                val consentNeeded = runCatching { prepare(this) != null }.getOrDefault(true)
+                if (consentNeeded) {
                     // Satisfy startForegroundService() contract on API 26-35 before stopping.
                     ensureNotificationChannel()
                     startForegroundSafe(
@@ -312,10 +313,9 @@ class VdpiVpnService : VpnService() {
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val cm = getSystemService(ConnectivityManager::class.java)
-            val caps = cm?.getNetworkCapabilities(cm.activeNetwork)
-            val isUnmetered = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) == true
-            builder.setMetered(!isUnmetered)
+            // Leave underlyingNetworks at default (null) and mark VPN unmetered so Android
+            // dynamically reflects the active Wi-Fi/Cellular network's real meteredness across handoffs.
+            builder.setMetered(false)
         }
 
         when (settings.splitTunnelMode) {
@@ -630,13 +630,16 @@ class VdpiVpnService : VpnService() {
 
         fun stop(context: Context) {
             if (!serviceActive.get()) {
-                NativeEngine.stop()
-                TunnelRuntimeState.update {
-                    TunnelRuntimeSnapshot(
-                        phase = TunnelPhase.DISCONNECTED,
-                        errorMessage = null,
-                        telemetry = NativeEngine.snapshot(),
-                    )
+                runCatching { context.stopService(Intent(context, VdpiVpnService::class.java)) }
+                CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+                    NativeEngine.stop()
+                    TunnelRuntimeState.update {
+                        TunnelRuntimeSnapshot(
+                            phase = TunnelPhase.DISCONNECTED,
+                            errorMessage = null,
+                            telemetry = NativeEngine.snapshot(),
+                        )
+                    }
                 }
                 return
             }
@@ -647,13 +650,15 @@ class VdpiVpnService : VpnService() {
                 context.startService(intent)
             }.onFailure {
                 runCatching { context.stopService(Intent(context, VdpiVpnService::class.java)) }
-                NativeEngine.stop()
-                TunnelRuntimeState.update {
-                    TunnelRuntimeSnapshot(
-                        phase = TunnelPhase.DISCONNECTED,
-                        errorMessage = null,
-                        telemetry = NativeEngine.snapshot(),
-                    )
+                CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+                    NativeEngine.stop()
+                    TunnelRuntimeState.update {
+                        TunnelRuntimeSnapshot(
+                            phase = TunnelPhase.DISCONNECTED,
+                            errorMessage = null,
+                            telemetry = NativeEngine.snapshot(),
+                        )
+                    }
                 }
             }
         }

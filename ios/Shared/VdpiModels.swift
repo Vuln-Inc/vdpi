@@ -164,14 +164,21 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
 }
 
 public struct EngineEvent: Codable, Equatable, Identifiable, Sendable {
+    public var seq: UInt64?
     public var tsMs: UInt64
     public var level: String
     public var tag: String
     public var message: String
 
-    public var id: String { "\(tsMs)-\(tag)-\(message.hashValue)" }
+    public var id: String {
+        if let seq {
+            return "seq-\(seq)"
+        }
+        return "\(tsMs)-\(tag)-\(message.hashValue)"
+    }
 
     enum CodingKeys: String, CodingKey {
+        case seq
         case tsMs = "ts_ms"
         case level
         case tag
@@ -216,6 +223,65 @@ public struct TelemetrySnapshot: Codable, Equatable, Sendable {
         case dnsAddr = "dns_addr"
         case dohEnabled = "doh_enabled"
         case events
+    }
+
+    public init(
+        running: Bool,
+        uptimeSecs: UInt64,
+        activeConnections: Int,
+        totalConnections: UInt64,
+        bytesTx: UInt64,
+        bytesRx: UInt64,
+        tlsHandshakes: UInt64,
+        autoHealEscalations: UInt64,
+        dnsQueries: UInt64,
+        quicBlocked: UInt64,
+        udpFlowsActive: UInt64,
+        learnedHosts: Int,
+        stageNumber: UInt8,
+        stageLabel: String,
+        dnsAddr: String,
+        dohEnabled: Bool,
+        events: [EngineEvent]
+    ) {
+        self.running = running
+        self.uptimeSecs = uptimeSecs
+        self.activeConnections = activeConnections
+        self.totalConnections = totalConnections
+        self.bytesTx = bytesTx
+        self.bytesRx = bytesRx
+        self.tlsHandshakes = tlsHandshakes
+        self.autoHealEscalations = autoHealEscalations
+        self.dnsQueries = dnsQueries
+        self.quicBlocked = quicBlocked
+        self.udpFlowsActive = udpFlowsActive
+        self.learnedHosts = learnedHosts
+        self.stageNumber = stageNumber
+        self.stageLabel = stageLabel
+        self.dnsAddr = dnsAddr
+        self.dohEnabled = dohEnabled
+        self.events = events
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.running = try c.decodeIfPresent(Bool.self, forKey: .running) ?? false
+        self.uptimeSecs = try c.decodeIfPresent(UInt64.self, forKey: .uptimeSecs) ?? 0
+        self.activeConnections = try c.decodeIfPresent(Int.self, forKey: .activeConnections) ?? 0
+        self.totalConnections = try c.decodeIfPresent(UInt64.self, forKey: .totalConnections) ?? 0
+        self.bytesTx = try c.decodeIfPresent(UInt64.self, forKey: .bytesTx) ?? 0
+        self.bytesRx = try c.decodeIfPresent(UInt64.self, forKey: .bytesRx) ?? 0
+        self.tlsHandshakes = try c.decodeIfPresent(UInt64.self, forKey: .tlsHandshakes) ?? 0
+        self.autoHealEscalations = try c.decodeIfPresent(UInt64.self, forKey: .autoHealEscalations) ?? 0
+        self.dnsQueries = try c.decodeIfPresent(UInt64.self, forKey: .dnsQueries) ?? 0
+        self.quicBlocked = try c.decodeIfPresent(UInt64.self, forKey: .quicBlocked) ?? 0
+        self.udpFlowsActive = try c.decodeIfPresent(UInt64.self, forKey: .udpFlowsActive) ?? 0
+        self.learnedHosts = try c.decodeIfPresent(Int.self, forKey: .learnedHosts) ?? 0
+        self.stageNumber = try c.decodeIfPresent(UInt8.self, forKey: .stageNumber) ?? 1
+        self.stageLabel = try c.decodeIfPresent(String.self, forKey: .stageLabel) ?? "ComboMultiRecord"
+        self.dnsAddr = try c.decodeIfPresent(String.self, forKey: .dnsAddr) ?? "1.1.1.1"
+        self.dohEnabled = try c.decodeIfPresent(Bool.self, forKey: .dohEnabled) ?? true
+        self.events = try c.decodeIfPresent([EngineEvent].self, forKey: .events) ?? []
     }
 
     public static let idle = TelemetrySnapshot(

@@ -9,8 +9,19 @@ use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, watch};
+use tokio::task::AbortHandle;
 use tracing::{debug, warn};
 use vdpi::desync::EngineContext;
+
+struct AbortOnDrop(Vec<AbortHandle>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            handle.abort();
+        }
+    }
+}
 
 /// Validates and registers a Unix/Android TUN `OwnedFd` with Tokio synchronously before
 /// returning control to the caller, so startup failures surface immediately and never leak the fd.
@@ -71,11 +82,11 @@ pub async fn run_registered_tun_fd(
                     let _ = read_stop_tx.send(true);
                     break;
                 }
-                Ok(Ok(n)) => {
-                    if inbound_tx.send(buf[..n].to_vec()).await.is_err() {
-                        break;
-                    }
-                }
+                Ok(Ok(n)) => match inbound_tx.try_send(buf[..n].to_vec()) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                },
                 Ok(Err(e)) if e.kind() == ErrorKind::Interrupted => continue,
                 Ok(Err(e)) => {
                     warn!(error = %e, "TUN read error");
@@ -133,6 +144,12 @@ pub async fn run_registered_tun_fd(
         }
     });
 
+    let _guard = AbortOnDrop(vec![
+        ext_bridge.abort_handle(),
+        reader_task.abort_handle(),
+        writer_task.abort_handle(),
+    ]);
+
     let pipeline_res = run_tun_pipeline(
         inbound_rx,
         outbound_tx,
@@ -160,6 +177,10 @@ pub async fn run_registered_tun_fd(
 }
 
 fn is_fatal_tun_errno(err: &std::io::Error) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if err.raw_os_error() == Some(libc::EBADFD) {
+        return true;
+    }
     matches!(
         err.raw_os_error(),
         Some(libc::EBADF) | Some(libc::ENODEV) | Some(libc::EIO) | Some(libc::ENXIO)
