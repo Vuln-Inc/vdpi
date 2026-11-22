@@ -26,7 +26,7 @@ pub enum Command {
     /// Start the vdpi engine in the foreground (default when no subcommand is given)
     #[command(visible_alias = "run")]
     Start,
-    /// Install vdpi and enable automatic background startup on login
+    /// Install vdpi and enable automatic background startup (Windows Service / LaunchAgent / systemd)
     Install,
     /// Stop vdpi, remove startup registration, and restore system proxy settings
     Uninstall,
@@ -211,6 +211,10 @@ pub struct CliArgs {
         global = true
     )]
     pub quiet: bool,
+
+    /// Run under the Windows Service Control Manager (internal)
+    #[arg(long = "service", hide = true, default_value_t = false, global = true)]
+    pub service: bool,
 }
 
 /// Validated runtime configuration derived from [`CliArgs`].
@@ -234,6 +238,7 @@ pub struct RuntimeConfig {
     pub connect_timeout: Duration,
     pub debug: bool,
     pub quiet: bool,
+    pub windows_service: bool,
 }
 
 impl CliArgs {
@@ -282,6 +287,7 @@ impl CliArgs {
             connect_timeout,
             debug: self.debug,
             quiet: self.quiet,
+            windows_service: self.service,
         }
     }
 }
@@ -328,5 +334,15 @@ mod tests {
         let cfg = cli.into_runtime_config();
         assert_eq!(cfg.mode, DesyncMode::TlsRecord);
         assert_eq!(cfg.chunk_size, 6);
+        assert!(!cfg.windows_service);
+    }
+
+    #[test]
+    fn parses_windows_service_flag() {
+        let cli = CliArgs::parse_from_iter(["vdpi", "--service", "--quiet"])
+            .expect("valid service flag");
+        let cfg = cli.into_runtime_config();
+        assert!(cfg.windows_service);
+        assert!(cfg.quiet);
     }
 }
