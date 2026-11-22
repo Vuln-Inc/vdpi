@@ -3,12 +3,17 @@ use regex::RegexSet;
 use std::net::IpAddr;
 
 /// Built-in domains and wildcards that should never undergo TLS ClientHello fragmentation
-/// (local mDNS, government portals, payment gateways, banking WAFs, and domestic portals).
+/// (local mDNS, private networks, government portals, payment gateways, and banking WAFs).
 pub const DEFAULT_BYPASS_PATTERNS: &[&str] = &[
     "localhost",
     "*.local",
     "*.lan",
     "*.internal",
+    "*.home.arpa",
+    "*.gov",
+    "*.mil",
+    "*.int",
+    "*.gov.uk",
     "*.gov.tr",
     "*.bel.tr",
     "*.pol.tr",
@@ -137,7 +142,7 @@ impl BypassPolicy {
     }
 }
 
-/// Converts a proxy bypass wildcard (like `*.gov.tr` or `*isbank.com.tr`) into an
+/// Converts a proxy bypass wildcard (like `*.gov` or `*.example.com`) into an
 /// anchored case-insensitive regex.
 fn wildcard_to_regex(pattern: &str) -> String {
     let p = pattern.trim().trim_end_matches('.').to_ascii_lowercase();
@@ -174,6 +179,9 @@ pub fn build_no_proxy_value(extra: &[String]) -> String {
         ".local".into(),
         ".lan".into(),
         ".internal".into(),
+        ".home.arpa".into(),
+        ".gov".into(),
+        ".gov.uk".into(),
         ".gov.tr".into(),
         ".bel.tr".into(),
         ".edu.tr".into(),
@@ -219,6 +227,9 @@ mod tests {
         assert!(policy.should_desync(Some("www.roblox.com"), None));
         assert!(policy.should_desync(Some("apis.roblox.com"), None));
 
+        assert!(!policy.should_desync(Some("www.usa.gov"), None));
+        assert!(!policy.should_desync(Some("www.gov.uk"), None));
+        assert!(!policy.should_desync(Some("router.home.arpa"), None));
         assert!(!policy.should_desync(Some("turkiye.gov.tr"), None));
         assert!(!policy.should_desync(Some("ais.osym.gov.tr"), None));
         assert!(!policy.should_desync(Some("www.isbank.com.tr"), None));

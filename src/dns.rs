@@ -340,7 +340,7 @@ fn build_udp_dns_servers(dns_addr: &str, dns_port: u16) -> Vec<SocketAddr> {
         servers.push(SocketAddr::new(ip, dns_port));
     }
     // Non-standard port 1253 on 77.88.8.8 / 77.88.8.1 bypasses transparent ISP port-53 DNS interceptors
-    // on fiber providers (such as Superonline, Kablonet, and Turk Telekom).
+    // on strict fiber and broadband networks worldwide.
     for (ip, port) in [
         (Ipv4Addr::new(77, 88, 8, 8), 1253),
         (Ipv4Addr::new(77, 88, 8, 1), 1253),
