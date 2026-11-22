@@ -1,8 +1,9 @@
-name: Build & Test
+name: Build & Release
 
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -26,3 +27,128 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Run Unit & Integration Tests
         run: cargo test
+
+  build-windows:
+    name: Package Windows (x86_64)
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Build Windows Release Binary
+        run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Package Windows Zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/win | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/vdpi.exe dist/win/vdpi.exe
+          Copy-Item README.md dist/win/README.md
+          Copy-Item LICENSE dist/win/LICENSE
+          Compress-Archive -Path dist/win/* -DestinationPath dist/vdpi-windows-x86_64.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: dist/vdpi-windows-x86_64.zip
+
+  build-macos:
+    name: Package macOS (Universal)
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Build Universal macOS Binary
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          mkdir -p dist/mac
+          lipo -create -output dist/mac/vdpi \
+            target/aarch64-apple-darwin/release/vdpi \
+            target/x86_64-apple-darwin/release/vdpi
+          chmod 755 dist/mac/vdpi
+          codesign -fs - dist/mac/vdpi
+          cp README.md LICENSE dist/mac/
+          COPYFILE_DISABLE=1 tar -czf dist/vdpi-macos-universal.tar.gz -C dist/mac vdpi README.md LICENSE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          path: dist/vdpi-macos-universal.tar.gz
+
+  build-linux:
+    name: Package Linux (x86_64 & arm64 musl)
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+      - name: Install Cross Toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+      - name: Build & Package Static Linux Binaries
+        run: |
+          cargo build --release --target x86_64-unknown-linux-musl
+          CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc \
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
+          cargo build --release --target aarch64-unknown-linux-musl
+
+          mkdir -p dist/lin64 dist/linarm
+          cp target/x86_64-unknown-linux-musl/release/vdpi dist/lin64/vdpi
+          chmod 755 dist/lin64/vdpi
+          cp README.md LICENSE dist/lin64/
+          tar -czf dist/vdpi-linux-x86_64.tar.gz -C dist/lin64 vdpi README.md LICENSE
+
+          cp target/aarch64-unknown-linux-musl/release/vdpi dist/linarm/vdpi
+          chmod 755 dist/linarm/vdpi
+          cp README.md LICENSE dist/linarm/
+          tar -czf dist/vdpi-linux-arm64.tar.gz -C dist/linarm vdpi README.md LICENSE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: |
+            dist/vdpi-linux-x86_64.tar.gz
+            dist/vdpi-linux-arm64.tar.gz
+
+  publish-release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-windows, build-macos, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Generate Checksums & Publish Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cd release-assets
+          sha256sum vdpi-windows-x86_64.zip vdpi-macos-universal.tar.gz vdpi-linux-x86_64.tar.gz vdpi-linux-arm64.tar.gz > SHA256SUMS.txt
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" --clobber \
+              vdpi-windows-x86_64.zip \
+              vdpi-macos-universal.tar.gz \
+              vdpi-linux-x86_64.tar.gz \
+              vdpi-linux-arm64.tar.gz \
+              SHA256SUMS.txt
+          else
+            gh release create "$TAG" \
+              --title "vdpi $TAG" \
+              --generate-notes \
+              vdpi-windows-x86_64.zip \
+              vdpi-macos-universal.tar.gz \
+              vdpi-linux-x86_64.tar.gz \
+              vdpi-linux-arm64.tar.gz \
+              SHA256SUMS.txt
+          fi
