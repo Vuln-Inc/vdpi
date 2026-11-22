@@ -3,16 +3,32 @@ use anyhow::{Context, Result};
 use std::ffi::c_void;
 use std::net::IpAddr;
 use std::os::windows::process::CommandExt;
+use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info, warn};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const INTERNET_SETTINGS_KEY: &str =
-    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
-const USER_ENV_KEY: &str = r"HKCU\Environment";
+const INTERNET_SETTINGS_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+const USER_ENV_SUBKEY: &str = "Environment";
+const SYSTEM_ENV_KEY: &str = r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
 
 const INTERNET_OPTION_SETTINGS_CHANGED: u32 = 39;
 const INTERNET_OPTION_REFRESH: u32 = 37;
+
+const HWND_BROADCAST: *mut c_void = 0xffffusize as *mut c_void;
+const WM_SETTINGCHANGE: u32 = 0x001A;
+const SMTO_ABORTIFHUNG: u32 = 0x0002;
+
+static RUNNING_AS_SERVICE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_running_as_service(active: bool) {
+    RUNNING_AS_SERVICE.store(active, Ordering::SeqCst);
+}
+
+pub fn is_running_as_service() -> bool {
+    RUNNING_AS_SERVICE.load(Ordering::SeqCst)
+}
 
 #[link(name = "wininet")]
 extern "system" {
@@ -22,6 +38,19 @@ extern "system" {
         lp_buffer: *mut c_void,
         dw_buffer_length: u32,
     ) -> i32;
+}
+
+#[link(name = "user32")]
+extern "system" {
+    fn SendMessageTimeoutW(
+        h_wnd: *mut c_void,
+        msg: u32,
+        w_param: usize,
+        l_param: isize,
+        fu_flags: u32,
+        u_timeout: u32,
+        lpdw_result: *mut usize,
+    ) -> isize;
 }
 
 #[derive(Debug, Clone)]
@@ -45,19 +74,36 @@ impl WindowsProxySession {
         let server_val = format!("{addr}:{http_port}");
         let proxy_override = build_windows_proxy_override(extra_bypass);
         let no_proxy_csv = build_no_proxy_value(extra_bypass);
+        let service_mode = is_running_as_service();
+        let roots = target_proxy_roots();
 
-        apply_wininet_proxy(&server_val, &proxy_override)?;
+        for root in &roots {
+            let inet_key = internet_settings_key(root);
+            if let Err(e) = apply_wininet_proxy(&inet_key, &server_val, &proxy_override) {
+                if service_mode {
+                    warn!(hive = %root, error = %e, "failed to apply WinINET proxy to user hive");
+                } else {
+                    return Err(e);
+                }
+            }
 
-        if enable_env_proxy {
-            let proxy_url = format!("http://{server_val}");
-            set_windows_user_env(&proxy_url, &no_proxy_csv);
+            if enable_env_proxy {
+                let env_key = user_env_key(root);
+                let proxy_url = format!("http://{server_val}");
+                set_windows_user_env(&env_key, &proxy_url, &no_proxy_csv);
+            }
         }
 
         notify_wininet_refresh();
+        if enable_env_proxy {
+            broadcast_environment_change();
+        }
 
         info!(
             proxy = %server_val,
             env_proxy = enable_env_proxy,
+            service_mode,
+            hives = roots.len(),
             "configured Windows WinINET system proxy"
         );
 
@@ -71,7 +117,13 @@ impl WindowsProxySession {
     }
 
     pub fn summary(&self) -> String {
-        if self.env_configured {
+        if is_running_as_service() {
+            if self.env_configured {
+                "active (Windows Service -> WinINET Registry + User Environment)".to_string()
+            } else {
+                "active (Windows Service -> WinINET Registry)".to_string()
+            }
+        } else if self.env_configured {
             "active (Windows WinINET Registry + User Environment)".to_string()
         } else {
             "active (Windows WinINET Registry)".to_string()
@@ -80,20 +132,37 @@ impl WindowsProxySession {
 
     pub fn reconcile(&self) {
         let expected_server = format!("{}:{}", self.addr, self.http_port);
-        let (enabled, current_server) = query_wininet_state();
-        if !enabled || !current_server.eq_ignore_ascii_case(&expected_server) {
-            if let Err(e) = apply_wininet_proxy(&expected_server, &self.proxy_override) {
-                warn!(error = %e, "failed to reconcile Windows proxy settings");
-            } else {
-                notify_wininet_refresh();
+        let expected_url = format!("http://{expected_server}");
+        let roots = target_proxy_roots();
+        let mut wininet_changed = false;
+        let mut env_changed = false;
+
+        for root in &roots {
+            let inet_key = internet_settings_key(root);
+            let (enabled, current_server) = query_wininet_state(&inet_key);
+            if !enabled || !current_server.eq_ignore_ascii_case(&expected_server) {
+                if let Err(e) = apply_wininet_proxy(&inet_key, &expected_server, &self.proxy_override)
+                {
+                    warn!(hive = %root, error = %e, "failed to reconcile Windows proxy settings");
+                } else {
+                    wininet_changed = true;
+                }
+            }
+
+            if self.env_configured {
+                let env_key = user_env_key(root);
+                if query_reg_sz(&env_key, "HTTPS_PROXY").as_deref() != Some(expected_url.as_str()) {
+                    set_windows_user_env(&env_key, &expected_url, &self.no_proxy_csv);
+                    env_changed = true;
+                }
             }
         }
 
-        if self.env_configured {
-            let expected_url = format!("http://{expected_server}");
-            if query_reg_sz(USER_ENV_KEY, "HTTPS_PROXY").as_deref() != Some(expected_url.as_str()) {
-                set_windows_user_env(&expected_url, &self.no_proxy_csv);
-            }
+        if wininet_changed {
+            notify_wininet_refresh();
+        }
+        if env_changed {
+            broadcast_environment_change();
         }
     }
 
@@ -104,27 +173,34 @@ impl WindowsProxySession {
 }
 
 pub fn clear_all_windows_proxies() -> Result<()> {
-    let _ = run_reg(&[
-        "add",
-        INTERNET_SETTINGS_KEY,
-        "/v",
-        "ProxyEnable",
-        "/t",
-        "REG_DWORD",
-        "/d",
-        "0",
-        "/f",
-    ]);
-    unset_windows_user_env();
+    for root in all_cleanup_roots() {
+        let inet_key = internet_settings_key(&root);
+        let _ = run_reg(&[
+            "add",
+            &inet_key,
+            "/v",
+            "ProxyEnable",
+            "/t",
+            "REG_DWORD",
+            "/d",
+            "0",
+            "/f",
+        ]);
+        let env_key = user_env_key(&root);
+        unset_windows_user_env(&env_key);
+    }
     notify_wininet_refresh();
+    broadcast_environment_change();
     Ok(())
 }
 
 pub fn print_windows_proxy_status() {
-    let (enabled, server) = query_wininet_state();
+    let inet_key = internet_settings_key("HKCU");
+    let env_key = user_env_key("HKCU");
+    let (enabled, server) = query_wininet_state(&inet_key);
     let override_val =
-        query_reg_sz(INTERNET_SETTINGS_KEY, "ProxyOverride").unwrap_or_else(|| "<unset>".into());
-    let https_env = query_reg_sz(USER_ENV_KEY, "HTTPS_PROXY").unwrap_or_else(|| "<unset>".into());
+        query_reg_sz(&inet_key, "ProxyOverride").unwrap_or_else(|| "<unset>".into());
+    let https_env = query_reg_sz(&env_key, "HTTPS_PROXY").unwrap_or_else(|| "<unset>".into());
 
     println!("\n=== Windows System Proxy (WinINET) ===");
     println!(
@@ -143,10 +219,74 @@ pub fn print_windows_proxy_status() {
     println!("User Env HTTPS_PROXY      : {https_env}");
 }
 
-fn apply_wininet_proxy(server: &str, proxy_override: &str) -> Result<()> {
+pub fn enumerate_interactive_hku_roots() -> Vec<String> {
+    let Ok(out) = Command::new("reg")
+        .creation_flags(CREATE_NO_WINDOW)
+        .args(["query", "HKU"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut roots = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let Some(sid) = trimmed
+            .strip_prefix(r"HKEY_USERS\")
+            .or_else(|| trimmed.strip_prefix(r"HKU\"))
+        else {
+            continue;
+        };
+        if sid.contains('\\') {
+            continue;
+        }
+        let is_user_sid = sid.starts_with("S-1-5-21-") || sid.starts_with("S-1-12-1-");
+        let is_classes = sid.to_ascii_lowercase().ends_with("_classes");
+        if is_user_sid && !is_classes {
+            roots.push(format!(r"HKU\{sid}"));
+        }
+    }
+    roots
+}
+
+fn target_proxy_roots() -> Vec<String> {
+    if is_running_as_service() {
+        enumerate_interactive_hku_roots()
+    } else {
+        vec!["HKCU".to_string()]
+    }
+}
+
+fn all_cleanup_roots() -> Vec<String> {
+    if is_running_as_service() {
+        enumerate_interactive_hku_roots()
+    } else {
+        let mut roots = vec!["HKCU".to_string()];
+        for hku in enumerate_interactive_hku_roots() {
+            if !roots.iter().any(|r| r.eq_ignore_ascii_case(&hku)) {
+                roots.push(hku);
+            }
+        }
+        roots
+    }
+}
+
+fn internet_settings_key(root: &str) -> String {
+    format!(r"{root}\{INTERNET_SETTINGS_SUBKEY}")
+}
+
+fn user_env_key(root: &str) -> String {
+    format!(r"{root}\{USER_ENV_SUBKEY}")
+}
+
+fn apply_wininet_proxy(inet_key: &str, server: &str, proxy_override: &str) -> Result<()> {
     run_reg(&[
         "add",
-        INTERNET_SETTINGS_KEY,
+        inet_key,
         "/v",
         "ProxyServer",
         "/t",
@@ -157,7 +297,7 @@ fn apply_wininet_proxy(server: &str, proxy_override: &str) -> Result<()> {
     ])?;
     run_reg(&[
         "add",
-        INTERNET_SETTINGS_KEY,
+        inet_key,
         "/v",
         "ProxyOverride",
         "/t",
@@ -168,7 +308,7 @@ fn apply_wininet_proxy(server: &str, proxy_override: &str) -> Result<()> {
     ])?;
     run_reg(&[
         "add",
-        INTERNET_SETTINGS_KEY,
+        inet_key,
         "/v",
         "ProxyEnable",
         "/t",
@@ -180,11 +320,11 @@ fn apply_wininet_proxy(server: &str, proxy_override: &str) -> Result<()> {
     Ok(())
 }
 
-fn set_windows_user_env(proxy_url: &str, no_proxy: &str) {
+fn set_windows_user_env(env_key: &str, proxy_url: &str, no_proxy: &str) {
     for key in ["HTTP_PROXY", "HTTPS_PROXY"] {
         let _ = run_reg(&[
             "add",
-            USER_ENV_KEY,
+            env_key,
             "/v",
             key,
             "/t",
@@ -196,7 +336,7 @@ fn set_windows_user_env(proxy_url: &str, no_proxy: &str) {
     }
     let _ = run_reg(&[
         "add",
-        USER_ENV_KEY,
+        env_key,
         "/v",
         "NO_PROXY",
         "/t",
@@ -205,19 +345,19 @@ fn set_windows_user_env(proxy_url: &str, no_proxy: &str) {
         no_proxy,
         "/f",
     ]);
-    let _ = run_reg(&["delete", USER_ENV_KEY, "/v", "ALL_PROXY", "/f"]);
+    let _ = run_reg(&["delete", env_key, "/v", "ALL_PROXY", "/f"]);
 }
 
-fn unset_windows_user_env() {
+fn unset_windows_user_env(env_key: &str) {
     for key in ["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY"] {
-        let _ = run_reg(&["delete", USER_ENV_KEY, "/v", key, "/f"]);
+        let _ = run_reg(&["delete", env_key, "/v", key, "/f"]);
     }
 }
 
-fn query_wininet_state() -> (bool, String) {
-    let enabled_raw = query_reg_sz(INTERNET_SETTINGS_KEY, "ProxyEnable").unwrap_or_default();
+fn query_wininet_state(inet_key: &str) -> (bool, String) {
+    let enabled_raw = query_reg_sz(inet_key, "ProxyEnable").unwrap_or_default();
     let enabled = enabled_raw == "0x1" || enabled_raw == "1";
-    let server = query_reg_sz(INTERNET_SETTINGS_KEY, "ProxyServer").unwrap_or_default();
+    let server = query_reg_sz(inet_key, "ProxyServer").unwrap_or_default();
     (enabled, server)
 }
 
@@ -233,18 +373,12 @@ pub fn query_reg_sz(key: &str, value_name: &str) -> Option<String> {
     let text = String::from_utf8_lossy(&out.stdout);
     for line in text.lines() {
         let trimmed = line.trim();
-        if trimmed
-            .to_ascii_lowercase()
-            .starts_with(&value_name.to_ascii_lowercase())
-        {
-            let parts: Vec<&str> = trimmed.splitn(3, char::is_whitespace).collect();
-            let tokens: Vec<&str> = trimmed.split_whitespace().collect();
-            if tokens.len() >= 3 {
-                let idx = trimmed.find(tokens[1])? + tokens[1].len();
-                let val = trimmed[idx..].trim();
-                let _ = parts;
-                return Some(val.to_string());
-            }
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+        if tokens.len() >= 3 && tokens[0].eq_ignore_ascii_case(value_name) {
+            let after_name = &trimmed[tokens[0].len()..];
+            let idx = after_name.find(tokens[1])? + tokens[1].len();
+            let val = after_name[idx..].trim();
+            return Some(val.to_string());
         }
     }
     None
@@ -267,7 +401,7 @@ pub fn run_reg(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-fn notify_wininet_refresh() {
+pub fn notify_wininet_refresh() {
     unsafe {
         let _ = InternetSetOptionW(
             std::ptr::null_mut(),
@@ -282,6 +416,131 @@ fn notify_wininet_refresh() {
             0,
         );
     }
+}
+
+pub fn broadcast_environment_change() {
+    let wide: Vec<u16> = "Environment\0".encode_utf16().collect();
+    let mut result: usize = 0;
+    unsafe {
+        let _ = SendMessageTimeoutW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            0,
+            wide.as_ptr() as isize,
+            SMTO_ABORTIFHUNG,
+            500,
+            &mut result,
+        );
+    }
+}
+
+/// Adds `dir` to the Windows System `Path` (`REG_EXPAND_SZ`) and removes any legacy directory
+/// from the current user's `Path` so `vdpi` resolves cleanly from any terminal.
+pub fn add_dir_to_windows_system_path(dir: &Path, legacy_dir: Option<&Path>) -> Result<bool> {
+    let target = dir.display().to_string();
+    let target_norm = target.trim_end_matches('\\');
+
+    let current = query_reg_sz(SYSTEM_ENV_KEY, "Path").unwrap_or_default();
+    let mut parts: Vec<String> = current
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect();
+
+    let already_present = parts
+        .iter()
+        .any(|p| p.trim_end_matches('\\').eq_ignore_ascii_case(target_norm));
+
+    let mut changed = false;
+    if !already_present {
+        parts.push(target_norm.to_string());
+        let new_path = parts.join(";");
+        run_reg(&[
+            "add",
+            SYSTEM_ENV_KEY,
+            "/v",
+            "Path",
+            "/t",
+            "REG_EXPAND_SZ",
+            "/d",
+            &new_path,
+            "/f",
+        ])?;
+        changed = true;
+    }
+
+    if let Some(legacy) = legacy_dir {
+        if remove_from_env_path_key(&user_env_key("HKCU"), &[legacy]) {
+            changed = true;
+        }
+    }
+
+    if changed {
+        broadcast_environment_change();
+    }
+    Ok(!already_present)
+}
+
+/// Removes `dir` (and optional `legacy_dir`) from System `Path` and interactive User `Path` entries.
+pub fn remove_dir_from_windows_path(dir: &Path, legacy_dir: Option<&Path>) {
+    let mut targets = vec![dir];
+    if let Some(legacy) = legacy_dir {
+        targets.push(legacy);
+    }
+
+    let mut changed = remove_from_env_path_key(SYSTEM_ENV_KEY, &targets);
+    for root in all_cleanup_roots() {
+        if remove_from_env_path_key(&user_env_key(&root), &targets) {
+            changed = true;
+        }
+    }
+
+    if changed {
+        broadcast_environment_change();
+    }
+}
+
+fn remove_from_env_path_key(env_key: &str, dirs: &[&Path]) -> bool {
+    let Some(current) = query_reg_sz(env_key, "Path") else {
+        return false;
+    };
+
+    let targets: Vec<String> = dirs
+        .iter()
+        .map(|d| d.display().to_string().trim_end_matches('\\').to_string())
+        .collect();
+
+    let parts: Vec<&str> = current
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let filtered: Vec<&str> = parts
+        .iter()
+        .copied()
+        .filter(|p| {
+            let norm = p.trim_end_matches('\\');
+            !targets.iter().any(|t| norm.eq_ignore_ascii_case(t))
+        })
+        .collect();
+
+    if filtered.len() == parts.len() {
+        return false;
+    }
+
+    let new_path = filtered.join(";");
+    let reg_type = if env_key == SYSTEM_ENV_KEY || new_path.contains('%') {
+        "REG_EXPAND_SZ"
+    } else {
+        "REG_SZ"
+    };
+
+    run_reg(&[
+        "add", env_key, "/v", "Path", "/t", reg_type, "/d", &new_path, "/f",
+    ])
+    .is_ok()
 }
 
 fn build_windows_proxy_override(extra: &[String]) -> String {
