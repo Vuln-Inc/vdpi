@@ -8,10 +8,12 @@ use crate::tls::{
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
-use tokio::io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tracing::debug;
@@ -88,6 +90,7 @@ pub struct EngineTelemetry {
     pub bytes_rx: AtomicU64,
     pub tls_handshakes: AtomicU64,
     pub auto_heal_escalations: AtomicU64,
+    pub learned_hosts: AtomicUsize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -98,6 +101,69 @@ pub struct EngineTelemetrySnapshot {
     pub bytes_rx: u64,
     pub tls_handshakes: u64,
     pub auto_heal_escalations: u64,
+    pub learned_hosts: usize,
+}
+
+/// Wraps an upstream `TcpStream` to update `bytes_tx` / `bytes_rx` live on every I/O completion
+/// (rather than only after clean EOF), so active downloads/streams and reset sockets are counted.
+struct CountingStream<S> {
+    inner: S,
+    telemetry: Arc<EngineTelemetry>,
+}
+
+impl<S> CountingStream<S> {
+    fn new(inner: S, telemetry: Arc<EngineTelemetry>) -> Self {
+        Self { inner, telemetry }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for CountingStream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &poll {
+            let n = buf.filled().len().saturating_sub(before);
+            if n > 0 {
+                self.telemetry
+                    .bytes_rx
+                    .fetch_add(n as u64, Ordering::Relaxed);
+            }
+        }
+        poll
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &poll {
+            if *n > 0 {
+                self.telemetry
+                    .bytes_tx
+                    .fetch_add(*n as u64, Ordering::Relaxed);
+            }
+        }
+        poll
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 struct ActiveConnGuard(Arc<EngineTelemetry>);
@@ -165,6 +231,7 @@ impl EngineContext {
             bytes_rx: self.telemetry.bytes_rx.load(Ordering::Relaxed),
             tls_handshakes: self.telemetry.tls_handshakes.load(Ordering::Relaxed),
             auto_heal_escalations: self.telemetry.auto_heal_escalations.load(Ordering::Relaxed),
+            learned_hosts: self.telemetry.learned_hosts.load(Ordering::Relaxed),
         }
     }
 
@@ -178,6 +245,7 @@ impl EngineContext {
 
     pub async fn clear_adaptive_cache(&self) {
         self.adaptive_cache.write().await.clear();
+        self.telemetry.learned_hosts.store(0, Ordering::Relaxed);
         self.preferred_isp_stage
             .store(LearnedStrategy::Primary as u8, Ordering::Relaxed);
     }
@@ -302,30 +370,41 @@ impl EngineContext {
         let mut remote_buf = [0u8; 4096];
         let mut filled: usize;
 
-        // Wait for initial client flight, while remaining safe for server-speaks-first protocols.
-        tokio::select! {
-            biased;
-            res = client.read(&mut first_buf) => {
-                let n = res?;
+        // Wait for initial client flight with a bounded idle timeout so stalled half-open
+        // connections cannot pin session permits indefinitely, while staying safe for
+        // server-speaks-first protocols.
+        let initial_flight = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                biased;
+                res = client.read(&mut first_buf) => Ok::<_, std::io::Error>((true, res?)),
+                res = remote.read(&mut remote_buf) => Ok::<_, std::io::Error>((false, res?)),
+            }
+        })
+        .await;
+
+        match initial_flight {
+            Ok(Ok((true, n))) => {
                 if n == 0 {
                     return Ok(());
                 }
                 filled = n;
             }
-            res = remote.read(&mut remote_buf) => {
-                let n = res?;
+            Ok(Ok((false, n))) => {
                 if n == 0 {
                     return Ok(());
                 }
                 let _guard = ActiveConnGuard::enter(&self.telemetry);
                 client.write_all(&remote_buf[..n]).await?;
-                self.telemetry.bytes_rx.fetch_add(n as u64, Ordering::Relaxed);
+                self.telemetry
+                    .bytes_rx
+                    .fetch_add(n as u64, Ordering::Relaxed);
                 drop(first_buf);
-                let (tx, rx) = copy_bidirectional(&mut client, &mut remote).await?;
-                self.telemetry.bytes_tx.fetch_add(tx, Ordering::Relaxed);
-                self.telemetry.bytes_rx.fetch_add(rx, Ordering::Relaxed);
+                let mut counted = CountingStream::new(remote, Arc::clone(&self.telemetry));
+                let _ = copy_bidirectional(&mut client, &mut counted).await?;
                 return Ok(());
             }
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => return Ok(()),
         }
 
         // If the first flight starts a TLS Handshake record (e.g. 1,800-byte Post-Quantum ClientHello),
@@ -392,9 +471,8 @@ impl EngineContext {
                 self.telemetry
                     .bytes_tx
                     .fetch_add(payload.len() as u64, Ordering::Relaxed);
-                let (tx, rx) = copy_bidirectional(&mut client, &mut remote).await?;
-                self.telemetry.bytes_tx.fetch_add(tx, Ordering::Relaxed);
-                self.telemetry.bytes_rx.fetch_add(rx, Ordering::Relaxed);
+                let mut counted = CountingStream::new(remote, Arc::clone(&self.telemetry));
+                let _ = copy_bidirectional(&mut client, &mut counted).await?;
                 return Ok(());
             }
 
@@ -414,14 +492,13 @@ impl EngineContext {
                 self.telemetry
                     .bytes_tx
                     .fetch_add(payload.len() as u64, Ordering::Relaxed);
-                let (tx, rx) = copy_bidirectional(&mut client, &mut remote).await?;
-                self.telemetry.bytes_tx.fetch_add(tx, Ordering::Relaxed);
-                self.telemetry.bytes_rx.fetch_add(rx, Ordering::Relaxed);
+                let mut counted = CountingStream::new(remote, Arc::clone(&self.telemetry));
+                let _ = copy_bidirectional(&mut client, &mut counted).await?;
                 return Ok(());
             }
 
             let stages = self.build_stage_order(cached_stage);
-            let retry_addrs = self.collect_retry_addrs(effective_host, remote_addr).await;
+            let mut retry_addrs: Option<Vec<SocketAddr>> = None;
 
             let mut probe_buf = vec![0u8; 16384];
             let mut current_remote = Some(remote);
@@ -429,10 +506,19 @@ impl EngineContext {
             let mut saw_tls_alert = false;
 
             for (idx, &stage) in stages.iter().enumerate() {
+                let is_last_stage = idx + 1 == stages.len();
                 let mut stream = match current_remote.take() {
                     Some(s) => s,
                     None => {
-                        let target = retry_addrs[idx % retry_addrs.len()];
+                        let addrs = match retry_addrs.as_ref() {
+                            Some(a) => a,
+                            None => {
+                                let resolved =
+                                    self.collect_retry_addrs(effective_host, remote_addr).await;
+                                retry_addrs.insert(resolved)
+                            }
+                        };
+                        let target = addrs[idx % addrs.len()];
                         match connect_retry_stream(self, target, remote_addr).await {
                             Some(s) => s,
                             None => continue,
@@ -445,6 +531,11 @@ impl EngineContext {
                     .await
                     .is_err()
                 {
+                    if !is_last_stage {
+                        self.telemetry
+                            .auto_heal_escalations
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     saw_network_block = true;
                     continue;
                 }
@@ -455,7 +546,6 @@ impl EngineContext {
                     _ => 2000,
                 };
 
-                let is_last_stage = idx + 1 == stages.len();
                 match tokio::time::timeout(
                     Duration::from_millis(wait_ms),
                     stream.read(&mut probe_buf),
@@ -497,6 +587,9 @@ impl EngineContext {
                                     guard.clear();
                                 }
                                 guard.insert(key, stage);
+                                self.telemetry
+                                    .learned_hosts
+                                    .store(guard.len(), Ordering::Relaxed);
                             }
 
                             // If earlier desync stage failed due to ISP RST/block/timeout (not server TLS Alert),
@@ -516,15 +609,16 @@ impl EngineContext {
                         client.write_all(&probe_buf[..n]).await?;
                         client.flush().await?;
                         drop(probe_buf);
-                        let (tx, rx) = copy_bidirectional(&mut client, &mut stream).await?;
-                        self.telemetry.bytes_tx.fetch_add(tx, Ordering::Relaxed);
-                        self.telemetry.bytes_rx.fetch_add(rx, Ordering::Relaxed);
+                        let mut counted = CountingStream::new(stream, Arc::clone(&self.telemetry));
+                        let _ = copy_bidirectional(&mut client, &mut counted).await?;
                         return Ok(());
                     }
                     _ => {
-                        self.telemetry
-                            .auto_heal_escalations
-                            .fetch_add(1, Ordering::Relaxed);
+                        if !is_last_stage {
+                            self.telemetry
+                                .auto_heal_escalations
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                         saw_network_block = true;
                         debug!(
                             host = ?effective_host,
@@ -539,7 +633,11 @@ impl EngineContext {
             // If all stages failed and we had a stale cached strategy, clear it so the next attempt probes fresh.
             if cached_stage.is_some() {
                 if let Some(key) = cache_key {
-                    self.adaptive_cache.write().await.remove(&key);
+                    let mut guard = self.adaptive_cache.write().await;
+                    guard.remove(&key);
+                    self.telemetry
+                        .learned_hosts
+                        .store(guard.len(), Ordering::Relaxed);
                 }
             }
 
@@ -555,9 +653,8 @@ impl EngineContext {
         self.telemetry
             .bytes_tx
             .fetch_add(payload.len() as u64, Ordering::Relaxed);
-        let (tx, rx) = copy_bidirectional(&mut client, &mut remote).await?;
-        self.telemetry.bytes_tx.fetch_add(tx, Ordering::Relaxed);
-        self.telemetry.bytes_rx.fetch_add(rx, Ordering::Relaxed);
+        let mut counted = CountingStream::new(remote, Arc::clone(&self.telemetry));
+        let _ = copy_bidirectional(&mut client, &mut counted).await?;
         Ok(())
     }
 
@@ -586,7 +683,7 @@ impl EngineContext {
         let mut addrs = vec![initial_addr];
         if let Some(h) = host {
             if !initial_addr.ip().is_loopback() {
-                if let Ok(ips) = self.dns.resolve(h).await {
+                if let Ok(ips) = self.dns.resolve_internal(h).await {
                     // Only rotate among alternate IPs of the same address family that already
                     // proved reachable on attempt 0 so unreachable IPv6 never stalls retries.
                     for ip in ips {
@@ -1021,7 +1118,14 @@ async fn send_with_oob(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
         match res {
             Ok(0) => bail!("peer closed connection during MSG_OOB send"),
             Ok(n) => sent += n,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(ref e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue;
+            }
             Err(e) => return Err(e.into()),
         }
     }
@@ -1034,6 +1138,11 @@ fn raw_send_oob(stream: &TcpStream, data: &[u8]) -> std::io::Result<usize> {
     use std::os::unix::io::AsRawFd;
 
     const MSG_OOB: i32 = 0x1;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const SEND_FLAGS: i32 = MSG_OOB | 0x4000; // MSG_OOB | MSG_NOSIGNAL
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const SEND_FLAGS: i32 = MSG_OOB;
+
     extern "C" {
         fn send(sockfd: i32, buf: *const c_void, len: usize, flags: i32) -> isize;
     }
@@ -1043,7 +1152,7 @@ fn raw_send_oob(stream: &TcpStream, data: &[u8]) -> std::io::Result<usize> {
             stream.as_raw_fd(),
             data.as_ptr().cast::<c_void>(),
             data.len(),
-            MSG_OOB,
+            SEND_FLAGS,
         )
     };
     if n < 0 {

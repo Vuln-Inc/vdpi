@@ -22,7 +22,14 @@ const MAX_DNS_MESSAGE_BYTES: usize = u16::MAX as usize;
 #[derive(Debug, Clone)]
 struct CacheEntry {
     ips: Vec<IpAddr>,
+    nxdomain: bool,
     expires_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+enum DnsOutcome {
+    Records(Vec<IpAddr>, Duration),
+    NxDomain(Duration),
 }
 
 #[derive(Clone)]
@@ -84,7 +91,27 @@ impl DnsResolver {
     /// Resistant to ISP port-53 DNS hijacking by cascading through RFC 8484 DoH providers
     /// and non-standard port 1253 UDP DNS before falling back to OS resolution.
     pub async fn resolve(&self, host: &str) -> Result<Vec<IpAddr>> {
-        self.query_count.fetch_add(1, Ordering::Relaxed);
+        self.resolve_with_metric(host, true).await
+    }
+
+    /// Internal resolution helper that does not increment user-facing `query_count` telemetry
+    /// (used for lazy TLS retry address rotation).
+    pub async fn resolve_internal(&self, host: &str) -> Result<Vec<IpAddr>> {
+        self.resolve_with_metric(host, false).await
+    }
+
+    async fn resolve_with_metric(&self, host: &str, count_metric: bool) -> Result<Vec<IpAddr>> {
+        match self.resolve_outcome(host, count_metric).await? {
+            DnsOutcome::Records(ips, _) if !ips.is_empty() => Ok(ips),
+            DnsOutcome::NxDomain(_) => bail!("NXDOMAIN for {host}"),
+            DnsOutcome::Records(_, _) => bail!("no IP addresses resolved for {host}"),
+        }
+    }
+
+    async fn resolve_outcome(&self, host: &str, count_metric: bool) -> Result<DnsOutcome> {
+        if count_metric {
+            self.query_count.fetch_add(1, Ordering::Relaxed);
+        }
         let normalized = host
             .trim()
             .trim_matches(|c| c == '[' || c == ']')
@@ -97,98 +124,125 @@ impl DnsResolver {
 
         // 1. Direct IP literal
         if let Ok(ip) = normalized.parse::<IpAddr>() {
-            return Ok(vec![ip]);
+            return Ok(DnsOutcome::Records(vec![ip], Duration::from_secs(300)));
         }
 
         // 2. Localhost fast-path
         if normalized == "localhost" {
-            return if self.ipv4_only {
-                Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)])
+            let ips = if self.ipv4_only {
+                vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]
             } else {
-                Ok(vec![
+                vec![
                     IpAddr::V4(Ipv4Addr::LOCALHOST),
                     IpAddr::V6(Ipv6Addr::LOCALHOST),
-                ])
+                ]
             };
+            return Ok(DnsOutcome::Records(ips, Duration::from_secs(300)));
         }
 
-        // 3. mDNS (.local) via OS resolver
+        // 3. mDNS (.local) via OS resolver (unfiltered because LAN IPs are expected)
         if normalized.ends_with(".local") {
-            return self.resolve_via_system(&normalized).await;
+            let ips = self.resolve_via_system(&normalized, false).await?;
+            return Ok(DnsOutcome::Records(ips, Duration::from_secs(60)));
         }
 
-        // 4. In-memory TTL cache lookup
+        // 4. In-memory TTL cache lookup (including negative NXDOMAIN cache)
         {
             let guard = self.cache.read().await;
             if let Some(entry) = guard.get(&normalized) {
-                if Instant::now() < entry.expires_at && !entry.ips.is_empty() {
-                    return Ok(entry.ips.clone());
+                let now = Instant::now();
+                if now < entry.expires_at {
+                    let rem = entry.expires_at.saturating_duration_since(now);
+                    if entry.nxdomain {
+                        return Ok(DnsOutcome::NxDomain(rem));
+                    }
+                    if !entry.ips.is_empty() {
+                        return Ok(DnsOutcome::Records(entry.ips.clone(), rem));
+                    }
                 }
             }
         }
 
         // 5. Multi-tier unpoisoned resolution:
-        //    Tier A: RFC 8484 DNS-over-HTTPS (with concurrent failover + 30s circuit-breaker if ISP blocks all DoH)
-        //    Tier B: Non-standard port 1253 / 443 / 5353 + backup UDP DNS (bypasses ISP port-53 transparent proxies)
-        //    Tier C: System resolver fallback
+        //    Tier A: RFC 8484 DNS-over-HTTPS (only transport failures trip the 30s circuit-breaker;
+        //            protocol NXDOMAIN/NODATA replies return directly without DoH failover!)
+        //    Tier B: Non-standard port 1253 / 443 / 5353 + backup UDP DNS
+        //    Tier C: System resolver fallback (with sinkhole IP filtering)
         let doh_in_backoff = self
             .doh_backoff_until
             .read()
             .await
             .is_some_and(|until| Instant::now() < until);
 
-        let (ips, ttl) = if self.enable_doh && !doh_in_backoff {
+        let outcome = if self.enable_doh && !doh_in_backoff {
             match self.resolve_via_doh(&normalized).await {
-                Ok(res) if !res.0.is_empty() => res,
-                _ => {
+                Ok(DnsOutcome::NxDomain(ttl)) => DnsOutcome::NxDomain(ttl),
+                Ok(DnsOutcome::Records(ips, ttl)) if !ips.is_empty() => {
+                    DnsOutcome::Records(ips, ttl)
+                }
+                Ok(DnsOutcome::Records(_, ttl)) => DnsOutcome::Records(Vec::new(), ttl),
+                Err(_) => {
                     *self.doh_backoff_until.write().await =
                         Some(Instant::now() + Duration::from_secs(30));
-                    match self.resolve_via_udp(&normalized).await {
-                        Ok(res) if !res.0.is_empty() => res,
-                        _ => {
-                            let sys = self.resolve_via_system(&normalized).await?;
-                            (sys, Duration::from_secs(60))
-                        }
-                    }
+                    self.resolve_udp_or_system(&normalized).await?
                 }
             }
         } else {
-            match self.resolve_via_udp(&normalized).await {
-                Ok(res) if !res.0.is_empty() => res,
-                _ => {
-                    let sys = self.resolve_via_system(&normalized).await?;
-                    (sys, Duration::from_secs(60))
-                }
-            }
+            self.resolve_udp_or_system(&normalized).await?
         };
 
-        if ips.is_empty() {
-            bail!("no IP addresses resolved for {normalized}");
+        match &outcome {
+            DnsOutcome::NxDomain(ttl) => {
+                let mut guard = self.cache.write().await;
+                insert_cache_entry(
+                    &mut guard,
+                    normalized,
+                    CacheEntry {
+                        ips: Vec::new(),
+                        nxdomain: true,
+                        expires_at: Instant::now() + (*ttl).min(Duration::from_secs(60)),
+                    },
+                );
+            }
+            DnsOutcome::Records(ips, ttl) if !ips.is_empty() && ips.len() <= MAX_CACHED_IPS => {
+                let mut guard = self.cache.write().await;
+                insert_cache_entry(
+                    &mut guard,
+                    normalized,
+                    CacheEntry {
+                        ips: ips.clone(),
+                        nxdomain: false,
+                        expires_at: Instant::now() + *ttl,
+                    },
+                );
+            }
+            _ => {}
         }
 
-        if ips.len() <= MAX_CACHED_IPS {
-            let mut guard = self.cache.write().await;
-            insert_cache_entry(
-                &mut guard,
-                normalized,
-                CacheEntry {
-                    ips: ips.clone(),
-                    expires_at: Instant::now() + ttl,
-                },
-            );
-        }
-
-        Ok(ips)
+        Ok(outcome)
     }
 
-    async fn resolve_via_doh(&self, domain: &str) -> Result<(Vec<IpAddr>, Duration)> {
-        if self.ipv4_only {
-            let (ips, ttl) = self.query_doh_type(domain, QTYPE_A).await?;
-            let clean = filter_poisoned_ips(ips);
-            if clean.is_empty() {
-                bail!("DoH returned no usable IPv4 records for {domain}");
+    async fn resolve_udp_or_system(&self, domain: &str) -> Result<DnsOutcome> {
+        match self.resolve_via_udp(domain).await {
+            Ok(DnsOutcome::NxDomain(ttl)) => Ok(DnsOutcome::NxDomain(ttl)),
+            Ok(DnsOutcome::Records(ips, ttl)) if !ips.is_empty() => {
+                Ok(DnsOutcome::Records(ips, ttl))
             }
-            return Ok((clean, ttl));
+            _ => {
+                let sys = self.resolve_via_system(domain, true).await?;
+                Ok(DnsOutcome::Records(sys, Duration::from_secs(60)))
+            }
+        }
+    }
+
+    async fn resolve_via_doh(&self, domain: &str) -> Result<DnsOutcome> {
+        if self.ipv4_only {
+            return match self.query_doh_type(domain, QTYPE_A).await? {
+                DnsOutcome::NxDomain(ttl) => Ok(DnsOutcome::NxDomain(ttl)),
+                DnsOutcome::Records(ips, ttl) => {
+                    Ok(DnsOutcome::Records(filter_poisoned_ips(ips), ttl))
+                }
+            };
         }
 
         let (v4_res, v6_res) = tokio::join!(
@@ -201,37 +255,63 @@ impl DnsResolver {
 
         let mut ips = Vec::new();
         let mut min_ttl = Duration::from_secs(300);
+        let mut saw_any_response = false;
+        let mut v4_nxdomain = false;
+        let mut v6_nxdomain = false;
 
-        if let Ok((v4, ttl)) = v4_res {
-            let clean_v4 = filter_poisoned_ips(v4);
-            if !clean_v4.is_empty() {
+        match v4_res {
+            Ok(DnsOutcome::NxDomain(ttl)) => {
+                saw_any_response = true;
+                v4_nxdomain = true;
                 min_ttl = min_ttl.min(ttl);
-                ips.extend(clean_v4);
             }
+            Ok(DnsOutcome::Records(v4, ttl)) => {
+                saw_any_response = true;
+                let clean_v4 = filter_poisoned_ips(v4);
+                if !clean_v4.is_empty() {
+                    min_ttl = min_ttl.min(ttl);
+                    ips.extend(clean_v4);
+                }
+            }
+            Err(_) => {}
         }
 
         // CNAME-only empty AAAA responses (such as www.roblox.com) are normal and must never
         // discard valid IPv4 A records.
-        if let Ok(Ok((v6, ttl))) = v6_res {
-            let clean_v6 = filter_poisoned_ips(v6);
-            if !clean_v6.is_empty() {
+        match v6_res {
+            Ok(Ok(DnsOutcome::NxDomain(ttl))) => {
+                saw_any_response = true;
+                v6_nxdomain = true;
                 min_ttl = min_ttl.min(ttl);
-                for ip in clean_v6 {
-                    if !ips.contains(&ip) {
-                        ips.push(ip);
+            }
+            Ok(Ok(DnsOutcome::Records(v6, ttl))) => {
+                saw_any_response = true;
+                let clean_v6 = filter_poisoned_ips(v6);
+                if !clean_v6.is_empty() {
+                    min_ttl = min_ttl.min(ttl);
+                    for ip in clean_v6 {
+                        if !ips.contains(&ip) {
+                            ips.push(ip);
+                        }
                     }
                 }
             }
+            _ => {}
         }
 
-        if ips.is_empty() {
-            bail!("DoH returned no usable A/AAAA records for {domain}");
+        if !ips.is_empty() {
+            return Ok(DnsOutcome::Records(ips, min_ttl));
         }
-
-        Ok((ips, min_ttl))
+        if v4_nxdomain && (v6_nxdomain || !saw_any_response || ips.is_empty()) {
+            return Ok(DnsOutcome::NxDomain(min_ttl.min(Duration::from_secs(30))));
+        }
+        if saw_any_response {
+            return Ok(DnsOutcome::Records(Vec::new(), min_ttl.min(Duration::from_secs(60))));
+        }
+        bail!("DoH transport failed for {domain}")
     }
 
-    async fn query_doh_type(&self, domain: &str, qtype: u16) -> Result<(Vec<IpAddr>, Duration)> {
+    async fn query_doh_type(&self, domain: &str, qtype: u16) -> Result<DnsOutcome> {
         let wire_query = encode_dns_query(domain, qtype)?;
         let count = self.doh_endpoints.len();
         if count == 0 {
@@ -247,14 +327,12 @@ impl DnsResolver {
                 domain = %domain,
                 qtype = qtype,
                 endpoint = %self.doh_endpoints[start],
-                count = parsed.0.len(),
                 "DoH query succeeded"
             );
             return Ok(parsed);
         }
 
-        // Preferred DoH failed (e.g. ISP throttled/blackholed it): race ALL remaining DoH
-        // endpoints concurrently so failover finishes in <= 1.2s instead of stalling sequentially.
+        // Preferred DoH transport failed: race ALL remaining DoH endpoints concurrently.
         let mut join_set = tokio::task::JoinSet::new();
         for offset in 1..count {
             let idx = (start + offset) % count;
@@ -278,7 +356,6 @@ impl DnsResolver {
                             domain = %domain,
                             qtype = qtype,
                             endpoint = %endpoint,
-                            count = parsed.0.len(),
                             "DoH failover succeeded and promoted endpoint"
                         );
                         return Ok(parsed);
@@ -291,8 +368,52 @@ impl DnsResolver {
         Err(last_err.unwrap_or_else(|| anyhow!("no DoH endpoints reachable")))
     }
 
-    async fn resolve_via_udp(&self, domain: &str) -> Result<(Vec<IpAddr>, Duration)> {
-        let wire_query = encode_dns_query(domain, QTYPE_A)?;
+    async fn resolve_via_udp(&self, domain: &str) -> Result<DnsOutcome> {
+        if self.ipv4_only {
+            return self.query_udp_type(domain, QTYPE_A).await;
+        }
+        let (v4_res, v6_res) = tokio::join!(
+            self.query_udp_type(domain, QTYPE_A),
+            tokio::time::timeout(
+                Duration::from_millis(800),
+                self.query_udp_type(domain, QTYPE_AAAA)
+            )
+        );
+        let mut ips = Vec::new();
+        let mut min_ttl = Duration::from_secs(300);
+        let mut nxdomain = false;
+
+        if let Ok(outcome) = v4_res {
+            match outcome {
+                DnsOutcome::NxDomain(ttl) => {
+                    nxdomain = true;
+                    min_ttl = min_ttl.min(ttl);
+                }
+                DnsOutcome::Records(v4, ttl) => {
+                    min_ttl = min_ttl.min(ttl);
+                    ips.extend(v4);
+                }
+            }
+        }
+        if let Ok(Ok(DnsOutcome::Records(v6, ttl))) = v6_res {
+            min_ttl = min_ttl.min(ttl);
+            for ip in v6 {
+                if !ips.contains(&ip) {
+                    ips.push(ip);
+                }
+            }
+        }
+        if !ips.is_empty() {
+            Ok(DnsOutcome::Records(ips, min_ttl))
+        } else if nxdomain {
+            Ok(DnsOutcome::NxDomain(min_ttl.min(Duration::from_secs(30))))
+        } else {
+            bail!("UDP DNS resolution failed for {domain}")
+        }
+    }
+
+    async fn query_udp_type(&self, domain: &str, qtype: u16) -> Result<DnsOutcome> {
+        let wire_query = encode_dns_query(domain, qtype)?;
         let count = self.udp_dns_servers.len();
         if count == 0 {
             bail!("no UDP DNS servers configured");
@@ -304,45 +425,34 @@ impl DnsResolver {
         for offset in 0..count {
             let idx = (start + offset) % count;
             let server = self.udp_dns_servers[idx];
-            let bind_addr = if server.is_ipv4() {
-                "0.0.0.0:0"
-            } else {
-                "[::]:0"
-            };
-            let Ok(sock) = UdpSocket::bind(bind_addr).await else {
-                continue;
-            };
-            if sock.connect(server).await.is_err() {
-                continue;
-            }
-            if sock.send(&wire_query).await.is_err() {
-                continue;
-            }
-
-            let mut buf = [0u8; 2048];
-            match tokio::time::timeout(Duration::from_millis(1000), sock.recv(&mut buf)).await {
-                Ok(Ok(n)) => match decode_dns_response(&buf[..n], QTYPE_A) {
-                    Ok((ips, ttl)) => {
+            match send_udp_dns_raw(server, &wire_query).await {
+                Ok(buf) => match decode_dns_outcome(&buf, qtype) {
+                    Ok(DnsOutcome::NxDomain(ttl)) => {
+                        if offset > 0 {
+                            self.preferred_udp_idx.store(idx, Ordering::Relaxed);
+                        }
+                        return Ok(DnsOutcome::NxDomain(ttl));
+                    }
+                    Ok(DnsOutcome::Records(ips, ttl)) => {
                         let clean = filter_poisoned_ips(ips);
-                        if !clean.is_empty() {
-                            if offset > 0 {
+                        if !clean.is_empty() || qtype == QTYPE_AAAA {
+                            if offset > 0 && !clean.is_empty() {
                                 self.preferred_udp_idx.store(idx, Ordering::Relaxed);
                             }
-                            return Ok((clean, ttl));
+                            return Ok(DnsOutcome::Records(clean, ttl));
                         }
                         last_err = Some(anyhow!("UDP DNS {server} returned poisoned/empty reply"));
                     }
                     Err(e) => last_err = Some(e),
                 },
-                Ok(Err(e)) => last_err = Some(e.into()),
-                Err(_) => last_err = Some(anyhow!("UDP DNS timeout from {server}")),
+                Err(e) => last_err = Some(e),
             }
         }
 
         Err(last_err.unwrap_or_else(|| anyhow!("UDP DNS resolution failed for {domain}")))
     }
 
-    async fn resolve_via_system(&self, domain: &str) -> Result<Vec<IpAddr>> {
+    async fn resolve_via_system(&self, domain: &str, filter_poison: bool) -> Result<Vec<IpAddr>> {
         let addrs = lookup_host((domain, 443u16))
             .await
             .with_context(|| format!("system DNS lookup failed for {domain}"))?;
@@ -353,13 +463,13 @@ impl DnsResolver {
             match sa.ip() {
                 IpAddr::V4(ip) => {
                     let addr = IpAddr::V4(ip);
-                    if !v4.contains(&addr) {
+                    if (!filter_poison || !is_poisoned_public_ip(addr)) && !v4.contains(&addr) {
                         v4.push(addr);
                     }
                 }
                 IpAddr::V6(ip) if !self.ipv4_only => {
                     let addr = IpAddr::V6(ip);
-                    if !v6.contains(&addr) {
+                    if (!filter_poison || !is_poisoned_public_ip(addr)) && !v6.contains(&addr) {
                         v6.push(addr);
                     }
                 }
@@ -373,7 +483,7 @@ impl DnsResolver {
         Ok(v4)
     }
 
-    /// Answers a raw RFC 1035 DNS wire query (as intercepted from a TUN interface on UDP/53),
+    /// Answers a raw RFC 1035 DNS wire query (as intercepted from a TUN interface on UDP/53 or TCP/53),
     /// routing `A` and `AAAA` queries through the anti-poisoning DoH / non-port-53 DNS ring
     /// and returning `(wire_response, resolved_domain_ips)` so callers can populate reverse-DNS
     /// metadata without Fake-IP translation.
@@ -390,7 +500,7 @@ impl DnsResolver {
         if block_https_svcb && parsed.qtype == QTYPE_HTTPS {
             self.query_count.fetch_add(1, Ordering::Relaxed);
             return Ok((
-                build_dns_wire_response(parsed.tx_id, parsed.flags, question_slice, 0, &[]),
+                build_dns_wire_response(parsed.tx_id, parsed.flags, question_slice, 0, &[], 60),
                 None,
             ));
         }
@@ -399,13 +509,26 @@ impl DnsResolver {
             if parsed.qtype == QTYPE_AAAA && self.ipv4_only {
                 self.query_count.fetch_add(1, Ordering::Relaxed);
                 return Ok((
-                    build_dns_wire_response(parsed.tx_id, parsed.flags, question_slice, 0, &[]),
+                    build_dns_wire_response(parsed.tx_id, parsed.flags, question_slice, 0, &[], 60),
                     None,
                 ));
             }
 
-            match self.resolve(&parsed.qname).await {
-                Ok(ips) => {
+            match self.resolve_outcome(&parsed.qname, true).await {
+                Ok(DnsOutcome::NxDomain(_)) => {
+                    return Ok((
+                        build_dns_wire_response(
+                            parsed.tx_id,
+                            parsed.flags,
+                            question_slice,
+                            3,
+                            &[],
+                            30,
+                        ),
+                        None,
+                    ));
+                }
+                Ok(DnsOutcome::Records(ips, ttl)) => {
                     let matching: Vec<IpAddr> = ips
                         .into_iter()
                         .filter(|ip| match parsed.qtype {
@@ -414,12 +537,14 @@ impl DnsResolver {
                             _ => false,
                         })
                         .collect();
+                    let ttl_secs = ttl.as_secs().clamp(15, 3600) as u32;
                     let resp = build_dns_wire_response(
                         parsed.tx_id,
                         parsed.flags,
                         question_slice,
                         0,
                         &matching,
+                        ttl_secs,
                     );
                     let meta = if matching.is_empty() {
                         None
@@ -430,16 +555,29 @@ impl DnsResolver {
                 }
                 Err(_) => {
                     return Ok((
-                        build_dns_wire_response(parsed.tx_id, parsed.flags, question_slice, 2, &[]),
+                        build_dns_wire_response(
+                            parsed.tx_id,
+                            parsed.flags,
+                            question_slice,
+                            2,
+                            &[],
+                            0,
+                        ),
                         None,
                     ));
                 }
             }
         }
 
-        // Forward other RR types (SRV, TXT, MX, PTR, etc.) raw over the DoH ring when enabled.
+        // Forward other RR types (SRV, TXT, MX, PTR, etc.) over DoH (respecting backoff) or UDP fallback.
         self.query_count.fetch_add(1, Ordering::Relaxed);
-        if self.enable_doh {
+        let doh_in_backoff = self
+            .doh_backoff_until
+            .read()
+            .await
+            .is_some_and(|until| Instant::now() < until);
+
+        if self.enable_doh && !doh_in_backoff {
             if let Ok(mut raw) = self.query_doh_raw(query).await {
                 if raw.len() >= 12 {
                     raw[0..2].copy_from_slice(&parsed.tx_id.to_be_bytes());
@@ -448,8 +586,15 @@ impl DnsResolver {
             }
         }
 
+        if let Ok(mut raw) = self.query_udp_raw(query).await {
+            if raw.len() >= 12 {
+                raw[0..2].copy_from_slice(&parsed.tx_id.to_be_bytes());
+                return Ok((raw, None));
+            }
+        }
+
         Ok((
-            build_dns_wire_response(parsed.tx_id, parsed.flags, question_slice, 0, &[]),
+            build_dns_wire_response(parsed.tx_id, parsed.flags, question_slice, 2, &[], 0),
             None,
         ))
     }
@@ -470,7 +615,7 @@ impl DnsResolver {
         {
             return Ok(bytes);
         }
-        for offset in 1..count {
+        for offset in 1..count.min(3) {
             let idx = (start + offset) % count;
             if let Ok(bytes) =
                 send_doh_request_raw(&self.http, &self.doh_endpoints[idx], &normalized_query).await
@@ -479,8 +624,39 @@ impl DnsResolver {
                 return Ok(bytes);
             }
         }
-        bail!("raw DoH query failed across all endpoints")
+        bail!("raw DoH query failed")
     }
+
+    async fn query_udp_raw(&self, wire_query: &[u8]) -> Result<Vec<u8>> {
+        let count = self.udp_dns_servers.len();
+        if count == 0 {
+            bail!("no UDP DNS servers configured");
+        }
+        let start = self.preferred_udp_idx.load(Ordering::Relaxed) % count;
+        for offset in 0..count.min(3) {
+            let idx = (start + offset) % count;
+            if let Ok(bytes) = send_udp_dns_raw(self.udp_dns_servers[idx], wire_query).await {
+                return Ok(bytes);
+            }
+        }
+        bail!("raw UDP DNS query failed")
+    }
+}
+
+async fn send_udp_dns_raw(server: SocketAddr, wire_query: &[u8]) -> Result<Vec<u8>> {
+    let bind_addr = if server.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let sock = UdpSocket::bind(bind_addr).await?;
+    sock.connect(server).await?;
+    sock.send(wire_query).await?;
+    let mut buf = [0u8; 2048];
+    let n = tokio::time::timeout(Duration::from_millis(1000), sock.recv(&mut buf))
+        .await
+        .map_err(|_| anyhow!("UDP DNS timeout from {server}"))??;
+    Ok(buf[..n].to_vec())
 }
 
 struct ParsedDnsQuestion {
@@ -498,6 +674,13 @@ fn parse_dns_question(buf: &[u8]) -> Result<ParsedDnsQuestion> {
     }
     let tx_id = u16::from_be_bytes([buf[0], buf[1]]);
     let flags = u16::from_be_bytes([buf[2], buf[3]]);
+    if (flags & 0x8000) != 0 {
+        bail!("DNS packet is a response (QR=1), not a query");
+    }
+    let opcode = (flags >> 11) & 0x0f;
+    if opcode != 0 {
+        bail!("unsupported DNS OPCODE {opcode}");
+    }
     let qdcount = u16::from_be_bytes([buf[4], buf[5]]);
     if qdcount == 0 {
         bail!("DNS query has no questions");
@@ -556,6 +739,7 @@ fn build_dns_wire_response(
     question_slice: &[u8],
     rcode: u8,
     answers: &[IpAddr],
+    ttl_secs: u32,
 ) -> Vec<u8> {
     let rd = req_flags & 0x0100;
     // QR=1 (0x8000), RA=1 (0x0080), preserve RD, set RCODE
@@ -578,14 +762,14 @@ fn build_dns_wire_response(
             IpAddr::V4(v4) => {
                 out.extend_from_slice(&QTYPE_A.to_be_bytes());
                 out.extend_from_slice(&QCLASS_IN.to_be_bytes());
-                out.extend_from_slice(&120u32.to_be_bytes());
+                out.extend_from_slice(&ttl_secs.to_be_bytes());
                 out.extend_from_slice(&4u16.to_be_bytes());
                 out.extend_from_slice(&v4.octets());
             }
             IpAddr::V6(v6) => {
                 out.extend_from_slice(&QTYPE_AAAA.to_be_bytes());
                 out.extend_from_slice(&QCLASS_IN.to_be_bytes());
-                out.extend_from_slice(&120u32.to_be_bytes());
+                out.extend_from_slice(&ttl_secs.to_be_bytes());
                 out.extend_from_slice(&16u16.to_be_bytes());
                 out.extend_from_slice(&v6.octets());
             }
@@ -636,9 +820,9 @@ async fn send_doh_request(
     endpoint: &str,
     wire_query: &[u8],
     qtype: u16,
-) -> Result<(Vec<IpAddr>, Duration)> {
+) -> Result<DnsOutcome> {
     let bytes = send_doh_request_raw(http, endpoint, wire_query).await?;
-    decode_dns_response(&bytes, qtype)
+    decode_dns_outcome(&bytes, qtype)
 }
 
 fn build_doh_endpoints(dns_addr: &str) -> Vec<String> {
@@ -647,11 +831,13 @@ fn build_doh_endpoints(dns_addr: &str) -> Vec<String> {
     if trimmed.starts_with("https://") {
         list.push(trimmed.to_string());
     } else if !trimmed.is_empty() {
-        let primary = match trimmed {
-            "1.1.1.1" | "1.0.0.1" => format!("https://{trimmed}/dns-query"),
-            "8.8.8.8" | "8.8.4.4" => format!("https://{trimmed}/dns-query"),
-            "9.9.9.9" | "149.112.112.112" => format!("https://{trimmed}/dns-query"),
+        let stripped = trimmed.trim_matches(|c| c == '[' || c == ']');
+        let primary = match stripped {
+            "1.1.1.1" | "1.0.0.1" => format!("https://{stripped}/dns-query"),
+            "8.8.8.8" | "8.8.4.4" => format!("https://{stripped}/dns-query"),
+            "9.9.9.9" | "149.112.112.112" => format!("https://{stripped}/dns-query"),
             other if other.parse::<Ipv4Addr>().is_ok() => format!("https://{other}/dns-query"),
+            other if other.parse::<Ipv6Addr>().is_ok() => format!("https://[{other}]/dns-query"),
             _ => "https://1.1.1.1/dns-query".to_string(),
         };
         list.push(primary);
@@ -764,12 +950,22 @@ pub fn encode_dns_query(domain: &str, qtype: u16) -> Result<Vec<u8>> {
 
 /// Decodes a DNS wire response and extracts matching `A` or `AAAA` records along with a clamped TTL.
 pub fn decode_dns_response(buf: &[u8], expected_qtype: u16) -> Result<(Vec<IpAddr>, Duration)> {
+    match decode_dns_outcome(buf, expected_qtype)? {
+        DnsOutcome::Records(ips, ttl) => Ok((ips, ttl)),
+        DnsOutcome::NxDomain(_) => bail!("DNS response returned RCODE 3 (NXDOMAIN)"),
+    }
+}
+
+fn decode_dns_outcome(buf: &[u8], expected_qtype: u16) -> Result<DnsOutcome> {
     if buf.len() < 12 {
         bail!("DNS response shorter than 12-byte header");
     }
 
     let flags = u16::from_be_bytes([buf[2], buf[3]]);
     let rcode = flags & 0x000f;
+    if rcode == 3 {
+        return Ok(DnsOutcome::NxDomain(Duration::from_secs(30)));
+    }
     if rcode != 0 {
         bail!("DNS response returned RCODE {rcode}");
     }
@@ -838,7 +1034,7 @@ pub fn decode_dns_response(buf: &[u8], expected_qtype: u16) -> Result<(Vec<IpAdd
     }
 
     let clamped_ttl = Duration::from_secs(min_ttl_secs.unwrap_or(120).clamp(30, 3600));
-    Ok((ips, clamped_ttl))
+    Ok(DnsOutcome::Records(ips, clamped_ttl))
 }
 
 fn skip_dns_name(buf: &[u8], mut pos: usize) -> Result<usize> {
@@ -877,6 +1073,7 @@ mod tests {
         let mut cache = HashMap::new();
         let entry = CacheEntry {
             ips: vec![Ipv4Addr::LOCALHOST.into()],
+            nxdomain: false,
             expires_at: Instant::now() + Duration::from_secs(3600),
         };
         for i in 0..MAX_CACHE_ENTRIES * 2 {
@@ -975,5 +1172,24 @@ mod tests {
         assert_eq!(u16::from_be_bytes([https_resp[6], https_resp[7]]), 0);
         assert!(https_meta.is_none());
         assert!(resolver.query_count() >= 2);
+    }
+
+    #[test]
+    fn decodes_nxdomain_distinctly_rejects_qr1_and_formats_ipv6_doh() {
+        let mut nx_resp = vec![
+            0x00, 0x01, 0x81, 0x83, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        nx_resp.extend_from_slice(&encode_dns_query("does-not-exist.invalid", QTYPE_A).unwrap()[12..]);
+        assert!(matches!(
+            decode_dns_outcome(&nx_resp, QTYPE_A).unwrap(),
+            DnsOutcome::NxDomain(_)
+        ));
+
+        // QR=1 packets must be rejected as queries
+        assert!(parse_dns_question(&nx_resp).is_err());
+
+        // IPv6 literals must be bracketed in DoH URLs
+        let endpoints = build_doh_endpoints("2606:4700:4700::1111");
+        assert_eq!(endpoints[0], "https://[2606:4700:4700::1111]/dns-query");
     }
 }

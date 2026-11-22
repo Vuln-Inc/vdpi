@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -342,6 +343,12 @@ fn xml_escape(s: &str) -> String {
 /// background startup for the active operating system (macOS LaunchAgent, native Windows
 /// Service under SCM, or Linux systemd user unit).
 pub fn install_service(cfg: &RuntimeConfig) -> Result<()> {
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = cfg;
+        bail!("service installation is not supported on {}", platform_name());
+    }
+
     #[cfg(target_os = "windows")]
     {
         use crate::platform::windows::{broadcast_environment_change, notify_wininet_refresh};
@@ -522,7 +529,7 @@ fn install_linux_systemd_service(target_bin: &Path, cfg: &RuntimeConfig) -> Resu
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn ensure_unix_shell_path() -> bool {
     let Ok(home) = home_dir() else {
         return false;
