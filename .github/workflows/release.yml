@@ -155,10 +155,10 @@ jobs:
           # Ad-hoc sign with entitlements preserved (required for TrollStore; re-signers replace this cleanly)
           codesign --force --sign - --entitlements PacketTunnel/PacketTunnel.entitlements "$APPEX_PATH"
           codesign --force --sign - --entitlements VdpiApp/VdpiApp.entitlements "$APP_PATH"
-          codesign -d --xml --entitlements /tmp/vdpi-appex-ent.plist "$APPEX_PATH"
-          codesign -d --xml --entitlements /tmp/vdpi-app-ent.plist "$APP_PATH"
-          plutil -lint /tmp/vdpi-appex-ent.plist
-          plutil -lint /tmp/vdpi-app-ent.plist
+          codesign --display --entitlements - --xml "$APPEX_PATH" | plutil -convert xml1 -o /tmp/vdpi-appex-ent.plist -
+          codesign --display --entitlements - --xml "$APP_PATH" | plutil -convert xml1 -o /tmp/vdpi-app-ent.plist -
+          cat /tmp/vdpi-appex-ent.plist
+          cat /tmp/vdpi-app-ent.plist
           grep -q "packet-tunnel-provider" /tmp/vdpi-appex-ent.plist
           grep -q "group.com.vulninc.vdpi" /tmp/vdpi-app-ent.plist
           rm -f /tmp/vdpi-appex-ent.plist /tmp/vdpi-app-ent.plist
