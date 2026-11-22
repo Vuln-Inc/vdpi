@@ -78,6 +78,9 @@ targets:
     platform: iOS
     sources:
       - path: VdpiAppTests
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: "YES"
     dependencies:
       - target: VdpiApp
       - framework: Frameworks/VdpiCore.xcframework
