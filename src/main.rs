@@ -1,5 +1,4 @@
 use anyhow::Result;
-use clap::Parser;
 use tokio::sync::watch;
 use tracing::info;
 use vdpi::config::{CliArgs, Command, RuntimeConfig};
@@ -11,11 +10,15 @@ use vdpi::service::{
     write_runtime_state,
 };
 
+mod launcher;
+
 fn main() -> Result<()> {
     raise_fd_limit();
 
-    let cli = CliArgs::parse();
-    let command = cli.command.clone();
+    let args: Vec<_> = std::env::args_os().collect();
+    let bare = args.len() == 1;
+    let cli = CliArgs::parse_from_iter(args).unwrap_or_else(|e| e.exit());
+    let mut command = cli.command.clone();
     let cfg = cli.into_runtime_config();
     init_tracing(&cfg);
 
@@ -29,8 +32,31 @@ fn main() -> Result<()> {
         anyhow::bail!("--service is only supported on Windows");
     }
 
+    if bare || matches!(command, Some(Command::Launcher)) {
+        match launcher::choose(!bare)? {
+            launcher::Choice::Run => {
+                if !cfg.quiet {
+                    launcher::print_run_notice();
+                }
+                command = Some(Command::Start);
+            }
+            launcher::Choice::Unattended => command = Some(Command::Start),
+            launcher::Choice::Install => {
+                let result = install_service(&cfg);
+                launcher::install_finished(&result);
+                return result;
+            }
+            launcher::Choice::Cancel => return Ok(()),
+        }
+    }
+
     match command {
-        Some(Command::Install) => install_service(&cfg),
+        Some(Command::Install) => {
+            install_service(&cfg)?;
+            launcher::clear_preference();
+            Ok(())
+        }
+        Some(Command::Launcher) => unreachable!("handled by launcher"),
         Some(Command::Uninstall) => uninstall_service(),
         Some(Command::Status) | Some(Command::Doctor) | Some(Command::Start) | None => {
             let rt = tokio::runtime::Builder::new_multi_thread()

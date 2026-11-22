@@ -23,9 +23,11 @@ pub enum DesyncMode {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
-    /// Start the vdpi engine in the foreground (default when no subcommand is given)
+    /// Start the vdpi engine in the foreground without opening the launcher
     #[command(visible_alias = "run")]
     Start,
+    /// Open the run or install chooser, even if a preference was saved
+    Launcher,
     /// Install vdpi and enable automatic background startup (Windows Service / LaunchAgent / systemd)
     Install,
     /// Stop vdpi, remove startup registration, and restore system proxy settings
