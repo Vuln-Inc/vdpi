@@ -28,6 +28,7 @@ pub struct DnsResolver {
     doh_endpoints: Vec<String>,
     preferred_doh_idx: Arc<AtomicUsize>,
     preferred_udp_idx: Arc<AtomicUsize>,
+    doh_backoff_until: Arc<RwLock<Option<Instant>>>,
     http: Client,
     cache: Arc<RwLock<HashMap<String, CacheEntry>>>,
 }
@@ -57,6 +58,7 @@ impl DnsResolver {
             doh_endpoints,
             preferred_doh_idx: Arc::new(AtomicUsize::new(0)),
             preferred_udp_idx: Arc::new(AtomicUsize::new(0)),
+            doh_backoff_until: Arc::new(RwLock::new(None)),
             http,
             cache: Arc::new(RwLock::new(HashMap::new())),
         })
@@ -109,19 +111,29 @@ impl DnsResolver {
         }
 
         // 5. Multi-tier unpoisoned resolution:
-        //    Tier A: RFC 8484 DNS-over-HTTPS (Cloudflare / Google / Quad9 IP endpoints)
-        //    Tier B: Non-standard port 1253 + backup UDP DNS (bypasses ISP port-53 transparent proxies)
+        //    Tier A: RFC 8484 DNS-over-HTTPS (with concurrent failover + 30s circuit-breaker if ISP blocks all DoH)
+        //    Tier B: Non-standard port 1253 / 443 / 5353 + backup UDP DNS (bypasses ISP port-53 transparent proxies)
         //    Tier C: System resolver fallback
-        let (ips, ttl) = if self.enable_doh {
+        let doh_in_backoff = self
+            .doh_backoff_until
+            .read()
+            .await
+            .is_some_and(|until| Instant::now() < until);
+
+        let (ips, ttl) = if self.enable_doh && !doh_in_backoff {
             match self.resolve_via_doh(&normalized).await {
                 Ok(res) if !res.0.is_empty() => res,
-                _ => match self.resolve_via_udp(&normalized).await {
-                    Ok(res) if !res.0.is_empty() => res,
-                    _ => {
-                        let sys = self.resolve_via_system(&normalized).await?;
-                        (sys, Duration::from_secs(60))
+                _ => {
+                    *self.doh_backoff_until.write().await =
+                        Some(Instant::now() + Duration::from_secs(30));
+                    match self.resolve_via_udp(&normalized).await {
+                        Ok(res) if !res.0.is_empty() => res,
+                        _ => {
+                            let sys = self.resolve_via_system(&normalized).await?;
+                            (sys, Duration::from_secs(60))
+                        }
                     }
-                },
+                }
             }
         } else {
             match self.resolve_via_udp(&normalized).await {
@@ -212,49 +224,52 @@ impl DnsResolver {
             bail!("no DoH endpoints configured");
         }
 
+        // Fast-path: try the currently sticky healthy DoH endpoint first.
         let start = self.preferred_doh_idx.load(Ordering::Relaxed) % count;
-        let mut last_err = None;
+        if let Ok(parsed) =
+            send_doh_request(&self.http, &self.doh_endpoints[start], &wire_query, qtype).await
+        {
+            debug!(
+                domain = %domain,
+                qtype = qtype,
+                endpoint = %self.doh_endpoints[start],
+                count = parsed.0.len(),
+                "DoH query succeeded"
+            );
+            return Ok(parsed);
+        }
 
-        for offset in 0..count {
+        // Preferred DoH failed (e.g. ISP throttled/blackholed it): race ALL remaining DoH
+        // endpoints concurrently so failover finishes in <= 1.2s instead of stalling sequentially.
+        let mut join_set = tokio::task::JoinSet::new();
+        for offset in 1..count {
             let idx = (start + offset) % count;
-            let endpoint = &self.doh_endpoints[idx];
-            match self
-                .http
-                .post(endpoint)
-                .header("content-type", "application/dns-message")
-                .header("accept", "application/dns-message")
-                .body(wire_query.clone())
-                .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => match resp.bytes().await {
-                    Ok(bytes) => match decode_dns_response(&bytes, qtype) {
-                        Ok(parsed) => {
-                            if offset > 0 {
-                                self.preferred_doh_idx.store(idx, Ordering::Relaxed);
-                            }
-                            debug!(
-                                domain = %domain,
-                                qtype = qtype,
-                                endpoint = %endpoint,
-                                count = parsed.0.len(),
-                                "DoH query succeeded"
-                            );
-                            return Ok(parsed);
-                        }
-                        Err(e) => last_err = Some(e),
-                    },
-                    Err(e) => last_err = Some(e.into()),
-                },
-                Ok(resp) => {
-                    last_err = Some(anyhow!(
-                        "DoH HTTP status {} from {}",
-                        resp.status(),
-                        endpoint
-                    ));
-                }
-                Err(e) => {
-                    last_err = Some(e.into());
+            let http = self.http.clone();
+            let endpoint = self.doh_endpoints[idx].clone();
+            let query = wire_query.clone();
+            join_set.spawn(async move {
+                let res = send_doh_request(&http, &endpoint, &query, qtype).await;
+                (idx, endpoint, res)
+            });
+        }
+
+        let mut last_err = None;
+        while let Some(joined) = join_set.join_next().await {
+            if let Ok((idx, endpoint, res)) = joined {
+                match res {
+                    Ok(parsed) => {
+                        self.preferred_doh_idx.store(idx, Ordering::Relaxed);
+                        join_set.abort_all();
+                        debug!(
+                            domain = %domain,
+                            qtype = qtype,
+                            endpoint = %endpoint,
+                            count = parsed.0.len(),
+                            "DoH failover succeeded and promoted endpoint"
+                        );
+                        return Ok(parsed);
+                    }
+                    Err(e) => last_err = Some(e),
                 }
             }
         }
@@ -343,6 +358,26 @@ impl DnsResolver {
         }
         Ok(v4)
     }
+}
+
+async fn send_doh_request(
+    http: &Client,
+    endpoint: &str,
+    wire_query: &[u8],
+    qtype: u16,
+) -> Result<(Vec<IpAddr>, Duration)> {
+    let resp = http
+        .post(endpoint)
+        .header("content-type", "application/dns-message")
+        .header("accept", "application/dns-message")
+        .body(wire_query.to_vec())
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        bail!("DoH HTTP status {} from {}", resp.status(), endpoint);
+    }
+    let bytes = resp.bytes().await?;
+    decode_dns_response(&bytes, qtype)
 }
 
 fn build_doh_endpoints(dns_addr: &str) -> Vec<String> {
