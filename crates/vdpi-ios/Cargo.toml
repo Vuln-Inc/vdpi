@@ -1,0 +1,24 @@
+[package]
+name = "vdpi-ios"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "iOS NEPacketTunnelProvider C-ABI static library powered by vdpi-tun"
+license.workspace = true
+
+[lib]
+name = "vdpi_ios"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+anyhow = "1.0"
+serde_json = "1.0"
+tokio = { version = "1.50", features = ["rt-multi-thread", "sync", "time"] }
+vdpi = { path = "../.." }
+vdpi-tun = { path = "../vdpi-tun" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+etherparse = "0.16"

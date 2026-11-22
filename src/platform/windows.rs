@@ -96,6 +96,10 @@ impl WindowsProxySession {
             }
         }
 
+        if service_mode {
+            apply_winhttp_proxy_if_safe(&server_val, &proxy_override);
+        }
+
         notify_wininet_refresh();
         if enable_env_proxy {
             broadcast_environment_change();
@@ -160,6 +164,9 @@ impl WindowsProxySession {
             }
         }
 
+        if is_running_as_service() {
+            apply_winhttp_proxy_if_safe(&expected_server, &self.proxy_override);
+        }
         if wininet_changed {
             notify_wininet_refresh();
         }
@@ -191,9 +198,60 @@ pub fn clear_all_windows_proxies() -> Result<()> {
         let env_key = user_env_key(&root);
         unset_windows_user_env(&env_key);
     }
+    reset_winhttp_proxy_if_vdpi();
     notify_wininet_refresh();
     broadcast_environment_change();
     Ok(())
+}
+
+fn query_winhttp_proxy_server() -> Option<String> {
+    let out = Command::new("netsh")
+        .creation_flags(CREATE_NO_WINDOW)
+        .args(["winhttp", "show", "proxy"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        if let Some((_, val)) = line.split_once(':') {
+            let trimmed = val.trim();
+            if trimmed.contains(':') && !trimmed.contains(' ') {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn apply_winhttp_proxy_if_safe(server: &str, bypass_list: &str) {
+    // Only configure WinHTTP when no unrelated external proxy is already set.
+    if let Some(current) = query_winhttp_proxy_server() {
+        if current.eq_ignore_ascii_case(server) {
+            return;
+        }
+        if !current.starts_with("127.0.0.1:") && !current.starts_with("[::1]:") {
+            return;
+        }
+    }
+    let proxy_arg = format!("proxy-server={server}");
+    let bypass_arg = format!("bypass-list={bypass_list}");
+    let _ = Command::new("netsh")
+        .creation_flags(CREATE_NO_WINDOW)
+        .args(["winhttp", "set", "proxy", &proxy_arg, &bypass_arg])
+        .output();
+}
+
+fn reset_winhttp_proxy_if_vdpi() {
+    if let Some(current) = query_winhttp_proxy_server() {
+        if current.starts_with("127.0.0.1:") || current.starts_with("[::1]:") {
+            let _ = Command::new("netsh")
+                .creation_flags(CREATE_NO_WINDOW)
+                .args(["winhttp", "reset", "proxy"])
+                .output();
+        }
+    }
 }
 
 pub fn print_windows_proxy_status() {
@@ -219,6 +277,10 @@ pub fn print_windows_proxy_status() {
     );
     println!("ProxyOverride             : {override_val}");
     println!("User Env HTTPS_PROXY      : {https_env}");
+    println!(
+        "WinHTTP Proxy             : {}",
+        query_winhttp_proxy_server().unwrap_or_else(|| "direct (no proxy)".into())
+    );
 }
 
 pub fn enumerate_interactive_hku_roots() -> Vec<String> {

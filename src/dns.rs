@@ -85,6 +85,7 @@ impl DnsResolver {
 
     pub async fn clear_cache(&self) {
         self.cache.write().await.clear();
+        *self.doh_backoff_until.write().await = None;
     }
 
     /// Resolves `host` into an ordered list of IP addresses (IPv4 preferred before IPv6).
@@ -255,18 +256,18 @@ impl DnsResolver {
 
         let mut ips = Vec::new();
         let mut min_ttl = Duration::from_secs(300);
-        let mut saw_any_response = false;
+        let mut v4_succeeded = false;
         let mut v4_nxdomain = false;
         let mut v6_nxdomain = false;
 
         match v4_res {
             Ok(DnsOutcome::NxDomain(ttl)) => {
-                saw_any_response = true;
+                v4_succeeded = true;
                 v4_nxdomain = true;
                 min_ttl = min_ttl.min(ttl);
             }
             Ok(DnsOutcome::Records(v4, ttl)) => {
-                saw_any_response = true;
+                v4_succeeded = true;
                 let clean_v4 = filter_poisoned_ips(v4);
                 if !clean_v4.is_empty() {
                     min_ttl = min_ttl.min(ttl);
@@ -277,15 +278,13 @@ impl DnsResolver {
         }
 
         // CNAME-only empty AAAA responses (such as www.roblox.com) are normal and must never
-        // discard valid IPv4 A records.
+        // discard valid IPv4 A records — and an empty AAAA response must never mask an A failure.
         match v6_res {
             Ok(Ok(DnsOutcome::NxDomain(ttl))) => {
-                saw_any_response = true;
                 v6_nxdomain = true;
                 min_ttl = min_ttl.min(ttl);
             }
             Ok(Ok(DnsOutcome::Records(v6, ttl))) => {
-                saw_any_response = true;
                 let clean_v6 = filter_poisoned_ips(v6);
                 if !clean_v6.is_empty() {
                     min_ttl = min_ttl.min(ttl);
@@ -302,10 +301,10 @@ impl DnsResolver {
         if !ips.is_empty() {
             return Ok(DnsOutcome::Records(ips, min_ttl));
         }
-        if v4_nxdomain && (v6_nxdomain || !saw_any_response || ips.is_empty()) {
+        if v4_nxdomain && (v6_nxdomain || ips.is_empty()) {
             return Ok(DnsOutcome::NxDomain(min_ttl.min(Duration::from_secs(30))));
         }
-        if saw_any_response {
+        if v4_succeeded {
             return Ok(DnsOutcome::Records(Vec::new(), min_ttl.min(Duration::from_secs(60))));
         }
         bail!("DoH transport failed for {domain}")
@@ -864,9 +863,10 @@ fn build_doh_endpoints(dns_addr: &str) -> Vec<String> {
 
 fn build_udp_dns_servers(dns_addr: &str, dns_port: u16) -> Vec<SocketAddr> {
     let mut servers = Vec::new();
+    let trimmed_dns = dns_addr.trim().trim_matches(|c| c == '[' || c == ']');
     // Non-standard ports (1253, 443, 5353) bypass transparent ISP port-53 DNS interceptors
     // on strict fiber and broadband networks worldwide.
-    if let Ok(ip) = dns_addr.trim().parse::<IpAddr>() {
+    if let Ok(ip) = trimmed_dns.parse::<IpAddr>() {
         if dns_port != 53 {
             servers.push(SocketAddr::new(ip, dns_port));
         }
@@ -883,7 +883,7 @@ fn build_udp_dns_servers(dns_addr: &str, dns_port: u16) -> Vec<SocketAddr> {
             servers.push(sa);
         }
     }
-    if let Ok(ip) = dns_addr.trim().parse::<IpAddr>() {
+    if let Ok(ip) = trimmed_dns.parse::<IpAddr>() {
         let sa = SocketAddr::new(ip, dns_port);
         if !servers.contains(&sa) {
             servers.push(sa);
@@ -962,6 +962,9 @@ fn decode_dns_outcome(buf: &[u8], expected_qtype: u16) -> Result<DnsOutcome> {
     }
 
     let flags = u16::from_be_bytes([buf[2], buf[3]]);
+    if (flags & 0x8000) == 0 {
+        bail!("DNS packet does not have QR response bit set");
+    }
     let rcode = flags & 0x000f;
     if rcode == 3 {
         return Ok(DnsOutcome::NxDomain(Duration::from_secs(30)));

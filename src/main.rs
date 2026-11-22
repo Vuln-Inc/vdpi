@@ -104,6 +104,7 @@ async fn run_daemon(cfg: RuntimeConfig) -> Result<()> {
     let proxy_session = if cfg.system_proxy {
         Some(foreground::ForegroundProxy::activate(
             primary_addr,
+            cfg.env_proxy,
             &cfg.bypass_domains,
         )?)
     } else {
@@ -115,9 +116,13 @@ async fn run_daemon(cfg: RuntimeConfig) -> Result<()> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let proxy_summary = proxy_session.as_ref().map(|s| s.summary.clone());
         #[cfg(windows)]
-        let proxy_summary = proxy_session
-            .as_ref()
-            .map(|_| "active (Windows proxy with automatic cleanup)".to_string());
+        let proxy_summary = proxy_session.as_ref().map(|_| {
+            if cfg.env_proxy {
+                "active (WinINET + HTTP_PROXY/HTTPS_PROXY with auto-cleanup)".to_string()
+            } else {
+                "active (WinINET proxy with auto-cleanup)".to_string()
+            }
+        });
         #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
         let proxy_summary = None;
         print_startup_banner(&cfg, primary_addr, socks_addr, proxy_summary);
@@ -178,6 +183,12 @@ fn print_startup_banner(
         "  System Integration  : {}\n",
         proxy_summary.unwrap_or_else(|| "disabled (--no-system-proxy)".to_string())
     );
+    #[cfg(windows)]
+    if cfg.system_proxy && cfg.env_proxy {
+        println!(
+            "  Desktop Apps Note   : Restart any already-open browser once if launching games (e.g. Roblox) from it,\n                        or run `vdpi install` so HTTPS_PROXY is inherited automatically at login.\n"
+        );
+    }
 }
 
 fn init_tracing(cfg: &RuntimeConfig) {

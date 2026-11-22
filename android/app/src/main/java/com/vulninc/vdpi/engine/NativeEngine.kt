@@ -29,12 +29,13 @@ data class NativeEngineConfig(
     @SerialName("ipv4_only") val ipv4Only: Boolean = false,
     @SerialName("block_quic") val blockQuic: Boolean = true,
     @SerialName("timeout_ms") val timeoutMs: Long = 8000L,
-    val mtu: Int = 1500,
+    val mtu: Int = 1400,
     @SerialName("bypass_domains") val bypassDomains: List<String> = emptyList(),
 )
 
 @Serializable
 data class EngineEvent(
+    val seq: Long = 0L,
     @SerialName("ts_ms") val tsMs: Long = 0L,
     val level: String = "info",
     val tag: String = "tun",

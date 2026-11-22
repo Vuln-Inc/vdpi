@@ -335,7 +335,10 @@ impl EngineContext {
                 ));
             }
         }
-        TcpStream::connect(target).await
+        let stream = TcpStream::connect(target).await?;
+        #[cfg(target_vendor = "apple")]
+        set_apple_nosigpipe(&stream);
+        Ok(stream)
     }
 
     /// Relays a bidirectional TCP tunnel between `client` and `remote`, inspecting the initial
@@ -1110,14 +1113,21 @@ async fn write_multi_record_oob(
 async fn send_with_oob(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
     use tokio::io::Interest;
 
-    let mut sent = 0usize;
-    while sent < data.len() {
+    if data.is_empty() {
+        return Ok(());
+    }
+    // Write everything except the final urgent byte as normal TCP payload so a partial
+    // write never emits duplicate TCP URG pointers or drops payload bytes mid-ClientHello.
+    if data.len() > 1 {
+        stream.write_all(&data[..data.len() - 1]).await?;
+    }
+    let oob_byte = &data[data.len() - 1..];
+    loop {
         stream.writable().await?;
-        let slice = &data[sent..];
-        let res = stream.try_io(Interest::WRITABLE, || raw_send_oob(stream, slice));
+        let res = stream.try_io(Interest::WRITABLE, || raw_send_oob(stream, oob_byte));
         match res {
             Ok(0) => bail!("peer closed connection during MSG_OOB send"),
-            Ok(n) => sent += n,
+            Ok(_) => return Ok(()),
             Err(ref e)
                 if matches!(
                     e.kind(),
@@ -1129,13 +1139,45 @@ async fn send_with_oob(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
             Err(e) => return Err(e.into()),
         }
     }
-    Ok(())
+}
+
+#[cfg(target_vendor = "apple")]
+fn set_apple_nosigpipe(stream: &TcpStream) {
+    use std::ffi::c_void;
+    use std::os::unix::io::AsRawFd;
+
+    const SOL_SOCKET: i32 = 0xffff;
+    const SO_NOSIGPIPE: i32 = 0x1022;
+    let one: i32 = 1;
+
+    extern "C" {
+        fn setsockopt(
+            sockfd: i32,
+            level: i32,
+            optname: i32,
+            optval: *const c_void,
+            optlen: u32,
+        ) -> i32;
+    }
+
+    unsafe {
+        let _ = setsockopt(
+            stream.as_raw_fd(),
+            SOL_SOCKET,
+            SO_NOSIGPIPE,
+            (&one as *const i32).cast::<c_void>(),
+            std::mem::size_of::<i32>() as u32,
+        );
+    }
 }
 
 #[cfg(unix)]
 fn raw_send_oob(stream: &TcpStream, data: &[u8]) -> std::io::Result<usize> {
     use std::ffi::c_void;
     use std::os::unix::io::AsRawFd;
+
+    #[cfg(target_vendor = "apple")]
+    set_apple_nosigpipe(stream);
 
     const MSG_OOB: i32 = 0x1;
     #[cfg(any(target_os = "linux", target_os = "android"))]

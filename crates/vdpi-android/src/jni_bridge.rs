@@ -1,6 +1,6 @@
-use crate::config::AndroidConfig;
 use crate::{
     clear_engine_cache, engine_version, run_doctor_json, snapshot_json, start_tunnel, stop_tunnel,
+    AndroidConfig,
 };
 use jni::objects::{JClass, JString};
 use jni::sys::{jint, jstring};

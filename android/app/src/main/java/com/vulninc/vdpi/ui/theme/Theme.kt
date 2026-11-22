@@ -57,8 +57,8 @@ val DarkVdpiPalette = VdpiPalette(
     canvas = Color(0xFF09090B),
     surface = Color(0xFF111113),
     surfaceRaised = Color(0xFF18181B),
-    border = Color(0x1AFFFFFF),
-    borderStrong = Color(0x33FFFFFF),
+    border = Color(0x26FFFFFF),
+    borderStrong = Color(0x40FFFFFF),
     topHighlight = Color(0x12FFFFFF),
     inkPrimary = Color(0xFFF4F4F5),
     inkSecondary = Color(0xFFA1A1AA),
@@ -70,8 +70,8 @@ val DarkVdpiPalette = VdpiPalette(
     signalBorder = Color(0x5210B981),
     warning = Color(0xFFF59E0B),
     warningTint = Color(0x1AF59E0B),
-    danger = Color(0xFFEF4444),
-    dangerTint = Color(0x1AEF4444),
+    danger = Color(0xFFF87171),
+    dangerTint = Color(0x1FF87171),
 )
 
 val LightVdpiPalette = VdpiPalette(
@@ -79,8 +79,8 @@ val LightVdpiPalette = VdpiPalette(
     canvas = Color(0xFFFAFAFA),
     surface = Color(0xFFFFFFFF),
     surfaceRaised = Color(0xFFF4F4F5),
-    border = Color(0xFFE4E4E7),
-    borderStrong = Color(0xFFD4D4D8),
+    border = Color(0xFFD4D4D8),
+    borderStrong = Color(0xFFA1A1AA),
     topHighlight = Color.Transparent,
     inkPrimary = Color(0xFF09090B),
     inkSecondary = Color(0xFF52525B),
@@ -89,11 +89,11 @@ val LightVdpiPalette = VdpiPalette(
     primaryButtonInk = Color(0xFFFAFAFA),
     signal = Color(0xFF047857),
     signalTint = Color(0x14047857),
-    signalBorder = Color(0x4D047857),
+    signalBorder = Color(0x52047857),
     warning = Color(0xFF9A3412),
     warningTint = Color(0x189A3412),
-    danger = Color(0xFFDC2626),
-    dangerTint = Color(0x14DC2626),
+    danger = Color(0xFFB91C1C),
+    dangerTint = Color(0x14B91C1C),
 )
 
 object VdpiTextStyles {

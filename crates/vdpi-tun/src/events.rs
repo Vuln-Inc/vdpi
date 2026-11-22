@@ -1,5 +1,6 @@
 use serde::Serialize;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -7,6 +8,7 @@ const MAX_EVENTS: usize = 120;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct EngineEvent {
+    pub seq: u64,
     pub ts_ms: u64,
     pub level: &'static str,
     pub tag: &'static str,
@@ -15,6 +17,7 @@ pub struct EngineEvent {
 
 #[derive(Debug, Default)]
 pub struct EventRing {
+    next_seq: AtomicU64,
     inner: Mutex<VecDeque<EngineEvent>>,
 }
 
@@ -28,30 +31,28 @@ impl EventRing {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        if let Ok(mut guard) = self.inner.lock() {
-            if guard.len() >= MAX_EVENTS {
-                guard.pop_front();
-            }
-            guard.push_back(EngineEvent {
-                ts_ms,
-                level,
-                tag,
-                message: message.into(),
-            });
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.len() >= MAX_EVENTS {
+            guard.pop_front();
         }
+        guard.push_back(EngineEvent {
+            seq,
+            ts_ms,
+            level,
+            tag,
+            message: message.into(),
+        });
     }
 
     pub fn snapshot(&self) -> Vec<EngineEvent> {
-        self.inner
-            .lock()
-            .map(|g| g.iter().cloned().collect())
-            .unwrap_or_default()
+        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.iter().cloned().collect()
     }
 
     pub fn clear(&self) {
-        if let Ok(mut guard) = self.inner.lock() {
-            guard.clear();
-        }
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.clear();
     }
 }
 
