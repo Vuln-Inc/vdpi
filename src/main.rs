@@ -8,8 +8,7 @@ use vdpi::platform::{platform_name, SystemProxySession};
 use vdpi::server::{bind_listeners, serve_until_shutdown};
 use vdpi::service::{install_service, print_status, run_doctor, uninstall_service};
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     raise_fd_limit();
 
     let cli = CliArgs::parse();
@@ -17,12 +16,32 @@ async fn main() -> Result<()> {
     let cfg = cli.into_runtime_config();
     init_tracing(&cfg);
 
+    #[cfg(target_os = "windows")]
+    if cfg.windows_service && matches!(command, Some(Command::Start) | None) {
+        return vdpi::platform::windows_service::run_windows_service(cfg);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    if cfg.windows_service {
+        anyhow::bail!("--service is only supported on Windows");
+    }
+
     match command {
         Some(Command::Install) => install_service(&cfg),
         Some(Command::Uninstall) => uninstall_service(),
-        Some(Command::Status) => print_status(&cfg).await,
-        Some(Command::Doctor) => run_doctor(cfg).await,
-        Some(Command::Start) | None => run_daemon(cfg).await,
+        Some(Command::Status) | Some(Command::Doctor) | Some(Command::Start) | None => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(async move {
+                match command {
+                    Some(Command::Status) => print_status(&cfg).await,
+                    Some(Command::Doctor) => run_doctor(cfg).await,
+                    Some(Command::Start) | None => run_daemon(cfg).await,
+                    _ => unreachable!(),
+                }
+            })
+        }
     }
 }
 
