@@ -971,6 +971,15 @@ mod tests {
                             ])
                             .await;
                     }
+
+                    // Close the write half and drain pipelined input so that closing the
+                    // mock socket does not reset the connection before the alert is read.
+                    let _ = sock.shutdown().await;
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        tokio::io::copy(&mut sock, &mut tokio::io::sink()),
+                    )
+                    .await;
                 });
             }
         });
