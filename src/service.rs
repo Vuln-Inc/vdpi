@@ -1,4 +1,4 @@
-use crate::config::RuntimeConfig;
+use crate::config::{DesyncMode, RuntimeConfig};
 use crate::desync::EngineContext;
 use crate::platform::{clear_all_system_proxies, platform_name, print_platform_proxy_status};
 use anyhow::{bail, Context, Result};
@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 
 pub const LAUNCH_AGENT_LABEL: &str = "com.vdpi";
 pub const SYSTEMD_UNIT_NAME: &str = "vdpi.service";
-pub const WINDOWS_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+pub const WINDOWS_SERVICE_NAME: &str = "vdpi";
+pub const WINDOWS_LEGACY_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 
 pub fn home_dir() -> Result<PathBuf> {
     if let Some(h) = std::env::var_os("HOME") {
@@ -25,11 +26,15 @@ pub fn home_dir() -> Result<PathBuf> {
 pub fn vdpi_root_dir() -> Result<PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
-            return Ok(PathBuf::from(local_appdata).join("vdpi"));
+        if let Some(program_files) = std::env::var_os("ProgramFiles") {
+            return Ok(PathBuf::from(program_files).join("vdpi"));
         }
+        Ok(PathBuf::from(r"C:\Program Files").join("vdpi"))
     }
-    Ok(home_dir()?.join(".vdpi"))
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(home_dir()?.join(".vdpi"))
+    }
 }
 
 pub fn installed_binary_path() -> Result<PathBuf> {
@@ -58,8 +63,20 @@ pub fn systemd_user_unit_path() -> Result<PathBuf> {
         .join(SYSTEMD_UNIT_NAME))
 }
 
-pub fn windows_autostart_vbs_path() -> Result<PathBuf> {
-    Ok(vdpi_root_dir()?.join("bin").join("vdpi-autostart.vbs"))
+pub fn build_windows_service_bin_path(bin_path: &Path, cfg: &RuntimeConfig) -> String {
+    let mut args = vec!["--service".to_string()];
+    args.extend(build_service_cli_args(cfg));
+    args.push("--quiet".to_string());
+    let quoted_args: Vec<String> = args.into_iter().map(|a| quote_windows_arg(&a)).collect();
+    format!("\"{}\" {}", bin_path.display(), quoted_args.join(" "))
+}
+
+fn quote_windows_arg(arg: &str) -> String {
+    if arg.is_empty() || arg.contains([' ', '\t', '"']) {
+        format!("\"{}\"", arg.replace('"', "\\\""))
+    } else {
+        arg.to_string()
+    }
 }
 
 pub fn build_service_cli_args(cfg: &RuntimeConfig) -> Vec<String> {
@@ -82,6 +99,53 @@ pub fn build_service_cli_args(cfg: &RuntimeConfig) -> Vec<String> {
 
     if !cfg.enable_doh {
         args.push("--no-doh".to_string());
+    }
+
+    if cfg.mode != DesyncMode::Combo {
+        let mode_str = match cfg.mode {
+            DesyncMode::Combo => "combo",
+            DesyncMode::TlsRecord => "tls-record",
+            DesyncMode::Fragment => "fragment",
+            DesyncMode::Split => "split",
+        };
+        args.push("--mode".to_string());
+        args.push(mode_str.to_string());
+    }
+
+    if cfg.dns_addr != "1.1.1.1" {
+        args.push("--dns".to_string());
+        args.push(cfg.dns_addr.clone());
+    }
+    if cfg.dns_port != 53 {
+        args.push("--dns-port".to_string());
+        args.push(cfg.dns_port.to_string());
+    }
+    if cfg.dns_ipv4_only {
+        args.push("--ipv4-only".to_string());
+    }
+    if !cfg.system_proxy {
+        args.push("--no-system-proxy".to_string());
+    } else {
+        if !cfg.socks_system_proxy && cfg.socks_port.is_some() {
+            args.push("--no-socks-proxy".to_string());
+        }
+        if !cfg.env_proxy {
+            args.push("--no-env-proxy".to_string());
+        }
+    }
+    if !cfg.block_quic {
+        args.push("--allow-quic".to_string());
+    }
+    for pattern in &cfg.patterns {
+        args.push("--include".to_string());
+        args.push(pattern.clone());
+    }
+    for domain in &cfg.bypass_domains {
+        args.push("--bypass".to_string());
+        args.push(domain.clone());
+    }
+    if cfg.debug {
+        args.push("--debug".to_string());
     }
 
     args
@@ -161,18 +225,6 @@ WantedBy=default.target\n",
     )
 }
 
-pub fn generate_windows_autostart_vbs(bin_path: &Path, cfg: &RuntimeConfig) -> String {
-    let mut args = build_service_cli_args(cfg);
-    args.push("--quiet".to_string());
-    let joined_args = args.join(" ");
-    let escaped_bin = bin_path.display().to_string().replace('"', "\"\"");
-    format!(
-        "Set WshShell = CreateObject(\"WScript.Shell\")\r\n\
-WshShell.Run \"\"\"{}\"\" {}\", 0, False\r\n",
-        escaped_bin, joined_args
-    )
-}
-
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -180,20 +232,50 @@ fn xml_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// Installs the `vdpi` binary into the user service directory and registers automatic
-/// background startup for the active operating system (macOS LaunchAgent, Windows Registry Run,
-/// or Linux systemd user unit).
+/// Installs the `vdpi` binary into the service directory and registers automatic
+/// background startup for the active operating system (macOS LaunchAgent, native Windows
+/// Service under SCM, or Linux systemd user unit).
 pub fn install_service(cfg: &RuntimeConfig) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        use crate::platform::windows::{broadcast_environment_change, notify_wininet_refresh};
+        use crate::platform::windows_service::{is_elevated, relaunch_elevated_and_wait};
+
+        if !is_elevated() {
+            println!("Requesting Administrator privileges to install the vdpi Windows service...");
+            relaunch_elevated_and_wait()?;
+            notify_wininet_refresh();
+            broadcast_environment_change();
+            println!("Installed and started Windows service: {WINDOWS_SERVICE_NAME} (AUTO_START)");
+            return Ok(());
+        }
+
+        // Stop existing Windows service and any legacy vdpi.exe processes before replacing the binary.
+        let _ = crate::platform::windows_service::stop_windows_service_if_running()?;
+        cleanup_legacy_windows_startup();
+        stop_other_windows_vdpi_processes();
+    }
+
     let vdpi_root = vdpi_root_dir()?;
     let bin_dir = vdpi_root.join("bin");
     let log_dir = vdpi_root.join("logs");
-    fs::create_dir_all(&bin_dir)?;
-    fs::create_dir_all(&log_dir)?;
+    fs::create_dir_all(&bin_dir)
+        .with_context(|| format!("failed to create service directory {}", bin_dir.display()))?;
+    fs::create_dir_all(&log_dir)
+        .with_context(|| format!("failed to create log directory {}", log_dir.display()))?;
 
     let current_exe = std::env::current_exe().context("failed to determine current executable")?;
     let target_bin = installed_binary_path()?;
 
-    if current_exe != target_bin {
+    let same_binary = match (
+        fs::canonicalize(&current_exe),
+        fs::canonicalize(&target_bin),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => current_exe == target_bin,
+    };
+
+    if !same_binary {
         let tmp_name = if cfg!(windows) {
             "vdpi.tmp.exe"
         } else {
@@ -224,7 +306,7 @@ pub fn install_service(cfg: &RuntimeConfig) -> Result<()> {
     install_linux_systemd_service(&target_bin, cfg)?;
 
     #[cfg(target_os = "windows")]
-    install_windows_startup_service(&target_bin, cfg)?;
+    install_windows_native_service(&target_bin, cfg)?;
 
     Ok(())
 }
@@ -275,8 +357,13 @@ fn install_macos_launch_agent(target_bin: &Path, cfg: &RuntimeConfig) -> Result<
         ])
         .output();
 
+    let path_updated = ensure_unix_shell_path();
+
     println!("Installed binary : {}", target_bin.display());
     println!("Loaded service   : {}", plist_path.display());
+    if path_updated {
+        println!("Shell PATH       : added ~/.vdpi/bin (restart shell or source profile)");
+    }
     Ok(())
 }
 
@@ -317,51 +404,158 @@ fn install_linux_systemd_service(target_bin: &Path, cfg: &RuntimeConfig) -> Resu
         }
     }
 
+    let path_updated = ensure_unix_shell_path();
+
     println!("Installed binary : {}", target_bin.display());
     println!("Systemd unit     : {}", unit_path.display());
+    if path_updated {
+        println!("Shell PATH       : added ~/.vdpi/bin (restart shell or source profile)");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_unix_shell_path() -> bool {
+    let Ok(home) = home_dir() else {
+        return false;
+    };
+    let export_line = r#"export PATH="$HOME/.vdpi/bin:$PATH""#;
+    let mut updated = false;
+    for rc_name in [".zshrc", ".bashrc", ".profile"] {
+        let rc_path = home.join(rc_name);
+        if !rc_path.is_file() {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(&rc_path) else {
+            continue;
+        };
+        if content.contains(".vdpi/bin") {
+            continue;
+        }
+        let mut next = content;
+        if !next.ends_with('\n') {
+            next.push('\n');
+        }
+        next.push_str(export_line);
+        next.push('\n');
+        if fs::write(&rc_path, next).is_ok() {
+            updated = true;
+        }
+    }
+    updated
+}
+
+#[cfg(target_os = "windows")]
+fn install_windows_native_service(target_bin: &Path, cfg: &RuntimeConfig) -> Result<()> {
+    use crate::platform::windows::{
+        add_dir_to_windows_system_path, broadcast_environment_change, notify_wininet_refresh,
+    };
+    use crate::platform::windows_service::install_or_update_windows_service;
+
+    let bin_path_cmd = build_windows_service_bin_path(target_bin, cfg);
+    install_or_update_windows_service(&bin_path_cmd)?;
+
+    let legacy_bin = legacy_windows_root_dir().map(|r| r.join("bin"));
+    let path_added = target_bin
+        .parent()
+        .and_then(|bin_dir| add_dir_to_windows_system_path(bin_dir, legacy_bin.as_deref()).ok())
+        .unwrap_or(false);
+
+    // Refresh WinINET and environment directly in the interactive caller's session as well.
+    notify_wininet_refresh();
+    broadcast_environment_change();
+
+    println!("Installed binary : {}", target_bin.display());
+    println!("Windows service  : {WINDOWS_SERVICE_NAME} (AUTO_START, RUNNING)");
+    if path_added {
+        if let Some(bin_dir) = target_bin.parent() {
+            println!("System PATH      : added {}", bin_dir.display());
+        }
+    }
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
-fn install_windows_startup_service(target_bin: &Path, cfg: &RuntimeConfig) -> Result<()> {
+fn legacy_windows_root_dir() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|p| PathBuf::from(p).join("vdpi"))
+}
+
+#[cfg(target_os = "windows")]
+fn cleanup_legacy_windows_startup() {
     use crate::platform::windows::run_reg;
+
+    let _ = run_reg(&["delete", WINDOWS_LEGACY_RUN_KEY, "/v", "vdpi", "/f"]);
+    if let Some(legacy_root) = legacy_windows_root_dir() {
+        let legacy_vbs = legacy_root.join("bin").join("vdpi-autostart.vbs");
+        let _ = fs::remove_file(legacy_vbs);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn stop_other_windows_vdpi_processes() {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-    let vbs_path = windows_autostart_vbs_path()?;
-    let vbs_content = generate_windows_autostart_vbs(target_bin, cfg);
-    fs::write(&vbs_path, vbs_content)?;
-
-    let run_cmd = format!("wscript.exe //B \"{}\"", vbs_path.display());
-    run_reg(&[
-        "add",
-        WINDOWS_RUN_KEY,
-        "/v",
-        "vdpi",
-        "/t",
-        "REG_SZ",
-        "/d",
-        &run_cmd,
-        "/f",
-    ])?;
 
     let my_pid = std::process::id();
     let _ = Command::new("taskkill")
         .creation_flags(CREATE_NO_WINDOW)
         .args(["/F", "/FI", &format!("PID ne {my_pid}"), "/IM", "vdpi.exe"])
         .output();
-
-    let _ = Command::new("wscript.exe")
-        .creation_flags(CREATE_NO_WINDOW)
-        .args(["//B", &vbs_path.display().to_string()])
-        .spawn();
-
-    println!("Installed binary : {}", target_bin.display());
-    println!("Startup launcher : {}", vbs_path.display());
-    Ok(())
 }
 
-/// Stops the background service, removes startup registration, and restores system proxy state.
+#[cfg(target_os = "windows")]
+fn cleanup_windows_install_files() {
+    use crate::platform::windows::remove_dir_from_windows_path;
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let Ok(vdpi_root) = vdpi_root_dir() else {
+        return;
+    };
+    let bin_dir = vdpi_root.join("bin");
+    let legacy_root = legacy_windows_root_dir();
+    let legacy_bin = legacy_root.as_ref().map(|r| r.join("bin"));
+
+    remove_dir_from_windows_path(&bin_dir, legacy_bin.as_deref());
+
+    let current_exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| fs::canonicalize(&p).ok());
+
+    if let Some(ref legacy) = legacy_root {
+        let running_from_legacy = current_exe
+            .as_ref()
+            .zip(fs::canonicalize(legacy).ok())
+            .is_some_and(|(exe, root)| exe.starts_with(root));
+        if legacy.exists() && !running_from_legacy {
+            let _ = fs::remove_dir_all(legacy);
+        }
+    }
+
+    if vdpi_root.exists() {
+        let running_from_root = current_exe
+            .as_ref()
+            .zip(fs::canonicalize(&vdpi_root).ok())
+            .is_some_and(|(exe, root)| exe.starts_with(root));
+        if running_from_root {
+            let _ = fs::remove_dir_all(vdpi_root.join("logs"));
+            // Schedule silent removal of the install folder right after this process exits.
+            let cleanup_cmd = format!(
+                "timeout /t 1 /nobreak >nul & rmdir /S /Q \"{}\"",
+                vdpi_root.display()
+            );
+            let _ = Command::new("cmd.exe")
+                .creation_flags(CREATE_NO_WINDOW)
+                .args(["/C", &cleanup_cmd])
+                .spawn();
+        } else {
+            let _ = fs::remove_dir_all(&vdpi_root);
+        }
+    }
+}
+
+/// Stops the background service, removes startup registration, cleans installed files,
+/// and restores system proxy state.
 pub fn uninstall_service() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -381,6 +575,11 @@ pub fn uninstall_service() -> Result<()> {
         } else {
             println!("LaunchAgent {} is not installed", plist_path.display());
         }
+        if let Ok(root) = vdpi_root_dir() {
+            if root.exists() {
+                let _ = fs::remove_dir_all(&root);
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -398,27 +597,46 @@ pub fn uninstall_service() -> Result<()> {
         } else {
             println!("Systemd unit {} is not installed", unit_path.display());
         }
+        if let Ok(home) = home_dir() {
+            let _ = fs::remove_file(home.join(".local").join("bin").join("vdpi"));
+        }
+        if let Ok(root) = vdpi_root_dir() {
+            if root.exists() {
+                let _ = fs::remove_dir_all(&root);
+            }
+        }
     }
 
     #[cfg(target_os = "windows")]
     {
-        use crate::platform::windows::run_reg;
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        use crate::platform::windows_service::{is_elevated, relaunch_elevated_and_wait};
 
-        let _ = run_reg(&["delete", WINDOWS_RUN_KEY, "/v", "vdpi", "/f"]);
-        if let Ok(vbs) = windows_autostart_vbs_path() {
-            let _ = fs::remove_file(vbs);
+        if !is_elevated() {
+            println!("Requesting Administrator privileges to uninstall the vdpi Windows service...");
+            relaunch_elevated_and_wait()?;
+            clear_all_system_proxies()?;
+            println!(
+                "Removed Windows service '{WINDOWS_SERVICE_NAME}' and restored {} system proxy settings.",
+                platform_name()
+            );
+            return Ok(());
         }
-        let my_pid = std::process::id();
-        let _ = Command::new("taskkill")
-            .creation_flags(CREATE_NO_WINDOW)
-            .args(["/F", "/FI", &format!("PID ne {my_pid}"), "/IM", "vdpi.exe"])
-            .output();
-        println!("Removed Windows startup registration and stopped background vdpi.exe.");
+
+        let removed = crate::platform::windows_service::uninstall_windows_service()?;
+        cleanup_legacy_windows_startup();
+        stop_other_windows_vdpi_processes();
+        if removed {
+            println!("Stopped and removed Windows service: {WINDOWS_SERVICE_NAME}");
+        } else {
+            println!("Windows service '{WINDOWS_SERVICE_NAME}' is not installed.");
+        }
     }
 
     clear_all_system_proxies()?;
+
+    #[cfg(target_os = "windows")]
+    cleanup_windows_install_files();
+
     println!("Restored {} system proxy settings.", platform_name());
     Ok(())
 }
@@ -492,9 +710,25 @@ pub async fn print_status(cfg: &RuntimeConfig) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         use crate::platform::windows::query_reg_sz;
-        let reg_val =
-            query_reg_sz(WINDOWS_RUN_KEY, "vdpi").unwrap_or_else(|| "not installed".into());
-        println!("Windows Startup (HKCU Run): {reg_val}");
+        use crate::platform::windows_service::query_windows_service_status;
+
+        let svc = query_windows_service_status();
+        if svc.installed {
+            let pid_suffix = svc.pid.map(|p| format!(", PID {p}")).unwrap_or_default();
+            println!(
+                "Windows Service ({WINDOWS_SERVICE_NAME})    : {} ({}{})",
+                svc.state, svc.start_type, pid_suffix
+            );
+            if let Some(bin) = svc.binary_path {
+                println!("Service Command           : {bin}");
+            }
+        } else {
+            println!("Windows Service ({WINDOWS_SERVICE_NAME})    : NOT INSTALLED");
+        }
+
+        if let Some(legacy) = query_reg_sz(WINDOWS_LEGACY_RUN_KEY, "vdpi") {
+            println!("Legacy Startup (HKCU Run) : {legacy} (run 'vdpi install' to migrate)");
+        }
     }
 
     print_platform_proxy_status();
@@ -670,11 +904,40 @@ mod tests {
         assert!(unit.contains("ExecStart=\"/home/test/.vdpi/bin/vdpi\""));
         assert!(unit.contains("LimitNOFILE=65536"));
 
-        let vbs = generate_windows_autostart_vbs(
-            Path::new(r"C:\Users\test\AppData\Local\vdpi\bin\vdpi.exe"),
+        let win_bin = build_windows_service_bin_path(
+            Path::new(r"C:\Program Files\vdpi\bin\vdpi.exe"),
             &cfg,
         );
-        assert!(vbs.contains("vdpi.exe"));
-        assert!(vbs.contains("--quiet"));
+        assert!(win_bin.starts_with(r#""C:\Program Files\vdpi\bin\vdpi.exe" --service "#));
+        assert!(win_bin.contains("--bind 127.0.0.1"));
+        assert!(win_bin.contains("--port 8080"));
+        assert!(win_bin.contains("--chunk-size 10"));
+        assert!(win_bin.contains("--socks-port 1080"));
+        assert!(win_bin.contains("--quiet"));
+    }
+
+    #[test]
+    fn preserves_custom_flags_in_windows_service_bin_path() {
+        let cli = CliArgs::parse_from_iter([
+            "vdpi",
+            "--mode",
+            "tls-record",
+            "--dns",
+            "8.8.8.8",
+            "--bypass",
+            "*.example.com",
+            "--no-env-proxy",
+        ])
+        .unwrap();
+        let cfg = cli.into_runtime_config();
+        let win_bin = build_windows_service_bin_path(
+            Path::new(r"C:\Program Files\vdpi\bin\vdpi.exe"),
+            &cfg,
+        );
+        assert!(win_bin.contains("--service"));
+        assert!(win_bin.contains("--mode tls-record"));
+        assert!(win_bin.contains("--dns 8.8.8.8"));
+        assert!(win_bin.contains("--bypass *.example.com"));
+        assert!(win_bin.contains("--no-env-proxy"));
     }
 }
