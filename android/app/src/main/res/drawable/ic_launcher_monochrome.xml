@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Adaptive monochrome safe-zone mark (fits cleanly within 66dp center circle) -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M31,32 L41,32 L52,66 L42,66 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M56,66 L67,32 L77,32 L66,66 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M42,72 L66,72 L66,76.5 L42,76.5 Z" />
+</vector>

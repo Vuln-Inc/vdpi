@@ -37,6 +37,7 @@ data class VdpiPalette(
     val surfaceRaised: Color,
     val border: Color,
     val borderStrong: Color,
+    val topHighlight: Color,
     val inkPrimary: Color,
     val inkSecondary: Color,
     val inkMuted: Color,
@@ -56,16 +57,17 @@ val DarkVdpiPalette = VdpiPalette(
     canvas = Color(0xFF09090B),
     surface = Color(0xFF111113),
     surfaceRaised = Color(0xFF18181B),
-    border = Color(0x18FFFFFF),
-    borderStrong = Color(0x2EFFFFFF),
+    border = Color(0x1AFFFFFF),
+    borderStrong = Color(0x33FFFFFF),
+    topHighlight = Color(0x12FFFFFF),
     inkPrimary = Color(0xFFF4F4F5),
     inkSecondary = Color(0xFFA1A1AA),
-    inkMuted = Color(0xFF6B6B76),
+    inkMuted = Color(0xFF8E8E9A),
     primaryButtonBg = Color(0xFFF4F4F5),
     primaryButtonInk = Color(0xFF09090B),
     signal = Color(0xFF10B981),
-    signalTint = Color(0x1810B981),
-    signalBorder = Color(0x4D10B981),
+    signalTint = Color(0x1A10B981),
+    signalBorder = Color(0x5210B981),
     warning = Color(0xFFF59E0B),
     warningTint = Color(0x1AF59E0B),
     danger = Color(0xFFEF4444),
@@ -79,19 +81,92 @@ val LightVdpiPalette = VdpiPalette(
     surfaceRaised = Color(0xFFF4F4F5),
     border = Color(0xFFE4E4E7),
     borderStrong = Color(0xFFD4D4D8),
+    topHighlight = Color.Transparent,
     inkPrimary = Color(0xFF09090B),
     inkSecondary = Color(0xFF52525B),
-    inkMuted = Color(0xFF71717A),
+    inkMuted = Color(0xFF5C5C66),
     primaryButtonBg = Color(0xFF09090B),
     primaryButtonInk = Color(0xFFFAFAFA),
-    signal = Color(0xFF059669),
-    signalTint = Color(0x14059669),
-    signalBorder = Color(0x4D059669),
-    warning = Color(0xFFD97706),
-    warningTint = Color(0x18D97706),
+    signal = Color(0xFF047857),
+    signalTint = Color(0x14047857),
+    signalBorder = Color(0x4D047857),
+    warning = Color(0xFFB45309),
+    warningTint = Color(0x18B45309),
     danger = Color(0xFFDC2626),
     dangerTint = Color(0x14DC2626),
 )
+
+object VdpiTextStyles {
+    val hero = TextStyle(
+        fontFamily = GeistSans,
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 30.sp,
+        lineHeight = 34.sp,
+        letterSpacing = (-0.9).sp,
+    )
+    val screenTitle = TextStyle(
+        fontFamily = GeistSans,
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 20.sp,
+        lineHeight = 26.sp,
+        letterSpacing = (-0.4).sp,
+    )
+    val sheetTitle = TextStyle(
+        fontFamily = GeistSans,
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 18.sp,
+        lineHeight = 24.sp,
+        letterSpacing = (-0.3).sp,
+    )
+    val rowTitle = TextStyle(
+        fontFamily = GeistSans,
+        fontWeight = FontWeight.Medium,
+        fontSize = 14.sp,
+        lineHeight = 20.sp,
+        letterSpacing = (-0.1).sp,
+    )
+    val body = TextStyle(
+        fontFamily = GeistSans,
+        fontWeight = FontWeight.Normal,
+        fontSize = 13.sp,
+        lineHeight = 19.sp,
+    )
+    val caption = TextStyle(
+        fontFamily = GeistSans,
+        fontWeight = FontWeight.Normal,
+        fontSize = 12.sp,
+        lineHeight = 17.sp,
+    )
+    val button = TextStyle(
+        fontFamily = GeistSans,
+        fontWeight = FontWeight.Medium,
+        fontSize = 14.sp,
+        lineHeight = 18.sp,
+        letterSpacing = (-0.1).sp,
+    )
+    val overline = TextStyle(
+        fontFamily = GeistMono,
+        fontWeight = FontWeight.Medium,
+        fontSize = 11.sp,
+        lineHeight = 14.sp,
+        letterSpacing = 0.85.sp,
+        fontFeatureSettings = "tnum",
+    )
+    val monoMetric = TextStyle(
+        fontFamily = GeistMono,
+        fontWeight = FontWeight.Medium,
+        fontSize = 13.sp,
+        lineHeight = 18.sp,
+        fontFeatureSettings = "tnum",
+    )
+    val monoSmall = TextStyle(
+        fontFamily = GeistMono,
+        fontWeight = FontWeight.Normal,
+        fontSize = 11.sp,
+        lineHeight = 15.sp,
+        fontFeatureSettings = "tnum",
+    )
+}
 
 val LocalVdpiPalette = staticCompositionLocalOf { DarkVdpiPalette }
 

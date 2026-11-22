@@ -2,10 +2,19 @@ package com.vulninc.vdpi.ui.screens
 
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -20,11 +29,12 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -35,21 +45,26 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vulninc.vdpi.data.SplitTunnelMode
 import com.vulninc.vdpi.data.VdpiSettings
 import com.vulninc.vdpi.engine.EngineEvent
@@ -61,6 +76,7 @@ import com.vulninc.vdpi.ui.components.SectionOverline
 import com.vulninc.vdpi.ui.components.VdpiBrandMark
 import com.vulninc.vdpi.ui.theme.GeistMono
 import com.vulninc.vdpi.ui.theme.GeistSans
+import com.vulninc.vdpi.ui.theme.VdpiTextStyles
 import com.vulninc.vdpi.ui.theme.VdpiThemeTokens
 import com.vulninc.vdpi.util.formatBytes
 import com.vulninc.vdpi.util.formatEventTime
@@ -68,11 +84,12 @@ import com.vulninc.vdpi.util.formatStageShort
 import com.vulninc.vdpi.util.formatUptime
 import com.vulninc.vdpi.vpn.TunnelPhase
 import com.vulninc.vdpi.vpn.TunnelRuntimeSnapshot
+import kotlinx.coroutines.flow.StateFlow
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TunnelScreen(
-    runtime: TunnelRuntimeSnapshot,
+    tunnelState: StateFlow<TunnelRuntimeSnapshot>,
     settings: VdpiSettings,
     doctorState: DoctorUiState,
     engineVersion: String,
@@ -81,8 +98,11 @@ fun TunnelScreen(
     onReconnect: () -> Unit,
     onRunDoctor: () -> Unit,
     onClearCache: () -> Unit,
+    onLogCopied: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    // Scoped locally so 1Hz telemetry updates never recompose MainActivity, Apps, or Settings.
+    val runtime by tunnelState.collectAsStateWithLifecycle()
     val palette = VdpiThemeTokens.palette
     val haptic = LocalHapticFeedback.current
     var showDoctorSheet by remember { mutableStateOf(false) }
@@ -120,7 +140,7 @@ fun TunnelScreen(
             .verticalScroll(rememberScrollState())
             .padding(horizontal = 20.dp, vertical = 16.dp),
     ) {
-        // Minimal header: brand mark + wordmark + mono version badge
+        // Minimal header: fractured-V brand mark + wordmark + mono version badge
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -147,8 +167,7 @@ fun TunnelScreen(
             ) {
                 Text(
                     text = "v$engineVersion",
-                    fontFamily = GeistMono,
-                    fontSize = 11.sp,
+                    style = VdpiTextStyles.monoSmall,
                     color = palette.inkMuted,
                 )
             }
@@ -161,6 +180,7 @@ fun TunnelScreen(
             borderColor = heroBorder,
             backgroundColor = palette.surface,
             radius = 16.dp,
+            topHighlight = true,
         ) {
             Column(modifier = Modifier.padding(20.dp)) {
                 Row(
@@ -169,24 +189,19 @@ fun TunnelScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(
-                            modifier = Modifier
-                                .size(7.dp)
-                                .clip(CircleShape)
-                                .background(statusDotColor),
+                        StatusBeacon(
+                            color = statusDotColor,
+                            pulsing = isConnected || isConnecting,
                         )
                         Spacer(Modifier.width(8.dp))
                         Text(
                             text = when (runtime.phase) {
-                                TunnelPhase.CONNECTED -> "ACTIVE · LOCAL TUN"
-                                TunnelPhase.CONNECTING -> "STARTING ENGINE"
-                                TunnelPhase.ERROR -> "ENGINE ERROR"
+                                TunnelPhase.CONNECTED -> "PROTECTED"
+                                TunnelPhase.CONNECTING -> "STARTING"
+                                TunnelPhase.ERROR -> "INTERRUPTED"
                                 TunnelPhase.DISCONNECTED -> "STANDBY"
                             },
-                            fontFamily = GeistMono,
-                            fontWeight = FontWeight.Medium,
-                            fontSize = 11.sp,
-                            letterSpacing = 0.8.sp,
+                            style = VdpiTextStyles.overline,
                             color = when (runtime.phase) {
                                 TunnelPhase.CONNECTED -> palette.signal
                                 TunnelPhase.CONNECTING -> palette.warning
@@ -199,11 +214,8 @@ fun TunnelScreen(
                     if (isConnected) {
                         Text(
                             text = formatUptime(runtime.telemetry.uptimeSecs),
-                            fontFamily = GeistMono,
-                            fontWeight = FontWeight.Medium,
-                            fontSize = 12.sp,
+                            style = VdpiTextStyles.monoMetric,
                             color = palette.inkSecondary,
-                            style = androidx.compose.ui.text.TextStyle(fontFeatureSettings = "tnum"),
                         )
                     }
                 }
@@ -217,18 +229,15 @@ fun TunnelScreen(
                         TunnelPhase.ERROR -> "Interrupted"
                         TunnelPhase.DISCONNECTED -> "Disconnected"
                     },
-                    fontFamily = GeistSans,
-                    fontWeight = FontWeight.SemiBold,
-                    fontSize = 30.sp,
-                    lineHeight = 34.sp,
-                    letterSpacing = (-0.9).sp,
+                    style = VdpiTextStyles.hero,
                     color = palette.inkPrimary,
                 )
 
                 Spacer(Modifier.height(6.dp))
 
+                val errMsg = runtime.errorMessage
                 val subtitle = when {
-                    isError && !runtime.errorMessage.isNullOrBlank() -> runtime.errorMessage
+                    isError && !errMsg.isNullOrBlank() -> errMsg
                     isConnected -> {
                         val splitNote = splitSummary(settings)
                         val modeStr = formatStageShort(
@@ -237,15 +246,13 @@ fun TunnelScreen(
                         )
                         if (splitNote != null) "$modeStr · $splitNote" else "$modeStr · ${settings.dnsAddr}"
                     }
-                    isConnecting -> "Establishing local TUN interface and DNS ring"
-                    else -> "Userspace anti-DPI engine · ${settings.desyncMode.label} · ${if (settings.enableDoh) "DoH" else "UDP"} ${settings.dnsAddr}"
+                    isConnecting -> "Starting local tunnel and encrypted DNS"
+                    else -> "${settings.desyncMode.label} · ${if (settings.enableDoh) "DoH" else "UDP"} ${settings.dnsAddr}"
                 }
 
                 Text(
                     text = subtitle,
-                    fontFamily = GeistSans,
-                    fontSize = 13.sp,
-                    lineHeight = 19.sp,
+                    style = VdpiTextStyles.body,
                     color = if (isError) palette.danger else palette.inkSecondary,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
@@ -263,90 +270,122 @@ fun TunnelScreen(
             }
         }
 
-        AnimatedVisibility(visible = pendingReconnect && isConnected) {
+        AnimatedVisibility(
+            visible = pendingReconnect && isConnected,
+            enter = fadeIn(tween(180)) + expandVertically(),
+            exit = fadeOut(tween(140)) + shrinkVertically(),
+        ) {
             Column {
                 Spacer(Modifier.height(12.dp))
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(10.dp))
+                        .clip(RoundedCornerShape(12.dp))
                         .background(palette.warningTint)
-                        .border(1.dp, palette.warning.copy(alpha = 0.35f), RoundedCornerShape(10.dp))
-                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                        .border(1.dp, palette.warning.copy(alpha = 0.35f), RoundedCornerShape(12.dp))
+                        .padding(start = 14.dp, end = 8.dp, top = 6.dp, bottom = 6.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween,
                 ) {
                     Text(
-                        text = "Settings updated. Reconnect to apply.",
-                        fontFamily = GeistSans,
-                        fontSize = 12.sp,
+                        text = "Settings changed. Reconnect to apply.",
+                        style = VdpiTextStyles.caption,
                         color = palette.inkPrimary,
                         modifier = Modifier.weight(1f),
                     )
-                    Spacer(Modifier.width(12.dp))
-                    Text(
-                        text = "Reconnect",
-                        fontFamily = GeistSans,
-                        fontWeight = FontWeight.Medium,
-                        fontSize = 12.sp,
-                        color = palette.warning,
+                    Spacer(Modifier.width(8.dp))
+                    Box(
                         modifier = Modifier
-                            .clip(RoundedCornerShape(6.dp))
-                            .clickable(onClick = onReconnect)
-                            .padding(horizontal = 8.dp, vertical = 4.dp),
-                    )
+                            .heightIn(min = 44.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable(role = Role.Button, onClick = onReconnect)
+                            .padding(horizontal = 12.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            text = "Reconnect",
+                            fontFamily = GeistSans,
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 12.sp,
+                            color = palette.warning,
+                        )
+                    }
                 }
             }
         }
 
         Spacer(Modifier.height(22.dp))
 
-        SectionOverline(
-            text = "Telemetry",
-            modifier = Modifier.padding(start = 2.dp, bottom = 8.dp),
-        )
+        // Quiet Active Profile on standby; full Live Telemetry when connected/connecting
+        if (!isConnected && !isConnecting) {
+            SectionOverline(
+                text = "Active Profile",
+                modifier = Modifier.padding(start = 2.dp, bottom = 8.dp),
+            )
+            HairlinePanel(radius = 14.dp) {
+                LedgerRow(
+                    label = "ENGINE",
+                    primaryValue = "${settings.desyncMode.label} · ${settings.chunkSize} B",
+                    secondaryMono = if (settings.blockQuic) "QUIC blocked" else "QUIC open",
+                )
+                HairlineRule()
+                LedgerRow(
+                    label = "DNS",
+                    primaryValue = "${if (settings.enableDoh) "DoH" else "UDP"} · ${settings.dnsAddr}",
+                    secondaryMono = if (settings.ipv4Only) "IPv4 only" else "Dual-stack",
+                )
+                HairlineRule()
+                LedgerRow(
+                    label = "SPLIT TUNNEL",
+                    primaryValue = settings.splitTunnelMode.label,
+                    secondaryMono = splitSummary(settings) ?: "All apps",
+                )
+            }
+        }
 
-        // Single cohesive hairline ledger — zero equal-weight icon cards
-        HairlinePanel(radius = 14.dp) {
-            val snap = runtime.telemetry
-            LedgerRow(
-                label = "TLS ENGINE",
-                primaryValue = if (isConnected) {
-                    formatStageShort(snap.stageNumber, snap.stageLabel)
-                } else {
-                    "${settings.desyncMode.label} · ${settings.chunkSize}B"
-                },
-                secondaryMono = "${snap.learnedHosts} learned",
-                highlightPrimary = isConnected,
-            )
-            HairlineRule()
-            LedgerRow(
-                label = "DNS RING",
-                primaryValue = if (settings.enableDoh) {
-                    "DoH · ${settings.dnsAddr}"
-                } else {
-                    "UDP · ${settings.dnsAddr}"
-                },
-                secondaryMono = "${snap.dnsQueries} queries",
-            )
-            HairlineRule()
-            LedgerRow(
-                label = "THROUGHPUT",
-                primaryValue = "↓ ${formatBytes(snap.bytesRx)}   ↑ ${formatBytes(snap.bytesTx)}",
-                secondaryMono = "${snap.activeConnections} active",
-                primaryMono = true,
-            )
-            HairlineRule()
-            LedgerRow(
-                label = "SESSIONS",
-                primaryValue = "${snap.tlsHandshakes} TLS · ${snap.udpFlowsActive} UDP",
-                secondaryMono = if (settings.blockQuic) {
-                    "${snap.quicBlocked} QUIC dropped"
-                } else {
-                    "QUIC allowed"
-                },
-                primaryMono = true,
-            )
+        AnimatedVisibility(
+            visible = isConnected || isConnecting,
+            enter = fadeIn(tween(220)) + expandVertically(),
+            exit = fadeOut(tween(150)) + shrinkVertically(),
+        ) {
+            Column {
+                SectionOverline(
+                    text = "Live Telemetry",
+                    modifier = Modifier.padding(start = 2.dp, bottom = 8.dp),
+                )
+                HairlinePanel(radius = 14.dp) {
+                    val snap = runtime.telemetry
+                    LedgerRow(
+                        label = "TLS ENGINE",
+                        primaryValue = formatStageShort(snap.stageNumber, snap.stageLabel),
+                        secondaryMono = "${snap.learnedHosts} learned",
+                        highlightPrimary = isConnected,
+                    )
+                    HairlineRule()
+                    LedgerRow(
+                        label = "DNS RESOLVER",
+                        primaryValue = "${if (settings.enableDoh) "DoH" else "UDP"} · ${settings.dnsAddr}",
+                        secondaryMono = "${snap.dnsQueries} queries",
+                    )
+                    HairlineRule()
+                    ThroughputLedgerRow(
+                        rxText = formatBytes(snap.bytesRx),
+                        txText = formatBytes(snap.bytesTx),
+                        activeConnections = snap.activeConnections,
+                    )
+                    HairlineRule()
+                    LedgerRow(
+                        label = "SESSIONS",
+                        primaryValue = "${snap.tlsHandshakes} TLS · ${snap.udpFlowsActive} UDP",
+                        secondaryMono = if (settings.blockQuic) {
+                            "${snap.quicBlocked} QUIC dropped"
+                        } else {
+                            "QUIC open"
+                        },
+                        primaryMono = true,
+                    )
+                }
+            }
         }
 
         Spacer(Modifier.height(14.dp))
@@ -406,8 +445,56 @@ fun TunnelScreen(
             EngineLogSheetContent(
                 events = runtime.telemetry.events,
                 onClearCache = onClearCache,
+                onCopied = onLogCopied,
             )
         }
+    }
+}
+
+@Composable
+private fun StatusBeacon(
+    color: Color,
+    pulsing: Boolean,
+) {
+    Box(
+        modifier = Modifier.size(12.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (pulsing) {
+            val transition = rememberInfiniteTransition(label = "beaconPulse")
+            val pulseScale by transition.animateFloat(
+                initialValue = 1f,
+                targetValue = 1.9f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(1800, easing = FastOutSlowInEasing),
+                    repeatMode = RepeatMode.Restart,
+                ),
+                label = "beaconScale",
+            )
+            val pulseAlpha by transition.animateFloat(
+                initialValue = 0.45f,
+                targetValue = 0f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(1800, easing = FastOutSlowInEasing),
+                    repeatMode = RepeatMode.Restart,
+                ),
+                label = "beaconAlpha",
+            )
+            Box(
+                modifier = Modifier
+                    .size(7.dp)
+                    .scale(pulseScale)
+                    .alpha(pulseAlpha)
+                    .clip(CircleShape)
+                    .background(color),
+            )
+        }
+        Box(
+            modifier = Modifier
+                .size(7.dp)
+                .clip(CircleShape)
+                .background(color),
+        )
     }
 }
 
@@ -455,11 +542,12 @@ private fun PrimaryTunnelButton(
             .background(bgColor)
             .border(
                 width = if (isConnected || isConnecting) 1.dp else 0.dp,
-                color = if (isConnected || isConnecting) palette.borderStrong else androidx.compose.ui.graphics.Color.Transparent,
+                color = if (isConnected || isConnecting) palette.borderStrong else Color.Transparent,
                 shape = shape,
             )
             .clickable(
                 enabled = !isConnecting,
+                role = Role.Button,
                 interactionSource = interaction,
                 indication = null,
                 onClick = onClick,
@@ -485,10 +573,7 @@ private fun PrimaryTunnelButton(
                     TunnelPhase.ERROR -> "Retry connection"
                     TunnelPhase.DISCONNECTED -> "Connect"
                 },
-                fontFamily = GeistSans,
-                fontWeight = FontWeight.Medium,
-                fontSize = 14.sp,
-                letterSpacing = (-0.1).sp,
+                style = VdpiTextStyles.button,
                 color = textColor,
             )
         }
@@ -514,20 +599,15 @@ private fun LedgerRow(
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = label,
-                fontFamily = GeistMono,
-                fontWeight = FontWeight.Medium,
+                style = VdpiTextStyles.overline,
                 fontSize = 10.sp,
-                letterSpacing = 0.8.sp,
                 color = palette.inkMuted,
             )
             Spacer(Modifier.height(3.dp))
             Text(
                 text = primaryValue,
-                fontFamily = if (primaryMono) GeistMono else GeistSans,
-                fontWeight = FontWeight.Medium,
-                fontSize = if (primaryMono) 13.sp else 14.sp,
-                color = if (highlightPrimary) palette.inkPrimary else palette.inkPrimary,
-                style = androidx.compose.ui.text.TextStyle(fontFeatureSettings = "tnum"),
+                style = if (primaryMono) VdpiTextStyles.monoMetric else VdpiTextStyles.rowTitle,
+                color = if (highlightPrimary) palette.signal else palette.inkPrimary,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
@@ -535,10 +615,59 @@ private fun LedgerRow(
         Spacer(Modifier.width(12.dp))
         Text(
             text = secondaryMono,
-            fontFamily = GeistMono,
-            fontSize = 11.sp,
+            style = VdpiTextStyles.monoSmall,
             color = palette.inkSecondary,
-            style = androidx.compose.ui.text.TextStyle(fontFeatureSettings = "tnum"),
+        )
+    }
+}
+
+@Composable
+private fun ThroughputLedgerRow(
+    rxText: String,
+    txText: String,
+    activeConnections: Int,
+) {
+    val palette = VdpiThemeTokens.palette
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 13.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = "DOWNLOAD",
+                style = VdpiTextStyles.overline,
+                fontSize = 10.sp,
+                color = palette.inkMuted,
+            )
+            Spacer(Modifier.height(3.dp))
+            Text(
+                text = "↓ $rxText",
+                style = VdpiTextStyles.monoMetric,
+                color = palette.inkPrimary,
+                maxLines = 1,
+            )
+        }
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = "UPLOAD",
+                style = VdpiTextStyles.overline,
+                fontSize = 10.sp,
+                color = palette.inkMuted,
+            )
+            Spacer(Modifier.height(3.dp))
+            Text(
+                text = "↑ $txText",
+                style = VdpiTextStyles.monoMetric,
+                color = palette.inkPrimary,
+                maxLines = 1,
+            )
+        }
+        Text(
+            text = "$activeConnections active",
+            style = VdpiTextStyles.monoSmall,
+            color = palette.inkSecondary,
         )
     }
 }
@@ -553,33 +682,33 @@ private fun DoctorSheetContent(
     Column(
         modifier = Modifier
             .fillMaxWidth()
+            .verticalScroll(rememberScrollState())
+            .navigationBarsPadding()
             .padding(horizontal = 20.dp)
-            .padding(bottom = 28.dp),
+            .padding(bottom = 24.dp),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
-            Column {
+            Column(modifier = Modifier.weight(1f)) {
                 Text(
                     text = "Diagnostics",
-                    fontFamily = GeistSans,
-                    fontWeight = FontWeight.SemiBold,
-                    fontSize = 18.sp,
-                    letterSpacing = (-0.3).sp,
+                    style = VdpiTextStyles.sheetTitle,
                     color = palette.inkPrimary,
                 )
                 Text(
-                    text = "Live DoH and 7-stage TLS ServerHello verification",
-                    fontFamily = GeistSans,
-                    fontSize = 12.sp,
+                    text = "Live DoH and TLS handshake verification",
+                    style = VdpiTextStyles.caption,
                     color = palette.inkSecondary,
                 )
             }
+            Spacer(Modifier.width(12.dp))
             GhostActionButton(
                 label = if (doctorState.running) "Running" else "Re-run",
-                onClick = { if (!doctorState.running) onRerun() },
+                enabled = !doctorState.running,
+                onClick = onRerun,
             )
         }
 
@@ -600,9 +729,8 @@ private fun DoctorSheetContent(
                     )
                     Spacer(Modifier.width(12.dp))
                     Text(
-                        text = "Probing DNS ring, Discord, and Roblox handshakes...",
-                        fontFamily = GeistSans,
-                        fontSize = 13.sp,
+                        text = "Probing encrypted DNS and TLS endpoints...",
+                        style = VdpiTextStyles.body,
                         color = palette.inkSecondary,
                     )
                 }
@@ -625,7 +753,7 @@ private fun DoctorSheetContent(
                         ) {
                             Box(
                                 modifier = Modifier
-                                    .padding(top = 5.dp)
+                                    .padding(top = 6.dp)
                                     .size(7.dp)
                                     .clip(CircleShape)
                                     .background(if (check.passed) palette.signal else palette.danger),
@@ -634,15 +762,12 @@ private fun DoctorSheetContent(
                             Column {
                                 Text(
                                     text = check.name,
-                                    fontFamily = GeistSans,
-                                    fontWeight = FontWeight.Medium,
-                                    fontSize = 14.sp,
+                                    style = VdpiTextStyles.rowTitle,
                                     color = palette.inkPrimary,
                                 )
                                 Text(
                                     text = check.detail,
-                                    fontFamily = GeistMono,
-                                    fontSize = 11.sp,
+                                    style = VdpiTextStyles.monoSmall,
                                     color = palette.inkSecondary,
                                     lineHeight = 16.sp,
                                 )
@@ -651,10 +776,8 @@ private fun DoctorSheetContent(
                         Spacer(Modifier.width(10.dp))
                         Text(
                             text = "${check.latencyMs} ms",
-                            fontFamily = GeistMono,
-                            fontSize = 11.sp,
+                            style = VdpiTextStyles.monoSmall,
                             color = palette.inkMuted,
-                            style = androidx.compose.ui.text.TextStyle(fontFeatureSettings = "tnum"),
                         )
                     }
                 }
@@ -667,38 +790,51 @@ private fun DoctorSheetContent(
 private fun EngineLogSheetContent(
     events: List<EngineEvent>,
     onClearCache: () -> Unit,
+    onCopied: () -> Unit,
 ) {
     val palette = VdpiThemeTokens.palette
+    val clipboard = LocalClipboardManager.current
     val reversed = remember(events) { events.asReversed() }
 
     Column(
         modifier = Modifier
             .fillMaxWidth()
+            .navigationBarsPadding()
             .padding(horizontal = 20.dp)
-            .padding(bottom = 28.dp),
+            .padding(bottom = 24.dp),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
-            Column {
+            Column(modifier = Modifier.weight(1f)) {
                 Text(
                     text = "Engine log",
-                    fontFamily = GeistSans,
-                    fontWeight = FontWeight.SemiBold,
-                    fontSize = 18.sp,
-                    letterSpacing = (-0.3).sp,
+                    style = VdpiTextStyles.sheetTitle,
                     color = palette.inkPrimary,
                 )
                 Text(
-                    text = "Recent events from Rust TUN core",
-                    fontFamily = GeistSans,
-                    fontSize = 12.sp,
+                    text = "Recent events from local TUN core",
+                    style = VdpiTextStyles.caption,
                     color = palette.inkSecondary,
                 )
             }
-            GhostActionButton(label = "Reset cache", onClick = onClearCache)
+            Spacer(Modifier.width(12.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                GhostActionButton(
+                    label = "Copy",
+                    enabled = reversed.isNotEmpty(),
+                    onClick = {
+                        val dump = reversed.joinToString("\n") { ev ->
+                            "${formatEventTime(ev.tsMs)} [${ev.tag}] ${ev.message}"
+                        }
+                        clipboard.setText(AnnotatedString(dump))
+                        onCopied()
+                    },
+                )
+                GhostActionButton(label = "Reset", onClick = onClearCache)
+            }
         }
 
         Spacer(Modifier.height(14.dp))
@@ -717,14 +853,17 @@ private fun EngineLogSheetContent(
                 ) {
                     Text(
                         text = "No engine events yet",
-                        fontFamily = GeistMono,
+                        style = VdpiTextStyles.monoSmall,
                         fontSize = 12.sp,
                         color = palette.inkMuted,
                     )
                 }
             } else {
                 LazyColumn(modifier = Modifier.padding(12.dp)) {
-                    items(reversed) { ev ->
+                    itemsIndexed(
+                        items = reversed,
+                        key = { idx, ev -> "${ev.tsMs}-${ev.tag}-$idx" },
+                    ) { _, ev ->
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -733,16 +872,13 @@ private fun EngineLogSheetContent(
                         ) {
                             Text(
                                 text = formatEventTime(ev.tsMs),
-                                fontFamily = GeistMono,
-                                fontSize = 11.sp,
+                                style = VdpiTextStyles.monoSmall,
                                 color = palette.inkMuted,
-                                style = androidx.compose.ui.text.TextStyle(fontFeatureSettings = "tnum"),
                             )
                             Spacer(Modifier.width(8.dp))
                             Text(
                                 text = "[${ev.tag}]",
-                                fontFamily = GeistMono,
-                                fontSize = 11.sp,
+                                style = VdpiTextStyles.monoSmall,
                                 color = when (ev.level) {
                                     "error" -> palette.danger
                                     "warn" -> palette.warning

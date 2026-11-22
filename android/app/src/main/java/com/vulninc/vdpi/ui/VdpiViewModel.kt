@@ -4,9 +4,13 @@ import android.app.Application
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
-import android.graphics.drawable.Drawable
+import android.os.Build
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.core.graphics.drawable.toBitmap
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.vulninc.vdpi.BuildConfig
 import com.vulninc.vdpi.data.SettingsRepository
 import com.vulninc.vdpi.data.SplitTunnelMode
 import com.vulninc.vdpi.data.ThemePreference
@@ -26,12 +30,14 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.Locale
+import kotlin.math.roundToInt
 
 data class InstalledAppItem(
     val packageName: String,
     val label: String,
     val isSystem: Boolean,
-    val icon: Drawable?,
+    val icon: ImageBitmap?,
 )
 
 data class DoctorUiState(
@@ -63,14 +69,16 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
     private val _pendingReconnect = MutableStateFlow(false)
     val pendingReconnect: StateFlow<Boolean> = _pendingReconnect.asStateFlow()
 
-    val engineVersion: String = NativeEngine.version()
+    // Never load JNI synchronously on the main thread during ViewModel creation.
+    val engineVersion: String = BuildConfig.VERSION_NAME
 
     init {
         loadInstalledApps()
     }
 
     private fun markDirtyIfConnected() {
-        if (tunnelState.value.phase == TunnelPhase.CONNECTED) {
+        val phase = tunnelState.value.phase
+        if (phase == TunnelPhase.CONNECTED || phase == TunnelPhase.CONNECTING) {
             _pendingReconnect.value = true
         }
     }
@@ -83,7 +91,7 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
         if (_appsLoading.value) return
         viewModelScope.launch {
             _appsLoading.value = true
-            val apps = withContext(Dispatchers.IO) {
+            val apps = withContext(Dispatchers.Default) {
                 queryLaunchableApps(getApplication())
             }
             _installedApps.value = apps
@@ -103,9 +111,12 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun clearNativeCache() {
-        viewModelScope.launch(Dispatchers.IO) {
-            NativeEngine.clearCache()
+    fun clearNativeCache(onDone: () -> Unit = {}) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                NativeEngine.clearCache()
+            }
+            onDone()
         }
     }
 
@@ -162,6 +173,11 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
         markDirtyIfConnected()
     }
 
+    fun restoreSplitPackages(packages: Set<String>) = viewModelScope.launch {
+        repo.setSplitPackages(packages)
+        markDirtyIfConnected()
+    }
+
     fun clearSplitPackages() = viewModelScope.launch {
         repo.clearSplitPackages()
         markDirtyIfConnected()
@@ -174,8 +190,20 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
     private fun queryLaunchableApps(app: Application): List<InstalledAppItem> {
         val pm = app.packageManager
         val selfPkg = app.packageName
+        val density = app.resources.displayMetrics.density
+        val iconPx = (36f * density).roundToInt().coerceIn(72, 144)
+
         val launcherIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-        val resolved = pm.queryIntentActivities(launcherIntent, PackageManager.MATCH_ALL)
+        val resolved = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            pm.queryIntentActivities(
+                launcherIntent,
+                PackageManager.ResolveInfoFlags.of(PackageManager.MATCH_ALL.toLong()),
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            pm.queryIntentActivities(launcherIntent, PackageManager.MATCH_ALL)
+        }
+
         val seen = HashSet<String>()
         val items = ArrayList<InstalledAppItem>(resolved.size)
 
@@ -184,7 +212,9 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
             val pkg = info.packageName
             if (pkg == selfPkg || !seen.add(pkg)) continue
             val label = runCatching { pm.getApplicationLabel(info).toString() }.getOrDefault(pkg)
-            val icon = runCatching { pm.getApplicationIcon(info) }.getOrNull()
+            val icon = runCatching {
+                pm.getApplicationIcon(info).toBitmap(iconPx, iconPx).asImageBitmap()
+            }.getOrNull()
             val isSystem = (info.flags and ApplicationInfo.FLAG_SYSTEM) != 0
             items.add(
                 InstalledAppItem(
@@ -196,7 +226,7 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
 
-        items.sortBy { it.label.lowercase() }
+        items.sortBy { it.label.lowercase(Locale.ROOT) }
         return items
     }
 }

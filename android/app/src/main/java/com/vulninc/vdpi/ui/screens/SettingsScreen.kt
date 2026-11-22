@@ -1,5 +1,7 @@
 package com.vulninc.vdpi.ui.screens
 
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -13,13 +15,18 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -29,10 +36,20 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.vulninc.vdpi.data.ThemePreference
@@ -45,13 +62,15 @@ import com.vulninc.vdpi.ui.components.SectionOverline
 import com.vulninc.vdpi.ui.components.SegmentedControl
 import com.vulninc.vdpi.ui.theme.GeistMono
 import com.vulninc.vdpi.ui.theme.GeistSans
+import com.vulninc.vdpi.ui.theme.VdpiTextStyles
 import com.vulninc.vdpi.ui.theme.VdpiThemeTokens
+import com.vulninc.vdpi.util.isValidBypassDomain
+import com.vulninc.vdpi.util.isValidDnsInput
+import com.vulninc.vdpi.util.sanitizeDomainInput
 
-private val DNS_PRESETS = listOf(
-    "1.1.1.1" to "Cloudflare",
-    "8.8.8.8" to "Google",
-    "94.140.14.140" to "AdGuard",
-    "9.9.9.9" to "Quad9",
+private val DNS_PRESET_ROWS = listOf(
+    listOf("1.1.1.1" to "Cloudflare", "8.8.8.8" to "Google"),
+    listOf("94.140.14.140" to "AdGuard", "9.9.9.9" to "Quad9"),
 )
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -73,8 +92,46 @@ fun SettingsScreen(
     modifier: Modifier = Modifier,
 ) {
     val palette = VdpiThemeTokens.palette
+    val haptic = LocalHapticFeedback.current
+    val focusManager = LocalFocusManager.current
+
     var customDnsInput by remember(settings.dnsAddr) { mutableStateOf(settings.dnsAddr) }
+    var dnsError by remember(settings.dnsAddr) { mutableStateOf<String?>(null) }
+
     var bypassInput by remember { mutableStateOf("") }
+    var bypassError by remember { mutableStateOf<String?>(null) }
+
+    val dnsTrimmed = customDnsInput.trim()
+    val dnsDirty = dnsTrimmed.isNotEmpty() && !dnsTrimmed.equals(settings.dnsAddr, ignoreCase = true)
+
+    fun submitDns() {
+        val candidate = customDnsInput.trim()
+        if (!isValidDnsInput(candidate)) {
+            dnsError = "Enter a valid IPv4, IPv6, or https:// DoH URL"
+            return
+        }
+        dnsError = null
+        focusManager.clearFocus()
+        if (!candidate.equals(settings.dnsAddr, ignoreCase = true)) {
+            onSetDnsAddr(candidate)
+        }
+    }
+
+    fun submitBypass() {
+        val cleaned = sanitizeDomainInput(bypassInput)
+        if (!isValidBypassDomain(cleaned)) {
+            bypassError = "Enter a valid domain (e.g. example.com or *.bank.org)"
+            return
+        }
+        if (cleaned in settings.bypassDomains) {
+            bypassError = "$cleaned is already in the bypass list"
+            return
+        }
+        bypassError = null
+        bypassInput = ""
+        focusManager.clearFocus()
+        onAddBypassDomain(cleaned)
+    }
 
     Column(
         modifier = modifier
@@ -84,10 +141,7 @@ fun SettingsScreen(
     ) {
         Text(
             text = "Settings",
-            fontFamily = GeistSans,
-            fontWeight = FontWeight.SemiBold,
-            fontSize = 20.sp,
-            letterSpacing = (-0.4).sp,
+            style = VdpiTextStyles.screenTitle,
             color = palette.inkPrimary,
         )
 
@@ -102,7 +156,16 @@ fun SettingsScreen(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clickable { onSetDesyncMode(mode) }
+                        .selectable(
+                            selected = selected,
+                            role = Role.RadioButton,
+                            onClick = {
+                                if (!selected) {
+                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                    onSetDesyncMode(mode)
+                                }
+                            },
+                        )
                         .padding(horizontal = 16.dp, vertical = 13.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -110,16 +173,13 @@ fun SettingsScreen(
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
                             text = mode.label,
-                            fontFamily = GeistSans,
-                            fontWeight = FontWeight.Medium,
-                            fontSize = 14.sp,
+                            style = VdpiTextStyles.rowTitle,
                             color = palette.inkPrimary,
                         )
                         Spacer(Modifier.height(2.dp))
                         Text(
                             text = mode.summary,
-                            fontFamily = GeistSans,
-                            fontSize = 12.sp,
+                            style = VdpiTextStyles.caption,
                             color = palette.inkSecondary,
                         )
                     }
@@ -139,46 +199,52 @@ fun SettingsScreen(
 
             HairlineRule()
 
-            // Chunk size stepper
+            // Chunk size stepper with full 44dp touch targets and bound-disabled feedback
+            val canDecrease = settings.chunkSize > 2
+            val canIncrease = settings.chunkSize < 64
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 13.dp),
+                    .padding(start = 16.dp, end = 10.dp, top = 8.dp, bottom = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
                         text = "Chunk size",
-                        fontFamily = GeistSans,
-                        fontWeight = FontWeight.Medium,
-                        fontSize = 14.sp,
+                        style = VdpiTextStyles.rowTitle,
                         color = palette.inkPrimary,
                     )
                     Text(
                         text = "Initial TLS split segment size",
-                        fontFamily = GeistSans,
-                        fontSize = 12.sp,
+                        style = VdpiTextStyles.caption,
                         color = palette.inkSecondary,
                     )
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     StepperButton(
                         label = "-",
-                        onClick = { onSetChunkSize((settings.chunkSize - 2).coerceAtLeast(2)) },
+                        contentDescription = "Decrease chunk size",
+                        enabled = canDecrease,
+                        onClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onSetChunkSize((settings.chunkSize - 2).coerceAtLeast(2))
+                        },
                     )
                     Text(
                         text = "${settings.chunkSize} B",
-                        fontFamily = GeistMono,
-                        fontWeight = FontWeight.Medium,
-                        fontSize = 13.sp,
+                        style = VdpiTextStyles.monoMetric,
                         color = palette.inkPrimary,
-                        modifier = Modifier.padding(horizontal = 12.dp),
-                        style = TextStyle(fontFeatureSettings = "tnum"),
+                        modifier = Modifier.padding(horizontal = 8.dp),
                     )
                     StepperButton(
                         label = "+",
-                        onClick = { onSetChunkSize((settings.chunkSize + 2).coerceAtMost(64)) },
+                        contentDescription = "Increase chunk size",
+                        enabled = canIncrease,
+                        onClick = {
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onSetChunkSize((settings.chunkSize + 2).coerceAtMost(64))
+                        },
                     )
                 }
             }
@@ -200,7 +266,7 @@ fun SettingsScreen(
         HairlinePanel(radius = 14.dp) {
             ToggleSettingRow(
                 title = "DNS-over-HTTPS (DoH)",
-                subtitle = "Anti-poisoning RFC 8484 ring with sticky failover",
+                subtitle = "Encrypted DNS with automatic failover",
                 checked = settings.enableDoh,
                 onCheckedChange = onSetEnableDoh,
             )
@@ -208,59 +274,76 @@ fun SettingsScreen(
             Column(modifier = Modifier.padding(16.dp)) {
                 Text(
                     text = "Primary upstream",
-                    fontFamily = GeistSans,
-                    fontWeight = FontWeight.Medium,
-                    fontSize = 14.sp,
+                    style = VdpiTextStyles.rowTitle,
                     color = palette.inkPrimary,
                 )
                 Spacer(Modifier.height(10.dp))
-                FlowRow(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    DNS_PRESETS.forEach { (addr, name) ->
-                        val active = settings.dnsAddr.equals(addr, ignoreCase = true)
-                        val chipShape = RoundedCornerShape(8.dp)
+
+                // Uniform 2x2 grid of 48dp DNS preset tiles
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    DNS_PRESET_ROWS.forEach { row ->
                         Row(
-                            modifier = Modifier
-                                .clip(chipShape)
-                                .background(if (active) palette.surfaceRaised else palette.canvas)
-                                .border(
-                                    1.dp,
-                                    if (active) palette.inkPrimary else palette.border,
-                                    chipShape,
-                                )
-                                .clickable {
-                                    customDnsInput = addr
-                                    onSetDnsAddr(addr)
-                                }
-                                .padding(horizontal = 10.dp, vertical = 7.dp),
-                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
-                            Text(
-                                text = name,
-                                fontFamily = GeistSans,
-                                fontWeight = FontWeight.Medium,
-                                fontSize = 12.sp,
-                                color = if (active) palette.inkPrimary else palette.inkSecondary,
-                            )
-                            Spacer(Modifier.width(6.dp))
-                            Text(
-                                text = addr,
-                                fontFamily = GeistMono,
-                                fontSize = 11.sp,
-                                color = palette.inkMuted,
-                            )
+                            row.forEach { (addr, name) ->
+                                val active = settings.dnsAddr.equals(addr, ignoreCase = true)
+                                val tileShape = RoundedCornerShape(10.dp)
+                                Column(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .heightIn(min = 50.dp)
+                                        .clip(tileShape)
+                                        .background(if (active) palette.surfaceRaised else palette.canvas)
+                                        .border(
+                                            1.dp,
+                                            if (active) palette.inkPrimary else palette.border,
+                                            tileShape,
+                                        )
+                                        .selectable(
+                                            selected = active,
+                                            role = Role.RadioButton,
+                                            onClick = {
+                                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                                customDnsInput = addr
+                                                dnsError = null
+                                                focusManager.clearFocus()
+                                                if (!active) onSetDnsAddr(addr)
+                                            },
+                                        )
+                                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                                    verticalArrangement = Arrangement.Center,
+                                ) {
+                                    Text(
+                                        text = name,
+                                        fontFamily = GeistSans,
+                                        fontWeight = FontWeight.Medium,
+                                        fontSize = 13.sp,
+                                        color = if (active) palette.inkPrimary else palette.inkSecondary,
+                                    )
+                                    Text(
+                                        text = addr,
+                                        style = VdpiTextStyles.monoSmall,
+                                        color = palette.inkMuted,
+                                    )
+                                }
+                            }
                         }
                     }
                 }
-                Spacer(Modifier.height(10.dp))
+
+                Spacer(Modifier.height(12.dp))
                 InlineInputRow(
                     value = customDnsInput,
                     placeholder = "IP or https://.../dns-query",
                     actionLabel = "Apply",
-                    onValueChange = { customDnsInput = it },
-                    onSubmit = { onSetDnsAddr(customDnsInput) },
+                    actionEnabled = dnsDirty,
+                    errorText = dnsError,
+                    onValueChange = {
+                        customDnsInput = it
+                        if (dnsError != null) dnsError = null
+                    },
+                    onSubmit = ::submitDns,
                 )
             }
             HairlineRule()
@@ -280,17 +363,13 @@ fun SettingsScreen(
             Column(modifier = Modifier.padding(16.dp)) {
                 Text(
                     text = "Custom domains",
-                    fontFamily = GeistSans,
-                    fontWeight = FontWeight.Medium,
-                    fontSize = 14.sp,
+                    style = VdpiTextStyles.rowTitle,
                     color = palette.inkPrimary,
                 )
                 Spacer(Modifier.height(2.dp))
                 Text(
-                    text = "LAN subnets, government portals, and major banking WAFs are bypassed automatically.",
-                    fontFamily = GeistSans,
-                    fontSize = 12.sp,
-                    lineHeight = 17.sp,
+                    text = "LAN subnets, government portals, and major banking sites are bypassed automatically.",
+                    style = VdpiTextStyles.caption,
                     color = palette.inkSecondary,
                 )
                 Spacer(Modifier.height(10.dp))
@@ -298,16 +377,16 @@ fun SettingsScreen(
                     value = bypassInput,
                     placeholder = "*.example.com",
                     actionLabel = "Add",
-                    onValueChange = { bypassInput = it },
-                    onSubmit = {
-                        if (bypassInput.isNotBlank()) {
-                            onAddBypassDomain(bypassInput)
-                            bypassInput = ""
-                        }
+                    actionEnabled = bypassInput.isNotBlank(),
+                    errorText = bypassError,
+                    onValueChange = {
+                        bypassInput = it
+                        if (bypassError != null) bypassError = null
                     },
+                    onSubmit = ::submitBypass,
                 )
                 if (settings.bypassDomains.isNotEmpty()) {
-                    Spacer(Modifier.height(10.dp))
+                    Spacer(Modifier.height(12.dp))
                     FlowRow(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -316,24 +395,25 @@ fun SettingsScreen(
                             val chipShape = RoundedCornerShape(8.dp)
                             Row(
                                 modifier = Modifier
+                                    .heightIn(min = 40.dp)
                                     .clip(chipShape)
                                     .background(palette.surfaceRaised)
                                     .border(1.dp, palette.border, chipShape)
-                                    .clickable { onRemoveBypassDomain(domain) }
-                                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                                    .clickable(role = Role.Button) { onRemoveBypassDomain(domain) }
+                                    .semantics { contentDescription = "Remove $domain" }
+                                    .padding(horizontal = 12.dp, vertical = 8.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
                                 Text(
                                     text = domain,
-                                    fontFamily = GeistMono,
-                                    fontSize = 11.sp,
+                                    style = VdpiTextStyles.monoSmall,
                                     color = palette.inkPrimary,
                                 )
-                                Spacer(Modifier.width(6.dp))
+                                Spacer(Modifier.width(8.dp))
                                 Text(
                                     text = "×",
                                     fontFamily = GeistMono,
-                                    fontSize = 12.sp,
+                                    fontSize = 13.sp,
                                     color = palette.inkMuted,
                                 )
                             }
@@ -351,9 +431,7 @@ fun SettingsScreen(
             Column(modifier = Modifier.padding(16.dp)) {
                 Text(
                     text = "Appearance",
-                    fontFamily = GeistSans,
-                    fontWeight = FontWeight.Medium,
-                    fontSize = 14.sp,
+                    style = VdpiTextStyles.rowTitle,
                     color = palette.inkPrimary,
                 )
                 Spacer(Modifier.height(10.dp))
@@ -376,6 +454,7 @@ fun SettingsScreen(
                 title = "Reset adaptive cache",
                 subtitle = "Clear learned TLS stages and in-memory DNS entries",
                 trailing = "Reset",
+                destructive = true,
                 onClick = onClearCache,
             )
         }
@@ -384,8 +463,7 @@ fun SettingsScreen(
 
         Text(
             text = "vdpi v$engineVersion · Pure Rust userspace anti-DPI · MIT",
-            fontFamily = GeistMono,
-            fontSize = 11.sp,
+            style = VdpiTextStyles.monoSmall,
             color = palette.inkMuted,
             modifier = Modifier.padding(start = 2.dp),
         )
@@ -402,10 +480,18 @@ private fun ToggleSettingRow(
     onCheckedChange: (Boolean) -> Unit,
 ) {
     val palette = VdpiThemeTokens.palette
+    val haptic = LocalHapticFeedback.current
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable { onCheckedChange(!checked) }
+            .toggleable(
+                value = checked,
+                role = Role.Switch,
+                onValueChange = { next ->
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    onCheckedChange(next)
+                },
+            )
             .padding(horizontal = 16.dp, vertical = 13.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
@@ -413,23 +499,20 @@ private fun ToggleSettingRow(
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = title,
-                fontFamily = GeistSans,
-                fontWeight = FontWeight.Medium,
-                fontSize = 14.sp,
+                style = VdpiTextStyles.rowTitle,
                 color = palette.inkPrimary,
             )
             Spacer(Modifier.height(2.dp))
             Text(
                 text = subtitle,
-                fontFamily = GeistSans,
-                fontSize = 12.sp,
+                style = VdpiTextStyles.caption,
                 color = palette.inkSecondary,
             )
         }
         Spacer(Modifier.width(12.dp))
         PrecisionSwitch(
             checked = checked,
-            onCheckedChange = onCheckedChange,
+            onCheckedChange = null,
             useSignalAccent = true,
         )
     }
@@ -440,13 +523,14 @@ private fun ActionSettingRow(
     title: String,
     subtitle: String,
     trailing: String,
+    destructive: Boolean = false,
     onClick: () -> Unit,
 ) {
     val palette = VdpiThemeTokens.palette
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .clickable(role = Role.Button, onClick = onClick)
             .padding(horizontal = 16.dp, vertical = 13.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
@@ -454,25 +538,22 @@ private fun ActionSettingRow(
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = title,
-                fontFamily = GeistSans,
-                fontWeight = FontWeight.Medium,
-                fontSize = 14.sp,
+                style = VdpiTextStyles.rowTitle,
                 color = palette.inkPrimary,
             )
             Spacer(Modifier.height(2.dp))
             Text(
                 text = subtitle,
-                fontFamily = GeistSans,
-                fontSize = 12.sp,
+                style = VdpiTextStyles.caption,
                 color = palette.inkSecondary,
             )
         }
         Spacer(Modifier.width(12.dp))
         Text(
             text = trailing,
-            fontFamily = GeistMono,
-            fontSize = 11.sp,
-            color = palette.inkSecondary,
+            style = VdpiTextStyles.monoSmall,
+            fontWeight = if (destructive) FontWeight.Medium else FontWeight.Normal,
+            color = if (destructive) palette.danger else palette.inkSecondary,
         )
     }
 }
@@ -480,26 +561,38 @@ private fun ActionSettingRow(
 @Composable
 private fun StepperButton(
     label: String,
+    contentDescription: String,
+    enabled: Boolean,
     onClick: () -> Unit,
 ) {
     val palette = VdpiThemeTokens.palette
-    val shape = RoundedCornerShape(7.dp)
+    val shape = RoundedCornerShape(8.dp)
+    // 44dp touch target wrapping a crisp 34dp visual control
     Box(
         modifier = Modifier
-            .size(30.dp)
+            .size(44.dp)
             .clip(shape)
-            .background(palette.surfaceRaised)
-            .border(1.dp, palette.border, shape)
-            .clickable(onClick = onClick),
+            .clickable(enabled = enabled, role = Role.Button, onClick = onClick)
+            .semantics { this.contentDescription = contentDescription },
         contentAlignment = Alignment.Center,
     ) {
-        Text(
-            text = label,
-            fontFamily = GeistMono,
-            fontWeight = FontWeight.Medium,
-            fontSize = 14.sp,
-            color = palette.inkPrimary,
-        )
+        Box(
+            modifier = Modifier
+                .size(34.dp)
+                .alpha(if (enabled) 1f else 0.35f)
+                .clip(shape)
+                .background(palette.surfaceRaised)
+                .border(1.dp, palette.border, shape),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text = label,
+                fontFamily = GeistMono,
+                fontWeight = FontWeight.Medium,
+                fontSize = 15.sp,
+                color = palette.inkPrimary,
+            )
+        }
     }
 }
 
@@ -508,64 +601,104 @@ private fun InlineInputRow(
     value: String,
     placeholder: String,
     actionLabel: String,
+    actionEnabled: Boolean,
+    errorText: String?,
     onValueChange: (String) -> Unit,
     onSubmit: () -> Unit,
 ) {
     val palette = VdpiThemeTokens.palette
-    val inputShape = RoundedCornerShape(8.dp)
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        Box(
-            modifier = Modifier
-                .weight(1f)
-                .height(40.dp)
-                .clip(inputShape)
-                .background(palette.canvas)
-                .border(1.dp, palette.border, inputShape)
-                .padding(horizontal = 12.dp),
-            contentAlignment = Alignment.CenterStart,
+    val inputShape = RoundedCornerShape(9.dp)
+    var focused by remember { mutableStateOf(false) }
+
+    val fieldBorder by animateColorAsState(
+        targetValue = when {
+            errorText != null -> palette.danger
+            focused -> palette.inkPrimary
+            else -> palette.border
+        },
+        animationSpec = tween(160),
+        label = "inputBorder",
+    )
+
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            if (value.isEmpty()) {
-                Text(
-                    text = placeholder,
-                    fontFamily = GeistMono,
-                    fontSize = 12.sp,
-                    color = palette.inkMuted,
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .height(46.dp)
+                    .clip(inputShape)
+                    .background(palette.canvas)
+                    .border(1.dp, fieldBorder, inputShape)
+                    .padding(horizontal = 12.dp),
+                contentAlignment = Alignment.CenterStart,
+            ) {
+                if (value.isEmpty()) {
+                    Text(
+                        text = placeholder,
+                        style = VdpiTextStyles.monoSmall,
+                        fontSize = 12.sp,
+                        color = palette.inkMuted,
+                    )
+                }
+                BasicTextField(
+                    value = value,
+                    onValueChange = onValueChange,
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.Uri,
+                        autoCorrectEnabled = false,
+                        imeAction = ImeAction.Done,
+                    ),
+                    keyboardActions = KeyboardActions(
+                        onDone = { onSubmit() },
+                    ),
+                    textStyle = TextStyle(
+                        fontFamily = GeistMono,
+                        fontSize = 12.sp,
+                        color = palette.inkPrimary,
+                    ),
+                    cursorBrush = SolidColor(palette.inkPrimary),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .onFocusChanged { focused = it.isFocused },
                 )
             }
-            BasicTextField(
-                value = value,
-                onValueChange = onValueChange,
-                singleLine = true,
-                textStyle = TextStyle(
-                    fontFamily = GeistMono,
-                    fontSize = 12.sp,
-                    color = palette.inkPrimary,
-                ),
-                cursorBrush = SolidColor(palette.inkPrimary),
-                modifier = Modifier.fillMaxWidth(),
-            )
+
+            Box(
+                modifier = Modifier
+                    .height(46.dp)
+                    .alpha(if (actionEnabled) 1f else 0.45f)
+                    .clip(inputShape)
+                    .background(if (actionEnabled) palette.primaryButtonBg else palette.surfaceRaised)
+                    .border(
+                        1.dp,
+                        if (actionEnabled) palette.primaryButtonBg else palette.borderStrong,
+                        inputShape,
+                    )
+                    .clickable(enabled = actionEnabled, role = Role.Button, onClick = onSubmit)
+                    .padding(horizontal = 16.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = actionLabel,
+                    fontFamily = GeistSans,
+                    fontWeight = FontWeight.Medium,
+                    fontSize = 13.sp,
+                    color = if (actionEnabled) palette.primaryButtonInk else palette.inkSecondary,
+                )
+            }
         }
 
-        Box(
-            modifier = Modifier
-                .height(40.dp)
-                .clip(inputShape)
-                .background(palette.surfaceRaised)
-                .border(1.dp, palette.borderStrong, inputShape)
-                .clickable(onClick = onSubmit)
-                .padding(horizontal = 14.dp),
-            contentAlignment = Alignment.Center,
-        ) {
+        if (errorText != null) {
+            Spacer(Modifier.height(6.dp))
             Text(
-                text = actionLabel,
-                fontFamily = GeistSans,
-                fontWeight = FontWeight.Medium,
-                fontSize = 12.sp,
-                color = palette.inkPrimary,
+                text = errorText,
+                style = VdpiTextStyles.caption,
+                color = palette.danger,
             )
         }
     }

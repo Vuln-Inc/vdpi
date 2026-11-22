@@ -4,16 +4,16 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- Left descending arm of fractured V (split packet stream) -->
+    <!-- Left descending arm of fractured V (split packet stream), optically centered at y=54 -->
     <path
         android:fillColor="#F4F4F5"
-        android:pathData="M31,34 L41,34 L52,68 L42,68 Z" />
+        android:pathData="M31,32 L41,32 L52,66 L42,66 Z" />
     <!-- Right ascending arm, deliberately offset across a clean hairline seam -->
     <path
         android:fillColor="#F4F4F5"
-        android:pathData="M56,68 L67,34 L77,34 L66,68 Z" />
+        android:pathData="M56,66 L67,32 L77,32 L66,66 Z" />
     <!-- Signal emerald status bar beneath the split -->
     <path
         android:fillColor="#10B981"
-        android:pathData="M42,74 L66,74 L66,78.5 L42,78.5 Z" />
+        android:pathData="M42,72 L66,72 L66,76.5 L42,76.5 Z" />
 </vector>
