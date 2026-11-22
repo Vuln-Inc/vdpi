@@ -1,6 +1,6 @@
 [package]
 name = "vdpi-android"
-version = "0.2.5"
+version = "0.3.0"
 edition = "2021"
 authors = ["Vuln-Inc"]
 description = "Android TUN + JNI anti-DPI tunnel engine powered by vdpi"

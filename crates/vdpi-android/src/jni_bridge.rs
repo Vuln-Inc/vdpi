@@ -113,6 +113,6 @@ pub extern "system" fn Java_com_vulninc_vdpi_engine_NativeEngine_nativeVersion(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    let ver = catch_unwind(AssertUnwindSafe(engine_version)).unwrap_or("0.2.5");
+    let ver = catch_unwind(AssertUnwindSafe(engine_version)).unwrap_or(env!("CARGO_PKG_VERSION"));
     safe_jstring(&mut env, ver)
 }
