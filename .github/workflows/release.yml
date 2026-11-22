@@ -24,9 +24,9 @@ jobs:
         with:
           components: clippy
       - name: Run Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Run Unit & Integration Tests
-        run: cargo test
+        run: cargo test --locked
 
   build-windows:
     name: Package Windows (x86_64)
@@ -39,7 +39,7 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
       - name: Build Windows Release Binary
-        run: cargo build --release --target x86_64-pc-windows-msvc
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc
       - name: Package Windows Zip
         shell: pwsh
         run: |
@@ -65,8 +65,8 @@ jobs:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - name: Build Universal macOS Binary
         run: |
-          cargo build --release --target aarch64-apple-darwin
-          cargo build --release --target x86_64-apple-darwin
+          cargo build --locked --release --target aarch64-apple-darwin
+          cargo build --locked --release --target x86_64-apple-darwin
           mkdir -p dist/mac
           lipo -create -output dist/mac/vdpi \
             target/aarch64-apple-darwin/release/vdpi \
@@ -96,10 +96,10 @@ jobs:
           sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
       - name: Build & Package Static Linux Binaries
         run: |
-          cargo build --release --target x86_64-unknown-linux-musl
+          cargo build --locked --release --target x86_64-unknown-linux-musl
           CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc \
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
-          cargo build --release --target aarch64-unknown-linux-musl
+          cargo build --locked --release --target aarch64-unknown-linux-musl
 
           mkdir -p dist/lin64 dist/linarm
           cp target/x86_64-unknown-linux-musl/release/vdpi dist/lin64/vdpi
