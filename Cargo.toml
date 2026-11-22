@@ -1,6 +1,6 @@
 [package]
 name = "vdpi"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Vuln-Inc"]
 description = "Zero-hassle, high-performance anti-DPI engine in Rust for macOS, Windows, and Linux"
