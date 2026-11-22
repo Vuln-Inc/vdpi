@@ -2,6 +2,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use reqwest::Client;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{lookup_host, UdpSocket};
@@ -25,6 +26,8 @@ pub struct DnsResolver {
     ipv4_only: bool,
     udp_dns_servers: Vec<SocketAddr>,
     doh_endpoints: Vec<String>,
+    preferred_doh_idx: Arc<AtomicUsize>,
+    preferred_udp_idx: Arc<AtomicUsize>,
     http: Client,
     cache: Arc<RwLock<HashMap<String, CacheEntry>>>,
 }
@@ -37,8 +40,8 @@ impl DnsResolver {
         // when HTTP_PROXY / HTTPS_PROXY environment variables are active.
         let http = Client::builder()
             .no_proxy()
-            .timeout(Duration::from_millis(2500))
-            .connect_timeout(Duration::from_millis(1500))
+            .timeout(Duration::from_millis(2000))
+            .connect_timeout(Duration::from_millis(1200))
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_nodelay(true)
             .build()
@@ -52,6 +55,8 @@ impl DnsResolver {
             ipv4_only,
             udp_dns_servers,
             doh_endpoints,
+            preferred_doh_idx: Arc::new(AtomicUsize::new(0)),
+            preferred_udp_idx: Arc::new(AtomicUsize::new(0)),
             http,
             cache: Arc::new(RwLock::new(HashMap::new())),
         })
@@ -152,30 +157,40 @@ impl DnsResolver {
 
     async fn resolve_via_doh(&self, domain: &str) -> Result<(Vec<IpAddr>, Duration)> {
         if self.ipv4_only {
-            return self.query_doh_type(domain, QTYPE_A).await;
+            let (ips, ttl) = self.query_doh_type(domain, QTYPE_A).await?;
+            let clean = filter_poisoned_ips(ips);
+            if clean.is_empty() {
+                bail!("DoH returned no usable IPv4 records for {domain}");
+            }
+            return Ok((clean, ttl));
         }
 
         let (v4_res, v6_res) = tokio::join!(
             self.query_doh_type(domain, QTYPE_A),
-            self.query_doh_type(domain, QTYPE_AAAA)
+            tokio::time::timeout(
+                Duration::from_millis(700),
+                self.query_doh_type(domain, QTYPE_AAAA)
+            )
         );
 
         let mut ips = Vec::new();
         let mut min_ttl = Duration::from_secs(300);
 
         if let Ok((v4, ttl)) = v4_res {
-            if !v4.is_empty() {
+            let clean_v4 = filter_poisoned_ips(v4);
+            if !clean_v4.is_empty() {
                 min_ttl = min_ttl.min(ttl);
-                ips.extend(v4);
+                ips.extend(clean_v4);
             }
         }
 
         // CNAME-only empty AAAA responses (such as www.roblox.com) are normal and must never
         // discard valid IPv4 A records.
-        if let Ok((v6, ttl)) = v6_res {
-            if !v6.is_empty() {
+        if let Ok(Ok((v6, ttl))) = v6_res {
+            let clean_v6 = filter_poisoned_ips(v6);
+            if !clean_v6.is_empty() {
                 min_ttl = min_ttl.min(ttl);
-                for ip in v6 {
+                for ip in clean_v6 {
                     if !ips.contains(&ip) {
                         ips.push(ip);
                     }
@@ -184,7 +199,7 @@ impl DnsResolver {
         }
 
         if ips.is_empty() {
-            bail!("DoH returned no A/AAAA records for {domain}");
+            bail!("DoH returned no usable A/AAAA records for {domain}");
         }
 
         Ok((ips, min_ttl))
@@ -192,9 +207,17 @@ impl DnsResolver {
 
     async fn query_doh_type(&self, domain: &str, qtype: u16) -> Result<(Vec<IpAddr>, Duration)> {
         let wire_query = encode_dns_query(domain, qtype)?;
+        let count = self.doh_endpoints.len();
+        if count == 0 {
+            bail!("no DoH endpoints configured");
+        }
+
+        let start = self.preferred_doh_idx.load(Ordering::Relaxed) % count;
         let mut last_err = None;
 
-        for endpoint in &self.doh_endpoints {
+        for offset in 0..count {
+            let idx = (start + offset) % count;
+            let endpoint = &self.doh_endpoints[idx];
             match self
                 .http
                 .post(endpoint)
@@ -207,6 +230,9 @@ impl DnsResolver {
                 Ok(resp) if resp.status().is_success() => match resp.bytes().await {
                     Ok(bytes) => match decode_dns_response(&bytes, qtype) {
                         Ok(parsed) => {
+                            if offset > 0 {
+                                self.preferred_doh_idx.store(idx, Ordering::Relaxed);
+                            }
                             debug!(
                                 domain = %domain,
                                 qtype = qtype,
@@ -238,9 +264,17 @@ impl DnsResolver {
 
     async fn resolve_via_udp(&self, domain: &str) -> Result<(Vec<IpAddr>, Duration)> {
         let wire_query = encode_dns_query(domain, QTYPE_A)?;
+        let count = self.udp_dns_servers.len();
+        if count == 0 {
+            bail!("no UDP DNS servers configured");
+        }
+
+        let start = self.preferred_udp_idx.load(Ordering::Relaxed) % count;
         let mut last_err = None;
 
-        for &server in &self.udp_dns_servers {
+        for offset in 0..count {
+            let idx = (start + offset) % count;
+            let server = self.udp_dns_servers[idx];
             let bind_addr = if server.is_ipv4() {
                 "0.0.0.0:0"
             } else {
@@ -257,10 +291,18 @@ impl DnsResolver {
             }
 
             let mut buf = [0u8; 2048];
-            match tokio::time::timeout(Duration::from_millis(1200), sock.recv(&mut buf)).await {
+            match tokio::time::timeout(Duration::from_millis(1000), sock.recv(&mut buf)).await {
                 Ok(Ok(n)) => match decode_dns_response(&buf[..n], QTYPE_A) {
-                    Ok(parsed) if !parsed.0.is_empty() => return Ok(parsed),
-                    Ok(_) => {}
+                    Ok((ips, ttl)) => {
+                        let clean = filter_poisoned_ips(ips);
+                        if !clean.is_empty() {
+                            if offset > 0 {
+                                self.preferred_udp_idx.store(idx, Ordering::Relaxed);
+                            }
+                            return Ok((clean, ttl));
+                        }
+                        last_err = Some(anyhow!("UDP DNS {server} returned poisoned/empty reply"));
+                    }
                     Err(e) => last_err = Some(e),
                 },
                 Ok(Err(e)) => last_err = Some(e.into()),
@@ -319,13 +361,17 @@ fn build_doh_endpoints(dns_addr: &str) -> Vec<String> {
         list.push(primary);
     }
 
-    // Multi-provider IP-literal DoH ring (no SNI required, immune to ISP domain-based DPI blocks)
+    // Multi-provider IP-literal DoH ring interleaved across independent networks
+    // (Cloudflare, Google, AdGuard Unfiltered, Quad9 — no SNI required, resilient to ISP IP blocks)
     for fallback in [
         "https://1.1.1.1/dns-query",
-        "https://1.0.0.1/dns-query",
         "https://8.8.8.8/dns-query",
-        "https://8.8.4.4/dns-query",
+        "https://94.140.14.140/dns-query",
         "https://9.9.9.9/dns-query",
+        "https://1.0.0.1/dns-query",
+        "https://94.140.14.141/dns-query",
+        "https://149.112.112.112/dns-query",
+        "https://8.8.4.4/dns-query",
     ] {
         if !list.iter().any(|x| x == fallback) {
             list.push(fallback.to_string());
@@ -336,14 +382,32 @@ fn build_doh_endpoints(dns_addr: &str) -> Vec<String> {
 
 fn build_udp_dns_servers(dns_addr: &str, dns_port: u16) -> Vec<SocketAddr> {
     let mut servers = Vec::new();
-    if let Ok(ip) = dns_addr.trim().parse::<IpAddr>() {
-        servers.push(SocketAddr::new(ip, dns_port));
-    }
-    // Non-standard port 1253 on 77.88.8.8 / 77.88.8.1 bypasses transparent ISP port-53 DNS interceptors
+    // Non-standard ports (1253, 443, 5353) bypass transparent ISP port-53 DNS interceptors
     // on strict fiber and broadband networks worldwide.
+    if let Ok(ip) = dns_addr.trim().parse::<IpAddr>() {
+        if dns_port != 53 {
+            servers.push(SocketAddr::new(ip, dns_port));
+        }
+    }
     for (ip, port) in [
         (Ipv4Addr::new(77, 88, 8, 8), 1253),
+        (Ipv4Addr::new(208, 67, 222, 222), 443),
         (Ipv4Addr::new(77, 88, 8, 1), 1253),
+        (Ipv4Addr::new(208, 67, 220, 220), 443),
+        (Ipv4Addr::new(208, 67, 222, 222), 5353),
+    ] {
+        let sa = SocketAddr::new(IpAddr::V4(ip), port);
+        if !servers.contains(&sa) {
+            servers.push(sa);
+        }
+    }
+    if let Ok(ip) = dns_addr.trim().parse::<IpAddr>() {
+        let sa = SocketAddr::new(ip, dns_port);
+        if !servers.contains(&sa) {
+            servers.push(sa);
+        }
+    }
+    for (ip, port) in [
         (Ipv4Addr::new(1, 1, 1, 1), 53),
         (Ipv4Addr::new(8, 8, 8, 8), 53),
     ] {
@@ -353,6 +417,32 @@ fn build_udp_dns_servers(dns_addr: &str, dns_port: u16) -> Vec<SocketAddr> {
         }
     }
     servers
+}
+
+/// Returns `true` when an IP returned by an external DNS server for a public hostname is an
+/// obvious sinkhole or ISP block-page address that must never be cached.
+pub fn is_poisoned_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_unspecified()
+                || v4.is_loopback()
+                || v4.is_broadcast()
+                || matches!(
+                    v4.octets(),
+                    [195, 175, 39, 39]
+                        | [195, 175, 39, 40]
+                        | [195, 175, 39, 49]
+                        | [195, 175, 39, 50]
+                )
+        }
+        IpAddr::V6(v6) => v6.is_unspecified() || v6.is_loopback(),
+    }
+}
+
+fn filter_poisoned_ips(ips: Vec<IpAddr>) -> Vec<IpAddr> {
+    ips.into_iter()
+        .filter(|ip| !is_poisoned_public_ip(*ip))
+        .collect()
 }
 
 /// Encodes an RFC 1035 / RFC 8484 DNS wire query (ID = 0 per RFC 8484 section 4.1 recommendation).
@@ -529,5 +619,16 @@ mod tests {
 
         let discord_ips = resolver.resolve("updates.discord.com").await.unwrap();
         assert!(!discord_ips.is_empty());
+    }
+
+    #[test]
+    fn filters_sinkhole_and_isp_blockpage_ips() {
+        assert!(is_poisoned_public_ip("0.0.0.0".parse().unwrap()));
+        assert!(is_poisoned_public_ip("127.0.0.1".parse().unwrap()));
+        assert!(is_poisoned_public_ip("::".parse().unwrap()));
+        assert!(is_poisoned_public_ip("::1".parse().unwrap()));
+        assert!(is_poisoned_public_ip("195.175.39.39".parse().unwrap()));
+        assert!(!is_poisoned_public_ip("162.159.135.232".parse().unwrap()));
+        assert!(!is_poisoned_public_ip("128.116.31.3".parse().unwrap()));
     }
 }
