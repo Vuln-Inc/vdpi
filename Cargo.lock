@@ -1868,9 +1868,33 @@ name = "vdpi-android"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "jni",
+ "serde_json",
+ "tokio",
+ "vdpi",
+ "vdpi-tun",
+]
+
+[[package]]
+name = "vdpi-ios"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "etherparse",
+ "libc",
+ "serde_json",
+ "tokio",
+ "vdpi",
+ "vdpi-tun",
+]
+
+[[package]]
+name = "vdpi-tun"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
  "etherparse",
  "futures",
- "jni",
  "libc",
  "netstack-smoltcp",
  "rcgen",

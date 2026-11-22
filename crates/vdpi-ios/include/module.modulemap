@@ -1,0 +1,4 @@
+module VdpiCore {
+    header "vdpi_ios.h"
+    export *
+}

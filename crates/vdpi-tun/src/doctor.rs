@@ -1,4 +1,4 @@
-use crate::config::AndroidConfig;
+use crate::config::TunnelConfig;
 use anyhow::{anyhow, Result};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
@@ -43,7 +43,7 @@ pub fn build_real_tls_client_hello(host: &str) -> Result<Vec<u8>> {
 }
 
 /// Runs live connectivity probes using `vdpi`'s real DoH resolver and 7-stage TLS desync engine.
-pub async fn run_doctor(cfg: &AndroidConfig) -> DoctorReport {
+pub async fn run_doctor(cfg: &TunnelConfig) -> DoctorReport {
     let runtime_cfg = cfg.clone().into_runtime_config();
     let ctx = match EngineContext::new(runtime_cfg) {
         Ok(c) => c,
@@ -272,7 +272,7 @@ mod tests {
             let _ = acceptor.accept(sock).await;
         });
 
-        let cfg = AndroidConfig::default();
+        let cfg = TunnelConfig::default();
         let ctx = EngineContext::new(cfg.into_runtime_config()).unwrap();
         let remote = ctx.connect_upstream_addr(addr).await.unwrap();
         let check = probe_connected_tls_target(

@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/vdpi-android"]
+members = [".", "crates/vdpi-tun", "crates/vdpi-android", "crates/vdpi-ios"]
 default-members = ["."]
 
 [package]

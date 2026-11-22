@@ -1,4 +1,4 @@
-use crate::config::{MAX_MTU, MIN_MTU};
+use crate::config::{TunProfile, MAX_MTU, MIN_MTU};
 use crate::events::EventRing;
 use anyhow::{anyhow, Context, Result};
 use etherparse::{SlicedPacket, TransportSlice};
@@ -17,14 +17,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch, RwLock, Semaphore};
 use tokio::task::AbortHandle;
 use tracing::debug;
-#[cfg(unix)]
-use tracing::warn;
 use vdpi::desync::{EngineContext, LearnedStrategy};
 
-const MAX_TCP_SESSIONS: usize = 192;
-const MAX_UDP_FLOWS: usize = 256;
-const MAX_DNS_INFLIGHT: usize = 96;
-const MAX_REVERSE_DNS_ENTRIES: usize = 2048;
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const UDP_RECV_BUF_BYTES: usize = 4096;
 
@@ -34,15 +28,23 @@ pub struct TunStats {
     pub udp_flows_active: AtomicU64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ReverseDnsCache {
+    max_entries: usize,
     map: RwLock<HashMap<IpAddr, String>>,
 }
 
 impl ReverseDnsCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries: max_entries.max(32),
+            map: RwLock::new(HashMap::new()),
+        }
+    }
+
     async fn insert(&self, ip: IpAddr, domain: String) {
         let mut guard = self.map.write().await;
-        if guard.len() >= MAX_REVERSE_DNS_ENTRIES && !guard.contains_key(&ip) {
+        if guard.len() >= self.max_entries && !guard.contains_key(&ip) {
             if let Some(victim) = guard.keys().next().copied() {
                 guard.remove(&victim);
             }
@@ -70,7 +72,7 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
+pub(crate) async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
     let _ = rx.wait_for(|s| *s).await;
 }
 
@@ -132,6 +134,7 @@ fn bind_udp_socket_strict(is_ipv4: bool) -> std::io::Result<UdpSocket> {
 
 /// Runs the pure-Rust userspace TUN packet pipeline (TCP via `vdpi` 7-stage desync + TCP/53 DNS,
 /// UDP/53 DNS interception via `vdpi` DoH ring, QUIC UDP/443 fallback, and Cone-NAT UDP relay).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_tun_pipeline(
     mut inbound_rx: mpsc::Receiver<Vec<u8>>,
     outbound_tx: mpsc::Sender<Vec<u8>>,
@@ -139,6 +142,7 @@ pub async fn run_tun_pipeline(
     tun_stats: Arc<TunStats>,
     events: Arc<EventRing>,
     mtu: usize,
+    profile: TunProfile,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let clamped_mtu = mtu.clamp(MIN_MTU, MAX_MTU);
@@ -147,11 +151,11 @@ pub async fn run_tun_pipeline(
         .enable_udp(true)
         .enable_icmp(false)
         .mtu(clamped_mtu)
-        .stack_buffer_size(512)
-        .tcp_buffer_size(256)
-        .udp_buffer_size(256)
-        .tcp_recv_buffer_size(64 * 1024)
-        .tcp_send_buffer_size(64 * 1024)
+        .stack_buffer_size(profile.stack_buffer_size)
+        .tcp_buffer_size(profile.tcp_buffer_size)
+        .udp_buffer_size(profile.udp_buffer_size)
+        .tcp_recv_buffer_size(profile.tcp_recv_buffer_size)
+        .tcp_send_buffer_size(profile.tcp_send_buffer_size)
         .build()
         .context("failed to build smoltcp netstack")?;
 
@@ -179,11 +183,11 @@ pub async fn run_tun_pipeline(
 
     let (mut stack_sink, mut stack_stream) = stack.split();
     let (mut udp_reader, mut udp_writer) = udp_socket.split();
-    let (udp_reply_tx, mut udp_reply_rx) = mpsc::channel::<UdpMsg>(512);
+    let (udp_reply_tx, mut udp_reply_rx) = mpsc::channel::<UdpMsg>(profile.udp_reply_capacity);
 
-    let reverse_dns = Arc::new(ReverseDnsCache::default());
-    let tcp_slots = Arc::new(Semaphore::new(MAX_TCP_SESSIONS));
-    let dns_slots = Arc::new(Semaphore::new(MAX_DNS_INFLIGHT));
+    let reverse_dns = Arc::new(ReverseDnsCache::new(profile.max_reverse_dns_entries));
+    let tcp_slots = Arc::new(Semaphore::new(profile.max_tcp_sessions));
+    let dns_slots = Arc::new(Semaphore::new(profile.max_dns_inflight));
     let udp_nat: UdpNatTable = Arc::new(RwLock::new(HashMap::new()));
     let observed_stage = Arc::new(AtomicU8::new(ctx.preferred_stage() as u8));
 
@@ -368,6 +372,7 @@ pub async fn run_tun_pipeline(
     let udp_stop_root = internal_stop_rx.clone();
     let mut stop_udp_rx = internal_stop_rx.clone();
     let udp_rx_stop_tx = internal_stop_tx.clone();
+    let max_udp_flows = profile.max_udp_flows;
     let udp_read_task = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -443,6 +448,7 @@ pub async fn run_tun_pipeline(
                         &udp_stats,
                         &udp_stop_root,
                         clamped_mtu,
+                        max_udp_flows,
                     )
                     .await;
                 }
@@ -496,7 +502,11 @@ async fn handle_tcp_dns_stream(
             Ok(Ok(_)) => {}
             _ => break,
         }
-        match ctx.dns.resolve_wire_query(&query, ctx.config.block_quic).await {
+        match ctx
+            .dns
+            .resolve_wire_query(&query, ctx.config.block_quic)
+            .await
+        {
             Ok((resp, meta)) => {
                 if let Some((domain, ips)) = meta {
                     for ip in ips {
@@ -528,6 +538,7 @@ async fn forward_udp_cone_nat(
     stats: &Arc<TunStats>,
     shutdown_rx: &watch::Receiver<bool>,
     mtu: usize,
+    max_udp_flows: usize,
 ) {
     if src_addr.is_ipv4() != dst_addr.is_ipv4() {
         return;
@@ -556,7 +567,7 @@ async fn forward_udp_cone_nat(
             entry.last_active_secs.store(now, Ordering::Relaxed);
             Arc::clone(&entry.socket)
         } else {
-            if guard.len() >= MAX_UDP_FLOWS {
+            if guard.len() >= max_udp_flows {
                 if let Some(oldest_key) = guard
                     .iter()
                     .min_by_key(|(_, e)| e.last_active_secs.load(Ordering::Relaxed))
@@ -651,205 +662,10 @@ async fn forward_udp_cone_nat(
     }
 }
 
-/// Validates and registers a Unix/Android TUN `OwnedFd` with Tokio synchronously before
-/// returning control to Kotlin, so startup failures surface immediately and never leak the fd.
-#[cfg(unix)]
-pub fn register_tun_fd(
-    owned_fd: std::os::unix::io::OwnedFd,
-) -> Result<Arc<tokio::io::unix::AsyncFd<std::os::unix::io::OwnedFd>>> {
-    use std::os::unix::io::AsRawFd;
-    use tokio::io::unix::AsyncFd;
-
-    set_nonblocking(owned_fd.as_raw_fd()).context("failed to set O_NONBLOCK on TUN fd")?;
-    // SAFETY: `owned_fd` exclusively owns the detached Android TUN fd and keeps it open
-    // for the entire lifetime of the `AsyncFd` wrapper.
-    let async_fd =
-        unsafe { AsyncFd::register(owned_fd) }.context("failed to register TUN fd with tokio")?;
-    Ok(Arc::new(async_fd))
-}
-
-/// Runs the TUN engine attached to a registered Unix/Android `AsyncFd<OwnedFd>`.
-/// Closes the TUN fd automatically when the tunnel stops or exits.
-#[cfg(unix)]
-pub async fn run_registered_tun_fd(
-    async_fd: Arc<tokio::io::unix::AsyncFd<std::os::unix::io::OwnedFd>>,
-    ctx: EngineContext,
-    tun_stats: Arc<TunStats>,
-    events: Arc<EventRing>,
-    mtu: usize,
-    shutdown_rx: watch::Receiver<bool>,
-) -> Result<()> {
-    use std::os::unix::io::AsRawFd;
-
-    let clamped_mtu = mtu.clamp(MIN_MTU, MAX_MTU);
-    let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>(512);
-    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(512);
-    let (fd_stop_tx, fd_stop_rx) = watch::channel(false);
-
-    let mut ext_stop = shutdown_rx.clone();
-    let ext_bridge_tx = fd_stop_tx.clone();
-    let ext_bridge = tokio::spawn(async move {
-        wait_shutdown(&mut ext_stop).await;
-        let _ = ext_bridge_tx.send(true);
-    });
-
-    let read_fd = Arc::clone(&async_fd);
-    let mut stop_read = fd_stop_rx.clone();
-    let read_stop_tx = fd_stop_tx.clone();
-    let read_buf_size = clamped_mtu + 128;
-    let reader_task = tokio::spawn(async move {
-        let mut buf = vec![0u8; read_buf_size];
-        loop {
-            let mut guard = tokio::select! {
-                biased;
-                _ = wait_shutdown(&mut stop_read) => break,
-                res = read_fd.readable() => match res {
-                    Ok(g) => g,
-                    Err(e) => {
-                        warn!(error = %e, "TUN readable wait failed");
-                        let _ = read_stop_tx.send(true);
-                        break;
-                    }
-                }
-            };
-
-            match guard.try_io(|inner| read_raw_fd(inner.as_raw_fd(), &mut buf)) {
-                Ok(Ok(0)) => {
-                    let _ = read_stop_tx.send(true);
-                    break;
-                }
-                Ok(Ok(n)) => {
-                    if inbound_tx.send(buf[..n].to_vec()).await.is_err() {
-                        break;
-                    }
-                }
-                Ok(Err(e)) if e.kind() == ErrorKind::Interrupted => continue,
-                Ok(Err(e)) => {
-                    warn!(error = %e, "TUN read error");
-                    let _ = read_stop_tx.send(true);
-                    break;
-                }
-                Err(_would_block) => continue,
-            }
-        }
-    });
-
-    let write_fd = Arc::clone(&async_fd);
-    let mut stop_write = fd_stop_rx.clone();
-    let write_stop_tx = fd_stop_tx.clone();
-    let writer_task = tokio::spawn(async move {
-        'outer: loop {
-            let pkt = tokio::select! {
-                biased;
-                _ = wait_shutdown(&mut stop_write) => break,
-                maybe_pkt = outbound_rx.recv() => match maybe_pkt {
-                    Some(p) => p,
-                    None => break,
-                }
-            };
-
-            loop {
-                let mut guard = tokio::select! {
-                    biased;
-                    _ = wait_shutdown(&mut stop_write) => break 'outer,
-                    res = write_fd.writable() => match res {
-                        Ok(g) => g,
-                        Err(e) => {
-                            warn!(error = %e, "TUN writable wait failed");
-                            let _ = write_stop_tx.send(true);
-                            break 'outer;
-                        }
-                    }
-                };
-
-                match guard.try_io(|inner| write_raw_fd(inner.as_raw_fd(), &pkt)) {
-                    Ok(Ok(_)) => break,
-                    Ok(Err(e)) if e.kind() == ErrorKind::Interrupted => continue,
-                    Ok(Err(e)) => {
-                        if is_fatal_tun_errno(&e) {
-                            warn!(error = %e, "fatal TUN write error");
-                            let _ = write_stop_tx.send(true);
-                            break 'outer;
-                        }
-                        debug!(error = %e, "transient TUN write drop");
-                        break;
-                    }
-                    Err(_would_block) => continue,
-                }
-            }
-        }
-    });
-
-    let pipeline_res = run_tun_pipeline(
-        inbound_rx,
-        outbound_tx,
-        ctx,
-        tun_stats,
-        events,
-        clamped_mtu,
-        fd_stop_rx,
-    )
-    .await;
-
-    ext_bridge.abort();
-    reader_task.abort();
-    writer_task.abort();
-    let _ = reader_task.await;
-    let _ = writer_task.await;
-    drop(async_fd);
-
-    if *shutdown_rx.borrow() {
-        Ok(())
-    } else {
-        pipeline_res.and_then(|_| Err(anyhow!("TUN interface closed unexpectedly")))
-    }
-}
-
-#[cfg(unix)]
-fn is_fatal_tun_errno(err: &std::io::Error) -> bool {
-    matches!(
-        err.raw_os_error(),
-        Some(libc::EBADF) | Some(libc::ENODEV) | Some(libc::EIO) | Some(libc::ENXIO)
-    )
-}
-
-#[cfg(unix)]
-fn set_nonblocking(fd: i32) -> std::io::Result<()> {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let res = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-    if res < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn read_raw_fd(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
-    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-    if n < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(n as usize)
-    }
-}
-
-#[cfg(unix)]
-fn write_raw_fd(fd: i32, buf: &[u8]) -> std::io::Result<usize> {
-    let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
-    if n < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(n as usize)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::AndroidConfig;
+    use crate::config::TunnelConfig;
     use etherparse::{PacketBuilder, SlicedPacket, TransportSlice};
     use std::net::Ipv4Addr;
     use vdpi::dns::{decode_dns_response, encode_dns_query};
@@ -908,9 +724,8 @@ mod tests {
         assert!(!is_quic_initial_packet(&quic_init));
     }
 
-    #[tokio::test]
-    async fn tun_pipeline_survives_malformed_packets_intercepts_dns_drops_quic_and_relays_udp() {
-        let cfg = AndroidConfig {
+    async fn exercise_pipeline(profile: TunProfile) {
+        let cfg = TunnelConfig {
             enable_doh: false,
             block_quic: true,
             ..Default::default()
@@ -930,10 +745,11 @@ mod tests {
             Arc::clone(&tun_stats),
             Arc::clone(&events),
             1500,
+            profile,
             stop_rx,
         ));
 
-        // 0. Inject garbage + malformed UDP packets FIRST; pipeline must survive completely!
+        // 0. Inject garbage + malformed UDP packets FIRST; pipeline must survive completely.
         in_tx.send(vec![0xff, 0xfe, 0xfd]).await.unwrap();
         let mut bad_udp = build_ipv4_udp(
             Ipv4Addr::new(10, 0, 0, 1),
@@ -1018,5 +834,15 @@ mod tests {
 
         stop_tx.send(true).unwrap();
         pipeline.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn standard_profile_handles_malformed_dns_quic_and_udp_echo() {
+        exercise_pipeline(TunProfile::STANDARD).await;
+    }
+
+    #[tokio::test]
+    async fn low_memory_ios_profile_handles_malformed_dns_quic_and_udp_echo() {
+        exercise_pipeline(TunProfile::LOW_MEMORY).await;
     }
 }

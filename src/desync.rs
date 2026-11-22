@@ -335,7 +335,10 @@ impl EngineContext {
                 ));
             }
         }
-        TcpStream::connect(target).await
+        let stream = TcpStream::connect(target).await?;
+        #[cfg(target_vendor = "apple")]
+        set_apple_nosigpipe(&stream);
+        Ok(stream)
     }
 
     /// Relays a bidirectional TCP tunnel between `client` and `remote`, inspecting the initial
@@ -1132,10 +1135,43 @@ async fn send_with_oob(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_vendor = "apple")]
+fn set_apple_nosigpipe(stream: &TcpStream) {
+    use std::ffi::c_void;
+    use std::os::unix::io::AsRawFd;
+
+    const SOL_SOCKET: i32 = 0xffff;
+    const SO_NOSIGPIPE: i32 = 0x1022;
+    let one: i32 = 1;
+
+    extern "C" {
+        fn setsockopt(
+            sockfd: i32,
+            level: i32,
+            optname: i32,
+            optval: *const c_void,
+            optlen: u32,
+        ) -> i32;
+    }
+
+    unsafe {
+        let _ = setsockopt(
+            stream.as_raw_fd(),
+            SOL_SOCKET,
+            SO_NOSIGPIPE,
+            (&one as *const i32).cast::<c_void>(),
+            std::mem::size_of::<i32>() as u32,
+        );
+    }
+}
+
 #[cfg(unix)]
 fn raw_send_oob(stream: &TcpStream, data: &[u8]) -> std::io::Result<usize> {
     use std::ffi::c_void;
     use std::os::unix::io::AsRawFd;
+
+    #[cfg(target_vendor = "apple")]
+    set_apple_nosigpipe(stream);
 
     const MSG_OOB: i32 = 0x1;
     #[cfg(any(target_os = "linux", target_os = "android"))]
