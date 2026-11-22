@@ -218,7 +218,7 @@ async fn end_to_end_socks5_udp_associate_voice_and_game_relay() {
 }
 
 #[tokio::test]
-async fn end_to_end_all_six_desync_stages_complete_real_tls_handshake() {
+async fn end_to_end_all_seven_desync_stages_complete_real_tls_handshake() {
     let host = "chat.discord.test";
     let (tls_addr, cert) = spawn_local_tls_echo_server(host).await;
     let connector = build_tls_client_connector(cert);
@@ -226,6 +226,7 @@ async fn end_to_end_all_six_desync_stages_complete_real_tls_handshake() {
     let stages = [
         LearnedStrategy::Primary,
         LearnedStrategy::OobSniDesync,
+        LearnedStrategy::MultiRecordOob,
         LearnedStrategy::FineFragment,
         LearnedStrategy::DeepRecordStorm,
         LearnedStrategy::SlowSniSlice,

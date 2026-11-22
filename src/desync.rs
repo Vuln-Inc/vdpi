@@ -16,7 +16,7 @@ use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tracing::debug;
 
-/// Strategy learned per-hostname (and globally per ISP network) by the 6-Stage Adaptive
+/// Strategy learned per-hostname (and globally per ISP network) by the 7-Stage Adaptive
 /// Auto-Heal TLS Engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -28,17 +28,20 @@ pub enum LearnedStrategy {
     /// Real server TCP stacks (`SO_OOBINLINE=0`) strip the urgent byte seamlessly while stateful
     /// full-stream-reassembling ISP DPI boxes corrupt/miss the SNI completely.
     OobSniDesync = 1,
-    /// Stage 3: Single intact outer TLS record split across 4 wire-paced TCP segments (compatible
+    /// Stage 3: Combined 4-record TLS split + `MSG_OOB` decoy byte injected right at the TLS
+    /// record boundary inside SNI, shifting subsequent TLS record framing for DPI state machines.
+    MultiRecordOob = 2,
+    /// Stage 4: Single intact outer TLS record split across 4 wire-paced TCP segments (compatible
     /// with strict servers that reject multi-record ClientHellos while defeating active DPI).
-    FineFragment = 2,
-    /// Stage 4: Deep 12+ RFC-compliant TLS record storm (up to 10 tiny 2-byte lead records
+    FineFragment = 3,
+    /// Stage 5: Deep 12+ RFC-compliant TLS record storm (up to 10 tiny 2-byte lead records
     /// exhausting hardware DPI per-flow packet caps before SNI hits the wire + SNI splits).
-    DeepRecordStorm = 3,
-    /// Stage 5: Single intact outer TLS record with slow 2-byte SNI-only pacing (for strict
+    DeepRecordStorm = 4,
+    /// Stage 6: Single intact outer TLS record with slow 2-byte SNI-only pacing (for strict
     /// servers behind stateful burst-reassembling DPI).
-    SlowSniSlice = 4,
-    /// Stage 6: Unmodified single-write passthrough (for unblocked strict WAFs/CDNs).
-    DirectPassthrough = 5,
+    SlowSniSlice = 5,
+    /// Stage 7: Unmodified single-write passthrough (for unblocked strict WAFs/CDNs).
+    DirectPassthrough = 6,
 }
 
 impl LearnedStrategy {
@@ -46,10 +49,11 @@ impl LearnedStrategy {
         match val {
             0 => Self::Primary,
             1 => Self::OobSniDesync,
-            2 => Self::FineFragment,
-            3 => Self::DeepRecordStorm,
-            4 => Self::SlowSniSlice,
-            5 => Self::DirectPassthrough,
+            2 => Self::MultiRecordOob,
+            3 => Self::FineFragment,
+            4 => Self::DeepRecordStorm,
+            5 => Self::SlowSniSlice,
+            6 => Self::DirectPassthrough,
             _ => Self::Primary,
         }
     }
@@ -59,9 +63,10 @@ impl LearnedStrategy {
     }
 }
 
-const ALL_STAGES: [LearnedStrategy; 6] = [
+const ALL_STAGES: [LearnedStrategy; 7] = [
     LearnedStrategy::Primary,
     LearnedStrategy::OobSniDesync,
+    LearnedStrategy::MultiRecordOob,
     LearnedStrategy::FineFragment,
     LearnedStrategy::DeepRecordStorm,
     LearnedStrategy::SlowSniSlice,
@@ -465,6 +470,11 @@ impl EngineContext {
                 // reassemblers ignore URG and see a corrupted hostname (e.g. "discaord.com").
                 write_oob_sni_split(remote, payload, ch_info).await?;
             }
+            LearnedStrategy::MultiRecordOob => {
+                // Combine 4-record TLS splitting with a MSG_OOB decoy byte right at the boundary
+                // before Record 4 so stateful DPI boxes lose TLS record framing completely.
+                write_multi_record_oob(remote, payload, ch_info, chunk_len).await?;
+            }
             LearnedStrategy::FineFragment => {
                 // Single intact outer TLS record split across 4 wire-paced TCP segments
                 // breaking both the 5-byte TLS record header and the SNI hostname midpoint.
@@ -761,6 +771,37 @@ async fn write_oob_sni_split(
 
     tokio::time::sleep(Duration::from_millis(3)).await;
     stream.write_all(&payload[split_at..]).await?;
+    Ok(())
+}
+
+/// Splits the ClientHello into 4 RFC-compliant TLS records and injects a 1-byte `MSG_OOB`
+/// decoy right at the end of the pre-midpoint SNI record (shifting the following TLS record
+/// header by 1 byte for any DPI engine that ignores TCP `URG`).
+async fn write_multi_record_oob(
+    stream: &mut TcpStream,
+    payload: &[u8],
+    ch_info: &ClientHelloInfo,
+    fallback_split: usize,
+) -> Result<()> {
+    let Some(records) = split_tls_records_multi(payload, ch_info, fallback_split) else {
+        return write_oob_sni_split(stream, payload, ch_info).await;
+    };
+
+    let oob_rec_idx = records.len().saturating_sub(2);
+    for (idx, rec) in records.iter().enumerate() {
+        if idx == oob_rec_idx && rec.len() <= 1024 {
+            let mut with_oob = Vec::with_capacity(rec.len() + 1);
+            with_oob.extend_from_slice(rec);
+            with_oob.push(b'a');
+            send_with_oob(stream, &with_oob).await?;
+            tokio::time::sleep(Duration::from_millis(4)).await;
+        } else {
+            stream.write_all(rec).await?;
+            if idx + 1 < records.len() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+    }
     Ok(())
 }
 
