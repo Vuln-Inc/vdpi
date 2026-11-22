@@ -246,6 +246,9 @@ jobs:
       contents: write
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*
@@ -257,6 +260,21 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
+          TAG_NOTES="$(git tag -l --format='%(contents)' "$TAG" | sed '/^[[:space:]]*$/d')"
+          if [ -n "$TAG_NOTES" ] && [ "$TAG_NOTES" != "vdpi $TAG" ] && [ "$TAG_NOTES" != "$TAG" ]; then
+            printf '%s\n' "$TAG_NOTES" > release-notes.md
+          else
+            PREV_TAG="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+            if [ -n "$PREV_TAG" ]; then
+              git log --no-merges --pretty=format:'- %s' "${PREV_TAG}..${TAG}" > release-notes.md
+            else
+              git log --no-merges -n 20 --pretty=format:'- %s' "$TAG" > release-notes.md
+            fi
+          fi
+          if [ ! -s release-notes.md ]; then
+            printf '%s\n' "- Release $TAG" > release-notes.md
+          fi
+
           cd release-assets
           sha256sum vdpi-windows-x86_64.zip vdpi-macos-universal.tar.gz vdpi-linux-x86_64.tar.gz vdpi-linux-arm64.tar.gz vdpi-android-universal.apk > SHA256SUMS.txt
           PRERELEASE_FLAG=""
@@ -275,7 +293,7 @@ jobs:
             gh release create "$TAG" \
               $PRERELEASE_FLAG \
               --title "vdpi $TAG" \
-              --generate-notes \
+              --notes-file ../release-notes.md \
               vdpi-windows-x86_64.zip \
               vdpi-macos-universal.tar.gz \
               vdpi-linux-x86_64.tar.gz \
