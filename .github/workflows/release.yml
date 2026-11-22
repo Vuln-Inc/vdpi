@@ -130,19 +130,46 @@ jobs:
             CODE_SIGN_IDENTITY="-" \
             CODE_SIGNING_REQUIRED=NO \
             DEVELOPMENT_TEAM=""
-      - name: Verify Physical iOS arm64 Device Build (App + PacketTunnel)
+      - name: Build Physical iOS arm64 Device App & Package Unsigned IPA
         working-directory: ios
         run: |
+          rm -rf build ../dist/ios
           xcodebuild build \
             -project Vdpi.xcodeproj \
             -scheme VdpiApp \
             -configuration Release \
             -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO
+
+          APP_PATH="build/Build/Products/Release-iphoneos/VdpiApp.app"
+          APPEX_PATH="$APP_PATH/PlugIns/VdpiPacketTunnel.appex"
+          test -d "$APP_PATH"
+          test -d "$APPEX_PATH"
+
+          # Ad-hoc sign with entitlements preserved (required for TrollStore; re-signers replace this cleanly)
+          codesign --force --sign - --entitlements PacketTunnel/PacketTunnel.entitlements "$APPEX_PATH"
+          codesign --force --sign - --entitlements VdpiApp/VdpiApp.entitlements "$APP_PATH"
+          codesign -d --entitlements :- "$APPEX_PATH" | grep -q "packet-tunnel-provider"
+          codesign -d --entitlements :- "$APP_PATH" | grep -q "group.com.vulninc.vdpi"
+
+          mkdir -p ../dist/ios/ipa-stage/Payload
+          cp -R "$APP_PATH" ../dist/ios/ipa-stage/Payload/VdpiApp.app
+          (cd ../dist/ios/ipa-stage && zip -qry ../vdpi-ios-unsigned.ipa Payload)
+          rm -rf ../dist/ios/ipa-stage
+
+          # Verify IPA layout contains both main app and embedded NetworkExtension
+          unzip -l ../dist/ios/vdpi-ios-unsigned.ipa | grep -q "Payload/VdpiApp.app/Info.plist"
+          unzip -l ../dist/ios/vdpi-ios-unsigned.ipa | grep -q "Payload/VdpiApp.app/PlugIns/VdpiPacketTunnel.appex/Info.plist"
+          ls -lh ../dist/ios/vdpi-ios-unsigned.ipa
       - name: Package VdpiCore.xcframework Artifact
         run: |
           mkdir -p dist/ios
           ditto -c -k --sequesterRsrc --keepParent ios/Frameworks/VdpiCore.xcframework dist/ios/VdpiCore.xcframework.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-ios
+          path: dist/ios/vdpi-ios-unsigned.ipa
       - uses: actions/upload-artifact@v4
         with:
           name: ios-xcframework
@@ -276,7 +303,7 @@ jobs:
           fi
 
           cd release-assets
-          sha256sum vdpi-windows-x86_64.zip vdpi-macos-universal.tar.gz vdpi-linux-x86_64.tar.gz vdpi-linux-arm64.tar.gz vdpi-android-universal.apk > SHA256SUMS.txt
+          sha256sum vdpi-windows-x86_64.zip vdpi-macos-universal.tar.gz vdpi-linux-x86_64.tar.gz vdpi-linux-arm64.tar.gz vdpi-android-universal.apk vdpi-ios-unsigned.ipa > SHA256SUMS.txt
           PRERELEASE_FLAG=""
           if [[ "$TAG" == *-* ]]; then
             PRERELEASE_FLAG="--prerelease"
@@ -288,6 +315,7 @@ jobs:
               vdpi-linux-x86_64.tar.gz \
               vdpi-linux-arm64.tar.gz \
               vdpi-android-universal.apk \
+              vdpi-ios-unsigned.ipa \
               SHA256SUMS.txt
           else
             gh release create "$TAG" \
@@ -299,5 +327,6 @@ jobs:
               vdpi-linux-x86_64.tar.gz \
               vdpi-linux-arm64.tar.gz \
               vdpi-android-universal.apk \
+              vdpi-ios-unsigned.ipa \
               SHA256SUMS.txt
           fi

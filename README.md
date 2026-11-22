@@ -28,7 +28,7 @@ Download the latest build for your device from **[GitHub Releases](https://githu
 | **Windows** | [`vdpi-windows-x86_64.zip`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-windows-x86_64.zip) | Windows 10 & 11 (`x86_64`) | Native Windows Service + WinINET + `HTTP_PROXY`/`HTTPS_PROXY` + WinHTTP |
 | **macOS** | [`vdpi-macos-universal.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-macos-universal.tar.gz) | Apple Silicon & Intel (Universal) | `LaunchAgent` + `networksetup` proxy |
 | **Linux** | [`vdpi-linux-x86_64.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-linux-x86_64.tar.gz) / [`vdpi-linux-arm64.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-linux-arm64.tar.gz) | `x86_64` & `arm64` (static `musl`) | `systemd --user` + GNOME / KDE proxy |
-| **iOS / iPadOS** | Build from source (`ios/`); CI publishes `ios-xcframework` artifact (no `.ipa` in Releases) | iOS / iPadOS 16+ (`arm64`) | `NEPacketTunnelProvider` + shared Rust TUN (`VdpiCore.xcframework`) |
+| **iOS / iPadOS** | [`vdpi-ios-unsigned.ipa`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-ios-unsigned.ipa) | iOS / iPadOS 16+ (`arm64`, unsigned — requires TrollStore or paid `NetworkExtension` signing) | `NEPacketTunnelProvider` + shared Rust TUN (`VdpiCore.xcframework`) |
 
 > **VPN coexistence note:** On desktop, `vdpi` runs as a pure userspace proxy (`127.0.0.1:8080` / `:1080`) with no kernel drivers, so it coexists alongside WireGuard, Cloudflare WARP, OpenVPN, Mullvad, and ProtonVPN. On **Android** (`VpnService`) and **iOS** (`NEPacketTunnelProvider`), `vdpi` uses the OS's zero-root local VPN API, which occupies the device's single active Personal VPN slot.
 
@@ -76,9 +76,17 @@ Download the latest build for your device from **[GitHub Releases](https://githu
 - **On-Demand VPN & Domain Bypass:** Supports iOS VPN On-Demand (`NEOnDemandRuleConnect`) and custom domain bypass rules. Note: consumer iOS restricts per-app VPN split-tunneling (`NEAppRule`) to supervised MDM devices, so consumer builds use domain bypass.
 - **Live Telemetry, Diagnostics & Logs:** App Group (`group.com.vulninc.vdpi`) shares settings while `NETunnelProviderSession.sendProviderMessage` IPC handles 1 Hz telemetry, live reloads, cache clears, and in-tunnel `rustls` TLS 1.3/1.2 Diagnostics.
 
-> **iOS signing, Simulator & physical-device testing caveats:**
-> - **CI & Simulator:** `VdpiCore.xcframework` builds, unit tests (`VdpiSharedTests`), and unsigned `generic/platform=iOS` Release compilation are verified in GitHub Actions on `macos-latest`. iOS Simulator does **not** execute `NEPacketTunnelProvider` packet routing — live on-device DPI bypass testing requires a physical iPhone/iPad.
-> - **Physical device provisioning:** Installing a `NEPacketTunnelProvider` on a physical iPhone/iPad requires a paid Apple Developer Program account ($99/yr) to provision the `com.apple.developer.networking.networkextension` (`packet-tunnel-provider`) entitlement, and no signed `.ipa` is published to GitHub Releases. Prebuilt `VdpiCore.xcframework.zip` is uploaded as the `ios-xcframework` GitHub Actions artifact.
+### Installing on iOS / iPadOS
+
+Download **[`vdpi-ios-unsigned.ipa`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-ios-unsigned.ipa)** from GitHub Releases (includes both `VdpiApp.app` and `PlugIns/VdpiPacketTunnel.appex` with ad-hoc embedded entitlements):
+
+- **TrollStore (iOS 16.0 – 16.6.1 / 17.0):** Install `vdpi-ios-unsigned.ipa` directly in TrollStore — CoreTrust preserves the `packet-tunnel-provider` and `group.com.vulninc.vdpi` entitlements without an Apple Developer account.
+- **Paid Apple Developer certificate / third-party signer (Feather, ESign, Sideloadly, etc.):** Re-sign `vdpi-ios-unsigned.ipa` with a paid certificate & provisioning profile that explicitly grants `com.apple.developer.networking.networkextension` (`packet-tunnel-provider`) and matching App Groups on **both** `VdpiApp` and `PlugIns/VdpiPacketTunnel.appex`.
+- **Xcode (recommended for paid Apple Developer Teams):** Build and sign directly from `ios/Vdpi.xcodeproj` using the steps in [Building from Source](#ios-app-xcode--xcframework).
+
+> **iOS signing & Simulator caveats:**
+> - **Free Apple ID sideloading does not work:** Apple blocks the `com.apple.developer.networking.networkextension` (`packet-tunnel-provider`) entitlement on free Apple IDs (AltStore / SideStore / free Sideloadly). Signing will fail or iOS will refuse to start the VPN tunnel.
+> - **CI & Simulator:** `VdpiCore.xcframework` builds, unit tests (`VdpiSharedTests`), and physical `arm64` Release packaging (`vdpi-ios-unsigned.ipa`) are verified in GitHub Actions on `macos-latest`. iOS Simulator does **not** execute `NEPacketTunnelProvider` packet routing — live on-device DPI bypass requires a physical iPhone/iPad. Prebuilt `VdpiCore.xcframework.zip` is also uploaded as the `ios-xcframework` GitHub Actions artifact.
 
 ---
 
