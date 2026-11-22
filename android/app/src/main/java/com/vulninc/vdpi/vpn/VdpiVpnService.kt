@@ -9,6 +9,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.Build
 import android.service.quicksettings.TileService
@@ -27,11 +30,15 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.atomic.AtomicBoolean
 
 enum class TunnelPhase {
     DISCONNECTED,
@@ -58,23 +65,51 @@ object TunnelRuntimeState {
 class VdpiVpnService : VpnService() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val transitionMutex = Mutex()
+    private var transitionJob: Job? = null
     private var pollJob: Job? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var lastNetworkId: Long? = null
+
+    @Volatile
+    private var latestStartId: Int = -1
+
+    override fun onCreate() {
+        super.onCreate()
+        serviceActive.set(true)
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        latestStartId = startId
         when (intent?.action) {
             ACTION_STOP -> {
-                stopTunnelAndSelf()
+                scheduleStop(startId)
                 return START_NOT_STICKY
             }
-            ACTION_START, null -> {
-                startTunnel()
-                return START_STICKY
+            ACTION_RECONNECT -> {
+                scheduleStart(reconnect = true, startId = startId)
+                return START_NOT_STICKY
+            }
+            ACTION_START, SERVICE_INTERFACE, null -> {
+                if (prepare(this) != null) {
+                    TunnelRuntimeState.update {
+                        it.copy(
+                            phase = TunnelPhase.ERROR,
+                            errorMessage = "VPN permission required",
+                        )
+                    }
+                    requestTileSync()
+                    stopSelf(startId)
+                    return START_NOT_STICKY
+                }
+                scheduleStart(reconnect = false, startId = startId)
+                return START_NOT_STICKY
             }
             else -> return START_NOT_STICKY
         }
     }
 
-    private fun startTunnel() {
+    private fun scheduleStart(reconnect: Boolean, startId: Int) {
         ensureNotificationChannel()
         TunnelRuntimeState.update {
             it.copy(phase = TunnelPhase.CONNECTING, errorMessage = null)
@@ -82,52 +117,113 @@ class VdpiVpnService : VpnService() {
         requestTileSync()
 
         val initialNotif = buildNotification(
-            title = "vdpi connecting",
+            title = if (reconnect) "vdpi reconnecting" else "vdpi starting",
             subtitle = "Starting local anti-DPI engine",
         )
-        startForegroundCompat(initialNotif)
-
-        scope.launch {
-            val settings = SettingsRepository(applicationContext).current()
-            val vpnInterface = establishVpnInterface(settings)
-            if (vpnInterface == null) {
-                TunnelRuntimeState.update {
-                    it.copy(
-                        phase = TunnelPhase.ERROR,
-                        errorMessage = "VPN permission revoked or interface could not be created",
-                    )
-                }
-                requestTileSync()
-                stopSelf()
-                return@launch
-            }
-
-            // Transfer sole TUN file descriptor ownership to the Rust engine.
-            val tunFd = vpnInterface.detachFd()
-            val startResult = NativeEngine.start(tunFd, settings.toNativeConfig())
-            if (startResult.isFailure) {
-                TunnelRuntimeState.update {
-                    it.copy(
-                        phase = TunnelPhase.ERROR,
-                        errorMessage = startResult.exceptionOrNull()?.message ?: "Engine failed to start",
-                    )
-                }
-                requestTileSync()
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
-                return@launch
-            }
-
+        if (!startForegroundSafe(initialNotif)) {
             TunnelRuntimeState.update {
                 it.copy(
-                    phase = TunnelPhase.CONNECTED,
-                    errorMessage = null,
-                    telemetry = NativeEngine.snapshot(),
+                    phase = TunnelPhase.ERROR,
+                    errorMessage = "Background start blocked by system",
                 )
             }
             requestTileSync()
-            startTelemetryLoop()
+            stopSelf(startId)
+            return
         }
+
+        transitionJob?.cancel()
+        transitionJob = scope.launch {
+            transitionMutex.withLock {
+                pollJob?.cancel()
+                pollJob = null
+                unregisterNetworkMonitor()
+
+                if (reconnect) {
+                    NativeEngine.stop()
+                }
+
+                ensureActive()
+                val settings = SettingsRepository(applicationContext).current()
+                val preparedConfig = NativeEngine.prepareStart(settings.toNativeConfig())
+                if (preparedConfig.isFailure) {
+                    failAndStop(
+                        preparedConfig.exceptionOrNull()?.message ?: "Failed to load native engine",
+                        startId,
+                    )
+                    return@withLock
+                }
+
+                ensureActive()
+                val vpnInterface = establishVpnInterface(settings)
+                if (vpnInterface == null) {
+                    failAndStop(
+                        "VPN permission revoked or interface could not be created",
+                        startId,
+                    )
+                    return@withLock
+                }
+
+                if (!isActive) {
+                    runCatching { vpnInterface.close() }
+                    return@withLock
+                }
+
+                // Transfer sole TUN file descriptor ownership to the Rust engine after library/config prep.
+                val tunFd = vpnInterface.detachFd()
+                val startResult = NativeEngine.startWithEncoded(tunFd, preparedConfig.getOrThrow())
+                if (startResult.isFailure) {
+                    failAndStop(
+                        startResult.exceptionOrNull()?.message ?: "Engine failed to start",
+                        startId,
+                    )
+                    return@withLock
+                }
+
+                if (!isActive) {
+                    NativeEngine.stop()
+                    return@withLock
+                }
+
+                TunnelRuntimeState.update {
+                    it.copy(
+                        phase = TunnelPhase.CONNECTED,
+                        errorMessage = null,
+                        telemetry = NativeEngine.snapshot(),
+                    )
+                }
+                registerNetworkMonitor()
+                requestTileSync()
+                startTelemetryLoop()
+            }
+        }
+    }
+
+    private fun scheduleStop(startId: Int? = null) {
+        transitionJob?.cancel()
+        transitionJob = scope.launch {
+            transitionMutex.withLock {
+                stopTunnelInternal(startId)
+            }
+        }
+    }
+
+    private fun failAndStop(message: String, startId: Int) {
+        unregisterNetworkMonitor()
+        pollJob?.cancel()
+        pollJob = null
+        NativeEngine.stop()
+        TunnelRuntimeState.update {
+            it.copy(
+                phase = TunnelPhase.ERROR,
+                errorMessage = message,
+                telemetry = NativeEngine.snapshot(),
+            )
+        }
+        requestTileSync()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        getSystemService(NotificationManager::class.java)?.cancel(NOTIFICATION_ID)
+        stopSelf(startId)
     }
 
     private fun establishVpnInterface(settings: VdpiSettings) = runCatching {
@@ -147,7 +243,10 @@ class VdpiVpnService : VpnService() {
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            builder.setMetered(false)
+            val cm = getSystemService(ConnectivityManager::class.java)
+            val caps = cm?.getNetworkCapabilities(cm.activeNetwork)
+            val isUnmetered = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) == true
+            builder.setMetered(!isUnmetered)
         }
 
         when (settings.splitTunnelMode) {
@@ -159,12 +258,15 @@ class VdpiVpnService : VpnService() {
                 }
             }
             SplitTunnelMode.ONLY_SELECTED -> {
-                val allowed = settings.splitPackages.filter { it != packageName }
-                if (allowed.isEmpty()) {
-                    // Fall back to excluding self so VPN remains usable when list is empty.
+                var addedCount = 0
+                settings.splitPackages.forEach { pkg ->
+                    if (pkg != packageName && safeAllow(builder, pkg)) {
+                        addedCount += 1
+                    }
+                }
+                if (addedCount == 0) {
+                    // Fall back to excluding self so VPN never enters a self-routing loop.
                     safeDisallow(builder, packageName)
-                } else {
-                    allowed.forEach { pkg -> safeAllow(builder, pkg) }
                 }
             }
         }
@@ -172,19 +274,53 @@ class VdpiVpnService : VpnService() {
         builder.establish()
     }.getOrNull()
 
-    private fun safeDisallow(builder: Builder, pkg: String) {
-        try {
+    private fun safeDisallow(builder: Builder, pkg: String): Boolean {
+        return try {
             builder.addDisallowedApplication(pkg)
+            true
         } catch (_: PackageManager.NameNotFoundException) {
-            // App was uninstalled after being saved in preferences.
+            false
         }
     }
 
-    private fun safeAllow(builder: Builder, pkg: String) {
-        try {
+    private fun safeAllow(builder: Builder, pkg: String): Boolean {
+        return try {
             builder.addAllowedApplication(pkg)
+            true
         } catch (_: PackageManager.NameNotFoundException) {
-            // Ignore uninstalled packages.
+            false
+        }
+    }
+
+    private fun registerNetworkMonitor() {
+        unregisterNetworkMonitor()
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return
+        lastNetworkId = cm.activeNetwork?.networkHandle
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                val handle = network.networkHandle
+                val prev = lastNetworkId
+                lastNetworkId = handle
+                if (prev != null && prev != handle && TunnelRuntimeState.state.value.phase == TunnelPhase.CONNECTED) {
+                    scope.launch {
+                        // Refresh cached DNS & adaptive strategy after Wi-Fi <-> cellular switch.
+                        NativeEngine.clearCache()
+                    }
+                }
+            }
+        }
+        runCatching {
+            cm.registerDefaultNetworkCallback(cb)
+            networkCallback = cb
+        }
+    }
+
+    private fun unregisterNetworkMonitor() {
+        val cb = networkCallback ?: return
+        networkCallback = null
+        lastNetworkId = null
+        runCatching {
+            getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb)
         }
     }
 
@@ -193,8 +329,18 @@ class VdpiVpnService : VpnService() {
         pollJob = scope.launch {
             val nm = getSystemService(NotificationManager::class.java)
             var tick = 0
+            var lastStage = -1
             while (isActive) {
                 val snap = NativeEngine.snapshot()
+                if (!snap.running) {
+                    if (TunnelRuntimeState.state.value.phase == TunnelPhase.CONNECTED) {
+                        val lastErr = snap.events.lastOrNull { it.level == "error" }?.message
+                            ?: "Tunnel stopped unexpectedly"
+                        failAndStop(lastErr, latestStartId)
+                    }
+                    return@launch
+                }
+
                 TunnelRuntimeState.update { current ->
                     if (current.phase == TunnelPhase.CONNECTED) {
                         current.copy(telemetry = snap)
@@ -202,9 +348,15 @@ class VdpiVpnService : VpnService() {
                         current
                     }
                 }
-                if (tick % 3 == 0) {
+
+                if (snap.stageNumber != lastStage) {
+                    lastStage = snap.stageNumber
+                    requestTileSync()
+                }
+
+                if (tick % 3 == 0 && isActive && TunnelRuntimeState.state.value.phase == TunnelPhase.CONNECTED) {
                     val subtitle = "Stage ${snap.stageNumber} · ↓ ${formatBytes(snap.bytesRx)}  ↑ ${formatBytes(snap.bytesTx)}"
-                    nm.notify(
+                    nm?.notify(
                         NOTIFICATION_ID,
                         buildNotification(title = "vdpi active", subtitle = subtitle),
                     )
@@ -215,7 +367,8 @@ class VdpiVpnService : VpnService() {
         }
     }
 
-    private fun stopTunnelAndSelf() {
+    private fun stopTunnelInternal(startId: Int? = null) {
+        unregisterNetworkMonitor()
         pollJob?.cancel()
         pollJob = null
         NativeEngine.stop()
@@ -228,17 +381,26 @@ class VdpiVpnService : VpnService() {
         }
         requestTileSync()
         stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        getSystemService(NotificationManager::class.java)?.cancel(NOTIFICATION_ID)
+        if (startId != null && startId >= 0) {
+            stopSelf(startId)
+        } else {
+            stopSelf()
+        }
     }
 
     override fun onRevoke() {
-        stopTunnelAndSelf()
+        scheduleStop(latestStartId)
         super.onRevoke()
     }
 
     override fun onDestroy() {
+        serviceActive.set(false)
+        unregisterNetworkMonitor()
+        transitionJob?.cancel()
         pollJob?.cancel()
         NativeEngine.stop()
+        getSystemService(NotificationManager::class.java)?.cancel(NOTIFICATION_ID)
         if (TunnelRuntimeState.state.value.phase != TunnelPhase.ERROR) {
             TunnelRuntimeState.update {
                 it.copy(phase = TunnelPhase.DISCONNECTED, telemetry = NativeEngine.snapshot())
@@ -249,20 +411,28 @@ class VdpiVpnService : VpnService() {
         super.onDestroy()
     }
 
-    private fun startForegroundCompat(notification: Notification) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+    private fun startForegroundSafe(notification: Notification): Boolean {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+            true
+        } catch (_: IllegalStateException) {
+            // Covers ForegroundServiceStartNotAllowedException (subclass of IllegalStateException on API 31+).
+            false
+        } catch (_: SecurityException) {
+            false
         }
     }
 
     private fun ensureNotificationChannel() {
-        val manager = getSystemService(NotificationManager::class.java)
+        val manager = getSystemService(NotificationManager::class.java) ?: return
         val channel = NotificationChannel(
             CHANNEL_ID,
             getString(R.string.notification_channel_name),
@@ -316,6 +486,7 @@ class VdpiVpnService : VpnService() {
 
     companion object {
         const val ACTION_START = "com.vulninc.vdpi.action.START"
+        const val ACTION_RECONNECT = "com.vulninc.vdpi.action.RECONNECT"
         const val ACTION_STOP = "com.vulninc.vdpi.action.STOP"
 
         private const val CHANNEL_ID = "vdpi_tunnel_status"
@@ -325,18 +496,72 @@ class VdpiVpnService : VpnService() {
         private const val TUN_IPV6_ADDR = "fd00:7664:7069::1"
         private const val TUN_IPV6_DNS = "fd00:7664:7069::2"
 
-        fun start(context: Context) {
+        private val serviceActive = AtomicBoolean(false)
+
+        fun start(context: Context): Boolean {
             val intent = Intent(context, VdpiVpnService::class.java).apply {
                 action = ACTION_START
             }
-            context.startForegroundService(intent)
+            return runCatching {
+                context.startForegroundService(intent)
+                true
+            }.getOrElse {
+                TunnelRuntimeState.update {
+                    it.copy(
+                        phase = TunnelPhase.ERROR,
+                        errorMessage = "Unable to start VPN service in background",
+                    )
+                }
+                false
+            }
+        }
+
+        fun reconnect(context: Context): Boolean {
+            val intent = Intent(context, VdpiVpnService::class.java).apply {
+                action = ACTION_RECONNECT
+            }
+            return runCatching {
+                context.startForegroundService(intent)
+                true
+            }.getOrElse {
+                TunnelRuntimeState.update {
+                    it.copy(
+                        phase = TunnelPhase.ERROR,
+                        errorMessage = "Unable to reconnect VPN service",
+                    )
+                }
+                false
+            }
         }
 
         fun stop(context: Context) {
+            if (!serviceActive.get()) {
+                NativeEngine.stop()
+                TunnelRuntimeState.update {
+                    TunnelRuntimeSnapshot(
+                        phase = TunnelPhase.DISCONNECTED,
+                        errorMessage = null,
+                        telemetry = NativeEngine.snapshot(),
+                    )
+                }
+                return
+            }
             val intent = Intent(context, VdpiVpnService::class.java).apply {
                 action = ACTION_STOP
             }
-            context.startService(intent)
+            runCatching {
+                context.startService(intent)
+            }.onFailure {
+                runCatching { context.stopService(Intent(context, VdpiVpnService::class.java)) }
+                NativeEngine.stop()
+                TunnelRuntimeState.update {
+                    TunnelRuntimeSnapshot(
+                        phase = TunnelPhase.DISCONNECTED,
+                        errorMessage = null,
+                        telemetry = NativeEngine.snapshot(),
+                    )
+                }
+            }
         }
     }
 }

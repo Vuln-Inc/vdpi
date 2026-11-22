@@ -1,9 +1,43 @@
+import java.io.File
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
     id("org.jetbrains.kotlin.plugin.serialization")
 }
+
+fun readWorkspaceVersion(): String {
+    val override = providers.gradleProperty("vdpiVersionName").orNull?.trim()
+    if (!override.isNullOrEmpty()) return override.removePrefix("v")
+    val cargoToml = rootProject.projectDir.parentFile?.resolve("Cargo.toml")
+    if (cargoToml != null && cargoToml.isFile) {
+        val match = Regex("""(?m)^version\s*=\s*"([^"]+)"""").find(cargoToml.readText())
+        if (match != null) return match.groupValues[1]
+    }
+    return "0.2.5"
+}
+
+fun computeVersionCode(semver: String): Int {
+    val parts = semver.substringBefore('-').split('.').mapNotNull { it.toIntOrNull() }
+    val major = parts.getOrElse(0) { 0 }
+    val minor = parts.getOrElse(1) { 0 }
+    val patch = parts.getOrElse(2) { 0 }
+    return (major * 10000 + minor * 100 + patch).coerceAtLeast(1)
+}
+
+val resolvedVersionName = readWorkspaceVersion()
+val resolvedVersionCode = computeVersionCode(resolvedVersionName)
+
+val releaseKeystorePath = System.getenv("VDPI_KEYSTORE_PATH")?.takeIf { it.isNotBlank() }
+val releaseKeystorePassword = System.getenv("VDPI_KEYSTORE_PASSWORD")?.takeIf { it.isNotBlank() }
+val releaseKeyAlias = System.getenv("VDPI_KEY_ALIAS")?.takeIf { it.isNotBlank() }
+val releaseKeyPassword = System.getenv("VDPI_KEY_PASSWORD")?.takeIf { it.isNotBlank() }
+val hasReleaseSigning = releaseKeystorePath != null &&
+    File(releaseKeystorePath).isFile &&
+    releaseKeystorePassword != null &&
+    releaseKeyAlias != null &&
+    releaseKeyPassword != null
 
 android {
     namespace = "com.vulninc.vdpi"
@@ -13,12 +47,23 @@ android {
         applicationId = "com.vulninc.vdpi"
         minSdk = 26
         targetSdk = 35
-        versionCode = 205
-        versionName = "0.2.5"
+        versionCode = resolvedVersionCode
+        versionName = resolvedVersionName
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+        }
+    }
+
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = File(releaseKeystorePath!!)
+                storePassword = releaseKeystorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
         }
     }
 
@@ -30,8 +75,11 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            // Sign with debug key if no release keystore is configured, so local/CI APKs are installable.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = if (hasReleaseSigning) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
         }
         debug {
             applicationIdSuffix = ".debug"
@@ -61,6 +109,26 @@ android {
             useLegacyPackaging = false
         }
     }
+}
+
+val verifyNativeLibs by tasks.registering {
+    val jniDir = file("src/main/jniLibs")
+    val requiredAbis = listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+    doLast {
+        val missing = requiredAbis.filter { abi ->
+            !jniDir.resolve("$abi/libvdpi_android.so").isFile
+        }
+        if (missing.isNotEmpty()) {
+            throw GradleException(
+                "Missing native Rust JNI libraries for ABIs: ${missing.joinToString(", ")}. " +
+                    "Run ./android/scripts/build-native.sh first."
+            )
+        }
+    }
+}
+
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders") }.configureEach {
+    dependsOn(verifyNativeLibs)
 }
 
 dependencies {

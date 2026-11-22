@@ -2,9 +2,11 @@ package com.vulninc.vdpi.data
 
 import android.content.Context
 import androidx.datastore.core.DataStore
+import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
@@ -12,20 +14,40 @@ import androidx.datastore.preferences.preferencesDataStore
 import com.vulninc.vdpi.engine.DesyncMode
 import com.vulninc.vdpi.engine.NativeEngineConfig
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import java.io.IOException
+import java.util.Locale
 
-private val Context.vdpiDataStore: DataStore<Preferences> by preferencesDataStore(name = "vdpi_settings")
+private val Context.vdpiDataStore: DataStore<Preferences> by preferencesDataStore(
+    name = "vdpi_settings",
+    corruptionHandler = ReplaceFileCorruptionHandler { emptyPreferences() },
+)
 
-enum class SplitTunnelMode(val label: String) {
-    BYPASS_SELECTED("Bypass selected"),
-    ONLY_SELECTED("Only selected"),
+enum class SplitTunnelMode(val wireName: String, val label: String) {
+    BYPASS_SELECTED("bypass_selected", "Bypass selected"),
+    ONLY_SELECTED("only_selected", "Only selected");
+
+    companion object {
+        fun fromWire(raw: String?): SplitTunnelMode {
+            if (raw == null) return BYPASS_SELECTED
+            return entries.firstOrNull { it.wireName == raw || it.name == raw } ?: BYPASS_SELECTED
+        }
+    }
 }
 
-enum class ThemePreference(val label: String) {
-    SYSTEM("System"),
-    DARK("Dark"),
-    LIGHT("Light"),
+enum class ThemePreference(val wireName: String, val label: String) {
+    SYSTEM("system", "System"),
+    DARK("dark", "Dark"),
+    LIGHT("light", "Light");
+
+    companion object {
+        fun fromWire(raw: String?): ThemePreference {
+            if (raw == null) return DARK
+            return entries.firstOrNull { it.wireName == raw || it.name == raw } ?: DARK
+        }
+    }
 }
 
 data class VdpiSettings(
@@ -65,32 +87,31 @@ class SettingsRepository(private val context: Context) {
         val THEME = stringPreferencesKey("theme")
     }
 
-    val settingsFlow: Flow<VdpiSettings> = context.vdpiDataStore.data.map { prefs ->
-        val mode = prefs[Keys.DESYNC_MODE]?.let { raw ->
-            DesyncMode.entries.firstOrNull { it.wireName == raw }
-        } ?: DesyncMode.COMBO
+    val settingsFlow: Flow<VdpiSettings> = context.vdpiDataStore.data
+        .catch { err ->
+            if (err is IOException) emit(emptyPreferences()) else throw err
+        }
+        .map { prefs ->
+            val mode = prefs[Keys.DESYNC_MODE]?.let { raw ->
+                DesyncMode.entries.firstOrNull { it.wireName == raw }
+            } ?: DesyncMode.COMBO
 
-        val splitMode = prefs[Keys.SPLIT_MODE]?.let { raw ->
-            runCatching { SplitTunnelMode.valueOf(raw) }.getOrNull()
-        } ?: SplitTunnelMode.BYPASS_SELECTED
+            val splitMode = SplitTunnelMode.fromWire(prefs[Keys.SPLIT_MODE])
+            val theme = ThemePreference.fromWire(prefs[Keys.THEME])
 
-        val theme = prefs[Keys.THEME]?.let { raw ->
-            runCatching { ThemePreference.valueOf(raw) }.getOrNull()
-        } ?: ThemePreference.DARK
-
-        VdpiSettings(
-            desyncMode = mode,
-            chunkSize = (prefs[Keys.CHUNK_SIZE] ?: 10).coerceIn(1, 64),
-            dnsAddr = prefs[Keys.DNS_ADDR]?.takeIf { it.isNotBlank() } ?: "1.1.1.1",
-            enableDoh = prefs[Keys.ENABLE_DOH] ?: true,
-            ipv4Only = prefs[Keys.IPV4_ONLY] ?: false,
-            blockQuic = prefs[Keys.BLOCK_QUIC] ?: true,
-            bypassDomains = prefs[Keys.BYPASS_DOMAINS]?.sorted() ?: emptyList(),
-            splitTunnelMode = splitMode,
-            splitPackages = prefs[Keys.SPLIT_PACKAGES] ?: emptySet(),
-            theme = theme,
-        )
-    }
+            VdpiSettings(
+                desyncMode = mode,
+                chunkSize = (prefs[Keys.CHUNK_SIZE] ?: 10).coerceIn(1, 64),
+                dnsAddr = prefs[Keys.DNS_ADDR]?.takeIf { it.isNotBlank() } ?: "1.1.1.1",
+                enableDoh = prefs[Keys.ENABLE_DOH] ?: true,
+                ipv4Only = prefs[Keys.IPV4_ONLY] ?: false,
+                blockQuic = prefs[Keys.BLOCK_QUIC] ?: true,
+                bypassDomains = prefs[Keys.BYPASS_DOMAINS]?.sorted() ?: emptyList(),
+                splitTunnelMode = splitMode,
+                splitPackages = prefs[Keys.SPLIT_PACKAGES] ?: emptySet(),
+                theme = theme,
+            )
+        }
 
     suspend fun current(): VdpiSettings = settingsFlow.first()
 
@@ -120,7 +141,7 @@ class SettingsRepository(private val context: Context) {
     }
 
     suspend fun addBypassDomain(domain: String) {
-        val cleaned = domain.trim().lowercase()
+        val cleaned = domain.trim().lowercase(Locale.ROOT)
         if (cleaned.isEmpty()) return
         context.vdpiDataStore.edit { prefs ->
             val current = prefs[Keys.BYPASS_DOMAINS] ?: emptySet()
@@ -136,7 +157,7 @@ class SettingsRepository(private val context: Context) {
     }
 
     suspend fun setSplitTunnelMode(mode: SplitTunnelMode) {
-        context.vdpiDataStore.edit { it[Keys.SPLIT_MODE] = mode.name }
+        context.vdpiDataStore.edit { it[Keys.SPLIT_MODE] = mode.wireName }
     }
 
     suspend fun toggleSplitPackage(packageName: String) {
@@ -150,11 +171,15 @@ class SettingsRepository(private val context: Context) {
         }
     }
 
+    suspend fun setSplitPackages(packages: Set<String>) {
+        context.vdpiDataStore.edit { it[Keys.SPLIT_PACKAGES] = packages }
+    }
+
     suspend fun clearSplitPackages() {
         context.vdpiDataStore.edit { it[Keys.SPLIT_PACKAGES] = emptySet() }
     }
 
     suspend fun setTheme(theme: ThemePreference) {
-        context.vdpiDataStore.edit { it[Keys.THEME] = theme.name }
+        context.vdpiDataStore.edit { it[Keys.THEME] = theme.wireName }
     }
 }

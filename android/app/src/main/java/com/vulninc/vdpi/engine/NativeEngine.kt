@@ -1,5 +1,6 @@
 package com.vulninc.vdpi.engine
 
+import com.vulninc.vdpi.BuildConfig
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -125,6 +126,23 @@ object NativeEngine {
         runCatching { json.decodeFromString(DoctorReport.serializer(), raw) }
             .getOrDefault(DoctorReport())
 
+    fun prepareStart(config: NativeEngineConfig): Result<String> {
+        return runCatching {
+            ensureLoaded()
+            encodeConfig(config)
+        }
+    }
+
+    fun startWithEncoded(tunFd: Int, encodedConfig: String): Result<Unit> {
+        return runCatching {
+            ensureLoaded()
+            val err = nativeStart(tunFd, encodedConfig)
+            if (err.isNotEmpty()) {
+                error(err)
+            }
+        }
+    }
+
     fun start(tunFd: Int, config: NativeEngineConfig): Result<Unit> {
         return runCatching {
             ensureLoaded()
@@ -166,15 +184,18 @@ object NativeEngine {
         }
     }
 
-    fun clearCache() {
-        if (!loaded) return
-        runCatching { nativeClearCache() }
+    fun clearCache(): Boolean {
+        if (!loaded) return true
+        return runCatching {
+            nativeClearCache()
+            true
+        }.getOrDefault(false)
     }
 
     fun version(): String {
         return runCatching {
             ensureLoaded()
             nativeVersion()
-        }.getOrDefault("0.2.5")
+        }.getOrDefault(BuildConfig.VERSION_NAME)
     }
 }

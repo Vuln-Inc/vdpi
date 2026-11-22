@@ -4,10 +4,14 @@ import com.vulninc.vdpi.engine.DesyncMode
 import com.vulninc.vdpi.engine.NativeEngine
 import com.vulninc.vdpi.engine.NativeEngineConfig
 import com.vulninc.vdpi.util.formatBytes
+import com.vulninc.vdpi.util.formatEventTime
 import com.vulninc.vdpi.util.formatStageShort
 import com.vulninc.vdpi.util.formatUptime
+import com.vulninc.vdpi.util.isValidBypassDomain
+import com.vulninc.vdpi.util.isValidDnsInput
 import com.vulninc.vdpi.util.sanitizeDomainInput
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -37,9 +41,35 @@ class FormattersAndConfigTest {
     }
 
     @Test
-    fun sanitizeDomainStripsSchemeAndPath() {
+    fun sanitizeDomainStripsSchemeAndPathCaseInsensitively() {
         assertEquals("example.com", sanitizeDomainInput("  https://Example.COM/foo/bar "))
-        assertEquals("*.mybank.com", sanitizeDomainInput("*.MyBank.com:443"))
+        assertEquals("example.com", sanitizeDomainInput("HTTPS://EXAMPLE.COM/path?q=1"))
+        assertEquals("*.mybank.com", sanitizeDomainInput("*.MyBank.com:443."))
+        assertEquals("instagram.com", sanitizeDomainInput("HTTP://INSTAGRAM.COM"))
+    }
+
+    @Test
+    fun validatesDnsAndBypassDomainInputs() {
+        assertTrue(isValidDnsInput("1.1.1.1"))
+        assertTrue(isValidDnsInput("9.9.9.9"))
+        assertTrue(isValidDnsInput("2606:4700:4700::1111"))
+        assertTrue(isValidDnsInput("https://dns.quad9.net/dns-query"))
+        assertFalse(isValidDnsInput("foo bar"))
+        assertFalse(isValidDnsInput("999.999.999.999"))
+        assertFalse(isValidDnsInput("http://1.1.1.1/dns-query"))
+
+        assertTrue(isValidBypassDomain("example.com"))
+        assertTrue(isValidBypassDomain("*.bank.gov.tr"))
+        assertTrue(isValidBypassDomain("HTTPS://Sub.Domain.Org/page"))
+        assertFalse(isValidBypassDomain("not a domain"))
+        assertFalse(isValidBypassDomain("singlelabel"))
+        assertFalse(isValidBypassDomain(""))
+    }
+
+    @Test
+    fun formatEventTimeHandlesZeroAndValidTimestamps() {
+        assertEquals("--:--:--", formatEventTime(0L))
+        assertTrue(formatEventTime(1700000000000L).matches(Regex("^\\d{2}:\\d{2}:\\d{2}$")))
     }
 
     @Test

@@ -1,16 +1,9 @@
-# Keep JNI entrypoints invoked from libvdpi_android.so
--keep class com.vulninc.vdpi.engine.NativeEngine { *; }
+# Keep JNI entrypoints and serialization models invoked from libvdpi_android.so
 -keep class com.vulninc.vdpi.engine.** { *; }
 
-# Keep kotlinx.serialization generated serializers
+# Keep kotlinx.serialization generated serializers and Companion metadata
 -keepattributes *Annotation*, InnerClasses
 -dontnote kotlinx.serialization.AnnotationsKt
--keepclassmembers class kotlinx.serialization.json.** {
-    *** Companion;
-}
--keepclasseswithmembers class kotlinx.serialization.json.** {
-    kotlinx.serialization.KSerializer serializer(...);
-}
 -keep,includedescriptorclasses class com.vulninc.vdpi.**$$serializer { *; }
 -keepclassmembers class com.vulninc.vdpi.** {
     *** Companion;

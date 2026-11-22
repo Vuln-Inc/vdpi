@@ -8,20 +8,55 @@ import android.service.quicksettings.TileService
 import androidx.core.service.quicksettings.PendingIntentActivityWrapper
 import androidx.core.service.quicksettings.TileServiceCompat
 import com.vulninc.vdpi.MainActivity
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 
 class VdpiTileService : TileService() {
 
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var collectJob: Job? = null
+
     override fun onStartListening() {
         super.onStartListening()
-        syncTile()
+        syncTile(TunnelRuntimeState.state.value)
+        collectJob?.cancel()
+        collectJob = scope.launch {
+            TunnelRuntimeState.state.collect { runtime ->
+                syncTile(runtime)
+            }
+        }
+    }
+
+    override fun onStopListening() {
+        collectJob?.cancel()
+        collectJob = null
+        super.onStopListening()
+    }
+
+    override fun onDestroy() {
+        collectJob?.cancel()
+        scope.cancel()
+        super.onDestroy()
     }
 
     override fun onClick() {
         super.onClick()
+        val action = { handleToggle() }
+        if (isLocked) {
+            unlockAndRun(action)
+        } else {
+            action()
+        }
+    }
+
+    private fun handleToggle() {
         val phase = TunnelRuntimeState.state.value.phase
         if (phase == TunnelPhase.CONNECTED || phase == TunnelPhase.CONNECTING) {
             VdpiVpnService.stop(applicationContext)
-            syncTile()
             return
         }
 
@@ -41,13 +76,11 @@ class VdpiTileService : TileService() {
             TileServiceCompat.startActivityAndCollapse(this, wrapper)
         } else {
             VdpiVpnService.start(applicationContext)
-            syncTile()
         }
     }
 
-    private fun syncTile() {
+    private fun syncTile(runtime: TunnelRuntimeSnapshot) {
         val tile = qsTile ?: return
-        val runtime = TunnelRuntimeState.state.value
         tile.label = "vdpi"
         when (runtime.phase) {
             TunnelPhase.CONNECTED -> {

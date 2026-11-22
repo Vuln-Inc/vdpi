@@ -1,8 +1,19 @@
 package com.vulninc.vdpi.util
 
-import java.text.SimpleDateFormat
-import java.util.Date
+import java.net.URI
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.Locale
+
+private val EVENT_TIME_FORMATTER: DateTimeFormatter =
+    DateTimeFormatter.ofPattern("HH:mm:ss", Locale.US)
+
+private val IPV4_REGEX = Regex(
+    "^((25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)\\.){3}(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)$"
+)
+private val IPV6_CHARS_REGEX = Regex("^[0-9a-fA-F:]+$")
+private val DOMAIN_LABEL_REGEX = Regex("^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
 fun formatBytes(bytes: Long): String {
     if (bytes < 0L) return "0 B"
@@ -39,17 +50,52 @@ fun formatStageShort(stageNumber: Int, stageLabel: String): String {
 
 fun formatEventTime(tsMs: Long): String {
     if (tsMs <= 0L) return "--:--:--"
-    val fmt = SimpleDateFormat("HH:mm:ss", Locale.US)
-    return fmt.format(Date(tsMs))
+    return Instant.ofEpochMilli(tsMs)
+        .atZone(ZoneId.systemDefault())
+        .format(EVENT_TIME_FORMATTER)
 }
 
 fun sanitizeDomainInput(raw: String): String {
     return raw
         .trim()
+        .lowercase(Locale.ROOT)
         .removePrefix("https://")
         .removePrefix("http://")
         .substringBefore('/')
+        .substringBefore('?')
+        .substringBefore('#')
         .substringBefore(':')
         .trim()
-        .lowercase(Locale.US)
+        .trimEnd('.')
+}
+
+fun isValidBypassDomain(raw: String): Boolean {
+    val cleaned = sanitizeDomainInput(raw)
+    if (cleaned.isEmpty() || cleaned.length > 253 || cleaned.any { it.isWhitespace() }) {
+        return false
+    }
+    val host = cleaned.removePrefix("*.")
+    val labels = host.split('.')
+    if (labels.size < 2) return false
+    return labels.all { DOMAIN_LABEL_REGEX.matches(it) }
+}
+
+fun isValidDnsInput(raw: String): Boolean {
+    val trimmed = raw.trim()
+    if (trimmed.isEmpty() || trimmed.any { it.isWhitespace() }) return false
+    val lower = trimmed.lowercase(Locale.ROOT)
+    if (lower.startsWith("https://")) {
+        return runCatching {
+            val uri = URI(trimmed)
+            uri.scheme.equals("https", ignoreCase = true) && !uri.host.isNullOrBlank()
+        }.getOrDefault(false)
+    }
+    if (IPV4_REGEX.matches(trimmed)) return true
+    val unbracketed = trimmed.removePrefix("[").removeSuffix("]")
+    if (unbracketed.contains(':') && IPV6_CHARS_REGEX.matches(unbracketed)) {
+        val doubleColons = unbracketed.windowed(2).count { it == "::" }
+        val groups = unbracketed.split(':').filter { it.isNotEmpty() }
+        return doubleColons <= 1 && groups.size in 1..8 && groups.all { it.length <= 4 }
+    }
+    return false
 }
