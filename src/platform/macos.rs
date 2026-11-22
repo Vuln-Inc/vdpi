@@ -179,9 +179,16 @@ impl MacosProxySession {
         }
     }
 
-    /// Cleanly disables proxy states on managed services and removes `launchd` proxy env vars.
+    /// Cleanly disables proxy states on all active managed services (including adapters
+    /// plugged in after startup) and removes `launchd` proxy env vars.
     pub fn deactivate(&self) {
+        let mut services = list_configurable_network_services().unwrap_or_default();
         for svc in &self.services {
+            if !services.iter().any(|s| s == svc) {
+                services.push(svc.clone());
+            }
+        }
+        for svc in &services {
             let _ = run_networksetup(&["-setwebproxystate", svc, "off"]);
             let _ = run_networksetup(&["-setsecurewebproxystate", svc, "off"]);
             if self.socks_configured {
