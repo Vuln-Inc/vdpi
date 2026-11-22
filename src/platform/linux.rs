@@ -97,24 +97,48 @@ impl LinuxProxySession {
 
     pub fn reconcile(&self) {
         if self.gnome_configured {
-            if let Ok(out) = Command::new("gsettings")
+            let mode_ok = Command::new("gsettings")
                 .args(["get", "org.gnome.system.proxy", "mode"])
                 .output()
-            {
-                let mode = String::from_utf8_lossy(&out.stdout);
-                if !mode.contains("manual") {
-                    let _ = configure_gnome_proxy(
-                        &self.addr.to_string(),
-                        &self.http_port.to_string(),
-                        if self.socks_configured {
-                            self.socks_port
-                        } else {
-                            None
-                        },
-                        &self.gsettings_ignore,
-                    );
-                }
+                .map(|o| String::from_utf8_lossy(&o.stdout).contains("manual"))
+                .unwrap_or(false);
+            let port_ok = Command::new("gsettings")
+                .args(["get", "org.gnome.system.proxy.http", "port"])
+                .output()
+                .map(|o| {
+                    String::from_utf8_lossy(&o.stdout)
+                        .trim()
+                        .parse::<u16>()
+                        .ok()
+                        == Some(self.http_port)
+                })
+                .unwrap_or(false);
+
+            if !mode_ok || !port_ok {
+                let _ = configure_gnome_proxy(
+                    &self.addr.to_string(),
+                    &self.http_port.to_string(),
+                    if self.socks_configured {
+                        self.socks_port
+                    } else {
+                        None
+                    },
+                    &self.gsettings_ignore,
+                );
             }
+        }
+        if let Some(ref kbin) = self.kde_bin {
+            configure_kde_proxy(
+                kbin,
+                &self.addr.to_string(),
+                self.http_port,
+                if self.socks_configured {
+                    self.socks_port
+                } else {
+                    None
+                },
+                &self.no_proxy_csv,
+            );
         }
         if self.systemd_env_configured {
             let proxy_url = format!("http://{}:{}", self.addr, self.http_port);
