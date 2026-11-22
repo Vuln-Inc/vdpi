@@ -136,13 +136,13 @@ fn print_startup_banner(
         println!("  SOCKS5 (TCP + UDP)  : {sa}");
     }
     println!(
-        "  Desync Engine       : {:?} ({}-byte SNI segments + 3-stage auto-heal)",
+        "  Desync Engine       : {:?} ({}-byte SNI segments + 5-stage auto-heal)",
         cfg.mode, cfg.chunk_size
     );
     println!(
         "  DNS Resolution      : {}",
         if cfg.enable_doh {
-            format!("RFC 8484 DoH ({}) + port-1253 fallback", cfg.dns_addr)
+            format!("RFC 8484 DoH ({}) + non-53 UDP fallback", cfg.dns_addr)
         } else {
             format!("UDP ({}:{})", cfg.dns_addr, cfg.dns_port)
         }
