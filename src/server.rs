@@ -3,11 +3,15 @@ use crate::proxy::http::handle_http_client;
 use crate::proxy::socks::{handle_socks4_client, handle_socks5_client};
 use anyhow::{Context, Result};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::net::SocketAddr;
+use std::io::ErrorKind;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tracing::{debug, warn};
+
+const PRIMARY_FALLBACK_PORTS: &[u16] = &[18080, 18081, 18082, 28080, 38080, 48080];
+const SOCKS_FALLBACK_PORTS: &[u16] = &[11080, 11081, 11082, 21080, 31080, 41080];
 
 pub struct BoundListeners {
     pub primary_listener: TcpListener,
@@ -17,26 +21,52 @@ pub struct BoundListeners {
 }
 
 /// Binds the primary protocol-autodetecting listener (HTTP + HTTPS CONNECT + SOCKS5 + SOCKS4a)
-/// and optional dedicated SOCKS5 listener with `SO_REUSEADDR`.
+/// and optional dedicated SOCKS5 listener, automatically rotating to a free port if the
+/// requested port is already in use or reserved (e.g. Windows Hyper-V/WSL2 excluded ranges).
 pub fn bind_listeners(ctx: &EngineContext) -> Result<BoundListeners> {
-    let primary_target = SocketAddr::new(ctx.config.addr, ctx.config.port);
-    let primary_listener = bind_reuse_tcp(primary_target)
-        .with_context(|| format!("failed to bind primary listener on {primary_target}"))?;
-    let primary_addr = primary_listener.local_addr()?;
+    let (primary_listener, primary_addr) =
+        bind_with_port_rotation(ctx.config.addr, ctx.config.port, PRIMARY_FALLBACK_PORTS, None)
+            .with_context(|| {
+                format!(
+                    "failed to bind primary listener on {}:{}",
+                    ctx.config.addr, ctx.config.port
+                )
+            })?;
+
+    if ctx.config.port != 0 && primary_addr.port() != ctx.config.port {
+        warn!(
+            requested = ctx.config.port,
+            actual = primary_addr.port(),
+            "primary port unavailable; automatically rotated to {}",
+            primary_addr
+        );
+    }
 
     let mut socks_listener = None;
     let mut socks_addr = None;
 
     if let Some(sp) = ctx.config.socks_port {
-        let socks_target = SocketAddr::new(ctx.config.addr, sp);
-        match bind_reuse_tcp(socks_target) {
-            Ok(listener) => {
-                socks_addr = Some(listener.local_addr()?);
+        match bind_with_port_rotation(
+            ctx.config.addr,
+            sp,
+            SOCKS_FALLBACK_PORTS,
+            Some(primary_addr.port()),
+        ) {
+            Ok((listener, addr)) => {
+                if sp != 0 && addr.port() != sp {
+                    warn!(
+                        requested = sp,
+                        actual = addr.port(),
+                        "SOCKS5 port unavailable; automatically rotated to {}",
+                        addr
+                    );
+                }
+                socks_addr = Some(addr);
                 socks_listener = Some(listener);
             }
             Err(e) => {
                 warn!(
-                    addr = %socks_target,
+                    addr = %SocketAddr::new(ctx.config.addr, sp),
                     error = %e,
                     "could not bind dedicated SOCKS5 port; SOCKS5 remains available via protocol auto-detection on primary port"
                 );
@@ -52,7 +82,64 @@ pub fn bind_listeners(ctx: &EngineContext) -> Result<BoundListeners> {
     })
 }
 
-fn bind_reuse_tcp(addr: SocketAddr) -> Result<TcpListener> {
+fn bind_with_port_rotation(
+    ip: IpAddr,
+    requested_port: u16,
+    extra_fallbacks: &[u16],
+    exclude_port: Option<u16>,
+) -> std::io::Result<(TcpListener, SocketAddr)> {
+    if requested_port == 0 {
+        let listener = bind_reuse_tcp(SocketAddr::new(ip, 0))?;
+        let addr = listener.local_addr()?;
+        return Ok((listener, addr));
+    }
+
+    let mut candidates = Vec::with_capacity(28);
+    candidates.push(requested_port);
+    for delta in 1u16..=20 {
+        if let Some(p) = requested_port.checked_add(delta) {
+            if p != 0 && !candidates.contains(&p) {
+                candidates.push(p);
+            }
+        }
+    }
+    for &p in extra_fallbacks {
+        if p != 0 && !candidates.contains(&p) {
+            candidates.push(p);
+        }
+    }
+    // Ultimate OS-assigned free port fallback so vdpi never crashes on port exhaustion.
+    candidates.push(0);
+
+    let mut last_err = None;
+    for port in candidates {
+        if port != 0 && exclude_port == Some(port) {
+            continue;
+        }
+        match bind_reuse_tcp(SocketAddr::new(ip, port)) {
+            Ok(listener) => {
+                let bound_addr = listener.local_addr()?;
+                return Ok((listener, bound_addr));
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::AddrInUse | ErrorKind::PermissionDenied
+                ) =>
+            {
+                debug!(%ip, port, error = %e, "port busy or reserved; trying next port");
+                last_err = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(ErrorKind::AddrInUse, "all candidate ports unavailable")
+    }))
+}
+
+fn bind_reuse_tcp(addr: SocketAddr) -> std::io::Result<TcpListener> {
     let domain = if addr.is_ipv4() {
         Domain::IPV4
     } else {
@@ -65,7 +152,7 @@ fn bind_reuse_tcp(addr: SocketAddr) -> Result<TcpListener> {
     sock.bind(&addr.into())?;
     sock.listen(1024)?;
     let std_listener: std::net::TcpListener = sock.into();
-    Ok(TcpListener::from_std(std_listener)?)
+    TcpListener::from_std(std_listener)
 }
 
 /// Runs the bound proxy listeners until `shutdown_rx` signals `true`.
@@ -154,5 +241,39 @@ pub async fn dispatch_autodetect(stream: TcpStream, ctx: EngineContext) -> Resul
         0x05 => handle_socks5_client(stream, ctx).await,
         0x04 => handle_socks4_client(stream, ctx).await,
         _ => handle_http_client(stream, ctx).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::CliArgs;
+
+    #[tokio::test]
+    async fn automatically_rotates_primary_and_socks_ports_when_busy() {
+        let occupied_primary = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p0 = occupied_primary.local_addr().unwrap().port();
+        let occupied_socks = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let s0 = occupied_socks.local_addr().unwrap().port();
+
+        let cli = CliArgs::parse_from_iter([
+            "vdpi",
+            "--no-system-proxy",
+            "--port",
+            &p0.to_string(),
+            "--socks-port",
+            &s0.to_string(),
+        ])
+        .unwrap();
+        let ctx = EngineContext::new(cli.into_runtime_config()).unwrap();
+
+        let bound = bind_listeners(&ctx).expect("should rotate past occupied ports");
+        assert_ne!(bound.primary_addr.port(), p0);
+        let socks_port = bound
+            .socks_addr
+            .expect("should also rotate dedicated SOCKS5 port")
+            .port();
+        assert_ne!(socks_port, s0);
+        assert_ne!(socks_port, bound.primary_addr.port());
     }
 }
