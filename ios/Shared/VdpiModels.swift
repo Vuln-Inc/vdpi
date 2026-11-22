@@ -138,6 +138,40 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
         toNativeConfig() != other.toNativeConfig()
     }
 
+    public func changedFieldLabels(comparedTo other: VdpiSettings) -> [String] {
+        changedFieldLabels(comparedToApplied: other.toNativeConfig())
+    }
+
+    public func changedFieldLabels(comparedToApplied config: NativeEngineConfig) -> [String] {
+        let current = toNativeConfig()
+        var labels: [String] = []
+        if current.mode != config.mode {
+            labels.append("Mode")
+        }
+        if current.chunkSize != config.chunkSize {
+            labels.append("Chunk")
+        }
+        if current.dnsAddr != config.dnsAddr {
+            labels.append("DNS")
+        }
+        if current.enableDoh != config.enableDoh {
+            labels.append("DoH")
+        }
+        if current.ipv4Only != config.ipv4Only {
+            labels.append("IPv4")
+        }
+        if current.blockQuic != config.blockQuic {
+            labels.append("QUIC")
+        }
+        if current.mtu != config.mtu {
+            labels.append("MTU")
+        }
+        if current.bypassDomains != config.bypassDomains.sorted() {
+            labels.append("Bypass")
+        }
+        return labels
+    }
+
     public func toNativeConfig() -> NativeEngineConfig {
         NativeEngineConfig(
             mode: desyncMode,
@@ -148,7 +182,7 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
             blockQuic: blockQuic,
             timeoutMs: 8000,
             mtu: clampedMtu,
-            bypassDomains: bypassDomains
+            bypassDomains: bypassDomains.sorted()
         )
     }
 

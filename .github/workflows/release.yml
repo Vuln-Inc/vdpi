@@ -155,13 +155,18 @@ jobs:
           # Ad-hoc sign with entitlements preserved (required for TrollStore; re-signers replace this cleanly)
           codesign --force --sign - --entitlements PacketTunnel/PacketTunnel.entitlements "$APPEX_PATH"
           codesign --force --sign - --entitlements VdpiApp/VdpiApp.entitlements "$APP_PATH"
-          codesign -d --entitlements - --xml "$APPEX_PATH" 2>/dev/null | grep -q "packet-tunnel-provider"
-          codesign -d --entitlements - --xml "$APP_PATH" 2>/dev/null | grep -q "group.com.vulninc.vdpi"
+          codesign -d --xml --entitlements /tmp/vdpi-appex-ent.plist "$APPEX_PATH"
+          codesign -d --xml --entitlements /tmp/vdpi-app-ent.plist "$APP_PATH"
+          plutil -lint /tmp/vdpi-appex-ent.plist
+          plutil -lint /tmp/vdpi-app-ent.plist
+          grep -q "packet-tunnel-provider" /tmp/vdpi-appex-ent.plist
+          grep -q "group.com.vulninc.vdpi" /tmp/vdpi-app-ent.plist
+          rm -f /tmp/vdpi-appex-ent.plist /tmp/vdpi-app-ent.plist
 
           mkdir -p ../dist/ios/ipa-stage/Payload
           cp -R "$APP_PATH" ../dist/ios/ipa-stage/Payload/VdpiApp.app
           (cd ../dist/ios/ipa-stage && zip -qry ../vdpi-ios-unsigned.ipa Payload)
-          rm -rf ../dist/ios/ipa-stage
+          rm -rf ../dist/ios/ipa-stage build
 
           # Verify IPA layout contains both main app and embedded NetworkExtension
           unzip -l ../dist/ios/vdpi-ios-unsigned.ipa | grep -q "Payload/VdpiApp.app/Info.plist"

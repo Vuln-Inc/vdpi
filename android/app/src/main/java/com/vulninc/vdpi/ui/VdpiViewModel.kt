@@ -23,12 +23,17 @@ import com.vulninc.vdpi.vpn.TunnelPhase
 import com.vulninc.vdpi.vpn.TunnelRuntimeSnapshot
 import com.vulninc.vdpi.vpn.TunnelRuntimeState
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.util.Locale
 import kotlin.math.roundToInt
@@ -45,9 +50,26 @@ data class DoctorUiState(
     val report: DoctorReport? = null,
 )
 
+fun computeSettingsChangeSummary(current: VdpiSettings, baseline: VdpiSettings): List<String> = buildList {
+    if (current.desyncMode != baseline.desyncMode) add("Mode")
+    if (current.chunkSize != baseline.chunkSize) add("Chunk")
+    val currentDns = current.dnsAddr.trim().ifBlank { "1.1.1.1" }
+    val baselineDns = baseline.dnsAddr.trim().ifBlank { "1.1.1.1" }
+    if (currentDns != baselineDns) add("DNS")
+    if (current.enableDoh != baseline.enableDoh) add("DoH")
+    if (current.ipv4Only != baseline.ipv4Only) add("IPv4")
+    if (current.blockQuic != baseline.blockQuic) add("QUIC")
+    if (current.bypassDomains.sorted() != baseline.bypassDomains.sorted()) add("Bypass")
+    if (current.splitTunnelMode != baseline.splitTunnelMode || current.splitPackages != baseline.splitPackages) {
+        add("Apps")
+    }
+}
+
 class VdpiViewModel(application: Application) : AndroidViewModel(application) {
 
     private val repo = SettingsRepository(application.applicationContext)
+    private val mutationMutex = Mutex()
+    private var appliedSettings: VdpiSettings? = null
 
     val settings: StateFlow<VdpiSettings> = repo.settingsFlow.stateIn(
         scope = viewModelScope,
@@ -56,6 +78,11 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
     )
 
     val tunnelState: StateFlow<TunnelRuntimeSnapshot> = TunnelRuntimeState.state
+
+    val tunnelPhase: StateFlow<TunnelPhase> = tunnelState
+        .map { it.phase }
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, tunnelState.value.phase)
 
     private val _installedApps = MutableStateFlow<List<InstalledAppItem>>(emptyList())
     val installedApps: StateFlow<List<InstalledAppItem>> = _installedApps.asStateFlow()
@@ -69,32 +96,79 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
     private val _pendingReconnect = MutableStateFlow(false)
     val pendingReconnect: StateFlow<Boolean> = _pendingReconnect.asStateFlow()
 
+    private val _reconnectPopupVisible = MutableStateFlow(false)
+    val reconnectPopupVisible: StateFlow<Boolean> = _reconnectPopupVisible.asStateFlow()
+
+    private val _pendingChangeSummary = MutableStateFlow("")
+    val pendingChangeSummary: StateFlow<String> = _pendingChangeSummary.asStateFlow()
+
     // Never load JNI synchronously on the main thread during ViewModel creation.
     val engineVersion: String = BuildConfig.VERSION_NAME
 
     init {
         loadInstalledApps()
         viewModelScope.launch {
-            var prevPhase = TunnelRuntimeState.state.value.phase
-            TunnelRuntimeState.state.collect { snap ->
-                val curr = snap.phase
-                if (curr != prevPhase && (curr == TunnelPhase.DISCONNECTED || curr == TunnelPhase.CONNECTED)) {
-                    _pendingReconnect.value = false
+            var prevPhase = tunnelPhase.value
+            if (prevPhase == TunnelPhase.CONNECTED && appliedSettings == null) {
+                val loaded = repo.current()
+                if (tunnelPhase.value == TunnelPhase.CONNECTED && appliedSettings == null) {
+                    appliedSettings = loaded
                 }
-                prevPhase = curr
+            }
+            tunnelPhase.collect { curr ->
+                if (curr != prevPhase) {
+                    when (curr) {
+                        TunnelPhase.CONNECTED -> {
+                            val loaded = repo.current()
+                            if (tunnelPhase.value == TunnelPhase.CONNECTED) {
+                                appliedSettings = loaded
+                                clearPendingReconnect()
+                            }
+                        }
+                        TunnelPhase.DISCONNECTED, TunnelPhase.ERROR -> {
+                            appliedSettings = null
+                            clearPendingReconnect()
+                        }
+                        TunnelPhase.CONNECTING -> Unit
+                    }
+                    prevPhase = curr
+                }
             }
         }
     }
 
-    private fun markDirtyIfConnected() {
-        val phase = tunnelState.value.phase
-        if (phase == TunnelPhase.CONNECTED || phase == TunnelPhase.CONNECTING) {
-            _pendingReconnect.value = true
+    private fun mutateRuntimeSetting(
+        isNoOp: (VdpiSettings) -> Boolean,
+        mutate: suspend () -> Unit,
+    ): Job = viewModelScope.launch {
+        mutationMutex.withLock {
+            val previous = repo.current()
+            if (isNoOp(previous)) return@withLock
+            mutate()
+            val updated = repo.current()
+            val phase = tunnelPhase.value
+            if (phase == TunnelPhase.CONNECTED || phase == TunnelPhase.CONNECTING) {
+                val baseline = appliedSettings ?: previous.also { appliedSettings = it }
+                val labels = computeSettingsChangeSummary(updated, baseline)
+                if (labels.isNotEmpty()) {
+                    _pendingReconnect.value = true
+                    _reconnectPopupVisible.value = true
+                    _pendingChangeSummary.value = labels.joinToString(", ")
+                } else {
+                    clearPendingReconnect()
+                }
+            }
         }
+    }
+
+    fun dismissReconnectPopup() {
+        _reconnectPopupVisible.value = false
     }
 
     fun clearPendingReconnect() {
         _pendingReconnect.value = false
+        _reconnectPopupVisible.value = false
+        _pendingChangeSummary.value = ""
     }
 
     fun loadInstalledApps() {
@@ -130,70 +204,84 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun setDesyncMode(mode: DesyncMode) = viewModelScope.launch {
+    fun setDesyncMode(mode: DesyncMode) = mutateRuntimeSetting(
+        isNoOp = { it.desyncMode == mode },
+    ) {
         repo.setDesyncMode(mode)
-        markDirtyIfConnected()
     }
 
-    fun setChunkSize(size: Int) = viewModelScope.launch {
-        repo.setChunkSize(size)
-        markDirtyIfConnected()
-    }
-
-    fun setDnsAddr(addr: String) = viewModelScope.launch {
-        repo.setDnsAddr(addr)
-        markDirtyIfConnected()
-    }
-
-    fun setEnableDoh(enabled: Boolean) = viewModelScope.launch {
-        repo.setEnableDoh(enabled)
-        markDirtyIfConnected()
-    }
-
-    fun setIpv4Only(enabled: Boolean) = viewModelScope.launch {
-        repo.setIpv4Only(enabled)
-        markDirtyIfConnected()
-    }
-
-    fun setBlockQuic(enabled: Boolean) = viewModelScope.launch {
-        repo.setBlockQuic(enabled)
-        markDirtyIfConnected()
-    }
-
-    fun addBypassDomain(raw: String) = viewModelScope.launch {
-        val cleaned = sanitizeDomainInput(raw)
-        if (cleaned.isNotEmpty()) {
-            repo.addBypassDomain(cleaned)
-            markDirtyIfConnected()
+    fun setChunkSize(size: Int) {
+        val clamped = size.coerceIn(1, 64)
+        mutateRuntimeSetting(isNoOp = { it.chunkSize == clamped }) {
+            repo.setChunkSize(clamped)
         }
     }
 
-    fun removeBypassDomain(domain: String) = viewModelScope.launch {
+    fun setDnsAddr(addr: String) {
+        val normalized = addr.trim().ifBlank { "1.1.1.1" }
+        mutateRuntimeSetting(isNoOp = { it.dnsAddr.trim().ifBlank { "1.1.1.1" } == normalized }) {
+            repo.setDnsAddr(normalized)
+        }
+    }
+
+    fun setEnableDoh(enabled: Boolean) = mutateRuntimeSetting(
+        isNoOp = { it.enableDoh == enabled },
+    ) {
+        repo.setEnableDoh(enabled)
+    }
+
+    fun setIpv4Only(enabled: Boolean) = mutateRuntimeSetting(
+        isNoOp = { it.ipv4Only == enabled },
+    ) {
+        repo.setIpv4Only(enabled)
+    }
+
+    fun setBlockQuic(enabled: Boolean) = mutateRuntimeSetting(
+        isNoOp = { it.blockQuic == enabled },
+    ) {
+        repo.setBlockQuic(enabled)
+    }
+
+    fun addBypassDomain(raw: String) {
+        val cleaned = sanitizeDomainInput(raw)
+        if (cleaned.isEmpty()) return
+        mutateRuntimeSetting(isNoOp = { cleaned in it.bypassDomains }) {
+            repo.addBypassDomain(cleaned)
+        }
+    }
+
+    fun removeBypassDomain(domain: String) = mutateRuntimeSetting(
+        isNoOp = { domain !in it.bypassDomains },
+    ) {
         repo.removeBypassDomain(domain)
-        markDirtyIfConnected()
     }
 
-    fun setSplitTunnelMode(mode: SplitTunnelMode) = viewModelScope.launch {
+    fun setSplitTunnelMode(mode: SplitTunnelMode) = mutateRuntimeSetting(
+        isNoOp = { it.splitTunnelMode == mode },
+    ) {
         repo.setSplitTunnelMode(mode)
-        markDirtyIfConnected()
     }
 
-    fun toggleSplitPackage(pkg: String) = viewModelScope.launch {
+    fun toggleSplitPackage(pkg: String) = mutateRuntimeSetting(
+        isNoOp = { false },
+    ) {
         repo.toggleSplitPackage(pkg)
-        markDirtyIfConnected()
     }
 
-    fun restoreSplitPackages(packages: Set<String>) = viewModelScope.launch {
+    fun restoreSplitPackages(packages: Set<String>) = mutateRuntimeSetting(
+        isNoOp = { it.splitPackages == packages },
+    ) {
         repo.setSplitPackages(packages)
-        markDirtyIfConnected()
     }
 
-    fun clearSplitPackages() = viewModelScope.launch {
+    fun clearSplitPackages() = mutateRuntimeSetting(
+        isNoOp = { it.splitPackages.isEmpty() },
+    ) {
         repo.clearSplitPackages()
-        markDirtyIfConnected()
     }
 
     fun setTheme(theme: ThemePreference) = viewModelScope.launch {
+        if (repo.current().theme == theme) return@launch
         repo.setTheme(theme)
     }
 

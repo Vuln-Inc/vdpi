@@ -1,6 +1,9 @@
 import SwiftUI
 
 struct SettingsView: View {
+    var topInset: CGFloat = 0
+    var bottomInset: CGFloat = 104
+
     @EnvironmentObject private var manager: TunnelManager
     @Environment(\.vdpiPalette) private var palette
 
@@ -15,6 +18,7 @@ struct SettingsView: View {
     @State private var bypassError: String? = nil
     @State private var showResetConfirm = false
     @FocusState private var focusedField: Field?
+    @Namespace private var themeNamespace
 
     private let dnsPresets: [(label: String, value: String)] = [
         ("Cloudflare", "1.1.1.1"),
@@ -26,45 +30,31 @@ struct SettingsView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                HStack {
-                    Text("Settings")
-                        .font(.system(size: 22, weight: .semibold))
-                        .tracking(-0.5)
-                        .foregroundStyle(palette.inkPrimary)
-                    Spacer()
-                }
+                headerBar
 
                 desyncSection
                 dnsSection
                 tunnelBehaviorSection
                 bypassDomainsSection
                 appearanceSection
-
-                Button {
-                    showResetConfirm = true
-                } label: {
-                    Text("Reset to Defaults")
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundStyle(palette.danger)
-                        .frame(maxWidth: .infinity)
-                        .frame(minHeight: 46)
-                        .background(palette.surface)
-                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                .strokeBorder(palette.danger.opacity(0.35), lineWidth: 1)
-                        )
-                }
-                .buttonStyle(.plain)
+                resetButton
             }
+            .animation(VdpiMotion.floatingHud, value: topInset)
+            .animation(VdpiMotion.floatingHud, value: focusedField != nil)
             .padding(.horizontal, 16)
-            .padding(.top, 16)
-            .padding(.bottom, 28)
+            .padding(.top, 12 + topInset)
+            .padding(.bottom, bottomInset)
         }
         .scrollIndicators(.hidden)
         .scrollDismissesKeyboard(.interactively)
         .onAppear {
             dnsDraft = manager.settings.dnsAddr
+        }
+        .vdpiOnChange(of: manager.settings.dnsAddr) { newDns in
+            if focusedField != .dns && dnsDraft != newDns {
+                dnsDraft = newDns
+                dnsError = nil
+            }
         }
         .confirmationDialog(
             "Reset all tunnel settings to defaults?",
@@ -72,45 +62,99 @@ struct SettingsView: View {
             titleVisibility: .visible
         ) {
             Button("Reset Defaults", role: .destructive) {
+                VdpiHaptics.trigger(.warning)
                 manager.resetSettings()
                 dnsDraft = manager.settings.dnsAddr
+                dnsError = nil
+                bypassError = nil
             }
             Button("Cancel", role: .cancel) {}
         }
     }
 
+    // MARK: - Header
+
+    private var headerBar: some View {
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Settings")
+                    .font(.system(size: 28, weight: .bold))
+                    .tracking(-0.7)
+                    .foregroundStyle(palette.inkPrimary)
+
+                Text("Desync engine, DNS ring & routing")
+                    .font(.system(size: 13))
+                    .foregroundStyle(palette.inkSecondary)
+            }
+
+            Spacer()
+
+            if focusedField != nil {
+                GlassCircleButton(
+                    systemImage: "keyboard.chevron.compact.down",
+                    accessibilityLabel: "Dismiss keyboard"
+                ) {
+                    focusedField = nil
+                }
+                .transition(.scale(scale: 0.85).combined(with: .opacity))
+            }
+        }
+    }
+
+    // MARK: - TLS Desynchronization
+
     private var desyncSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             SectionOverline(title: "TLS Desynchronization")
 
-            HairlinePanel {
+            GlassPanel(cornerRadius: 22) {
                 VStack(spacing: 0) {
                     ForEach(Array(DesyncMode.allCases.enumerated()), id: \.element.id) { idx, mode in
                         if idx > 0 { HairlineRule() }
                         let selected = manager.settings.desyncMode == mode
                         Button {
-                            manager.updateSettings { $0.desyncMode = mode }
+                            guard !selected else { return }
+                            VdpiHaptics.trigger(.selection)
+                            withAnimation(VdpiMotion.cardShift) {
+                                manager.updateSettings { $0.desyncMode = mode }
+                            }
                         } label: {
                             HStack(spacing: 12) {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(mode.label)
-                                        .font(.system(size: 14, weight: .medium))
+                                        .font(.system(size: 14, weight: .semibold))
                                         .foregroundStyle(palette.inkPrimary)
                                     Text(mode.subtitle)
                                         .font(.system(size: 12))
                                         .foregroundStyle(palette.inkSecondary)
                                 }
+
                                 Spacer()
-                                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
-                                    .font(.system(size: 18))
-                                    .foregroundStyle(selected ? palette.inkPrimary : palette.inkMuted)
+
+                                ZStack {
+                                    Circle()
+                                        .strokeBorder(
+                                            selected ? palette.signal : palette.borderStrong,
+                                            lineWidth: 1.5
+                                        )
+                                        .frame(width: 22, height: 22)
+
+                                    if selected {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .font(.system(size: 22))
+                                            .foregroundStyle(palette.signal)
+                                            .transition(.scale(scale: 0.5).combined(with: .opacity))
+                                    }
+                                }
+                                .animation(VdpiMotion.tabLens, value: selected)
                             }
-                            .frame(minHeight: 48)
-                            .padding(.horizontal, 14)
+                            .frame(minHeight: 50)
+                            .padding(.horizontal, 16)
                             .padding(.vertical, 8)
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        .accessibilityAddTraits(selected ? .isSelected : [])
                     }
 
                     HairlineRule()
@@ -118,29 +162,31 @@ struct SettingsView: View {
                     HStack(spacing: 12) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Chunk Size")
-                                .font(.system(size: 14, weight: .medium))
+                                .font(.system(size: 14, weight: .semibold))
                                 .foregroundStyle(palette.inkPrimary)
                             Text("TLS ClientHello split size in bytes (1–64)")
                                 .font(.system(size: 12))
                                 .foregroundStyle(palette.inkSecondary)
                         }
+
                         Spacer()
-                        HStack(spacing: 6) {
+
+                        HStack(spacing: 2) {
                             Button {
-                                manager.updateSettings { $0.chunkSize = max(1, $0.chunkSize - 1) }
+                                VdpiHaptics.trigger(.light)
+                                withAnimation(VdpiMotion.cardShift) {
+                                    manager.updateSettings { $0.chunkSize = max(1, $0.chunkSize - 1) }
+                                }
                             } label: {
                                 Image(systemName: "minus")
                                     .font(.system(size: 13, weight: .semibold))
-                                    .frame(width: 44, height: 44)
-                                    .foregroundStyle(palette.inkPrimary)
-                                    .background(palette.surfaceRaised)
-                                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                            .strokeBorder(palette.border, lineWidth: 1)
+                                    .frame(width: 38, height: 38)
+                                    .foregroundStyle(
+                                        manager.settings.chunkSize <= 1 ? palette.inkMuted : palette.inkPrimary
                                     )
+                                    .contentShape(Circle())
                             }
-                            .buttonStyle(VdpiPressButtonStyle())
+                            .buttonStyle(VdpiPressButtonStyle(haptic: nil))
                             .disabled(manager.settings.chunkSize <= 1)
                             .accessibilityLabel("Decrease chunk size")
 
@@ -148,66 +194,69 @@ struct SettingsView: View {
                                 .font(.system(size: 13, weight: .semibold, design: .monospaced))
                                 .monospacedDigit()
                                 .foregroundStyle(palette.inkPrimary)
+                                .contentTransition(.numericText())
                                 .frame(minWidth: 44)
+                                .multilineTextAlignment(.center)
 
                             Button {
-                                manager.updateSettings { $0.chunkSize = min(64, $0.chunkSize + 1) }
+                                VdpiHaptics.trigger(.light)
+                                withAnimation(VdpiMotion.cardShift) {
+                                    manager.updateSettings { $0.chunkSize = min(64, $0.chunkSize + 1) }
+                                }
                             } label: {
                                 Image(systemName: "plus")
                                     .font(.system(size: 13, weight: .semibold))
-                                    .frame(width: 44, height: 44)
-                                    .foregroundStyle(palette.inkPrimary)
-                                    .background(palette.surfaceRaised)
-                                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                            .strokeBorder(palette.border, lineWidth: 1)
+                                    .frame(width: 38, height: 38)
+                                    .foregroundStyle(
+                                        manager.settings.chunkSize >= 64 ? palette.inkMuted : palette.inkPrimary
                                     )
+                                    .contentShape(Circle())
                             }
-                            .buttonStyle(VdpiPressButtonStyle())
+                            .buttonStyle(VdpiPressButtonStyle(haptic: nil))
                             .disabled(manager.settings.chunkSize >= 64)
                             .accessibilityLabel("Increase chunk size")
                         }
+                        .padding(3)
+                        .vdpiGlass(in: Capsule(), tier: .subtle)
                     }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
                 }
             }
         }
     }
 
+    // MARK: - DNS & Privacy
+
     private var dnsSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             SectionOverline(title: "DNS & Privacy")
 
-            HairlinePanel {
+            GlassPanel(cornerRadius: 22) {
                 VStack(alignment: .leading, spacing: 0) {
                     VStack(alignment: .leading, spacing: 10) {
                         Text("Upstream Resolver")
-                            .font(.system(size: 14, weight: .medium))
+                            .font(.system(size: 14, weight: .semibold))
                             .foregroundStyle(palette.inkPrimary)
 
                         HStack(spacing: 8) {
                             TextField("1.1.1.1 or https://dns.google/dns-query", text: $dnsDraft)
-                                .font(.system(size: 14, design: .monospaced))
+                                .font(.system(size: 13.5, design: .monospaced))
                                 .foregroundStyle(palette.inkPrimary)
                                 .textInputAutocapitalization(.never)
                                 .autocorrectionDisabled(true)
                                 .keyboardType(.URL)
                                 .submitLabel(.done)
                                 .focused($focusedField, equals: .dns)
-                                .padding(.horizontal, 12)
+                                .padding(.horizontal, 14)
                                 .frame(minHeight: 44)
-                                .background(palette.surfaceRaised)
-                                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                        .strokeBorder(
-                                            dnsError != nil
-                                                ? palette.danger
-                                                : (focusedField == .dns ? palette.borderStrong : palette.border),
-                                            lineWidth: 1
-                                        )
+                                .vdpiGlass(
+                                    in: RoundedRectangle(cornerRadius: 14, style: .continuous),
+                                    tier: .subtle,
+                                    tint: dnsError != nil ? palette.dangerTint : nil,
+                                    borderAccent: dnsError != nil
+                                        ? palette.danger
+                                        : (focusedField == .dns ? palette.borderStrong : nil)
                                 )
                                 .onSubmit { commitDns() }
 
@@ -216,11 +265,11 @@ struct SettingsView: View {
                             }
                             .font(.system(size: 13, weight: .semibold))
                             .foregroundStyle(palette.primaryButtonInk)
-                            .padding(.horizontal, 14)
+                            .padding(.horizontal, 16)
                             .frame(minHeight: 44)
                             .background(palette.primaryButtonBg)
-                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                            .buttonStyle(VdpiPressButtonStyle())
+                            .clipShape(Capsule())
+                            .buttonStyle(VdpiPressButtonStyle(haptic: nil))
                         }
 
                         if let dnsError {
@@ -234,32 +283,42 @@ struct SettingsView: View {
                                 ForEach(dnsPresets, id: \.value) { preset in
                                     let active = manager.settings.dnsAddr == preset.value
                                     Button {
+                                        VdpiHaptics.trigger(.selection)
                                         focusedField = nil
                                         dnsError = nil
                                         dnsDraft = preset.value
-                                        manager.updateSettings { $0.dnsAddr = preset.value }
+                                        withAnimation(VdpiMotion.cardShift) {
+                                            manager.updateSettings { $0.dnsAddr = preset.value }
+                                        }
                                     } label: {
-                                        Text("\(preset.label) · \(preset.value)")
-                                            .font(.system(size: 12, weight: .medium, design: .monospaced))
-                                            .foregroundStyle(active ? palette.primaryButtonInk : palette.inkSecondary)
-                                            .padding(.horizontal, 12)
-                                            .frame(minHeight: 44)
-                                            .background(active ? palette.primaryButtonBg : palette.surfaceRaised)
-                                            .clipShape(Capsule())
-                                            .overlay(
-                                                Capsule().strokeBorder(
-                                                    active ? Color.clear : palette.border,
-                                                    lineWidth: 1
-                                                )
-                                            )
+                                        HStack(spacing: 6) {
+                                            if active {
+                                                Circle()
+                                                    .fill(palette.signal)
+                                                    .frame(width: 6, height: 6)
+                                            }
+                                            Text("\(preset.label) · \(preset.value)")
+                                                .font(.system(size: 12, weight: .medium, design: .monospaced))
+                                        }
+                                        .foregroundStyle(active ? palette.inkPrimary : palette.inkSecondary)
+                                        .padding(.horizontal, 13)
+                                        .frame(minHeight: 38)
+                                        .vdpiGlass(
+                                            in: Capsule(),
+                                            tier: active ? .regular : .subtle,
+                                            tint: active ? palette.signalTint : nil,
+                                            borderAccent: active ? palette.signal : nil,
+                                            interactive: true
+                                        )
                                     }
-                                    .buttonStyle(VdpiPressButtonStyle())
+                                    .buttonStyle(VdpiPressButtonStyle(haptic: nil))
                                     .accessibilityAddTraits(active ? .isSelected : [])
                                 }
                             }
+                            .padding(.vertical, 2)
                         }
                     }
-                    .padding(14)
+                    .padding(16)
 
                     HairlineRule()
 
@@ -268,7 +327,10 @@ struct SettingsView: View {
                         subtitle: "Sticky multi-provider DoH ring with sinkhole filtering",
                         isOn: Binding(
                             get: { manager.settings.enableDoh },
-                            set: { val in manager.updateSettings { $0.enableDoh = val } }
+                            set: { val in
+                                VdpiHaptics.trigger(.light)
+                                manager.updateSettings { $0.enableDoh = val }
+                            }
                         )
                     )
 
@@ -279,7 +341,10 @@ struct SettingsView: View {
                         subtitle: "Drops QUIC Initial packets so apps cleanly use TCP TLS",
                         isOn: Binding(
                             get: { manager.settings.blockQuic },
-                            set: { val in manager.updateSettings { $0.blockQuic = val } }
+                            set: { val in
+                                VdpiHaptics.trigger(.light)
+                                manager.updateSettings { $0.blockQuic = val }
+                            }
                         )
                     )
 
@@ -290,7 +355,10 @@ struct SettingsView: View {
                         subtitle: "Disable IPv6 tunnel routing and AAAA queries",
                         isOn: Binding(
                             get: { manager.settings.ipv4Only },
-                            set: { val in manager.updateSettings { $0.ipv4Only = val } }
+                            set: { val in
+                                VdpiHaptics.trigger(.light)
+                                manager.updateSettings { $0.ipv4Only = val }
+                            }
                         )
                     )
                 }
@@ -298,18 +366,23 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - Tunnel Behavior
+
     private var tunnelBehaviorSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             SectionOverline(title: "Tunnel Behavior")
 
-            HairlinePanel {
+            GlassPanel(cornerRadius: 22) {
                 VStack(spacing: 0) {
                     toggleRow(
                         title: "Connect On-Demand",
                         subtitle: "Automatically keep vdpi active across Wi-Fi and Cellular",
                         isOn: Binding(
                             get: { manager.settings.onDemandEnabled },
-                            set: { val in manager.updateSettings { $0.onDemandEnabled = val } }
+                            set: { val in
+                                VdpiHaptics.trigger(.light)
+                                manager.updateSettings { $0.onDemandEnabled = val }
+                            }
                         )
                     )
                 }
@@ -317,11 +390,13 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - Domain Bypass
+
     private var bypassDomainsSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             SectionOverline(title: "Domain Bypass")
 
-            HairlinePanel {
+            GlassPanel(cornerRadius: 22) {
                 VStack(alignment: .leading, spacing: 12) {
                     Text("Domains here skip TLS fragmentation (LAN, banking, and government portals are already bypassed automatically). Consumer iOS restricts per-app VPN routing to MDM.")
                         .font(.system(size: 12))
@@ -330,18 +405,21 @@ struct SettingsView: View {
 
                     HStack(spacing: 8) {
                         TextField("e.g. *.example.com", text: $bypassDraft)
-                            .font(.system(size: 13, design: .monospaced))
+                            .font(.system(size: 13.5, design: .monospaced))
                             .foregroundStyle(palette.inkPrimary)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled(true)
                             .submitLabel(.done)
-                            .padding(.horizontal, 12)
+                            .focused($focusedField, equals: .bypass)
+                            .padding(.horizontal, 14)
                             .frame(minHeight: 44)
-                            .background(palette.surfaceRaised)
-                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                    .strokeBorder(palette.border, lineWidth: 1)
+                            .vdpiGlass(
+                                in: RoundedRectangle(cornerRadius: 14, style: .continuous),
+                                tier: .subtle,
+                                tint: bypassError != nil ? palette.dangerTint : nil,
+                                borderAccent: bypassError != nil
+                                    ? palette.danger
+                                    : (focusedField == .bypass ? palette.borderStrong : nil)
                             )
                             .onSubmit { addBypassDomain() }
 
@@ -353,7 +431,8 @@ struct SettingsView: View {
                         .padding(.horizontal, 16)
                         .frame(minHeight: 44)
                         .background(palette.primaryButtonBg)
-                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .clipShape(Capsule())
+                        .buttonStyle(VdpiPressButtonStyle(haptic: nil))
                     }
 
                     if let bypassError {
@@ -363,73 +442,133 @@ struct SettingsView: View {
                     }
 
                     if !manager.settings.bypassDomains.isEmpty {
-                        VStack(spacing: 6) {
+                        VStack(spacing: 8) {
                             ForEach(manager.settings.bypassDomains, id: \.self) { domain in
-                                HStack {
+                                HStack(spacing: 10) {
                                     Text(domain)
-                                        .font(.system(size: 13, design: .monospaced))
+                                        .font(.system(size: 13, weight: .medium, design: .monospaced))
                                         .foregroundStyle(palette.inkPrimary)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+
                                     Spacer()
+
                                     Button {
-                                        manager.updateSettings {
-                                            $0.bypassDomains.removeAll { $0 == domain }
+                                        VdpiHaptics.trigger(.light)
+                                        withAnimation(VdpiMotion.cardShift) {
+                                            manager.updateSettings {
+                                                $0.bypassDomains.removeAll { $0 == domain }
+                                            }
                                         }
                                     } label: {
                                         Image(systemName: "xmark")
-                                            .font(.system(size: 12, weight: .semibold))
+                                            .font(.system(size: 11, weight: .bold))
                                             .foregroundStyle(palette.inkMuted)
-                                            .frame(width: 44, height: 44)
-                                            .contentShape(Rectangle())
+                                            .frame(width: 32, height: 32)
+                                            .contentShape(Circle())
                                     }
-                                    .buttonStyle(VdpiPressButtonStyle())
+                                    .buttonStyle(VdpiPressButtonStyle(haptic: nil))
                                     .accessibilityLabel("Remove \(domain)")
                                 }
-                                .padding(.leading, 12)
-                                .padding(.trailing, 2)
-                                .background(palette.surfaceRaised)
-                                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                                .padding(.leading, 14)
+                                .padding(.trailing, 6)
+                                .frame(minHeight: 42)
+                                .vdpiGlass(in: Capsule(), tier: .subtle)
+                                .transition(.opacity.combined(with: .scale(scale: 0.94)))
                             }
                         }
+                        .animation(VdpiMotion.cardShift, value: manager.settings.bypassDomains)
                     }
                 }
-                .padding(14)
+                .padding(16)
             }
         }
     }
+
+    // MARK: - Appearance
 
     private var appearanceSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             SectionOverline(title: "Appearance")
 
-            HairlinePanel {
-                HStack(spacing: 8) {
+            GlassPanel(cornerRadius: 22) {
+                HStack(spacing: 4) {
                     ForEach(ThemePreference.allCases) { pref in
                         let selected = manager.settings.theme == pref
                         Button {
-                            manager.updateSettings { $0.theme = pref }
+                            guard !selected else { return }
+                            VdpiHaptics.trigger(.selection)
+                            withAnimation(VdpiMotion.tabLens) {
+                                manager.updateSettings { $0.theme = pref }
+                            }
                         } label: {
                             Text(pref.label)
-                                .font(.system(size: 13, weight: selected ? .semibold : .medium))
+                                .font(.system(size: 13.5, weight: selected ? .semibold : .medium))
                                 .frame(maxWidth: .infinity)
                                 .frame(minHeight: 44)
-                                .foregroundStyle(selected ? palette.primaryButtonInk : palette.inkSecondary)
-                                .background(selected ? palette.primaryButtonBg : palette.surfaceRaised)
-                                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                                .foregroundStyle(selected ? palette.inkPrimary : palette.inkMuted)
+                                .background {
+                                    if selected {
+                                        Capsule()
+                                            .fill(palette.glassLensFill)
+                                            .overlay(
+                                                Capsule()
+                                                    .strokeBorder(palette.specularRim(), lineWidth: 0.9)
+                                            )
+                                            .shadow(
+                                                color: palette.shadowColor.opacity(palette.isDark ? 0.45 : 0.65),
+                                                radius: 6,
+                                                x: 0,
+                                                y: 2
+                                            )
+                                            .matchedGeometryEffect(id: "vdpi.theme.lens", in: themeNamespace)
+                                    }
+                                }
+                                .contentShape(Capsule())
                         }
-                        .buttonStyle(VdpiPressButtonStyle())
+                        .buttonStyle(.plain)
                         .accessibilityAddTraits(selected ? .isSelected : [])
                     }
                 }
-                .padding(10)
+                .padding(6)
             }
         }
     }
+
+    // MARK: - Reset to Defaults
+
+    private var resetButton: some View {
+        Button {
+            VdpiHaptics.trigger(.warning)
+            showResetConfirm = true
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.counterclockwise")
+                    .font(.system(size: 13.5, weight: .semibold))
+                Text("Reset to Defaults")
+                    .font(.system(size: 14, weight: .semibold))
+            }
+            .foregroundStyle(palette.danger)
+            .frame(maxWidth: .infinity)
+            .frame(minHeight: 50)
+            .vdpiGlass(
+                in: Capsule(),
+                tier: .regular,
+                tint: palette.dangerTint,
+                borderAccent: palette.danger,
+                interactive: true
+            )
+        }
+        .buttonStyle(VdpiPressButtonStyle(haptic: nil))
+    }
+
+    // MARK: - Helpers
 
     private func toggleRow(title: String, subtitle: String, isOn: Binding<Bool>) -> some View {
         Toggle(isOn: isOn) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
-                    .font(.system(size: 14, weight: .medium))
+                    .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(palette.inkPrimary)
                 Text(subtitle)
                     .font(.system(size: 12))
@@ -437,7 +576,7 @@ struct SettingsView: View {
             }
         }
         .tint(palette.signal)
-        .padding(.horizontal, 14)
+        .padding(.horizontal, 16)
         .padding(.vertical, 12)
     }
 
@@ -447,15 +586,18 @@ struct SettingsView: View {
         if trimmed.isEmpty {
             dnsError = nil
             dnsDraft = "1.1.1.1"
+            VdpiHaptics.trigger(.light)
             manager.updateSettings { $0.dnsAddr = "1.1.1.1" }
             return
         }
         guard VdpiFormatters.isValidDnsInput(trimmed) else {
+            VdpiHaptics.trigger(.warning)
             dnsError = "Enter an IPv4, IPv6, or https:// DoH URL"
             return
         }
         dnsError = nil
         dnsDraft = trimmed
+        VdpiHaptics.trigger(.success)
         manager.updateSettings { $0.dnsAddr = trimmed }
         manager.showToast("Updated DNS resolver")
     }
@@ -463,15 +605,19 @@ struct SettingsView: View {
     private func addBypassDomain() {
         focusedField = nil
         guard let normalized = VdpiFormatters.normalizeBypassDomain(bypassDraft) else {
+            VdpiHaptics.trigger(.warning)
             bypassError = "Enter a valid domain such as example.com or *.example.com"
             return
         }
         bypassError = nil
         bypassDraft = ""
-        manager.updateSettings { s in
-            if !s.bypassDomains.contains(normalized) {
-                s.bypassDomains.append(normalized)
-                s.bypassDomains.sort()
+        VdpiHaptics.trigger(.success)
+        withAnimation(VdpiMotion.cardShift) {
+            manager.updateSettings { s in
+                if !s.bypassDomains.contains(normalized) {
+                    s.bypassDomains.append(normalized)
+                    s.bypassDomains.sort()
+                }
             }
         }
     }

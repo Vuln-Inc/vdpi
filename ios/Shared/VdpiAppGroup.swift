@@ -5,6 +5,7 @@ public enum VdpiAppGroup {
     public static let suiteName = "group.com.vulninc.vdpi"
     public static let extensionBundleId = "com.vulninc.vdpi.packet-tunnel"
     private static let settingsKey = "vdpi_settings_v1"
+    private static let appliedConfigKey = "vdpi_applied_config_v1"
 
     public static var defaults: UserDefaults {
         UserDefaults(suiteName: suiteName) ?? .standard
@@ -22,6 +23,27 @@ public enum VdpiAppGroup {
     public static func saveSettings(_ settings: VdpiSettings, to storage: UserDefaults = defaults) {
         if let encoded = try? JSONEncoder().encode(settings) {
             storage.set(encoded, forKey: settingsKey)
+        }
+    }
+
+    public static func loadAppliedConfig(from defaults: UserDefaults? = nil) -> NativeEngineConfig? {
+        let storage = defaults ?? VdpiAppGroup.defaults
+        guard let data = storage.data(forKey: appliedConfigKey),
+              let decoded = try? JSONDecoder().decode(NativeEngineConfig.self, from: data)
+        else {
+            return nil
+        }
+        return decoded
+    }
+
+    public static func saveAppliedConfig(_ config: NativeEngineConfig?, to defaults: UserDefaults? = nil) {
+        let storage = defaults ?? VdpiAppGroup.defaults
+        guard let config else {
+            storage.removeObject(forKey: appliedConfigKey)
+            return
+        }
+        if let encoded = try? JSONEncoder().encode(config) {
+            storage.set(encoded, forKey: appliedConfigKey)
         }
     }
 }

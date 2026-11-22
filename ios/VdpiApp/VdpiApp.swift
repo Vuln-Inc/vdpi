@@ -10,7 +10,7 @@ struct VdpiApp: App {
             ThemedRootView()
                 .environmentObject(manager)
                 .preferredColorScheme(manager.settings.theme.preferredColorScheme)
-                .onChange(of: scenePhase) { newPhase in
+                .vdpiOnChange(of: scenePhase) { newPhase in
                     manager.setSceneActive(newPhase == .active)
                 }
         }

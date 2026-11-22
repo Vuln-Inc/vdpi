@@ -3,4 +3,11 @@
     <string name="app_name">vdpi</string>
     <string name="notification_channel_name">Tunnel Status</string>
     <string name="notification_channel_desc">Persistent status while the local anti-DPI tunnel is active</string>
+    <string name="notification_action_disconnect">Disconnect</string>
+    <string name="notification_action_reconnect">Reconnect</string>
+    <string name="notification_title_connected">vdpi · Protected</string>
+    <string name="notification_title_connecting">vdpi · Connecting</string>
+    <string name="notification_subtitle_connecting">Establishing local anti-DPI tunnel</string>
+    <string name="notification_permission_hint">Enable notifications to keep vdpi pinned at the top</string>
+    <string name="notification_settings_action">Settings</string>
 </resources>

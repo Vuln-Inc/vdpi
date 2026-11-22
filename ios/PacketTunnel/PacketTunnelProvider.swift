@@ -115,6 +115,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     self.isRunning = true
                     self.startPathMonitoring()
                     self.pumpInboundPackets()
+                    VdpiAppGroup.saveAppliedConfig(settings.toNativeConfig())
                     completionHandler(nil)
                 }
             }
@@ -132,6 +133,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // VdpiNativeBridge.stop() joins the Rust writer task and completionHandler returns.
         lifecycleQueue.async {
             VdpiNativeBridge.stop()
+            VdpiAppGroup.saveAppliedConfig(nil)
             completionHandler()
         }
     }
@@ -201,6 +203,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         ) {
                             completionHandler?(ProviderCommandResponse(ok: false, error: errMsg).encodeData())
                         } else {
+                            VdpiAppGroup.saveAppliedConfig(settings.toNativeConfig())
                             completionHandler?(ProviderCommandResponse(ok: true).encodeData())
                         }
                     }

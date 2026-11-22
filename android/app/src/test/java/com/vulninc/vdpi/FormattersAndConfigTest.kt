@@ -1,8 +1,12 @@
 package com.vulninc.vdpi
 
+import com.vulninc.vdpi.data.SplitTunnelMode
+import com.vulninc.vdpi.data.ThemePreference
+import com.vulninc.vdpi.data.VdpiSettings
 import com.vulninc.vdpi.engine.DesyncMode
 import com.vulninc.vdpi.engine.NativeEngine
 import com.vulninc.vdpi.engine.NativeEngineConfig
+import com.vulninc.vdpi.ui.computeSettingsChangeSummary
 import com.vulninc.vdpi.util.formatBytes
 import com.vulninc.vdpi.util.formatEventTime
 import com.vulninc.vdpi.util.formatStageShort
@@ -122,5 +126,150 @@ class FormattersAndConfigTest {
         assertEquals("OobSniDesync", snap.stageLabel)
         assertEquals(1, snap.events.size)
         assertEquals("started", snap.events.first().message)
+    }
+
+    @Test
+    fun changeSummaryIgnoresThemeOnlyEdits() {
+        val baseline = VdpiSettings()
+        assertEquals(
+            emptyList<String>(),
+            computeSettingsChangeSummary(baseline.copy(theme = ThemePreference.LIGHT), baseline),
+        )
+        assertEquals(
+            emptyList<String>(),
+            computeSettingsChangeSummary(baseline.copy(theme = ThemePreference.SYSTEM), baseline),
+        )
+    }
+
+    @Test
+    fun changeSummaryNormalizesDnsWhitespaceAndBypassOrder() {
+        val baseline = VdpiSettings(
+            dnsAddr = "1.1.1.1",
+            bypassDomains = listOf("a.com", "b.com"),
+        )
+        assertEquals(
+            emptyList<String>(),
+            computeSettingsChangeSummary(baseline.copy(dnsAddr = " 1.1.1.1 "), baseline),
+        )
+        assertEquals(
+            emptyList<String>(),
+            computeSettingsChangeSummary(baseline, baseline.copy(dnsAddr = " 1.1.1.1 ")),
+        )
+        assertEquals(
+            emptyList<String>(),
+            computeSettingsChangeSummary(
+                baseline.copy(bypassDomains = listOf("b.com", "a.com")),
+                baseline,
+            ),
+        )
+    }
+
+    @Test
+    fun changeSummaryReportsExpectedLabelsForEachField() {
+        val baseline = VdpiSettings(
+            desyncMode = DesyncMode.COMBO,
+            chunkSize = 10,
+            dnsAddr = "1.1.1.1",
+            enableDoh = true,
+            ipv4Only = false,
+            blockQuic = true,
+            bypassDomains = listOf("a.com", "b.com"),
+            splitTunnelMode = SplitTunnelMode.BYPASS_SELECTED,
+            splitPackages = emptySet(),
+            theme = ThemePreference.DARK,
+        )
+
+        assertEquals(
+            listOf("Mode"),
+            computeSettingsChangeSummary(baseline.copy(desyncMode = DesyncMode.TLS_RECORD), baseline),
+        )
+        assertEquals(
+            listOf("Chunk"),
+            computeSettingsChangeSummary(baseline.copy(chunkSize = 16), baseline),
+        )
+        assertEquals(
+            listOf("DNS"),
+            computeSettingsChangeSummary(baseline.copy(dnsAddr = "9.9.9.9"), baseline),
+        )
+        assertEquals(
+            listOf("DoH"),
+            computeSettingsChangeSummary(baseline.copy(enableDoh = false), baseline),
+        )
+        assertEquals(
+            listOf("IPv4"),
+            computeSettingsChangeSummary(baseline.copy(ipv4Only = true), baseline),
+        )
+        assertEquals(
+            listOf("QUIC"),
+            computeSettingsChangeSummary(baseline.copy(blockQuic = false), baseline),
+        )
+        assertEquals(
+            listOf("Bypass"),
+            computeSettingsChangeSummary(
+                baseline.copy(bypassDomains = listOf("a.com", "b.com", "c.com")),
+                baseline,
+            ),
+        )
+        assertEquals(
+            listOf("Apps"),
+            computeSettingsChangeSummary(
+                baseline.copy(splitTunnelMode = SplitTunnelMode.ONLY_SELECTED),
+                baseline,
+            ),
+        )
+        assertEquals(
+            listOf("Apps"),
+            computeSettingsChangeSummary(
+                baseline.copy(splitPackages = setOf("com.example.app")),
+                baseline,
+            ),
+        )
+
+        val allChanged = baseline.copy(
+            desyncMode = DesyncMode.FRAGMENT,
+            chunkSize = 20,
+            dnsAddr = "8.8.8.8",
+            enableDoh = false,
+            ipv4Only = true,
+            blockQuic = false,
+            bypassDomains = listOf("c.com"),
+            splitTunnelMode = SplitTunnelMode.ONLY_SELECTED,
+            splitPackages = setOf("com.example.app"),
+            theme = ThemePreference.LIGHT,
+        )
+        val combined = computeSettingsChangeSummary(allChanged, baseline)
+        assertEquals(8, combined.size)
+        assertEquals(
+            setOf("Mode", "Chunk", "DNS", "DoH", "IPv4", "QUIC", "Bypass", "Apps"),
+            combined.toSet(),
+        )
+    }
+
+    @Test
+    fun changeSummaryClearsWhenRevertedToBaseline() {
+        val baseline = VdpiSettings(
+            desyncMode = DesyncMode.COMBO,
+            dnsAddr = "1.1.1.1",
+            bypassDomains = listOf("a.com", "b.com"),
+            splitPackages = setOf("com.example.keep"),
+        )
+        val edited = baseline.copy(
+            desyncMode = DesyncMode.SPLIT,
+            dnsAddr = "9.9.9.9",
+            bypassDomains = listOf("a.com"),
+            splitPackages = setOf("com.example.keep", "com.example.other"),
+        )
+        assertEquals(
+            setOf("Mode", "DNS", "Bypass", "Apps"),
+            computeSettingsChangeSummary(edited, baseline).toSet(),
+        )
+
+        val reverted = edited.copy(
+            desyncMode = baseline.desyncMode,
+            dnsAddr = " 1.1.1.1 ",
+            bypassDomains = listOf("b.com", "a.com"),
+            splitPackages = baseline.splitPackages,
+        )
+        assertEquals(emptyList<String>(), computeSettingsChangeSummary(reverted, baseline))
     }
 }

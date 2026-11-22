@@ -3,7 +3,7 @@ members = [".", "crates/vdpi-tun", "crates/vdpi-android", "crates/vdpi-ios"]
 default-members = ["."]
 
 [workspace.package]
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 authors = ["Vuln-Inc"]
 license = "MIT"

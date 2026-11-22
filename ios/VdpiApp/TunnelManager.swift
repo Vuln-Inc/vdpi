@@ -35,18 +35,20 @@ final class TunnelManager: ObservableObject {
     @Published var telemetry: TelemetrySnapshot = .idle
     @Published var doctorState: DoctorUiState = DoctorUiState()
     @Published var pendingReconnect: Bool = false
+    @Published var reconnectPopupVisible: Bool = false
+    @Published var pendingChangeSummary: String = ""
+    @Published private(set) var isReloading: Bool = false
     @Published var toastMessage: String? = nil
 
     let engineVersion: String
 
     private var vpnManager: NETunnelProviderManager?
-    private var appliedSettings: VdpiSettings?
+    private var appliedConfig: NativeEngineConfig?
     private var statusObserver: NSObjectProtocol?
     private var loadTask: Task<Void, Never>?
     private var lifecycleTask: Task<Void, Never>?
     private var telemetryTask: Task<Void, Never>?
     private var toastTask: Task<Void, Never>?
-    private var isReloading: Bool = false
     private var isSceneActive: Bool = true
 
     init() {
@@ -80,18 +82,18 @@ final class TunnelManager: ObservableObject {
     }
 
     func updateSettings(_ mutate: (inout VdpiSettings) -> Void) {
-        var next = settings
+        let previous = settings
+        var next = previous
         mutate(&next)
-        guard next != settings else { return }
+        guard next != previous else { return }
 
-        let onDemandChanged = next.onDemandEnabled != settings.onDemandEnabled
+        let onDemandChanged = next.onDemandEnabled != previous.onDemandEnabled
+        let nativeConfigChanged = next.toNativeConfig() != previous.toNativeConfig()
         settings = next
         VdpiAppGroup.saveSettings(next)
 
-        if phase == .connected, let applied = appliedSettings {
-            pendingReconnect = next.requiresTunnelReload(comparedTo: applied)
-        } else {
-            pendingReconnect = false
+        if nativeConfigChanged {
+            recomputePendingReconnect(revealPopup: true)
         }
 
         if onDemandChanged {
@@ -99,6 +101,10 @@ final class TunnelManager: ObservableObject {
                 await syncOnDemandPreference()
             }
         }
+    }
+
+    func dismissReconnectPopup() {
+        reconnectPopupVisible = false
     }
 
     func resetSettings() {
@@ -131,14 +137,22 @@ final class TunnelManager: ObservableObject {
             do {
                 let manager = try await ensureConfiguredManager(for: target)
                 guard !Task.isCancelled else { return }
-                appliedSettings = target
-                pendingReconnect = settings.requiresTunnelReload(comparedTo: target)
+                let applied = target.toNativeConfig()
+                appliedConfig = applied
+                VdpiAppGroup.saveAppliedConfig(applied)
+                pendingReconnect = false
+                reconnectPopupVisible = false
+                pendingChangeSummary = ""
                 try manager.connection.startVPNTunnel()
+                recomputePendingReconnect(revealPopup: false)
                 triggerHaptic(.medium)
             } catch {
                 guard !Task.isCancelled else { return }
                 phase = .error
                 errorMessage = error.localizedDescription
+                appliedConfig = nil
+                VdpiAppGroup.saveAppliedConfig(nil)
+                recomputePendingReconnect(revealPopup: false)
                 triggerNotificationHaptic(.error)
             }
         }
@@ -147,7 +161,11 @@ final class TunnelManager: ObservableObject {
     func disconnect() {
         lifecycleTask?.cancel()
         errorMessage = nil
+        appliedConfig = nil
+        VdpiAppGroup.saveAppliedConfig(nil)
         pendingReconnect = false
+        reconnectPopupVisible = false
+        pendingChangeSummary = ""
 
         guard let manager = vpnManager else {
             phase = .disconnected
@@ -188,8 +206,13 @@ final class TunnelManager: ObservableObject {
                let response = ProviderCommandResponse.decodeData(replyData),
                response.ok
             {
-                appliedSettings = target
-                pendingReconnect = settings.requiresTunnelReload(comparedTo: target)
+                let applied = target.toNativeConfig()
+                appliedConfig = applied
+                VdpiAppGroup.saveAppliedConfig(applied)
+                pendingReconnect = false
+                reconnectPopupVisible = false
+                pendingChangeSummary = ""
+                recomputePendingReconnect(revealPopup: false)
                 triggerNotificationHaptic(.success)
                 showToast("Applied updated settings")
                 await fetchTelemetryOnce()
@@ -296,10 +319,12 @@ final class TunnelManager: ObservableObject {
                     == VdpiAppGroup.extensionBundleId
             }) {
                 vpnManager = existing
-                syncStatus(existing.connection.status)
-                if existing.connection.status == .connected {
-                    appliedSettings = settings
+                let status = existing.connection.status
+                if status == .connected || status == .connecting || status == .reasserting {
+                    appliedConfig = VdpiAppGroup.loadAppliedConfig() ?? settings.toNativeConfig()
                 }
+                syncStatus(status)
+                recomputePendingReconnect(revealPopup: false)
             }
         } catch {
             // Simulator or unprovisioned builds without NetworkExtension entitlement stay in standby cleanly.
@@ -358,27 +383,60 @@ final class TunnelManager: ObservableObject {
         }
     }
 
+    private func recomputePendingReconnect(revealPopup: Bool) {
+        guard phase == .connected || phase == .connecting,
+              let applied = appliedConfig
+        else {
+            pendingReconnect = false
+            reconnectPopupVisible = false
+            pendingChangeSummary = ""
+            return
+        }
+
+        let labels = settings.changedFieldLabels(comparedToApplied: applied)
+        if labels.isEmpty {
+            pendingReconnect = false
+            reconnectPopupVisible = false
+            pendingChangeSummary = ""
+        } else {
+            pendingReconnect = true
+            pendingChangeSummary = labels.joined(separator: ", ")
+            if revealPopup {
+                reconnectPopupVisible = true
+            }
+        }
+    }
+
     private func syncStatus(_ status: NEVPNStatus) {
         switch status {
         case .connected:
             phase = .connected
             errorMessage = nil
-            if appliedSettings == nil {
-                appliedSettings = settings
+            if let persisted = VdpiAppGroup.loadAppliedConfig() {
+                appliedConfig = persisted
+            } else if appliedConfig == nil {
+                appliedConfig = settings.toNativeConfig()
             }
+            recomputePendingReconnect(revealPopup: false)
             if isSceneActive {
                 startTelemetryPolling()
             }
         case .connecting, .reasserting:
             phase = .connecting
+            if appliedConfig == nil, let persisted = VdpiAppGroup.loadAppliedConfig() {
+                appliedConfig = persisted
+            }
+            recomputePendingReconnect(revealPopup: false)
         case .disconnecting:
             phase = .disconnecting
+            recomputePendingReconnect(revealPopup: false)
             telemetryTask?.cancel()
             telemetryTask = nil
         case .disconnected, .invalid:
             phase = .disconnected
-            pendingReconnect = false
-            appliedSettings = nil
+            appliedConfig = nil
+            VdpiAppGroup.saveAppliedConfig(nil)
+            recomputePendingReconnect(revealPopup: false)
             telemetryTask?.cancel()
             telemetryTask = nil
             telemetry = TelemetrySnapshot(
@@ -402,6 +460,9 @@ final class TunnelManager: ObservableObject {
             )
         @unknown default:
             phase = .disconnected
+            appliedConfig = nil
+            VdpiAppGroup.saveAppliedConfig(nil)
+            recomputePendingReconnect(revealPopup: false)
         }
     }
 
