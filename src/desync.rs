@@ -2,12 +2,13 @@ use crate::bypass::BypassPolicy;
 use crate::config::{DesyncMode, RuntimeConfig};
 use crate::dns::DnsResolver;
 use crate::tls::{
-    expected_tls_record_len, extract_http_host_split, parse_client_hello, split_tls_records,
-    ClientHelloInfo,
+    expected_tls_record_len, extract_http_host_splits, parse_client_hello, split_tls_records,
+    split_tls_records_deep, split_tls_records_multi, ClientHelloInfo,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{copy_bidirectional_with_sizes, AsyncReadExt, AsyncWriteExt};
@@ -15,17 +16,51 @@ use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tracing::debug;
 
-/// Strategy learned per-hostname by the 3-Stage Adaptive Auto-Heal TLS Engine.
+/// Strategy learned per-hostname (and globally per ISP network) by the 5-Stage Adaptive
+/// Auto-Heal TLS Engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum LearnedStrategy {
-    /// Configured primary desync mode (default `Combo`: SNI record split + chunked pre-SNI record).
-    Primary,
-    /// Single-record fine TCP segment fragmentation across the SNI header (compatible with servers
-    /// that forbid multi-record ClientHellos while still defeating active fiber DPI).
-    FineFragment,
-    /// Unmodified single-record passthrough (for strict non-blocked CDNs/WAFs).
-    DirectPassthrough,
+    /// Stage 1: Configured primary mode (default `Combo`: 4 wire-paced RFC-compliant TLS records
+    /// split across the handshake header and SNI midpoint).
+    Primary = 0,
+    /// Stage 2: Single intact outer TLS record split across 4 wire-paced TCP segments (compatible
+    /// with strict servers that reject multi-record ClientHellos while defeating active DPI).
+    FineFragment = 1,
+    /// Stage 3: Deep 12+ RFC-compliant TLS record storm (up to 10 tiny 2-byte lead records
+    /// exhausting hardware DPI per-flow packet caps before SNI hits the wire + SNI splits).
+    DeepRecordStorm = 2,
+    /// Stage 4: Single intact outer TLS record with slow 2-byte SNI-only pacing (for strict
+    /// servers behind stateful burst-reassembling DPI).
+    SlowSniSlice = 3,
+    /// Stage 5: Unmodified single-write passthrough (for unblocked strict WAFs/CDNs).
+    DirectPassthrough = 4,
 }
+
+impl LearnedStrategy {
+    fn from_u8(val: u8) -> Self {
+        match val {
+            0 => Self::Primary,
+            1 => Self::FineFragment,
+            2 => Self::DeepRecordStorm,
+            3 => Self::SlowSniSlice,
+            4 => Self::DirectPassthrough,
+            _ => Self::Primary,
+        }
+    }
+
+    fn is_desync(self) -> bool {
+        !matches!(self, Self::DirectPassthrough)
+    }
+}
+
+const ALL_STAGES: [LearnedStrategy; 5] = [
+    LearnedStrategy::Primary,
+    LearnedStrategy::FineFragment,
+    LearnedStrategy::DeepRecordStorm,
+    LearnedStrategy::SlowSniSlice,
+    LearnedStrategy::DirectPassthrough,
+];
 
 #[derive(Clone)]
 pub struct EngineContext {
@@ -33,6 +68,7 @@ pub struct EngineContext {
     pub dns: DnsResolver,
     pub bypass: Arc<BypassPolicy>,
     pub adaptive_cache: Arc<RwLock<HashMap<String, LearnedStrategy>>>,
+    pub preferred_isp_stage: Arc<AtomicU8>,
 }
 
 impl EngineContext {
@@ -49,6 +85,7 @@ impl EngineContext {
             dns,
             bypass: Arc::new(bypass),
             adaptive_cache: Arc::new(RwLock::new(HashMap::new())),
+            preferred_isp_stage: Arc::new(AtomicU8::new(LearnedStrategy::Primary as u8)),
         })
     }
 
@@ -154,8 +191,9 @@ impl EngineContext {
             .await
     }
 
-    /// Delivers an already-buffered initial client flight (`payload`) to `remote` with 3-stage
-    /// adaptive TLS auto-healing and then enters full-speed bidirectional streaming.
+    /// Delivers an already-buffered initial client flight (`payload`) to `remote` with 5-stage
+    /// adaptive TLS auto-healing, stale-cache eviction, and strict ServerHello validation,
+    /// then enters full-speed bidirectional streaming.
     pub async fn establish_and_relay(
         &self,
         mut client: TcpStream,
@@ -171,50 +209,43 @@ impl EngineContext {
             if !self.bypass.should_desync(effective_host, Some(remote_ip)) {
                 debug!(host = ?effective_host, %remote_ip, "TLS passthrough (bypassed)");
                 remote.write_all(payload).await?;
-                remote.flush().await?;
                 let _ = copy_bidirectional_with_sizes(&mut client, &mut remote, 65536, 65536).await;
                 return Ok(());
             }
 
             let cache_key = effective_host.map(|h| h.to_ascii_lowercase());
-            if let Some(ref key) = cache_key {
-                let cached = self.adaptive_cache.read().await.get(key).copied();
-                if let Some(strategy) = cached {
-                    self.write_tls_strategy(&mut remote, payload, &ch_info, strategy)
-                        .await?;
-                    let _ =
-                        copy_bidirectional_with_sizes(&mut client, &mut remote, 65536, 65536).await;
-                    return Ok(());
-                }
-            }
+            let cached_stage = match cache_key.as_ref() {
+                Some(key) => self.adaptive_cache.read().await.get(key).copied(),
+                None => None,
+            };
 
-            // If additional bytes were coalesced after the first TLS record, skip active probing.
+            // If additional bytes were coalesced after the first TLS record, send with preferred strategy.
             if payload.len() != ch_info.record_total_len {
-                self.write_tls_strategy(&mut remote, payload, &ch_info, LearnedStrategy::Primary)
+                let stage = cached_stage.unwrap_or_else(|| {
+                    LearnedStrategy::from_u8(self.preferred_isp_stage.load(Ordering::Relaxed))
+                });
+                self.write_tls_strategy(&mut remote, payload, &ch_info, stage)
                     .await?;
                 let _ = copy_bidirectional_with_sizes(&mut client, &mut remote, 65536, 65536).await;
                 return Ok(());
             }
 
-            // 3-Stage Adaptive Auto-Heal Handshake Probe:
-            // Stage 1: Configured Primary mode (e.g. Combo TLS record split + TCP segmenting)
-            // Stage 2: Fine single-record TCP segment fragmentation (for servers rejecting multi-record ClientHello)
-            // Stage 3: Clean single-record passthrough (for unblocked strict CDNs/WAFs)
-            let stages = [
-                LearnedStrategy::Primary,
-                LearnedStrategy::FineFragment,
-                LearnedStrategy::DirectPassthrough,
-            ];
+            let stages = self.build_stage_order(cached_stage);
+            let retry_addrs = self.collect_retry_addrs(effective_host, remote_addr).await;
+
             let mut probe_buf = vec![0u8; 16384];
             let mut current_remote = Some(remote);
+            let mut saw_network_block = false;
+            let mut saw_tls_alert = false;
 
             for (idx, &stage) in stages.iter().enumerate() {
                 let mut stream = match current_remote.take() {
                     Some(s) => s,
                     None => {
+                        let target = retry_addrs[idx % retry_addrs.len()];
                         match tokio::time::timeout(
                             Duration::from_millis(2500),
-                            TcpStream::connect(remote_addr),
+                            TcpStream::connect(target),
                         )
                         .await
                         {
@@ -232,10 +263,17 @@ impl EngineContext {
                     .await
                     .is_err()
                 {
+                    saw_network_block = true;
                     continue;
                 }
 
-                let wait_ms = if idx == 0 { 1600 } else { 2200 };
+                let wait_ms = match stage {
+                    LearnedStrategy::DeepRecordStorm | LearnedStrategy::SlowSniSlice => 2400,
+                    _ if idx == 0 => 1500,
+                    _ => 2000,
+                };
+
+                let is_last_stage = idx + 1 == stages.len();
                 match tokio::time::timeout(
                     Duration::from_millis(wait_ms),
                     stream.read(&mut probe_buf),
@@ -243,24 +281,45 @@ impl EngineContext {
                 .await
                 {
                     Ok(Ok(n)) if n > 0 => {
-                        let first_byte = probe_buf[0];
-                        // 0x15 is a TLS Alert record (e.g. illegal_parameter from strict servers on multi-record ClientHello).
-                        // If a stage receives a TLS Alert and more fallback stages remain, heal automatically!
-                        if first_byte == 0x15 && idx + 1 < stages.len() {
-                            debug!(
-                                host = ?effective_host,
-                                ?stage,
-                                "upstream returned TLS Alert (0x15); auto-healing with next stage"
-                            );
+                        let is_valid_tls_server_hello =
+                            n >= 2 && probe_buf[0] == 0x16 && probe_buf[1] == 0x03;
+
+                        if !is_valid_tls_server_hello && !is_last_stage {
+                            if probe_buf[0] == 0x15 {
+                                saw_tls_alert = true;
+                                debug!(
+                                    host = ?effective_host,
+                                    ?stage,
+                                    "upstream returned TLS Alert (0x15); auto-healing with next stage"
+                                );
+                            } else {
+                                // Non-TLS response on a TLS handshake (e.g. ISP injected HTTP 302/403 block page)
+                                saw_network_block = true;
+                                debug!(
+                                    host = ?effective_host,
+                                    ?stage,
+                                    first_byte = probe_buf[0],
+                                    "non-TLS response on TLS handshake (possible DPI block injection); escalating"
+                                );
+                            }
                             continue;
                         }
 
-                        if let Some(key) = cache_key {
-                            let mut guard = self.adaptive_cache.write().await;
-                            if guard.len() > 4096 {
-                                guard.clear();
+                        if is_valid_tls_server_hello {
+                            if let Some(key) = cache_key {
+                                let mut guard = self.adaptive_cache.write().await;
+                                if guard.len() > 4096 {
+                                    guard.clear();
+                                }
+                                guard.insert(key, stage);
                             }
-                            guard.insert(key, stage);
+
+                            // If earlier desync stage failed due to ISP RST/block/timeout (not server TLS Alert),
+                            // promote this winning desync stage globally so subsequent domains skip failed probes.
+                            if idx > 0 && saw_network_block && !saw_tls_alert && stage.is_desync() {
+                                self.preferred_isp_stage
+                                    .store(stage as u8, Ordering::Relaxed);
+                            }
                         }
 
                         client.write_all(&probe_buf[..n]).await?;
@@ -271,13 +330,21 @@ impl EngineContext {
                         return Ok(());
                     }
                     _ => {
+                        saw_network_block = true;
                         debug!(
                             host = ?effective_host,
                             ?stage,
-                            "TLS stage reset or timed out; auto-healing with next stage"
+                            "TLS stage reset, closed, or timed out; auto-healing with next stage"
                         );
                         continue;
                     }
+                }
+            }
+
+            // If all stages failed and we had a stale cached strategy, clear it so the next attempt probes fresh.
+            if cached_stage.is_some() {
+                if let Some(key) = cache_key {
+                    self.adaptive_cache.write().await.remove(&key);
                 }
             }
 
@@ -294,6 +361,44 @@ impl EngineContext {
         Ok(())
     }
 
+    fn build_stage_order(&self, cached_stage: Option<LearnedStrategy>) -> Vec<LearnedStrategy> {
+        let mut order = Vec::with_capacity(ALL_STAGES.len());
+        if let Some(cached) = cached_stage {
+            order.push(cached);
+        }
+        let preferred = LearnedStrategy::from_u8(self.preferred_isp_stage.load(Ordering::Relaxed));
+        if !order.contains(&preferred) {
+            order.push(preferred);
+        }
+        for stage in ALL_STAGES {
+            if !order.contains(&stage) {
+                order.push(stage);
+            }
+        }
+        order
+    }
+
+    async fn collect_retry_addrs(
+        &self,
+        host: Option<&str>,
+        initial_addr: SocketAddr,
+    ) -> Vec<SocketAddr> {
+        let mut addrs = vec![initial_addr];
+        if let Some(h) = host {
+            if !initial_addr.ip().is_loopback() {
+                if let Ok(ips) = self.dns.resolve(h).await {
+                    for ip in ips {
+                        let sa = SocketAddr::new(ip, initial_addr.port());
+                        if !addrs.contains(&sa) {
+                            addrs.push(sa);
+                        }
+                    }
+                }
+            }
+        }
+        addrs
+    }
+
     async fn write_tls_strategy(
         &self,
         remote: &mut TcpStream,
@@ -305,56 +410,102 @@ impl EngineContext {
         match strategy {
             LearnedStrategy::Primary => match self.config.mode {
                 DesyncMode::Combo => {
-                    if let Some((rec1, rec2)) = split_tls_records(payload, ch_info, chunk_len) {
-                        write_in_chunks(remote, &rec1, chunk_len).await?;
-                        remote.write_all(&rec2).await?;
-                        remote.flush().await?;
+                    if let Some(records) = split_tls_records_multi(payload, ch_info, chunk_len) {
+                        write_paced_records(remote, &records, Duration::from_millis(2), None)
+                            .await?;
+                    } else if let Some((rec1, rec2)) =
+                        split_tls_records(payload, ch_info, chunk_len)
+                    {
+                        write_paced_slices(remote, &[&rec1, &rec2], Duration::from_millis(2))
+                            .await?;
                     } else {
-                        write_in_chunks(remote, payload, chunk_len).await?;
+                        write_in_paced_chunks(remote, payload, chunk_len, Duration::from_millis(1))
+                            .await?;
                     }
                 }
                 DesyncMode::TlsRecord => {
                     if let Some((rec1, rec2)) = split_tls_records(payload, ch_info, chunk_len) {
-                        remote.write_all(&rec1).await?;
-                        remote.flush().await?;
-                        remote.write_all(&rec2).await?;
-                        remote.flush().await?;
+                        write_paced_slices(remote, &[&rec1, &rec2], Duration::from_millis(2))
+                            .await?;
                     } else {
-                        write_in_chunks(remote, payload, chunk_len).await?;
+                        write_in_paced_chunks(remote, payload, chunk_len, Duration::from_millis(1))
+                            .await?;
                     }
                 }
                 DesyncMode::Fragment => {
-                    write_in_chunks(remote, payload, chunk_len).await?;
+                    write_targeted_sni_slices(
+                        remote,
+                        payload,
+                        ch_info,
+                        Duration::from_millis(2),
+                        false,
+                    )
+                    .await?;
                 }
                 DesyncMode::Split => {
                     let split_at = chunk_len.min(payload.len().saturating_sub(1)).max(1);
                     if payload.len() > 1 {
-                        remote.write_all(&payload[..split_at]).await?;
-                        remote.flush().await?;
-                        remote.write_all(&payload[split_at..]).await?;
-                        remote.flush().await?;
+                        write_paced_slices(
+                            remote,
+                            &[&payload[..split_at], &payload[split_at..]],
+                            Duration::from_millis(2),
+                        )
+                        .await?;
                     } else {
                         remote.write_all(payload).await?;
                     }
                 }
             },
             LearnedStrategy::FineFragment => {
-                // Keep a single outer TLS record (100% compatible with servers that reject multi-record
-                // ClientHellos), but slice the bytes up through the end of the SNI extension into
-                // 2-byte TCP segments with TCP_NODELAY so active DPI state machines fail SNI reassembly.
-                let sni_end = match (ch_info.sni_payload_offset, ch_info.sni_len) {
-                    (Some(off), Some(len)) => (5 + off + len).min(payload.len()),
-                    _ => payload.len().min(64),
-                };
-                write_in_chunks(remote, &payload[..sni_end], 2).await?;
-                if sni_end < payload.len() {
-                    remote.write_all(&payload[sni_end..]).await?;
-                    remote.flush().await?;
+                // Single intact outer TLS record split across 4 wire-paced TCP segments
+                // breaking both the 5-byte TLS record header and the SNI hostname midpoint.
+                write_targeted_sni_slices(
+                    remote,
+                    payload,
+                    ch_info,
+                    Duration::from_millis(2),
+                    false,
+                )
+                .await?;
+            }
+            LearnedStrategy::DeepRecordStorm => {
+                // 12+ RFC-compliant TLS records: up to 10 tiny 2-byte lead records exhausting
+                // DPI per-flow inspection packet caps BEFORE SNI appears, then SNI-split records
+                // with a longer midpoint gap to defeat burst-window reassembly.
+                if let Some(records) = split_tls_records_deep(payload, ch_info, chunk_len) {
+                    let mid_idx = records.len().saturating_sub(2);
+                    write_paced_records(
+                        remote,
+                        &records,
+                        Duration::from_millis(4),
+                        Some((mid_idx, Duration::from_millis(15))),
+                    )
+                    .await?;
+                } else {
+                    write_targeted_sni_slices(
+                        remote,
+                        payload,
+                        ch_info,
+                        Duration::from_millis(6),
+                        true,
+                    )
+                    .await?;
                 }
+            }
+            LearnedStrategy::SlowSniSlice => {
+                // Single intact outer TLS record: breaks record header on packet 1, then slices
+                // the SNI hostname itself into 2-byte paced segments with a 20ms midpoint gap.
+                write_targeted_sni_slices(
+                    remote,
+                    payload,
+                    ch_info,
+                    Duration::from_millis(6),
+                    true,
+                )
+                .await?;
             }
             LearnedStrategy::DirectPassthrough => {
                 remote.write_all(payload).await?;
-                remote.flush().await?;
             }
         }
         Ok(())
@@ -373,7 +524,6 @@ impl EngineContext {
             let effective_host = ch_info.sni.as_deref().or(known_host);
             if !self.bypass.should_desync(effective_host, Some(remote_ip)) {
                 remote.write_all(payload).await?;
-                remote.flush().await?;
                 return Ok(());
             }
             return self
@@ -381,29 +531,169 @@ impl EngineContext {
                 .await;
         }
 
-        if let Some((http_host, split_at)) = extract_http_host_split(payload) {
+        if let Some((http_host, hdr_split, val_split)) = extract_http_host_splits(payload) {
             let effective_host = Some(http_host.as_str()).or(known_host);
-            if self.bypass.should_desync(effective_host, Some(remote_ip)) && payload.len() > 1 {
-                debug!(host = %http_host, %remote_ip, "applying plain HTTP Host DPI split");
-                remote.write_all(&payload[..split_at]).await?;
-                remote.flush().await?;
-                remote.write_all(&payload[split_at..]).await?;
-                remote.flush().await?;
+            if self.bypass.should_desync(effective_host, Some(remote_ip)) && payload.len() > 2 {
+                debug!(host = %http_host, %remote_ip, "applying paced plain HTTP Host DPI split");
+                if hdr_split < val_split && val_split < payload.len() {
+                    write_paced_slices(
+                        remote,
+                        &[
+                            &payload[..hdr_split],
+                            &payload[hdr_split..val_split],
+                            &payload[val_split..],
+                        ],
+                        Duration::from_millis(2),
+                    )
+                    .await?;
+                } else {
+                    write_paced_slices(
+                        remote,
+                        &[&payload[..val_split], &payload[val_split..]],
+                        Duration::from_millis(2),
+                    )
+                    .await?;
+                }
                 return Ok(());
             }
         }
 
         remote.write_all(payload).await?;
-        remote.flush().await?;
         Ok(())
     }
 }
 
-async fn write_in_chunks(stream: &mut TcpStream, data: &[u8], chunk_size: usize) -> Result<()> {
+async fn write_paced_slices(
+    stream: &mut TcpStream,
+    slices: &[&[u8]],
+    delay: Duration,
+) -> Result<()> {
+    for (idx, slice) in slices.iter().enumerate() {
+        if slice.is_empty() {
+            continue;
+        }
+        stream.write_all(slice).await?;
+        if idx + 1 < slices.len() && !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+    }
+    Ok(())
+}
+
+async fn write_paced_records(
+    stream: &mut TcpStream,
+    records: &[Vec<u8>],
+    delay: Duration,
+    extra_pause: Option<(usize, Duration)>,
+) -> Result<()> {
+    for (idx, rec) in records.iter().enumerate() {
+        if rec.is_empty() {
+            continue;
+        }
+        stream.write_all(rec).await?;
+        if idx + 1 < records.len() {
+            let pause = match extra_pause {
+                Some((target_idx, extra)) if idx == target_idx => extra,
+                _ => delay,
+            };
+            if !pause.is_zero() {
+                tokio::time::sleep(pause).await;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn write_in_paced_chunks(
+    stream: &mut TcpStream,
+    data: &[u8],
+    chunk_size: usize,
+    delay: Duration,
+) -> Result<()> {
     let step = chunk_size.max(1);
-    for chunk in data.chunks(step) {
+    let mut chunks = data.chunks(step).peekable();
+    while let Some(chunk) = chunks.next() {
         stream.write_all(chunk).await?;
-        stream.flush().await?;
+        if chunks.peek().is_some() && !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+    }
+    Ok(())
+}
+
+/// Sends a single intact outer TLS record split at strategic wire boundaries:
+/// - Packet 1: `[0..2]` (breaks the 5-byte TLS record header)
+/// - Packet 2: `[2..sni_start + 1]`
+/// - Packet(s) across SNI: either midpoint split (fast) or 2-byte SNI slicing + 20ms midpoint gap (deep)
+/// - Final packet: remainder of ClientHello
+async fn write_targeted_sni_slices(
+    stream: &mut TcpStream,
+    payload: &[u8],
+    ch_info: &ClientHelloInfo,
+    delay: Duration,
+    slow_sni_bytes: bool,
+) -> Result<()> {
+    if payload.len() <= 6 {
+        stream.write_all(payload).await?;
+        return Ok(());
+    }
+
+    let (sni_start, sni_end) = match (ch_info.sni_payload_offset, ch_info.sni_len) {
+        (Some(off), Some(len)) if len >= 2 => {
+            let start = (5 + off).min(payload.len() - 1);
+            let end = (5 + off + len).min(payload.len());
+            (start, end)
+        }
+        _ => (2usize, payload.len().min(64)),
+    };
+
+    if !slow_sni_bytes {
+        let cut1 = 2usize.min(sni_start);
+        let cut2 = (sni_start + 1).min(sni_end).min(payload.len() - 1);
+        let cut3 = (sni_start + ((sni_end - sni_start) / 2).max(1)).min(payload.len() - 1);
+
+        let mut cuts = vec![cut1, cut2, cut3];
+        cuts.sort_unstable();
+        cuts.dedup();
+
+        let mut slices = Vec::with_capacity(cuts.len() + 1);
+        let mut prev = 0usize;
+        for cut in cuts {
+            if cut > prev && cut < payload.len() {
+                slices.push(&payload[prev..cut]);
+                prev = cut;
+            }
+        }
+        if prev < payload.len() {
+            slices.push(&payload[prev..]);
+        }
+        return write_paced_slices(stream, &slices, delay).await;
+    }
+
+    // Deep slow single-record mode: break header, send pre-SNI, then slice SNI in 2-byte packets
+    // with a 20ms pause right at the SNI midpoint.
+    stream.write_all(&payload[..2]).await?;
+    tokio::time::sleep(delay).await;
+
+    if sni_start > 2 {
+        stream.write_all(&payload[2..sni_start]).await?;
+        tokio::time::sleep(delay).await;
+    }
+
+    let sni_slice = &payload[sni_start..sni_end];
+    let mid_chunk = (sni_slice.len() / 2) / 2;
+    for (idx, chunk) in sni_slice.chunks(2).enumerate() {
+        stream.write_all(chunk).await?;
+        let pause = if idx == mid_chunk {
+            Duration::from_millis(20)
+        } else {
+            delay
+        };
+        tokio::time::sleep(pause).await;
+    }
+
+    if sni_end < payload.len() {
+        stream.write_all(&payload[sni_end..]).await?;
     }
     Ok(())
 }
@@ -413,11 +703,11 @@ mod tests {
     use super::*;
     use crate::config::CliArgs;
     use crate::tls::build_synthetic_client_hello;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
     use tokio::net::TcpListener;
 
     #[tokio::test]
-    async fn combo_desync_rewrites_client_hello_into_two_valid_tls_records() {
+    async fn combo_desync_rewrites_client_hello_into_valid_multi_tls_records() {
         let cli =
             CliArgs::parse_from_iter(["vdpi", "--no-system-proxy", "--chunk-size", "10"]).unwrap();
         let ctx = EngineContext::new(cli.into_runtime_config()).unwrap();
@@ -444,16 +734,19 @@ mod tests {
         drop(remote);
 
         let received = server_task.await.unwrap();
-        assert_eq!(received.len(), ch_expected.len() + 5);
-        assert_eq!(received[0], 0x16);
-        let r1_len = u16::from_be_bytes([received[3], received[4]]) as usize;
-        assert_eq!(received[5 + r1_len], 0x16);
-        let r2_len =
-            u16::from_be_bytes([received[5 + r1_len + 3], received[5 + r1_len + 4]]) as usize;
-
+        let mut pos = 0usize;
+        let mut record_count = 0usize;
         let mut reassembled = Vec::new();
-        reassembled.extend_from_slice(&received[5..5 + r1_len]);
-        reassembled.extend_from_slice(&received[5 + r1_len + 5..5 + r1_len + 5 + r2_len]);
+        while pos < received.len() {
+            assert_eq!(received[pos], 0x16);
+            let rlen = u16::from_be_bytes([received[pos + 3], received[pos + 4]]) as usize;
+            let body = &received[pos + 5..pos + 5 + rlen];
+            assert!(!body.windows(11).any(|w| w == b"discord.com"));
+            reassembled.extend_from_slice(body);
+            pos += 5 + rlen;
+            record_count += 1;
+        }
+        assert_eq!(record_count, 4);
         assert_eq!(reassembled, ch_expected[5..]);
     }
 
@@ -498,12 +791,10 @@ mod tests {
                     let _ = sock.read_exact(&mut body).await;
 
                     if rec_len < orig_rec_len {
-                        // Reject multi-record split with TLS Alert illegal_parameter (0x15)
                         let _ = sock
                             .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x2f])
                             .await;
                     } else {
-                        // Accept single-record FineFragment and send ServerHello (0x16)
                         let _ = sock
                             .write_all(&[
                                 0x16, 0x03, 0x03, 0x00, 0x05, b'H', b'E', b'L', b'L', b'O',
@@ -550,6 +841,123 @@ mod tests {
                 .get("cdn.strict-images.example")
                 .copied(),
             Some(LearnedStrategy::FineFragment)
+        );
+    }
+
+    #[tokio::test]
+    async fn escalates_to_deep_record_storm_and_promotes_isp_stage_on_dpi_block_injection() {
+        let cli = CliArgs::parse_from_iter([
+            "vdpi",
+            "--no-system-proxy",
+            "--chunk-size",
+            "10",
+            "--include",
+            "blocked\\.example$",
+        ])
+        .unwrap();
+        let ctx = EngineContext::new(cli.into_runtime_config()).unwrap();
+
+        let ch = build_synthetic_client_hello("chat.blocked.example", 256);
+        let expected_payload_len = ch.len() - 5;
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+
+        // Simulate a strict stateful ISP DPI box that:
+        // - Injects a fake HTTP 302 block page if <= 4 TLS records arrive (Stage 1)
+        // - Resets/closes connection if single-record (Stage 2)
+        // - Allows connection through when >= 10 tiny lead TLS records arrive (Stage 3 DeepRecordStorm)
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = upstream.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut count = 0usize;
+                    let mut total_payload = 0usize;
+                    loop {
+                        let mut hdr = [0u8; 5];
+                        match tokio::time::timeout(
+                            Duration::from_millis(80),
+                            sock.read_exact(&mut hdr),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_)) => {
+                                let rlen = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                                let mut body = vec![0u8; rlen];
+                                if sock.read_exact(&mut body).await.is_err() {
+                                    break;
+                                }
+                                count += 1;
+                                total_payload += rlen;
+                                if total_payload >= expected_payload_len {
+                                    break;
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+
+                    if count == 4 {
+                        // Fake ISP HTTP block-page injection on a TLS port
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 302 Found\r\nLocation: http://blocked.isp/\r\n\r\n")
+                            .await;
+                    } else if count == 1 {
+                        // TCP RST / immediate EOF
+                        drop(sock);
+                    } else if count >= 10 {
+                        // Valid TLS ServerHello passes through!
+                        let _ = sock
+                            .write_all(&[
+                                0x16, 0x03, 0x03, 0x00, 0x05, b'O', b'K', b'T', b'L', b'S',
+                            ])
+                            .await;
+                    }
+                });
+            }
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let ch_send = ch.clone();
+
+        let client_task = tokio::spawn(async move {
+            let mut c = TcpStream::connect(proxy_addr).await.unwrap();
+            c.write_all(&ch_send).await.unwrap();
+            let mut reply = [0u8; 10];
+            c.read_exact(&mut reply).await.unwrap();
+            reply
+        });
+
+        let (accepted_client, _) = proxy_listener.accept().await.unwrap();
+        let initial_remote = TcpStream::connect(upstream_addr).await.unwrap();
+        ctx.relay_tunnel(
+            accepted_client,
+            initial_remote,
+            Some("chat.blocked.example"),
+            upstream_addr,
+        )
+        .await
+        .unwrap();
+
+        let reply = client_task.await.unwrap();
+        assert_eq!(
+            &reply,
+            &[0x16, 0x03, 0x03, 0x00, 0x05, b'O', b'K', b'T', b'L', b'S']
+        );
+        assert_eq!(
+            ctx.adaptive_cache
+                .read()
+                .await
+                .get("chat.blocked.example")
+                .copied(),
+            Some(LearnedStrategy::DeepRecordStorm)
+        );
+        assert_eq!(
+            LearnedStrategy::from_u8(ctx.preferred_isp_stage.load(Ordering::Relaxed)),
+            LearnedStrategy::DeepRecordStorm
         );
     }
 }
