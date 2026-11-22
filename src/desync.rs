@@ -249,17 +249,9 @@ impl EngineContext {
                     Some(s) => s,
                     None => {
                         let target = retry_addrs[idx % retry_addrs.len()];
-                        match tokio::time::timeout(
-                            Duration::from_millis(2500),
-                            TcpStream::connect(target),
-                        )
-                        .await
-                        {
-                            Ok(Ok(s)) => {
-                                let _ = s.set_nodelay(true);
-                                s
-                            }
-                            _ => continue,
+                        match connect_retry_stream(target, remote_addr).await {
+                            Some(s) => s,
+                            None => continue,
                         }
                     }
                 };
@@ -393,7 +385,12 @@ impl EngineContext {
         if let Some(h) = host {
             if !initial_addr.ip().is_loopback() {
                 if let Ok(ips) = self.dns.resolve(h).await {
+                    // Only rotate among alternate IPs of the same address family that already
+                    // proved reachable on attempt 0 so unreachable IPv6 never stalls retries.
                     for ip in ips {
+                        if ip.is_ipv4() != initial_addr.is_ipv4() {
+                            continue;
+                        }
                         let sa = SocketAddr::new(ip, initial_addr.port());
                         if !addrs.contains(&sa) {
                             addrs.push(sa);
@@ -573,6 +570,24 @@ impl EngineContext {
         remote.write_all(payload).await?;
         Ok(())
     }
+}
+
+async fn connect_retry_stream(target: SocketAddr, fallback: SocketAddr) -> Option<TcpStream> {
+    if let Ok(Ok(s)) =
+        tokio::time::timeout(Duration::from_millis(2200), TcpStream::connect(target)).await
+    {
+        let _ = s.set_nodelay(true);
+        return Some(s);
+    }
+    if target != fallback {
+        if let Ok(Ok(s)) =
+            tokio::time::timeout(Duration::from_millis(2200), TcpStream::connect(fallback)).await
+        {
+            let _ = s.set_nodelay(true);
+            return Some(s);
+        }
+    }
+    None
 }
 
 async fn write_paced_slices(
