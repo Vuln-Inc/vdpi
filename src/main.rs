@@ -4,8 +4,10 @@ use tracing::info;
 use vdpi::config::{CliArgs, Command, RuntimeConfig};
 use vdpi::desync::EngineContext;
 use vdpi::platform::platform_name;
-#[cfg(not(windows))]
-use vdpi::platform::SystemProxySession;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use vdpi::platform::unix_foreground as foreground;
+#[cfg(windows)]
+use vdpi::platform::windows::foreground;
 use vdpi::server::{bind_listeners, serve_until_shutdown};
 use vdpi::service::{
     clear_runtime_state, install_service, print_status, run_doctor, uninstall_service,
@@ -15,13 +17,9 @@ use vdpi::service::{
 mod launcher;
 
 fn main() -> Result<()> {
-    #[cfg(windows)]
-    if std::env::args_os().nth(1).as_deref()
-        == Some(std::ffi::OsStr::new(
-            vdpi::platform::windows::foreground::GUARD_ARG,
-        ))
-    {
-        return vdpi::platform::windows::foreground::run_guard();
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(foreground::GUARD_ARG)) {
+        return foreground::run_guard();
     }
     raise_fd_limit();
 
@@ -90,14 +88,13 @@ async fn run_daemon(cfg: RuntimeConfig) -> Result<()> {
 
     let primary_addr = bound.primary_addr;
     let socks_addr = bound.socks_addr;
-    #[cfg(not(windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let proxy_session = if cfg.system_proxy {
-        Some(SystemProxySession::activate(
-            primary_addr.ip(),
-            primary_addr.port(),
-            socks_addr.map(|a| a.port()),
-            cfg.socks_system_proxy,
-            cfg.env_proxy,
+        Some(foreground::ForegroundProxy::activate(
+            primary_addr,
+            socks_addr
+                .filter(|_| cfg.socks_system_proxy)
+                .map(|a| a.port()),
             &cfg.bypass_domains,
         )?)
     } else {
@@ -105,24 +102,24 @@ async fn run_daemon(cfg: RuntimeConfig) -> Result<()> {
     };
     #[cfg(windows)]
     let proxy_session = if cfg.system_proxy {
-        Some(
-            vdpi::platform::windows::foreground::ForegroundProxy::activate(
-                primary_addr,
-                &cfg.bypass_domains,
-            )?,
-        )
+        Some(foreground::ForegroundProxy::activate(
+            primary_addr,
+            &cfg.bypass_domains,
+        )?)
     } else {
         None
     };
     write_runtime_state(primary_addr, socks_addr);
 
     if !cfg.quiet {
-        #[cfg(not(windows))]
-        let proxy_summary = proxy_session.as_ref().map(|s| s.summary());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let proxy_summary = proxy_session.as_ref().map(|s| s.summary.clone());
         #[cfg(windows)]
         let proxy_summary = proxy_session
             .as_ref()
             .map(|_| "active (Windows proxy with automatic cleanup)".to_string());
+        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+        let proxy_summary = None;
         print_startup_banner(&cfg, primary_addr, socks_addr, proxy_summary);
         info!(
             platform = platform_name(),
@@ -136,44 +133,12 @@ async fn run_daemon(cfg: RuntimeConfig) -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    #[cfg(not(windows))]
-    let (watchdog_stop, watchdog_task) = if let Some(ref session) = proxy_session {
-        let watchdog_session = session.clone();
-        let (tx, mut rx) = watch::channel(false);
-        let task = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
-            ticker.tick().await;
-            loop {
-                tokio::select! {
-                    _ = rx.changed() => break,
-                    _ = ticker.tick() => {
-                        let s = watchdog_session.clone();
-                        let _ = tokio::task::spawn_blocking(move || s.reconcile()).await;
-                    }
-                }
-            }
-        });
-        (Some(tx), Some(task))
-    } else {
-        (None, None)
-    };
-
     let server_task = tokio::spawn(serve_until_shutdown(bound, ctx, shutdown_rx));
 
     wait_for_shutdown_signal().await;
     info!("received shutdown signal; stopping vdpi cleanly");
 
-    #[cfg(not(windows))]
-    {
-        drop(watchdog_stop);
-        if let Some(task) = watchdog_task {
-            let _ = task.await;
-        }
-        if let Some(session) = proxy_session {
-            session.deactivate();
-        }
-    }
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     drop(proxy_session);
     let _ = shutdown_tx.send(true);
     clear_runtime_state(std::process::id());

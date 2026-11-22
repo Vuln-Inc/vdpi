@@ -9,6 +9,8 @@ pub mod macos;
 pub mod windows;
 #[cfg(target_os = "windows")]
 pub mod windows_service;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod unix_foreground;
 
 /// Cross-platform system proxy session handle that configures OS-level HTTP/HTTPS/SOCKS5
 /// settings on startup, reconciles across network changes, and cleanly restores state on exit.
@@ -92,6 +94,11 @@ impl SystemProxySession {
     pub fn deactivate(&self) {
         #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
         self.inner.deactivate();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn deactivate_foreground(&self) {
+        self.inner.deactivate_foreground();
     }
 
     pub fn summary(&self) -> String {

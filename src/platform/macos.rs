@@ -200,6 +200,27 @@ impl MacosProxySession {
         }
         debug!("restored macOS system proxy state");
     }
+
+    pub(super) fn deactivate_foreground(&self) {
+        let addr = self.addr.to_string();
+        let http = self.http_port.to_string();
+        let socks = self.socks_port.map(|p| p.to_string());
+        if let Ok(statuses) = inspect_service_proxies() {
+            for st in statuses {
+                if st.web_enabled && st.web_server == addr && st.web_port == http {
+                    let _ = run_networksetup(&["-setwebproxystate", &st.service, "off"]);
+                }
+                if st.secure_enabled && st.secure_server == addr && st.secure_port == http {
+                    let _ = run_networksetup(&["-setsecurewebproxystate", &st.service, "off"]);
+                }
+                if self.socks_configured && st.socks_enabled && st.socks_server == addr
+                    && socks.as_deref() == Some(st.socks_port.as_str())
+                {
+                    let _ = run_networksetup(&["-setsocksfirewallproxystate", &st.service, "off"]);
+                }
+            }
+        }
+    }
 }
 
 fn is_vpn_default_route_active() -> bool {
