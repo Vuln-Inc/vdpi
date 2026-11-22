@@ -41,7 +41,7 @@ pub fn choose(explicit: bool) -> Result<Choice> {
 
     if selected == Choice::Run {
         if let Err(e) = state
-            .context("could not locate the per-user launcher directory")
+            .context("could not locate the vdpi executable directory")
             .and_then(|p| remember_run(&p))
         {
             eprintln!("vdpi could not save your choice: {e:#}");
@@ -89,27 +89,10 @@ pub fn clear_preference() {
 }
 
 fn preference_path() -> Option<PathBuf> {
-    #[cfg(windows)]
-    let base = env::var_os("LOCALAPPDATA")
-        .filter(|p| !p.is_empty())
-        .map(PathBuf::from);
-    #[cfg(target_os = "macos")]
-    let base = vdpi::service::home_dir()
-        .ok()
-        .map(|p| p.join("Library/Application Support"));
-    #[cfg(not(any(windows, target_os = "macos")))]
-    let base = env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| vdpi::service::home_dir().ok().map(|p| p.join(".config")));
-    base.map(|p| p.join("vdpi").join("run-directly"))
+    Some(env::current_exe().ok()?.parent()?.join("run-directly"))
 }
 
 fn remember_run(path: &Path) -> Result<()> {
-    let parent = path
-        .parent()
-        .context("launcher preference has no parent directory")?;
-    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     // An empty marker is sufficient; create_new publishes it atomically.
     match OpenOptions::new().write(true).create_new(true).open(path) {
         Ok(_) => Ok(()),
@@ -165,7 +148,7 @@ mod tests {
     fn run_preference_survives_reopening_and_repeat_saves() {
         let dir = env::temp_dir().join(format!("vdpi-launcher-test-{}", std::process::id()));
         fs::create_dir(&dir).unwrap();
-        let marker = dir.join("vdpi").join("run-directly");
+        let marker = dir.join("run-directly");
         let result = (|| {
             remember_run(&marker)?;
             remember_run(&marker)?;

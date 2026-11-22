@@ -58,7 +58,7 @@ The launcher is a terminal interface on Windows, macOS, and Linux. Use **Up/Down
 
 **Run directly** saves your choice for future launches and prints a reminder that you can install later with `vdpi install`. Use `vdpi launcher` to reopen the chooser, or `vdpi start` to skip it. Commands with explicit flags and unattended shell invocations can start the foreground proxy without a prompt.
 
-The run-only preference is a file named `run-directly` in `%LOCALAPPDATA%\vdpi` on Windows, `~/Library/Application Support/vdpi` on macOS, or `$XDG_CONFIG_HOME/vdpi` (default `~/.config/vdpi`) on Linux.
+The run-only preference is saved as `run-directly` next to `vdpi.exe` on Windows or `vdpi` on macOS and Linux. Launching from another working directory still uses the file next to the executable. If you upgraded from an older version, select **Run directly** once to save it in the new location.
 
 Foreground mode does not export user proxy environment variables, because apps launched while vdpi is running could keep those variables after it exits.
 
