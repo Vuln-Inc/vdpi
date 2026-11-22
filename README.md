@@ -249,6 +249,23 @@ are not affected by the negotiation timeout.
 The normal test suite uses local sockets. To also run the optional public DNS smoke test,
 use `cargo test --locked resolves_discord_and_roblox_via_live_doh -- --ignored`.
 
+### Building the Android App (APK)
+
+`vdpi` runs on Android (API 26+) via a local userspace `VpnService` backed by a pure-Rust TUN stack (`crates/vdpi-android`) wired directly into `vdpi`'s 7-stage TLS desync engine, anti-poisoning DoH ring, QUIC fallback, and Cone-NAT UDP relay—requiring zero root access.
+
+Requires Rust Android targets (`aarch64-linux-android`, `armv7-linux-androideabi`, `x86_64-linux-android`), `cargo-ndk`, JDK 21, and Android SDK 35 + NDK 27:
+
+```bash
+# 1. Cross-compile libvdpi_android.so for arm64-v8a, armeabi-v7a, and x86_64
+./android/scripts/build-native.sh
+
+# 2. Run Android unit tests, lint, and assemble the release APK
+cd android
+./gradlew testDebugUnitTest lintDebug assembleRelease
+```
+
+The signed universal APK is written to `android/app/build/outputs/apk/release/app-release.apk`.
+
 <details>
 <summary>Repository layout</summary>
 
