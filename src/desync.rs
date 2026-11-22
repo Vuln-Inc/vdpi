@@ -16,7 +16,7 @@ use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tracing::debug;
 
-/// Strategy learned per-hostname (and globally per ISP network) by the 5-Stage Adaptive
+/// Strategy learned per-hostname (and globally per ISP network) by the 6-Stage Adaptive
 /// Auto-Heal TLS Engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -24,27 +24,32 @@ pub enum LearnedStrategy {
     /// Stage 1: Configured primary mode (default `Combo`: 4 wire-paced RFC-compliant TLS records
     /// split across the handshake header and SNI midpoint).
     Primary = 0,
-    /// Stage 2: Single intact outer TLS record split across 4 wire-paced TCP segments (compatible
+    /// Stage 2: TCP Out-of-Band (`MSG_OOB`) urgent decoy byte injected right at the SNI midpoint.
+    /// Real server TCP stacks (`SO_OOBINLINE=0`) strip the urgent byte seamlessly while stateful
+    /// full-stream-reassembling ISP DPI boxes corrupt/miss the SNI completely.
+    OobSniDesync = 1,
+    /// Stage 3: Single intact outer TLS record split across 4 wire-paced TCP segments (compatible
     /// with strict servers that reject multi-record ClientHellos while defeating active DPI).
-    FineFragment = 1,
-    /// Stage 3: Deep 12+ RFC-compliant TLS record storm (up to 10 tiny 2-byte lead records
+    FineFragment = 2,
+    /// Stage 4: Deep 12+ RFC-compliant TLS record storm (up to 10 tiny 2-byte lead records
     /// exhausting hardware DPI per-flow packet caps before SNI hits the wire + SNI splits).
-    DeepRecordStorm = 2,
-    /// Stage 4: Single intact outer TLS record with slow 2-byte SNI-only pacing (for strict
+    DeepRecordStorm = 3,
+    /// Stage 5: Single intact outer TLS record with slow 2-byte SNI-only pacing (for strict
     /// servers behind stateful burst-reassembling DPI).
-    SlowSniSlice = 3,
-    /// Stage 5: Unmodified single-write passthrough (for unblocked strict WAFs/CDNs).
-    DirectPassthrough = 4,
+    SlowSniSlice = 4,
+    /// Stage 6: Unmodified single-write passthrough (for unblocked strict WAFs/CDNs).
+    DirectPassthrough = 5,
 }
 
 impl LearnedStrategy {
     fn from_u8(val: u8) -> Self {
         match val {
             0 => Self::Primary,
-            1 => Self::FineFragment,
-            2 => Self::DeepRecordStorm,
-            3 => Self::SlowSniSlice,
-            4 => Self::DirectPassthrough,
+            1 => Self::OobSniDesync,
+            2 => Self::FineFragment,
+            3 => Self::DeepRecordStorm,
+            4 => Self::SlowSniSlice,
+            5 => Self::DirectPassthrough,
             _ => Self::Primary,
         }
     }
@@ -54,8 +59,9 @@ impl LearnedStrategy {
     }
 }
 
-const ALL_STAGES: [LearnedStrategy; 5] = [
+const ALL_STAGES: [LearnedStrategy; 6] = [
     LearnedStrategy::Primary,
+    LearnedStrategy::OobSniDesync,
     LearnedStrategy::FineFragment,
     LearnedStrategy::DeepRecordStorm,
     LearnedStrategy::SlowSniSlice,
@@ -456,6 +462,12 @@ impl EngineContext {
                     }
                 }
             },
+            LearnedStrategy::OobSniDesync => {
+                // Inject 1 TCP Out-of-Band (MSG_OOB, URG=1) decoy byte right at the SNI midpoint.
+                // Real server kernels strip the urgent byte (SO_OOBINLINE=0), while DPI stream
+                // reassemblers ignore URG and see a corrupted hostname (e.g. "discaord.com").
+                write_oob_sni_split(remote, payload, ch_info).await?;
+            }
             LearnedStrategy::FineFragment => {
                 // Single intact outer TLS record split across 4 wire-paced TCP segments
                 // breaking both the 5-byte TLS record header and the SNI hostname midpoint.
@@ -698,6 +710,108 @@ async fn write_targeted_sni_slices(
     Ok(())
 }
 
+/// Sends a single intact TLS record while injecting 1 TCP Out-of-Band (`MSG_OOB`, `URG=1`)
+/// decoy byte right at the SNI hostname midpoint.
+/// Destination TCP stacks strip the urgent byte (`SO_OOBINLINE=0`), while stateful DPI
+/// stream reassemblers merge the decoy byte into the SNI and fail signature matching.
+async fn write_oob_sni_split(
+    stream: &mut TcpStream,
+    payload: &[u8],
+    ch_info: &ClientHelloInfo,
+) -> Result<()> {
+    if payload.len() <= 6 {
+        stream.write_all(payload).await?;
+        return Ok(());
+    }
+
+    let split_at = match (ch_info.sni_payload_offset, ch_info.sni_len) {
+        (Some(off), Some(len)) if len >= 2 => (5 + off + (len / 2)).clamp(1, payload.len() - 1),
+        (Some(off), Some(_)) => (5 + off).clamp(1, payload.len() - 1),
+        _ => (payload.len() / 2).clamp(1, payload.len() - 1),
+    };
+
+    // Keep the MSG_OOB write under 1024 bytes so the kernel transmits it atomically in a single
+    // TCP segment with URG pointing directly at the trailing decoy byte (even for large
+    // Post-Quantum ClientHellos where SNI appears past offset 1200).
+    let oob_start = split_at.saturating_sub(1000);
+    if oob_start > 0 {
+        stream.write_all(&payload[..oob_start]).await?;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    let mut oob_chunk = Vec::with_capacity((split_at - oob_start) + 1);
+    oob_chunk.extend_from_slice(&payload[oob_start..split_at]);
+    oob_chunk.push(b'a');
+    send_with_oob(stream, &oob_chunk).await?;
+
+    tokio::time::sleep(Duration::from_millis(3)).await;
+    stream.write_all(&payload[split_at..]).await?;
+    Ok(())
+}
+
+async fn send_with_oob(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
+    use tokio::io::Interest;
+
+    let mut sent = 0usize;
+    while sent < data.len() {
+        stream.writable().await?;
+        let slice = &data[sent..];
+        let res = stream.try_io(Interest::WRITABLE, || raw_send_oob(stream, slice));
+        match res {
+            Ok(0) => bail!("peer closed connection during MSG_OOB send"),
+            Ok(n) => sent += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn raw_send_oob(stream: &TcpStream, data: &[u8]) -> std::io::Result<usize> {
+    use std::ffi::c_void;
+    use std::os::unix::io::AsRawFd;
+
+    const MSG_OOB: i32 = 0x1;
+    extern "C" {
+        fn send(sockfd: i32, buf: *const c_void, len: usize, flags: i32) -> isize;
+    }
+
+    let n = unsafe { send(stream.as_raw_fd(), data.as_ptr().cast::<c_void>(), data.len(), MSG_OOB) };
+    if n < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    }
+}
+
+#[cfg(windows)]
+fn raw_send_oob(stream: &TcpStream, data: &[u8]) -> std::io::Result<usize> {
+    use std::os::windows::io::AsRawSocket;
+
+    const MSG_OOB: i32 = 0x1;
+    const WSAEWOULDBLOCK: i32 = 10035;
+
+    #[link(name = "ws2_32")]
+    extern "system" {
+        fn send(s: usize, buf: *const u8, len: i32, flags: i32) -> i32;
+        fn WSAGetLastError() -> i32;
+    }
+
+    let len = i32::try_from(data.len()).unwrap_or(i32::MAX);
+    let n = unsafe { send(stream.as_raw_socket() as usize, data.as_ptr(), len, MSG_OOB) };
+    if n < 0 {
+        let code = unsafe { WSAGetLastError() };
+        if code == WSAEWOULDBLOCK {
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+        } else {
+            Err(std::io::Error::from_raw_os_error(code))
+        }
+    } else {
+        Ok(n as usize)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -840,7 +954,7 @@ mod tests {
                 .await
                 .get("cdn.strict-images.example")
                 .copied(),
-            Some(LearnedStrategy::FineFragment)
+            Some(LearnedStrategy::OobSniDesync)
         );
     }
 
