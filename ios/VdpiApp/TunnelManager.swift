@@ -224,12 +224,11 @@ final class TunnelManager: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] notification in
-            guard let self,
-                  let connection = notification.object as? NEVPNConnection,
-                  connection === self.vpnManager?.connection
-            else { return }
-            Task { @MainActor in
-                self.syncStatus(connection.status)
+            guard let connection = notification.object as? NEVPNConnection else { return }
+            let status = connection.status
+            Task { @MainActor [weak self] in
+                guard let self, connection === self.vpnManager?.connection else { return }
+                self.syncStatus(status)
             }
         }
     }

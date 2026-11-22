@@ -12,6 +12,12 @@ cd "$REPO_ROOT"
 # Ensure required Apple targets are installed
 rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 
+# Pin minimum deployment target to iOS 16.0 across Rust + C/asm crates (ring)
+export IPHONEOS_DEPLOYMENT_TARGET="16.0"
+export CFLAGS_aarch64_apple_ios="-miphoneos-version-min=16.0"
+export CFLAGS_aarch64_apple_ios_sim="-mios-simulator-version-min=16.0"
+export CFLAGS_x86_64_apple_ios="-mios-simulator-version-min=16.0"
+
 # Cross-compile static libraries for physical iOS (arm64) and iOS Simulator (arm64 + x86_64)
 cargo build -p vdpi-ios --release --locked --target aarch64-apple-ios
 cargo build -p vdpi-ios --release --locked --target aarch64-apple-ios-sim
