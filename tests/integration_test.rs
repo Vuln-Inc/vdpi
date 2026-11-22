@@ -1,13 +1,14 @@
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::watch;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use vdpi::config::{CliArgs, DesyncMode};
-use vdpi::desync::EngineContext;
+use vdpi::desync::{EngineContext, LearnedStrategy};
 use vdpi::proxy::socks::{encode_socks5_udp_packet, parse_socks5_udp_packet};
 use vdpi::server::{bind_listeners, serve_until_shutdown};
 
@@ -214,4 +215,58 @@ async fn end_to_end_socks5_udp_associate_voice_and_game_relay() {
 
     drop(ctrl);
     let _ = stop_tx.send(true);
+}
+
+#[tokio::test]
+async fn end_to_end_all_five_desync_stages_complete_real_tls_handshake() {
+    let host = "chat.discord.test";
+    let (tls_addr, cert) = spawn_local_tls_echo_server(host).await;
+    let connector = build_tls_client_connector(cert);
+
+    let stages = [
+        LearnedStrategy::Primary,
+        LearnedStrategy::FineFragment,
+        LearnedStrategy::DeepRecordStorm,
+        LearnedStrategy::SlowSniSlice,
+        LearnedStrategy::DirectPassthrough,
+    ];
+
+    for stage in stages {
+        let cli = CliArgs::parse_from_iter([
+            "vdpi",
+            "--no-system-proxy",
+            "--chunk-size",
+            "10",
+            "--include",
+            "discord\\.test$",
+        ])
+        .unwrap();
+        let ctx = EngineContext::new(cli.into_runtime_config()).unwrap();
+        ctx.preferred_isp_stage
+            .store(stage as u8, Ordering::Relaxed);
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+
+        let srv_ctx = ctx.clone();
+        let relay_task = tokio::spawn(async move {
+            let (client_sock, _) = proxy_listener.accept().await.unwrap();
+            let remote_sock = TcpStream::connect(tls_addr).await.unwrap();
+            srv_ctx
+                .relay_tunnel(client_sock, remote_sock, Some(host), tls_addr)
+                .await
+                .unwrap();
+        });
+
+        let client_tcp = TcpStream::connect(proxy_addr).await.unwrap();
+        let sni = ServerName::try_from(host).unwrap();
+        let mut tls = connector.connect(sni, client_tcp).await.unwrap();
+        let msg = format!("ok-{stage:?}");
+        tls.write_all(msg.as_bytes()).await.unwrap();
+        let mut reply = Vec::new();
+        tls.read_to_end(&mut reply).await.unwrap();
+        assert_eq!(reply, msg.as_bytes());
+        drop(tls);
+        relay_task.await.unwrap();
+    }
 }
