@@ -98,11 +98,11 @@ jobs:
         with:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
       - uses: Swatinem/rust-cache@v2
-      - name: Install XcodeGen
+      - name: Install XcodeGen & ldid
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
           HOMEBREW_NO_INSTALL_CLEANUP: "1"
-        run: brew install xcodegen
+        run: brew install xcodegen ldid-procursus
       - name: Build VdpiCore.xcframework (Rust iOS + Simulator)
         run: ./ios/scripts/build-xcframework.sh
       - name: Generate Xcode Project
@@ -152,16 +152,11 @@ jobs:
           test -d "$APP_PATH"
           test -d "$APPEX_PATH"
 
-          # Ad-hoc sign with entitlements preserved (required for TrollStore; re-signers replace this cleanly)
-          codesign --force --sign - --entitlements PacketTunnel/PacketTunnel.entitlements "$APPEX_PATH"
-          codesign --force --sign - --entitlements VdpiApp/VdpiApp.entitlements "$APP_PATH"
-          codesign --display --entitlements - --xml "$APPEX_PATH" | plutil -convert xml1 -o /tmp/vdpi-appex-ent.plist -
-          codesign --display --entitlements - --xml "$APP_PATH" | plutil -convert xml1 -o /tmp/vdpi-app-ent.plist -
-          cat /tmp/vdpi-appex-ent.plist
-          cat /tmp/vdpi-app-ent.plist
-          grep -q "packet-tunnel-provider" /tmp/vdpi-appex-ent.plist
-          grep -q "group.com.vulninc.vdpi" /tmp/vdpi-app-ent.plist
-          rm -f /tmp/vdpi-appex-ent.plist /tmp/vdpi-app-ent.plist
+          # Ad-hoc sign with ldid so iOS arm64 entitlements are preserved (required for TrollStore; re-signers replace this cleanly)
+          ldid -SPacketTunnel/PacketTunnel.entitlements "$APPEX_PATH/VdpiPacketTunnel"
+          ldid -SVdpiApp/VdpiApp.entitlements "$APP_PATH/VdpiApp"
+          ldid -e "$APPEX_PATH/VdpiPacketTunnel" | tee /dev/stderr | grep -q "packet-tunnel-provider"
+          ldid -e "$APP_PATH/VdpiApp" | tee /dev/stderr | grep -q "group.com.vulninc.vdpi"
 
           mkdir -p ../dist/ios/ipa-stage/Payload
           cp -R "$APP_PATH" ../dist/ios/ipa-stage/Payload/VdpiApp.app
