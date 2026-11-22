@@ -168,8 +168,8 @@ fun SectionOverline(
 @Composable
 fun PrecisionSwitch(
     checked: Boolean,
-    onCheckedChange: ((Boolean) -> Unit)? = null,
     modifier: Modifier = Modifier,
+    onCheckedChange: ((Boolean) -> Unit)? = null,
     useSignalAccent: Boolean = false,
 ) {
     val palette = VdpiThemeTokens.palette
