@@ -3,6 +3,9 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 use vdpi::config::{DesyncMode, RuntimeConfig};
 
+pub const MIN_MTU: usize = 1280;
+pub const MAX_MTU: usize = 9000;
+
 /// JSON-serializable runtime settings passed from the Android app into the Rust TUN engine.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -40,6 +43,10 @@ impl AndroidConfig {
             return Ok(Self::default());
         }
         serde_json::from_str(raw)
+    }
+
+    pub fn clamped_mtu(&self) -> usize {
+        self.mtu.clamp(MIN_MTU, MAX_MTU)
     }
 
     pub fn into_runtime_config(self) -> RuntimeConfig {
@@ -99,14 +106,22 @@ mod tests {
     }
 
     #[test]
-    fn clamps_runtime_config_bounds() {
-        let cfg = AndroidConfig {
+    fn clamps_runtime_config_and_mtu_bounds() {
+        let raw = AndroidConfig {
             chunk_size: 0,
             timeout_ms: 100,
+            mtu: usize::MAX,
             dns_addr: "   ".into(),
             ..Default::default()
-        }
-        .into_runtime_config();
+        };
+        assert_eq!(raw.clamped_mtu(), MAX_MTU);
+        let low = AndroidConfig {
+            mtu: 64,
+            ..Default::default()
+        };
+        assert_eq!(low.clamped_mtu(), MIN_MTU);
+
+        let cfg = raw.into_runtime_config();
 
         assert_eq!(cfg.chunk_size, 1);
         assert_eq!(cfg.connect_timeout, Duration::from_millis(1500));

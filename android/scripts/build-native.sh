@@ -7,6 +7,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
 cargo ndk \
+  -P 26 \
   -t arm64-v8a \
   -t armeabi-v7a \
   -t x86_64 \

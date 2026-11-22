@@ -9,11 +9,13 @@ use crate::config::AndroidConfig;
 use crate::doctor::run_doctor;
 use crate::events::{EngineEvent, EventRing};
 use crate::tun_engine::TunStats;
-use anyhow::Result;
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::{anyhow, Result};
 use serde::Serialize;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -50,44 +52,80 @@ struct ActiveTunnel {
 
 struct TunnelManager {
     runtime: Runtime,
+    /// Serializes start/stop lifecycle transitions without blocking telemetry reads.
+    lifecycle_lock: Mutex<()>,
     active: Mutex<Option<ActiveTunnel>>,
     events: Arc<EventRing>,
 }
 
-static MANAGER: OnceLock<TunnelManager> = OnceLock::new();
+static MANAGER: OnceLock<std::result::Result<TunnelManager, String>> = OnceLock::new();
 
-fn manager() -> &'static TunnelManager {
-    MANAGER.get_or_init(|| {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
+fn manager() -> Result<&'static TunnelManager> {
+    let init = MANAGER.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .thread_name("vdpi-android")
             .enable_all()
             .build()
-            .expect("failed to initialize tokio runtime");
-        TunnelManager {
-            runtime,
-            active: Mutex::new(None),
-            events: Arc::new(EventRing::new()),
-        }
-    })
+            .map(|runtime| TunnelManager {
+                runtime,
+                lifecycle_lock: Mutex::new(()),
+                active: Mutex::new(None),
+                events: Arc::new(EventRing::new()),
+            })
+            .map_err(|e| format!("failed to initialize tokio runtime: {e}"))
+    });
+    match init {
+        Ok(mgr) => Ok(mgr),
+        Err(msg) => Err(anyhow!("{msg}")),
+    }
 }
 
 pub fn engine_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// Starts the Android TUN engine on `tun_fd`. Replaces any existing session cleanly.
-#[cfg(unix)]
-pub fn start_tunnel(tun_fd: i32, cfg: AndroidConfig) -> Result<()> {
-    stop_tunnel();
+fn stop_active_locked(mgr: &TunnelManager) {
+    let active = mgr.active.lock().ok().and_then(|mut g| g.take());
+    if let Some(tunnel) = active {
+        let _ = tunnel.shutdown_tx.send(true);
+        let mut handle = tunnel.task;
+        // Wait boundedly for graceful teardown so `OwnedFd` closes before returning.
+        let finished = mgr.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_millis(1500), &mut handle)
+                .await
+                .is_ok()
+        });
+        if !finished {
+            handle.abort();
+        }
+        mgr.events.push("info", "tunnel", "disconnect completed");
+    }
+}
 
-    let mgr = manager();
-    let mtu = cfg.mtu;
+/// Starts the Android TUN engine on `owned_fd`, closing any prior session cleanly first.
+/// Registers `owned_fd` with Tokio synchronously so invalid fds fail immediately and never leak.
+#[cfg(unix)]
+pub fn start_tunnel(owned_fd: std::os::unix::io::OwnedFd, cfg: AndroidConfig) -> Result<()> {
+    let mgr = manager()?;
+    let _lifecycle = mgr
+        .lifecycle_lock
+        .lock()
+        .map_err(|_| anyhow!("tunnel lifecycle lock poisoned"))?;
+
+    stop_active_locked(mgr);
+
+    let mtu = cfg.clamped_mtu();
     let mode_label = format!("{:?}", cfg.mode);
     let dns_label = cfg.dns_addr.clone();
     let doh_enabled = cfg.enable_doh;
 
     let ctx = EngineContext::new(cfg.into_runtime_config())?;
+    let async_fd = {
+        let _enter = mgr.runtime.enter();
+        tun_engine::register_tun_fd(owned_fd).context("failed to register Android TUN fd")?
+    };
+
     let tun_stats = Arc::new(TunStats::default());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -104,8 +142,8 @@ pub fn start_tunnel(tun_fd: i32, cfg: AndroidConfig) -> Result<()> {
     let task_events = Arc::clone(&mgr.events);
 
     let task = mgr.runtime.spawn(async move {
-        if let Err(e) = tun_engine::run_tun_fd(
-            tun_fd,
+        if let Err(e) = tun_engine::run_registered_tun_fd(
+            async_fd,
             task_ctx,
             task_stats,
             Arc::clone(&task_events),
@@ -138,17 +176,19 @@ pub fn start_tunnel(_tun_fd: i32, _cfg: AndroidConfig) -> Result<()> {
 }
 
 pub fn stop_tunnel() {
-    let mgr = manager();
-    let active = mgr.active.lock().ok().and_then(|mut g| g.take());
-    if let Some(tunnel) = active {
-        let _ = tunnel.shutdown_tx.send(true);
-        tunnel.task.abort();
-        mgr.events.push("info", "tunnel", "disconnect requested");
-    }
+    let Ok(mgr) = manager() else {
+        return;
+    };
+    let Ok(_lifecycle) = mgr.lifecycle_lock.lock() else {
+        return;
+    };
+    stop_active_locked(mgr);
 }
 
 pub fn clear_engine_cache() {
-    let mgr = manager();
+    let Ok(mgr) = manager() else {
+        return;
+    };
     let ctx = mgr
         .active
         .lock()
@@ -165,22 +205,23 @@ pub fn clear_engine_cache() {
 }
 
 pub fn snapshot_json() -> String {
-    let mgr = manager();
+    let Ok(mgr) = manager() else {
+        return r#"{"running":false}"#.to_string();
+    };
     let events = mgr.events.snapshot();
     let snapshot = {
         let guard = mgr.active.lock().ok();
         if let Some(Some(tunnel)) = guard.as_deref() {
             let core = tunnel.ctx.telemetry_snapshot();
             let stage = tunnel.ctx.preferred_stage();
-            let learned_hosts = tunnel
-                .ctx
-                .adaptive_cache
-                .try_read()
-                .map(|m| m.len())
-                .unwrap_or(0);
+            let running = !tunnel.task.is_finished();
             TelemetrySnapshot {
-                running: !tunnel.task.is_finished(),
-                uptime_secs: tunnel.started_at.elapsed().as_secs(),
+                running,
+                uptime_secs: if running {
+                    tunnel.started_at.elapsed().as_secs()
+                } else {
+                    0
+                },
                 active_connections: core.active_connections,
                 total_connections: core.total_connections,
                 bytes_tx: core.bytes_tx,
@@ -190,7 +231,7 @@ pub fn snapshot_json() -> String {
                 dns_queries: tunnel.ctx.dns.query_count(),
                 quic_blocked: tunnel.tun_stats.quic_blocked.load(Ordering::Relaxed),
                 udp_flows_active: tunnel.tun_stats.udp_flows_active.load(Ordering::Relaxed),
-                learned_hosts,
+                learned_hosts: core.learned_hosts,
                 stage_number: stage.stage_number(),
                 stage_label: stage.label().to_string(),
                 dns_addr: tunnel.ctx.config.dns_addr.clone(),
@@ -225,7 +266,9 @@ pub fn snapshot_json() -> String {
 
 pub fn run_doctor_json(config_json: &str) -> String {
     let cfg = AndroidConfig::from_json_str(config_json).unwrap_or_default();
-    let mgr = manager();
+    let Ok(mgr) = manager() else {
+        return r#"{"ok":false,"checks":[]}"#.to_string();
+    };
     mgr.events
         .push("info", "doctor", "running live connectivity diagnostics");
     let report = mgr.runtime.block_on(run_doctor(&cfg));
@@ -233,7 +276,10 @@ pub fn run_doctor_json(config_json: &str) -> String {
     mgr.events.push(
         if report.ok { "info" } else { "warn" },
         "doctor",
-        format!("diagnostics finished ({passed}/{} passed)", report.checks.len()),
+        format!(
+            "diagnostics finished ({passed}/{} passed)",
+            report.checks.len()
+        ),
     );
     serde_json::to_string(&report).unwrap_or_else(|_| r#"{"ok":false,"checks":[]}"#.to_string())
 }

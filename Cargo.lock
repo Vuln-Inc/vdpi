@@ -1873,9 +1873,13 @@ dependencies = [
  "jni",
  "libc",
  "netstack-smoltcp",
+ "rcgen",
+ "rustls",
  "serde",
  "serde_json",
+ "socket2 0.5.10",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "vdpi",
 ]

@@ -1,7 +1,9 @@
 use crate::config::{DesyncMode, RuntimeConfig};
 use crate::desync::EngineContext;
 use crate::platform::{clear_all_system_proxies, platform_name, print_platform_proxy_status};
-use anyhow::{bail, Context, Result};
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+use anyhow::Context;
+use anyhow::{bail, Result};
 use reqwest::{Client, Proxy};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -342,13 +344,13 @@ fn xml_escape(s: &str) -> String {
 /// Installs the `vdpi` binary into the service directory and registers automatic
 /// background startup for the active operating system (macOS LaunchAgent, native Windows
 /// Service under SCM, or Linux systemd user unit).
-pub fn install_service(cfg: &RuntimeConfig) -> Result<()> {
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        let _ = cfg;
-        bail!("service installation is not supported on {}", platform_name());
-    }
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+pub fn install_service(_cfg: &RuntimeConfig) -> Result<()> {
+    bail!("service installation is not supported on {}", platform_name());
+}
 
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+pub fn install_service(cfg: &RuntimeConfig) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         use crate::platform::windows::{broadcast_environment_change, notify_wininet_refresh};
