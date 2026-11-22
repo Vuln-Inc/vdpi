@@ -13,6 +13,10 @@ const QTYPE_A: u16 = 1;
 const QTYPE_CNAME: u16 = 5;
 const QTYPE_AAAA: u16 = 28;
 const QCLASS_IN: u16 = 1;
+const MAX_CACHE_ENTRIES: usize = 4096;
+const MAX_CACHED_IPS: usize = 32;
+const MAX_DNS_NAME_BYTES: usize = 253;
+const MAX_DNS_MESSAGE_BYTES: usize = u16::MAX as usize;
 
 #[derive(Debug, Clone)]
 struct CacheEntry {
@@ -44,6 +48,7 @@ impl DnsResolver {
             .timeout(Duration::from_millis(2000))
             .connect_timeout(Duration::from_millis(1200))
             .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(2)
             .tcp_nodelay(true)
             .build()
             .context("failed to build DoH HTTP client")?;
@@ -74,8 +79,8 @@ impl DnsResolver {
             .trim_end_matches('.')
             .to_ascii_lowercase();
 
-        if normalized.is_empty() {
-            bail!("empty hostname");
+        if normalized.is_empty() || normalized.len() > MAX_DNS_NAME_BYTES {
+            bail!("invalid hostname length");
         }
 
         // 1. Direct IP literal
@@ -149,13 +154,10 @@ impl DnsResolver {
             bail!("no IP addresses resolved for {normalized}");
         }
 
-        {
+        if ips.len() <= MAX_CACHED_IPS {
             let mut guard = self.cache.write().await;
-            if guard.len() > 4096 {
-                let now = Instant::now();
-                guard.retain(|_, v| v.expires_at > now);
-            }
-            guard.insert(
+            insert_cache_entry(
+                &mut guard,
                 normalized,
                 CacheEntry {
                     ips: ips.clone(),
@@ -360,13 +362,23 @@ impl DnsResolver {
     }
 }
 
+fn insert_cache_entry(cache: &mut HashMap<String, CacheEntry>, key: String, entry: CacheEntry) {
+    if cache.len() >= MAX_CACHE_ENTRIES && !cache.contains_key(&key) {
+        // TTL alone doesn't cap a burst of unique answers, all of which may be fresh.
+        if let Some(victim) = cache.keys().next().cloned() {
+            cache.remove(&victim);
+        }
+    }
+    cache.insert(key, entry);
+}
+
 async fn send_doh_request(
     http: &Client,
     endpoint: &str,
     wire_query: &[u8],
     qtype: u16,
 ) -> Result<(Vec<IpAddr>, Duration)> {
-    let resp = http
+    let mut resp = http
         .post(endpoint)
         .header("content-type", "application/dns-message")
         .header("accept", "application/dns-message")
@@ -376,7 +388,19 @@ async fn send_doh_request(
     if !resp.status().is_success() {
         bail!("DoH HTTP status {} from {}", resp.status(), endpoint);
     }
-    let bytes = resp.bytes().await?;
+    if resp
+        .content_length()
+        .is_some_and(|n| n > MAX_DNS_MESSAGE_BYTES as u64)
+    {
+        bail!("DoH response exceeded {MAX_DNS_MESSAGE_BYTES} bytes");
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if chunk.len() > MAX_DNS_MESSAGE_BYTES - bytes.len() {
+            bail!("DoH response exceeded {MAX_DNS_MESSAGE_BYTES} bytes");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     decode_dns_response(&bytes, qtype)
 }
 
@@ -612,6 +636,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dns_cache_is_bounded_even_when_every_answer_is_fresh() {
+        let mut cache = HashMap::new();
+        let entry = CacheEntry {
+            ips: vec![Ipv4Addr::LOCALHOST.into()],
+            expires_at: Instant::now() + Duration::from_secs(3600),
+        };
+        for i in 0..MAX_CACHE_ENTRIES * 2 {
+            insert_cache_entry(&mut cache, format!("{i}.example"), entry.clone());
+            assert!(cache.len() <= MAX_CACHE_ENTRIES);
+        }
+        assert_eq!(cache.len(), MAX_CACHE_ENTRIES);
+        assert!(cache.contains_key(&format!("{}.example", MAX_CACHE_ENTRIES * 2 - 1)));
+    }
+
+    #[test]
     fn encodes_and_decodes_cname_plus_a_and_cname_only_aaaa() {
         let q = encode_dns_query("www.roblox.com", QTYPE_A).unwrap();
         assert_eq!(&q[12..16], &[3, b'w', b'w', b'w']);
@@ -646,6 +685,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires public DNS and DoH connectivity"]
     async fn resolves_discord_and_roblox_via_live_doh() {
         let resolver = DnsResolver::new("1.1.1.1", 53, true, false).unwrap();
         let roblox_ips = resolver.resolve("www.roblox.com").await.unwrap();
