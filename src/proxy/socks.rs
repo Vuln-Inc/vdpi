@@ -1,3 +1,4 @@
+use super::HANDSHAKE_TIMEOUT;
 use crate::desync::EngineContext;
 use anyhow::{bail, Result};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -20,35 +21,8 @@ const ATYP_IPV6: u8 = 0x04;
 pub async fn handle_socks5_client(mut client: TcpStream, ctx: EngineContext) -> Result<()> {
     let _ = client.set_nodelay(true);
 
-    // 1. Greeting: [VER, NMETHODS, METHODS...]
-    let mut hdr = [0u8; 2];
-    client.read_exact(&mut hdr).await?;
-    if hdr[0] != SOCKS5_VER {
-        bail!("unexpected SOCKS5 version {}", hdr[0]);
-    }
-    let nmethods = hdr[1] as usize;
-    let mut methods = vec![0u8; nmethods];
-    if nmethods > 0 {
-        client.read_exact(&mut methods).await?;
-    }
-
-    if !methods.contains(&0x00) {
-        let _ = client.write_all(&[SOCKS5_VER, 0xff]).await;
-        bail!("SOCKS5 client did not offer NO AUTH (0x00)");
-    }
-    client.write_all(&[SOCKS5_VER, 0x00]).await?;
-    client.flush().await?;
-
-    // 2. Request: [VER, CMD, RSV, ATYP, DST.ADDR, DST.PORT]
-    let mut req_hdr = [0u8; 4];
-    client.read_exact(&mut req_hdr).await?;
-    if req_hdr[0] != SOCKS5_VER {
-        bail!("invalid SOCKS5 request version {}", req_hdr[0]);
-    }
-
-    let cmd = req_hdr[1];
-    let atyp = req_hdr[3];
-    let (target_host, known_domain, target_port) = read_socks5_addr(&mut client, atyp).await?;
+    let (cmd, (target_host, known_domain, target_port)) =
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, read_socks5_request(&mut client)).await??;
 
     match cmd {
         CMD_CONNECT => {
@@ -99,30 +73,37 @@ pub async fn handle_socks5_client(mut client: TcpStream, ctx: EngineContext) -> 
     }
 }
 
+async fn read_socks5_request(
+    client: &mut TcpStream,
+) -> Result<(u8, (String, Option<String>, u16))> {
+    let mut hdr = [0u8; 2];
+    client.read_exact(&mut hdr).await?;
+    if hdr[0] != SOCKS5_VER {
+        bail!("unexpected SOCKS5 version {}", hdr[0]);
+    }
+    let mut methods = [0u8; 255];
+    let methods = &mut methods[..usize::from(hdr[1])];
+    client.read_exact(methods).await?;
+    if !methods.contains(&0x00) {
+        let _ = client.write_all(&[SOCKS5_VER, 0xff]).await;
+        bail!("SOCKS5 client did not offer NO AUTH (0x00)");
+    }
+    client.write_all(&[SOCKS5_VER, 0x00]).await?;
+    client.flush().await?;
+
+    let mut req_hdr = [0u8; 4];
+    client.read_exact(&mut req_hdr).await?;
+    if req_hdr[0] != SOCKS5_VER {
+        bail!("invalid SOCKS5 request version {}", req_hdr[0]);
+    }
+    Ok((req_hdr[1], read_socks5_addr(client, req_hdr[3]).await?))
+}
+
 /// Handles a SOCKS4 / SOCKS4a `CONNECT` client connection.
 pub async fn handle_socks4_client(mut client: TcpStream, ctx: EngineContext) -> Result<()> {
     let _ = client.set_nodelay(true);
-
-    let mut hdr = [0u8; 8];
-    client.read_exact(&mut hdr).await?;
-    if hdr[0] != SOCKS4_VER || hdr[1] != CMD_CONNECT {
-        let _ = client.write_all(&[0x00, 0x5b, 0, 0, 0, 0, 0, 0]).await;
-        bail!("unsupported SOCKS4 header");
-    }
-
-    let port = u16::from_be_bytes([hdr[2], hdr[3]]);
-    let ip = Ipv4Addr::new(hdr[4], hdr[5], hdr[6], hdr[7]);
-
-    // Read null-terminated USERID
-    read_cstring(&mut client, 256).await?;
-
-    // SOCKS4a: 0.0.0.x (x != 0) carries null-terminated domain after USERID
-    let (host, known_domain) = if hdr[4] == 0 && hdr[5] == 0 && hdr[6] == 0 && hdr[7] != 0 {
-        let domain = read_cstring(&mut client, 512).await?;
-        (domain.clone(), Some(domain))
-    } else {
-        (ip.to_string(), None)
-    };
+    let (host, known_domain, port) =
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, read_socks4_request(&mut client)).await??;
 
     debug!(host = %host, port = port, "SOCKS4/4a CONNECT");
     match ctx.connect_target(&host, port).await {
@@ -137,6 +118,31 @@ pub async fn handle_socks4_client(mut client: TcpStream, ctx: EngineContext) -> 
             Err(e)
         }
     }
+}
+
+async fn read_socks4_request(client: &mut TcpStream) -> Result<(String, Option<String>, u16)> {
+    let mut hdr = [0u8; 8];
+    client.read_exact(&mut hdr).await?;
+    if hdr[0] != SOCKS4_VER || hdr[1] != CMD_CONNECT {
+        let _ = client.write_all(&[0x00, 0x5b, 0, 0, 0, 0, 0, 0]).await;
+        bail!("unsupported SOCKS4 header");
+    }
+
+    let port = u16::from_be_bytes([hdr[2], hdr[3]]);
+    let ip = Ipv4Addr::new(hdr[4], hdr[5], hdr[6], hdr[7]);
+
+    // Read null-terminated USERID
+    read_cstring(client, 256).await?;
+
+    // SOCKS4a: 0.0.0.x (x != 0) carries null-terminated domain after USERID
+    let (host, known_domain) = if hdr[4] == 0 && hdr[5] == 0 && hdr[6] == 0 && hdr[7] != 0 {
+        let domain = read_cstring(client, 512).await?;
+        (domain.clone(), Some(domain))
+    } else {
+        (ip.to_string(), None)
+    };
+
+    Ok((host, known_domain, port))
 }
 
 async fn run_udp_associate_session(
