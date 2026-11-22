@@ -76,7 +76,7 @@ public struct NativeEngineConfig: Codable, Equatable, Sendable {
         ipv4Only: Bool = false,
         blockQuic: Bool = true,
         timeoutMs: UInt64 = 8000,
-        mtu: Int = 1500,
+        mtu: Int = 1400,
         bypassDomains: [String] = []
     ) {
         self.mode = mode
@@ -112,7 +112,7 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
         enableDoh: Bool = true,
         ipv4Only: Bool = false,
         blockQuic: Bool = true,
-        mtu: Int = 1500,
+        mtu: Int = 1400,
         bypassDomains: [String] = [],
         onDemandEnabled: Bool = false,
         theme: ThemePreference = .dark

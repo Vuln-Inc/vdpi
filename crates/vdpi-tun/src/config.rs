@@ -88,7 +88,7 @@ impl Default for TunnelConfig {
             ipv4_only: false,
             block_quic: true,
             timeout_ms: 8000,
-            mtu: 1500,
+            mtu: 1400,
             bypass_domains: Vec::new(),
         }
     }
@@ -159,7 +159,7 @@ mod tests {
         assert_eq!(partial.dns_addr, "9.9.9.9");
         assert!(!partial.block_quic);
         assert!(partial.enable_doh);
-        assert_eq!(partial.mtu, 1500);
+        assert_eq!(partial.mtu, 1400);
     }
 
     #[test]

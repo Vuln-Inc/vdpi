@@ -105,11 +105,13 @@ pub fn is_valid_inbound_tun_packet(pkt: &[u8]) -> bool {
     true
 }
 
-/// Detects QUIC Long-Header Initial packets on UDP/443 (RFC 9000: header form bit 0x80 and
-/// fixed bit 0x40 set, minimum padded Initial datagram size) so non-QUIC UDP/443 protocols
-/// such as WireGuard or TURN are not blindly dropped.
-pub fn is_quic_initial_packet(payload: &[u8]) -> bool {
-    payload.len() >= 1000 && (payload[0] & 0xc0) == 0xc0
+/// Detects whether a UDP/443 payload looks like QUIC traffic (including RFC 9000 Long Header
+/// `0xc0`, RFC 9287 Greased Fixed-Bit Long Header `0x80`, and Short-Header 1-RTT packets).
+/// When `block_quic` is enabled on a mobile TUN, dropping *all* non-empty UDP/443 datagrams for
+/// desync-eligible hosts prevents half-open or migrated QUIC sessions that otherwise trigger
+/// Chrome `ERR_QUIC_PROTOCOL_ERROR` instead of a clean TCP/TLS fallback.
+pub fn is_blocked_quic_udp(dst_port: u16, payload: &[u8]) -> bool {
+    dst_port == 443 && !payload.is_empty()
 }
 
 fn max_udp_payload_for_mtu(mtu: usize, is_ipv4: bool) -> usize {
@@ -327,13 +329,33 @@ pub async fn run_tun_pipeline(
                             _ = wait_shutdown(&mut conn_stop) => {}
                             _ = async {
                                 let known_host = rdns.lookup(dst.ip()).await;
-                                match conn_ctx.connect_upstream_addr(dst).await {
-                                    Ok(remote) => {
+                                let upstream_res = match conn_ctx.connect_upstream_addr(dst).await {
+                                    Ok(remote) => Ok((remote, dst)),
+                                    Err(primary_err) => {
+                                        // On IPv4-only networks, cached IPv6 addresses from before
+                                        // tunnel start fail with ENETUNREACH after smoltcp has
+                                        // already accepted the local TCP SYN. Rescue over IPv4.
+                                        if dst.is_ipv6() {
+                                            if let Some(host) = known_host.as_deref() {
+                                                match resolve_and_connect_ipv4(&conn_ctx, host, dst.port()).await {
+                                                    Some(pair) => Ok(pair),
+                                                    None => Err(primary_err),
+                                                }
+                                            } else {
+                                                Err(primary_err)
+                                            }
+                                        } else {
+                                            Err(primary_err)
+                                        }
+                                    }
+                                };
+                                match upstream_res {
+                                    Ok((remote, effective_dst)) => {
                                         if let Err(e) = conn_ctx
-                                            .relay_stream(stream, remote, known_host.as_deref(), dst)
+                                            .relay_stream(stream, remote, known_host.as_deref(), effective_dst)
                                             .await
                                         {
-                                            debug!(%dst, host = ?known_host, error = %e, "TUN TCP relay ended");
+                                            debug!(%effective_dst, host = ?known_host, error = %e, "TUN TCP relay ended");
                                         }
                                         let current = conn_ctx.preferred_stage() as u8;
                                         let prev = tracker.swap(current, Ordering::Relaxed);
@@ -418,11 +440,10 @@ pub async fn run_tun_pipeline(
                         continue;
                     }
 
-                    // 2. Drop QUIC Initial UDP/443 packets for desync-eligible targets so apps fall back to TCP/TLS
-                    if udp_ctx.config.block_quic
-                        && dst_addr.port() == 443
-                        && is_quic_initial_packet(&payload)
-                    {
+                    // 2. Drop all QUIC UDP/443 datagrams for desync-eligible targets (including
+                    //    RFC 9287 greased headers and migrated short-header sessions) so browsers
+                    //    cleanly fall back to TCP/TLS without hitting ERR_QUIC_PROTOCOL_ERROR.
+                    if udp_ctx.config.block_quic && is_blocked_quic_udp(dst_addr.port(), &payload) {
                         let known_host = udp_rdns.lookup(dst_addr.ip()).await;
                         if udp_ctx.bypass.should_desync(known_host.as_deref(), Some(dst_addr.ip())) {
                             let count = udp_stats.quic_blocked.fetch_add(1, Ordering::Relaxed) + 1;
@@ -480,6 +501,21 @@ pub async fn run_tun_pipeline(
     } else {
         Err(anyhow!("TUN pipeline terminated unexpectedly"))
     }
+}
+
+async fn resolve_and_connect_ipv4(
+    ctx: &EngineContext,
+    host: &str,
+    port: u16,
+) -> Option<(tokio::net::TcpStream, SocketAddr)> {
+    let ips = ctx.dns.resolve(host).await.ok()?;
+    for ip in ips.into_iter().filter(|ip| ip.is_ipv4()) {
+        let addr = SocketAddr::new(ip, port);
+        if let Ok(stream) = ctx.connect_upstream_addr(addr).await {
+            return Some((stream, addr));
+        }
+    }
+    None
 }
 
 async fn handle_tcp_dns_stream(
@@ -713,15 +749,16 @@ mod tests {
     }
 
     #[test]
-    fn quic_initial_detector_distinguishes_quic_from_small_or_non_quic_udp() {
-        let mut quic_init = vec![0xc0; 1200];
-        assert!(is_quic_initial_packet(&quic_init));
-
-        let wg = vec![0x01; 148];
-        assert!(!is_quic_initial_packet(&wg));
-
-        quic_init[0] = 0x40;
-        assert!(!is_quic_initial_packet(&quic_init));
+    fn quic_udp_443_blocker_blocks_standard_greased_and_short_header_packets_only_on_port_443() {
+        assert!(is_blocked_quic_udp(443, &vec![0xc0; 1200]));
+        // RFC 9287 Greased QUIC bit (fixed bit 0x40 cleared -> 0x80)
+        assert!(is_blocked_quic_udp(443, &vec![0x80; 1200]));
+        // Migrated 1-RTT QUIC Short-Header packet (< 1000 bytes)
+        assert!(is_blocked_quic_udp(443, &[0x40; 64]));
+        assert!(!is_blocked_quic_udp(443, &[]));
+        // Non-443 UDP (voice, games, DNS) must never be blocked by QUIC rule
+        assert!(!is_blocked_quic_udp(50000, &vec![0xc0; 1200]));
+        assert!(!is_blocked_quic_udp(53, &[0x40; 64]));
     }
 
     async fn exercise_pipeline(profile: TunProfile) {
@@ -788,18 +825,25 @@ mod tests {
         let (ips, _) = decode_dns_response(udp.payload(), 1).unwrap();
         assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
 
-        // 2. Send a QUIC Initial UDP/443 packet to a public IP -> must be dropped and counted
-        let quic_pkt = build_ipv4_udp(
-            Ipv4Addr::new(10, 0, 0, 1),
-            54000,
-            Ipv4Addr::new(162, 159, 135, 232),
-            443,
-            &vec![0xc0; 1200],
-        );
-        in_tx.send(quic_pkt).await.unwrap();
+        // 2. Send QUIC Initial (0xc0), RFC 9287 Greased (0x80), and Short-Header (0x40)
+        //    UDP/443 packets to a public IP -> all 3 must be cleanly dropped and counted.
+        for (src_port, payload) in [
+            (54000u16, vec![0xc0; 1200]),
+            (54001u16, vec![0x80; 1200]),
+            (54002u16, vec![0x40; 64]),
+        ] {
+            let quic_pkt = build_ipv4_udp(
+                Ipv4Addr::new(10, 0, 0, 1),
+                src_port,
+                Ipv4Addr::new(162, 159, 135, 232),
+                443,
+                &payload,
+            );
+            in_tx.send(quic_pkt).await.unwrap();
+        }
 
         tokio::time::sleep(Duration::from_millis(80)).await;
-        assert_eq!(tun_stats.quic_blocked.load(Ordering::Relaxed), 1);
+        assert_eq!(tun_stats.quic_blocked.load(Ordering::Relaxed), 3);
 
         // 3. Send a regular UDP packet to a local echo server -> Cone NAT must relay both ways
         let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();

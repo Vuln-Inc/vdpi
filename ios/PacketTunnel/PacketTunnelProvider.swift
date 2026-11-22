@@ -42,7 +42,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         completionHandler: @escaping (Error?) -> Void
     ) {
         let settings = VdpiAppGroup.loadSettings()
-        let networkSettings = TunnelNetworkSettingsBuilder.build(settings: settings)
+        let effectiveIpv4Only = settings.ipv4Only || !TunnelNetworkSettingsBuilder.hasGlobalIpv6OnPhysicalInterface()
+        let networkSettings = TunnelNetworkSettingsBuilder.build(
+            settings: settings,
+            effectiveIpv4Only: effectiveIpv4Only
+        )
 
         setTunnelNetworkSettings(networkSettings) { [weak self] error in
             guard let self else {
@@ -54,7 +58,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
 
-            let configJson = settings.toNativeConfigJSON()
+            var effectiveSettings = settings
+            effectiveSettings.ipv4Only = effectiveIpv4Only
+            let configJson = effectiveSettings.toNativeConfigJSON()
             let ctxPtr = Unmanaged.passUnretained(self).toOpaque()
             if let errMsg = VdpiNativeBridge.start(
                 configJson: configJson,
@@ -120,7 +126,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     return
                 }
                 let settings = VdpiAppGroup.loadSettings()
-                let networkSettings = TunnelNetworkSettingsBuilder.build(settings: settings)
+                let effectiveIpv4Only = settings.ipv4Only || !TunnelNetworkSettingsBuilder.hasGlobalIpv6OnPhysicalInterface()
+                let networkSettings = TunnelNetworkSettingsBuilder.build(
+                    settings: settings,
+                    effectiveIpv4Only: effectiveIpv4Only
+                )
                 self.setTunnelNetworkSettings(networkSettings) { [weak self] error in
                     guard let self else {
                         completionHandler?(Data("{\"ok\":false}".utf8))
@@ -131,9 +141,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         completionHandler?(Data("{\"ok\":false,\"error\":\"\(msg)\"}".utf8))
                         return
                     }
+                    var effectiveSettings = settings
+                    effectiveSettings.ipv4Only = effectiveIpv4Only
                     let ctxPtr = Unmanaged.passUnretained(self).toOpaque()
                     if let errMsg = VdpiNativeBridge.start(
-                        configJson: settings.toNativeConfigJSON(),
+                        configJson: effectiveSettings.toNativeConfigJSON(),
                         writeCallback: vdpiOutboundPacketCallback,
                         userContext: ctxPtr
                     ) {

@@ -14,6 +14,7 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.Build
+import java.net.Inet6Address
 import android.service.quicksettings.TileService
 import androidx.core.app.NotificationCompat
 import com.vulninc.vdpi.MainActivity
@@ -72,6 +73,7 @@ class VdpiVpnService : VpnService() {
     private var pollJob: Job? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var lastNetworkId: Long? = null
+    private var lastHasGlobalIpv6: Boolean? = null
 
     @Volatile
     private var latestStartId: Int = -1
@@ -169,7 +171,13 @@ class VdpiVpnService : VpnService() {
                 if (sessionGeneration.get() != gen) return@withLock
 
                 val settings = SettingsRepository(applicationContext).current()
-                val preparedConfig = NativeEngine.prepareStart(settings.toNativeConfig())
+                val hasGlobalIpv6 = hasGlobalIpv6Connectivity()
+                val effectiveIpv4Only = settings.ipv4Only || !hasGlobalIpv6
+                val nativeConfig = settings.toNativeConfig().copy(
+                    ipv4Only = effectiveIpv4Only,
+                    mtu = TUN_MTU,
+                )
+                val preparedConfig = NativeEngine.prepareStart(nativeConfig)
                 if (preparedConfig.isFailure) {
                     failAndStop(
                         preparedConfig.exceptionOrNull()?.message ?: "Failed to load native engine",
@@ -182,7 +190,7 @@ class VdpiVpnService : VpnService() {
                 ensureActive()
                 if (sessionGeneration.get() != gen) return@withLock
 
-                val vpnInterface = establishVpnInterface(settings)
+                val vpnInterface = establishVpnInterface(settings, effectiveIpv4Only)
                 if (vpnInterface == null) {
                     failAndStop(
                         "VPN permission revoked or interface could not be created",
@@ -260,16 +268,43 @@ class VdpiVpnService : VpnService() {
         stopSelf(startId)
     }
 
-    private fun establishVpnInterface(settings: VdpiSettings) = runCatching {
+    private fun hasGlobalIpv6Connectivity(): Boolean {
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return false
+        val candidates = buildList {
+            cm.activeNetwork?.let { add(it) }
+            @Suppress("DEPRECATION")
+            cm.allNetworks.forEach { if (!contains(it)) add(it) }
+        }
+        for (net in candidates) {
+            val caps = cm.getNetworkCapabilities(net) ?: continue
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue
+            if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue
+            val linkProps = cm.getLinkProperties(net) ?: continue
+            val hasGlobal = linkProps.linkAddresses.any { linkAddr ->
+                val addr = linkAddr.address
+                if (addr !is Inet6Address) return@any false
+                if (addr.isLinkLocalAddress || addr.isLoopbackAddress || addr.isMulticastAddress || addr.isSiteLocalAddress) {
+                    return@any false
+                }
+                val firstByte = addr.address.firstOrNull()?.toInt()?.and(0xFF) ?: return@any false
+                // RFC 4291 Global Unicast IPv6 (2000::/3)
+                (firstByte and 0xE0) == 0x20
+            }
+            if (hasGlobal) return true
+        }
+        return false
+    }
+
+    private fun establishVpnInterface(settings: VdpiSettings, effectiveIpv4Only: Boolean) = runCatching {
         val builder = Builder()
             .setSession("vdpi")
-            .setMtu(1500)
+            .setMtu(TUN_MTU)
             .addAddress(TUN_IPV4_ADDR, 30)
             .addRoute("0.0.0.0", 0)
             .addDnsServer(TUN_IPV4_DNS)
             .setBlocking(false)
 
-        if (!settings.ipv4Only) {
+        if (!effectiveIpv4Only) {
             builder
                 .addAddress(TUN_IPV6_ADDR, 126)
                 .addRoute("::", 0)
@@ -330,15 +365,24 @@ class VdpiVpnService : VpnService() {
         unregisterNetworkMonitor()
         val cm = getSystemService(ConnectivityManager::class.java) ?: return
         lastNetworkId = cm.activeNetwork?.networkHandle
+        lastHasGlobalIpv6 = hasGlobalIpv6Connectivity()
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 val handle = network.networkHandle
                 val prev = lastNetworkId
+                val prevIpv6 = lastHasGlobalIpv6
+                val nowIpv6 = hasGlobalIpv6Connectivity()
                 lastNetworkId = handle
+                lastHasGlobalIpv6 = nowIpv6
                 if (prev != null && prev != handle && TunnelRuntimeState.state.value.phase == TunnelPhase.CONNECTED) {
-                    scope.launch {
-                        // Refresh cached DNS & adaptive strategy after Wi-Fi <-> cellular switch.
-                        NativeEngine.clearCache()
+                    if (prevIpv6 != null && prevIpv6 != nowIpv6) {
+                        // Underlying network changed between IPv4-only and IPv6-capable; rebuild TUN routes.
+                        scheduleStart(reconnect = true, startId = latestStartId)
+                    } else {
+                        scope.launch {
+                            // Refresh cached DNS & adaptive strategy after Wi-Fi <-> cellular switch.
+                            NativeEngine.clearCache()
+                        }
                     }
                 }
             }
@@ -353,6 +397,7 @@ class VdpiVpnService : VpnService() {
         val cb = networkCallback ?: return
         networkCallback = null
         lastNetworkId = null
+        lastHasGlobalIpv6 = null
         runCatching {
             getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb)
         }
@@ -539,8 +584,9 @@ class VdpiVpnService : VpnService() {
 
         private const val CHANNEL_ID = "vdpi_tunnel_status"
         private const val NOTIFICATION_ID = 4201
-        private const val TUN_IPV4_ADDR = "10.0.0.1"
-        private const val TUN_IPV4_DNS = "10.0.0.2"
+        private const val TUN_MTU = 1400
+        private const val TUN_IPV4_ADDR = "198.18.0.2"
+        private const val TUN_IPV4_DNS = "198.18.0.1"
         private const val TUN_IPV6_ADDR = "fd00:7664:7069::1"
         private const val TUN_IPV6_DNS = "fd00:7664:7069::2"
 

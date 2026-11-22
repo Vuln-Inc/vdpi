@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import NetworkExtension
 
@@ -14,7 +15,44 @@ public enum TunnelNetworkSettingsBuilder {
     public static let tunnelIpv6Address = "fd00:198:18::2"
     public static let tunnelIpv6PrefixLength: NSNumber = 120
 
-    public static func build(settings: VdpiSettings) -> NEPacketTunnelNetworkSettings {
+    /// Returns `true` if any active non-loopback, non-utun physical interface currently holds
+    /// an RFC 4291 Global Unicast IPv6 address (`2000::/3`). Prevents advertising an IPv6 TUN
+    /// default route on IPv4-only Wi-Fi/cellular networks where `smoltcp` would accept IPv6 SYNs
+    /// locally before upstream dials fail with `ENETUNREACH`.
+    public static func hasGlobalIpv6OnPhysicalInterface() -> Bool {
+        var ifaddrPtr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddrPtr) == 0, let first = ifaddrPtr else {
+            return false
+        }
+        defer { freeifaddrs(first) }
+
+        var cursor: UnsafeMutablePointer<ifaddrs>? = first
+        while let current = cursor {
+            defer { cursor = current.pointee.ifa_next }
+            let flags = Int32(current.pointee.ifa_flags)
+            guard (flags & IFF_UP) != 0, (flags & IFF_LOOPBACK) == 0 else { continue }
+            guard let namePtr = current.pointee.ifa_name else { continue }
+            let name = String(cString: namePtr)
+            if name.hasPrefix("utun") || name.hasPrefix("lo") || name.hasPrefix("awdl") || name.hasPrefix("llw") {
+                continue
+            }
+            guard let addr = current.pointee.ifa_addr, addr.pointee.sa_family == UInt8(AF_INET6) else {
+                continue
+            }
+            let sin6 = addr.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { $0.pointee }
+            let firstByte = withUnsafeBytes(of: sin6.sin6_addr) { $0[0] }
+            if (firstByte & 0xE0) == 0x20 {
+                return true
+            }
+        }
+        return false
+    }
+
+    public static func build(
+        settings: VdpiSettings,
+        effectiveIpv4Only: Bool? = nil
+    ) -> NEPacketTunnelNetworkSettings {
+        let ipv4Only = effectiveIpv4Only ?? settings.ipv4Only
         let networkSettings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: tunnelRemoteAddress)
         networkSettings.mtu = NSNumber(value: settings.clampedMtu)
 
@@ -31,8 +69,8 @@ public enum TunnelNetworkSettingsBuilder {
         ]
         networkSettings.ipv4Settings = ipv4
 
-        // IPv6: enabled unless user explicitly selected IPv4-only mode.
-        if !settings.ipv4Only {
+        // IPv6: enabled only when user allows IPv6 AND physical connectivity actually has global IPv6.
+        if !ipv4Only {
             let ipv6 = NEIPv6Settings(
                 addresses: [tunnelIpv6Address],
                 networkPrefixLengths: [tunnelIpv6PrefixLength]
