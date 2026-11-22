@@ -56,6 +56,8 @@ Open `vdpi.exe` from File Explorer, or run `vdpi` with no arguments in an intera
 
 The run-only preference is a file named `run-directly` in `%LOCALAPPDATA%\vdpi` on Windows, `~/Library/Application Support/vdpi` on macOS, or `$XDG_CONFIG_HOME/vdpi` (default `~/.config/vdpi`) on Linux.
 
+On Windows, foreground vdpi restores the previous system proxy when its console closes. Foreground mode does not export user proxy environment variables, because apps launched while vdpi is running could keep those variables after it exits. An installed background service runs independently of the console window.
+
 Download the release archive for your OS from **[Releases](https://github.com/Vuln-Inc/vdpi/releases/latest)**, extract it, and run `vdpi install`.  
 Everything — binary installation, `PATH` registration, background service setup, and OS proxy configuration — is handled natively by `vdpi` itself.
 

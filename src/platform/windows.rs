@@ -8,6 +8,8 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info, warn};
 
+pub mod foreground;
+
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const INTERNET_SETTINGS_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 const USER_ENV_SUBKEY: &str = "Environment";

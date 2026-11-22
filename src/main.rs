@@ -3,7 +3,9 @@ use tokio::sync::watch;
 use tracing::info;
 use vdpi::config::{CliArgs, Command, RuntimeConfig};
 use vdpi::desync::EngineContext;
-use vdpi::platform::{platform_name, SystemProxySession};
+use vdpi::platform::platform_name;
+#[cfg(not(windows))]
+use vdpi::platform::SystemProxySession;
 use vdpi::server::{bind_listeners, serve_until_shutdown};
 use vdpi::service::{
     clear_runtime_state, install_service, print_status, run_doctor, uninstall_service,
@@ -13,6 +15,14 @@ use vdpi::service::{
 mod launcher;
 
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(
+            vdpi::platform::windows::foreground::GUARD_ARG,
+        ))
+    {
+        return vdpi::platform::windows::foreground::run_guard();
+    }
     raise_fd_limit();
 
     let args: Vec<_> = std::env::args_os().collect();
@@ -80,8 +90,7 @@ async fn run_daemon(cfg: RuntimeConfig) -> Result<()> {
 
     let primary_addr = bound.primary_addr;
     let socks_addr = bound.socks_addr;
-    write_runtime_state(primary_addr, socks_addr);
-
+    #[cfg(not(windows))]
     let proxy_session = if cfg.system_proxy {
         Some(SystemProxySession::activate(
             primary_addr.ip(),
@@ -94,14 +103,27 @@ async fn run_daemon(cfg: RuntimeConfig) -> Result<()> {
     } else {
         None
     };
+    #[cfg(windows)]
+    let proxy_session = if cfg.system_proxy {
+        Some(
+            vdpi::platform::windows::foreground::ForegroundProxy::activate(
+                primary_addr,
+                &cfg.bypass_domains,
+            )?,
+        )
+    } else {
+        None
+    };
+    write_runtime_state(primary_addr, socks_addr);
 
     if !cfg.quiet {
-        print_startup_banner(
-            &cfg,
-            primary_addr,
-            socks_addr,
-            proxy_session.as_ref().map(|s| s.summary()),
-        );
+        #[cfg(not(windows))]
+        let proxy_summary = proxy_session.as_ref().map(|s| s.summary());
+        #[cfg(windows)]
+        let proxy_summary = proxy_session
+            .as_ref()
+            .map(|_| "active (Windows proxy with automatic cleanup)".to_string());
+        print_startup_banner(&cfg, primary_addr, socks_addr, proxy_summary);
         info!(
             platform = platform_name(),
             mode = ?cfg.mode,
@@ -114,19 +136,16 @@ async fn run_daemon(cfg: RuntimeConfig) -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    if let Some(ref session) = proxy_session {
+    #[cfg(not(windows))]
+    let (watchdog_stop, watchdog_task) = if let Some(ref session) = proxy_session {
         let watchdog_session = session.clone();
-        let mut watchdog_rx = shutdown_rx.clone();
-        tokio::spawn(async move {
+        let (tx, mut rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
             ticker.tick().await;
             loop {
                 tokio::select! {
-                    _ = watchdog_rx.changed() => {
-                        if *watchdog_rx.borrow() {
-                            break;
-                        }
-                    }
+                    _ = rx.changed() => break,
                     _ = ticker.tick() => {
                         let s = watchdog_session.clone();
                         let _ = tokio::task::spawn_blocking(move || s.reconcile()).await;
@@ -134,18 +153,30 @@ async fn run_daemon(cfg: RuntimeConfig) -> Result<()> {
                 }
             }
         });
-    }
+        (Some(tx), Some(task))
+    } else {
+        (None, None)
+    };
 
     let server_task = tokio::spawn(serve_until_shutdown(bound, ctx, shutdown_rx));
 
     wait_for_shutdown_signal().await;
     info!("received shutdown signal; stopping vdpi cleanly");
 
+    #[cfg(not(windows))]
+    {
+        drop(watchdog_stop);
+        if let Some(task) = watchdog_task {
+            let _ = task.await;
+        }
+        if let Some(session) = proxy_session {
+            session.deactivate();
+        }
+    }
+    #[cfg(windows)]
+    drop(proxy_session);
     let _ = shutdown_tx.send(true);
     clear_runtime_state(std::process::id());
-    if let Some(session) = proxy_session {
-        session.deactivate();
-    }
 
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_task).await;
     Ok(())
