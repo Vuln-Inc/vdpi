@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use reqwest::Client;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{lookup_host, UdpSocket};
@@ -12,6 +12,7 @@ use tracing::debug;
 const QTYPE_A: u16 = 1;
 const QTYPE_CNAME: u16 = 5;
 const QTYPE_AAAA: u16 = 28;
+const QTYPE_HTTPS: u16 = 65;
 const QCLASS_IN: u16 = 1;
 const MAX_CACHE_ENTRIES: usize = 4096;
 const MAX_CACHED_IPS: usize = 32;
@@ -33,6 +34,7 @@ pub struct DnsResolver {
     preferred_doh_idx: Arc<AtomicUsize>,
     preferred_udp_idx: Arc<AtomicUsize>,
     doh_backoff_until: Arc<RwLock<Option<Instant>>>,
+    query_count: Arc<AtomicU64>,
     http: Client,
     cache: Arc<RwLock<HashMap<String, CacheEntry>>>,
 }
@@ -64,15 +66,25 @@ impl DnsResolver {
             preferred_doh_idx: Arc::new(AtomicUsize::new(0)),
             preferred_udp_idx: Arc::new(AtomicUsize::new(0)),
             doh_backoff_until: Arc::new(RwLock::new(None)),
+            query_count: Arc::new(AtomicU64::new(0)),
             http,
             cache: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    pub fn query_count(&self) -> u64 {
+        self.query_count.load(Ordering::Relaxed)
+    }
+
+    pub async fn clear_cache(&self) {
+        self.cache.write().await.clear();
     }
 
     /// Resolves `host` into an ordered list of IP addresses (IPv4 preferred before IPv6).
     /// Resistant to ISP port-53 DNS hijacking by cascading through RFC 8484 DoH providers
     /// and non-standard port 1253 UDP DNS before falling back to OS resolution.
     pub async fn resolve(&self, host: &str) -> Result<Vec<IpAddr>> {
+        self.query_count.fetch_add(1, Ordering::Relaxed);
         let normalized = host
             .trim()
             .trim_matches(|c| c == '[' || c == ']')
@@ -360,6 +372,226 @@ impl DnsResolver {
         }
         Ok(v4)
     }
+
+    /// Answers a raw RFC 1035 DNS wire query (as intercepted from a TUN interface on UDP/53),
+    /// routing `A` and `AAAA` queries through the anti-poisoning DoH / non-port-53 DNS ring
+    /// and returning `(wire_response, resolved_domain_ips)` so callers can populate reverse-DNS
+    /// metadata without Fake-IP translation.
+    pub async fn resolve_wire_query(
+        &self,
+        query: &[u8],
+        block_https_svcb: bool,
+    ) -> Result<(Vec<u8>, Option<(String, Vec<IpAddr>)>)> {
+        let parsed = parse_dns_question(query)?;
+        let question_slice = &query[12..parsed.question_end];
+
+        // Suppress HTTPS/SVCB (type 65) records when QUIC blocking is enabled so browsers and apps
+        // don't receive HTTP/3 Alt-Svc hints that bypass TCP TLS desync.
+        if block_https_svcb && parsed.qtype == QTYPE_HTTPS {
+            self.query_count.fetch_add(1, Ordering::Relaxed);
+            return Ok((
+                build_dns_wire_response(parsed.tx_id, parsed.flags, question_slice, 0, &[]),
+                None,
+            ));
+        }
+
+        if parsed.qclass == QCLASS_IN && matches!(parsed.qtype, QTYPE_A | QTYPE_AAAA) {
+            if parsed.qtype == QTYPE_AAAA && self.ipv4_only {
+                self.query_count.fetch_add(1, Ordering::Relaxed);
+                return Ok((
+                    build_dns_wire_response(parsed.tx_id, parsed.flags, question_slice, 0, &[]),
+                    None,
+                ));
+            }
+
+            match self.resolve(&parsed.qname).await {
+                Ok(ips) => {
+                    let matching: Vec<IpAddr> = ips
+                        .into_iter()
+                        .filter(|ip| match parsed.qtype {
+                            QTYPE_A => ip.is_ipv4(),
+                            QTYPE_AAAA => ip.is_ipv6(),
+                            _ => false,
+                        })
+                        .collect();
+                    let resp = build_dns_wire_response(
+                        parsed.tx_id,
+                        parsed.flags,
+                        question_slice,
+                        0,
+                        &matching,
+                    );
+                    let meta = if matching.is_empty() {
+                        None
+                    } else {
+                        Some((parsed.qname, matching))
+                    };
+                    return Ok((resp, meta));
+                }
+                Err(_) => {
+                    return Ok((
+                        build_dns_wire_response(parsed.tx_id, parsed.flags, question_slice, 2, &[]),
+                        None,
+                    ));
+                }
+            }
+        }
+
+        // Forward other RR types (SRV, TXT, MX, PTR, etc.) raw over the DoH ring when enabled.
+        self.query_count.fetch_add(1, Ordering::Relaxed);
+        if self.enable_doh {
+            if let Ok(mut raw) = self.query_doh_raw(query).await {
+                if raw.len() >= 12 {
+                    raw[0..2].copy_from_slice(&parsed.tx_id.to_be_bytes());
+                    return Ok((raw, None));
+                }
+            }
+        }
+
+        Ok((
+            build_dns_wire_response(parsed.tx_id, parsed.flags, question_slice, 0, &[]),
+            None,
+        ))
+    }
+
+    async fn query_doh_raw(&self, wire_query: &[u8]) -> Result<Vec<u8>> {
+        let count = self.doh_endpoints.len();
+        if count == 0 {
+            bail!("no DoH endpoints configured");
+        }
+        let mut normalized_query = wire_query.to_vec();
+        if normalized_query.len() >= 2 {
+            normalized_query[0] = 0;
+            normalized_query[1] = 0;
+        }
+        let start = self.preferred_doh_idx.load(Ordering::Relaxed) % count;
+        if let Ok(bytes) =
+            send_doh_request_raw(&self.http, &self.doh_endpoints[start], &normalized_query).await
+        {
+            return Ok(bytes);
+        }
+        for offset in 1..count {
+            let idx = (start + offset) % count;
+            if let Ok(bytes) =
+                send_doh_request_raw(&self.http, &self.doh_endpoints[idx], &normalized_query).await
+            {
+                self.preferred_doh_idx.store(idx, Ordering::Relaxed);
+                return Ok(bytes);
+            }
+        }
+        bail!("raw DoH query failed across all endpoints")
+    }
+}
+
+struct ParsedDnsQuestion {
+    tx_id: u16,
+    flags: u16,
+    qname: String,
+    qtype: u16,
+    qclass: u16,
+    question_end: usize,
+}
+
+fn parse_dns_question(buf: &[u8]) -> Result<ParsedDnsQuestion> {
+    if buf.len() < 12 {
+        bail!("DNS query shorter than 12-byte header");
+    }
+    let tx_id = u16::from_be_bytes([buf[0], buf[1]]);
+    let flags = u16::from_be_bytes([buf[2], buf[3]]);
+    let qdcount = u16::from_be_bytes([buf[4], buf[5]]);
+    if qdcount == 0 {
+        bail!("DNS query has no questions");
+    }
+
+    let (qname, pos) = read_dns_name(buf, 12)?;
+    if pos + 4 > buf.len() {
+        bail!("truncated DNS question footer");
+    }
+    let qtype = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+    let qclass = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]);
+
+    Ok(ParsedDnsQuestion {
+        tx_id,
+        flags,
+        qname,
+        qtype,
+        qclass,
+        question_end: pos + 4,
+    })
+}
+
+fn read_dns_name(buf: &[u8], mut pos: usize) -> Result<(String, usize)> {
+    let mut labels = Vec::new();
+    let mut steps = 0usize;
+    loop {
+        if pos >= buf.len() {
+            bail!("DNS name out of bounds");
+        }
+        steps += 1;
+        if steps > 128 {
+            bail!("DNS name exceeded label limit");
+        }
+        let len = buf[pos];
+        if len == 0 {
+            return Ok((labels.join("."), pos + 1));
+        }
+        if (len & 0b1100_0000) != 0 {
+            bail!("compression pointer not supported in DNS query question");
+        }
+        let end = pos + 1 + (len as usize);
+        if end > buf.len() {
+            bail!("truncated DNS label");
+        }
+        let label = std::str::from_utf8(&buf[pos + 1..end])
+            .context("non-UTF8 DNS label")?
+            .to_ascii_lowercase();
+        labels.push(label);
+        pos = end;
+    }
+}
+
+fn build_dns_wire_response(
+    tx_id: u16,
+    req_flags: u16,
+    question_slice: &[u8],
+    rcode: u8,
+    answers: &[IpAddr],
+) -> Vec<u8> {
+    let rd = req_flags & 0x0100;
+    // QR=1 (0x8000), RA=1 (0x0080), preserve RD, set RCODE
+    let resp_flags = 0x8080 | rd | u16::from(rcode & 0x0f);
+    let ancount = u16::try_from(answers.len()).unwrap_or(u16::MAX);
+
+    let mut out = Vec::with_capacity(12 + question_slice.len() + answers.len() * 28);
+    out.extend_from_slice(&tx_id.to_be_bytes());
+    out.extend_from_slice(&resp_flags.to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT = 1
+    out.extend_from_slice(&ancount.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT = 0
+    out.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT = 0
+    out.extend_from_slice(question_slice);
+
+    for ip in answers.iter().take(usize::from(ancount)) {
+        // Compression pointer to QNAME at offset 12 (0xC00C)
+        out.extend_from_slice(&[0xc0, 0x0c]);
+        match ip {
+            IpAddr::V4(v4) => {
+                out.extend_from_slice(&QTYPE_A.to_be_bytes());
+                out.extend_from_slice(&QCLASS_IN.to_be_bytes());
+                out.extend_from_slice(&120u32.to_be_bytes());
+                out.extend_from_slice(&4u16.to_be_bytes());
+                out.extend_from_slice(&v4.octets());
+            }
+            IpAddr::V6(v6) => {
+                out.extend_from_slice(&QTYPE_AAAA.to_be_bytes());
+                out.extend_from_slice(&QCLASS_IN.to_be_bytes());
+                out.extend_from_slice(&120u32.to_be_bytes());
+                out.extend_from_slice(&16u16.to_be_bytes());
+                out.extend_from_slice(&v6.octets());
+            }
+        }
+    }
+    out
 }
 
 fn insert_cache_entry(cache: &mut HashMap<String, CacheEntry>, key: String, entry: CacheEntry) {
@@ -372,12 +604,7 @@ fn insert_cache_entry(cache: &mut HashMap<String, CacheEntry>, key: String, entr
     cache.insert(key, entry);
 }
 
-async fn send_doh_request(
-    http: &Client,
-    endpoint: &str,
-    wire_query: &[u8],
-    qtype: u16,
-) -> Result<(Vec<IpAddr>, Duration)> {
+async fn send_doh_request_raw(http: &Client, endpoint: &str, wire_query: &[u8]) -> Result<Vec<u8>> {
     let mut resp = http
         .post(endpoint)
         .header("content-type", "application/dns-message")
@@ -401,6 +628,16 @@ async fn send_doh_request(
         }
         bytes.extend_from_slice(&chunk);
     }
+    Ok(bytes)
+}
+
+async fn send_doh_request(
+    http: &Client,
+    endpoint: &str,
+    wire_query: &[u8],
+    qtype: u16,
+) -> Result<(Vec<IpAddr>, Duration)> {
+    let bytes = send_doh_request_raw(http, endpoint, wire_query).await?;
     decode_dns_response(&bytes, qtype)
 }
 
@@ -705,5 +942,38 @@ mod tests {
         assert!(is_poisoned_public_ip("195.175.39.39".parse().unwrap()));
         assert!(!is_poisoned_public_ip("162.159.135.232".parse().unwrap()));
         assert!(!is_poisoned_public_ip("128.116.31.3".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn answers_wire_dns_queries_for_localhost_and_blocks_https_svcb_when_enabled() {
+        let resolver = DnsResolver::new("1.1.1.1", 53, false, false).unwrap();
+
+        let mut query = encode_dns_query("localhost", QTYPE_A).unwrap();
+        query[0] = 0xab;
+        query[1] = 0xcd;
+
+        let (resp, meta) = resolver.resolve_wire_query(&query, true).await.unwrap();
+        assert_eq!(&resp[0..2], &[0xab, 0xcd]);
+        let (ips, _) = decode_dns_response(&resp, QTYPE_A).unwrap();
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+        assert_eq!(
+            meta,
+            Some((
+                "localhost".to_string(),
+                vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]
+            ))
+        );
+
+        let mut https_query = encode_dns_query("discord.com", QTYPE_HTTPS).unwrap();
+        https_query[0] = 0x12;
+        https_query[1] = 0x34;
+        let (https_resp, https_meta) = resolver
+            .resolve_wire_query(&https_query, true)
+            .await
+            .unwrap();
+        assert_eq!(&https_resp[0..2], &[0x12, 0x34]);
+        assert_eq!(u16::from_be_bytes([https_resp[6], https_resp[7]]), 0);
+        assert!(https_meta.is_none());
+        assert!(resolver.query_count() >= 2);
     }
 }

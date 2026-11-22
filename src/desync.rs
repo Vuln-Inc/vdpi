@@ -8,10 +8,10 @@ use crate::tls::{
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tracing::debug;
@@ -45,7 +45,7 @@ pub enum LearnedStrategy {
 }
 
 impl LearnedStrategy {
-    fn from_u8(val: u8) -> Self {
+    pub fn from_u8(val: u8) -> Self {
         match val {
             0 => Self::Primary,
             1 => Self::OobSniDesync,
@@ -58,8 +58,61 @@ impl LearnedStrategy {
         }
     }
 
+    pub fn stage_number(self) -> u8 {
+        (self as u8) + 1
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Primary => "ComboMultiRecord",
+            Self::OobSniDesync => "OobSniDesync",
+            Self::MultiRecordOob => "MultiRecordOob",
+            Self::FineFragment => "FineFragment",
+            Self::DeepRecordStorm => "DeepRecordStorm",
+            Self::SlowSniSlice => "SlowSniSlice",
+            Self::DirectPassthrough => "DirectPassthrough",
+        }
+    }
+
     fn is_desync(self) -> bool {
         !matches!(self, Self::DirectPassthrough)
+    }
+}
+
+/// Lock-free live engine counters shared across proxy and TUN sessions.
+#[derive(Debug, Default)]
+pub struct EngineTelemetry {
+    pub active_connections: AtomicUsize,
+    pub total_connections: AtomicU64,
+    pub bytes_tx: AtomicU64,
+    pub bytes_rx: AtomicU64,
+    pub tls_handshakes: AtomicU64,
+    pub auto_heal_escalations: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EngineTelemetrySnapshot {
+    pub active_connections: usize,
+    pub total_connections: u64,
+    pub bytes_tx: u64,
+    pub bytes_rx: u64,
+    pub tls_handshakes: u64,
+    pub auto_heal_escalations: u64,
+}
+
+struct ActiveConnGuard(Arc<EngineTelemetry>);
+
+impl ActiveConnGuard {
+    fn enter(telemetry: &Arc<EngineTelemetry>) -> Self {
+        telemetry.active_connections.fetch_add(1, Ordering::Relaxed);
+        telemetry.total_connections.fetch_add(1, Ordering::Relaxed);
+        Self(Arc::clone(telemetry))
+    }
+}
+
+impl Drop for ActiveConnGuard {
+    fn drop(&mut self) {
+        self.0.active_connections.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -80,6 +133,7 @@ pub struct EngineContext {
     pub bypass: Arc<BypassPolicy>,
     pub adaptive_cache: Arc<RwLock<HashMap<String, LearnedStrategy>>>,
     pub preferred_isp_stage: Arc<AtomicU8>,
+    pub telemetry: Arc<EngineTelemetry>,
     pub(crate) listener_addrs: [Option<SocketAddr>; 4],
 }
 
@@ -98,8 +152,51 @@ impl EngineContext {
             bypass: Arc::new(bypass),
             adaptive_cache: Arc::new(RwLock::new(HashMap::new())),
             preferred_isp_stage: Arc::new(AtomicU8::new(LearnedStrategy::Primary as u8)),
+            telemetry: Arc::new(EngineTelemetry::default()),
             listener_addrs: [None; 4],
         })
+    }
+
+    pub fn telemetry_snapshot(&self) -> EngineTelemetrySnapshot {
+        EngineTelemetrySnapshot {
+            active_connections: self.telemetry.active_connections.load(Ordering::Relaxed),
+            total_connections: self.telemetry.total_connections.load(Ordering::Relaxed),
+            bytes_tx: self.telemetry.bytes_tx.load(Ordering::Relaxed),
+            bytes_rx: self.telemetry.bytes_rx.load(Ordering::Relaxed),
+            tls_handshakes: self.telemetry.tls_handshakes.load(Ordering::Relaxed),
+            auto_heal_escalations: self.telemetry.auto_heal_escalations.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn preferred_stage(&self) -> LearnedStrategy {
+        LearnedStrategy::from_u8(self.preferred_isp_stage.load(Ordering::Relaxed))
+    }
+
+    pub async fn learned_host_count(&self) -> usize {
+        self.adaptive_cache.read().await.len()
+    }
+
+    pub async fn clear_adaptive_cache(&self) {
+        self.adaptive_cache.write().await.clear();
+        self.preferred_isp_stage
+            .store(LearnedStrategy::Primary as u8, Ordering::Relaxed);
+    }
+
+    /// Connects directly to an already-resolved upstream `SocketAddr` with `connect_timeout`
+    /// and `TCP_NODELAY`, enforcing listener-loop and unspecified-address guards.
+    pub async fn connect_upstream_addr(&self, target: SocketAddr) -> Result<TcpStream> {
+        let stream =
+            tokio::time::timeout(self.config.connect_timeout, self.connect_upstream(target))
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "connect {target} timed out after {:?}",
+                        self.config.connect_timeout
+                    )
+                })?
+                .with_context(|| format!("connect {target} failed"))?;
+        let _ = stream.set_nodelay(true);
+        Ok(stream)
     }
 
     /// Resolves `host` via DoH/DNS and connects to `(ip, port)` with Happy Eyeballs fallback and `TCP_NODELAY`.
@@ -177,12 +274,28 @@ impl EngineContext {
     /// client flight to apply adaptive TLS ClientHello or HTTP Host DPI desynchronization.
     pub async fn relay_tunnel(
         &self,
-        mut client: TcpStream,
-        mut remote: TcpStream,
+        client: TcpStream,
+        remote: TcpStream,
         known_host: Option<&str>,
         remote_addr: SocketAddr,
     ) -> Result<()> {
         let _ = client.set_nodelay(true);
+        self.relay_stream(client, remote, known_host, remote_addr)
+            .await
+    }
+
+    /// Relays any `AsyncRead + AsyncWrite` client stream (such as a proxy `TcpStream` or a
+    /// userspace TUN TCP stream) to `remote` with adaptive TLS/HTTP DPI desynchronization.
+    pub async fn relay_stream<C>(
+        &self,
+        mut client: C,
+        mut remote: TcpStream,
+        known_host: Option<&str>,
+        remote_addr: SocketAddr,
+    ) -> Result<()>
+    where
+        C: AsyncRead + AsyncWrite + Unpin,
+    {
         let _ = remote.set_nodelay(true);
 
         let mut first_buf = vec![0u8; 16384 + 512];
@@ -204,9 +317,13 @@ impl EngineContext {
                 if n == 0 {
                     return Ok(());
                 }
+                let _guard = ActiveConnGuard::enter(&self.telemetry);
                 client.write_all(&remote_buf[..n]).await?;
+                self.telemetry.bytes_rx.fetch_add(n as u64, Ordering::Relaxed);
                 drop(first_buf);
-                copy_bidirectional(&mut client, &mut remote).await?;
+                let (tx, rx) = copy_bidirectional(&mut client, &mut remote).await?;
+                self.telemetry.bytes_tx.fetch_add(tx, Ordering::Relaxed);
+                self.telemetry.bytes_rx.fetch_add(rx, Ordering::Relaxed);
                 return Ok(());
             }
         }
@@ -230,29 +347,54 @@ impl EngineContext {
         }
 
         let payload = &first_buf[..filled];
-        self.establish_and_relay(client, remote, payload, known_host, remote_addr)
+        self.establish_and_relay_stream(client, remote, payload, known_host, remote_addr)
             .await
     }
 
-    /// Delivers an already-buffered initial client flight (`payload`) to `remote` with 5-stage
+    /// Delivers an already-buffered initial client flight (`payload`) to `remote` with 7-stage
     /// adaptive TLS auto-healing, stale-cache eviction, and strict ServerHello validation,
     /// then enters full-speed bidirectional streaming.
     pub async fn establish_and_relay(
         &self,
-        mut client: TcpStream,
-        mut remote: TcpStream,
+        client: TcpStream,
+        remote: TcpStream,
         payload: &[u8],
         known_host: Option<&str>,
         remote_addr: SocketAddr,
     ) -> Result<()> {
+        self.establish_and_relay_stream(client, remote, payload, known_host, remote_addr)
+            .await
+    }
+
+    /// Generic stream variant of [`Self::establish_and_relay`] usable with userspace TUN TCP streams.
+    pub async fn establish_and_relay_stream<C>(
+        &self,
+        mut client: C,
+        mut remote: TcpStream,
+        payload: &[u8],
+        known_host: Option<&str>,
+        remote_addr: SocketAddr,
+    ) -> Result<()>
+    where
+        C: AsyncRead + AsyncWrite + Unpin,
+    {
+        let _guard = ActiveConnGuard::enter(&self.telemetry);
         let remote_ip = remote_addr.ip();
 
         if let Some(ch_info) = parse_client_hello(payload) {
+            self.telemetry
+                .tls_handshakes
+                .fetch_add(1, Ordering::Relaxed);
             let effective_host = ch_info.sni.as_deref().or(known_host);
             if !self.bypass.should_desync(effective_host, Some(remote_ip)) {
                 debug!(host = ?effective_host, %remote_ip, "TLS passthrough (bypassed)");
                 remote.write_all(payload).await?;
-                copy_bidirectional(&mut client, &mut remote).await?;
+                self.telemetry
+                    .bytes_tx
+                    .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                let (tx, rx) = copy_bidirectional(&mut client, &mut remote).await?;
+                self.telemetry.bytes_tx.fetch_add(tx, Ordering::Relaxed);
+                self.telemetry.bytes_rx.fetch_add(rx, Ordering::Relaxed);
                 return Ok(());
             }
 
@@ -269,7 +411,12 @@ impl EngineContext {
                 });
                 self.write_tls_strategy(&mut remote, payload, &ch_info, stage)
                     .await?;
-                copy_bidirectional(&mut client, &mut remote).await?;
+                self.telemetry
+                    .bytes_tx
+                    .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                let (tx, rx) = copy_bidirectional(&mut client, &mut remote).await?;
+                self.telemetry.bytes_tx.fetch_add(tx, Ordering::Relaxed);
+                self.telemetry.bytes_rx.fetch_add(rx, Ordering::Relaxed);
                 return Ok(());
             }
 
@@ -320,6 +467,9 @@ impl EngineContext {
                             n >= 2 && probe_buf[0] == 0x16 && probe_buf[1] == 0x03;
 
                         if !is_valid_tls_server_hello && !is_last_stage {
+                            self.telemetry
+                                .auto_heal_escalations
+                                .fetch_add(1, Ordering::Relaxed);
                             if probe_buf[0] == 0x15 {
                                 saw_tls_alert = true;
                                 debug!(
@@ -357,13 +507,24 @@ impl EngineContext {
                             }
                         }
 
+                        self.telemetry
+                            .bytes_tx
+                            .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                        self.telemetry
+                            .bytes_rx
+                            .fetch_add(n as u64, Ordering::Relaxed);
                         client.write_all(&probe_buf[..n]).await?;
                         client.flush().await?;
                         drop(probe_buf);
-                        copy_bidirectional(&mut client, &mut stream).await?;
+                        let (tx, rx) = copy_bidirectional(&mut client, &mut stream).await?;
+                        self.telemetry.bytes_tx.fetch_add(tx, Ordering::Relaxed);
+                        self.telemetry.bytes_rx.fetch_add(rx, Ordering::Relaxed);
                         return Ok(());
                     }
                     _ => {
+                        self.telemetry
+                            .auto_heal_escalations
+                            .fetch_add(1, Ordering::Relaxed);
                         saw_network_block = true;
                         debug!(
                             host = ?effective_host,
@@ -391,7 +552,12 @@ impl EngineContext {
         // Non-TLS or plain HTTP traffic
         self.write_initial_flight(&mut remote, payload, known_host, remote_ip)
             .await?;
-        copy_bidirectional(&mut client, &mut remote).await?;
+        self.telemetry
+            .bytes_tx
+            .fetch_add(payload.len() as u64, Ordering::Relaxed);
+        let (tx, rx) = copy_bidirectional(&mut client, &mut remote).await?;
+        self.telemetry.bytes_tx.fetch_add(tx, Ordering::Relaxed);
+        self.telemetry.bytes_rx.fetch_add(rx, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1186,5 +1352,67 @@ mod tests {
             LearnedStrategy::from_u8(ctx.preferred_isp_stage.load(Ordering::Relaxed)),
             LearnedStrategy::DeepRecordStorm
         );
+    }
+
+    #[tokio::test]
+    async fn relay_stream_supports_generic_streams_and_records_telemetry() {
+        let cli = CliArgs::parse_from_iter([
+            "vdpi",
+            "--no-system-proxy",
+            "--include",
+            "stream\\.example$",
+        ])
+        .unwrap();
+        let ctx = EngineContext::new(cli.into_runtime_config()).unwrap();
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let ch = build_synthetic_client_hello("api.stream.example", 256);
+
+        let expected_payload_len = ch.len() - 5;
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = upstream.accept().await.unwrap();
+            let mut total_payload = 0usize;
+            while total_payload < expected_payload_len {
+                let mut hdr = [0u8; 5];
+                sock.read_exact(&mut hdr).await.unwrap();
+                let rlen = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                let mut body = vec![0u8; rlen];
+                sock.read_exact(&mut body).await.unwrap();
+                total_payload += rlen;
+            }
+            sock.write_all(&[0x16, 0x03, 0x03, 0x00, 0x05, b'H', b'E', b'L', b'L', b'O'])
+                .await
+                .unwrap();
+            let _ = sock.shutdown().await;
+        });
+
+        let (mut app_side, tun_side) = tokio::io::duplex(8192);
+        let ch_send = ch.clone();
+        let app_task = tokio::spawn(async move {
+            app_side.write_all(&ch_send).await.unwrap();
+            let mut reply = [0u8; 10];
+            app_side.read_exact(&mut reply).await.unwrap();
+            reply
+        });
+
+        let remote = ctx.connect_upstream_addr(upstream_addr).await.unwrap();
+        ctx.relay_stream(tun_side, remote, Some("api.stream.example"), upstream_addr)
+            .await
+            .unwrap();
+
+        let reply = app_task.await.unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            &reply,
+            &[0x16, 0x03, 0x03, 0x00, 0x05, b'H', b'E', b'L', b'L', b'O']
+        );
+
+        let snap = ctx.telemetry_snapshot();
+        assert_eq!(snap.active_connections, 0);
+        assert_eq!(snap.total_connections, 1);
+        assert_eq!(snap.tls_handshakes, 1);
+        assert!(snap.bytes_tx >= ch.len() as u64);
+        assert!(snap.bytes_rx >= 10);
     }
 }

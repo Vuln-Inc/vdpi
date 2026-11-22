@@ -1,10 +1,12 @@
 use clap::{Parser, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::net::IpAddr;
 use std::time::Duration;
 
 /// Strategy used by `vdpi` to desynchronize Deep Packet Inspection on outbound handshakes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum DesyncMode {
     /// Split TLS ClientHello into two RFC-compliant TLS records at the SNI midpoint AND
     /// transmit the first record in `chunk_size`-byte TCP segments with TCP_NODELAY.
@@ -341,8 +343,8 @@ mod tests {
 
     #[test]
     fn parses_windows_service_flag() {
-        let cli = CliArgs::parse_from_iter(["vdpi", "--service", "--quiet"])
-            .expect("valid service flag");
+        let cli =
+            CliArgs::parse_from_iter(["vdpi", "--service", "--quiet"]).expect("valid service flag");
         let cfg = cli.into_runtime_config();
         assert!(cfg.windows_service);
         assert!(cfg.quiet);
