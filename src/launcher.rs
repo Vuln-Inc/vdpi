@@ -4,10 +4,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-#[cfg(windows)]
-mod windows;
+mod tui;
 
-const TITLE: &str = "Run or install vdpi";
 const RUN_HINT: &str = "Keep vdpi open to use it. This choice is remembered.";
 const INSTALL_HINT: &str = "Install vdpi to start automatically in the background.";
 const RUN_NOTICE: &str =
@@ -27,18 +25,13 @@ pub fn choose(explicit: bool) -> Result<Choice> {
         return Ok(Choice::Run);
     }
 
-    let terminal = io::stdin().is_terminal() && io::stderr().is_terminal();
-    #[cfg(windows)]
-    let desktop_first = windows::has_own_console();
-    #[cfg(not(windows))]
-    let desktop_first = false;
-
-    let selected = if terminal && !desktop_first {
-        console_choice()?
-    } else if let Some(choice) = desktop_choice(explicit || desktop_first)? {
-        choice
-    } else if terminal {
-        console_choice()?
+    let selected = if io::stdin().is_terminal() && io::stdout().is_terminal() {
+        if env::var("TERM").as_deref() == Ok("dumb") {
+            read_choice(io::stdin().lock(), io::stderr().lock())?
+        } else {
+            tui::choose(env::var_os("NO_COLOR").is_none())
+                .context("running the terminal launcher")?
+        }
     } else if explicit {
         anyhow::bail!("no interactive launcher available; use `vdpi start` or `vdpi install`");
     } else {
@@ -58,12 +51,7 @@ pub fn choose(explicit: bool) -> Result<Choice> {
 }
 
 pub fn print_run_notice() {
-    let (amber, reset) = if use_color() {
-        ("\x1b[33m", "\x1b[0m")
-    } else {
-        ("", "")
-    };
-    eprintln!("  {amber}Run directly{reset}  |  {RUN_NOTICE}");
+    eprintln!("  Run directly  |  {RUN_NOTICE}");
 }
 
 pub fn install_finished(result: &Result<()>) {
@@ -71,8 +59,22 @@ pub fn install_finished(result: &Result<()>) {
         clear_preference();
     }
     #[cfg(windows)]
-    if windows::has_own_console() {
-        windows::install_finished(result);
+    if io::stdin().is_terminal() && has_own_console() {
+        match result {
+            Ok(()) => eprintln!("\n  vdpi is installed and starts automatically."),
+            Err(error) => eprintln!("\n  Installation did not finish: {error:#}"),
+        }
+        eprintln!("  Press Enter to close this window.");
+        let _ = io::stdin().read_line(&mut String::new());
+    }
+}
+
+#[cfg(windows)]
+fn has_own_console() -> bool {
+    let mut processes = [0; 2];
+    // The array is writable for two process IDs for the duration of the call.
+    unsafe {
+        windows_sys::Win32::System::Console::GetConsoleProcessList(processes.as_mut_ptr(), 2) == 1
     }
 }
 
@@ -116,49 +118,14 @@ fn remember_run(path: &Path) -> Result<()> {
     }
 }
 
-fn use_color() -> bool {
-    io::stderr().is_terminal()
-        && env::var_os("NO_COLOR").is_none()
-        && env::var("TERM").as_deref() != Ok("dumb")
-        && enable_terminal_color()
-}
-
-#[cfg(windows)]
-fn enable_terminal_color() -> bool {
-    windows::enable_terminal_color()
-}
-
-#[cfg(not(windows))]
-fn enable_terminal_color() -> bool {
-    true
-}
-
-fn console_choice() -> Result<Choice> {
-    let color = use_color();
-    read_choice(io::stdin().lock(), io::stderr().lock(), color).context("reading launcher choice")
-}
-
-fn read_choice(mut input: impl BufRead, mut output: impl Write, color: bool) -> io::Result<Choice> {
-    let (teal, dim, reset) = if color {
-        ("\x1b[1;36m", "\x1b[2m", "\x1b[0m")
-    } else {
-        ("", "", "")
-    };
+fn read_choice(mut input: impl BufRead, mut output: impl Write) -> io::Result<Choice> {
+    writeln!(output, "\n  vdpi v{}\n", env!("CARGO_PKG_VERSION"))?;
+    writeln!(output, "  1  Run directly\n     {RUN_HINT}\n")?;
     writeln!(
         output,
-        "\n  {teal}vdpi{reset}  {dim}v{}{reset}",
-        env!("CARGO_PKG_VERSION")
+        "  2  Install for automatic startup\n     {INSTALL_HINT}\n"
     )?;
-    writeln!(
-        output,
-        "  {dim}--------------------------------------------{reset}\n"
-    )?;
-    writeln!(output, "  {teal}1{reset}  Run directly\n     {RUN_HINT}\n")?;
-    writeln!(
-        output,
-        "  {teal}2{reset}  Install for automatic startup\n     {INSTALL_HINT}\n"
-    )?;
-    writeln!(output, "  {teal}q{reset}  Quit\n")?;
+    writeln!(output, "  q  Quit\n")?;
     let mut answer = String::new();
     loop {
         write!(output, "  Choose [1 / 2 / q]: ")?;
@@ -176,75 +143,6 @@ fn read_choice(mut input: impl BufRead, mut output: impl Write, color: bool) -> 
     }
 }
 
-#[cfg(windows)]
-fn desktop_choice(allowed: bool) -> Result<Option<Choice>> {
-    Ok(if allowed {
-        windows::desktop_choice()
-    } else {
-        None
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn desktop_choice(_: bool) -> Result<Option<Choice>> {
-    if env::var_os("SSH_CONNECTION").is_some() || env::var_os("CI").is_some() {
-        return Ok(None);
-    }
-    let script = format!(
-        "button returned of (display alert \"{TITLE}\" message \"{RUN_HINT}\\n{INSTALL_HINT}\" buttons {{\"Cancel\", \"Run directly\", \"Install\"}} default button \"Run directly\" cancel button \"Cancel\")"
-    );
-    let output = std::process::Command::new("/usr/bin/osascript")
-        .args(["-e", &script])
-        .output()?;
-    Ok(if output.status.success() {
-        match String::from_utf8_lossy(&output.stdout).trim() {
-            "Run directly" => Some(Choice::Run),
-            "Install" => Some(Choice::Install),
-            _ => None,
-        }
-    } else if String::from_utf8_lossy(&output.stderr).contains("(-128)") {
-        Some(Choice::Cancel)
-    } else {
-        None
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn desktop_choice(_: bool) -> Result<Option<Choice>> {
-    if env::var_os("DISPLAY").is_none() && env::var_os("WAYLAND_DISPLAY").is_none() {
-        return Ok(None);
-    }
-    let text = format!("{RUN_HINT}\n{INSTALL_HINT}");
-    let output = match std::process::Command::new("zenity")
-        .args([
-            "--question",
-            "--title",
-            TITLE,
-            "--text",
-            &text,
-            "--ok-label=Run directly",
-            "--cancel-label=Cancel",
-            "--extra-button=Install",
-        ])
-        .output()
-    {
-        Ok(output) => output,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).context("opening the desktop launcher"),
-    };
-    Ok(
-        if String::from_utf8_lossy(&output.stdout).trim() == "Install" {
-            Some(Choice::Install)
-        } else if output.status.success() {
-            Some(Choice::Run)
-        } else if output.status.code() == Some(1) {
-            Some(Choice::Cancel)
-        } else {
-            None
-        },
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,17 +151,14 @@ mod tests {
     fn console_reprompts_on_invalid_input_and_eof_cancels() {
         let mut output = Vec::new();
         assert_eq!(
-            read_choice(&b"\nno\n2\n"[..], &mut output, false).unwrap(),
+            read_choice(&b"\nno\n2\n"[..], &mut output).unwrap(),
             Choice::Install
         );
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("Run directly"));
         assert!(output.contains("Enter 1 to run"));
         assert!(!output.contains('\x1b'));
-        assert_eq!(
-            read_choice(&b""[..], Vec::new(), false).unwrap(),
-            Choice::Cancel
-        );
+        assert_eq!(read_choice(&b""[..], Vec::new()).unwrap(), Choice::Cancel);
     }
 
     #[test]
