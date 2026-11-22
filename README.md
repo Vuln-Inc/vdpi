@@ -212,15 +212,23 @@ Options:
 
 ## Building from Source
 
-Requires Rust `1.78+`:
+Use the current stable Rust toolchain:
 
 ```bash
 git clone https://github.com/Vuln-Inc/vdpi.git
 cd vdpi
-cargo build --release
-cargo test
+cargo build --locked --release
+cargo test --locked
 ./target/release/vdpi install
 ```
+
+The proxy allows up to 256 concurrent client sessions across both listeners. At capacity,
+new connections are closed until a slot becomes free. Incomplete HTTP headers and SOCKS
+negotiations time out after 15 seconds once the protocol is detected. Established tunnels
+are not affected by the negotiation timeout.
+
+The normal test suite uses local sockets. To also run the optional public DNS smoke test,
+use `cargo test --locked resolves_discord_and_roblox_via_live_doh -- --ignored`.
 
 <details>
 <summary>Repository layout</summary>
