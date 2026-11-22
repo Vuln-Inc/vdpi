@@ -74,6 +74,16 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         loadInstalledApps()
+        viewModelScope.launch {
+            var prevPhase = TunnelRuntimeState.state.value.phase
+            TunnelRuntimeState.state.collect { snap ->
+                val curr = snap.phase
+                if (curr != prevPhase && (curr == TunnelPhase.DISCONNECTED || curr == TunnelPhase.CONNECTED)) {
+                    _pendingReconnect.value = false
+                }
+                prevPhase = curr
+            }
+        }
     }
 
     private fun markDirtyIfConnected() {

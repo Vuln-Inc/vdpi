@@ -492,11 +492,9 @@ async fn handle_tcp_dns_stream(
             break;
         }
         let mut query = vec![0u8; msg_len];
-        if tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut query))
-            .await
-            .is_err()
-        {
-            break;
+        match tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut query)).await {
+            Ok(Ok(_)) => {}
+            _ => break,
         }
         match ctx.dns.resolve_wire_query(&query, ctx.config.block_quic).await {
             Ok((resp, meta)) => {

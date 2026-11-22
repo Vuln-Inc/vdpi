@@ -90,8 +90,8 @@ val LightVdpiPalette = VdpiPalette(
     signal = Color(0xFF047857),
     signalTint = Color(0x14047857),
     signalBorder = Color(0x4D047857),
-    warning = Color(0xFFB45309),
-    warningTint = Color(0x18B45309),
+    warning = Color(0xFF9A3412),
+    warningTint = Color(0x189A3412),
     danger = Color(0xFFDC2626),
     dangerTint = Color(0x14DC2626),
 )

@@ -159,73 +159,79 @@ fun AppsScreen(
 
             Spacer(Modifier.height(14.dp))
 
-            // 48dp hairline search field with focus border, Search IME action, and 44dp clear button
+            // Full-area 48dp hairline search field via decorationBox (zero dead touch zones)
             val searchShape = RoundedCornerShape(10.dp)
-            Row(
+            BasicTextField(
+                value = query,
+                onValueChange = { query = it },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(
+                    autoCorrectEnabled = false,
+                    imeAction = ImeAction.Search,
+                ),
+                keyboardActions = KeyboardActions(
+                    onSearch = { focusManager.clearFocus() },
+                ),
+                textStyle = TextStyle(
+                    fontFamily = GeistSans,
+                    fontSize = 13.sp,
+                    color = palette.inkPrimary,
+                ),
+                cursorBrush = SolidColor(palette.inkPrimary),
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(48.dp)
-                    .clip(searchShape)
-                    .background(palette.surface)
-                    .border(1.dp, searchBorder, searchShape)
-                    .padding(start = 14.dp, end = 4.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                SearchGlyph(tint = if (searchFocused) palette.inkPrimary else palette.inkMuted)
-                Spacer(Modifier.width(10.dp))
-                Box(modifier = Modifier.weight(1f)) {
-                    if (query.isEmpty()) {
-                        Text(
-                            text = "Search apps or package name",
-                            style = VdpiTextStyles.body,
-                            color = palette.inkMuted,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                    BasicTextField(
-                        value = query,
-                        onValueChange = { query = it },
-                        singleLine = true,
-                        keyboardOptions = KeyboardOptions(
-                            autoCorrectEnabled = false,
-                            imeAction = ImeAction.Search,
-                        ),
-                        keyboardActions = KeyboardActions(
-                            onSearch = { focusManager.clearFocus() },
-                        ),
-                        textStyle = TextStyle(
-                            fontFamily = GeistSans,
-                            fontSize = 13.sp,
-                            color = palette.inkPrimary,
-                        ),
-                        cursorBrush = SolidColor(palette.inkPrimary),
+                    .onFocusChanged { searchFocused = it.isFocused },
+                decorationBox = { innerTextField ->
+                    Row(
                         modifier = Modifier
-                            .fillMaxWidth()
-                            .onFocusChanged { searchFocused = it.isFocused },
-                    )
-                }
-                if (query.isNotEmpty()) {
-                    Box(
-                        modifier = Modifier
-                            .size(44.dp)
-                            .clip(RoundedCornerShape(8.dp))
-                            .clickable(role = Role.Button) {
-                                query = ""
-                                focusManager.clearFocus()
-                            }
-                            .semantics { contentDescription = "Clear search" },
-                        contentAlignment = Alignment.Center,
+                            .fillMaxSize()
+                            .clip(searchShape)
+                            .background(palette.surface)
+                            .border(1.dp, searchBorder, searchShape)
+                            .padding(start = 14.dp, end = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Text(
-                            text = "×",
-                            fontFamily = GeistMono,
-                            fontSize = 16.sp,
-                            color = palette.inkSecondary,
-                        )
+                        SearchGlyph(tint = if (searchFocused) palette.inkPrimary else palette.inkMuted)
+                        Spacer(Modifier.width(10.dp))
+                        Box(
+                            modifier = Modifier.weight(1f),
+                            contentAlignment = Alignment.CenterStart,
+                        ) {
+                            if (query.isEmpty()) {
+                                Text(
+                                    text = "Search apps or package name",
+                                    style = VdpiTextStyles.body,
+                                    color = palette.inkMuted,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                            innerTextField()
+                        }
+                        if (query.isNotEmpty()) {
+                            Box(
+                                modifier = Modifier
+                                    .size(44.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable(role = Role.Button) {
+                                        query = ""
+                                        focusManager.clearFocus()
+                                    }
+                                    .semantics { contentDescription = "Clear search" },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Text(
+                                    text = "×",
+                                    fontFamily = GeistMono,
+                                    fontSize = 16.sp,
+                                    color = palette.inkSecondary,
+                                )
+                            }
+                        }
                     }
-                }
-            }
+                },
+            )
 
             Spacer(Modifier.height(10.dp))
 
@@ -254,10 +260,10 @@ fun AppsScreen(
                 if (settings.splitPackages.isNotEmpty()) {
                     Box(
                         modifier = Modifier
-                            .heightIn(min = 40.dp)
+                            .heightIn(min = 44.dp)
                             .clip(RoundedCornerShape(8.dp))
                             .clickable(role = Role.Button, onClick = onClearPackages)
-                            .padding(horizontal = 10.dp),
+                            .padding(horizontal = 12.dp),
                         contentAlignment = Alignment.Center,
                     ) {
                         Text(
@@ -339,7 +345,7 @@ private fun FilterPill(
     val shape = RoundedCornerShape(8.dp)
     Box(
         modifier = Modifier
-            .heightIn(min = 40.dp)
+            .heightIn(min = 44.dp)
             .clip(shape)
             .background(if (selected) palette.surfaceRaised else palette.surface)
             .border(1.dp, if (selected) palette.borderStrong else palette.border, shape)

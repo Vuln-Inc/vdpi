@@ -1,6 +1,8 @@
 package com.vulninc.vdpi.ui.screens
 
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.togetherWith
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
@@ -45,6 +47,7 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -98,7 +101,6 @@ fun TunnelScreen(
     onReconnect: () -> Unit,
     onRunDoctor: () -> Unit,
     onClearCache: () -> Unit,
-    onLogCopied: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     // Scoped locally so 1Hz telemetry updates never recompose MainActivity, Apps, or Settings.
@@ -316,74 +318,78 @@ fun TunnelScreen(
 
         Spacer(Modifier.height(22.dp))
 
-        // Quiet Active Profile on standby; full Live Telemetry when connected/connecting
-        if (!isConnected && !isConnecting) {
-            SectionOverline(
-                text = "Active Profile",
-                modifier = Modifier.padding(start = 2.dp, bottom = 8.dp),
-            )
-            HairlinePanel(radius = 14.dp) {
-                LedgerRow(
-                    label = "ENGINE",
-                    primaryValue = "${settings.desyncMode.label} · ${settings.chunkSize} B",
-                    secondaryMono = if (settings.blockQuic) "QUIC blocked" else "QUIC open",
-                )
-                HairlineRule()
-                LedgerRow(
-                    label = "DNS",
-                    primaryValue = "${if (settings.enableDoh) "DoH" else "UDP"} · ${settings.dnsAddr}",
-                    secondaryMono = if (settings.ipv4Only) "IPv4 only" else "Dual-stack",
-                )
-                HairlineRule()
-                LedgerRow(
-                    label = "SPLIT TUNNEL",
-                    primaryValue = settings.splitTunnelMode.label,
-                    secondaryMono = splitSummary(settings) ?: "All apps",
-                )
-            }
-        }
-
-        AnimatedVisibility(
-            visible = isConnected || isConnecting,
-            enter = fadeIn(tween(220)) + expandVertically(),
-            exit = fadeOut(tween(150)) + shrinkVertically(),
-        ) {
-            Column {
-                SectionOverline(
-                    text = "Live Telemetry",
-                    modifier = Modifier.padding(start = 2.dp, bottom = 8.dp),
-                )
-                HairlinePanel(radius = 14.dp) {
-                    val snap = runtime.telemetry
-                    LedgerRow(
-                        label = "TLS ENGINE",
-                        primaryValue = formatStageShort(snap.stageNumber, snap.stageLabel),
-                        secondaryMono = "${snap.learnedHosts} learned",
-                        highlightPrimary = isConnected,
+        // Smooth crossfade between quiet Active Profile on standby and Live Telemetry when active
+        AnimatedContent(
+            targetState = isConnected || isConnecting,
+            transitionSpec = {
+                fadeIn(tween(180)) togetherWith fadeOut(tween(120))
+            },
+            label = "telemetryPanelTransition",
+        ) { live ->
+            if (!live) {
+                Column {
+                    SectionOverline(
+                        text = "Active Profile",
+                        modifier = Modifier.padding(start = 2.dp, bottom = 8.dp),
                     )
-                    HairlineRule()
-                    LedgerRow(
-                        label = "DNS RESOLVER",
-                        primaryValue = "${if (settings.enableDoh) "DoH" else "UDP"} · ${settings.dnsAddr}",
-                        secondaryMono = "${snap.dnsQueries} queries",
+                    HairlinePanel(radius = 14.dp) {
+                        LedgerRow(
+                            label = "ENGINE",
+                            primaryValue = "${settings.desyncMode.label} · ${settings.chunkSize} B",
+                            secondaryMono = if (settings.blockQuic) "QUIC blocked" else "QUIC open",
+                        )
+                        HairlineRule()
+                        LedgerRow(
+                            label = "DNS",
+                            primaryValue = "${if (settings.enableDoh) "DoH" else "UDP"} · ${settings.dnsAddr}",
+                            secondaryMono = if (settings.ipv4Only) "IPv4 only" else "Dual-stack",
+                        )
+                        HairlineRule()
+                        LedgerRow(
+                            label = "SPLIT TUNNEL",
+                            primaryValue = settings.splitTunnelMode.label,
+                            secondaryMono = splitSummary(settings) ?: "All apps",
+                        )
+                    }
+                }
+            } else {
+                Column {
+                    SectionOverline(
+                        text = "Live Telemetry",
+                        modifier = Modifier.padding(start = 2.dp, bottom = 8.dp),
                     )
-                    HairlineRule()
-                    ThroughputLedgerRow(
-                        rxText = formatBytes(snap.bytesRx),
-                        txText = formatBytes(snap.bytesTx),
-                        activeConnections = snap.activeConnections,
-                    )
-                    HairlineRule()
-                    LedgerRow(
-                        label = "SESSIONS",
-                        primaryValue = "${snap.tlsHandshakes} TLS · ${snap.udpFlowsActive} UDP",
-                        secondaryMono = if (settings.blockQuic) {
-                            "${snap.quicBlocked} QUIC dropped"
-                        } else {
-                            "QUIC open"
-                        },
-                        primaryMono = true,
-                    )
+                    HairlinePanel(radius = 14.dp) {
+                        val snap = runtime.telemetry
+                        LedgerRow(
+                            label = "TLS ENGINE",
+                            primaryValue = formatStageShort(snap.stageNumber, snap.stageLabel),
+                            secondaryMono = "${snap.learnedHosts} learned",
+                            highlightPrimary = isConnected,
+                        )
+                        HairlineRule()
+                        LedgerRow(
+                            label = "DNS RESOLVER",
+                            primaryValue = "${if (settings.enableDoh) "DoH" else "UDP"} · ${settings.dnsAddr}",
+                            secondaryMono = "${snap.dnsQueries} queries",
+                        )
+                        HairlineRule()
+                        ThroughputLedgerRow(
+                            rxText = formatBytes(snap.bytesRx),
+                            txText = formatBytes(snap.bytesTx),
+                            activeConnections = snap.activeConnections,
+                        )
+                        HairlineRule()
+                        LedgerRow(
+                            label = "SESSIONS",
+                            primaryValue = "${snap.tlsHandshakes} TLS · ${snap.udpFlowsActive} UDP",
+                            secondaryMono = if (settings.blockQuic) {
+                                "${snap.quicBlocked} QUIC dropped"
+                            } else {
+                                "QUIC open"
+                            },
+                            primaryMono = true,
+                        )
+                    }
                 }
             }
         }
@@ -445,7 +451,6 @@ fun TunnelScreen(
             EngineLogSheetContent(
                 events = runtime.telemetry.events,
                 onClearCache = onClearCache,
-                onCopied = onLogCopied,
             )
         }
     }
@@ -790,11 +795,18 @@ private fun DoctorSheetContent(
 private fun EngineLogSheetContent(
     events: List<EngineEvent>,
     onClearCache: () -> Unit,
-    onCopied: () -> Unit,
 ) {
     val palette = VdpiThemeTokens.palette
     val clipboard = LocalClipboardManager.current
     val reversed = remember(events) { events.asReversed() }
+    var sheetNotice by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(sheetNotice) {
+        if (sheetNotice != null) {
+            kotlinx.coroutines.delay(2200L)
+            sheetNotice = null
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -815,9 +827,9 @@ private fun EngineLogSheetContent(
                     color = palette.inkPrimary,
                 )
                 Text(
-                    text = "Recent events from local TUN core",
+                    text = sheetNotice ?: "Recent events from local TUN core",
                     style = VdpiTextStyles.caption,
-                    color = palette.inkSecondary,
+                    color = if (sheetNotice != null) palette.signal else palette.inkSecondary,
                 )
             }
             Spacer(Modifier.width(12.dp))
@@ -830,10 +842,16 @@ private fun EngineLogSheetContent(
                             "${formatEventTime(ev.tsMs)} [${ev.tag}] ${ev.message}"
                         }
                         clipboard.setText(AnnotatedString(dump))
-                        onCopied()
+                        sheetNotice = "Copied to clipboard"
                     },
                 )
-                GhostActionButton(label = "Reset", onClick = onClearCache)
+                GhostActionButton(
+                    label = "Reset",
+                    onClick = {
+                        onClearCache()
+                        sheetNotice = "Adaptive cache cleared"
+                    },
+                )
             }
         }
 

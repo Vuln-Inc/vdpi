@@ -28,6 +28,8 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.consumeWindowInsets
+import androidx.compose.foundation.layout.displayCutoutPadding
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -103,8 +105,12 @@ class MainActivity : ComponentActivity() {
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) {
-        // Proceed regardless of notification permission; VPN still functions cleanly.
-        VdpiVpnService.start(this)
+        // Re-verify VPN consent before calling startForegroundService() in case it was revoked while dialog was open.
+        if (VpnService.prepare(this) == null) {
+            VdpiVpnService.start(this)
+        } else {
+            uiFeedback.tryEmit("VPN permission required")
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -178,13 +184,19 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     containerColor = palette.canvas,
                     contentWindowInsets = WindowInsets(0, 0, 0, 0),
-                    snackbarHost = { MinimalSnackbarHost(snackbarHostState) },
+                    snackbarHost = {
+                        MinimalSnackbarHost(
+                            hostState = snackbarHostState,
+                            modifier = Modifier.imePadding(),
+                        )
+                    },
                     bottomBar = {
                         MinimalBottomBar(
                             activeTab = activeTab,
                             onSelect = { tab ->
+                                val switched = tab != activeTab
                                 activeTab = tab
-                                if (tab == MainTab.APPS) {
+                                if (switched && tab == MainTab.APPS) {
                                     viewModel.loadInstalledApps()
                                 }
                             },
@@ -195,7 +207,9 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier
                             .fillMaxSize()
                             .statusBarsPadding()
+                            .displayCutoutPadding()
                             .padding(innerPadding)
+                            .consumeWindowInsets(innerPadding)
                             .imePadding(),
                     ) {
                         Crossfade(
@@ -229,12 +243,7 @@ class MainActivity : ComponentActivity() {
                                             }
                                         },
                                         onRunDoctor = viewModel::runDiagnostics,
-                                        onClearCache = {
-                                            viewModel.clearNativeCache {
-                                                showNotice("Adaptive cache cleared")
-                                            }
-                                        },
-                                        onLogCopied = { showNotice("Engine log copied") },
+                                        onClearCache = { viewModel.clearNativeCache() },
                                     )
 
                                     MainTab.APPS -> AppsScreen(

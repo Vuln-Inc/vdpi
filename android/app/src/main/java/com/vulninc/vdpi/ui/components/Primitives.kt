@@ -268,7 +268,7 @@ fun <T> SegmentedControl(
             Box(
                 modifier = Modifier
                     .weight(1f)
-                    .height(40.dp)
+                    .height(44.dp)
                     .clip(itemShape)
                     .background(itemBg)
                     .border(
@@ -369,18 +369,23 @@ fun MinimalSnackbarHost(
                 modifier = Modifier.weight(1f),
             )
             data.visuals.actionLabel?.let { action ->
-                Spacer(Modifier.width(12.dp))
-                Text(
-                    text = action,
-                    fontFamily = GeistSans,
-                    fontWeight = FontWeight.SemiBold,
-                    fontSize = 13.sp,
-                    color = if (palette.isDark) palette.signal else Color(0xFF34D399),
+                Spacer(Modifier.width(8.dp))
+                Box(
                     modifier = Modifier
+                        .heightIn(min = 44.dp)
                         .clip(RoundedCornerShape(6.dp))
                         .clickable(role = Role.Button) { data.performAction() }
-                        .padding(horizontal = 8.dp, vertical = 4.dp),
-                )
+                        .padding(horizontal = 10.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = action,
+                        fontFamily = GeistSans,
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 13.sp,
+                        color = if (palette.isDark) palette.signal else Color(0xFF34D399),
+                    )
+                }
             }
         }
     }

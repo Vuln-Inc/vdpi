@@ -395,11 +395,14 @@ fun SettingsScreen(
                             val chipShape = RoundedCornerShape(8.dp)
                             Row(
                                 modifier = Modifier
-                                    .heightIn(min = 40.dp)
+                                    .heightIn(min = 44.dp)
                                     .clip(chipShape)
                                     .background(palette.surfaceRaised)
                                     .border(1.dp, palette.border, chipShape)
-                                    .clickable(role = Role.Button) { onRemoveBypassDomain(domain) }
+                                    .clickable(role = Role.Button) {
+                                        focusManager.clearFocus()
+                                        onRemoveBypassDomain(domain)
+                                    }
                                     .semantics { contentDescription = "Remove $domain" }
                                     .padding(horizontal = 12.dp, vertical = 8.dp),
                                 verticalAlignment = Alignment.CenterVertically,
@@ -626,47 +629,50 @@ private fun InlineInputRow(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Box(
+            BasicTextField(
+                value = value,
+                onValueChange = onValueChange,
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = KeyboardType.Uri,
+                    autoCorrectEnabled = false,
+                    imeAction = ImeAction.Done,
+                ),
+                keyboardActions = KeyboardActions(
+                    onDone = { onSubmit() },
+                ),
+                textStyle = TextStyle(
+                    fontFamily = GeistMono,
+                    fontSize = 12.sp,
+                    color = palette.inkPrimary,
+                ),
+                cursorBrush = SolidColor(palette.inkPrimary),
                 modifier = Modifier
                     .weight(1f)
                     .height(46.dp)
-                    .clip(inputShape)
-                    .background(palette.canvas)
-                    .border(1.dp, fieldBorder, inputShape)
-                    .padding(horizontal = 12.dp),
-                contentAlignment = Alignment.CenterStart,
-            ) {
-                if (value.isEmpty()) {
-                    Text(
-                        text = placeholder,
-                        style = VdpiTextStyles.monoSmall,
-                        fontSize = 12.sp,
-                        color = palette.inkMuted,
-                    )
-                }
-                BasicTextField(
-                    value = value,
-                    onValueChange = onValueChange,
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(
-                        keyboardType = KeyboardType.Uri,
-                        autoCorrectEnabled = false,
-                        imeAction = ImeAction.Done,
-                    ),
-                    keyboardActions = KeyboardActions(
-                        onDone = { onSubmit() },
-                    ),
-                    textStyle = TextStyle(
-                        fontFamily = GeistMono,
-                        fontSize = 12.sp,
-                        color = palette.inkPrimary,
-                    ),
-                    cursorBrush = SolidColor(palette.inkPrimary),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .onFocusChanged { focused = it.isFocused },
-                )
-            }
+                    .onFocusChanged { focused = it.isFocused },
+                decorationBox = { innerTextField ->
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .clip(inputShape)
+                            .background(palette.canvas)
+                            .border(1.dp, fieldBorder, inputShape)
+                            .padding(horizontal = 12.dp),
+                        contentAlignment = Alignment.CenterStart,
+                    ) {
+                        if (value.isEmpty()) {
+                            Text(
+                                text = placeholder,
+                                style = VdpiTextStyles.monoSmall,
+                                fontSize = 12.sp,
+                                color = palette.inkMuted,
+                            )
+                        }
+                        innerTextField()
+                    }
+                },
+            )
 
             Box(
                 modifier = Modifier
