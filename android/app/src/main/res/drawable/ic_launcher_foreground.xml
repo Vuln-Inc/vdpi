@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Left descending arm of fractured V (split packet stream) -->
+    <path
+        android:fillColor="#F4F4F5"
+        android:pathData="M31,34 L41,34 L52,68 L42,68 Z" />
+    <!-- Right ascending arm, deliberately offset across a clean hairline seam -->
+    <path
+        android:fillColor="#F4F4F5"
+        android:pathData="M56,68 L67,34 L77,34 L66,68 Z" />
+    <!-- Signal emerald status bar beneath the split -->
+    <path
+        android:fillColor="#10B981"
+        android:pathData="M42,74 L66,74 L66,78.5 L42,78.5 Z" />
+</vector>
