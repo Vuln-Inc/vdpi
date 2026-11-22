@@ -189,8 +189,168 @@ pub fn split_tls_records(
     Some((rec1, rec2))
 }
 
-/// Extracts the `Host` header hostname and the byte offset of its midpoint in a plain HTTP request.
-pub fn extract_http_host_split(buf: &[u8]) -> Option<(String, usize)> {
+/// Splits a TLS ClientHello into 3–4 RFC-compliant TLS Handshake (`0x16`) records:
+/// - Record 1: first 2 bytes of the handshake header (`[0x01, len_hi]`)
+/// - Record 2: up to the 1st byte of the SNI hostname
+/// - Record 3: slice through the midpoint of the SNI hostname
+/// - Record 4: remainder of the ClientHello (plus any coalesced trailing bytes)
+///
+/// Defeats both single-packet SNI filters and active inline DPI boxes that attempt
+/// shallow 2-record TLS reassembly.
+pub fn split_tls_records_multi(
+    buf: &[u8],
+    info: &ClientHelloInfo,
+    fallback_split: usize,
+) -> Option<Vec<Vec<u8>>> {
+    if buf.len() < info.record_total_len || info.record_total_len <= 8 {
+        return None;
+    }
+
+    let payload = &buf[5..info.record_total_len];
+    let max_cut = payload.len() - 1;
+    let mut cuts = Vec::with_capacity(3);
+
+    if max_cut >= 2 {
+        cuts.push(2);
+    }
+
+    match (info.sni_payload_offset, info.sni_len) {
+        (Some(off), Some(len)) if len >= 3 => {
+            cuts.push((off + 1).clamp(1, max_cut));
+            cuts.push((off + (len / 2).max(2)).clamp(1, max_cut));
+        }
+        (Some(off), Some(len)) if len >= 1 => {
+            cuts.push((off + (len / 2).max(1)).clamp(1, max_cut));
+        }
+        _ => {
+            cuts.push(fallback_split.clamp(1, max_cut));
+        }
+    }
+
+    cuts.sort_unstable();
+    cuts.dedup();
+    if cuts.is_empty() {
+        return None;
+    }
+
+    let trailing = &buf[info.record_total_len..];
+    let mut records = Vec::with_capacity(cuts.len() + 1);
+    let mut prev = 0usize;
+
+    for cut in cuts.into_iter().chain(std::iter::once(payload.len())) {
+        if cut <= prev {
+            continue;
+        }
+        let slice = &payload[prev..cut];
+        let is_last = cut == payload.len();
+        let mut rec =
+            Vec::with_capacity(5 + slice.len() + if is_last { trailing.len() } else { 0 });
+        rec.extend_from_slice(&[
+            buf[0],
+            buf[1],
+            buf[2],
+            ((slice.len() >> 8) & 0xff) as u8,
+            (slice.len() & 0xff) as u8,
+        ]);
+        rec.extend_from_slice(slice);
+        if is_last && !trailing.is_empty() {
+            rec.extend_from_slice(trailing);
+        }
+        records.push(rec);
+        prev = cut;
+    }
+
+    if records.len() < 2 {
+        return None;
+    }
+    Some(records)
+}
+
+/// Splits a TLS ClientHello into a deep sequence of 12+ RFC-compliant TLS Handshake (`0x16`)
+/// records: up to 10 tiny 2-byte lead records before the SNI extension (exhausting hardware
+/// DPI per-flow packet-inspection caps before the hostname even hits the wire) followed by
+/// SNI-split records.
+pub fn split_tls_records_deep(
+    buf: &[u8],
+    info: &ClientHelloInfo,
+    fallback_split: usize,
+) -> Option<Vec<Vec<u8>>> {
+    if buf.len() < info.record_total_len || info.record_total_len <= 16 {
+        return None;
+    }
+
+    let payload = &buf[5..info.record_total_len];
+    let max_cut = payload.len() - 1;
+    let mut cuts = Vec::with_capacity(16);
+
+    // Emit up to 10 tiny 2-byte TLS handshake records at the very start of ClientHello
+    // (ClientHello header + Version + Random) so packet-budget-limited inline DPI boxes
+    // stop inspecting the flow before any SNI bytes arrive.
+    let lead_limit = info
+        .sni_payload_offset
+        .unwrap_or(fallback_split.max(24))
+        .min(20)
+        .min(max_cut);
+    let mut pos = 2usize;
+    while pos <= lead_limit {
+        cuts.push(pos);
+        pos += 2;
+    }
+
+    // Then slice right through the SNI hostname itself across multiple records.
+    match (info.sni_payload_offset, info.sni_len) {
+        (Some(off), Some(len)) if len >= 4 => {
+            cuts.push((off + 1).clamp(1, max_cut));
+            cuts.push((off + (len / 3).max(2)).clamp(1, max_cut));
+            cuts.push((off + (len * 2 / 3).max(3)).clamp(1, max_cut));
+        }
+        (Some(off), Some(len)) if len >= 1 => {
+            cuts.push((off + 1).clamp(1, max_cut));
+        }
+        _ => {
+            cuts.push(fallback_split.clamp(1, max_cut));
+        }
+    }
+
+    cuts.sort_unstable();
+    cuts.dedup();
+
+    let trailing = &buf[info.record_total_len..];
+    let mut records = Vec::with_capacity(cuts.len() + 1);
+    let mut prev = 0usize;
+
+    for cut in cuts.into_iter().chain(std::iter::once(payload.len())) {
+        if cut <= prev {
+            continue;
+        }
+        let slice = &payload[prev..cut];
+        let is_last = cut == payload.len();
+        let mut rec =
+            Vec::with_capacity(5 + slice.len() + if is_last { trailing.len() } else { 0 });
+        rec.extend_from_slice(&[
+            buf[0],
+            buf[1],
+            buf[2],
+            ((slice.len() >> 8) & 0xff) as u8,
+            (slice.len() & 0xff) as u8,
+        ]);
+        rec.extend_from_slice(slice);
+        if is_last && !trailing.is_empty() {
+            rec.extend_from_slice(trailing);
+        }
+        records.push(rec);
+        prev = cut;
+    }
+
+    if records.len() < 3 {
+        return None;
+    }
+    Some(records)
+}
+
+/// Extracts the `Host` header hostname, a split inside the `Host:` header name,
+/// and the byte offset of the hostname midpoint in a plain HTTP request.
+pub fn extract_http_host_splits(buf: &[u8]) -> Option<(String, usize, usize)> {
     let header_end = buf
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -211,15 +371,21 @@ pub fn extract_http_host_split(buf: &[u8]) -> Option<(String, usize)> {
                 .trim()
                 .to_ascii_lowercase();
             if !host_only.is_empty() {
+                let header_split = (offset + 2).clamp(1, buf.len().saturating_sub(1));
                 let host_start = offset + 5 + ws;
-                let split_at = (host_start + (host_only.len() / 2).max(1))
-                    .clamp(1, buf.len().saturating_sub(1));
-                return Some((host_only, split_at));
+                let value_split = (host_start + (host_only.len() / 2).max(1))
+                    .clamp(header_split, buf.len().saturating_sub(1));
+                return Some((host_only, header_split, value_split));
             }
         }
         offset += line.len() + 2;
     }
     None
+}
+
+/// Extracts the `Host` header hostname and the byte offset of its midpoint in a plain HTTP request.
+pub fn extract_http_host_split(buf: &[u8]) -> Option<(String, usize)> {
+    extract_http_host_splits(buf).map(|(host, _, mid)| (host, mid))
 }
 
 /// Helper used in tests and diagnostics to craft a standards-compliant TLS 1.3/1.2 ClientHello
@@ -304,6 +470,31 @@ mod tests {
         reassembled.extend_from_slice(&rec1[5..]);
         reassembled.extend_from_slice(&rec2[5..]);
         assert_eq!(reassembled, ch[5..]);
+
+        let multi = split_tls_records_multi(&ch, &info, 10).expect("should multi-split records");
+        assert_eq!(multi.len(), 4);
+        assert_eq!(multi[0].len(), 5 + 2);
+        let mut multi_reassembled = Vec::new();
+        for rec in &multi {
+            assert_eq!(rec[0], 0x16);
+            assert!(!rec.windows(needle.len()).any(|w| w == needle));
+            let rlen = u16::from_be_bytes([rec[3], rec[4]]) as usize;
+            assert_eq!(rec.len(), 5 + rlen);
+            multi_reassembled.extend_from_slice(&rec[5..]);
+        }
+        assert_eq!(multi_reassembled, ch[5..]);
+
+        let deep = split_tls_records_deep(&ch, &info, 10).expect("should deep-split records");
+        assert!(deep.len() >= 12);
+        let mut deep_reassembled = Vec::new();
+        for rec in &deep {
+            assert_eq!(rec[0], 0x16);
+            assert!(!rec.windows(needle.len()).any(|w| w == needle));
+            let rlen = u16::from_be_bytes([rec[3], rec[4]]) as usize;
+            assert_eq!(rec.len(), 5 + rlen);
+            deep_reassembled.extend_from_slice(&rec[5..]);
+        }
+        assert_eq!(deep_reassembled, ch[5..]);
     }
 
     #[test]
