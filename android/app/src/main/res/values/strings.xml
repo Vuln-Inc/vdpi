@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">vdpi</string>
+    <string name="notification_channel_name">Tunnel Status</string>
+    <string name="notification_channel_desc">Persistent status while the local anti-DPI tunnel is active</string>
+</resources>
