@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "crates/vdpi-android"]
+default-members = ["."]
+
 [package]
 name = "vdpi"
 version = "0.2.5"

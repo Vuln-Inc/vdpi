@@ -3,3 +3,14 @@ Cargo.lock.bak
 .DS_Store
 *.swp
 *.log
+
+# Android build outputs
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/app/src/main/jniLibs/
+*.apk
+*.aab
+*.jks
+*.keystore
