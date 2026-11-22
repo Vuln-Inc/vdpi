@@ -6,7 +6,10 @@ use vdpi::config::{CliArgs, Command, RuntimeConfig};
 use vdpi::desync::EngineContext;
 use vdpi::platform::{platform_name, SystemProxySession};
 use vdpi::server::{bind_listeners, serve_until_shutdown};
-use vdpi::service::{install_service, print_status, run_doctor, uninstall_service};
+use vdpi::service::{
+    clear_runtime_state, install_service, print_status, run_doctor, uninstall_service,
+    write_runtime_state,
+};
 
 fn main() -> Result<()> {
     raise_fd_limit();
@@ -51,6 +54,7 @@ async fn run_daemon(cfg: RuntimeConfig) -> Result<()> {
 
     let primary_addr = bound.primary_addr;
     let socks_addr = bound.socks_addr;
+    write_runtime_state(primary_addr, socks_addr);
 
     let proxy_session = if cfg.system_proxy {
         Some(SystemProxySession::activate(
@@ -112,6 +116,7 @@ async fn run_daemon(cfg: RuntimeConfig) -> Result<()> {
     info!("received shutdown signal; stopping vdpi cleanly");
 
     let _ = shutdown_tx.send(true);
+    clear_runtime_state(std::process::id());
     if let Some(session) = proxy_session {
         session.deactivate();
     }

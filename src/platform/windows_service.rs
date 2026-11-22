@@ -3,6 +3,7 @@ use crate::desync::EngineContext;
 use crate::platform::windows::set_running_as_service;
 use crate::platform::SystemProxySession;
 use crate::server::{bind_listeners, serve_until_shutdown};
+use crate::service::{clear_runtime_state, write_runtime_state};
 use anyhow::{bail, Context, Result};
 use std::ffi::c_void;
 use std::ptr;
@@ -487,6 +488,7 @@ fn run_service_runtime(handle: ServiceStatusHandle, cfg: RuntimeConfig) -> Resul
 
         let primary_addr = bound.primary_addr;
         let socks_addr = bound.socks_addr;
+        write_runtime_state(primary_addr, socks_addr);
 
         let proxy_session = if cfg.system_proxy {
             Some(SystemProxySession::activate(
@@ -560,6 +562,7 @@ fn run_service_runtime(handle: ServiceStatusHandle, cfg: RuntimeConfig) -> Resul
 
         report_service_status(handle, SERVICE_STOP_PENDING, 0, NO_ERROR, 2, 5000);
         let _ = server_shutdown_tx.send(true);
+        clear_runtime_state(std::process::id());
 
         if reason == StopReason::Stop {
             if let Some(session) = proxy_session {

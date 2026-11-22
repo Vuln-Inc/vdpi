@@ -3,7 +3,9 @@ use crate::desync::EngineContext;
 use crate::platform::{clear_all_system_proxies, platform_name, print_platform_proxy_status};
 use anyhow::{bail, Context, Result};
 use reqwest::{Client, Proxy};
+use serde::{Deserialize, Serialize};
 use std::fs;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -12,6 +14,105 @@ pub const LAUNCH_AGENT_LABEL: &str = "com.vdpi";
 pub const SYSTEMD_UNIT_NAME: &str = "vdpi.service";
 pub const WINDOWS_SERVICE_NAME: &str = "vdpi";
 pub const WINDOWS_LEGACY_RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+
+/// Persisted active listener metadata written when `vdpi` starts so `vdpi status`
+/// and `vdpi doctor` always discover rotated ports automatically.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeState {
+    pub pid: u32,
+    pub addr: IpAddr,
+    pub port: u16,
+    pub socks_port: Option<u16>,
+}
+
+fn runtime_state_write_path() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        if crate::platform::windows::is_running_as_service() {
+            let base = std::env::var_os("ProgramData")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+            return Some(base.join("vdpi").join("state.json"));
+        }
+        if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
+            return Some(PathBuf::from(local_appdata).join("vdpi").join("state.json"));
+        }
+    }
+    vdpi_root_dir().ok().map(|r| r.join("state.json"))
+}
+
+fn runtime_state_read_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    #[cfg(target_os = "windows")]
+    {
+        let pd = std::env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+        paths.push(pd.join("vdpi").join("state.json"));
+        if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
+            paths.push(PathBuf::from(local_appdata).join("vdpi").join("state.json"));
+        }
+    }
+    if let Ok(root) = vdpi_root_dir() {
+        let p = root.join("state.json");
+        if !paths.contains(&p) {
+            paths.push(p);
+        }
+    }
+    paths
+}
+
+pub fn write_runtime_state(primary_addr: SocketAddr, socks_addr: Option<SocketAddr>) {
+    let Some(path) = runtime_state_write_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let state = RuntimeState {
+        pid: std::process::id(),
+        addr: primary_addr.ip(),
+        port: primary_addr.port(),
+        socks_port: socks_addr.map(|a| a.port()),
+    };
+    let Ok(json) = serde_json::to_string(&state) else {
+        return;
+    };
+    let tmp = path.with_extension("json.tmp");
+    if fs::write(&tmp, json).is_ok() {
+        let _ = fs::remove_file(&path);
+        let _ = fs::rename(&tmp, &path);
+    }
+}
+
+pub fn clear_runtime_state(expected_pid: u32) {
+    let Some(path) = runtime_state_write_path() else {
+        return;
+    };
+    if let Ok(raw) = fs::read_to_string(&path) {
+        if let Ok(state) = serde_json::from_str::<RuntimeState>(&raw) {
+            if state.pid == expected_pid {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+}
+
+pub fn read_runtime_states() -> Vec<RuntimeState> {
+    let mut states = Vec::new();
+    for path in runtime_state_read_paths() {
+        if let Ok(raw) = fs::read_to_string(&path) {
+            if let Ok(state) = serde_json::from_str::<RuntimeState>(&raw) {
+                if !states.contains(&state) {
+                    states.push(state);
+                }
+            }
+        }
+    }
+    states
+}
 
 pub fn home_dir() -> Result<PathBuf> {
     if let Some(h) = std::env::var_os("HOME") {
@@ -532,6 +633,14 @@ fn cleanup_windows_install_files() {
         }
     }
 
+    let pd_dir = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+        .join("vdpi");
+    if pd_dir.exists() {
+        let _ = fs::remove_dir_all(&pd_dir);
+    }
+
     if vdpi_root.exists() {
         let running_from_root = current_exe
             .as_ref()
@@ -641,32 +750,66 @@ pub fn uninstall_service() -> Result<()> {
     Ok(())
 }
 
+async fn discover_live_daemon(
+    client: &Client,
+    cfg: &RuntimeConfig,
+) -> (IpAddr, u16, Option<u16>, Option<String>) {
+    let states = read_runtime_states();
+
+    let primary_url = format!("http://{}:{}/vdpi-health", cfg.addr, cfg.port);
+    if let Ok(resp) = client.get(&primary_url).send().await {
+        if resp.status().is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            let matching_socks = states
+                .iter()
+                .find(|s| s.addr == cfg.addr && s.port == cfg.port)
+                .map(|s| s.socks_port)
+                .unwrap_or(cfg.socks_port);
+            return (cfg.addr, cfg.port, matching_socks, Some(text));
+        }
+    }
+
+    for st in states {
+        if st.addr == cfg.addr && st.port == cfg.port {
+            continue;
+        }
+        let url = format!("http://{}:{}/vdpi-health", st.addr, st.port);
+        if let Ok(resp) = client.get(&url).send().await {
+            if resp.status().is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                return (st.addr, st.port, st.socks_port, Some(text));
+            }
+        }
+    }
+
+    (cfg.addr, cfg.port, cfg.socks_port, None)
+}
+
 /// Prints a comprehensive status overview of `vdpi`, startup service registration, and OS proxies.
 pub async fn print_status(cfg: &RuntimeConfig) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let health_url = format!("http://{}:{}/vdpi-health", cfg.addr, cfg.port);
     let client = Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()?;
 
-    let daemon_state = match client.get(&health_url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            let text = resp.text().await.unwrap_or_default();
-            format!("RUNNING ({})", text.trim())
-        }
-        _ => "NOT RESPONDING".to_string(),
+    let (active_addr, active_port, active_socks_port, health_body) =
+        discover_live_daemon(&client, cfg).await;
+
+    let daemon_state = match health_body {
+        Some(text) => format!("RUNNING ({})", text.trim()),
+        None => "NOT RESPONDING".to_string(),
     };
 
-    let socks_state = if let Some(sp) = cfg.socks_port {
+    let socks_state = if let Some(sp) = active_socks_port {
         match tokio::time::timeout(
             Duration::from_secs(1),
-            tokio::net::TcpStream::connect((cfg.addr, sp)),
+            tokio::net::TcpStream::connect((active_addr, sp)),
         )
         .await
         {
-            Ok(Ok(_)) => format!("LISTENING ({}:{})", cfg.addr, sp),
-            _ => format!("CLOSED ({}:{})", cfg.addr, sp),
+            Ok(Ok(_)) => format!("LISTENING ({}:{})", active_addr, sp),
+            _ => format!("CLOSED ({}:{})", active_addr, sp),
         }
     } else {
         "DISABLED (available via primary port auto-detect)".to_string()
@@ -675,7 +818,7 @@ pub async fn print_status(cfg: &RuntimeConfig) -> Result<()> {
     println!("=== vdpi status ({}) ===", platform_name());
     println!(
         "Primary HTTP/CONNECT/Auto : {}:{} -> {}",
-        cfg.addr, cfg.port, daemon_state
+        active_addr, active_port, daemon_state
     );
     println!("Dedicated SOCKS5 (TCP/UDP): {}", socks_state);
 
@@ -744,35 +887,31 @@ pub async fn run_doctor(cfg: RuntimeConfig) -> Result<()> {
         .no_proxy()
         .timeout(Duration::from_millis(800))
         .build()?;
-    let health_url = format!("http://{}:{}/vdpi-health", cfg.addr, cfg.port);
 
-    let (http_proxy_addr, socks_proxy_addr, _guard_tx) =
-        match direct_check.get(&health_url).send().await {
-            Ok(r) if r.status().is_success() => {
-                let hp = std::net::SocketAddr::new(cfg.addr, cfg.port);
-                let sp = std::net::SocketAddr::new(cfg.addr, cfg.socks_port.unwrap_or(cfg.port));
-                println!("Testing against running vdpi daemon at {hp} (SOCKS5: {sp})...\n");
-                (hp, sp, None)
-            }
-            _ => {
-                let mut ephemeral_cfg = cfg.clone();
-                ephemeral_cfg.port = 0;
-                ephemeral_cfg.socks_port = Some(0);
-                ephemeral_cfg.system_proxy = false;
-                let ctx = EngineContext::new(ephemeral_cfg)?;
-                let bound = crate::server::bind_listeners(&ctx)?;
-                let hp = bound.primary_addr;
-                let sp = bound.socks_addr.unwrap_or(hp);
-                let (tx, rx) = tokio::sync::watch::channel(false);
-                tokio::spawn(async move {
-                    let _ = crate::server::serve_until_shutdown(bound, ctx, rx).await;
-                });
-                println!(
-                    "Testing with ephemeral in-process vdpi engine at {hp} (SOCKS5: {sp})...\n"
-                );
-                (hp, sp, Some(tx))
-            }
-        };
+    let (active_addr, active_port, active_socks_port, live_health) =
+        discover_live_daemon(&direct_check, &cfg).await;
+
+    let (http_proxy_addr, socks_proxy_addr, _guard_tx) = if live_health.is_some() {
+        let hp = SocketAddr::new(active_addr, active_port);
+        let sp = SocketAddr::new(active_addr, active_socks_port.unwrap_or(active_port));
+        println!("Testing against running vdpi daemon at {hp} (SOCKS5: {sp})...\n");
+        (hp, sp, None)
+    } else {
+        let mut ephemeral_cfg = cfg.clone();
+        ephemeral_cfg.port = 0;
+        ephemeral_cfg.socks_port = Some(0);
+        ephemeral_cfg.system_proxy = false;
+        let ctx = EngineContext::new(ephemeral_cfg)?;
+        let bound = crate::server::bind_listeners(&ctx)?;
+        let hp = bound.primary_addr;
+        let sp = bound.socks_addr.unwrap_or(hp);
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            let _ = crate::server::serve_until_shutdown(bound, ctx, rx).await;
+        });
+        println!("Testing with ephemeral in-process vdpi engine at {hp} (SOCKS5: {sp})...\n");
+        (hp, sp, Some(tx))
+    };
 
     let http_client = Client::builder()
         .proxy(Proxy::all(format!("http://{http_proxy_addr}"))?)
