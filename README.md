@@ -54,7 +54,7 @@ Open `vdpi.exe` from File Explorer, or run `vdpi` with no arguments in an intera
 - **Install for automatic startup:** Register a background service that runs independently of the launcher window.
 - **Quit:** Leave without starting or saving a preference.
 
-Windows uses a native dialog for desktop launches. Linux uses Zenity when available. macOS can use a native alert outside a terminal. Interactive terminals use the numbered console menu.
+The launcher is a terminal interface on Windows, macOS, and Linux. Use **Up/Down** or **Tab** to move, **Enter** to select, and **Esc** to quit. Press **1** to run directly or **2** to install. The layout switches to a compact menu in smaller terminals. When `TERM=dumb`, vdpi uses a plain numbered prompt.
 
 **Run directly** saves your choice for future launches and prints a reminder that you can install later with `vdpi install`. Use `vdpi launcher` to reopen the chooser, or `vdpi start` to skip it. Commands with explicit flags and unattended shell invocations can start the foreground proxy without a prompt.
 
