@@ -253,7 +253,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         monitor.start(queue: monitorQueue)
     }
 
-    private func handlePathUpdate(_ path: NWPath) {
+    private func handlePathUpdate(_ path: Network.NWPath) {
         guard isRunning, path.status == .satisfied else { return }
         let signature = path.availableInterfaces
             .map { "\($0.name):\($0.type)" }
