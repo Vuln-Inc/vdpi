@@ -44,6 +44,27 @@ public enum VdpiFormatters {
         return eventTimeFormatter.string(from: date)
     }
 
+    public static func formatStageLabel(_ stageLabel: String) -> String {
+        switch stageLabel {
+        case "ComboMultiRecord":
+            return "Combo"
+        case "OobSniDesync":
+            return "OOB SNI"
+        case "MultiRecordOob":
+            return "Multi + OOB"
+        case "FineFragment":
+            return "Fine Fragment"
+        case "DeepRecordStorm":
+            return "Deep Storm"
+        case "SlowSniSlice":
+            return "Slow SNI"
+        case "DirectPassthrough":
+            return "Passthrough"
+        default:
+            return stageLabel
+        }
+    }
+
     public static func formatStageShort(stageNumber: UInt8, label: String) -> String {
         "S\(stageNumber) · \(label)"
     }

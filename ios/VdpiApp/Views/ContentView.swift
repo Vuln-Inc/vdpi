@@ -1,4 +1,7 @@
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
 
 enum VdpiTab: String, CaseIterable, Identifiable {
     case tunnel
@@ -14,9 +17,13 @@ enum VdpiTab: String, CaseIterable, Identifiable {
     }
 
     var systemImage: String {
+        systemImage(selected: true)
+    }
+
+    func systemImage(selected: Bool) -> String {
         switch self {
-        case .tunnel: return "shield.lefthalf.filled"
-        case .settings: return "slider.horizontal.3"
+        case .tunnel: return selected ? "shield.fill" : "shield"
+        case .settings: return selected ? "gearshape.fill" : "gearshape"
         }
     }
 }
@@ -25,40 +32,93 @@ struct ContentView: View {
     @EnvironmentObject private var manager: TunnelManager
     @Environment(\.vdpiPalette) private var palette
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
 
     @State private var selectedTab: VdpiTab = .tunnel
     @State private var popupDragOffset: CGFloat = 0
+    @State private var bottomSafeInset: CGFloat = 0
+    @State private var isKeyboardVisible: Bool = false
+    @State private var tabBarWidth: CGFloat = 248
     @Namespace private var tabBarNamespace
 
     private var showReconnectPopup: Bool {
-        (manager.reconnectPopupVisible && (manager.phase == .connected || manager.phase == .connecting))
-            || manager.isReloading
+        (manager.phase == .connected || manager.phase == .connecting)
+            && manager.reconnectPopupVisible
     }
 
-    private var showMiniBar: Bool {
+    private var showAccessoryPill: Bool {
         selectedTab == .settings && manager.phase != .disconnected
     }
 
+    private var tabBarBottomOffset: CGFloat {
+        bottomSafeInset > 0 ? max(bottomSafeInset - 12, 12) : 12
+    }
+
+    private var bottomScrimHeight: CGFloat {
+        showAccessoryPill
+            ? tabBarBottomOffset + 148
+            : max(96, tabBarBottomOffset + 90)
+    }
+
     private var topContentInset: CGFloat {
-        showReconnectPopup ? 84 : 0
+        showReconnectPopup ? 76 : 0
     }
 
     private var bottomContentInset: CGFloat {
-        showMiniBar ? 164 : 104
+        showAccessoryPill
+            ? tabBarBottomOffset + 136
+            : tabBarBottomOffset + 78
+    }
+
+    private var popupAnimation: Animation {
+        reduceMotion ? .easeInOut(duration: 0.15) : .spring(response: 0.36, dampingFraction: 0.82)
+    }
+
+    private var tabLensAnimation: Animation {
+        reduceMotion ? .easeInOut(duration: 0.15) : .spring(response: 0.34, dampingFraction: 0.80)
+    }
+
+    private var pillAnimation: Animation {
+        reduceMotion ? .easeInOut(duration: 0.15) : .easeOut(duration: 0.22)
+    }
+
+    private var dismissAnimation: Animation {
+        reduceMotion ? .easeInOut(duration: 0.15) : VdpiMotion.dismiss
+    }
+
+    private var popupTransition: AnyTransition {
+        reduceMotion
+            ? .opacity
+            : .offset(y: -24).combined(with: .opacity)
+    }
+
+    private var bottomItemTransition: AnyTransition {
+        reduceMotion
+            ? .opacity
+            : .offset(y: 12).combined(with: .opacity)
     }
 
     var body: some View {
         ZStack {
-            VdpiAmbientBackdrop(phase: manager.phase)
+            // Z0: Clean solid Apple canvas background (no ambient orbs or blur)
+            palette.canvas
+                .ignoresSafeArea()
 
-            // State-preserving ZStack so scroll offsets and unsaved drafts persist across tabs.
+            // Z0: State-preserving ZStack so scroll offsets and unsaved drafts persist across tabs
             ZStack {
-                TunnelView(topInset: topContentInset, bottomInset: bottomContentInset)
+                TunnelView(
+                    topInset: topContentInset,
+                    bottomInset: bottomContentInset,
+                    showInlineReconnect: !showReconnectPopup
+                )
+                    .vdpiSoftBottomScrollEdge()
                     .opacity(selectedTab == .tunnel ? 1 : 0)
                     .allowsHitTesting(selectedTab == .tunnel)
                     .accessibilityHidden(selectedTab != .tunnel)
 
                 SettingsView(topInset: topContentInset, bottomInset: bottomContentInset)
+                    .vdpiSoftBottomScrollEdge()
                     .opacity(selectedTab == .settings ? 1 : 0)
                     .allowsHitTesting(selectedTab == .settings)
                     .accessibilityHidden(selectedTab != .settings)
@@ -66,126 +126,177 @@ struct ContentView: View {
             .frame(maxWidth: 680, maxHeight: .infinity)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .background(safeAreaReader)
+        // Z10 + Z20: Scroll edge dissolution scrim behind floating bottom chrome
+        .overlay(alignment: .bottom) {
+            ZStack(alignment: .bottom) {
+                ScrollEdgeFadeScrim(height: bottomScrimHeight, fromBottom: true)
+                    .opacity(isKeyboardVisible ? 0 : 1)
+
+                bottomDockStack
+                    .padding(.bottom, tabBarBottomOffset)
+                    .opacity(isKeyboardVisible ? 0 : 1)
+                    .offset(y: isKeyboardVisible && !reduceMotion ? 24 : 0)
+                    .allowsHitTesting(!isKeyboardVisible)
+                    .accessibilityHidden(isKeyboardVisible)
+            }
+            .ignoresSafeArea(.container, edges: .bottom)
+            .ignoresSafeArea(.keyboard, edges: .bottom)
+        }
+        // Z30: Top-floating "Settings Changed" Liquid Glass popup across all tabs
         .overlay(alignment: .top) {
             if showReconnectPopup {
                 reconnectPopup
                     .padding(.horizontal, 16)
                     .padding(.top, 8)
-                    .transition(
-                        .move(edge: .top)
-                            .combined(with: .opacity)
-                            .combined(with: .scale(scale: 0.94, anchor: .top))
-                    )
+                    .transition(popupTransition)
             }
         }
-        .overlay(alignment: .bottom) {
-            bottomDockStack
-                .ignoresSafeArea(.keyboard, edges: .bottom)
+        .animation(popupAnimation, value: showReconnectPopup)
+        .animation(pillAnimation, value: showAccessoryPill)
+        .animation(pillAnimation, value: manager.toastMessage)
+        .animation(pillAnimation, value: isKeyboardVisible)
+        #if canImport(UIKit)
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { notification in
+            if let frame = notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect {
+                isKeyboardVisible = frame.height > 0
+            } else {
+                isKeyboardVisible = true
+            }
         }
-        .animation(VdpiMotion.floatingHud, value: showReconnectPopup)
-        .animation(VdpiMotion.floatingHud, value: showMiniBar)
-        .animation(VdpiMotion.floatingHud, value: manager.toastMessage)
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+            isKeyboardVisible = false
+        }
+        #endif
     }
 
-    // MARK: - Top Floating Reconnect Popup
+    private var safeAreaReader: some View {
+        GeometryReader { proxy in
+            Color.clear
+                .onAppear {
+                    bottomSafeInset = proxy.safeAreaInsets.bottom
+                }
+                .vdpiOnChange(of: proxy.safeAreaInsets.bottom) { newInset in
+                    bottomSafeInset = newInset
+                }
+        }
+        .ignoresSafeArea(.keyboard, edges: .bottom)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
+    // MARK: - Z30: Top-Floating "Settings Changed" Liquid Glass Popup
 
     private var reconnectPopup: some View {
         let subtitle: String = manager.pendingChangeSummary.isEmpty
             ? "Reconnect to apply"
-            : "Reconnect · \(manager.pendingChangeSummary)"
+            : "Reconnect to apply · \(manager.pendingChangeSummary)"
 
-        return GlassPanel(
-            cornerRadius: 24,
-            tier: .elevated,
-            tint: palette.warningTint,
-            borderAccent: palette.warning
-        ) {
-            HStack(spacing: 11) {
-                RotatingSyncIcon(
-                    tint: palette.warning,
-                    background: palette.warningTint,
-                    isFast: manager.isReloading,
-                    reduceMotion: reduceMotion
-                )
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Settings changed")
-                        .font(.system(size: 13.5, weight: .semibold))
-                        .foregroundStyle(palette.inkPrimary)
-                        .lineLimit(1)
-
-                    Text(subtitle)
-                        .font(.system(size: 11.5, weight: .medium, design: .monospaced))
-                        .foregroundStyle(palette.inkSecondary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                HStack(spacing: 6) {
-                    Button {
-                        VdpiHaptics.trigger(.medium)
-                        manager.applyChangesLive()
-                    } label: {
-                        Group {
-                            if manager.isReloading {
-                                ProgressView()
-                                    .progressViewStyle(.circular)
-                                    .tint(palette.primaryButtonInk)
-                                    .scaleEffect(0.76)
-                            } else {
-                                Text("Reconnect")
-                                    .font(.system(size: 12.5, weight: .semibold))
-                                    .lineLimit(1)
-                            }
-                        }
-                        .foregroundStyle(palette.primaryButtonInk)
-                        .padding(.horizontal, 13)
-                        .frame(minWidth: 86, minHeight: 34)
-                        .background(palette.primaryButtonBg)
-                        .clipShape(Capsule())
-                    }
-                    .buttonStyle(VdpiPressButtonStyle(haptic: nil))
-                    .disabled(manager.isReloading)
-
-                    Button {
-                        VdpiHaptics.trigger(.light)
-                        withAnimation(VdpiMotion.dismiss) {
-                            popupDragOffset = 0
-                            manager.dismissReconnectPopup()
-                        }
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 11, weight: .bold))
-                            .foregroundStyle(palette.inkSecondary)
-                            .frame(width: 28, height: 28)
-                            .background(palette.surfaceRaised.opacity(palette.isDark ? 0.65 : 0.72))
-                            .clipShape(Circle())
-                            .overlay(
-                                Circle()
-                                    .strokeBorder(palette.border, lineWidth: 0.75)
-                            )
-                            .contentShape(Circle())
-                    }
-                    .buttonStyle(VdpiPressButtonStyle(haptic: nil))
-                    .disabled(manager.isReloading)
-                    .opacity(manager.isReloading ? 0.35 : 1)
-                    .accessibilityLabel("Dismiss reconnect banner")
+        return HStack(spacing: 10) {
+            Group {
+                if manager.isReloading && !reduceMotion {
+                    ProgressView()
+                        .progressViewStyle(.circular)
+                        .controlSize(.mini)
+                        .tint(palette.warning)
+                        .frame(width: 14, height: 14)
+                } else {
+                    Circle()
+                        .fill(palette.warning)
+                        .frame(width: 8, height: 8)
                 }
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
+            .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Settings Changed")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(palette.inkPrimary)
+                    .lineLimit(1)
+
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundStyle(palette.inkSecondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            HStack(spacing: 2) {
+                Button {
+                    VdpiHaptics.trigger(.medium)
+                    manager.applyChangesLive()
+                } label: {
+                    ZStack {
+                        Text("Reconnect")
+                            .font(.footnote.weight(.semibold))
+                            .lineLimit(1)
+                            .opacity(manager.isReloading ? 0 : 1)
+
+                        if manager.isReloading {
+                            ProgressView()
+                                .progressViewStyle(.circular)
+                                .controlSize(.mini)
+                                .tint(.white)
+                        }
+                    }
+                    .foregroundStyle(palette.primaryButtonInk)
+                    .padding(.horizontal, 14)
+                    .frame(minHeight: 34)
+                    .background(Capsule().fill(palette.primaryButtonBg))
+                    .overlay {
+                        if colorSchemeContrast == .increased {
+                            Capsule()
+                                .strokeBorder(Color.white.opacity(0.45), lineWidth: 1.0)
+                                .allowsHitTesting(false)
+                        }
+                    }
+                    .frame(minHeight: 44)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(VdpiPressButtonStyle(haptic: nil))
+                .disabled(manager.isReloading)
+                .accessibilityLabel(manager.isReloading ? "Reconnecting tunnel" : "Reconnect tunnel")
+
+                Button {
+                    dismissReconnectPopup()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(palette.inkPrimary.opacity(0.60))
+                        .frame(width: 28, height: 28)
+                        .background(
+                            Circle()
+                                .fill(palette.inkPrimary.opacity(0.08))
+                        )
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(VdpiPressButtonStyle(haptic: nil))
+                .disabled(manager.isReloading)
+                .opacity(manager.isReloading ? 0.35 : 1)
+                .accessibilityLabel("Dismiss")
+            }
         }
-        .frame(maxWidth: 440)
+        .padding(.leading, 14)
+        .padding(.trailing, 4)
+        .padding(.vertical, 6)
+        .frame(minHeight: 56)
+        .frame(maxWidth: 420)
+        .vdpiGlass(in: Capsule(), tier: .elevated)
+        .dynamicTypeSize(...DynamicTypeSize.xLarge)
         .offset(y: popupDragOffset)
+        .accessibilityAction(named: "Dismiss") {
+            dismissReconnectPopup()
+        }
         .gesture(
-            DragGesture(minimumDistance: 6)
+            DragGesture(minimumDistance: 6, coordinateSpace: .global)
                 .onChanged { value in
                     guard !manager.isReloading else { return }
                     if value.translation.height < 0 {
                         popupDragOffset = value.translation.height
                     } else {
-                        popupDragOffset = value.translation.height * 0.14
+                        popupDragOffset = value.translation.height * 0.25
                     }
                 }
                 .onEnded { value in
@@ -193,56 +304,60 @@ struct ContentView: View {
                         popupDragOffset = 0
                         return
                     }
-                    if value.translation.height < -24 || value.predictedEndTranslation.height < -48 {
-                        VdpiHaptics.trigger(.light)
-                        withAnimation(VdpiMotion.dismiss) {
-                            popupDragOffset = 0
-                            manager.dismissReconnectPopup()
-                        }
+                    let velocityDelta = value.predictedEndTranslation.height - value.translation.height
+                    if value.translation.height < -24 || velocityDelta < -48 {
+                        dismissReconnectPopup()
                     } else {
-                        withAnimation(VdpiMotion.floatingHud) {
+                        withAnimation(popupAnimation) {
                             popupDragOffset = 0
                         }
                     }
                 }
         )
+        .onDisappear {
+            popupDragOffset = 0
+        }
     }
 
-    // MARK: - Bottom Floating Dock Stack
+    private func dismissReconnectPopup() {
+        guard !manager.isReloading else { return }
+        VdpiHaptics.trigger(.light)
+        withAnimation(dismissAnimation) {
+            popupDragOffset = 0
+            manager.dismissReconnectPopup()
+        }
+    }
+
+    // MARK: - Z20: Bottom Floating HUD Stack
 
     private var bottomDockStack: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: 8) {
             if let toast = manager.toastMessage {
                 toastPill(toast)
-                    .transition(
-                        .move(edge: .bottom)
-                            .combined(with: .opacity)
-                            .combined(with: .scale(scale: 0.94, anchor: .bottom))
-                    )
+                    .transition(bottomItemTransition)
             }
 
-            if showMiniBar {
-                liveTunnelMiniBar
-                    .transition(
-                        .move(edge: .bottom)
-                            .combined(with: .opacity)
-                            .combined(with: .scale(scale: 0.94, anchor: .bottom))
-                    )
-            }
+            VdpiGlassGroupContainer(spacing: 8) {
+                if showAccessoryPill {
+                    liveTunnelAccessoryPill
+                        .transition(bottomItemTransition)
+                }
 
-            floatingTabBar
+                floatingTabBar
+            }
         }
         .padding(.horizontal, 16)
-        .padding(.bottom, 10)
     }
 
     private func toastPill(_ message: String) -> some View {
         HStack(spacing: 8) {
             Circle()
-                .fill(palette.signal)
+                .fill(palette.accent)
                 .frame(width: 6, height: 6)
+                .accessibilityHidden(true)
+
             Text(message)
-                .font(.system(size: 13, weight: .medium))
+                .font(.footnote.weight(.medium))
                 .foregroundStyle(palette.inkPrimary)
                 .multilineTextAlignment(.center)
                 .lineLimit(2)
@@ -250,36 +365,38 @@ struct ContentView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .vdpiGlass(in: Capsule(), tier: .elevated)
+        .dynamicTypeSize(...DynamicTypeSize.accessibility2)
         .padding(.horizontal, 12)
     }
 
-    private var liveTunnelMiniBar: some View {
-        let phaseDotColor = miniBarPhaseColor
-        let shouldPulse = manager.phase == .connected || manager.phase == .connecting
+    // MARK: - Floating Live Tunnel Accessory Pill
+
+    private var liveTunnelAccessoryPill: some View {
         let isStopping = manager.phase == .disconnecting
+        let isError = manager.phase == .error
 
         return HStack(spacing: 10) {
             Button {
                 VdpiHaptics.trigger(.selection)
-                withAnimation(VdpiMotion.tabLens) {
+                withAnimation(tabLensAnimation) {
                     selectedTab = .tunnel
                 }
             } label: {
                 HStack(spacing: 10) {
-                    PulsingStatusDot(
-                        color: phaseDotColor,
-                        isPulsing: shouldPulse,
+                    CalmStatusDot(
+                        color: accessoryStatusColor,
+                        isBreathing: manager.phase == .connecting,
                         reduceMotion: reduceMotion
                     )
 
                     VStack(alignment: .leading, spacing: 1) {
-                        Text(miniBarTitle)
-                            .font(.system(size: 13, weight: .semibold))
+                        Text(accessoryTitle)
+                            .font(.footnote.weight(.semibold))
                             .foregroundStyle(palette.inkPrimary)
                             .lineLimit(1)
 
-                        Text(miniBarSubtitle)
-                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                        Text(accessorySubtitle)
+                            .font(.caption)
                             .monospacedDigit()
                             .foregroundStyle(palette.inkSecondary)
                             .contentTransition(.numericText())
@@ -289,73 +406,62 @@ struct ContentView: View {
 
                     Spacer(minLength: 4)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(maxWidth: .infinity, minHeight: 50, alignment: .leading)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("\(miniBarTitle), \(miniBarSubtitle). Switch to Tunnel")
+            .accessibilityLabel("\(accessoryTitle), \(accessorySubtitle). Switch to Tunnel")
 
             Button {
-                VdpiHaptics.trigger(.medium)
                 manager.toggleTunnel()
             } label: {
                 ZStack {
+                    Circle()
+                        .fill(palette.inkPrimary.opacity(palette.isDark ? 0.12 : 0.10))
+                        .frame(width: 34, height: 34)
+
                     if isStopping {
                         ProgressView()
                             .progressViewStyle(.circular)
+                            .controlSize(.mini)
                             .tint(palette.inkPrimary)
-                            .scaleEffect(0.75)
                     } else {
-                        Image(systemName: manager.phase == .error ? "arrow.clockwise" : "power")
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundStyle(miniBarPowerTint)
+                        Image(systemName: isError ? "arrow.clockwise" : "power")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(palette.inkPrimary)
                     }
                 }
-                .frame(width: 36, height: 36)
-                .vdpiGlass(
-                    in: Circle(),
-                    tier: .regular,
-                    tint: miniBarPowerBgTint,
-                    borderAccent: miniBarPowerBorder,
-                    interactive: true
-                )
+                .frame(width: 44, height: 44)
+                .contentShape(Circle())
             }
-            .buttonStyle(VdpiPressButtonStyle(haptic: nil))
+            .buttonStyle(AccessoryStopButtonStyle())
             .disabled(isStopping)
-            .accessibilityLabel(
-                manager.phase == .connected || manager.phase == .connecting
-                    ? "Disconnect tunnel"
-                    : "Reconnect tunnel"
-            )
+            .accessibilityLabel(isError ? "Reconnect tunnel" : "Disconnect tunnel")
         }
         .padding(.leading, 14)
-        .padding(.trailing, 8)
-        .frame(height: 52)
-        .frame(maxWidth: 400)
-        .vdpiGlass(
-            in: Capsule(),
-            tier: .elevated,
-            tint: miniBarGlassTint,
-            borderAccent: miniBarBorderAccent,
-            interactive: true
-        )
+        .padding(.trailing, 3)
+        .frame(minHeight: 50)
+        .frame(maxWidth: 380)
+        .vdpiGlass(in: Capsule(), tier: .elevated, interactive: true)
+        .dynamicTypeSize(...DynamicTypeSize.xLarge)
     }
 
-    private var miniBarTitle: String {
+    private var accessoryTitle: String {
         switch manager.phase {
-        case .connected: return "Protected"
-        case .connecting: return "Connecting"
-        case .disconnecting: return "Stopping"
-        case .error: return "Error"
-        case .disconnected: return "Standby"
+        case .connected: return "Connected"
+        case .connecting: return "Connecting..."
+        case .disconnecting: return "Disconnecting..."
+        case .error: return "Tunnel Error"
+        case .disconnected: return "Disconnected"
         }
     }
 
-    private var miniBarSubtitle: String {
+    private var accessorySubtitle: String {
         switch manager.phase {
         case .connected:
             let uptime = VdpiFormatters.formatUptime(manager.telemetry.uptimeSecs)
-            return "Up \(uptime) · S\(manager.telemetry.stageNumber) · \(VdpiFormatters.formatBytes(manager.telemetry.bytesRx))"
+            let rx = VdpiFormatters.formatBytes(manager.telemetry.bytesRx)
+            return "\(uptime) · ↓ \(rx)"
         case .connecting:
             return "Starting TLS desync & DoH..."
         case .disconnecting:
@@ -367,126 +473,114 @@ struct ContentView: View {
         }
     }
 
-    private var miniBarPhaseColor: Color {
+    private var accessoryStatusColor: Color {
         switch manager.phase {
-        case .connected: return manager.pendingReconnect ? palette.warning : palette.signal
+        case .connected: return palette.signal
         case .connecting, .disconnecting: return palette.warning
         case .error: return palette.danger
         case .disconnected: return palette.inkMuted
         }
     }
 
-    private var miniBarGlassTint: Color? {
-        switch manager.phase {
-        case .connected: return manager.pendingReconnect ? palette.warningTint : palette.signalTint
-        case .connecting, .disconnecting: return palette.warningTint
-        case .error: return palette.dangerTint
-        case .disconnected: return nil
-        }
-    }
-
-    private var miniBarBorderAccent: Color? {
-        switch manager.phase {
-        case .connected: return manager.pendingReconnect ? palette.warning : palette.signal
-        case .connecting, .disconnecting: return palette.warning
-        case .error: return palette.danger
-        case .disconnected: return nil
-        }
-    }
-
-    private var miniBarPowerTint: Color {
-        switch manager.phase {
-        case .connected: return palette.signal
-        case .connecting, .disconnecting: return palette.warning
-        case .error: return palette.danger
-        case .disconnected: return palette.inkPrimary
-        }
-    }
-
-    private var miniBarPowerBgTint: Color? {
-        switch manager.phase {
-        case .connected: return palette.signalTint
-        case .connecting, .disconnecting: return palette.warningTint
-        case .error: return palette.dangerTint
-        case .disconnected: return nil
-        }
-    }
-
-    private var miniBarPowerBorder: Color? {
-        switch manager.phase {
-        case .connected: return palette.signal
-        case .connecting, .disconnecting: return palette.warning
-        case .error: return palette.danger
-        case .disconnected: return nil
-        }
-    }
-
     // MARK: - Floating Liquid Glass Capsule Tab Bar
 
     private var floatingTabBar: some View {
-        HStack(spacing: 4) {
-            ForEach(VdpiTab.allCases) { tab in
+        let tabs = VdpiTab.allCases
+
+        return HStack(spacing: 0) {
+            ForEach(tabs) { tab in
                 let isSelected = (selectedTab == tab)
                 Button {
-                    guard selectedTab != tab else { return }
-                    VdpiHaptics.trigger(.selection)
-                    withAnimation(VdpiMotion.tabLens) {
-                        selectedTab = tab
-                    }
+                    selectTab(tab)
                 } label: {
-                    HStack(spacing: 7) {
-                        Image(systemName: tab.systemImage)
-                            .font(.system(size: 14, weight: isSelected ? .semibold : .medium))
+                    VStack(spacing: 2) {
+                        Image(systemName: tab.systemImage(selected: isSelected))
+                            .font(.system(size: 20, weight: isSelected ? .semibold : .medium))
                             .overlay(alignment: .topTrailing) {
                                 if tab == .tunnel, let dotColor = tunnelTabStatusDotColor {
                                     Circle()
                                         .fill(dotColor)
                                         .frame(width: 6, height: 6)
-                                        .overlay(
-                                            Circle()
-                                                .strokeBorder(
-                                                    palette.isDark ? Color.black.opacity(0.75) : Color.white.opacity(0.95),
-                                                    lineWidth: 1
-                                                )
-                                        )
-                                        .offset(x: 3.5, y: -2.5)
+                                        .offset(x: 5, y: -2)
+                                        .accessibilityHidden(true)
                                 }
                             }
 
                         Text(tab.title)
-                            .font(.system(size: 13, weight: isSelected ? .semibold : .medium))
+                            .font(.caption2.weight(.medium))
+                            .dynamicTypeSize(...DynamicTypeSize.large)
                             .lineLimit(1)
                     }
-                    .foregroundStyle(isSelected ? palette.inkPrimary : palette.inkMuted)
-                    .scaleEffect(isSelected ? 1.0 : 0.96)
-                    .frame(maxWidth: .infinity)
-                    .frame(minHeight: 44)
+                    .foregroundStyle(isSelected ? palette.accent : palette.inkPrimary.opacity(0.60))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .background {
                         if isSelected {
-                            Capsule()
-                                .fill(palette.glassLensFill)
-                                .overlay(
-                                    Capsule()
-                                        .strokeBorder(palette.specularRim(), lineWidth: 0.9)
-                                )
-                                .shadow(
-                                    color: palette.shadowColor.opacity(palette.isDark ? 0.45 : 0.65),
-                                    radius: 6,
-                                    x: 0,
-                                    y: 2
-                                )
+                            tabBarLens
                                 .matchedGeometryEffect(id: "vdpi.tab.lens", in: tabBarNamespace)
                         }
                     }
                     .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel(tabAccessibilityLabel(for: tab))
                 .accessibilityAddTraits(isSelected ? .isSelected : [])
             }
         }
         .padding(5)
-        .frame(maxWidth: 270)
+        .frame(maxWidth: 248)
+        .frame(height: 62)
         .vdpiGlass(in: Capsule(), tier: .elevated)
+        .background(
+            GeometryReader { proxy in
+                Color.clear
+                    .onAppear {
+                        tabBarWidth = max(proxy.size.width, 1)
+                    }
+                    .vdpiOnChange(of: proxy.size.width) { width in
+                        tabBarWidth = max(width, 1)
+                    }
+            }
+        )
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 14, coordinateSpace: .local)
+                .onChanged { value in
+                    guard abs(value.translation.width) > abs(value.translation.height) else { return }
+                    let segmentWidth = tabBarWidth / CGFloat(max(tabs.count, 1))
+                    let rawIndex = Int(value.location.x / max(segmentWidth, 1))
+                    let clampedIndex = min(max(rawIndex, 0), tabs.count - 1)
+                    selectTab(tabs[clampedIndex])
+                }
+        )
+    }
+
+    private var tabBarLens: some View {
+        let rimColor: Color = colorSchemeContrast == .increased
+            ? palette.borderStrong
+            : (palette.isDark ? Color.white.opacity(0.26) : Color.black.opacity(0.06))
+        let rimWidth: CGFloat = colorSchemeContrast == .increased ? 1.0 : 0.5
+
+        return Capsule()
+            .fill(reduceTransparency ? palette.surface : palette.glassLensFill)
+            .overlay {
+                if !reduceTransparency {
+                    Capsule()
+                        .fill(palette.topSheenGradient)
+                        .allowsHitTesting(false)
+                }
+            }
+            .overlay(
+                Capsule()
+                    .strokeBorder(rimColor, lineWidth: rimWidth)
+                    .allowsHitTesting(false)
+            )
+    }
+
+    private func selectTab(_ tab: VdpiTab) {
+        guard selectedTab != tab else { return }
+        VdpiHaptics.trigger(.selection)
+        withAnimation(tabLensAnimation) {
+            selectedTab = tab
+        }
     }
 
     private var tunnelTabStatusDotColor: Color? {
@@ -501,92 +595,125 @@ struct ContentView: View {
             return nil
         }
     }
+
+    private func tabAccessibilityLabel(for tab: VdpiTab) -> String {
+        guard tab == .tunnel else { return tab.title }
+        switch manager.phase {
+        case .connected:
+            return manager.pendingReconnect ? "Tunnel, connected, settings pending" : "Tunnel, connected"
+        case .connecting:
+            return "Tunnel, connecting"
+        case .error:
+            return "Tunnel, error"
+        case .disconnected, .disconnecting:
+            return tab.title
+        }
+    }
 }
 
 // MARK: - HUD Supporting Micro-Views
 
-private struct RotatingSyncIcon: View {
-    let tint: Color
-    let background: Color
-    let isFast: Bool
+private struct CalmStatusDot: View {
+    let color: Color
+    let isBreathing: Bool
     let reduceMotion: Bool
 
-    @State private var angle: Double = 0
+    @State private var isDimmed = false
 
     var body: some View {
-        ZStack {
-            Circle()
-                .fill(background)
-                .overlay(
-                    Circle()
-                        .strokeBorder(tint.opacity(0.38), lineWidth: 1)
-                )
-                .frame(width: 34, height: 34)
-
-            Image(systemName: "arrow.triangle.2.circlepath")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(tint)
-                .rotationEffect(.degrees(reduceMotion ? 0 : angle))
-        }
-        .onAppear {
-            startSpin(fast: isFast)
-        }
-        .vdpiOnChange(of: isFast) { fast in
-            startSpin(fast: fast)
-        }
-        .accessibilityHidden(true)
+        Circle()
+            .fill(color)
+            .frame(width: 8, height: 8)
+            .opacity(isBreathing && !reduceMotion && isDimmed ? 0.45 : 1.0)
+            .onAppear {
+                syncBreathing()
+            }
+            .vdpiOnChange(of: isBreathing) { _ in
+                syncBreathing()
+            }
+            .vdpiOnChange(of: reduceMotion) { _ in
+                syncBreathing()
+            }
+            .accessibilityHidden(true)
     }
 
-    private func startSpin(fast: Bool) {
-        guard !reduceMotion else {
-            angle = 0
+    private func syncBreathing() {
+        guard isBreathing && !reduceMotion else {
+            withAnimation(.easeOut(duration: 0.15)) {
+                isDimmed = false
+            }
             return
         }
-        angle = 0
-        withAnimation(.linear(duration: fast ? 0.9 : 4.2).repeatForever(autoreverses: false)) {
-            angle = 360
+        isDimmed = false
+        withAnimation(.easeInOut(duration: 1.2).repeatForever(autoreverses: true)) {
+            isDimmed = true
         }
     }
 }
 
-private struct PulsingStatusDot: View {
-    let color: Color
-    let isPulsing: Bool
-    let reduceMotion: Bool
-
-    @State private var pulseExpanded = false
-
-    var body: some View {
-        ZStack {
-            if isPulsing && !reduceMotion {
-                Circle()
-                    .fill(color.opacity(pulseExpanded ? 0.0 : 0.42))
-                    .frame(width: 18, height: 18)
-                    .scaleEffect(pulseExpanded ? 1.35 : 0.55)
-            }
-            Circle()
-                .fill(color)
-                .frame(width: 8, height: 8)
-                .shadow(color: color.opacity(0.5), radius: 4, x: 0, y: 0)
-        }
-        .frame(width: 18, height: 18)
-        .onAppear {
-            updatePulse()
-        }
-        .vdpiOnChange(of: isPulsing) { _ in
-            updatePulse()
-        }
-        .accessibilityHidden(true)
+private struct AccessoryStopButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        StopPressBody(configuration: configuration)
     }
 
-    private func updatePulse() {
-        guard isPulsing && !reduceMotion else {
-            pulseExpanded = false
-            return
+    private struct StopPressBody: View {
+        @Environment(\.accessibilityReduceMotion) private var reduceMotion
+        let configuration: Configuration
+
+        var body: some View {
+            configuration.label
+                .scaleEffect(configuration.isPressed && !reduceMotion ? 0.92 : 1.0)
+                .opacity(configuration.isPressed ? 0.84 : 1.0)
+                .animation(reduceMotion ? nil : VdpiMotion.press, value: configuration.isPressed)
+                .vdpiOnChange(of: configuration.isPressed) { isPressed in
+                    if isPressed {
+                        Task { @MainActor in
+                            VdpiHaptics.trigger(.medium)
+                        }
+                    }
+                }
         }
-        pulseExpanded = false
-        withAnimation(.easeOut(duration: 1.5).repeatForever(autoreverses: false)) {
-            pulseExpanded = true
+    }
+}
+
+private struct VdpiGlassGroupContainer<Content: View>: View {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    let spacing: CGFloat
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        #if compiler(>=6.2) && os(iOS)
+        if #available(iOS 26.0, *), !reduceTransparency {
+            GlassEffectContainer(spacing: spacing) {
+                VStack(spacing: spacing) {
+                    content()
+                }
+            }
+        } else {
+            VStack(spacing: spacing) {
+                content()
+            }
         }
+        #else
+        VStack(spacing: spacing) {
+            content()
+        }
+        #endif
+    }
+}
+
+private extension View {
+    @ViewBuilder
+    func vdpiSoftBottomScrollEdge() -> some View {
+        #if compiler(>=6.2) && os(iOS)
+        if #available(iOS 26.0, *) {
+            scrollEdgeEffectStyle(.soft, for: .bottom)
+        } else {
+            self
+        }
+        #else
+        self
+        #endif
     }
 }

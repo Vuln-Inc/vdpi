@@ -4,16 +4,8 @@ import android.graphics.RenderEffect as AndroidRenderEffect
 import android.graphics.Shader
 import android.os.Build
 import androidx.annotation.RequiresApi
-import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
-import androidx.compose.animation.core.tween
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -24,6 +16,8 @@ import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
@@ -41,7 +35,6 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.shadow
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -68,24 +61,21 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import com.vulninc.vdpi.ui.theme.VdpiThemeTokens
-import com.vulninc.vdpi.vpn.TunnelPhase
-import kotlin.math.PI
-import kotlin.math.cos
-import kotlin.math.max
 import kotlin.math.roundToInt
-import kotlin.math.sin
 
-val LocalBottomChromePadding = compositionLocalOf { 104.dp }
+val LocalBottomChromePadding = compositionLocalOf { 100.dp }
 val LocalTopOverlayPadding = compositionLocalOf { 0.dp }
 val LocalGlassBackdropLayer = compositionLocalOf<GraphicsLayer?> { null }
+val LocalReduceTransparency = compositionLocalOf { false }
+val LocalIncreaseContrast = compositionLocalOf { false }
 
 object VdpiMotion {
-    val tabLensSpring = spring<Dp>(dampingRatio = 0.74f, stiffness = 340f)
-    val tabLensFloatSpring = spring<Float>(dampingRatio = 0.74f, stiffness = 340f)
-    val pressSpring = spring<Float>(dampingRatio = 0.78f, stiffness = 750f)
-    val toggleSpring = spring<Float>(dampingRatio = 0.70f, stiffness = 520f)
-    val popupSpring = spring<IntOffset>(dampingRatio = 0.76f, stiffness = 280f)
-    val miniBarSpring = spring<IntOffset>(dampingRatio = 0.84f, stiffness = 310f)
+    val tabLensSpring = spring<Dp>(dampingRatio = 0.78f, stiffness = 360f)
+    val tabLensFloatSpring = spring<Float>(dampingRatio = 0.78f, stiffness = 360f)
+    val pressSpring = spring<Float>(dampingRatio = 0.85f, stiffness = 800f)
+    val toggleSpring = spring<Float>(dampingRatio = 0.78f, stiffness = 620f)
+    val popupSpring = spring<IntOffset>(dampingRatio = 0.82f, stiffness = 340f)
+    val miniBarSpring = spring<IntOffset>(dampingRatio = 0.86f, stiffness = 340f)
 }
 
 @RequiresApi(Build.VERSION_CODES.S)
@@ -96,7 +86,7 @@ private fun createBackdropBlurEffect(radiusPx: Float): RenderEffect =
 
 fun Modifier.springPress(
     interactionSource: MutableInteractionSource,
-    pressedScale: Float = 0.96f,
+    pressedScale: Float = 0.97f,
 ): Modifier = composed {
     val isPressed by interactionSource.collectIsPressedAsState()
     val scale by animateFloatAsState(
@@ -110,6 +100,13 @@ fun Modifier.springPress(
     }
 }
 
+/**
+ * Liquid Glass material strictly for the floating functional chrome layer:
+ * floating tab bar, floating live-tunnel accessory pill, top reconnect banner,
+ * floating circular toolbar buttons, and floating snackbars.
+ *
+ * Never apply to content cards, backgrounds, or list rows.
+ */
 fun Modifier.liquidGlass(
     shape: Shape = CircleShape,
     elevated: Boolean = true,
@@ -117,12 +114,23 @@ fun Modifier.liquidGlass(
     fillTint: Color? = null,
 ): Modifier = composed {
     val palette = VdpiThemeTokens.palette
+    val reduceTransparency = LocalReduceTransparency.current
+    val increaseContrast = LocalIncreaseContrast.current
+
+    if (reduceTransparency) {
+        val borderColor = if (increaseContrast) palette.borderStrong else palette.border
+        return@composed this
+            .clip(shape)
+            .background(palette.surface)
+            .border(width = 1.dp, color = borderColor, shape = shape)
+    }
+
     val backdropLayer = LocalGlassBackdropLayer.current
     val density = LocalDensity.current
     val useRealBlur = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && backdropLayer != null
     val blurLayer = if (useRealBlur) rememberGraphicsLayer() else null
-    val blurRadiusPx = remember(elevated, density) {
-        with(density) { (if (elevated) 22.dp else 16.dp).toPx() }
+    val blurRadiusPx = remember(density) {
+        with(density) { 22.dp.toPx() }
     }
     val cachedBlurEffect = remember(useRealBlur, blurRadiusPx) {
         if (useRealBlur && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -135,17 +143,24 @@ fun Modifier.liquidGlass(
 
     val baseFill = fillTint ?: if (elevated) palette.glassFillElevated else palette.glassFill
     val topFill = baseFill.copy(
-        alpha = (baseFill.alpha * if (palette.isDark) 1.06f else 1.04f).coerceAtMost(0.96f),
+        alpha = (baseFill.alpha * if (palette.isDark) 1.04f else 1.03f).coerceAtMost(0.95f),
     )
     val bottomFill = baseFill.copy(
-        alpha = (baseFill.alpha * if (palette.isDark) 0.90f else 0.94f).coerceAtLeast(0.08f),
+        alpha = (baseFill.alpha * if (palette.isDark) 0.92f else 0.96f).coerceAtLeast(0.08f),
     )
+    val bodyBrush = remember(topFill, bottomFill) {
+        Brush.verticalGradient(colors = listOf(topFill, bottomFill))
+    }
+
+    val sheenTop = remember(palette.isDark) {
+        Color.White.copy(alpha = if (palette.isDark) 0.06f else 0.22f)
+    }
 
     val rimTop = if (rimTint != null) {
         lerp(
             palette.glassRimTop,
-            rimTint.copy(alpha = if (palette.isDark) 0.72f else 0.62f),
-            0.55f,
+            rimTint.copy(alpha = if (palette.isDark) 0.42f else 0.36f),
+            0.40f,
         )
     } else {
         palette.glassRimTop
@@ -153,8 +168,8 @@ fun Modifier.liquidGlass(
     val rimSide = if (rimTint != null) {
         lerp(
             palette.glassRimSide,
-            rimTint.copy(alpha = if (palette.isDark) 0.28f else 0.24f),
-            0.50f,
+            rimTint.copy(alpha = if (palette.isDark) 0.18f else 0.16f),
+            0.35f,
         )
     } else {
         palette.glassRimSide
@@ -162,8 +177,8 @@ fun Modifier.liquidGlass(
     val rimBottom = if (rimTint != null) {
         lerp(
             palette.glassRimBottom,
-            rimTint.copy(alpha = if (palette.isDark) 0.42f else 0.34f),
-            0.50f,
+            rimTint.copy(alpha = if (palette.isDark) 0.24f else 0.20f),
+            0.35f,
         )
     } else {
         palette.glassRimBottom
@@ -172,19 +187,23 @@ fun Modifier.liquidGlass(
     val rimBrush = remember(rimTop, rimSide, rimBottom) {
         Brush.verticalGradient(
             0.00f to rimTop,
-            0.36f to rimSide,
+            0.38f to rimSide,
             0.78f to rimSide,
             1.00f to rimBottom,
         )
     }
 
+    val neutralShadow = remember(palette.isDark) {
+        Color.Black.copy(alpha = if (palette.isDark) 0.48f else 0.14f)
+    }
+
     val shadowModifier = if (elevated) {
         Modifier.shadow(
-            elevation = if (palette.isDark) 16.dp else 12.dp,
+            elevation = if (palette.isDark) 12.dp else 8.dp,
             shape = shape,
             clip = false,
-            ambientColor = palette.glassShadow,
-            spotColor = palette.glassShadow,
+            ambientColor = neutralShadow,
+            spotColor = neutralShadow,
         )
     } else {
         Modifier
@@ -198,6 +217,12 @@ fun Modifier.liquidGlass(
         }
     } else {
         Modifier
+    }
+
+    val borderModifier = if (increaseContrast) {
+        Modifier.border(width = 1.dp, color = palette.borderStrong, shape = shape)
+    } else {
+        Modifier.border(width = 0.5.dp, brush = rimBrush, shape = shape)
     }
 
     this
@@ -229,20 +254,14 @@ fun Modifier.liquidGlass(
                 }
             }
 
-            // Layered vertical translucent body tint
-            drawRect(
-                brush = Brush.verticalGradient(
-                    colors = listOf(topFill, bottomFill),
-                ),
-            )
+            drawRect(brush = bodyBrush)
 
-            // Inner top refraction sheen over the top 38%
             if (size.height > 0f) {
                 drawRect(
                     brush = Brush.verticalGradient(
                         colorStops = arrayOf(
-                            0.00f to palette.glassSheenTop,
-                            0.38f to Color.Transparent,
+                            0.00f to sheenTop,
+                            0.30f to Color.Transparent,
                         ),
                         startY = 0f,
                         endY = size.height,
@@ -250,31 +269,11 @@ fun Modifier.liquidGlass(
                 )
             }
         }
-        .border(width = 1.dp, brush = rimBrush, shape = shape)
+        .then(borderModifier)
 }
 
 @Composable
-fun LiquidGlassCard(
-    modifier: Modifier = Modifier,
-    radius: Dp = 24.dp,
-    rimTint: Color? = null,
-    fillTint: Color? = null,
-    elevated: Boolean = true,
-    content: @Composable ColumnScope.() -> Unit,
-) {
-    Column(
-        modifier = modifier.liquidGlass(
-            shape = RoundedCornerShape(radius),
-            elevated = elevated,
-            rimTint = rimTint,
-            fillTint = fillTint,
-        ),
-        content = content,
-    )
-}
-
-@Composable
-fun LiquidGlassCapsule(
+fun FloatingGlassCapsule(
     modifier: Modifier = Modifier,
     rimTint: Color? = null,
     fillTint: Color? = null,
@@ -294,11 +293,28 @@ fun LiquidGlassCapsule(
 }
 
 @Composable
+fun LiquidGlassCapsule(
+    modifier: Modifier = Modifier,
+    rimTint: Color? = null,
+    fillTint: Color? = null,
+    elevated: Boolean = true,
+    content: @Composable BoxScope.() -> Unit,
+) {
+    FloatingGlassCapsule(
+        modifier = modifier,
+        rimTint = rimTint,
+        fillTint = fillTint,
+        elevated = elevated,
+        content = content,
+    )
+}
+
+@Composable
 fun FloatingGlassIconButton(
     onClick: () -> Unit,
     contentDescription: String,
     modifier: Modifier = Modifier,
-    size: Dp = 44.dp,
+    size: Dp = 42.dp,
     badgeColor: Color? = null,
     enabled: Boolean = true,
     icon: @Composable BoxScope.() -> Unit,
@@ -306,294 +322,132 @@ fun FloatingGlassIconButton(
     val palette = VdpiThemeTokens.palette
     val haptic = LocalHapticFeedback.current
     val interactionSource = remember { MutableInteractionSource() }
+    val touchTarget = if (size >= 44.dp) size else 44.dp
 
     Box(
         modifier = modifier
-            .size(size)
-            .alpha(if (enabled) 1f else 0.45f)
-            .springPress(interactionSource = interactionSource, pressedScale = 0.92f)
+            .size(touchTarget)
+            .alpha(if (enabled) 1f else 0.42f)
             .semantics {
                 this.contentDescription = contentDescription
                 this.role = Role.Button
+            }
+            .clickable(
+                interactionSource = interactionSource,
+                indication = null,
+                enabled = enabled,
+                role = Role.Button,
+            ) {
+                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                onClick()
             },
         contentAlignment = Alignment.Center,
     ) {
         Box(
             modifier = Modifier
-                .fillMaxSize()
-                .liquidGlass(
-                    shape = CircleShape,
-                    elevated = true,
-                )
-                .clickable(
-                    interactionSource = interactionSource,
-                    indication = null,
-                    enabled = enabled,
-                    role = Role.Button,
-                ) {
-                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                    onClick()
-                },
+                .size(size)
+                .springPress(interactionSource = interactionSource, pressedScale = 0.96f),
             contentAlignment = Alignment.Center,
-            content = icon,
-        )
-
-        if (badgeColor != null) {
+        ) {
             Box(
                 modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(top = 5.dp, end = 5.dp)
-                    .size(7.dp)
-                    .shadow(
-                        elevation = 4.dp,
+                    .fillMaxSize()
+                    .liquidGlass(
                         shape = CircleShape,
-                        clip = false,
-                        ambientColor = badgeColor,
-                        spotColor = badgeColor,
-                    )
-                    .clip(CircleShape)
-                    .background(badgeColor)
-                    .border(
-                        width = 1.dp,
-                        color = if (palette.isDark) Color(0xCC06080B) else Color(0xE6FFFFFF),
-                        shape = CircleShape,
+                        elevated = true,
                     ),
+                contentAlignment = Alignment.Center,
+                content = icon,
+            )
+
+            if (badgeColor != null) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(top = 4.dp, end = 4.dp)
+                        .size(7.dp)
+                        .clip(CircleShape)
+                        .background(badgeColor)
+                        .border(
+                            width = 1.dp,
+                            color = palette.canvas,
+                            shape = CircleShape,
+                        ),
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Apple HIG Scroll Edge Effect: dissolves scrolled content smoothly into the canvas edge
+ * beneath floating chrome using a multi-stop EaseInCubic falloff.
+ */
+@Composable
+fun ScrollEdgeFadeScrim(
+    modifier: Modifier = Modifier,
+    height: Dp = 96.dp,
+    fromBottom: Boolean = true,
+) {
+    val canvas = VdpiThemeTokens.palette.canvas
+    val brush = remember(canvas, fromBottom) {
+        val stops = arrayOf(
+            0.00f to canvas.copy(alpha = 0.000f),
+            0.20f to canvas.copy(alpha = 0.007f),
+            0.35f to canvas.copy(alpha = 0.039f),
+            0.50f to canvas.copy(alpha = 0.115f),
+            0.65f to canvas.copy(alpha = 0.253f),
+            0.78f to canvas.copy(alpha = 0.437f),
+            0.90f to canvas.copy(alpha = 0.671f),
+            1.00f to canvas.copy(alpha = 0.920f),
+        )
+        if (fromBottom) {
+            Brush.verticalGradient(colorStops = stops)
+        } else {
+            Brush.verticalGradient(
+                colorStops = stops
+                    .map { (pos, color) -> (1f - pos) to color }
+                    .reversed()
+                    .toTypedArray(),
             )
         }
     }
+
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(height)
+            .background(brush),
+    )
 }
 
+/**
+ * Opaque Apple Inset Grouped surface for the content layer.
+ * Zero blur and zero drop shadow; adds a crisp 1dp border when Increase Contrast is enabled.
+ */
 @Composable
-fun AuroraHeroBackground(
-    phase: TunnelPhase,
+fun InsetGroupedCard(
     modifier: Modifier = Modifier,
+    radius: Dp = 16.dp,
+    backgroundColor: Color = VdpiThemeTokens.palette.surface,
+    content: @Composable ColumnScope.() -> Unit,
 ) {
-    val palette = VdpiThemeTokens.palette
-    val colorSpec = tween<Color>(durationMillis = 680)
-
-    val baseTop by animateColorAsState(
-        targetValue = when (phase) {
-            TunnelPhase.CONNECTED -> Color(0xFF06283D)
-            TunnelPhase.CONNECTING -> Color(0xFF181E38)
-            TunnelPhase.ERROR -> Color(0xFF2E0B14)
-            TunnelPhase.DISCONNECTED -> if (palette.isDark) Color(0xFF141821) else Color(0xFFE2E8F0)
-        },
-        animationSpec = colorSpec,
-        label = "auroraBaseTop",
-    )
-    val baseBottom by animateColorAsState(
-        targetValue = when (phase) {
-            TunnelPhase.CONNECTED -> Color(0xFF041C2C)
-            TunnelPhase.CONNECTING -> Color(0xFF0E1326)
-            TunnelPhase.ERROR -> Color(0xFF19060B)
-            TunnelPhase.DISCONNECTED -> if (palette.isDark) Color(0xFF0B0E15) else Color(0xFFD5DFEC)
-        },
-        animationSpec = colorSpec,
-        label = "auroraBaseBottom",
-    )
-    val orbPrimary by animateColorAsState(
-        targetValue = when (phase) {
-            TunnelPhase.CONNECTED -> Color(0xFF00D26A)
-            TunnelPhase.CONNECTING -> Color(0xFFF59E0B)
-            TunnelPhase.ERROR -> Color(0xFFFF4D6D)
-            TunnelPhase.DISCONNECTED -> if (palette.isDark) Color(0xFF334155) else Color(0xFF94A3B8)
-        },
-        animationSpec = colorSpec,
-        label = "auroraOrbPrimary",
-    )
-    val orbSecondary by animateColorAsState(
-        targetValue = when (phase) {
-            TunnelPhase.CONNECTED -> Color(0xFF00C2D1)
-            TunnelPhase.CONNECTING -> Color(0xFF19C8FF)
-            TunnelPhase.ERROR -> Color(0xFFB91C1C)
-            TunnelPhase.DISCONNECTED -> if (palette.isDark) Color(0xFF1E293B) else Color(0xFF64748B)
-        },
-        animationSpec = colorSpec,
-        label = "auroraOrbSecondary",
-    )
-
-    val transition = rememberInfiniteTransition(label = "auroraMesh")
-    val slowPhase by transition.animateFloat(
-        initialValue = 0f,
-        targetValue = (2.0 * PI).toFloat(),
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 15000, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart,
-        ),
-        label = "auroraSlowOrbit",
-    )
-    val fastPhase by transition.animateFloat(
-        initialValue = 0f,
-        targetValue = (2.0 * PI).toFloat(),
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 6800, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart,
-        ),
-        label = "auroraFastOrbit",
-    )
-    val pulse by transition.animateFloat(
-        initialValue = 0.88f,
-        targetValue = 1.08f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 4800, easing = LinearEasing),
-            repeatMode = RepeatMode.Reverse,
-        ),
-        label = "auroraPulse",
-    )
-
-    val activeAngle = if (phase == TunnelPhase.CONNECTING) fastPhase else slowPhase
-    val dotColor = if (phase == TunnelPhase.DISCONNECTED && !palette.isDark) {
-        Color(0xFF0F172A).copy(alpha = 0.05f)
+    val increaseContrast = LocalIncreaseContrast.current
+    val shape = RoundedCornerShape(radius)
+    val contrastBorder = if (increaseContrast) {
+        Modifier.border(
+            width = 1.dp,
+            color = VdpiThemeTokens.palette.borderStrong,
+            shape = shape,
+        )
     } else {
-        Color.White.copy(alpha = 0.05f)
+        Modifier
     }
-
-    Canvas(modifier = modifier.fillMaxSize()) {
-        val w = size.width
-        val h = size.height
-        if (w <= 0f || h <= 0f) return@Canvas
-        val maxDim = max(w, h)
-
-        // Base atmospheric gradient
-        drawRect(
-            brush = Brush.verticalGradient(
-                colors = listOf(baseTop, baseBottom),
-            ),
-        )
-
-        val primaryAlpha = when (phase) {
-            TunnelPhase.CONNECTED -> 0.42f
-            TunnelPhase.CONNECTING -> 0.36f
-            TunnelPhase.ERROR -> 0.38f
-            TunnelPhase.DISCONNECTED -> if (palette.isDark) 0.28f else 0.24f
-        }
-        val secondaryAlpha = when (phase) {
-            TunnelPhase.CONNECTED -> 0.34f
-            TunnelPhase.CONNECTING -> 0.34f
-            TunnelPhase.ERROR -> 0.32f
-            TunnelPhase.DISCONNECTED -> if (palette.isDark) 0.24f else 0.18f
-        }
-
-        val orbitRadiusX = w * 0.18f
-        val orbitRadiusY = h * 0.14f
-
-        val orb1Center = Offset(
-            x = w * 0.24f + cos(activeAngle) * orbitRadiusX,
-            y = h * 0.28f + sin(activeAngle) * orbitRadiusY,
-        )
-        val orb2Center = Offset(
-            x = w * 0.78f + cos(activeAngle + 2.35f) * orbitRadiusX,
-            y = h * 0.64f + sin(activeAngle + 2.35f) * orbitRadiusY,
-        )
-        val orb3Center = Offset(
-            x = w * 0.56f + sin(activeAngle * 0.7f) * (w * 0.14f),
-            y = h * 0.16f + cos(activeAngle * 0.7f) * (h * 0.10f),
-        )
-
-        drawRect(
-            brush = Brush.radialGradient(
-                colors = listOf(
-                    orbPrimary.copy(alpha = primaryAlpha),
-                    orbPrimary.copy(alpha = primaryAlpha * 0.35f),
-                    Color.Transparent,
-                ),
-                center = orb1Center,
-                radius = maxDim * 0.72f * pulse,
-            ),
-        )
-
-        drawRect(
-            brush = Brush.radialGradient(
-                colors = listOf(
-                    orbSecondary.copy(alpha = secondaryAlpha),
-                    orbSecondary.copy(alpha = secondaryAlpha * 0.30f),
-                    Color.Transparent,
-                ),
-                center = orb2Center,
-                radius = maxDim * 0.68f,
-            ),
-        )
-
-        drawRect(
-            brush = Brush.radialGradient(
-                colors = listOf(
-                    lerp(orbPrimary, orbSecondary, 0.5f).copy(alpha = secondaryAlpha * 0.65f),
-                    Color.Transparent,
-                ),
-                center = orb3Center,
-                radius = maxDim * 0.52f,
-            ),
-        )
-
-        // Subtle tactical dot-matrix texture (0.05 alpha)
-        val stepPx = 14.dp.toPx()
-        val dotRadius = 0.9.dp.toPx()
-        var y = stepPx * 0.5f
-        while (y < h) {
-            var x = stepPx * 0.5f
-            while (x < w) {
-                drawCircle(
-                    color = dotColor,
-                    radius = dotRadius,
-                    center = Offset(x, y),
-                )
-                x += stepPx
-            }
-            y += stepPx
-        }
-    }
-}
-
-@Composable
-fun AmbientCanvasBackdrop(
-    phase: TunnelPhase,
-    modifier: Modifier = Modifier,
-) {
-    val palette = VdpiThemeTokens.palette
-    val colorSpec = tween<Color>(durationMillis = 720)
-
-    val primaryWash by animateColorAsState(
-        targetValue = when (phase) {
-            TunnelPhase.CONNECTED -> palette.signal.copy(alpha = if (palette.isDark) 0.13f else 0.10f)
-            TunnelPhase.CONNECTING -> palette.warning.copy(alpha = if (palette.isDark) 0.12f else 0.09f)
-            TunnelPhase.ERROR -> palette.danger.copy(alpha = if (palette.isDark) 0.13f else 0.09f)
-            TunnelPhase.DISCONNECTED -> palette.accent.copy(alpha = if (palette.isDark) 0.06f else 0.06f)
-        },
-        animationSpec = colorSpec,
-        label = "ambientPrimaryWash",
+    Column(
+        modifier = modifier
+            .clip(shape)
+            .background(backgroundColor)
+            .then(contrastBorder),
+        content = content,
     )
-    val secondaryWash by animateColorAsState(
-        targetValue = when (phase) {
-            TunnelPhase.CONNECTED -> palette.accent.copy(alpha = if (palette.isDark) 0.10f else 0.08f)
-            TunnelPhase.CONNECTING -> palette.accent.copy(alpha = if (palette.isDark) 0.10f else 0.07f)
-            TunnelPhase.ERROR -> Color(0xFFB91C1C).copy(alpha = if (palette.isDark) 0.09f else 0.06f)
-            TunnelPhase.DISCONNECTED -> palette.inkMuted.copy(alpha = if (palette.isDark) 0.05f else 0.05f)
-        },
-        animationSpec = colorSpec,
-        label = "ambientSecondaryWash",
-    )
-
-    Canvas(modifier = modifier.fillMaxSize()) {
-        val w = size.width
-        val h = size.height
-        if (w <= 0f || h <= 0f) return@Canvas
-
-        drawRect(color = palette.canvas)
-
-        drawRect(
-            brush = Brush.radialGradient(
-                colors = listOf(primaryWash, Color.Transparent),
-                center = Offset(x = w * 0.22f, y = h * 0.04f),
-                radius = max(w, h) * 0.72f,
-            ),
-        )
-
-        drawRect(
-            brush = Brush.radialGradient(
-                colors = listOf(secondaryWash, Color.Transparent),
-                center = Offset(x = w * 0.85f, y = h * 0.16f),
-                radius = max(w, h) * 0.58f,
-            ),
-        )
-    }
 }

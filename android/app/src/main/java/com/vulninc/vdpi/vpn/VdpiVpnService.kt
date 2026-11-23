@@ -64,8 +64,15 @@ object TunnelRuntimeState {
     private val _state = MutableStateFlow(TunnelRuntimeSnapshot())
     val state: StateFlow<TunnelRuntimeSnapshot> = _state.asStateFlow()
 
+    private val _appliedSettings = MutableStateFlow<VdpiSettings?>(null)
+    val appliedSettings: StateFlow<VdpiSettings?> = _appliedSettings.asStateFlow()
+
     internal fun update(transform: (TunnelRuntimeSnapshot) -> TunnelRuntimeSnapshot) {
         _state.value = transform(_state.value)
+    }
+
+    internal fun setAppliedSettings(settings: VdpiSettings?) {
+        _appliedSettings.value = settings
     }
 }
 
@@ -73,6 +80,7 @@ class VdpiVpnService : VpnService() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val transitionMutex = Mutex()
+    private val notificationLock = Any()
     private val sessionGeneration = AtomicLong(0L)
     @Volatile private var transitionJob: Job? = null
     @Volatile private var pollJob: Job? = null
@@ -135,18 +143,22 @@ class VdpiVpnService : VpnService() {
             ) {
                 return
             }
-            repostJob?.cancel()
-            repostJob = scope.launch {
-                delay(NOTIFICATION_REPOST_DELAY_MS)
-                val currentPhase = TunnelRuntimeState.state.value.phase
-                val notification = lastNotification
-                if (isActive &&
-                    serviceActive.get() &&
-                    sessionGeneration.get() == expectedGen &&
-                    (currentPhase == TunnelPhase.CONNECTING || currentPhase == TunnelPhase.CONNECTED) &&
-                    notification != null
-                ) {
-                    notifySafely(notification)
+            synchronized(notificationLock) {
+                repostJob?.cancel()
+                repostJob = scope.launch {
+                    delay(NOTIFICATION_REPOST_DELAY_MS)
+                    synchronized(notificationLock) {
+                        val currentPhase = TunnelRuntimeState.state.value.phase
+                        val notification = lastNotification
+                        if (isActive &&
+                            serviceActive.get() &&
+                            sessionGeneration.get() == expectedGen &&
+                            (currentPhase == TunnelPhase.CONNECTING || currentPhase == TunnelPhase.CONNECTED) &&
+                            notification != null
+                        ) {
+                            notifySafely(notification)
+                        }
+                    }
                 }
             }
         }
@@ -171,7 +183,7 @@ class VdpiVpnService : VpnService() {
                 return START_NOT_STICKY
             }
             ACTION_RECONNECT -> {
-                scheduleStart(reconnect = true, startId = startId)
+                scheduleStart(startId = startId)
                 return START_NOT_STICKY
             }
             ACTION_START, SERVICE_INTERFACE, null -> {
@@ -194,73 +206,93 @@ class VdpiVpnService : VpnService() {
                             errorMessage = "VPN permission required",
                         )
                     }
+                    TunnelRuntimeState.setAppliedSettings(null)
                     requestTileSync()
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     getSystemService(NotificationManager::class.java)?.cancel(NOTIFICATION_ID)
                     stopSelf(startId)
                     return START_NOT_STICKY
                 }
-                scheduleStart(reconnect = false, startId = startId)
+                scheduleStart(startId = startId)
                 return START_NOT_STICKY
             }
             else -> return START_NOT_STICKY
         }
     }
 
-    private fun scheduleStart(reconnect: Boolean, startId: Int) {
+    private fun scheduleStart(startId: Int) {
+        if (!serviceActive.get()) return
         val gen = sessionGeneration.incrementAndGet()
-        repostJob?.cancel()
-        repostJob = null
-        connectedAtWallMs = null
+        pollJob?.cancel()
+        pollJob = null
         ensureNotificationChannel()
-        TunnelRuntimeState.update {
-            it.copy(phase = TunnelPhase.CONNECTING, errorMessage = null)
-        }
-        requestTileSync()
 
         val initialNotif = buildNotification(
             title = getString(R.string.notification_title_connecting),
             subtitle = getString(R.string.notification_subtitle_connecting),
             ongoing = true,
             showReconnect = false,
+            connectedAtMs = null,
         )
-        if (!startForegroundSafe(initialNotif)) {
-            clearNotificationState()
+
+        val foregroundStarted = synchronized(notificationLock) {
+            if (!serviceActive.get() || sessionGeneration.get() != gen) return
+            repostJob?.cancel()
+            repostJob = null
+            connectedAtWallMs = null
             TunnelRuntimeState.update {
-                it.copy(
-                    phase = TunnelPhase.ERROR,
-                    errorMessage = "Background start blocked by system",
-                )
+                it.copy(phase = TunnelPhase.CONNECTING, errorMessage = null)
             }
-            requestTileSync()
+            TunnelRuntimeState.setAppliedSettings(null)
+            if (startForegroundSafe(initialNotif)) {
+                lastNotification = initialNotif
+                true
+            } else {
+                clearNotificationStateLocked()
+                TunnelRuntimeState.update {
+                    it.copy(
+                        phase = TunnelPhase.ERROR,
+                        errorMessage = "Background start blocked by system",
+                    )
+                }
+                TunnelRuntimeState.setAppliedSettings(null)
+                false
+            }
+        }
+        requestTileSync()
+        if (!foregroundStarted) {
             stopSelf(startId)
             return
         }
-        lastNotification = initialNotif
 
         transitionJob?.cancel()
         transitionJob = scope.launch {
             transitionMutex.withLock {
-                if (sessionGeneration.get() != gen) return@withLock
+                if (!serviceActive.get() || sessionGeneration.get() != gen) return@withLock
 
                 // Re-assert foreground status inside the serialized critical section in case a
                 // prior stop/fail finished tearing down while this start was queued.
-                if (!startForegroundSafe(initialNotif)) {
+                val asserted = synchronized(notificationLock) {
+                    if (!serviceActive.get() || sessionGeneration.get() != gen) return@withLock
+                    if (startForegroundSafe(initialNotif)) {
+                        lastNotification = initialNotif
+                        true
+                    } else {
+                        false
+                    }
+                }
+                if (!asserted) {
                     failAndStop("Background start blocked by system", startId, gen)
                     return@withLock
                 }
-                lastNotification = initialNotif
 
                 pollJob?.cancel()
                 pollJob = null
                 unregisterNetworkMonitor()
-
-                if (reconnect) {
-                    NativeEngine.stop()
-                }
+                NativeEngine.stop()
 
                 ensureActive()
-                if (sessionGeneration.get() != gen) return@withLock
+                if (!serviceActive.get() || sessionGeneration.get() != gen) return@withLock
 
                 val settings = SettingsRepository(applicationContext).current()
                 val hasGlobalIpv6 = hasGlobalIpv6Connectivity()
@@ -280,7 +312,7 @@ class VdpiVpnService : VpnService() {
                 }
 
                 ensureActive()
-                if (sessionGeneration.get() != gen) return@withLock
+                if (!serviceActive.get() || sessionGeneration.get() != gen) return@withLock
 
                 val vpnInterface = establishVpnInterface(settings, effectiveIpv4Only)
                 if (vpnInterface == null) {
@@ -292,7 +324,7 @@ class VdpiVpnService : VpnService() {
                     return@withLock
                 }
 
-                if (!isActive || sessionGeneration.get() != gen) {
+                if (!isActive || !serviceActive.get() || sessionGeneration.get() != gen) {
                     runCatching { vpnInterface.close() }
                     return@withLock
                 }
@@ -309,23 +341,13 @@ class VdpiVpnService : VpnService() {
                     return@withLock
                 }
 
-                if (!isActive || sessionGeneration.get() != gen) {
+                if (!isActive || !serviceActive.get() || sessionGeneration.get() != gen) {
                     NativeEngine.stop()
                     return@withLock
                 }
 
                 val initialSnap = NativeEngine.snapshot()
                 val connectedAt = System.currentTimeMillis()
-                connectedAtWallMs = connectedAt
-
-                TunnelRuntimeState.update {
-                    it.copy(
-                        phase = TunnelPhase.CONNECTED,
-                        errorMessage = null,
-                        telemetry = initialSnap,
-                    )
-                }
-
                 val initialSubtitle = formatConnectedSubtitle(initialSnap)
                 val connectedNotif = buildNotification(
                     title = getString(R.string.notification_title_connected),
@@ -334,8 +356,31 @@ class VdpiVpnService : VpnService() {
                     showReconnect = true,
                     connectedAtMs = connectedAt,
                 )
-                lastNotification = connectedNotif
-                val postedInitial = notifySafely(connectedNotif)
+
+                var committed = false
+                var postedInitial = false
+                synchronized(notificationLock) {
+                    if (isActive && serviceActive.get() && sessionGeneration.get() == gen) {
+                        repostJob?.cancel()
+                        repostJob = null
+                        connectedAtWallMs = connectedAt
+                        TunnelRuntimeState.setAppliedSettings(settings)
+                        TunnelRuntimeState.update {
+                            it.copy(
+                                phase = TunnelPhase.CONNECTED,
+                                errorMessage = null,
+                                telemetry = initialSnap,
+                            )
+                        }
+                        lastNotification = connectedNotif
+                        postedInitial = notifySafely(connectedNotif)
+                        committed = true
+                    }
+                }
+                if (!committed) {
+                    NativeEngine.stop()
+                    return@withLock
+                }
 
                 registerNetworkMonitor()
                 requestTileSync()
@@ -343,6 +388,7 @@ class VdpiVpnService : VpnService() {
                     sessionGen = gen,
                     sessionStartId = startId,
                     initialPostedSubtitle = if (postedInitial) initialSubtitle else null,
+                    initialStageNumber = initialSnap.stageNumber,
                 )
             }
         }
@@ -368,17 +414,24 @@ class VdpiVpnService : VpnService() {
         NativeEngine.stop()
         // If a newer start superseded this failed attempt while JNI stop ran, do not tear it down.
         if (sessionGeneration.get() != expectedGen) return
-        clearNotificationState()
-        TunnelRuntimeState.update {
-            it.copy(
-                phase = TunnelPhase.ERROR,
-                errorMessage = message,
-                telemetry = NativeEngine.snapshot(),
-            )
+        val finalSnap = NativeEngine.snapshot()
+        val committed = synchronized(notificationLock) {
+            if (sessionGeneration.get() != expectedGen) return@synchronized false
+            clearNotificationStateLocked()
+            TunnelRuntimeState.update {
+                it.copy(
+                    phase = TunnelPhase.ERROR,
+                    errorMessage = message,
+                    telemetry = finalSnap,
+                )
+            }
+            TunnelRuntimeState.setAppliedSettings(null)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            getSystemService(NotificationManager::class.java)?.cancel(NOTIFICATION_ID)
+            true
         }
+        if (!committed) return
         requestTileSync()
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        getSystemService(NotificationManager::class.java)?.cancel(NOTIFICATION_ID)
         stopSelf(startId)
     }
 
@@ -481,6 +534,7 @@ class VdpiVpnService : VpnService() {
         lastHasGlobalIpv6 = hasGlobalIpv6Connectivity()
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
+                if (!serviceActive.get()) return
                 val handle = network.networkHandle
                 val prev = lastNetworkId
                 val prevIpv6 = lastHasGlobalIpv6
@@ -490,7 +544,7 @@ class VdpiVpnService : VpnService() {
                 if (prev != null && prev != handle && TunnelRuntimeState.state.value.phase == TunnelPhase.CONNECTED) {
                     if (prevIpv6 != null && prevIpv6 != nowIpv6) {
                         // Underlying network changed between IPv4-only and IPv6-capable; rebuild TUN routes.
-                        scheduleStart(reconnect = true, startId = latestStartId)
+                        scheduleStart(startId = latestStartId)
                     } else {
                         scope.launch {
                             // Refresh cached DNS & adaptive strategy after Wi-Fi <-> cellular switch.
@@ -520,6 +574,7 @@ class VdpiVpnService : VpnService() {
         sessionGen: Long,
         sessionStartId: Int,
         initialPostedSubtitle: String?,
+        initialStageNumber: Int,
     ) {
         pollJob?.cancel()
         pollJob = scope.launch {
@@ -527,11 +582,11 @@ class VdpiVpnService : VpnService() {
             var wasInteractive = powerManager?.isInteractive ?: true
             var lastPostedSubtitle = initialPostedSubtitle
             var tick = 0
-            var lastStage = -1
-            while (isActive && sessionGeneration.get() == sessionGen) {
+            var lastStage = initialStageNumber
+            while (isActive && serviceActive.get() && sessionGeneration.get() == sessionGen) {
                 val snap = NativeEngine.snapshot()
                 // Re-check after blocking JNI snapshot so a clean stop never masquerades as ERROR.
-                if (!isActive || sessionGeneration.get() != sessionGen) {
+                if (!isActive || !serviceActive.get() || sessionGeneration.get() != sessionGen) {
                     return@launch
                 }
                 if (!snap.running) {
@@ -567,21 +622,42 @@ class VdpiVpnService : VpnService() {
                 if (interactive &&
                     (wokeUp || tick % 3 == 0) &&
                     isActive &&
+                    serviceActive.get() &&
                     sessionGeneration.get() == sessionGen &&
                     TunnelRuntimeState.state.value.phase == TunnelPhase.CONNECTED
                 ) {
                     val subtitle = formatConnectedSubtitle(snap)
                     if (subtitle != lastPostedSubtitle) {
-                        val notif = buildNotification(
-                            title = getString(R.string.notification_title_connected),
-                            subtitle = subtitle,
-                            ongoing = true,
-                            showReconnect = true,
-                            connectedAtMs = connectedAtWallMs,
-                        )
-                        lastNotification = notif
-                        if (notifySafely(notif)) {
-                            lastPostedSubtitle = subtitle
+                        val connectedAt = synchronized(notificationLock) {
+                            if (sessionGeneration.get() == sessionGen && serviceActive.get()) {
+                                connectedAtWallMs
+                            } else {
+                                null
+                            }
+                        }
+                        if (connectedAt != null) {
+                            val notif = buildNotification(
+                                title = getString(R.string.notification_title_connected),
+                                subtitle = subtitle,
+                                ongoing = true,
+                                showReconnect = true,
+                                connectedAtMs = connectedAt,
+                            )
+                            val posted = synchronized(notificationLock) {
+                                if (isActive &&
+                                    serviceActive.get() &&
+                                    sessionGeneration.get() == sessionGen &&
+                                    TunnelRuntimeState.state.value.phase == TunnelPhase.CONNECTED
+                                ) {
+                                    lastNotification = notif
+                                    notifySafely(notif)
+                                } else {
+                                    false
+                                }
+                            }
+                            if (posted) {
+                                lastPostedSubtitle = subtitle
+                            }
                         }
                     }
                 }
@@ -598,17 +674,24 @@ class VdpiVpnService : VpnService() {
         NativeEngine.stop()
         // If a newer start superseded this stop while JNI stop ran, leave the new session intact.
         if (sessionGeneration.get() != expectedGen) return
-        clearNotificationState()
-        TunnelRuntimeState.update {
-            TunnelRuntimeSnapshot(
-                phase = TunnelPhase.DISCONNECTED,
-                errorMessage = null,
-                telemetry = NativeEngine.snapshot(),
-            )
+        val finalSnap = NativeEngine.snapshot()
+        val committed = synchronized(notificationLock) {
+            if (sessionGeneration.get() != expectedGen) return@synchronized false
+            clearNotificationStateLocked()
+            TunnelRuntimeState.update {
+                TunnelRuntimeSnapshot(
+                    phase = TunnelPhase.DISCONNECTED,
+                    errorMessage = null,
+                    telemetry = finalSnap,
+                )
+            }
+            TunnelRuntimeState.setAppliedSettings(null)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            getSystemService(NotificationManager::class.java)?.cancel(NOTIFICATION_ID)
+            true
         }
+        if (!committed) return
         requestTileSync()
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        getSystemService(NotificationManager::class.java)?.cancel(NOTIFICATION_ID)
         if (startId != null && startId >= 0) {
             stopSelf(startId)
         } else {
@@ -623,6 +706,7 @@ class VdpiVpnService : VpnService() {
 
     override fun onDestroy() {
         serviceActive.set(false)
+        sessionGeneration.incrementAndGet()
         clearNotificationState()
         runCatching { unregisterReceiver(dismissReceiver) }
         unregisterNetworkMonitor()
@@ -635,12 +719,19 @@ class VdpiVpnService : VpnService() {
                 it.copy(phase = TunnelPhase.DISCONNECTED, telemetry = NativeEngine.snapshot())
             }
         }
+        TunnelRuntimeState.setAppliedSettings(null)
         requestTileSync()
         scope.cancel()
         super.onDestroy()
     }
 
     private fun clearNotificationState() {
+        synchronized(notificationLock) {
+            clearNotificationStateLocked()
+        }
+    }
+
+    private fun clearNotificationStateLocked() {
         repostJob?.cancel()
         repostJob = null
         lastNotification = null
@@ -648,7 +739,8 @@ class VdpiVpnService : VpnService() {
     }
 
     private fun formatConnectedSubtitle(snap: TelemetrySnapshot): String {
-        return "Stage ${snap.stageNumber} · ↓ ${formatBytes(snap.bytesRx)}  ↑ ${formatBytes(snap.bytesTx)}"
+        val stage = snap.stageNumber.coerceAtLeast(1)
+        return "Stage $stage · ↓ ${formatBytes(snap.bytesRx)}  ↑ ${formatBytes(snap.bytesTx)}"
     }
 
     private fun canPostNotifications(): Boolean {
@@ -735,7 +827,9 @@ class VdpiVpnService : VpnService() {
                 .setShowWhen(true)
                 .setUsesChronometer(true)
         } else {
-            builder.setShowWhen(false)
+            builder
+                .setShowWhen(false)
+                .setUsesChronometer(false)
         }
 
         if (ongoing) {
@@ -799,6 +893,7 @@ class VdpiVpnService : VpnService() {
                         errorMessage = "Unable to start VPN service in background",
                     )
                 }
+                TunnelRuntimeState.setAppliedSettings(null)
                 false
             }
         }
@@ -817,6 +912,7 @@ class VdpiVpnService : VpnService() {
                         errorMessage = "Unable to reconnect VPN service",
                     )
                 }
+                TunnelRuntimeState.setAppliedSettings(null)
                 false
             }
         }
@@ -825,13 +921,18 @@ class VdpiVpnService : VpnService() {
             if (!serviceActive.get()) {
                 runCatching { context.stopService(Intent(context, VdpiVpnService::class.java)) }
                 CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
-                    NativeEngine.stop()
-                    TunnelRuntimeState.update {
-                        TunnelRuntimeSnapshot(
-                            phase = TunnelPhase.DISCONNECTED,
-                            errorMessage = null,
-                            telemetry = NativeEngine.snapshot(),
-                        )
+                    if (!serviceActive.get()) {
+                        NativeEngine.stop()
+                        if (!serviceActive.get()) {
+                            TunnelRuntimeState.update {
+                                TunnelRuntimeSnapshot(
+                                    phase = TunnelPhase.DISCONNECTED,
+                                    errorMessage = null,
+                                    telemetry = NativeEngine.snapshot(),
+                                )
+                            }
+                            TunnelRuntimeState.setAppliedSettings(null)
+                        }
                     }
                 }
                 return
@@ -844,13 +945,18 @@ class VdpiVpnService : VpnService() {
             }.onFailure {
                 runCatching { context.stopService(Intent(context, VdpiVpnService::class.java)) }
                 CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
-                    NativeEngine.stop()
-                    TunnelRuntimeState.update {
-                        TunnelRuntimeSnapshot(
-                            phase = TunnelPhase.DISCONNECTED,
-                            errorMessage = null,
-                            telemetry = NativeEngine.snapshot(),
-                        )
+                    if (!serviceActive.get()) {
+                        NativeEngine.stop()
+                        if (!serviceActive.get()) {
+                            TunnelRuntimeState.update {
+                                TunnelRuntimeSnapshot(
+                                    phase = TunnelPhase.DISCONNECTED,
+                                    errorMessage = null,
+                                    telemetry = NativeEngine.snapshot(),
+                                )
+                            }
+                            TunnelRuntimeState.setAppliedSettings(null)
+                        }
                     }
                 }
             }

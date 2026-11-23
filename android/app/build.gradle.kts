@@ -15,7 +15,7 @@ fun readWorkspaceVersion(): String {
         val match = Regex("""(?m)^version\s*=\s*"([^"]+)"""").find(cargoToml.readText())
         if (match != null) return match.groupValues[1]
     }
-    return "0.3.2"
+    return "0.3.3"
 }
 
 fun computeVersionCode(semver: String): Int {

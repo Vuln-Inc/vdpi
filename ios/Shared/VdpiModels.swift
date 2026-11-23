@@ -90,6 +90,34 @@ public struct NativeEngineConfig: Codable, Equatable, Sendable {
         self.mtu = max(1280, min(9000, mtu))
         self.bypassDomains = bypassDomains
     }
+
+    public func canonicalized() -> NativeEngineConfig {
+        NativeEngineConfig(
+            mode: mode,
+            chunkSize: chunkSize,
+            dnsAddr: dnsAddr,
+            enableDoh: enableDoh,
+            ipv4Only: ipv4Only,
+            blockQuic: blockQuic,
+            timeoutMs: timeoutMs,
+            mtu: mtu,
+            bypassDomains: Self.canonicalBypassDomains(bypassDomains)
+        )
+    }
+
+    public static func canonicalBypassDomains(_ domains: [String]) -> [String] {
+        var seen = Set<String>()
+        var unique: [String] = []
+        unique.reserveCapacity(domains.count)
+        for raw in domains {
+            let cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleaned.isEmpty else { continue }
+            if seen.insert(cleaned).inserted {
+                unique.append(cleaned)
+            }
+        }
+        return unique.sorted()
+    }
 }
 
 /// Persistent user settings shared between `VdpiApp` and `VdpiPacketTunnel` via App Group.
@@ -104,6 +132,19 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
     public var bypassDomains: [String]
     public var onDemandEnabled: Bool
     public var theme: ThemePreference
+
+    enum CodingKeys: String, CodingKey {
+        case desyncMode
+        case chunkSize
+        case dnsAddr
+        case enableDoh
+        case ipv4Only
+        case blockQuic
+        case mtu
+        case bypassDomains
+        case onDemandEnabled
+        case theme
+    }
 
     public init(
         desyncMode: DesyncMode = .combo,
@@ -129,13 +170,37 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
         self.theme = theme
     }
 
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.desyncMode = try c.decodeIfPresent(DesyncMode.self, forKey: .desyncMode) ?? .combo
+        let rawChunk = try c.decodeIfPresent(Int.self, forKey: .chunkSize) ?? 10
+        self.chunkSize = max(1, min(64, rawChunk))
+        self.dnsAddr = try c.decodeIfPresent(String.self, forKey: .dnsAddr) ?? "1.1.1.1"
+        self.enableDoh = try c.decodeIfPresent(Bool.self, forKey: .enableDoh) ?? true
+        self.ipv4Only = try c.decodeIfPresent(Bool.self, forKey: .ipv4Only) ?? false
+        self.blockQuic = try c.decodeIfPresent(Bool.self, forKey: .blockQuic) ?? true
+        let rawMtu = try c.decodeIfPresent(Int.self, forKey: .mtu) ?? 1400
+        self.mtu = max(1280, min(9000, rawMtu))
+        self.bypassDomains = try c.decodeIfPresent([String].self, forKey: .bypassDomains) ?? []
+        self.onDemandEnabled = try c.decodeIfPresent(Bool.self, forKey: .onDemandEnabled) ?? false
+        self.theme = try c.decodeIfPresent(ThemePreference.self, forKey: .theme) ?? .dark
+    }
+
+    public var clampedChunkSize: Int {
+        max(1, min(64, chunkSize))
+    }
+
     public var clampedMtu: Int {
         max(1280, min(9000, mtu))
     }
 
     /// Compares only settings that require a tunnel restart/reload when changed.
     public func requiresTunnelReload(comparedTo other: VdpiSettings) -> Bool {
-        toNativeConfig() != other.toNativeConfig()
+        requiresTunnelReload(comparedToApplied: other.toNativeConfig())
+    }
+
+    public func requiresTunnelReload(comparedToApplied config: NativeEngineConfig) -> Bool {
+        !changedFieldLabels(comparedToApplied: config).isEmpty
     }
 
     public func changedFieldLabels(comparedTo other: VdpiSettings) -> [String] {
@@ -144,45 +209,57 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
 
     public func changedFieldLabels(comparedToApplied config: NativeEngineConfig) -> [String] {
         let current = toNativeConfig()
+        let applied = config.canonicalized()
         var labels: [String] = []
-        if current.mode != config.mode {
+        if current.mode != applied.mode {
             labels.append("Mode")
         }
-        if current.chunkSize != config.chunkSize {
+        if current.chunkSize != applied.chunkSize {
             labels.append("Chunk")
         }
-        if current.dnsAddr != config.dnsAddr {
+        if current.dnsAddr != applied.dnsAddr {
             labels.append("DNS")
         }
-        if current.enableDoh != config.enableDoh {
+        if current.enableDoh != applied.enableDoh {
             labels.append("DoH")
         }
-        if current.ipv4Only != config.ipv4Only {
+        if current.ipv4Only != applied.ipv4Only {
             labels.append("IPv4")
         }
-        if current.blockQuic != config.blockQuic {
+        if current.blockQuic != applied.blockQuic {
             labels.append("QUIC")
         }
-        if current.mtu != config.mtu {
+        if current.mtu != applied.mtu {
             labels.append("MTU")
         }
-        if current.bypassDomains != config.bypassDomains.sorted() {
+        if current.bypassDomains != applied.bypassDomains {
             labels.append("Bypass")
         }
         return labels
     }
 
+    /// Concise summary for the floating reconnect banner and Home inline reconnect card.
+    public func pendingChangeSummary(comparedToApplied config: NativeEngineConfig) -> String {
+        let labels = changedFieldLabels(comparedToApplied: config)
+        guard !labels.isEmpty else { return "" }
+        if labels.count <= 3 {
+            return labels.joined(separator: ", ")
+        }
+        let head = labels.prefix(2).joined(separator: ", ")
+        return "\(head) +\(labels.count - 2) more"
+    }
+
     public func toNativeConfig() -> NativeEngineConfig {
         NativeEngineConfig(
             mode: desyncMode,
-            chunkSize: chunkSize,
+            chunkSize: clampedChunkSize,
             dnsAddr: dnsAddr,
             enableDoh: enableDoh,
             ipv4Only: ipv4Only,
             blockQuic: blockQuic,
             timeoutMs: 8000,
             mtu: clampedMtu,
-            bypassDomains: bypassDomains.sorted()
+            bypassDomains: NativeEngineConfig.canonicalBypassDomains(bypassDomains)
         )
     }
 

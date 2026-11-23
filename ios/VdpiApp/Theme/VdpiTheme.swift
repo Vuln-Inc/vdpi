@@ -20,7 +20,7 @@ public struct VdpiPalette: Equatable, Sendable {
     public let danger: Color
     public let dangerTint: Color
 
-    // Liquid Glass tokens
+    // Floating-chrome glass and accent tokens
     public let accent: Color
     public let accentTint: Color
     public let glassFill: Color
@@ -36,74 +36,76 @@ public struct VdpiPalette: Equatable, Sendable {
     public let warningGlow: Color
     public let dangerGlow: Color
 
+    // Authentic Apple HIG iOS Dark Mode palette
     public static let dark = VdpiPalette(
         isDark: true,
         canvas: Color(hex: 0x000000),
-        surface: Color(hex: 0x0D0E12),
-        surfaceRaised: Color(hex: 0x181A20),
-        border: Color.white.opacity(0.11),
-        borderStrong: Color.white.opacity(0.22),
+        surface: Color(hex: 0x1C1C1E),
+        surfaceRaised: Color(hex: 0x2C2C2E),
+        border: Color(hex: 0x38383A),
+        borderStrong: Color(hex: 0x48484A),
         inkPrimary: Color(hex: 0xFFFFFF),
-        inkSecondary: Color(hex: 0xA1A8B3),
-        inkMuted: Color(hex: 0x7C8594),
-        primaryButtonBg: Color(hex: 0xFFFFFF),
-        primaryButtonInk: Color(hex: 0x06080D),
-        signal: Color(hex: 0x10E896),
-        signalTint: Color(hex: 0x10E896, alpha: 0.14),
-        signalBorder: Color(hex: 0x10E896, alpha: 0.38),
-        warning: Color(hex: 0xF59E0B),
-        warningTint: Color(hex: 0xF59E0B, alpha: 0.14),
-        danger: Color(hex: 0xFF4D6D),
-        dangerTint: Color(hex: 0xFF4D6D, alpha: 0.15),
-        accent: Color(hex: 0x19C8FF),
-        accentTint: Color(hex: 0x19C8FF, alpha: 0.14),
-        glassFill: Color(hex: 0x141720, alpha: 0.54),
-        glassFillElevated: Color(hex: 0x1D212E, alpha: 0.68),
-        glassFillSubtle: Color(hex: 0x0F1118, alpha: 0.38),
-        glassLensFill: Color.white.opacity(0.14),
-        specularTop: Color.white.opacity(0.32),
+        inkSecondary: Color(hex: 0x98989F),
+        inkMuted: Color(hex: 0x8E8E93),
+        primaryButtonBg: Color(hex: 0x0066CC),
+        primaryButtonInk: Color(hex: 0xFFFFFF),
+        signal: Color(hex: 0x30D158),
+        signalTint: Color(hex: 0x30D158, alpha: 0.15),
+        signalBorder: Color(hex: 0x30D158, alpha: 0.35),
+        warning: Color(hex: 0xFF9F0A),
+        warningTint: Color(hex: 0xFF9F0A, alpha: 0.16),
+        danger: Color(hex: 0xFF453A),
+        dangerTint: Color(hex: 0xFF453A, alpha: 0.16),
+        accent: Color(hex: 0x409CFF),
+        accentTint: Color(hex: 0x409CFF, alpha: 0.16),
+        glassFill: Color(hex: 0x1C1C1E, alpha: 0.56),
+        glassFillElevated: Color(hex: 0x1C1C1E, alpha: 0.68),
+        glassFillSubtle: Color(hex: 0x2C2C2E, alpha: 0.45),
+        glassLensFill: Color.white.opacity(0.16),
+        specularTop: Color.white.opacity(0.24),
         specularMid: Color.white.opacity(0.08),
-        specularBottom: Color.white.opacity(0.14),
-        innerSheen: Color.white.opacity(0.11),
-        shadowColor: Color.black.opacity(0.55),
-        signalGlow: Color(hex: 0x10E896, alpha: 0.42),
-        warningGlow: Color(hex: 0xF59E0B, alpha: 0.38),
-        dangerGlow: Color(hex: 0xFF4D6D, alpha: 0.42)
+        specularBottom: Color.white.opacity(0.10),
+        innerSheen: Color.white.opacity(0.05),
+        shadowColor: Color.black.opacity(0.36),
+        signalGlow: .clear,
+        warningGlow: .clear,
+        dangerGlow: .clear
     )
 
+    // Authentic Apple HIG iOS Light Mode palette
     public static let light = VdpiPalette(
         isDark: false,
-        canvas: Color(hex: 0xF4F7FA),
+        canvas: Color(hex: 0xF2F2F7),
         surface: Color(hex: 0xFFFFFF),
-        surfaceRaised: Color(hex: 0xEAEFF5),
-        border: Color(hex: 0x0A0F1A, alpha: 0.10),
-        borderStrong: Color(hex: 0x0A0F1A, alpha: 0.20),
-        inkPrimary: Color(hex: 0x0A0F1A),
-        inkSecondary: Color(hex: 0x4B5565),
-        inkMuted: Color(hex: 0x64748B),
-        primaryButtonBg: Color(hex: 0x0A0F1A),
+        surfaceRaised: Color(hex: 0xE5E5EA),
+        border: Color(hex: 0xC6C6C8),
+        borderStrong: Color(hex: 0xAEAEB2),
+        inkPrimary: Color(hex: 0x000000),
+        inkSecondary: Color(hex: 0x5C5C60),
+        inkMuted: Color(hex: 0x6C6C70),
+        primaryButtonBg: Color(hex: 0x0066CC),
         primaryButtonInk: Color(hex: 0xFFFFFF),
-        signal: Color(hex: 0x059669),
-        signalTint: Color(hex: 0x059669, alpha: 0.11),
-        signalBorder: Color(hex: 0x059669, alpha: 0.34),
-        warning: Color(hex: 0xD97706),
-        warningTint: Color(hex: 0xD97706, alpha: 0.11),
-        danger: Color(hex: 0xE11D48),
-        dangerTint: Color(hex: 0xE11D48, alpha: 0.11),
-        accent: Color(hex: 0x0284C7),
-        accentTint: Color(hex: 0x0284C7, alpha: 0.11),
-        glassFill: Color.white.opacity(0.64),
-        glassFillElevated: Color.white.opacity(0.80),
-        glassFillSubtle: Color(hex: 0xEAEFF5, alpha: 0.56),
-        glassLensFill: Color.white.opacity(0.86),
-        specularTop: Color.white.opacity(0.92),
-        specularMid: Color(hex: 0x0A0F1A, alpha: 0.07),
-        specularBottom: Color(hex: 0x0A0F1A, alpha: 0.12),
-        innerSheen: Color.white.opacity(0.55),
-        shadowColor: Color(hex: 0x0A0F1A, alpha: 0.09),
-        signalGlow: Color(hex: 0x059669, alpha: 0.30),
-        warningGlow: Color(hex: 0xD97706, alpha: 0.28),
-        dangerGlow: Color(hex: 0xE11D48, alpha: 0.30)
+        signal: Color(hex: 0x1E7E34),
+        signalTint: Color(hex: 0x34C759, alpha: 0.12),
+        signalBorder: Color(hex: 0x34C759, alpha: 0.30),
+        warning: Color(hex: 0xC93400),
+        warningTint: Color(hex: 0xFF9500, alpha: 0.12),
+        danger: Color(hex: 0xD70015),
+        dangerTint: Color(hex: 0xFF3B30, alpha: 0.12),
+        accent: Color(hex: 0x0066CC),
+        accentTint: Color(hex: 0x0066CC, alpha: 0.12),
+        glassFill: Color.white.opacity(0.68),
+        glassFillElevated: Color.white.opacity(0.78),
+        glassFillSubtle: Color.white.opacity(0.55),
+        glassLensFill: Color.black.opacity(0.08),
+        specularTop: Color.white.opacity(0.88),
+        specularMid: Color.black.opacity(0.06),
+        specularBottom: Color.black.opacity(0.10),
+        innerSheen: Color.white.opacity(0.32),
+        shadowColor: Color.black.opacity(0.10),
+        signalGlow: .clear,
+        warningGlow: .clear,
+        dangerGlow: .clear
     )
 
     public static func resolve(
@@ -121,10 +123,10 @@ public struct VdpiPalette: Equatable, Sendable {
         if let accent {
             return LinearGradient(
                 stops: [
-                    .init(color: accent.opacity(isDark ? 0.68 : 0.58), location: 0.0),
-                    .init(color: specularTop.opacity(isDark ? 0.85 : 0.90), location: 0.26),
-                    .init(color: specularMid, location: 0.58),
-                    .init(color: accent.opacity(isDark ? 0.34 : 0.28), location: 1.0),
+                    .init(color: accent.opacity(isDark ? 0.34 : 0.26), location: 0.0),
+                    .init(color: specularTop.opacity(isDark ? 0.65 : 0.72), location: 0.28),
+                    .init(color: specularMid, location: 0.62),
+                    .init(color: accent.opacity(isDark ? 0.16 : 0.14), location: 1.0),
                 ],
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
@@ -133,7 +135,7 @@ public struct VdpiPalette: Equatable, Sendable {
         return LinearGradient(
             stops: [
                 .init(color: specularTop, location: 0.0),
-                .init(color: specularMid, location: 0.46),
+                .init(color: specularMid, location: 0.50),
                 .init(color: specularBottom, location: 1.0),
             ],
             startPoint: .topLeading,
@@ -145,8 +147,8 @@ public struct VdpiPalette: Equatable, Sendable {
         LinearGradient(
             stops: [
                 .init(color: innerSheen, location: 0.0),
-                .init(color: innerSheen.opacity(0.28), location: 0.32),
-                .init(color: .clear, location: 0.68),
+                .init(color: innerSheen.opacity(0.20), location: 0.24),
+                .init(color: .clear, location: 0.52),
             ],
             startPoint: .top,
             endPoint: .bottom

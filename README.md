@@ -43,9 +43,9 @@ Download the latest build for your device from **[GitHub Releases](https://githu
 - **Zero-Root Local TUN Engine:** Captures device traffic locally via `VpnService` (`198.18.0.2/30`, MTU `1400`, DNS `198.18.0.1`), desynchronizes TLS `ClientHello` handshakes in userspace, and relays UDP via a Cone-NAT table for voice and gaming traffic.
 - **Anti-Poisoning DNS, Automatic IPv6 Detection & Clean QUIC Fallback:** Intercepts both UDP/53 and RFC 1035 TCP/53 DNS queries through `vdpi`'s multi-provider RFC 8484 DoH ring, automatically detects whether the underlying Wi-Fi/Cellular interface actually has global unicast IPv6 (`2000::/3`) so IPv4-only networks never blackhole dual-stack sites, and drops all UDP/443 QUIC datagrams (including RFC 9287 greased and short-header frames) for desync-eligible hosts so Chrome and webviews fall back cleanly to HTTP/2 over desynchronized TCP/TLS instead of throwing `ERR_QUIC_PROTOCOL_ERROR`.
 - **Per-App Split Tunneling:** Choose between **Bypass selected** or **Only selected** apps (without requiring `QUERY_ALL_PACKAGES`).
-- **Always-On VPN & Quick Settings Tile:** Supports Android's Always-On VPN setting and a live Quick Settings tile (note: do not enable *"Block connections without VPN"* lockdown mode if your device relies on bypass exclusions).
+- **Always-On VPN, Top-Pinned Notification & Quick Settings Tile:** Supports Android's Always-On VPN setting, a live Quick Settings tile, and a top-pinned silent VPN status notification with live uptime and Android 14–16 auto-repin if dismissed while connected (note: do not enable *"Block connections without VPN"* lockdown mode if your device relies on bypass exclusions).
 - **Live Telemetry & In-App Diagnostics:** Real-time 1 Hz counters (active TLS stage, connections, TX/RX bytes, DNS queries, blocked QUIC, active UDP flows), built-in `rustls` TLS 1.3/1.2 connectivity probes, and copyable chronological engine logs.
-- **Modern Native UI:** Jetpack Compose interface with Dark, Light, and System themes, 16 KB page-aligned native libraries, WCAG AA contrast, and explicit backup exclusion rules.
+- **Clean Apple HIG Native UI:** Jetpack Compose interface featuring a floating Liquid Glass navigation bar and live tunnel mini-bar, a cross-tab top **"Settings Changed"** reconnect popup, Dark/Light/System themes, WCAG AA contrast, 16 KB page-aligned native libraries, and explicit backup exclusion rules.
 
 ### Installing on Android
 
@@ -75,6 +75,7 @@ Download the latest build for your device from **[GitHub Releases](https://githu
 - **Clean RFC 2544 Addressing, LAN Exclusion & Automatic IPv6 Gating:** Uses `198.18.0.2/24` with virtual DNS `198.18.0.1` and distinct remote endpoint `198.19.0.1` (MTU `1400`), excludes all RFC 1918 / loopback / broadcast / link-local / ULA LAN ranges, automatically disables IPv6 tunnel routes on IPv4-only networks via `getifaddrs`, and observes `NWPathMonitor` to flush caches on Wi-Fi/Cellular handoffs.
 - **On-Demand VPN & Domain Bypass:** Supports iOS VPN On-Demand (`NEOnDemandRuleConnect`) and custom domain bypass rules. Note: consumer iOS restricts per-app VPN split-tunneling (`NEAppRule`) to supervised MDM devices, so consumer builds use domain bypass.
 - **Live Telemetry, Diagnostics & Logs:** App Group (`group.com.vulninc.vdpi`) shares settings while `NETunnelProviderSession.sendProviderMessage` IPC handles 1 Hz telemetry, live reloads, cache clears, and in-tunnel `rustls` TLS 1.3/1.2 Diagnostics.
+- **Clean Apple HIG SwiftUI Interface:** Native iOS/iPadOS UI with a floating Liquid Glass navigation bar and live tunnel mini-bar, a cross-tab top **"Settings Changed"** reconnect popup, and Dark, Light, and System themes.
 
 ### Installing on iOS / iPadOS
 
@@ -425,13 +426,13 @@ vdpi/
 │       ├── vpn/                # VdpiVpnService (Always-On, reconnect, network callback) & QS Tile
 │       ├── engine/             # NativeEngine JNI bindings & Kotlinx models
 │       ├── data/               # DataStore settings repository & split-tunnel config
-│       └── ui/                 # Tunnel, Apps, and Settings screens + monochrome theme
+│       └── ui/                 # Tunnel, Apps, and Settings screens + Apple HIG & Liquid Glass theme
 ├── ios/                        # Native SwiftUI iOS app + NEPacketTunnelProvider (iOS 16+)
 │   ├── project.yml             # XcodeGen project specification (VdpiApp, VdpiPacketTunnel, Tests)
 │   ├── scripts/build-xcframework.sh # Rust iOS + Simulator XCFramework build script
 │   ├── Shared/                 # Models, App Group IPC, Formatters, NativeBridge, TunnelNetworkSettings
 │   ├── PacketTunnel/           # NEPacketTunnelProvider + NWPathMonitor + Info.plist + Entitlements
-│   ├── VdpiApp/                # SwiftUI Tunnel & Settings views, TunnelManager, monochrome theme
+│   ├── VdpiApp/                # SwiftUI Tunnel & Settings views, TunnelManager, Apple HIG & Liquid Glass theme
 │   └── VdpiAppTests/           # XCTest suite verifying wire JSON, IPC, routes, and live Rust FFI
 └── tests/
     └── integration_test.rs     # End-to-end TLS desync, auto-heal, SOCKS5/4a, and UDP relay tests

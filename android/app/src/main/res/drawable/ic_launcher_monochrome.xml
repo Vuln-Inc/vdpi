@@ -4,14 +4,10 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- Adaptive monochrome safe-zone mark (fits cleanly within 66dp center circle) -->
     <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M31,32 L41,32 L52,66 L42,66 Z" />
+        android:fillColor="#A6FFFFFF"
+        android:pathData="M57.04,36.82 Q57.04,31.81 60.58,35.35 L73.22,47.99 Q76.74,51.51 73.22,55.03 L60.58,67.67 Q57.04,71.21 57.04,66.20 Z" />
     <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M56,66 L67,32 L77,32 L66,66 Z" />
-    <path
-        android:fillColor="#FFFFFF"
-        android:pathData="M42,72 L66,72 L66,76.5 L42,76.5 Z" />
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M47.42,40.33 Q50.96,36.79 50.96,41.80 L50.96,71.18 Q50.96,76.19 47.42,72.65 L34.78,60.01 Q31.26,56.49 34.78,52.97 Z" />
 </vector>

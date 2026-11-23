@@ -10,6 +10,9 @@ struct VdpiApp: App {
             ThemedRootView()
                 .environmentObject(manager)
                 .preferredColorScheme(manager.settings.theme.preferredColorScheme)
+                .onAppear {
+                    manager.setSceneActive(scenePhase == .active)
+                }
                 .vdpiOnChange(of: scenePhase) { newPhase in
                     manager.setSceneActive(newPhase == .active)
                 }
@@ -27,6 +30,7 @@ private struct ThemedRootView: View {
             systemScheme: systemScheme
         )
         ContentView()
+            .tint(palette.accent)
             .environment(\.vdpiPalette, palette)
     }
 }

@@ -22,12 +22,14 @@ import com.vulninc.vdpi.util.sanitizeDomainInput
 import com.vulninc.vdpi.vpn.TunnelPhase
 import com.vulninc.vdpi.vpn.TunnelRuntimeSnapshot
 import com.vulninc.vdpi.vpn.TunnelRuntimeState
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
@@ -52,14 +54,14 @@ data class DoctorUiState(
 
 fun computeSettingsChangeSummary(current: VdpiSettings, baseline: VdpiSettings): List<String> = buildList {
     if (current.desyncMode != baseline.desyncMode) add("Mode")
-    if (current.chunkSize != baseline.chunkSize) add("Chunk")
+    if (current.chunkSize.coerceIn(1, 64) != baseline.chunkSize.coerceIn(1, 64)) add("Chunk")
     val currentDns = current.dnsAddr.trim().ifBlank { "1.1.1.1" }
     val baselineDns = baseline.dnsAddr.trim().ifBlank { "1.1.1.1" }
     if (currentDns != baselineDns) add("DNS")
     if (current.enableDoh != baseline.enableDoh) add("DoH")
     if (current.ipv4Only != baseline.ipv4Only) add("IPv4")
     if (current.blockQuic != baseline.blockQuic) add("QUIC")
-    if (current.bypassDomains.sorted() != baseline.bypassDomains.sorted()) add("Bypass")
+    if (current.bypassDomains.toSet() != baseline.bypassDomains.toSet()) add("Bypass")
     if (current.splitTunnelMode != baseline.splitTunnelMode || current.splitPackages != baseline.splitPackages) {
         add("Apps")
     }
@@ -108,20 +110,33 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
     init {
         loadInstalledApps()
         viewModelScope.launch {
-            var prevPhase = tunnelPhase.value
-            if (prevPhase == TunnelPhase.CONNECTED && appliedSettings == null) {
-                val loaded = repo.current()
-                if (tunnelPhase.value == TunnelPhase.CONNECTED && appliedSettings == null) {
-                    appliedSettings = loaded
-                }
-            }
-            tunnelPhase.collect { curr ->
-                if (curr != prevPhase) {
+            var prevPhase: TunnelPhase? = null
+            combine(tunnelPhase, TunnelRuntimeState.appliedSettings) { phase, applied ->
+                phase to applied
+            }.collect { (curr, applied) ->
+                mutationMutex.withLock {
                     when (curr) {
                         TunnelPhase.CONNECTED -> {
-                            val loaded = repo.current()
+                            val current = repo.current()
                             if (tunnelPhase.value == TunnelPhase.CONNECTED) {
-                                appliedSettings = loaded
+                                val baseline = applied ?: appliedSettings ?: current
+                                appliedSettings = baseline
+                                val labels = computeSettingsChangeSummary(current, baseline)
+                                if (labels.isNotEmpty()) {
+                                    val shouldReveal = prevPhase != TunnelPhase.CONNECTING || !_pendingReconnect.value
+                                    _pendingReconnect.value = true
+                                    if (shouldReveal) {
+                                        _reconnectPopupVisible.value = true
+                                    }
+                                    _pendingChangeSummary.value = labels.joinToString(", ")
+                                } else {
+                                    clearPendingReconnect()
+                                }
+                            }
+                        }
+                        TunnelPhase.CONNECTING -> {
+                            if (prevPhase != TunnelPhase.CONNECTING) {
+                                appliedSettings = null
                                 clearPendingReconnect()
                             }
                         }
@@ -129,7 +144,6 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
                             appliedSettings = null
                             clearPendingReconnect()
                         }
-                        TunnelPhase.CONNECTING -> Unit
                     }
                     prevPhase = curr
                 }
@@ -148,7 +162,9 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
             val updated = repo.current()
             val phase = tunnelPhase.value
             if (phase == TunnelPhase.CONNECTED || phase == TunnelPhase.CONNECTING) {
-                val baseline = appliedSettings ?: previous.also { appliedSettings = it }
+                val baseline = TunnelRuntimeState.appliedSettings.value
+                    ?: appliedSettings
+                    ?: previous.also { appliedSettings = it }
                 val labels = computeSettingsChangeSummary(updated, baseline)
                 if (labels.isNotEmpty()) {
                     _pendingReconnect.value = true
@@ -157,6 +173,9 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
                 } else {
                     clearPendingReconnect()
                 }
+            } else {
+                appliedSettings = null
+                clearPendingReconnect()
             }
         }
     }
@@ -175,11 +194,16 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
         if (_appsLoading.value) return
         viewModelScope.launch {
             _appsLoading.value = true
-            val apps = withContext(Dispatchers.Default) {
-                queryLaunchableApps(getApplication())
+            try {
+                val apps = withContext(Dispatchers.Default) {
+                    queryLaunchableApps(getApplication())
+                }
+                if (apps != null) {
+                    _installedApps.value = apps
+                }
+            } finally {
+                _appsLoading.value = false
             }
-            _installedApps.value = apps
-            _appsLoading.value = false
         }
     }
 
@@ -187,11 +211,16 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
         if (_doctorState.value.running) return
         viewModelScope.launch {
             _doctorState.value = DoctorUiState(running = true, report = null)
-            val cfg = settings.value.toNativeConfig()
-            val report = withContext(Dispatchers.IO) {
-                NativeEngine.runDoctor(cfg)
+            try {
+                val cfg = repo.current().toNativeConfig()
+                val report = withContext(Dispatchers.IO) {
+                    NativeEngine.runDoctor(cfg)
+                }
+                _doctorState.value = DoctorUiState(running = false, report = report)
+            } catch (e: CancellationException) {
+                _doctorState.value = _doctorState.value.copy(running = false)
+                throw e
             }
-            _doctorState.value = DoctorUiState(running = false, report = report)
         }
     }
 
@@ -263,7 +292,7 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun toggleSplitPackage(pkg: String) = mutateRuntimeSetting(
-        isNoOp = { false },
+        isNoOp = { pkg.isBlank() },
     ) {
         repo.toggleSplitPackage(pkg)
     }
@@ -285,22 +314,24 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
         repo.setTheme(theme)
     }
 
-    private fun queryLaunchableApps(app: Application): List<InstalledAppItem> {
+    private fun queryLaunchableApps(app: Application): List<InstalledAppItem>? {
         val pm = app.packageManager
         val selfPkg = app.packageName
         val density = app.resources.displayMetrics.density
         val iconPx = (36f * density).roundToInt().coerceIn(72, 144)
 
         val launcherIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-        val resolved = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            pm.queryIntentActivities(
-                launcherIntent,
-                PackageManager.ResolveInfoFlags.of(PackageManager.MATCH_ALL.toLong()),
-            )
-        } else {
-            @Suppress("DEPRECATION")
-            pm.queryIntentActivities(launcherIntent, PackageManager.MATCH_ALL)
-        }
+        val resolved = runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                pm.queryIntentActivities(
+                    launcherIntent,
+                    PackageManager.ResolveInfoFlags.of(PackageManager.MATCH_ALL.toLong()),
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                pm.queryIntentActivities(launcherIntent, PackageManager.MATCH_ALL)
+            }
+        }.getOrElse { return null }
 
         val seen = HashSet<String>()
         val items = ArrayList<InstalledAppItem>(resolved.size)

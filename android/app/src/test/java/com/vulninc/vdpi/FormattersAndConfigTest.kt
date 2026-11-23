@@ -9,6 +9,7 @@ import com.vulninc.vdpi.engine.NativeEngineConfig
 import com.vulninc.vdpi.ui.computeSettingsChangeSummary
 import com.vulninc.vdpi.util.formatBytes
 import com.vulninc.vdpi.util.formatEventTime
+import com.vulninc.vdpi.util.formatStageLabel
 import com.vulninc.vdpi.util.formatStageShort
 import com.vulninc.vdpi.util.formatUptime
 import com.vulninc.vdpi.util.isValidBypassDomain
@@ -42,6 +43,27 @@ class FormattersAndConfigTest {
         assertEquals("Stage 1 · Combo", formatStageShort(1, "ComboMultiRecord"))
         assertEquals("Stage 2 · OOB SNI", formatStageShort(2, "OobSniDesync"))
         assertEquals("Stage 5 · Deep Storm", formatStageShort(5, "DeepRecordStorm"))
+    }
+
+    @Test
+    fun formatStageLabelMapsKnownStrategies() {
+        assertEquals("Combo", formatStageLabel("ComboMultiRecord"))
+        assertEquals("OOB SNI", formatStageLabel("OobSniDesync"))
+        assertEquals("Multi + OOB", formatStageLabel("MultiRecordOob"))
+        assertEquals("Fine Fragment", formatStageLabel("FineFragment"))
+        assertEquals("Deep Storm", formatStageLabel("DeepRecordStorm"))
+        assertEquals("Slow SNI", formatStageLabel("SlowSniSlice"))
+        assertEquals("Passthrough", formatStageLabel("DirectPassthrough"))
+    }
+
+    @Test
+    fun formatStageLabelFallsBackVerbatimForUnknownAndBlankInputs() {
+        assertEquals("SplitOnly", formatStageLabel("SplitOnly"))
+        assertEquals("TlsRecord", formatStageLabel("TlsRecord"))
+        assertEquals("Combo", formatStageLabel("Combo"))
+        assertEquals("OobTlsRecord", formatStageLabel("OobTlsRecord"))
+        assertEquals("", formatStageLabel(""))
+        assertEquals("   ", formatStageLabel("   "))
     }
 
     @Test

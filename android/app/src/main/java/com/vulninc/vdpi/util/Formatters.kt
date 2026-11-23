@@ -34,18 +34,19 @@ fun formatUptime(totalSecs: Long): String {
     return String.format(Locale.US, "%02d:%02d:%02d", h, m, s)
 }
 
+fun formatStageLabel(stageLabel: String): String = when (stageLabel) {
+    "ComboMultiRecord" -> "Combo"
+    "OobSniDesync" -> "OOB SNI"
+    "MultiRecordOob" -> "Multi + OOB"
+    "FineFragment" -> "Fine Fragment"
+    "DeepRecordStorm" -> "Deep Storm"
+    "SlowSniSlice" -> "Slow SNI"
+    "DirectPassthrough" -> "Passthrough"
+    else -> stageLabel
+}
+
 fun formatStageShort(stageNumber: Int, stageLabel: String): String {
-    val human = when (stageLabel) {
-        "ComboMultiRecord" -> "Combo"
-        "OobSniDesync" -> "OOB SNI"
-        "MultiRecordOob" -> "Multi + OOB"
-        "FineFragment" -> "Fine Fragment"
-        "DeepRecordStorm" -> "Deep Storm"
-        "SlowSniSlice" -> "Slow SNI"
-        "DirectPassthrough" -> "Passthrough"
-        else -> stageLabel
-    }
-    return "Stage $stageNumber · $human"
+    return "Stage $stageNumber · ${formatStageLabel(stageLabel)}"
 }
 
 fun formatEventTime(tsMs: Long): String {

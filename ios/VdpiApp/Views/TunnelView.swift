@@ -4,70 +4,27 @@ import UIKit
 struct TunnelView: View {
     var topInset: CGFloat = 0
     var bottomInset: CGFloat = 104
+    var showInlineReconnect: Bool = true
 
     @EnvironmentObject private var manager: TunnelManager
     @Environment(\.vdpiPalette) private var palette
-    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @State private var showDiagnosticsSheet = false
     @State private var showLogsSheet = false
-    @State private var cacheSpinning = false
+    @State private var cacheCleared = false
+    @State private var cacheFeedbackTask: Task<Void, Never>?
 
     private var isConnected: Bool { manager.phase == .connected }
     private var isBusy: Bool { manager.phase == .connecting || manager.phase == .disconnecting }
 
-    private var heroBorderColor: Color {
-        switch manager.phase {
-        case .connected: return palette.signalBorder
-        case .connecting, .disconnecting: return palette.warning.opacity(0.50)
-        case .error: return palette.danger.opacity(0.55)
-        case .disconnected: return palette.border
-        }
-    }
-
-    private var heroRimAccent: Color? {
-        switch manager.phase {
-        case .connected: return palette.signal
-        case .connecting, .disconnecting: return palette.warning
-        case .error: return palette.danger
-        case .disconnected: return nil
-        }
-    }
-
-    private var heroShadowColor: Color {
-        switch manager.phase {
-        case .connected: return palette.signalGlow.opacity(palette.isDark ? 0.55 : 0.45)
-        case .connecting, .disconnecting: return palette.warningGlow.opacity(palette.isDark ? 0.48 : 0.35)
-        case .error: return palette.dangerGlow.opacity(palette.isDark ? 0.50 : 0.38)
-        case .disconnected: return palette.shadowColor
-        }
-    }
-
-    private var statusTint: Color {
-        switch manager.phase {
-        case .connected: return palette.signal
-        case .connecting, .disconnecting: return palette.warning
-        case .error: return palette.danger
-        case .disconnected: return palette.inkMuted
-        }
-    }
-
-    private var statusBg: Color {
-        switch manager.phase {
-        case .connected: return palette.signalTint
-        case .connecting, .disconnecting: return palette.warningTint
-        case .error: return palette.dangerTint
-        case .disconnected: return palette.surfaceRaised.opacity(palette.isDark ? 0.72 : 0.82)
-        }
-    }
-
     private var heroTitle: String {
         switch manager.phase {
-        case .connected: return "Protected"
+        case .connected: return "Connected"
         case .connecting: return "Connecting"
-        case .disconnecting: return "Stopping"
-        case .disconnected: return "Ready to Shield"
-        case .error: return "Tunnel Error"
+        case .disconnecting: return "Disconnecting"
+        case .disconnected: return "Not Connected"
+        case .error: return "Connection Error"
         }
     }
 
@@ -76,7 +33,7 @@ struct TunnelView: View {
         case .disconnected, .error: return "Connect"
         case .connecting: return "Connecting..."
         case .connected: return "Disconnect"
-        case .disconnecting: return "Stopping..."
+        case .disconnecting: return "Disconnecting..."
         }
     }
 
@@ -88,13 +45,16 @@ struct TunnelView: View {
             return palette.danger
         }
         if let report = manager.doctorState.report {
-            return report.ok ? palette.signal : palette.danger
+            return report.ok ? nil : palette.danger
         }
         return nil
     }
 
     private var logsBadgeColor: Color? {
-        if manager.telemetry.events.contains(where: { $0.level.lowercased() == "error" }) {
+        if manager.telemetry.events.contains(where: {
+            let level = $0.level.lowercased()
+            return level == "error" || level == "err"
+        }) {
             return palette.danger
         }
         return nil
@@ -102,30 +62,41 @@ struct TunnelView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 0) {
                 headerBar
 
                 heroCard
+                    .padding(.top, 16)
 
-                if manager.pendingReconnect && manager.phase == .connected {
+                if manager.pendingReconnect && manager.phase == .connected && showInlineReconnect {
                     inlineReconnectCard
-                        .transition(.opacity.combined(with: .scale(scale: 0.97, anchor: .top)))
+                        .padding(.top, 12)
+                        .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
                 }
 
                 if isConnected {
-                    liveTelemetrySection
+                    connectionSection
+                        .padding(.top, 24)
                 } else {
-                    standbyProfileSection
+                    profileSection
+                        .padding(.top, 24)
                 }
+
+                actionsSection
+                    .padding(.top, 24)
             }
-            .animation(VdpiMotion.cardShift, value: manager.phase)
-            .animation(VdpiMotion.cardShift, value: manager.pendingReconnect)
-            .animation(VdpiMotion.floatingHud, value: topInset)
+            .animation(reduceMotion ? nil : VdpiMotion.cardShift, value: manager.phase)
+            .animation(reduceMotion ? nil : VdpiMotion.cardShift, value: manager.pendingReconnect)
+            .animation(reduceMotion ? nil : VdpiMotion.cardShift, value: showInlineReconnect)
+            .animation(reduceMotion ? nil : VdpiMotion.floatingHud, value: topInset)
             .padding(.horizontal, 16)
             .padding(.top, 12 + topInset)
             .padding(.bottom, bottomInset)
         }
         .scrollIndicators(.hidden)
+        .onDisappear {
+            cacheFeedbackTask?.cancel()
+        }
         .sheet(isPresented: $showDiagnosticsSheet) {
             DiagnosticsSheet()
                 .environmentObject(manager)
@@ -144,27 +115,15 @@ struct TunnelView: View {
         }
     }
 
-    // MARK: - Floating Header
+    // MARK: - Header
 
     private var headerBar: some View {
-        HStack(spacing: 10) {
-            HStack(spacing: 10) {
-                VdpiBrandMark(isActive: isConnected)
-
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text("vdpi")
-                        .font(.system(size: 28, weight: .bold))
-                        .tracking(-0.7)
-                        .foregroundStyle(palette.inkPrimary)
-
-                    Text("v\(manager.engineVersion)")
-                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                        .foregroundStyle(palette.inkSecondary)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
-                        .vdpiGlass(in: Capsule(), tier: .subtle)
-                }
-            }
+        HStack(alignment: .center, spacing: 12) {
+            Text("vdpi")
+                .font(.largeTitle.bold())
+                .tracking(-0.6)
+                .foregroundStyle(palette.inkPrimary)
+                .accessibilityAddTraits(.isHeader)
 
             Spacer(minLength: 8)
 
@@ -187,374 +146,378 @@ struct TunnelView: View {
                 ) {
                     showLogsSheet = true
                 }
-
-                GlassCircleButton(
-                    systemImage: "arrow.counterclockwise",
-                    accessibilityLabel: "Clear Cache",
-                    isSpinning: cacheSpinning
-                ) {
-                    cacheSpinning = true
-                    manager.clearCache()
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.65) {
-                        cacheSpinning = false
-                    }
-                }
             }
         }
     }
 
-    // MARK: - Aurora Mesh-Gradient Hero Card
+    // MARK: - Hero Card
 
     private var heroCard: some View {
-        let shape = RoundedRectangle(cornerRadius: 28, style: .continuous)
-        let strategyText: String = isConnected
-            ? VdpiFormatters.formatStageShort(
-                stageNumber: manager.telemetry.stageNumber,
-                label: manager.telemetry.stageLabel
-            )
-            : "S1 · \(manager.settings.desyncMode.label)"
+        InsetGroupedCard(cornerRadius: 16) {
+            VStack(spacing: 0) {
+                StatusDisc(phase: manager.phase)
 
-        return VStack(alignment: .leading, spacing: 18) {
-            HStack(spacing: 8) {
-                StatusPill(
-                    text: manager.phase.label.uppercased(),
-                    tint: statusTint,
-                    background: statusBg,
-                    border: heroBorderColor,
-                    isPulsing: isConnected || isBusy
-                )
-
-                Spacer(minLength: 6)
-
-                Text(strategyText)
-                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(palette.inkSecondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .vdpiGlass(in: Capsule(), tier: .subtle)
-            }
-
-            VStack(alignment: .leading, spacing: 6) {
                 Text(heroTitle)
-                    .font(.system(size: 30, weight: .bold))
-                    .tracking(-0.8)
+                    .font(.title2.bold())
                     .foregroundStyle(palette.inkPrimary)
+                    .multilineTextAlignment(.center)
+                    .padding(.top, 14)
 
                 heroSubtitle
-            }
+                    .padding(.top, 4)
 
-            if isConnected {
-                connectedThroughputBar
-                    .transition(.opacity.combined(with: .scale(scale: 0.97, anchor: .top)))
+                PrimaryActionButton(
+                    title: primaryButtonTitle,
+                    isLoading: isBusy,
+                    isDestructiveOutline: isConnected || isBusy
+                ) {
+                    manager.toggleTunnel()
+                }
+                .padding(.top, 20)
             }
-
-            PrimaryActionButton(
-                title: primaryButtonTitle,
-                isLoading: isBusy,
-                isDestructiveOutline: isConnected
-            ) {
-                manager.toggleTunnel()
-            }
+            .frame(maxWidth: .infinity)
+            .padding(20)
         }
-        .padding(20)
-        .background(
-            OrganicMeshHeroBackdrop(
-                phase: manager.phase,
-                isSceneActive: scenePhase == .active
-            )
-        )
-        .clipShape(shape)
-        .overlay(
-            shape.strokeBorder(
-                palette.specularRim(accent: heroRimAccent),
-                lineWidth: 1.15
-            )
-        )
-        .shadow(
-            color: heroShadowColor,
-            radius: isConnected ? 26 : 16,
-            x: 0,
-            y: isConnected ? 14 : 8
-        )
-        .animation(VdpiMotion.cardShift, value: manager.phase)
     }
 
     @ViewBuilder
     private var heroSubtitle: some View {
         if let err = manager.errorMessage, manager.phase == .error {
             Text(err)
-                .font(.system(size: 13, weight: .medium))
+                .font(.subheadline)
                 .foregroundStyle(palette.danger)
+                .multilineTextAlignment(.center)
+                .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
         } else if isConnected {
             let t = manager.telemetry
-            let resolver = t.dohEnabled ? "DoH \(t.dnsAddr)" : "DNS \(t.dnsAddr)"
-            Text("Up \(VdpiFormatters.formatUptime(t.uptimeSecs)) · \(resolver)")
-                .font(.system(size: 13, weight: .medium, design: .monospaced))
+            let resolver = t.dohEnabled ? "\(t.dnsAddr) DoH" : t.dnsAddr
+            Text("\(resolver) · \(VdpiFormatters.formatUptime(t.uptimeSecs))")
+                .font(.subheadline)
                 .monospacedDigit()
-                .foregroundStyle(palette.signal)
+                .foregroundStyle(palette.inkSecondary)
                 .contentTransition(.numericText())
                 .lineLimit(1)
                 .minimumScaleFactor(0.85)
         } else if manager.phase == .connecting {
-            Text("Starting userspace TLS desync & RFC 8484 DoH ring...")
-                .font(.system(size: 13))
+            Text("Establishing local tunnel...")
+                .font(.subheadline)
                 .foregroundStyle(palette.inkSecondary)
-                .fixedSize(horizontal: false, vertical: true)
+                .multilineTextAlignment(.center)
+                .lineLimit(1)
         } else if manager.phase == .disconnecting {
-            Text("Closing local NetworkExtension tunnel...")
-                .font(.system(size: 13))
+            Text("Closing local tunnel...")
+                .font(.subheadline)
                 .foregroundStyle(palette.inkSecondary)
-                .fixedSize(horizontal: false, vertical: true)
+                .multilineTextAlignment(.center)
+                .lineLimit(1)
         } else {
-            let s = manager.settings
-            let resolver = s.enableDoh ? "DoH \(s.dnsAddr)" : "DNS \(s.dnsAddr)"
-            Text("Zero-server TLS desync · \(resolver)")
-                .font(.system(size: 13, weight: .medium, design: .monospaced))
+            Text("Local anti-DPI tunnel ready")
+                .font(.subheadline)
                 .foregroundStyle(palette.inkSecondary)
-                .lineLimit(2)
-        }
-    }
-
-    private var connectedThroughputBar: some View {
-        let t = manager.telemetry
-        return HStack(spacing: 0) {
-            throughputColumn(
-                label: "DOWNLINK",
-                value: VdpiFormatters.formatBytes(t.bytesRx)
-            )
-
-            Rectangle()
-                .fill(palette.border)
-                .frame(width: 1, height: 26)
-
-            throughputColumn(
-                label: "UPLINK",
-                value: VdpiFormatters.formatBytes(t.bytesTx)
-            )
-
-            Rectangle()
-                .fill(palette.border)
-                .frame(width: 1, height: 26)
-
-            throughputColumn(
-                label: "QUIC BLOCKED",
-                value: "\(t.quicBlocked)"
-            )
-        }
-        .padding(.vertical, 10)
-        .padding(.horizontal, 6)
-        .vdpiGlass(
-            in: RoundedRectangle(cornerRadius: 16, style: .continuous),
-            tier: .subtle
-        )
-    }
-
-    private func throughputColumn(label: String, value: String) -> some View {
-        VStack(spacing: 3) {
-            Text(label)
-                .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
-                .tracking(0.6)
-                .foregroundStyle(palette.inkMuted)
+                .multilineTextAlignment(.center)
                 .lineLimit(1)
-
-            Text(value)
-                .font(.system(size: 14, weight: .semibold, design: .monospaced))
-                .monospacedDigit()
-                .foregroundStyle(palette.inkPrimary)
-                .contentTransition(.numericText())
-                .lineLimit(1)
-                .minimumScaleFactor(0.8)
         }
-        .frame(maxWidth: .infinity)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(label): \(value)")
     }
 
-    // MARK: - Persistent Home Inline Reconnect Card
+    // MARK: - Persistent Home Inline Reconnect Row
 
     private var inlineReconnectCard: some View {
         let detail = manager.pendingChangeSummary.isEmpty
-            ? "Reload the tunnel to apply your updated settings."
-            : "Pending: \(manager.pendingChangeSummary)"
+            ? "Reconnect to apply"
+            : manager.pendingChangeSummary
 
-        return GlassPanel(
-            cornerRadius: 20,
-            tier: .regular,
-            tint: palette.warningTint,
-            borderAccent: palette.warning
-        ) {
+        return InsetGroupedCard(cornerRadius: 16) {
             HStack(spacing: 12) {
-                ZStack {
-                    Circle()
-                        .fill(palette.warningTint)
-                        .overlay(
-                            Circle()
-                                .strokeBorder(palette.warning.opacity(0.35), lineWidth: 1)
-                        )
-                        .frame(width: 34, height: 34)
-                    Image(systemName: "arrow.triangle.2.circlepath")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(palette.warning)
-                }
-                .accessibilityHidden(true)
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(palette.warning)
+                    .accessibilityHidden(true)
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Settings updated")
-                        .font(.system(size: 13.5, weight: .semibold))
+                    Text("Settings Changed")
+                        .font(.subheadline.weight(.semibold))
                         .foregroundStyle(palette.inkPrimary)
+
                     Text(detail)
-                        .font(.system(size: 12))
+                        .font(.footnote)
                         .foregroundStyle(palette.inkSecondary)
                         .lineLimit(2)
                 }
 
-                Spacer(minLength: 6)
+                Spacer(minLength: 8)
 
                 Button {
                     VdpiHaptics.trigger(.medium)
                     manager.applyChangesLive()
                 } label: {
-                    Group {
+                    ZStack {
+                        Text("Reconnect")
+                            .font(.subheadline.weight(.semibold))
+                            .lineLimit(1)
+                            .opacity(manager.isReloading ? 0 : 1)
+
                         if manager.isReloading {
                             ProgressView()
                                 .progressViewStyle(.circular)
+                                .controlSize(.mini)
                                 .tint(palette.primaryButtonInk)
-                                .scaleEffect(0.78)
-                        } else {
-                            Text("Apply")
-                                .font(.system(size: 13, weight: .semibold))
                         }
                     }
                     .foregroundStyle(palette.primaryButtonInk)
-                    .padding(.horizontal, 16)
-                    .frame(minWidth: 72, minHeight: 38)
-                    .background(palette.primaryButtonBg)
-                    .clipShape(Capsule())
+                    .padding(.horizontal, 14)
+                    .frame(minHeight: 34)
+                    .background(Capsule().fill(palette.primaryButtonBg))
+                    .frame(minHeight: 44)
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(VdpiPressButtonStyle(haptic: nil))
                 .disabled(manager.isReloading)
+                .accessibilityLabel(manager.isReloading ? "Reconnecting tunnel" : "Reconnect tunnel")
             }
-            .padding(14)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
         }
     }
 
-    // MARK: - Live Telemetry
+    // MARK: - Connection Telemetry Section
 
-    private var liveTelemetrySection: some View {
+    private var connectionSection: some View {
         let t = manager.telemetry
-        let columns = [
-            GridItem(.flexible(), spacing: 10),
-            GridItem(.flexible(), spacing: 10),
-        ]
+        let dnsValue = t.dohEnabled ? "\(t.dnsAddr) (DoH)" : t.dnsAddr
 
-        return GlassPanel(cornerRadius: 22) {
-            VStack(alignment: .leading, spacing: 14) {
-                HStack {
-                    SectionOverline(title: "Live Telemetry")
-                    Spacer()
-                    Text(t.dohEnabled ? "DoH · \(t.dnsAddr)" : "DNS · \(t.dnsAddr)")
-                        .font(.system(size: 11, weight: .medium, design: .monospaced))
-                        .foregroundStyle(palette.inkSecondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
+        return VStack(alignment: .leading, spacing: 8) {
+            SectionHeader(title: "Connection")
 
-                LazyVGrid(columns: columns, spacing: 10) {
-                    MetricTile(
-                        label: "Upload",
-                        value: VdpiFormatters.formatBytes(t.bytesTx),
-                        systemImage: "arrow.up"
-                    )
-                    MetricTile(
-                        label: "Download",
-                        value: VdpiFormatters.formatBytes(t.bytesRx),
-                        systemImage: "arrow.down"
-                    )
-                    MetricTile(
-                        label: "Active / Total",
-                        value: "\(t.activeConnections) / \(t.totalConnections)",
-                        systemImage: "network"
-                    )
-                    MetricTile(
-                        label: "TLS Handshakes",
-                        value: "\(t.tlsHandshakes)",
-                        systemImage: "lock.shield"
-                    )
-                    MetricTile(
-                        label: "DNS Queries",
-                        value: "\(t.dnsQueries)",
-                        systemImage: "globe"
-                    )
-                    MetricTile(
-                        label: "QUIC Fallback",
-                        value: "\(t.quicBlocked)",
-                        systemImage: "bolt.slash"
-                    )
-                    MetricTile(
-                        label: "UDP Flows",
-                        value: "\(t.udpFlowsActive)",
-                        systemImage: "dot.radiowaves.left.and.right"
-                    )
-                    MetricTile(
-                        label: "Learned Hosts",
-                        value: "\(t.learnedHosts)",
-                        systemImage: "cpu"
-                    )
+            InsetGroupedCard(cornerRadius: 16) {
+                VStack(spacing: 0) {
+                    keyValueRow("Download", value: VdpiFormatters.formatBytes(t.bytesRx))
+                    InsetDivider(leadingInset: 16)
+                    keyValueRow("Upload", value: VdpiFormatters.formatBytes(t.bytesTx))
+                    InsetDivider(leadingInset: 16)
+                    keyValueRow("Strategy", value: VdpiFormatters.formatStageLabel(t.stageLabel))
+                    InsetDivider(leadingInset: 16)
+                    keyValueRow("DNS", value: dnsValue)
+                    InsetDivider(leadingInset: 16)
+                    keyValueRow("QUIC Blocked", value: "\(t.quicBlocked)")
                 }
-                .contentTransition(.numericText())
             }
-            .padding(16)
         }
         .transition(.opacity)
     }
 
-    // MARK: - Standby Profile
+    // MARK: - Standby Profile Section
 
-    private var standbyProfileSection: some View {
+    private var profileSection: some View {
         let s = manager.settings
-        return GlassPanel(cornerRadius: 22) {
-            VStack(alignment: .leading, spacing: 0) {
-                SectionOverline(title: "Active Profile")
-                    .padding(.horizontal, 16)
-                    .padding(.top, 16)
-                    .padding(.bottom, 12)
+        let dnsValue = s.enableDoh ? "\(s.dnsAddr) (DoH)" : s.dnsAddr
 
-                HairlineRule()
+        return VStack(alignment: .leading, spacing: 8) {
+            SectionHeader(title: "Profile")
 
-                profileRow("Desync Mode", value: "\(s.desyncMode.label) (\(s.chunkSize) B)")
-                HairlineRule()
-                profileRow("DNS Ring", value: s.enableDoh ? "DoH (\(s.dnsAddr))" : s.dnsAddr)
-                HairlineRule()
-                profileRow("QUIC Fallback", value: s.blockQuic ? "Enabled (UDP/443)" : "Disabled")
-                HairlineRule()
-                profileRow("On-Demand", value: s.onDemandEnabled ? "Auto-Connect" : "Manual")
-                HairlineRule()
-                profileRow(
-                    "Bypass Rules",
-                    value: s.bypassDomains.isEmpty ? "Built-in LAN & Portals" : "\(s.bypassDomains.count) custom"
-                )
+            InsetGroupedCard(cornerRadius: 16) {
+                VStack(spacing: 0) {
+                    keyValueRow("Mode", value: "\(s.desyncMode.label) (\(s.chunkSize) B)")
+                    InsetDivider(leadingInset: 16)
+                    keyValueRow("DNS", value: dnsValue)
+                    InsetDivider(leadingInset: 16)
+                    keyValueRow("QUIC Blocking", value: s.blockQuic ? "On" : "Off")
+                    InsetDivider(leadingInset: 16)
+                    keyValueRow("On-Demand", value: s.onDemandEnabled ? "On" : "Off")
+                }
             }
         }
         .transition(.opacity)
     }
 
-    private func profileRow(_ title: String, value: String) -> some View {
-        HStack(spacing: 12) {
+    // MARK: - Actions Section
+
+    private var actionsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            SectionHeader(title: "Actions")
+
+            InsetGroupedCard(cornerRadius: 16) {
+                Button {
+                    triggerClearCache()
+                } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: "arrow.counterclockwise")
+                            .font(.body)
+                            .foregroundStyle(palette.accent)
+                            .frame(width: 24)
+                            .accessibilityHidden(true)
+
+                        Text("Clear Engine Cache")
+                            .font(.body)
+                            .foregroundStyle(palette.inkPrimary)
+
+                        Spacer(minLength: 8)
+
+                        if cacheCleared {
+                            HStack(spacing: 4) {
+                                Image(systemName: "checkmark")
+                                    .font(.footnote.weight(.semibold))
+                                Text("Cleared")
+                                    .font(.subheadline)
+                            }
+                            .foregroundStyle(palette.inkSecondary)
+                            .transition(.opacity)
+                        }
+                    }
+                    .frame(minHeight: 44)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 6)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    // MARK: - Helpers
+
+    private func keyValueRow(_ title: String, value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
             Text(title)
-                .font(.system(size: 13))
-                .foregroundStyle(palette.inkSecondary)
-            Spacer()
-            Text(value)
-                .font(.system(size: 13, weight: .medium, design: .monospaced))
+                .font(.body)
                 .foregroundStyle(palette.inkPrimary)
+
+            Spacer(minLength: 8)
+
+            Text(value)
+                .font(.body)
+                .monospacedDigit()
+                .foregroundStyle(palette.inkSecondary)
+                .contentTransition(.numericText())
                 .lineLimit(1)
                 .truncationMode(.middle)
         }
+        .frame(minHeight: 44)
         .padding(.horizontal, 16)
-        .padding(.vertical, 12)
+        .padding(.vertical, 6)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(title): \(value)")
+    }
+
+    private func triggerClearCache() {
+        VdpiHaptics.trigger(.light)
+        manager.clearCache()
+        cacheFeedbackTask?.cancel()
+        withAnimation(reduceMotion ? nil : VdpiMotion.cardShift) {
+            cacheCleared = true
+        }
+        cacheFeedbackTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_600_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(reduceMotion ? nil : VdpiMotion.cardShift) {
+                cacheCleared = false
+            }
+        }
+    }
+}
+
+// MARK: - Quiet Tonal Status Disc
+
+private struct StatusDisc: View {
+    @Environment(\.vdpiPalette) private var palette
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var scenePhase
+
+    let phase: TunnelPhase
+
+    @State private var pulseDimmed = false
+
+    private var isTransitioning: Bool {
+        phase == .connecting || phase == .disconnecting
+    }
+
+    private var shouldPulse: Bool {
+        isTransitioning && !reduceMotion && scenePhase == .active
+    }
+
+    private var discFill: Color {
+        switch phase {
+        case .connected: return palette.signalTint
+        case .disconnected: return palette.surfaceRaised
+        case .connecting, .disconnecting: return palette.warningTint
+        case .error: return palette.dangerTint
+        }
+    }
+
+    private var symbolName: String {
+        switch phase {
+        case .connected: return "shield.fill"
+        case .disconnected: return "shield"
+        case .connecting, .disconnecting: return "shield.lefthalf.filled"
+        case .error: return "exclamationmark.shield.fill"
+        }
+    }
+
+    private var symbolColor: Color {
+        switch phase {
+        case .connected: return palette.signal
+        case .disconnected: return palette.inkSecondary
+        case .connecting, .disconnecting: return palette.warning
+        case .error: return palette.danger
+        }
+    }
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(discFill)
+                .frame(width: 68, height: 68)
+
+            Image(systemName: symbolName)
+                .font(.system(size: 28, weight: .semibold))
+                .foregroundStyle(symbolColor)
+        }
+        .opacity(pulseDimmed ? 0.48 : 1.0)
+        .accessibilityHidden(true)
+        .onAppear {
+            syncPulse()
+        }
+        .vdpiOnChange(of: shouldPulse) { _ in
+            syncPulse()
+        }
+    }
+
+    private func syncPulse() {
+        if shouldPulse {
+            pulseDimmed = false
+            withAnimation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true)) {
+                pulseDimmed = true
+            }
+        } else {
+            withAnimation(.easeOut(duration: 0.2)) {
+                pulseDimmed = false
+            }
+        }
+    }
+}
+
+// MARK: - Sheet Inset Card (Elevated Dark Sheet Contrast)
+
+private struct SheetInsetCard<Content: View>: View {
+    @Environment(\.vdpiPalette) private var palette
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
+
+    var cornerRadius: CGFloat = 16
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        let fillColor = palette.isDark ? palette.surfaceRaised : palette.surface
+        content()
+            .background(shape.fill(fillColor))
+            .clipShape(shape)
+            .overlay {
+                if colorSchemeContrast == .increased {
+                    shape
+                        .strokeBorder(palette.borderStrong, lineWidth: 1.0)
+                        .allowsHitTesting(false)
+                }
+            }
     }
 }
 
@@ -565,126 +528,173 @@ private struct DiagnosticsSheet: View {
     @Environment(\.vdpiPalette) private var palette
     @Environment(\.dismiss) private var dismiss
 
+    private var sheetBackground: Color {
+        palette.isDark ? palette.surface : palette.canvas
+    }
+
     var body: some View {
         NavigationStack {
             ZStack {
-                VdpiAmbientBackdrop(phase: manager.phase)
+                sheetBackground
+                    .ignoresSafeArea()
 
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 14) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        SectionHeader(title: "Checks")
+
                         if manager.doctorState.running {
-                            GlassPanel(cornerRadius: 20) {
+                            SheetInsetCard(cornerRadius: 16) {
                                 HStack(spacing: 12) {
                                     ProgressView()
-                                        .tint(palette.inkPrimary)
+                                        .progressViewStyle(.circular)
+                                        .tint(palette.inkSecondary)
+
                                     VStack(alignment: .leading, spacing: 2) {
-                                        Text("Running live probes...")
-                                            .font(.system(size: 14, weight: .semibold))
+                                        Text("Running Diagnostics")
+                                            .font(.body)
                                             .foregroundStyle(palette.inkPrimary)
-                                        Text("Testing RFC 8484 DoH and TLS 1.3/1.2 ServerHello desync.")
-                                            .font(.system(size: 12))
+
+                                        Text("Testing DNS, DoH, TLS, and QUIC paths.")
+                                            .font(.footnote)
                                             .foregroundStyle(palette.inkSecondary)
                                     }
-                                    Spacer()
+
+                                    Spacer(minLength: 8)
                                 }
-                                .padding(16)
+                                .frame(minHeight: 56)
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 10)
                             }
                         } else if let doctorError = manager.doctorState.error {
-                            GlassPanel(
-                                cornerRadius: 20,
-                                tier: .regular,
-                                tint: palette.dangerTint,
-                                borderAccent: palette.danger
-                            ) {
-                                HStack(alignment: .top, spacing: 10) {
-                                    Image(systemName: "exclamationmark.triangle.fill")
+                            SheetInsetCard(cornerRadius: 16) {
+                                HStack(alignment: .top, spacing: 12) {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .font(.title3)
                                         .foregroundStyle(palette.danger)
-                                        .padding(.top, 2)
+                                        .padding(.top, 1)
+
                                     VStack(alignment: .leading, spacing: 3) {
-                                        Text("Diagnostics failed")
-                                            .font(.system(size: 14, weight: .semibold))
+                                        Text("Diagnostics Failed")
+                                            .font(.body)
                                             .foregroundStyle(palette.inkPrimary)
+
                                         Text(doctorError)
-                                            .font(.system(size: 12))
+                                            .font(.footnote)
                                             .foregroundStyle(palette.inkSecondary)
                                             .fixedSize(horizontal: false, vertical: true)
                                     }
-                                    Spacer()
+
+                                    Spacer(minLength: 8)
                                 }
-                                .padding(16)
+                                .frame(minHeight: 56)
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 12)
                             }
                         } else if let report = manager.doctorState.report, !report.checks.isEmpty {
-                            GlassPanel(cornerRadius: 20) {
+                            SheetInsetCard(cornerRadius: 16) {
                                 VStack(spacing: 0) {
                                     ForEach(Array(report.checks.enumerated()), id: \.element.id) { idx, check in
                                         if idx > 0 {
-                                            HairlineRule()
+                                            InsetDivider(leadingInset: 48)
                                         }
-                                        HStack(alignment: .top, spacing: 12) {
-                                            Image(systemName: check.passed ? "checkmark.circle.fill" : "xmark.circle.fill")
-                                                .font(.system(size: 16))
-                                                .foregroundStyle(check.passed ? palette.signal : palette.danger)
-                                                .padding(.top, 2)
-
-                                            VStack(alignment: .leading, spacing: 3) {
-                                                HStack {
-                                                    Text(check.name)
-                                                        .font(.system(size: 14, weight: .semibold))
-                                                        .foregroundStyle(palette.inkPrimary)
-                                                    Spacer()
-                                                    Text("\(check.latencyMs) ms")
-                                                        .font(.system(size: 11, weight: .medium, design: .monospaced))
-                                                        .monospacedDigit()
-                                                        .foregroundStyle(palette.inkMuted)
-                                                }
-                                                Text(check.target)
-                                                    .font(.system(size: 11, design: .monospaced))
-                                                    .foregroundStyle(palette.inkMuted)
-                                                Text(check.detail)
-                                                    .font(.system(size: 12))
-                                                    .foregroundStyle(palette.inkSecondary)
-                                                    .fixedSize(horizontal: false, vertical: true)
-                                            }
-                                        }
-                                        .padding(14)
-                                        .accessibilityElement(children: .combine)
-                                        .accessibilityLabel(
-                                            "\(check.name), \(check.passed ? "Passed" : "Failed"), \(check.latencyMs) milliseconds, \(check.detail)"
-                                        )
+                                        diagnosticCheckRow(check)
                                     }
                                 }
                             }
+
+                            SectionFooter(text: summaryFooter(for: report))
                         } else {
-                            GlassPanel(cornerRadius: 20) {
-                                Text("Tap Run Diagnostics to verify live DoH and TLS desync probes.")
-                                    .font(.system(size: 13))
+                            SheetInsetCard(cornerRadius: 16) {
+                                Text("Tap Re-run to verify live DNS, DoH, and TLS desync probes.")
+                                    .font(.subheadline)
                                     .foregroundStyle(palette.inkSecondary)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .padding(16)
                             }
                         }
-
-                        PrimaryActionButton(
-                            title: manager.doctorState.running ? "Testing..." : "Run Diagnostics Again",
-                            isLoading: manager.doctorState.running,
-                            isDestructiveOutline: false
-                        ) {
-                            manager.runDiagnostics()
-                        }
                     }
-                    .padding(16)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 16)
+                    .padding(.bottom, 24)
                 }
                 .scrollIndicators(.hidden)
             }
             .navigationTitle("Diagnostics")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Done") { dismiss() }
-                        .foregroundStyle(palette.inkPrimary)
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Re-run") {
+                        VdpiHaptics.trigger(.light)
+                        manager.runDiagnostics()
+                    }
+                    .foregroundStyle(manager.doctorState.running ? palette.inkMuted : palette.accent)
+                    .disabled(manager.doctorState.running)
+                }
+
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                    .fontWeight(.semibold)
+                    .foregroundStyle(palette.accent)
                 }
             }
         }
+    }
+
+    private func diagnosticCheckRow(_ check: DoctorCheck) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: check.passed ? "checkmark.circle.fill" : "xmark.circle.fill")
+                .font(.title3)
+                .foregroundStyle(check.passed ? palette.signal : palette.danger)
+                .padding(.top, 1)
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(check.name)
+                    .font(.body)
+                    .foregroundStyle(palette.inkPrimary)
+
+                if !check.detail.isEmpty {
+                    Text(check.detail)
+                        .font(.footnote)
+                        .foregroundStyle(palette.inkSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if !check.target.isEmpty {
+                    Text(check.target)
+                        .font(.caption)
+                        .foregroundStyle(palette.inkMuted)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+
+            Spacer(minLength: 8)
+
+            Text("\(check.latencyMs) ms")
+                .font(.subheadline)
+                .monospacedDigit()
+                .foregroundStyle(palette.inkSecondary)
+                .padding(.top, 2)
+        }
+        .frame(minHeight: 48)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            "\(check.name), \(check.passed ? "Passed" : "Failed"), \(check.latencyMs) milliseconds, \(check.detail)"
+        )
+    }
+
+    private func summaryFooter(for report: DoctorReport) -> String {
+        let failedCount = report.checks.filter { !$0.passed }.count
+        if failedCount == 0 {
+            return "All \(report.checks.count) checks passed."
+        }
+        let noun = failedCount == 1 ? "issue" : "issues"
+        return "\(failedCount) \(noun) detected - check DNS or network settings."
     }
 }
 
@@ -693,92 +703,164 @@ private struct DiagnosticsSheet: View {
 private struct EngineLogsSheet: View {
     @EnvironmentObject private var manager: TunnelManager
     @Environment(\.vdpiPalette) private var palette
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dismiss) private var dismiss
+
     @State private var copied = false
+    @State private var copyFeedbackTask: Task<Void, Never>?
 
     private var formattedLogs: String {
         manager.telemetry.events.map { ev in
-            "[\(VdpiFormatters.formatEventTime(ev.tsMs))] [\(ev.level.uppercased())] [\(ev.tag)] \(ev.message)"
+            "[\(VdpiFormatters.formatEventTime(ev.tsMs))] \(severityPrefix(ev.level)) [\(ev.tag)] \(ev.message)"
         }.joined(separator: "\n")
+    }
+
+    private var sheetBackground: Color {
+        palette.isDark ? palette.surface : palette.canvas
+    }
+
+    private var logWellBackground: Color {
+        palette.isDark ? palette.canvas : palette.surface
     }
 
     var body: some View {
         NavigationStack {
             ZStack {
-                VdpiAmbientBackdrop(phase: manager.phase)
+                sheetBackground
+                    .ignoresSafeArea()
 
                 if manager.telemetry.events.isEmpty {
-                    VStack(spacing: 10) {
+                    VStack(spacing: 8) {
                         Image(systemName: "terminal")
-                            .font(.system(size: 26))
+                            .font(.title)
                             .foregroundStyle(palette.inkMuted)
-                        Text("No engine events yet")
-                            .font(.system(size: 15, weight: .semibold))
+                            .accessibilityHidden(true)
+
+                        Text("No Engine Logs Yet")
+                            .font(.headline)
                             .foregroundStyle(palette.inkPrimary)
-                        Text("Connect the tunnel or run Diagnostics to capture live events.")
-                            .font(.system(size: 12.5))
+
+                        Text("Connect the tunnel to record activity.")
+                            .font(.subheadline)
                             .foregroundStyle(palette.inkSecondary)
                             .multilineTextAlignment(.center)
                     }
                     .padding(32)
                 } else {
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 8) {
-                            ForEach(manager.telemetry.events.reversed()) { ev in
-                                GlassPanel(cornerRadius: 14, tier: .subtle) {
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        HStack(spacing: 6) {
-                                            Text(VdpiFormatters.formatEventTime(ev.tsMs))
-                                                .font(.system(size: 11, design: .monospaced))
-                                                .foregroundStyle(palette.inkMuted)
-                                            Text(ev.tag.uppercased())
-                                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                                                .foregroundStyle(levelColor(ev.level))
-                                        }
-                                        Text(ev.message)
-                                            .font(.system(size: 12, design: .monospaced))
-                                            .foregroundStyle(palette.inkPrimary)
-                                            .fixedSize(horizontal: false, vertical: true)
-                                    }
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .padding(12)
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 6) {
+                                ForEach(manager.telemetry.events) { ev in
+                                    logLineView(ev)
+                                        .id(ev.id)
+                                }
+
+                                Color.clear
+                                    .frame(height: 1)
+                                    .id("engine-logs-bottom")
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(12)
+                            .textSelection(.enabled)
+                        }
+                        .background(
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .fill(logWellBackground)
+                        )
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .padding(16)
+                        .onAppear {
+                            proxy.scrollTo("engine-logs-bottom", anchor: .bottom)
+                        }
+                        .vdpiOnChange(of: manager.telemetry.events.last?.id) { _ in
+                            if reduceMotion {
+                                proxy.scrollTo("engine-logs-bottom", anchor: .bottom)
+                            } else {
+                                withAnimation(.easeOut(duration: 0.2)) {
+                                    proxy.scrollTo("engine-logs-bottom", anchor: .bottom)
                                 }
                             }
                         }
-                        .padding(16)
                     }
-                    .scrollIndicators(.hidden)
                 }
+            }
+            .onDisappear {
+                copyFeedbackTask?.cancel()
             }
             .navigationTitle("Engine Logs")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button(copied ? "Copied" : "Copy") {
+                ToolbarItemGroup(placement: .navigationBarLeading) {
+                    Button {
                         UIPasteboard.general.string = formattedLogs
                         VdpiHaptics.trigger(.success)
+                        copyFeedbackTask?.cancel()
                         copied = true
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) {
+                        copyFeedbackTask = Task { @MainActor in
+                            try? await Task.sleep(nanoseconds: 1_800_000_000)
+                            guard !Task.isCancelled else { return }
                             copied = false
                         }
+                    } label: {
+                        Text(copied ? "Copied" : "Copy")
                     }
+                    .foregroundStyle(
+                        manager.telemetry.events.isEmpty ? palette.inkMuted : palette.accent
+                    )
                     .disabled(manager.telemetry.events.isEmpty)
-                    .foregroundStyle(palette.inkPrimary)
+
+                    ShareLink(item: formattedLogs) {
+                        Image(systemName: "square.and.arrow.up")
+                    }
+                    .foregroundStyle(
+                        manager.telemetry.events.isEmpty ? palette.inkMuted : palette.accent
+                    )
+                    .disabled(manager.telemetry.events.isEmpty)
+                    .accessibilityLabel("Share Engine Logs")
                 }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Done") { dismiss() }
-                        .foregroundStyle(palette.inkPrimary)
+
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                    .fontWeight(.semibold)
+                    .foregroundStyle(palette.accent)
                 }
             }
         }
     }
 
+    private func logLineView(_ ev: EngineEvent) -> some View {
+        let timestamp = Text(VdpiFormatters.formatEventTime(ev.tsMs) + " ")
+            .foregroundColor(palette.inkMuted)
+        let prefix = Text(severityPrefix(ev.level) + " ")
+            .foregroundColor(levelColor(ev.level))
+        let tag = Text("[\(ev.tag)] ")
+            .foregroundColor(palette.inkMuted)
+        let message = Text(ev.message)
+            .foregroundColor(palette.inkPrimary)
+
+        return Text("\(timestamp)\(prefix)\(tag)\(message)")
+            .font(.system(.caption, design: .monospaced))
+            .monospacedDigit()
+            .lineSpacing(4)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func severityPrefix(_ level: String) -> String {
+        switch level.lowercased() {
+        case "error", "err": return "[ERR]"
+        case "warn", "warning": return "[WARN]"
+        case "info": return "[INFO]"
+        default: return "[\(level.uppercased())]"
+        }
+    }
+
     private func levelColor(_ level: String) -> Color {
         switch level.lowercased() {
-        case "error": return palette.danger
-        case "warn": return palette.warning
-        case "info": return palette.signal
-        default: return palette.inkMuted
+        case "error", "err": return palette.danger
+        case "warn", "warning": return palette.warning
+        default: return palette.inkSecondary
         }
     }
 }

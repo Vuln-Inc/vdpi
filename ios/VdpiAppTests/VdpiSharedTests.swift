@@ -252,4 +252,40 @@ final class VdpiSharedTests: XCTestCase {
         XCTAssertTrue(VdpiPalette.resolve(preference: .system, systemScheme: .dark).isDark)
         XCTAssertFalse(VdpiPalette.resolve(preference: .system, systemScheme: .light).isDark)
     }
+
+    func testFormatStageLabelMapsKnownStrategiesAndPreservesFallback() {
+        XCTAssertEqual(VdpiFormatters.formatStageLabel("ComboMultiRecord"), "Combo")
+        XCTAssertEqual(VdpiFormatters.formatStageLabel("OobSniDesync"), "OOB SNI")
+        XCTAssertEqual(VdpiFormatters.formatStageLabel("MultiRecordOob"), "Multi + OOB")
+        XCTAssertEqual(VdpiFormatters.formatStageLabel("FineFragment"), "Fine Fragment")
+        XCTAssertEqual(VdpiFormatters.formatStageLabel("DeepRecordStorm"), "Deep Storm")
+        XCTAssertEqual(VdpiFormatters.formatStageLabel("SlowSniSlice"), "Slow SNI")
+        XCTAssertEqual(VdpiFormatters.formatStageLabel("DirectPassthrough"), "Passthrough")
+        XCTAssertEqual(VdpiFormatters.formatStageLabel("CustomStage"), "CustomStage")
+        XCTAssertEqual(VdpiFormatters.formatStageLabel(""), "")
+    }
+
+    func testVdpiPaletteUsesAppleSystemAccentsWithoutNeonGlow() {
+        XCTAssertTrue(VdpiPalette.dark.isDark)
+        XCTAssertFalse(VdpiPalette.light.isDark)
+        XCTAssertNotEqual(VdpiPalette.dark, VdpiPalette.light)
+
+        XCTAssertEqual(VdpiPalette.dark.accent, Color(hex: 0x409CFF))
+        XCTAssertEqual(VdpiPalette.dark.accentTint, Color(hex: 0x409CFF, alpha: 0.16))
+        XCTAssertEqual(VdpiPalette.dark.primaryButtonBg, Color(hex: 0x0066CC))
+        XCTAssertEqual(VdpiPalette.dark.primaryButtonInk, Color(hex: 0xFFFFFF))
+        XCTAssertEqual(VdpiPalette.dark.signal, Color(hex: 0x30D158))
+        XCTAssertEqual(VdpiPalette.dark.signalGlow, .clear)
+        XCTAssertEqual(VdpiPalette.dark.warningGlow, .clear)
+        XCTAssertEqual(VdpiPalette.dark.dangerGlow, .clear)
+
+        XCTAssertEqual(VdpiPalette.light.accent, Color(hex: 0x0066CC))
+        XCTAssertEqual(VdpiPalette.light.accentTint, Color(hex: 0x0066CC, alpha: 0.12))
+        XCTAssertEqual(VdpiPalette.light.primaryButtonBg, Color(hex: 0x0066CC))
+        XCTAssertEqual(VdpiPalette.light.primaryButtonInk, Color(hex: 0xFFFFFF))
+        XCTAssertEqual(VdpiPalette.light.signal, Color(hex: 0x1E7E34))
+        XCTAssertEqual(VdpiPalette.light.signalGlow, .clear)
+        XCTAssertEqual(VdpiPalette.light.warningGlow, .clear)
+        XCTAssertEqual(VdpiPalette.light.dangerGlow, .clear)
+    }
 }
