@@ -288,4 +288,31 @@ final class VdpiSharedTests: XCTestCase {
         XCTAssertEqual(VdpiPalette.light.warningGlow, .clear)
         XCTAssertEqual(VdpiPalette.light.dangerGlow, .clear)
     }
+
+    func testSettingsDefaultThemeAndDecodeFallbackIsSystem() throws {
+        XCTAssertEqual(VdpiSettings().theme, .system)
+
+        let emptyJson = try XCTUnwrap("{}".data(using: .utf8))
+        let decoded = try JSONDecoder().decode(VdpiSettings.self, from: emptyJson)
+        XCTAssertEqual(decoded.theme, .system)
+    }
+
+    func testDesyncModeSubtitlesMatchAndroidParity() {
+        XCTAssertEqual(
+            DesyncMode.combo.subtitle,
+            "4-record TLS split + adaptive 7-stage auto-heal"
+        )
+        XCTAssertEqual(
+            DesyncMode.tlsRecord.subtitle,
+            "Split ClientHello across two RFC TLS records"
+        )
+        XCTAssertEqual(
+            DesyncMode.fragment.subtitle,
+            "Single outer TLS record sliced at SNI boundaries"
+        )
+        XCTAssertEqual(
+            DesyncMode.split.subtitle,
+            "Initial chunk-byte TCP split on first flight"
+        )
+    }
 }

@@ -2,8 +2,9 @@
 
 # `vdpi`
 
-**Self-healing anti-DPI engine in pure Rust for Desktop, Android, and iOS.**
+**Zero-hassle, self-healing anti-DPI engine in Rust - native across Windows, macOS, Linux, Android, and iOS.**
 
+[![GitHub](https://img.shields.io/badge/GitHub-Vuln--Inc%2Fvdpi-0f172a?style=for-the-badge&logo=github)](https://github.com/Vuln-Inc/vdpi)
 [![Release](https://img.shields.io/github/v/release/Vuln-Inc/vdpi?style=for-the-badge&logo=github&color=38bdf8)](https://github.com/Vuln-Inc/vdpi/releases/latest)
 [![Platforms](https://img.shields.io/badge/Platforms-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Android%20%7C%20iOS-818cf8?style=for-the-badge)](#platforms)
 [![Rust](https://img.shields.io/badge/Rust-2021%20Edition-c084fc?style=for-the-badge&logo=rust)](https://www.rust-lang.org/)
@@ -12,7 +13,7 @@
 Single self-contained binary on desktop. Zero-root local VPN apps on Android and iOS. Zero kernel drivers.  
 Works across ISPs and mobile networks worldwide with instant startup, zero ping penalty, and full **Discord** & **Roblox** support.
 
-[Platforms](#platforms) · [Android App](#android-app) · [iOS App](#ios-app) · [Desktop Installation](#desktop-installation) · [How It Works](#how-it-works) · [Diagnostics](#diagnostics) · [CLI Reference](#cli-reference) · [Building from Source](#building-from-source)
+[GitHub](https://github.com/Vuln-Inc/vdpi) · [Platforms](#platforms) · [Android App](#android-app) · [iOS App](#ios--ipados-app) · [Desktop Installation](#desktop-installation) · [How It Works](#how-it-works) · [Diagnostics](#diagnostics) · [CLI Reference](#cli-reference) · [Building from Source](#building-from-source)
 
 </div>
 
@@ -45,7 +46,7 @@ Download the latest build for your device from **[GitHub Releases](https://githu
 - **Per-App Split Tunneling:** Choose between **Bypass selected** or **Only selected** apps (without requiring `QUERY_ALL_PACKAGES`).
 - **Always-On VPN, Top-Pinned Notification & Quick Settings Tile:** Supports Android's Always-On VPN setting, a live Quick Settings tile, and a top-pinned silent VPN status notification with live uptime and Android 14–16 auto-repin if dismissed while connected (note: do not enable *"Block connections without VPN"* lockdown mode if your device relies on bypass exclusions).
 - **Live Telemetry & In-App Diagnostics:** Real-time 1 Hz counters (active TLS stage, connections, TX/RX bytes, DNS queries, blocked QUIC, active UDP flows), built-in `rustls` TLS 1.3/1.2 connectivity probes, and copyable chronological engine logs.
-- **Clean Apple HIG Native UI:** Jetpack Compose interface featuring a floating Liquid Glass navigation bar and live tunnel mini-bar, a cross-tab top **"Settings Changed"** reconnect popup, Dark/Light/System themes, WCAG AA contrast, 16 KB page-aligned native libraries, and explicit backup exclusion rules.
+- **Adaptive Apple Liquid Glass UI:** Jetpack Compose interface featuring a floating Liquid Glass navigation bar, live tunnel mini-bar, two-pane landscape layout, cross-tab top **"Settings Changed"** reconnect popup, System-default theme (with Dark/Light overrides), WCAG AA contrast, 16 KB page-aligned native libraries, and explicit backup exclusion rules.
 
 ### Installing on Android
 
@@ -75,7 +76,7 @@ Download the latest build for your device from **[GitHub Releases](https://githu
 - **Clean RFC 2544 Addressing, LAN Exclusion & Automatic IPv6 Gating:** Uses `198.18.0.2/24` with virtual DNS `198.18.0.1` and distinct remote endpoint `198.19.0.1` (MTU `1400`), excludes all RFC 1918 / loopback / broadcast / link-local / ULA LAN ranges, automatically disables IPv6 tunnel routes on IPv4-only networks via `getifaddrs`, and observes `NWPathMonitor` to flush caches on Wi-Fi/Cellular handoffs.
 - **On-Demand VPN & Domain Bypass:** Supports iOS VPN On-Demand (`NEOnDemandRuleConnect`) and custom domain bypass rules. Note: consumer iOS restricts per-app VPN split-tunneling (`NEAppRule`) to supervised MDM devices, so consumer builds use domain bypass.
 - **Live Telemetry, Diagnostics & Logs:** App Group (`group.com.vulninc.vdpi`) shares settings while `NETunnelProviderSession.sendProviderMessage` IPC handles 1 Hz telemetry, live reloads, cache clears, and in-tunnel `rustls` TLS 1.3/1.2 Diagnostics.
-- **Clean Apple HIG SwiftUI Interface:** Native iOS/iPadOS UI with a floating Liquid Glass navigation bar and live tunnel mini-bar, a cross-tab top **"Settings Changed"** reconnect popup, and Dark, Light, and System themes.
+- **Adaptive Apple Liquid Glass SwiftUI Interface:** Native iOS/iPadOS UI featuring a floating Liquid Glass navigation bar, live tunnel mini-bar, two-pane landscape layout, cross-tab top **"Settings Changed"** reconnect popup, and System-default theme (with Dark and Light overrides).
 
 ### Installing on iOS / iPadOS
 
@@ -444,4 +445,4 @@ vdpi/
 
 ## License
 
-Released under the [MIT License](./LICENSE). Copyright © 2026 [Vuln-Inc](https://github.com/Vuln-Inc).
+Released under the [MIT License](./LICENSE). Official repository: [github.com/Vuln-Inc/vdpi](https://github.com/Vuln-Inc/vdpi) · Copyright © 2026 [Vuln-Inc](https://github.com/Vuln-Inc).

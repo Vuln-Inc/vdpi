@@ -1,9 +1,9 @@
 package com.vulninc.vdpi.ui.screens
 
+import android.content.res.Configuration
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -23,17 +23,23 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -64,6 +70,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.Role
@@ -87,7 +94,6 @@ import com.vulninc.vdpi.ui.components.LocalTopOverlayPadding
 import com.vulninc.vdpi.ui.components.PrecisionSwitch
 import com.vulninc.vdpi.ui.components.SectionFooter
 import com.vulninc.vdpi.ui.components.SegmentedControl
-import com.vulninc.vdpi.ui.components.VdpiMotion
 import com.vulninc.vdpi.ui.components.springPress
 import com.vulninc.vdpi.ui.theme.VdpiTextStyles
 import com.vulninc.vdpi.ui.theme.VdpiThemeTokens
@@ -118,11 +124,10 @@ fun AppsScreen(
     val palette = VdpiThemeTokens.palette
     val focusManager = LocalFocusManager.current
     val bottomChromePadding = LocalBottomChromePadding.current
-    val topOverlayPadding by animateDpAsState(
-        targetValue = LocalTopOverlayPadding.current,
-        animationSpec = VdpiMotion.tabLensSpring,
-        label = "appsTopOverlay",
-    )
+    val topOverlayPadding = LocalTopOverlayPadding.current
+    val configuration = LocalConfiguration.current
+    val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE &&
+        configuration.screenWidthDp >= 560
 
     var query by rememberSaveable { mutableStateOf("") }
     var showSystem by rememberSaveable { mutableStateOf(false) }
@@ -146,244 +151,345 @@ fun AppsScreen(
         }
     }
 
-    Column(
+    Box(
         modifier = modifier
             .fillMaxSize()
-            .statusBarsPadding(),
+            .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal)),
+        contentAlignment = Alignment.TopCenter,
     ) {
-        Spacer(Modifier.height(topOverlayPadding))
+        Column(
+            modifier = (if (isLandscape) Modifier.widthIn(max = 760.dp) else Modifier)
+                .fillMaxSize(),
+        ) {
+            Spacer(Modifier.height(topOverlayPadding))
 
-        Column(modifier = Modifier.padding(horizontal = 16.dp)) {
-            Spacer(Modifier.height(12.dp))
-
-            // Apple Large Title header with conditional monochrome FloatingGlassIconButton
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 44.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Text(
-                    text = "Apps",
-                    style = VdpiTextStyles.pageTitle,
-                    color = palette.inkPrimary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
-                )
-
-                AnimatedVisibility(
-                    visible = settings.splitPackages.isNotEmpty(),
-                    enter = fadeIn(tween(180)) + scaleIn(initialScale = 0.84f, animationSpec = tween(180)),
-                    exit = fadeOut(tween(140)) + scaleOut(targetScale = 0.84f, animationSpec = tween(140)),
-                ) {
-                    FloatingGlassIconButton(
-                        onClick = onClearPackages,
-                        contentDescription = "Reset selected apps",
-                        size = 42.dp,
-                    ) {
-                        ResetSelectionGlyph(tint = palette.inkPrimary)
-                    }
-                }
-            }
-
-            Spacer(Modifier.height(12.dp))
-
-            // Mode picker: clean Apple Segmented Control
-            SegmentedControl(
-                options = SplitTunnelMode.entries,
-                selected = settings.splitTunnelMode,
-                labelFor = { mode ->
-                    when (mode) {
-                        SplitTunnelMode.BYPASS_SELECTED -> "Bypass Selected"
-                        SplitTunnelMode.ONLY_SELECTED -> "Only Selected"
-                    }
-                },
-                onSelect = onSetSplitMode,
-            )
-
-            // 1-line SectionFooter-style muted explanation
-            AnimatedContent(
-                targetState = settings.splitTunnelMode,
-                transitionSpec = { fadeIn(tween(160)) togetherWith fadeOut(tween(120)) },
-                label = "splitModeSummary",
-            ) { mode ->
-                SectionFooter(
-                    text = when (mode) {
-                        SplitTunnelMode.BYPASS_SELECTED ->
-                            "Selected apps connect directly without DPI bypass."
-                        SplitTunnelMode.ONLY_SELECTED ->
-                            "Only selected apps route through vdpi."
-                    },
-                )
-            }
-
-            Spacer(Modifier.height(16.dp))
-
-            // Borderless Apple-style search field
-            AppleSearchField(
-                query = query,
-                onQueryChange = { query = it },
-                onSearch = { focusManager.clearFocus() },
-                onClear = {
-                    query = ""
-                    focusManager.clearFocus()
-                },
-            )
-
-            Spacer(Modifier.height(6.dp))
-
-            // Compact inline tonal filter chips (zero glass on content)
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState()),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                TonalFilterChip(
-                    label = "All",
-                    selected = activeFilter == AppFilter.ALL,
-                    onClick = { activeFilter = AppFilter.ALL },
-                )
-                TonalFilterChip(
-                    label = if (selectedCount > 0) "Selected ($selectedCount)" else "Selected",
-                    selected = activeFilter == AppFilter.SELECTED,
-                    onClick = { activeFilter = AppFilter.SELECTED },
-                )
-                TonalFilterChip(
-                    label = "System",
-                    selected = showSystem,
-                    onClick = { showSystem = !showSystem },
-                )
-            }
-
-            Spacer(Modifier.height(6.dp))
-        }
-
-        if (loading && apps.isEmpty()) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f)
-                    .padding(horizontal = 16.dp)
-                    .padding(top = 4.dp, bottom = bottomChromePadding),
-                contentAlignment = Alignment.TopCenter,
-            ) {
-                InsetGroupedCard(
-                    modifier = Modifier.fillMaxWidth(),
-                    radius = 16.dp,
-                ) {
-                    Column(
+            Column(modifier = Modifier.padding(horizontal = 16.dp)) {
+                if (isLandscape) {
+                    // Compact landscape header: title left, reset + segmented mode picker right
+                    Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 24.dp, vertical = 28.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(12.dp),
-                    ) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(22.dp),
-                            strokeWidth = 2.dp,
-                            color = palette.inkSecondary,
-                        )
-                        Text(
-                            text = "Loading installed apps",
-                            style = VdpiTextStyles.body,
-                            color = palette.inkSecondary,
-                        )
-                    }
-                }
-            }
-        } else if (filtered.isEmpty()) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f)
-                    .padding(horizontal = 16.dp)
-                    .padding(top = 4.dp, bottom = bottomChromePadding),
-                contentAlignment = Alignment.TopCenter,
-            ) {
-                InsetGroupedCard(
-                    modifier = Modifier.fillMaxWidth(),
-                    radius = 16.dp,
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 24.dp, vertical = 28.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                            .padding(top = 6.dp, bottom = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
                         Text(
-                            text = when {
-                                activeFilter == AppFilter.SELECTED -> "No Apps Selected"
-                                query.isNotBlank() -> "No Matching Apps"
-                                else -> "No Apps Available"
-                            },
-                            style = VdpiTextStyles.rowTitle.copy(fontWeight = FontWeight.Medium),
+                            text = "Apps",
+                            style = VdpiTextStyles.pageTitle.copy(
+                                fontSize = 24.sp,
+                                lineHeight = 28.sp,
+                                letterSpacing = (-0.3).sp,
+                            ),
                             color = palette.inkPrimary,
-                            textAlign = TextAlign.Center,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
                         )
-                        Text(
-                            text = when {
-                                activeFilter == AppFilter.SELECTED ->
-                                    "Switch to All and toggle any app to include it."
-                                query.isNotBlank() ->
-                                    "Try another app name or package identifier."
-                                else ->
-                                    "Enable System to inspect system packages."
+
+                        AnimatedVisibility(
+                            visible = settings.splitPackages.isNotEmpty(),
+                            enter = fadeIn(tween(180)) + scaleIn(initialScale = 0.84f, animationSpec = tween(180)),
+                            exit = fadeOut(tween(140)) + scaleOut(targetScale = 0.84f, animationSpec = tween(140)),
+                        ) {
+                            FloatingGlassIconButton(
+                                onClick = onClearPackages,
+                                contentDescription = "Reset selected apps",
+                                size = 42.dp,
+                            ) {
+                                ResetSelectionGlyph(tint = palette.inkPrimary)
+                            }
+                        }
+
+                        SegmentedControl(
+                            options = SplitTunnelMode.entries,
+                            selected = settings.splitTunnelMode,
+                            labelFor = { mode ->
+                                when (mode) {
+                                    SplitTunnelMode.BYPASS_SELECTED -> "Bypass Selected"
+                                    SplitTunnelMode.ONLY_SELECTED -> "Only Selected"
+                                }
                             },
-                            style = VdpiTextStyles.caption,
-                            color = palette.inkSecondary,
-                            textAlign = TextAlign.Center,
+                            onSelect = onSetSplitMode,
+                            modifier = Modifier.widthIn(max = 320.dp),
                         )
-                        if (query.isNotBlank()) {
-                            Spacer(Modifier.height(6.dp))
-                            GhostActionButton(
-                                label = "Clear Search",
-                                onClick = {
-                                    query = ""
-                                    focusManager.clearFocus()
-                                },
+                    }
+
+                    // Combined landscape search bar + tonal filter chips row
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        AppleSearchField(
+                            query = query,
+                            onQueryChange = { query = it },
+                            onSearch = { focusManager.clearFocus() },
+                            onClear = {
+                                query = ""
+                                focusManager.clearFocus()
+                            },
+                            modifier = Modifier.weight(1f),
+                        )
+
+                        Row(
+                            modifier = Modifier.horizontalScroll(rememberScrollState()),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            TonalFilterChip(
+                                label = "All",
+                                selected = activeFilter == AppFilter.ALL,
+                                onClick = { activeFilter = AppFilter.ALL },
+                            )
+                            TonalFilterChip(
+                                label = if (selectedCount > 0) "Selected ($selectedCount)" else "Selected",
+                                selected = activeFilter == AppFilter.SELECTED,
+                                onClick = { activeFilter = AppFilter.SELECTED },
+                            )
+                            TonalFilterChip(
+                                label = "System",
+                                selected = showSystem,
+                                onClick = { showSystem = !showSystem },
+                                isToggle = true,
+                            )
+                        }
+                    }
+
+                    Spacer(Modifier.height(6.dp))
+                } else {
+                    Spacer(Modifier.height(12.dp))
+
+                    // Apple Large Title header with conditional monochrome FloatingGlassIconButton
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 44.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Text(
+                            text = "Apps",
+                            style = VdpiTextStyles.pageTitle,
+                            color = palette.inkPrimary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
+                        )
+
+                        AnimatedVisibility(
+                            visible = settings.splitPackages.isNotEmpty(),
+                            enter = fadeIn(tween(180)) + scaleIn(initialScale = 0.84f, animationSpec = tween(180)),
+                            exit = fadeOut(tween(140)) + scaleOut(targetScale = 0.84f, animationSpec = tween(140)),
+                        ) {
+                            FloatingGlassIconButton(
+                                onClick = onClearPackages,
+                                contentDescription = "Reset selected apps",
+                                size = 42.dp,
+                            ) {
+                                ResetSelectionGlyph(tint = palette.inkPrimary)
+                            }
+                        }
+                    }
+
+                    Spacer(Modifier.height(12.dp))
+
+                    // Mode picker: clean Apple Segmented Control
+                    SegmentedControl(
+                        options = SplitTunnelMode.entries,
+                        selected = settings.splitTunnelMode,
+                        labelFor = { mode ->
+                            when (mode) {
+                                SplitTunnelMode.BYPASS_SELECTED -> "Bypass Selected"
+                                SplitTunnelMode.ONLY_SELECTED -> "Only Selected"
+                            }
+                        },
+                        onSelect = onSetSplitMode,
+                    )
+
+                    // 1-line SectionFooter-style muted explanation
+                    AnimatedContent(
+                        targetState = settings.splitTunnelMode,
+                        transitionSpec = { fadeIn(tween(160)) togetherWith fadeOut(tween(120)) },
+                        label = "splitModeSummary",
+                    ) { mode ->
+                        SectionFooter(
+                            text = when (mode) {
+                                SplitTunnelMode.BYPASS_SELECTED ->
+                                    "Selected apps connect directly without DPI bypass."
+                                SplitTunnelMode.ONLY_SELECTED ->
+                                    "Only selected apps route through vdpi."
+                            },
+                        )
+                    }
+
+                    Spacer(Modifier.height(16.dp))
+
+                    // Borderless Apple-style search field
+                    AppleSearchField(
+                        query = query,
+                        onQueryChange = { query = it },
+                        onSearch = { focusManager.clearFocus() },
+                        onClear = {
+                            query = ""
+                            focusManager.clearFocus()
+                        },
+                    )
+
+                    Spacer(Modifier.height(6.dp))
+
+                    // Compact inline tonal filter chips (zero glass on content)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        TonalFilterChip(
+                            label = "All",
+                            selected = activeFilter == AppFilter.ALL,
+                            onClick = { activeFilter = AppFilter.ALL },
+                        )
+                        TonalFilterChip(
+                            label = if (selectedCount > 0) "Selected ($selectedCount)" else "Selected",
+                            selected = activeFilter == AppFilter.SELECTED,
+                            onClick = { activeFilter = AppFilter.SELECTED },
+                        )
+                        TonalFilterChip(
+                            label = "System",
+                            selected = showSystem,
+                            onClick = { showSystem = !showSystem },
+                            isToggle = true,
+                        )
+                    }
+
+                    Spacer(Modifier.height(6.dp))
+                }
+            }
+
+            if (loading && apps.isEmpty()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                        .padding(horizontal = 16.dp)
+                        .padding(top = 4.dp, bottom = bottomChromePadding),
+                    contentAlignment = Alignment.TopCenter,
+                ) {
+                    InsetGroupedCard(
+                        modifier = Modifier.fillMaxWidth(),
+                        radius = 16.dp,
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 24.dp, vertical = 28.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(22.dp),
+                                strokeWidth = 2.dp,
+                                color = palette.inkSecondary,
+                            )
+                            Text(
+                                text = "Loading installed apps",
+                                style = VdpiTextStyles.body,
+                                color = palette.inkSecondary,
                             )
                         }
                     }
                 }
-            }
-        } else {
-            val lastIndex = filtered.lastIndex
-            LazyColumn(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f),
-                contentPadding = PaddingValues(
-                    start = 16.dp,
-                    end = 16.dp,
-                    top = 4.dp,
-                    bottom = bottomChromePadding,
-                ),
-                verticalArrangement = Arrangement.spacedBy(0.dp),
-            ) {
-                itemsIndexed(
-                    items = filtered,
-                    key = { _, app -> app.packageName },
-                ) { index, app ->
-                    val selected = app.packageName in settings.splitPackages
-                    val rowShape = when {
-                        lastIndex == 0 -> SingleRowShape
-                        index == 0 -> FirstRowShape
-                        index == lastIndex -> LastRowShape
-                        else -> RectangleShape
+            } else if (filtered.isEmpty()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                        .padding(horizontal = 16.dp)
+                        .padding(top = 4.dp, bottom = bottomChromePadding),
+                    contentAlignment = Alignment.TopCenter,
+                ) {
+                    InsetGroupedCard(
+                        modifier = Modifier.fillMaxWidth(),
+                        radius = 16.dp,
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 24.dp, vertical = 28.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            Text(
+                                text = when {
+                                    activeFilter == AppFilter.SELECTED -> "No Apps Selected"
+                                    query.isNotBlank() -> "No Matching Apps"
+                                    else -> "No Apps Available"
+                                },
+                                style = VdpiTextStyles.rowTitle.copy(fontWeight = FontWeight.Medium),
+                                color = palette.inkPrimary,
+                                textAlign = TextAlign.Center,
+                            )
+                            Text(
+                                text = when {
+                                    activeFilter == AppFilter.SELECTED ->
+                                        "Switch to All and toggle any app to include it."
+                                    query.isNotBlank() ->
+                                        "Try another app name or package identifier."
+                                    else ->
+                                        "Enable System to inspect system packages."
+                                },
+                                style = VdpiTextStyles.caption,
+                                color = palette.inkSecondary,
+                                textAlign = TextAlign.Center,
+                            )
+                            if (query.isNotBlank()) {
+                                Spacer(Modifier.height(6.dp))
+                                GhostActionButton(
+                                    label = "Clear Search",
+                                    onClick = {
+                                        query = ""
+                                        focusManager.clearFocus()
+                                    },
+                                )
+                            }
+                        }
                     }
-                    GroupedAppRow(
-                        item = app,
-                        selected = selected,
-                        shape = rowShape,
-                        showDivider = index < lastIndex,
-                        onToggle = { onTogglePackage(app.packageName) },
-                        modifier = Modifier.animateItem(),
-                    )
+                }
+            } else {
+                val lastIndex = filtered.lastIndex
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f),
+                    contentPadding = PaddingValues(
+                        start = 16.dp,
+                        end = 16.dp,
+                        top = 4.dp,
+                        bottom = bottomChromePadding,
+                    ),
+                    verticalArrangement = Arrangement.spacedBy(0.dp),
+                ) {
+                    itemsIndexed(
+                        items = filtered,
+                        key = { _, app -> app.packageName },
+                    ) { index, app ->
+                        val selected = app.packageName in settings.splitPackages
+                        val rowShape = when {
+                            lastIndex == 0 -> SingleRowShape
+                            index == 0 -> FirstRowShape
+                            index == lastIndex -> LastRowShape
+                            else -> RectangleShape
+                        }
+                        GroupedAppRow(
+                            item = app,
+                            selected = selected,
+                            shape = rowShape,
+                            showDivider = index < lastIndex,
+                            onToggle = { onTogglePackage(app.packageName) },
+                            modifier = Modifier.animateItem(),
+                        )
+                    }
                 }
             }
         }
@@ -488,6 +594,7 @@ private fun TonalFilterChip(
     label: String,
     selected: Boolean,
     onClick: () -> Unit,
+    isToggle: Boolean = false,
 ) {
     val palette = VdpiThemeTokens.palette
     val haptic = LocalHapticFeedback.current
@@ -504,17 +611,35 @@ private fun TonalFilterChip(
         label = "filterChipText",
     )
 
-    Box(
-        modifier = Modifier
-            .heightIn(min = 44.dp)
-            .clickable(
-                interactionSource = interaction,
-                indication = null,
-                role = Role.Tab,
-            ) {
+    val selectionModifier = if (isToggle) {
+        Modifier.toggleable(
+            value = selected,
+            interactionSource = interaction,
+            indication = null,
+            role = Role.Checkbox,
+            onValueChange = {
                 haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                 onClick()
             },
+        )
+    } else {
+        Modifier.selectable(
+            selected = selected,
+            interactionSource = interaction,
+            indication = null,
+            role = Role.Tab,
+            onClick = {
+                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                onClick()
+            },
+        )
+    }
+
+    Box(
+        modifier = Modifier
+            .heightIn(min = 44.dp)
+            .widthIn(min = 44.dp)
+            .then(selectionModifier),
         contentAlignment = Alignment.Center,
     ) {
         Box(
@@ -619,7 +744,6 @@ private fun GroupedAppRow(
             PrecisionSwitch(
                 checked = selected,
                 onCheckedChange = null,
-                useSignalAccent = true,
             )
         }
 

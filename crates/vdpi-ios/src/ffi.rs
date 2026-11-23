@@ -2,8 +2,10 @@ use crate::{
     clear_engine_cache, engine_version, push_packet, run_doctor_json, snapshot_json, start_tunnel,
     stop_tunnel, IosConfig, PacketCallback, WritePacketFn,
 };
-use std::ffi::{c_char, c_void, CStr, CString};
+use std::ffi::{c_char, c_void, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+
+const MAX_CONFIG_JSON_BYTES: usize = 256 * 1024;
 
 fn into_c_string(value: impl Into<String>) -> *mut c_char {
     let sanitized = value.into().replace('\0', " ");
@@ -12,17 +14,35 @@ fn into_c_string(value: impl Into<String>) -> *mut c_char {
         .unwrap_or(std::ptr::null_mut())
 }
 
-unsafe fn read_c_str(ptr: *const c_char) -> String {
+/// Reads a NUL-terminated UTF-8 config string from `ptr`, scanning at most
+/// `MAX_CONFIG_JSON_BYTES` bytes so malformed or unterminated pointers cannot trigger
+/// an unbounded `CStr::from_ptr` scan.
+///
+/// Returns `Ok("")` when `ptr` is NULL.
+///
+/// # Safety
+/// - `ptr` must be NULL or point to readable bytes up to the first NUL terminator or
+///   `MAX_CONFIG_JSON_BYTES + 1` bytes, whichever comes first.
+unsafe fn read_bounded_config_json<'a>(ptr: *const c_char) -> Result<&'a str, &'static str> {
     if ptr.is_null() {
-        return String::new();
+        return Ok("");
     }
-    CStr::from_ptr(ptr).to_string_lossy().into_owned()
+    let bytes = ptr.cast::<u8>();
+    let mut len = 0usize;
+    while len <= MAX_CONFIG_JSON_BYTES {
+        if *bytes.add(len) == 0 {
+            let slice = std::slice::from_raw_parts(bytes, len);
+            return std::str::from_utf8(slice).map_err(|_| "config JSON is not valid UTF-8");
+        }
+        len += 1;
+    }
+    Err("config JSON exceeds 256 KiB limit or is not NUL-terminated")
 }
 
 /// Starts the iOS TUN engine. Returns NULL on success, or an owned error string on failure.
 ///
 /// # Safety
-/// - `config_json` may be NULL or a valid NUL-terminated UTF-8 C string.
+/// - `config_json` may be NULL or a valid NUL-terminated UTF-8 C string (<= 256 KiB).
 /// - `write_cb` must be a valid function pointer safe to invoke from background threads.
 /// - `user_ctx` must remain valid until `vdpi_ios_stop()` returns.
 #[no_mangle]
@@ -35,8 +55,11 @@ pub unsafe extern "C" fn vdpi_ios_start(
         let Some(func) = write_cb else {
             return Some("missing write_cb packet callback".to_string());
         };
-        let raw_cfg = read_c_str(config_json);
-        let cfg = match IosConfig::from_json_str(&raw_cfg) {
+        let raw_cfg = match read_bounded_config_json(config_json) {
+            Ok(s) => s,
+            Err(msg) => return Some(msg.to_string()),
+        };
+        let cfg = match IosConfig::from_json_str(raw_cfg) {
             Ok(c) => c,
             Err(e) => return Some(format!("invalid config JSON: {e}")),
         };
@@ -90,12 +113,15 @@ pub extern "C" fn vdpi_ios_snapshot_json() -> *mut c_char {
 /// Runs live DoH and rustls TLS 1.3/1.2 diagnostics and returns a JSON report string.
 ///
 /// # Safety
-/// - `config_json` may be NULL or a valid NUL-terminated UTF-8 C string.
+/// - `config_json` may be NULL or a valid NUL-terminated UTF-8 C string (<= 256 KiB).
 #[no_mangle]
 pub unsafe extern "C" fn vdpi_ios_run_doctor_json(config_json: *const c_char) -> *mut c_char {
     let payload = catch_unwind(AssertUnwindSafe(|| {
-        let raw_cfg = read_c_str(config_json);
-        run_doctor_json(&raw_cfg)
+        let raw_cfg = match read_bounded_config_json(config_json) {
+            Ok(s) => s,
+            Err(_) => return r#"{"ok":false,"checks":[]}"#.to_string(),
+        };
+        run_doctor_json(raw_cfg)
     }))
     .unwrap_or_else(|_| r#"{"ok":false,"checks":[]}"#.to_string());
     into_c_string(payload)
@@ -125,6 +151,7 @@ pub unsafe extern "C" fn vdpi_ios_string_free(ptr: *mut c_char) {
 mod tests {
     use super::*;
     use etherparse::{PacketBuilder, SlicedPacket, TransportSlice};
+    use std::ffi::CStr;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
@@ -236,5 +263,50 @@ mod tests {
             serde_json::from_str(&take_owned_c_string(vdpi_ios_snapshot_json())).unwrap();
         assert_eq!(stopped_snap["running"], serde_json::Value::Bool(false));
         assert!(!unsafe { vdpi_ios_push_packet(pkt.as_ptr(), pkt.len()) });
+    }
+
+    #[test]
+    fn bounded_config_json_reader_rejects_oversized_unterminated_and_invalid_utf8() {
+        // NULL pointer maps to empty default config string.
+        assert_eq!(unsafe { read_bounded_config_json(std::ptr::null()) }, Ok(""));
+
+        // Valid NUL-terminated UTF-8 JSON succeeds.
+        let valid = CString::new(r#"{"mtu":1400}"#).unwrap();
+        assert_eq!(
+            unsafe { read_bounded_config_json(valid.as_ptr()) },
+            Ok(r#"{"mtu":1400}"#)
+        );
+
+        // Exact cap (256 KiB) followed by NUL terminator succeeds.
+        let mut exact = vec![b' '; MAX_CONFIG_JSON_BYTES];
+        exact.push(0);
+        let exact_res = unsafe { read_bounded_config_json(exact.as_ptr().cast::<c_char>()) };
+        assert_eq!(exact_res.map(str::len), Ok(MAX_CONFIG_JSON_BYTES));
+
+        // Buffer without a NUL byte within MAX_CONFIG_JSON_BYTES fails without scanning further.
+        let oversized = vec![b'a'; MAX_CONFIG_JSON_BYTES + 16];
+        let over_err = unsafe { read_bounded_config_json(oversized.as_ptr().cast::<c_char>()) };
+        assert!(over_err.is_err());
+
+        // Invalid UTF-8 bytes fail cleanly.
+        let bad_utf8: [u8; 3] = [0xff, 0xfe, 0x00];
+        let utf8_err = unsafe { read_bounded_config_json(bad_utf8.as_ptr().cast::<c_char>()) };
+        assert!(utf8_err.is_err());
+
+        // Public FFI entrypoints reject oversized pointers cleanly.
+        let start_err = unsafe {
+            vdpi_ios_start(
+                oversized.as_ptr().cast::<c_char>(),
+                Some(capture_cb),
+                std::ptr::null_mut(),
+            )
+        };
+        let start_msg = take_owned_c_string(start_err);
+        assert!(start_msg.contains("256 KiB"));
+
+        let doctor_resp = take_owned_c_string(unsafe {
+            vdpi_ios_run_doctor_json(oversized.as_ptr().cast::<c_char>())
+        });
+        assert_eq!(doctor_resp, r#"{"ok":false,"checks":[]}"#);
     }
 }

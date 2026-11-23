@@ -6,6 +6,7 @@ import android.app.UiModeManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.graphics.Color as AndroidColor
 import android.net.VpnService
 import android.os.Build
@@ -30,10 +31,8 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
-import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.Canvas
@@ -50,6 +49,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
@@ -60,7 +60,9 @@ import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.union
@@ -92,7 +94,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
@@ -110,9 +111,11 @@ import androidx.compose.ui.graphics.rememberGraphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.util.VelocityTracker
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -122,6 +125,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -133,6 +137,7 @@ import com.vulninc.vdpi.ui.VdpiViewModel
 import com.vulninc.vdpi.ui.components.LocalBottomChromePadding
 import com.vulninc.vdpi.ui.components.LocalGlassBackdropLayer
 import com.vulninc.vdpi.ui.components.LocalIncreaseContrast
+import com.vulninc.vdpi.ui.components.LocalReduceMotion
 import com.vulninc.vdpi.ui.components.LocalReduceTransparency
 import com.vulninc.vdpi.ui.components.LocalTopOverlayPadding
 import com.vulninc.vdpi.ui.components.MinimalSnackbarHost
@@ -157,8 +162,11 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import java.util.Locale
+import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.cos
 import kotlin.math.roundToInt
+import kotlin.math.sin
 
 private enum class MainTab(val label: String, val icon: TabIconKind) {
     TUNNEL("Tunnel", TabIconKind.TUNNEL),
@@ -292,20 +300,31 @@ class MainActivity : ComponentActivity() {
 
                 var activeTab by rememberSaveable { mutableStateOf(MainTab.TUNNEL) }
                 val saveableStateHolder = rememberSaveableStateHolder()
-                val backdropLayer = rememberGraphicsLayer()
 
                 val showReconnectPopup = reconnectPopupVisible &&
                     (tunnelPhase == TunnelPhase.CONNECTED || tunnelPhase == TunnelPhase.CONNECTING)
                 val showLiveAccessoryPill = activeTab != MainTab.TUNNEL && tunnelPhase != TunnelPhase.DISCONNECTED
 
+                val configuration = LocalConfiguration.current
+                val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE &&
+                    configuration.screenWidthDp >= 560
+
                 val density = LocalDensity.current
                 val imeBottomInset = with(density) { WindowInsets.ime.getBottom(this).toDp() }
                 val isImeVisible = imeBottomInset > 0.dp
                 val navBarBottomInset = with(density) { WindowInsets.navigationBars.getBottom(this).toDp() }
-                val tabBarBottomOffset = maxOf(navBarBottomInset + 10.dp, 14.dp)
+                val tabBarBottomOffset = if (isLandscape) {
+                    maxOf(navBarBottomInset + 6.dp, 8.dp)
+                } else {
+                    maxOf(navBarBottomInset + 10.dp, 14.dp)
+                }
 
                 val topOverlayPadding by animateDpAsState(
-                    targetValue = if (showReconnectPopup) 74.dp else 0.dp,
+                    targetValue = when {
+                        !showReconnectPopup -> 0.dp
+                        isLandscape -> 64.dp
+                        else -> 84.dp
+                    },
                     animationSpec = if (chromeA11y.reduceMotion) {
                         tween(150)
                     } else {
@@ -314,7 +333,11 @@ class MainActivity : ComponentActivity() {
                     label = "topOverlayPadding",
                 )
                 val bottomChromePadding by animateDpAsState(
-                    targetValue = tabBarBottomOffset + if (showLiveAccessoryPill) 136.dp else 78.dp,
+                    targetValue = tabBarBottomOffset + if (isLandscape) {
+                        if (showLiveAccessoryPill) 114.dp else 64.dp
+                    } else {
+                        if (showLiveAccessoryPill) 136.dp else 78.dp
+                    },
                     animationSpec = if (chromeA11y.reduceMotion) {
                         tween(150)
                     } else {
@@ -322,23 +345,17 @@ class MainActivity : ComponentActivity() {
                     },
                     label = "bottomChromePadding",
                 )
-                val scrollEdgeScrimHeight by animateDpAsState(
-                    targetValue = (tabBarBottomOffset + if (showLiveAccessoryPill) 148.dp else 90.dp)
-                        .coerceAtLeast(96.dp),
-                    animationSpec = if (chromeA11y.reduceMotion) {
-                        tween(150)
-                    } else {
-                        spring(dampingRatio = 0.84f, stiffness = 310f)
-                    },
-                    label = "scrollEdgeScrimHeight",
-                )
+                val scrollEdgeScrimHeight = bottomChromePadding + 28.dp
                 val scrimAlpha by animateFloatAsState(
                     targetValue = if (isImeVisible) 0f else 1f,
                     animationSpec = tween(150),
                     label = "scrollEdgeScrimAlpha",
                 )
                 val snackbarDockClearance by animateDpAsState(
-                    targetValue = tabBarBottomOffset + 62.dp + (if (showLiveAccessoryPill) 58.dp else 0.dp) + 8.dp,
+                    targetValue = tabBarBottomOffset +
+                        (if (isLandscape) 50.dp else 62.dp) +
+                        (if (showLiveAccessoryPill) (if (isLandscape) 50.dp else 58.dp) else 0.dp) +
+                        8.dp,
                     animationSpec = if (chromeA11y.reduceMotion) {
                         tween(150)
                     } else {
@@ -352,8 +369,9 @@ class MainActivity : ComponentActivity() {
                     snackbarDockClearance
                 }
 
-                val sharedBackdropLayer = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !chromeA11y.reduceTransparency) {
-                    backdropLayer
+                val useBackdropBlur = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !chromeA11y.reduceTransparency
+                val sharedBackdropLayer = if (useBackdropBlur) {
+                    rememberGraphicsLayer()
                 } else {
                     null
                 }
@@ -362,25 +380,27 @@ class MainActivity : ComponentActivity() {
                     LocalGlassBackdropLayer provides sharedBackdropLayer,
                     LocalBottomChromePadding provides bottomChromePadding,
                     LocalTopOverlayPadding provides topOverlayPadding,
+                    LocalReduceMotion provides chromeA11y.reduceMotion,
                     LocalReduceTransparency provides chromeA11y.reduceTransparency,
                     LocalIncreaseContrast provides chromeA11y.increaseContrast,
                 ) {
                     Box(modifier = Modifier.fillMaxSize()) {
                         // Z0: Full-bleed Content Layer on clean solid canvas (recorded into backdropLayer on API 31+).
                         // Override LocalGlassBackdropLayer to null inside recorded content so zero feedback loops occur.
+                        val contentBackdropModifier = if (sharedBackdropLayer != null) {
+                            Modifier.drawWithContent {
+                                sharedBackdropLayer.record {
+                                    this@drawWithContent.drawContent()
+                                }
+                                drawLayer(sharedBackdropLayer)
+                            }
+                        } else {
+                            Modifier
+                        }
                         Box(
                             modifier = Modifier
                                 .fillMaxSize()
-                                .drawWithContent {
-                                    if (sharedBackdropLayer != null) {
-                                        sharedBackdropLayer.record {
-                                            this@drawWithContent.drawContent()
-                                        }
-                                        drawLayer(sharedBackdropLayer)
-                                    } else {
-                                        drawContent()
-                                    }
-                                },
+                                .then(contentBackdropModifier),
                         ) {
                             CompositionLocalProvider(LocalGlassBackdropLayer provides null) {
                                 Box(
@@ -456,8 +476,14 @@ class MainActivity : ComponentActivity() {
                                                         }
                                                     },
                                                     onClearCache = {
-                                                        viewModel.clearNativeCache {
-                                                            showNotice("Adaptive cache cleared")
+                                                        viewModel.clearNativeCache { cleared ->
+                                                            showNotice(
+                                                                if (cleared) {
+                                                                    "Adaptive cache cleared"
+                                                                } else {
+                                                                    "Cache resets when disconnected"
+                                                                },
+                                                            )
                                                         }
                                                     },
                                                 )
@@ -488,7 +514,7 @@ class MainActivity : ComponentActivity() {
                             modifier = Modifier
                                 .align(Alignment.BottomCenter)
                                 .fillMaxWidth()
-                                .padding(horizontal = 16.dp)
+                                .padding(horizontal = 28.dp)
                                 .padding(bottom = tabBarBottomOffset),
                             enter = if (chromeA11y.reduceMotion) {
                                 fadeIn(tween(150))
@@ -511,27 +537,30 @@ class MainActivity : ComponentActivity() {
                                         fadeIn(tween(150))
                                     } else {
                                         slideInVertically(tween(220)) { pillSlidePx } +
-                                            fadeIn(tween(220)) +
-                                            expandVertically(tween(220), expandFrom = Alignment.Bottom)
+                                            fadeIn(tween(220))
                                     },
                                     exit = if (chromeA11y.reduceMotion) {
                                         fadeOut(tween(150))
                                     } else {
                                         slideOutVertically(tween(220)) { pillSlidePx } +
-                                            fadeOut(tween(220)) +
-                                            shrinkVertically(tween(220), shrinkTowards = Alignment.Bottom)
+                                            fadeOut(tween(220))
                                     },
                                 ) {
-                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Column(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalAlignment = Alignment.CenterHorizontally,
+                                    ) {
                                         FloatingLiveTunnelAccessoryPill(
                                             tunnelState = viewModel.tunnelState,
+                                            isLandscape = isLandscape,
                                             reduceMotion = chromeA11y.reduceMotion,
                                             reduceTransparency = chromeA11y.reduceTransparency,
                                             increaseContrast = chromeA11y.increaseContrast,
                                             onOpenTunnel = { activeTab = MainTab.TUNNEL },
                                             onDisconnect = ::disconnectTunnel,
+                                            onReconnect = ::requestConnect,
                                         )
-                                        Spacer(Modifier.height(8.dp))
+                                        Spacer(Modifier.height(if (isLandscape) 6.dp else 8.dp))
                                     }
                                 }
 
@@ -539,6 +568,7 @@ class MainActivity : ComponentActivity() {
                                     activeTab = activeTab,
                                     tunnelPhase = tunnelPhase,
                                     pendingReconnect = pendingReconnect,
+                                    isLandscape = isLandscape,
                                     reduceMotion = chromeA11y.reduceMotion,
                                     reduceTransparency = chromeA11y.reduceTransparency,
                                     increaseContrast = chromeA11y.increaseContrast,
@@ -558,6 +588,8 @@ class MainActivity : ComponentActivity() {
                             hostState = snackbarHostState,
                             modifier = Modifier
                                 .align(Alignment.BottomCenter)
+                                .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal))
+                                .widthIn(max = 520.dp)
                                 .padding(bottom = snackbarBottomOffset),
                         )
 
@@ -566,9 +598,15 @@ class MainActivity : ComponentActivity() {
                         Box(
                             modifier = Modifier
                                 .align(Alignment.TopCenter)
-                                .windowInsetsPadding(WindowInsets.statusBars.union(WindowInsets.displayCutout))
+                                .fillMaxWidth()
+                                .windowInsetsPadding(
+                                    WindowInsets.statusBars
+                                        .union(WindowInsets.displayCutout)
+                                        .only(WindowInsetsSides.Top),
+                                )
                                 .padding(horizontal = 16.dp)
-                                .padding(top = 8.dp),
+                                .padding(top = if (isLandscape) 4.dp else 8.dp),
+                            contentAlignment = Alignment.TopCenter,
                         ) {
                             AnimatedVisibility(
                                 visible = showReconnectPopup,
@@ -587,6 +625,7 @@ class MainActivity : ComponentActivity() {
                             ) {
                                 TopReconnectGlassPopup(
                                     pendingChangeSummary = pendingChangeSummary,
+                                    isLandscape = isLandscape,
                                     reduceMotion = chromeA11y.reduceMotion,
                                     reduceTransparency = chromeA11y.reduceTransparency,
                                     increaseContrast = chromeA11y.increaseContrast,
@@ -630,7 +669,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun triggerReconnect() {
-        viewModel.clearPendingReconnect()
+        viewModel.resetForExplicitReconnect()
         if (VpnService.prepare(this) != null) {
             requestConnect()
         } else {
@@ -754,6 +793,7 @@ private fun Modifier.chromeGlassSurface(
 @Composable
 private fun TopReconnectGlassPopup(
     pendingChangeSummary: String,
+    isLandscape: Boolean,
     reduceMotion: Boolean,
     reduceTransparency: Boolean,
     increaseContrast: Boolean,
@@ -785,9 +825,10 @@ private fun TopReconnectGlassPopup(
 
     Box(
         modifier = modifier
+            .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal))
+            .widthIn(max = if (isLandscape) 460.dp else 520.dp)
             .fillMaxWidth()
-            .widthIn(max = 420.dp)
-            .heightIn(min = 56.dp)
+            .heightIn(min = if (isLandscape) 48.dp else 56.dp)
             .semantics {
                 customActions = listOf(
                     CustomAccessibilityAction(label = "Dismiss") {
@@ -819,6 +860,7 @@ private fun TopReconnectGlassPopup(
                         dragOffsetY = 0f
                     },
                     onVerticalDrag = { change, dragAmount ->
+                        change.consume()
                         totalDrag += dragAmount
                         velocityTracker.addPosition(change.uptimeMillis, Offset(0f, totalDrag))
                         dragOffsetY = if (totalDrag < 0f) {
@@ -837,10 +879,11 @@ private fun TopReconnectGlassPopup(
             ),
         contentAlignment = Alignment.Center,
     ) {
+        val verticalPadding = if (isLandscape) 2.dp else 6.dp
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(start = 14.dp, end = 2.dp, top = 6.dp, bottom = 6.dp),
+                .padding(start = 14.dp, end = 2.dp, top = verticalPadding, bottom = verticalPadding),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Box(
@@ -988,11 +1031,13 @@ private fun TopReconnectGlassPopup(
 @Composable
 private fun FloatingLiveTunnelAccessoryPill(
     tunnelState: StateFlow<TunnelRuntimeSnapshot>,
+    isLandscape: Boolean,
     reduceMotion: Boolean,
     reduceTransparency: Boolean,
     increaseContrast: Boolean,
     onOpenTunnel: () -> Unit,
     onDisconnect: () -> Unit,
+    onReconnect: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     // Scoped locally so 1Hz telemetry ticks never recompose MainActivity, AppsScreen, or SettingsScreen.
@@ -1000,9 +1045,10 @@ private fun FloatingLiveTunnelAccessoryPill(
     val palette = VdpiThemeTokens.palette
     val haptic = LocalHapticFeedback.current
     val pillInteraction = remember { MutableInteractionSource() }
-    val stopInteraction = remember { MutableInteractionSource() }
+    val actionInteraction = remember { MutableInteractionSource() }
 
     val phase = runtime.phase
+    val isError = phase == TunnelPhase.ERROR
     val snap = runtime.telemetry
 
     val dotColor by animateColorAsState(
@@ -1041,11 +1087,15 @@ private fun FloatingLiveTunnelAccessoryPill(
     }
     val metricColor = palette.inkPrimary.copy(alpha = 0.65f)
 
+    val pillMinHeight = if (isLandscape) 44.dp else 50.dp
+    val pillVerticalPadding = if (isLandscape) 4.dp else 6.dp
+
     Box(
         modifier = modifier
+            .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal))
+            .widthIn(max = if (isLandscape) 360.dp else 420.dp)
             .fillMaxWidth()
-            .widthIn(max = 340.dp)
-            .heightIn(min = 50.dp)
+            .heightIn(min = pillMinHeight)
             .chromeGlassSurface(
                 reduceTransparency = reduceTransparency,
                 increaseContrast = increaseContrast,
@@ -1060,7 +1110,7 @@ private fun FloatingLiveTunnelAccessoryPill(
             Row(
                 modifier = Modifier
                     .weight(1f)
-                    .heightIn(min = 50.dp)
+                    .heightIn(min = pillMinHeight)
                     .clickable(
                         interactionSource = pillInteraction,
                         indication = null,
@@ -1069,7 +1119,7 @@ private fun FloatingLiveTunnelAccessoryPill(
                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         onOpenTunnel()
                     }
-                    .padding(start = 14.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
+                    .padding(start = 14.dp, end = 6.dp, top = pillVerticalPadding, bottom = pillVerticalPadding),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 CalmStatusDot(
@@ -1134,14 +1184,20 @@ private fun FloatingLiveTunnelAccessoryPill(
                     .padding(end = 3.dp)
                     .size(44.dp)
                     .clickable(
-                        interactionSource = stopInteraction,
+                        interactionSource = actionInteraction,
                         indication = null,
                         role = Role.Button,
                     ) {
                         haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                        onDisconnect()
+                        if (isError) {
+                            onReconnect()
+                        } else {
+                            onDisconnect()
+                        }
                     }
-                    .semantics { contentDescription = "Disconnect tunnel" },
+                    .semantics {
+                        contentDescription = if (isError) "Reconnect tunnel" else "Disconnect tunnel"
+                    },
                 contentAlignment = Alignment.Center,
             ) {
                 val buttonFill = if (palette.isDark) {
@@ -1156,17 +1212,24 @@ private fun FloatingLiveTunnelAccessoryPill(
                             if (reduceMotion) {
                                 Modifier
                             } else {
-                                Modifier.springPress(interactionSource = stopInteraction, pressedScale = 0.92f)
+                                Modifier.springPress(interactionSource = actionInteraction, pressedScale = 0.92f)
                             },
                         )
                         .clip(CircleShape)
                         .background(buttonFill),
                     contentAlignment = Alignment.Center,
                 ) {
-                    PowerGlyph(
-                        tint = palette.inkPrimary,
-                        modifier = Modifier.size(15.dp),
-                    )
+                    if (isError) {
+                        RefreshGlyph(
+                            tint = palette.inkPrimary,
+                            modifier = Modifier.size(15.dp),
+                        )
+                    } else {
+                        PowerGlyph(
+                            tint = palette.inkPrimary,
+                            modifier = Modifier.size(15.dp),
+                        )
+                    }
                 }
             }
         }
@@ -1178,6 +1241,7 @@ private fun FloatingLiquidGlassTabBar(
     activeTab: MainTab,
     tunnelPhase: TunnelPhase,
     pendingReconnect: Boolean,
+    isLandscape: Boolean,
     reduceMotion: Boolean,
     reduceTransparency: Boolean,
     increaseContrast: Boolean,
@@ -1187,31 +1251,39 @@ private fun FloatingLiquidGlassTabBar(
     val palette = VdpiThemeTokens.palette
     val haptic = LocalHapticFeedback.current
     val density = LocalDensity.current
+    val isRtl = LocalLayoutDirection.current == LayoutDirection.Rtl
+    val effectiveReduceMotion = reduceMotion || LocalReduceMotion.current
     val tabs = MainTab.entries
     val selectedIndex = tabs.indexOf(activeTab).coerceAtLeast(0)
 
     val strongLensBorder = increaseContrast || reduceTransparency
-    val lensFill = when {
+    val lensTopColor = when {
         reduceTransparency -> palette.surfaceRaised
-        palette.isDark -> Color.White.copy(alpha = 0.14f)
-        else -> Color.White.copy(alpha = 0.74f)
+        palette.isDark -> Color.White.copy(alpha = 0.16f)
+        else -> Color.White.copy(alpha = 0.92f)
+    }
+    val lensBottomColor = when {
+        reduceTransparency -> palette.surfaceRaised
+        palette.isDark -> Color.White.copy(alpha = 0.07f)
+        else -> Color.White.copy(alpha = 0.78f)
     }
     val lensBorderWidth = if (strongLensBorder) 1.dp else 0.5.dp
     val lensRimColor = when {
         strongLensBorder -> palette.borderStrong
-        palette.isDark -> Color.White.copy(alpha = 0.26f)
-        else -> Color.Black.copy(alpha = 0.06f)
+        palette.isDark -> Color.White.copy(alpha = 0.28f)
+        else -> Color.Black.copy(alpha = 0.07f)
     }
-    val lensShadowColor = Color.Black.copy(alpha = 0.08f)
+    val lensShadowColor = Color.Black.copy(alpha = if (palette.isDark) 0.16f else 0.09f)
 
     val currentActiveTab by rememberUpdatedState(activeTab)
     val currentOnSelect by rememberUpdatedState(onSelect)
 
     Box(
         modifier = modifier
+            .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal))
+            .widthIn(max = if (isLandscape) 360.dp else 420.dp)
             .fillMaxWidth()
-            .widthIn(max = 340.dp)
-            .height(62.dp)
+            .height(if (isLandscape) 50.dp else 62.dp)
             .chromeGlassSurface(
                 reduceTransparency = reduceTransparency,
                 increaseContrast = increaseContrast,
@@ -1222,7 +1294,7 @@ private fun FloatingLiquidGlassTabBar(
         BoxWithConstraints(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(5.dp),
+                .padding(if (isLandscape) 3.dp else 4.dp),
         ) {
             val tabWidth = maxWidth / tabs.size
             val tabHeight = maxHeight
@@ -1230,35 +1302,48 @@ private fun FloatingLiquidGlassTabBar(
             val maxLensOffsetPx = (tabWidthPx * (tabs.size - 1)).coerceAtLeast(0f)
 
             var dragLensOffsetPx by remember { mutableFloatStateOf(Float.NaN) }
+            val isDragging = !dragLensOffsetPx.isNaN()
             val targetOffset = tabWidth * selectedIndex
             val animatedLensOffset by animateDpAsState(
                 targetValue = targetOffset,
-                animationSpec = if (reduceMotion) tween(150) else VdpiMotion.tabLensSpring,
+                animationSpec = if (effectiveReduceMotion) tween(150) else VdpiMotion.tabLensSpring,
                 label = "tabLensOffset",
             )
-            val effectiveLensOffset = if (!dragLensOffsetPx.isNaN()) {
+            val effectiveLensOffset = if (isDragging) {
                 with(density) { dragLensOffsetPx.toDp() }
             } else {
                 animatedLensOffset
             }
 
-            val travelFraction = if (!reduceMotion && dragLensOffsetPx.isNaN() && tabWidth.value > 0f) {
+            val dragScaleX by animateFloatAsState(
+                targetValue = if (isDragging && !effectiveReduceMotion) 1.07f else 1f,
+                animationSpec = spring(dampingRatio = 0.72f, stiffness = 420f),
+                label = "tabLensDragScaleX",
+            )
+            val dragScaleY by animateFloatAsState(
+                targetValue = if (isDragging && !effectiveReduceMotion) 1.05f else 1f,
+                animationSpec = spring(dampingRatio = 0.72f, stiffness = 420f),
+                label = "tabLensDragScaleY",
+            )
+
+            val travelFraction = if (!effectiveReduceMotion && !isDragging && tabWidth.value > 0f) {
                 (abs(animatedLensOffset.value - targetOffset.value) / tabWidth.value).coerceIn(0f, 1f)
             } else {
                 0f
             }
-            val lensStretchX = 1f + travelFraction * 0.08f
-            val lensSquashY = 1f - travelFraction * 0.03f
+            val lensStretchX = dragScaleX * (1f + travelFraction * 0.06f)
+            val lensSquashY = dragScaleY * (1f - travelFraction * 0.02f)
 
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .pointerInput(tabs.size, tabWidthPx) {
+                    .pointerInput(tabs.size, tabWidthPx, isRtl) {
                         if (tabWidthPx <= 0f) return@pointerInput
                         detectHorizontalDragGestures(
                             onDragStart = { startOffset ->
-                                val clamped = (startOffset.x - tabWidthPx * 0.5f).coerceIn(0f, maxLensOffsetPx)
-                                dragLensOffsetPx = clamped
+                                val rawOffset = startOffset.x - tabWidthPx * 0.5f
+                                dragLensOffsetPx = (if (isRtl) maxLensOffsetPx - rawOffset else rawOffset)
+                                    .coerceIn(0f, maxLensOffsetPx)
                             },
                             onDragEnd = {
                                 dragLensOffsetPx = Float.NaN
@@ -1267,9 +1352,13 @@ private fun FloatingLiquidGlassTabBar(
                                 dragLensOffsetPx = Float.NaN
                             },
                             onHorizontalDrag = { change, _ ->
+                                change.consume()
                                 val x = change.position.x
-                                dragLensOffsetPx = (x - tabWidthPx * 0.5f).coerceIn(0f, maxLensOffsetPx)
-                                val hoveredIdx = (x / tabWidthPx).toInt().coerceIn(0, tabs.lastIndex)
+                                val rawOffset = x - tabWidthPx * 0.5f
+                                dragLensOffsetPx = (if (isRtl) maxLensOffsetPx - rawOffset else rawOffset)
+                                    .coerceIn(0f, maxLensOffsetPx)
+                                val rawIdx = (x / tabWidthPx).toInt().coerceIn(0, tabs.lastIndex)
+                                val hoveredIdx = if (isRtl) tabs.lastIndex - rawIdx else rawIdx
                                 val hoveredTab = tabs[hoveredIdx]
                                 if (hoveredTab != currentActiveTab) {
                                     haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
@@ -1279,7 +1368,19 @@ private fun FloatingLiquidGlassTabBar(
                         )
                     },
             ) {
-                // Sliding convex specular glass lens (52dp tall, 26dp concentric radius)
+                // Sliding Apple iOS 26 Liquid Glass puck lens
+                val lensShadowModifier = if (reduceTransparency) {
+                    Modifier
+                } else {
+                    Modifier.shadow(
+                        elevation = if (palette.isDark) 3.dp else 4.dp,
+                        shape = CircleShape,
+                        clip = false,
+                        ambientColor = lensShadowColor,
+                        spotColor = lensShadowColor,
+                    )
+                }
+
                 Box(
                     modifier = Modifier
                         .offset { IntOffset(effectiveLensOffset.roundToPx(), 0) }
@@ -1289,31 +1390,35 @@ private fun FloatingLiquidGlassTabBar(
                             scaleX = lensStretchX
                             scaleY = lensSquashY
                         }
-                        .then(
-                            if (reduceTransparency) {
-                                Modifier
-                            } else {
-                                Modifier.shadow(
-                                    elevation = 3.dp,
-                                    shape = CircleShape,
-                                    clip = false,
-                                    ambientColor = lensShadowColor,
-                                    spotColor = lensShadowColor,
-                                )
-                            },
-                        )
+                        .then(lensShadowModifier)
                         .clip(CircleShape)
-                        .background(lensFill)
-                        .drawBehind {
-                            if (!reduceTransparency) {
+                        .drawWithContent {
+                            if (reduceTransparency) {
+                                drawRect(color = palette.surfaceRaised)
+                            } else if (size.height > 0f) {
                                 drawRect(
                                     brush = Brush.verticalGradient(
-                                        0.00f to Color.White.copy(alpha = if (palette.isDark) 0.14f else 0.42f),
-                                        0.48f to Color.Transparent,
-                                        1.00f to Color.White.copy(alpha = if (palette.isDark) 0.03f else 0.14f),
+                                        colorStops = arrayOf(
+                                            0.00f to lensTopColor,
+                                            1.00f to lensBottomColor,
+                                        ),
+                                        startY = 0f,
+                                        endY = size.height,
+                                    ),
+                                )
+                                drawRect(
+                                    brush = Brush.verticalGradient(
+                                        colorStops = arrayOf(
+                                            0.00f to Color.White.copy(alpha = if (palette.isDark) 0.14f else 0.65f),
+                                            0.28f to Color.Transparent,
+                                            1.00f to Color.White.copy(alpha = if (palette.isDark) 0.04f else 0.18f),
+                                        ),
+                                        startY = 0f,
+                                        endY = size.height,
                                     ),
                                 )
                             }
+                            drawContent()
                         }
                         .border(width = lensBorderWidth, color = lensRimColor, shape = CircleShape),
                 )
@@ -1326,13 +1431,14 @@ private fun FloatingLiquidGlassTabBar(
                         val selected = tab == activeTab
                         val interactionSource = remember { MutableInteractionSource() }
                         val tint by animateColorAsState(
-                            targetValue = if (selected) {
-                                palette.accent
-                            } else {
-                                palette.inkPrimary.copy(alpha = 0.60f)
-                            },
-                            animationSpec = tween(if (reduceMotion) 150 else 180),
+                            targetValue = if (selected) palette.accent else palette.inkSecondary,
+                            animationSpec = tween(if (effectiveReduceMotion) 150 else 180),
                             label = "tabTint",
+                        )
+                        val iconScale by animateFloatAsState(
+                            targetValue = if (selected && !effectiveReduceMotion) 1.04f else 1f,
+                            animationSpec = spring(dampingRatio = 0.78f, stiffness = 460f),
+                            label = "tabIconScale",
                         )
 
                         val statusDotColor = if (tab == MainTab.TUNNEL && tunnelPhase == TunnelPhase.CONNECTED) {
@@ -1347,7 +1453,7 @@ private fun FloatingLiquidGlassTabBar(
                                 .fillMaxHeight()
                                 .clip(CircleShape)
                                 .then(
-                                    if (reduceMotion) {
+                                    if (effectiveReduceMotion) {
                                         Modifier
                                     } else {
                                         Modifier.springPress(interactionSource = interactionSource, pressedScale = 0.95f)
@@ -1367,36 +1473,85 @@ private fun FloatingLiquidGlassTabBar(
                                 ),
                             contentAlignment = Alignment.Center,
                         ) {
-                            Column(
-                                horizontalAlignment = Alignment.CenterHorizontally,
-                                verticalArrangement = Arrangement.Center,
-                            ) {
-                                Box(contentAlignment = Alignment.Center) {
-                                    MinimalTabIcon(
-                                        kind = tab.icon,
-                                        tint = tint,
-                                        filled = selected,
-                                    )
-                                    if (statusDotColor != null) {
-                                        Box(
+                            if (isLandscape) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                ) {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        MinimalTabIcon(
+                                            kind = tab.icon,
+                                            tint = tint,
+                                            filled = selected,
                                             modifier = Modifier
-                                                .align(Alignment.TopEnd)
-                                                .offset(x = 5.dp, y = (-2).dp)
-                                                .size(6.dp)
-                                                .clip(CircleShape)
-                                                .background(statusDotColor),
+                                                .size(18.dp)
+                                                .graphicsLayer {
+                                                    scaleX = iconScale
+                                                    scaleY = iconScale
+                                                },
                                         )
+                                        if (statusDotColor != null) {
+                                            Box(
+                                                modifier = Modifier
+                                                    .align(Alignment.TopEnd)
+                                                    .offset(x = 3.dp, y = (-2).dp)
+                                                    .size(5.dp)
+                                                    .clip(CircleShape)
+                                                    .background(statusDotColor),
+                                            )
+                                        }
                                     }
+                                    Text(
+                                        text = tab.label,
+                                        style = VdpiTextStyles.tabLabel.copy(
+                                            fontSize = 12.sp,
+                                            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                                        ),
+                                        color = tint,
+                                        maxLines = 1,
+                                        softWrap = false,
+                                        overflow = TextOverflow.Clip,
+                                    )
                                 }
-                                Spacer(Modifier.height(2.dp))
-                                Text(
-                                    text = tab.label,
-                                    style = VdpiTextStyles.tabLabel,
-                                    color = tint,
-                                    maxLines = 1,
-                                    softWrap = false,
-                                    overflow = TextOverflow.Clip,
-                                )
+                            } else {
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.Center,
+                                ) {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        MinimalTabIcon(
+                                            kind = tab.icon,
+                                            tint = tint,
+                                            filled = selected,
+                                            modifier = Modifier.graphicsLayer {
+                                                scaleX = iconScale
+                                                scaleY = iconScale
+                                            },
+                                        )
+                                        if (statusDotColor != null) {
+                                            Box(
+                                                modifier = Modifier
+                                                    .align(Alignment.TopEnd)
+                                                    .offset(x = 6.dp, y = (-3).dp)
+                                                    .size(6.dp)
+                                                    .clip(CircleShape)
+                                                    .background(statusDotColor),
+                                            )
+                                        }
+                                    }
+                                    Spacer(Modifier.height(2.dp))
+                                    Text(
+                                        text = tab.label,
+                                        style = VdpiTextStyles.tabLabel.copy(
+                                            fontSize = 11.sp,
+                                            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                                        ),
+                                        color = tint,
+                                        maxLines = 1,
+                                        softWrap = false,
+                                        overflow = TextOverflow.Clip,
+                                    )
+                                }
                             }
                         }
                     }
@@ -1442,6 +1597,7 @@ private fun DownArrowGlyph(
     tint: Color,
     modifier: Modifier = Modifier,
 ) {
+    val headPath = remember { Path() }
     Canvas(modifier = modifier) {
         val w = size.width
         val h = size.height
@@ -1454,12 +1610,54 @@ private fun DownArrowGlyph(
             strokeWidth = strokeWidth,
             cap = StrokeCap.Round,
         )
-        val head = Path().apply {
-            moveTo(w * 0.22f, h * 0.56f)
-            lineTo(w * 0.50f, h * 0.84f)
-            lineTo(w * 0.78f, h * 0.56f)
-        }
-        drawPath(path = head, color = tint, style = stroke)
+        headPath.reset()
+        headPath.moveTo(w * 0.22f, h * 0.56f)
+        headPath.lineTo(w * 0.50f, h * 0.84f)
+        headPath.lineTo(w * 0.78f, h * 0.56f)
+        drawPath(path = headPath, color = tint, style = stroke)
+    }
+}
+
+@Composable
+private fun RefreshGlyph(
+    tint: Color,
+    modifier: Modifier = Modifier,
+) {
+    val arrowPath = remember { Path() }
+    Canvas(modifier = modifier) {
+        val strokeWidth = 1.75.dp.toPx()
+        val cx = size.width * 0.5f
+        val cy = size.height * 0.5f
+        val radius = ((minOf(size.width, size.height) - strokeWidth * 2f) * 0.44f).coerceAtLeast(1f)
+        val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round, join = StrokeJoin.Round)
+
+        drawArc(
+            color = tint,
+            startAngle = 30f,
+            sweepAngle = 295f,
+            useCenter = false,
+            topLeft = Offset(cx - radius, cy - radius),
+            size = Size(radius * 2f, radius * 2f),
+            style = stroke,
+        )
+
+        val tipAngle = -35.0 * PI / 180.0
+        val tx = cx + (radius * cos(tipAngle)).toFloat()
+        val ty = cy + (radius * sin(tipAngle)).toFloat()
+        val backAngle = tipAngle + PI * 1.5
+        val barbSpread = 42.0 * PI / 180.0
+        val barbLen = radius * 0.46f
+
+        val b1x = tx + (barbLen * cos(backAngle - barbSpread)).toFloat()
+        val b1y = ty + (barbLen * sin(backAngle - barbSpread)).toFloat()
+        val b2x = tx + (barbLen * cos(backAngle + barbSpread)).toFloat()
+        val b2y = ty + (barbLen * sin(backAngle + barbSpread)).toFloat()
+
+        arrowPath.reset()
+        arrowPath.moveTo(b1x, b1y)
+        arrowPath.lineTo(tx, ty)
+        arrowPath.lineTo(b2x, b2y)
+        drawPath(path = arrowPath, color = tint, style = stroke)
     }
 }
 

@@ -6,7 +6,6 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
@@ -14,7 +13,6 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.defaultMinSize
@@ -26,6 +24,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -68,89 +67,6 @@ private val AppleSwitchOffDark = Color(0xFF39393D)
 private val AppleSwitchOffLight = Color(0xFFE9E9EB)
 private val AppleSegmentedThumbDark = Color(0xFF636366)
 private val AppleSegmentedThumbLight = Color(0xFFFFFFFF)
-
-/**
- * Crisp geometric vdpi brand mark: fractured V symbolizing TLS packet splitting
- * above a clean signal bar tinted with `palette.signal` when active.
- */
-@Composable
-fun VdpiBrandMark(
-    active: Boolean,
-    modifier: Modifier = Modifier,
-    size: Dp = 22.dp,
-) {
-    val palette = VdpiThemeTokens.palette
-    val signalStrokeColor by animateColorAsState(
-        targetValue = if (active) palette.signal else palette.inkPrimary,
-        animationSpec = tween(200),
-        label = "brandSignalBar",
-    )
-
-    Canvas(modifier = modifier.size(size)) {
-        val w = this.size.width
-        val h = this.size.height
-
-        val leftArm = Path().apply {
-            moveTo(w * 0.14f, h * 0.18f)
-            lineTo(w * 0.30f, h * 0.18f)
-            lineTo(w * 0.47f, h * 0.72f)
-            lineTo(w * 0.31f, h * 0.72f)
-            close()
-        }
-        val rightArm = Path().apply {
-            moveTo(w * 0.53f, h * 0.72f)
-            lineTo(w * 0.70f, h * 0.18f)
-            lineTo(w * 0.86f, h * 0.18f)
-            lineTo(w * 0.69f, h * 0.72f)
-            close()
-        }
-        val bar = Path().apply {
-            moveTo(w * 0.31f, h * 0.82f)
-            lineTo(w * 0.69f, h * 0.82f)
-            lineTo(w * 0.69f, h * 0.90f)
-            lineTo(w * 0.31f, h * 0.90f)
-            close()
-        }
-
-        drawPath(leftArm, color = palette.inkPrimary)
-        drawPath(rightArm, color = palette.inkPrimary)
-        drawPath(bar, color = signalStrokeColor)
-    }
-}
-
-/**
- * Opaque Apple Inset Grouped surface container.
- * Uses no outer border, drop shadow, or top highlight unless a caller explicitly supplies
- * a non-default alert [borderColor].
- */
-@Composable
-fun HairlinePanel(
-    modifier: Modifier = Modifier,
-    borderColor: Color = VdpiThemeTokens.palette.border,
-    backgroundColor: Color = VdpiThemeTokens.palette.surface,
-    radius: Dp = 16.dp,
-    @Suppress("UNUSED_PARAMETER") topHighlight: Boolean = false,
-    content: @Composable ColumnScope.() -> Unit,
-) {
-    val palette = VdpiThemeTokens.palette
-    val shape = RoundedCornerShape(radius)
-    val showAlertBorder = borderColor != palette.border && borderColor != Color.Transparent
-
-    val borderModifier = if (showAlertBorder) {
-        Modifier.border(width = 1.dp, color = borderColor, shape = shape)
-    } else {
-        Modifier
-    }
-
-    Column(
-        modifier = modifier
-            .fillMaxWidth()
-            .clip(shape)
-            .background(backgroundColor)
-            .then(borderModifier),
-        content = content,
-    )
-}
 
 /**
  * Crisp 0.5dp Apple Inset Grouped separator with optional leading inset.
@@ -207,14 +123,13 @@ fun SectionFooter(
 
 /**
  * Apple Settings Inset Grouped list row with quiet press highlight wash,
- * optional subtitle, leading/trailing accessories, and secondary trailing value.
+ * optional subtitle, and leading/trailing accessories.
  */
 @Composable
 fun InsetGroupedRow(
     title: String,
     modifier: Modifier = Modifier,
     subtitle: String? = null,
-    trailingText: String? = null,
     onClick: (() -> Unit)? = null,
     leading: (@Composable () -> Unit)? = null,
     trailing: (@Composable () -> Unit)? = null,
@@ -263,6 +178,7 @@ fun InsetGroupedRow(
                 style = VdpiTextStyles.rowTitle,
                 color = palette.inkPrimary,
                 maxLines = 1,
+                softWrap = false,
                 overflow = TextOverflow.Ellipsis,
             )
             if (subtitle != null) {
@@ -277,24 +193,10 @@ fun InsetGroupedRow(
             }
         }
 
-        if (trailingText != null || trailing != null) {
-            Spacer(Modifier.width(12.dp))
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                if (trailingText != null) {
-                    Text(
-                        text = trailingText,
-                        style = VdpiTextStyles.body,
-                        color = palette.inkSecondary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-                if (trailing != null) {
-                    trailing()
-                }
+        if (trailing != null) {
+            Spacer(Modifier.width(16.dp))
+            Box(contentAlignment = Alignment.CenterEnd) {
+                trailing()
             }
         }
     }
@@ -310,7 +212,6 @@ fun PrecisionSwitch(
     checked: Boolean,
     modifier: Modifier = Modifier,
     onCheckedChange: ((Boolean) -> Unit)? = null,
-    @Suppress("UNUSED_PARAMETER") useSignalAccent: Boolean = false,
 ) {
     val palette = VdpiThemeTokens.palette
     val haptic = LocalHapticFeedback.current
@@ -358,6 +259,7 @@ fun PrecisionSwitch(
     val thumbWidth = (27f + 4f * pressStretch).dp
     val maxTravel = 51.dp - 4.dp - thumbWidth
     val thumbOffset = 2.dp + maxTravel * progress
+    val thumbShadow = remember { Color.Black.copy(alpha = 0.22f) }
 
     Box(
         modifier = interactiveModifier,
@@ -377,8 +279,8 @@ fun PrecisionSwitch(
                         elevation = 3.dp,
                         shape = CircleShape,
                         clip = false,
-                        ambientColor = Color.Black.copy(alpha = 0.18f),
-                        spotColor = Color.Black.copy(alpha = 0.24f),
+                        ambientColor = thumbShadow,
+                        spotColor = thumbShadow,
                     )
                     .size(width = thumbWidth, height = 27.dp)
                     .clip(CircleShape)
@@ -405,14 +307,18 @@ fun <T> SegmentedControl(
     val palette = VdpiThemeTokens.palette
     val haptic = LocalHapticFeedback.current
     val selectedIndex = options.indexOf(selected).coerceAtLeast(0)
-    val trackShape = RoundedCornerShape(10.dp)
-    val thumbShape = RoundedCornerShape(8.dp)
+    val trackShape = remember { RoundedCornerShape(10.dp) }
+    val thumbShape = remember { RoundedCornerShape(8.dp) }
     val thumbColor = if (palette.isDark) AppleSegmentedThumbDark else AppleSegmentedThumbLight
+    val thumbShadow = remember(palette.isDark) {
+        Color.Black.copy(alpha = if (palette.isDark) 0.28f else 0.12f)
+    }
     val dividerColor = palette.inkPrimary.copy(alpha = if (palette.isDark) 0.14f else 0.12f)
 
     BoxWithConstraints(
         modifier = modifier
             .fillMaxWidth()
+            .heightIn(min = 48.dp)
             .clip(trackShape)
             .background(palette.surfaceRaised)
             .padding(2.dp),
@@ -452,13 +358,13 @@ fun <T> SegmentedControl(
                     .offset { IntOffset(indicatorOffset.roundToPx(), 0) }
                     .width(segmentWidth)
                     .fillMaxHeight()
-                    .heightIn(min = 34.dp)
+                    .heightIn(min = 44.dp)
                     .shadow(
                         elevation = 2.dp,
                         shape = thumbShape,
                         clip = false,
-                        ambientColor = Color.Black.copy(alpha = if (palette.isDark) 0.24f else 0.10f),
-                        spotColor = Color.Black.copy(alpha = if (palette.isDark) 0.30f else 0.14f),
+                        ambientColor = thumbShadow,
+                        spotColor = thumbShadow,
                     )
                     .clip(thumbShape)
                     .background(thumbColor),
@@ -479,7 +385,7 @@ fun <T> SegmentedControl(
                 Box(
                     modifier = Modifier
                         .weight(1f)
-                        .heightIn(min = 34.dp)
+                        .heightIn(min = 44.dp)
                         .clip(thumbShape)
                         .selectable(
                             selected = isSelected,
@@ -503,6 +409,7 @@ fun <T> SegmentedControl(
                         fontSize = 13.sp,
                         color = textColor,
                         maxLines = 1,
+                        softWrap = false,
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
@@ -564,6 +471,7 @@ fun GhostActionButton(
             fontSize = 14.sp,
             color = palette.inkPrimary,
             maxLines = 1,
+            softWrap = false,
             overflow = TextOverflow.Ellipsis,
         )
         if (trailingMono != null) {
@@ -573,6 +481,8 @@ fun GhostActionButton(
                 style = VdpiTextStyles.monoSmall,
                 color = palette.inkSecondary,
                 maxLines = 1,
+                softWrap = false,
+                overflow = TextOverflow.Ellipsis,
             )
         }
     }
@@ -588,66 +498,74 @@ fun MinimalSnackbarHost(
     modifier: Modifier = Modifier,
 ) {
     val palette = VdpiThemeTokens.palette
-    val capsuleShape = RoundedCornerShape(24.dp)
+    val capsuleShape = remember { RoundedCornerShape(24.dp) }
     SnackbarHost(
         hostState = hostState,
         modifier = modifier.padding(horizontal = 20.dp, vertical = 8.dp),
     ) { data ->
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .liquidGlass(
-                    shape = capsuleShape,
-                    elevated = true,
-                )
-                .padding(start = 18.dp, end = 10.dp, top = 11.dp, bottom = 11.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
+        Box(
+            modifier = Modifier.fillMaxWidth(),
+            contentAlignment = Alignment.Center,
         ) {
-            Text(
-                text = data.visuals.message,
-                style = VdpiTextStyles.body,
-                color = palette.inkPrimary,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
+            Row(
                 modifier = Modifier
-                    .weight(1f)
-                    .padding(end = 8.dp),
-            )
-            data.visuals.actionLabel?.let { action ->
-                val actionInteraction = remember { MutableInteractionSource() }
-                val actionPressed by actionInteraction.collectIsPressedAsState()
-                val actionWash by animateColorAsState(
-                    targetValue = if (actionPressed) {
-                        palette.accent.copy(alpha = 0.14f)
-                    } else {
-                        Color.Transparent
-                    },
-                    animationSpec = tween(durationMillis = if (actionPressed) 60 else 150),
-                    label = "snackbarActionWash",
-                )
-                Box(
-                    modifier = Modifier
-                        .heightIn(min = 36.dp)
-                        .springPress(interactionSource = actionInteraction, pressedScale = 0.96f)
-                        .clip(CircleShape)
-                        .background(actionWash)
-                        .clickable(
-                            interactionSource = actionInteraction,
-                            indication = null,
-                            role = Role.Button,
-                        ) { data.performAction() }
-                        .padding(horizontal = 12.dp),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Text(
-                        text = action,
-                        fontFamily = GeistSans,
-                        fontWeight = FontWeight.SemiBold,
-                        fontSize = 13.sp,
-                        color = palette.accent,
-                        maxLines = 1,
+                    .widthIn(max = 520.dp)
+                    .fillMaxWidth()
+                    .liquidGlass(
+                        shape = capsuleShape,
+                        elevated = true,
                     )
+                    .padding(start = 18.dp, end = 10.dp, top = 11.dp, bottom = 11.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text(
+                    text = data.visuals.message,
+                    style = VdpiTextStyles.body,
+                    color = palette.inkPrimary,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(end = 8.dp),
+                )
+                data.visuals.actionLabel?.let { action ->
+                    val actionInteraction = remember { MutableInteractionSource() }
+                    val actionPressed by actionInteraction.collectIsPressedAsState()
+                    val actionWash by animateColorAsState(
+                        targetValue = if (actionPressed) {
+                            palette.accent.copy(alpha = 0.14f)
+                        } else {
+                            Color.Transparent
+                        },
+                        animationSpec = tween(durationMillis = if (actionPressed) 60 else 150),
+                        label = "snackbarActionWash",
+                    )
+                    Box(
+                        modifier = Modifier
+                            .heightIn(min = 44.dp)
+                            .widthIn(min = 44.dp)
+                            .springPress(interactionSource = actionInteraction, pressedScale = 0.96f)
+                            .clip(CircleShape)
+                            .background(actionWash)
+                            .clickable(
+                                interactionSource = actionInteraction,
+                                indication = null,
+                                role = Role.Button,
+                            ) { data.performAction() }
+                            .padding(horizontal = 12.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            text = action,
+                            fontFamily = GeistSans,
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 13.sp,
+                            color = palette.accent,
+                            maxLines = 1,
+                            softWrap = false,
+                        )
+                    }
                 }
             }
         }
@@ -665,6 +583,7 @@ fun MinimalTabIcon(
     modifier: Modifier = Modifier,
     filled: Boolean = false,
 ) {
+    val path = remember { Path() }
     Canvas(modifier = modifier.size(22.dp)) {
         val w = size.width
         val h = size.height
@@ -675,24 +594,23 @@ fun MinimalTabIcon(
             TabIconKind.TUNNEL -> {
                 if (filled) {
                     val armStroke = Stroke(width = 1.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round)
-                    val leftArm = Path().apply {
-                        moveTo(w * 0.14f, h * 0.18f)
-                        lineTo(w * 0.31f, h * 0.18f)
-                        lineTo(w * 0.47f, h * 0.70f)
-                        lineTo(w * 0.30f, h * 0.70f)
-                        close()
-                    }
-                    val rightArm = Path().apply {
-                        moveTo(w * 0.53f, h * 0.70f)
-                        lineTo(w * 0.69f, h * 0.18f)
-                        lineTo(w * 0.86f, h * 0.18f)
-                        lineTo(w * 0.70f, h * 0.70f)
-                        close()
-                    }
-                    drawPath(leftArm, color = tint, style = Fill)
-                    drawPath(leftArm, color = tint, style = armStroke)
-                    drawPath(rightArm, color = tint, style = Fill)
-                    drawPath(rightArm, color = tint, style = armStroke)
+                    path.reset()
+                    path.moveTo(w * 0.14f, h * 0.18f)
+                    path.lineTo(w * 0.31f, h * 0.18f)
+                    path.lineTo(w * 0.47f, h * 0.70f)
+                    path.lineTo(w * 0.30f, h * 0.70f)
+                    path.close()
+                    drawPath(path, color = tint, style = Fill)
+                    drawPath(path, color = tint, style = armStroke)
+
+                    path.reset()
+                    path.moveTo(w * 0.53f, h * 0.70f)
+                    path.lineTo(w * 0.69f, h * 0.18f)
+                    path.lineTo(w * 0.86f, h * 0.18f)
+                    path.lineTo(w * 0.70f, h * 0.70f)
+                    path.close()
+                    drawPath(path, color = tint, style = Fill)
+                    drawPath(path, color = tint, style = armStroke)
 
                     val barHeight = h * 0.11f
                     drawRoundRect(
@@ -702,16 +620,15 @@ fun MinimalTabIcon(
                         cornerRadius = CornerRadius(barHeight * 0.5f, barHeight * 0.5f),
                     )
                 } else {
-                    val left = Path().apply {
-                        moveTo(w * 0.17f, h * 0.20f)
-                        lineTo(w * 0.42f, h * 0.70f)
-                    }
-                    val right = Path().apply {
-                        moveTo(w * 0.58f, h * 0.70f)
-                        lineTo(w * 0.83f, h * 0.20f)
-                    }
-                    drawPath(left, color = tint, style = stroke)
-                    drawPath(right, color = tint, style = stroke)
+                    path.reset()
+                    path.moveTo(w * 0.17f, h * 0.20f)
+                    path.lineTo(w * 0.42f, h * 0.70f)
+                    drawPath(path, color = tint, style = stroke)
+
+                    path.reset()
+                    path.moveTo(w * 0.58f, h * 0.70f)
+                    path.lineTo(w * 0.83f, h * 0.20f)
+                    drawPath(path, color = tint, style = stroke)
                     drawLine(
                         color = tint,
                         start = Offset(w * 0.31f, h * 0.84f),
@@ -724,39 +641,28 @@ fun MinimalTabIcon(
 
             TabIconKind.APPS -> {
                 val cell = w * 0.33f
-                val corner = CornerRadius(2.8.dp.toPx(), 2.8.dp.toPx())
-                val origins = listOf(
-                    Offset(w * 0.12f, h * 0.12f),
-                    Offset(w * 0.55f, h * 0.12f),
-                    Offset(w * 0.12f, h * 0.55f),
-                    Offset(w * 0.55f, h * 0.55f),
-                )
+                val cornerPx = 2.8.dp.toPx()
+                val x0 = w * 0.12f
+                val x1 = w * 0.55f
+                val y0 = h * 0.12f
+                val y1 = h * 0.55f
                 if (filled) {
-                    origins.forEach { topLeft ->
-                        drawRoundRect(
-                            color = tint,
-                            topLeft = topLeft,
-                            size = Size(cell, cell),
-                            cornerRadius = corner,
-                            style = Fill,
-                        )
-                    }
+                    val corner = CornerRadius(cornerPx, cornerPx)
+                    val cellSize = Size(cell, cell)
+                    drawRoundRect(color = tint, topLeft = Offset(x0, y0), size = cellSize, cornerRadius = corner, style = Fill)
+                    drawRoundRect(color = tint, topLeft = Offset(x1, y0), size = cellSize, cornerRadius = corner, style = Fill)
+                    drawRoundRect(color = tint, topLeft = Offset(x0, y1), size = cellSize, cornerRadius = corner, style = Fill)
+                    drawRoundRect(color = tint, topLeft = Offset(x1, y1), size = cellSize, cornerRadius = corner, style = Fill)
                 } else {
                     val inset = strokeWidth * 0.5f
                     val innerCell = (cell - strokeWidth).coerceAtLeast(1f)
-                    val innerCorner = CornerRadius(
-                        (2.8.dp.toPx() - inset * 0.5f).coerceAtLeast(1f),
-                        (2.8.dp.toPx() - inset * 0.5f).coerceAtLeast(1f),
-                    )
-                    origins.forEach { topLeft ->
-                        drawRoundRect(
-                            color = tint,
-                            topLeft = Offset(topLeft.x + inset, topLeft.y + inset),
-                            size = Size(innerCell, innerCell),
-                            cornerRadius = innerCorner,
-                            style = stroke,
-                        )
-                    }
+                    val innerCornerPx = (cornerPx - inset * 0.5f).coerceAtLeast(1f)
+                    val innerCorner = CornerRadius(innerCornerPx, innerCornerPx)
+                    val innerSize = Size(innerCell, innerCell)
+                    drawRoundRect(color = tint, topLeft = Offset(x0 + inset, y0 + inset), size = innerSize, cornerRadius = innerCorner, style = stroke)
+                    drawRoundRect(color = tint, topLeft = Offset(x1 + inset, y0 + inset), size = innerSize, cornerRadius = innerCorner, style = stroke)
+                    drawRoundRect(color = tint, topLeft = Offset(x0 + inset, y1 + inset), size = innerSize, cornerRadius = innerCorner, style = stroke)
+                    drawRoundRect(color = tint, topLeft = Offset(x1 + inset, y1 + inset), size = innerSize, cornerRadius = innerCorner, style = stroke)
                 }
             }
 

@@ -3,7 +3,7 @@ members = [".", "crates/vdpi-tun", "crates/vdpi-android", "crates/vdpi-ios"]
 default-members = ["."]
 
 [workspace.package]
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 authors = ["Vuln-Inc"]
 license = "MIT"
@@ -15,7 +15,7 @@ name = "vdpi"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-description = "Zero-hassle, high-performance anti-DPI engine in Rust for macOS, Windows, and Linux"
+description = "Zero-hassle, self-healing anti-DPI engine in Rust - native across Windows, macOS, Linux, Android, and iOS"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

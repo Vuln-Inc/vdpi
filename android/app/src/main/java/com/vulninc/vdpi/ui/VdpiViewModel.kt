@@ -190,6 +190,17 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
         _pendingChangeSummary.value = ""
     }
 
+    fun resetForExplicitReconnect() {
+        appliedSettings = null
+        clearPendingReconnect()
+        viewModelScope.launch {
+            mutationMutex.withLock {
+                appliedSettings = null
+                clearPendingReconnect()
+            }
+        }
+    }
+
     fun loadInstalledApps() {
         if (_appsLoading.value) return
         viewModelScope.launch {
@@ -224,12 +235,12 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun clearNativeCache(onDone: () -> Unit = {}) {
+    fun clearNativeCache(onResult: (Boolean) -> Unit = {}) {
         viewModelScope.launch {
-            withContext(Dispatchers.IO) {
+            val cleared = withContext(Dispatchers.IO) {
                 NativeEngine.clearCache()
             }
-            onDone()
+            onResult(cleared)
         }
     }
 

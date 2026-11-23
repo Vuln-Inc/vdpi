@@ -241,7 +241,11 @@ class VdpiVpnService : VpnService() {
             repostJob = null
             connectedAtWallMs = null
             TunnelRuntimeState.update {
-                it.copy(phase = TunnelPhase.CONNECTING, errorMessage = null)
+                it.copy(
+                    phase = TunnelPhase.CONNECTING,
+                    errorMessage = null,
+                    telemetry = TelemetrySnapshot(),
+                )
             }
             TunnelRuntimeState.setAppliedSettings(null)
             if (startForegroundSafe(initialNotif)) {

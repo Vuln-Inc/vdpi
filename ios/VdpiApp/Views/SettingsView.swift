@@ -8,6 +8,10 @@ struct SettingsView: View {
     @Environment(\.vdpiPalette) private var palette
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorSchemeContrast) private var colorSchemeContrast
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+
+    private static let githubRepositoryURL = URL(string: "https://github.com/Vuln-Inc/vdpi")!
 
     private enum Field: Hashable {
         case dns
@@ -34,18 +38,42 @@ struct SettingsView: View {
         DnsPreset(label: "Quad9", value: "9.9.9.9"),
     ]
 
+    private func isPresetDns(_ addr: String) -> Bool {
+        dnsPresets.contains { $0.value.caseInsensitiveCompare(addr) == .orderedSame }
+    }
+
+    private func draftValue(for dnsAddr: String) -> String {
+        isPresetDns(dnsAddr) ? "" : dnsAddr
+    }
+
+    private var isCustomDnsActive: Bool {
+        let current = manager.settings.dnsAddr
+        guard !isPresetDns(current) else { return false }
+        let trimmed = dnsDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.caseInsensitiveCompare(current) == .orderedSame
+    }
+
     private var canApplyDns: Bool {
         let trimmed = dnsDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed != manager.settings.dnsAddr || dnsError != nil
+        guard !trimmed.isEmpty else { return false }
+        return trimmed.caseInsensitiveCompare(manager.settings.dnsAddr) != .orderedSame
     }
 
     private var canAddBypass: Bool {
         !bypassDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    private var isWideLayout: Bool {
+        verticalSizeClass == .compact || horizontalSizeClass == .regular
+    }
+
+    private var isCompactHeight: Bool {
+        verticalSizeClass == .compact
+    }
+
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
+            VStack(alignment: .leading, spacing: isCompactHeight ? 20 : 24) {
                 headerBar
 
                 desyncSection
@@ -54,21 +82,26 @@ struct SettingsView: View {
                 bypassDomainsSection
                 appearanceSection
                 resetSection
+                aboutSection
+                versionFooter
             }
             .animation(reduceMotion ? nil : VdpiMotion.floatingHud, value: topInset)
             .animation(reduceMotion ? nil : VdpiMotion.floatingHud, value: focusedField != nil)
+            .frame(maxWidth: isWideLayout ? 680 : .infinity, alignment: .leading)
             .padding(.horizontal, 16)
-            .padding(.top, 12 + topInset)
+            .padding(.top, (isCompactHeight ? 4 : 12) + topInset)
             .padding(.bottom, bottomInset)
+            .frame(maxWidth: .infinity)
         }
         .scrollIndicators(.hidden)
         .scrollDismissesKeyboard(.interactively)
         .onAppear {
-            dnsDraft = manager.settings.dnsAddr
+            dnsDraft = draftValue(for: manager.settings.dnsAddr)
         }
         .vdpiOnChange(of: manager.settings.dnsAddr) { newDns in
-            if focusedField != .dns && dnsDraft != newDns {
-                dnsDraft = newDns
+            let expected = draftValue(for: newDns)
+            if focusedField != .dns && dnsDraft != expected {
+                dnsDraft = expected
                 dnsError = nil
             }
         }
@@ -91,7 +124,7 @@ struct SettingsView: View {
                 VdpiHaptics.trigger(.warning)
                 focusedField = nil
                 manager.resetSettings()
-                dnsDraft = manager.settings.dnsAddr
+                dnsDraft = draftValue(for: manager.settings.dnsAddr)
                 dnsError = nil
                 bypassError = nil
             }
@@ -270,13 +303,13 @@ struct SettingsView: View {
                         if idx > 0 {
                             InsetDivider(leadingInset: 16)
                         }
-                        let active = manager.settings.dnsAddr == preset.value
+                        let active = manager.settings.dnsAddr.caseInsensitiveCompare(preset.value) == .orderedSame
                         Button {
                             guard !active else { return }
                             VdpiHaptics.trigger(.selection)
                             focusedField = nil
                             dnsError = nil
-                            dnsDraft = preset.value
+                            dnsDraft = ""
                             withAnimation(reduceMotion ? nil : VdpiMotion.cardShift) {
                                 manager.updateSettings { $0.dnsAddr = preset.value }
                             }
@@ -325,16 +358,23 @@ struct SettingsView: View {
                                 .frame(minHeight: 44)
                                 .onSubmit { commitDns() }
 
-                            Button("Apply") {
-                                commitDns()
+                            if isCustomDnsActive {
+                                Image(systemName: "checkmark")
+                                    .font(.body.weight(.semibold))
+                                    .foregroundStyle(palette.accent)
+                                    .accessibilityLabel("Active custom DNS")
+                            } else {
+                                Button("Apply") {
+                                    commitDns()
+                                }
+                                .font(.body.weight(.semibold))
+                                .foregroundStyle(canApplyDns ? palette.accent : palette.inkMuted)
+                                .fixedSize(horizontal: true, vertical: false)
+                                .frame(minWidth: 44, minHeight: 44)
+                                .contentShape(Rectangle())
+                                .buttonStyle(.plain)
+                                .disabled(!canApplyDns)
                             }
-                            .font(.body.weight(.semibold))
-                            .foregroundStyle(canApplyDns ? palette.accent : palette.inkMuted)
-                            .fixedSize(horizontal: true, vertical: false)
-                            .frame(minWidth: 44, minHeight: 44)
-                            .contentShape(Rectangle())
-                            .buttonStyle(.plain)
-                            .disabled(!canApplyDns)
                         }
 
                         if let dnsError {
@@ -402,7 +442,6 @@ struct SettingsView: View {
                     isOn: Binding(
                         get: { manager.settings.onDemandEnabled },
                         set: { val in
-                            VdpiHaptics.trigger(.light)
                             manager.updateSettings { $0.onDemandEnabled = val }
                         }
                     )
@@ -423,7 +462,7 @@ struct SettingsView: View {
                 VStack(spacing: 0) {
                     VStack(alignment: .leading, spacing: 6) {
                         HStack(spacing: 12) {
-                            TextField("Add domain (e.g. bank.com)", text: $bypassDraft)
+                            TextField("Add domain (e.g. example.com)", text: $bypassDraft)
                                 .font(.body)
                                 .foregroundStyle(palette.inkPrimary)
                                 .textInputAutocapitalization(.never)
@@ -512,7 +551,6 @@ struct SettingsView: View {
                         get: { manager.settings.theme },
                         set: { pref in
                             guard manager.settings.theme != pref else { return }
-                            VdpiHaptics.trigger(.selection)
                             manager.updateSettings { $0.theme = pref }
                         }
                     )
@@ -552,6 +590,58 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - 7. About
+
+    private var aboutSection: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            SectionHeader("About")
+
+            InsetGroupedCard(cornerRadius: 16) {
+                Link(destination: Self.githubRepositoryURL) {
+                    HStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("GitHub Repository")
+                                .font(.body)
+                                .foregroundStyle(palette.inkPrimary)
+                            Text("github.com/Vuln-Inc/vdpi")
+                                .font(.footnote)
+                                .foregroundStyle(palette.inkSecondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+
+                        Spacer(minLength: 8)
+
+                        Image(systemName: "arrow.up.right")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(palette.inkMuted)
+                            .accessibilityHidden(true)
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(SettingsRowButtonStyle(highlightColor: palette.surfaceRaised))
+                .accessibilityLabel("Open vdpi GitHub repository")
+            }
+        }
+    }
+
+    // MARK: - Version Footer
+
+    private var versionFooter: some View {
+        let ver = manager.engineVersion.lowercased().hasPrefix("v")
+            ? manager.engineVersion
+            : "v\(manager.engineVersion)"
+        return Text("vdpi \(ver) · github.com/Vuln-Inc/vdpi")
+            .font(.footnote)
+            .foregroundStyle(palette.inkMuted)
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: .infinity, alignment: .center)
+            .padding(.top, -4)
+    }
+
     // MARK: - Row Helpers & Actions
 
     private func toggleRow(title: String, isOn: Binding<Bool>) -> some View {
@@ -571,9 +661,7 @@ struct SettingsView: View {
         if trimmed.isEmpty {
             focusedField = nil
             dnsError = nil
-            dnsDraft = "1.1.1.1"
-            VdpiHaptics.trigger(.light)
-            manager.updateSettings { $0.dnsAddr = "1.1.1.1" }
+            dnsDraft = draftValue(for: manager.settings.dnsAddr)
             return
         }
         guard VdpiFormatters.isValidDnsInput(trimmed) else {
@@ -583,16 +671,23 @@ struct SettingsView: View {
         }
         focusedField = nil
         dnsError = nil
-        dnsDraft = trimmed
-        VdpiHaptics.trigger(.success)
-        manager.updateSettings { $0.dnsAddr = trimmed }
-        manager.showToast("Updated DNS resolver")
+        dnsDraft = draftValue(for: trimmed)
+        if trimmed.caseInsensitiveCompare(manager.settings.dnsAddr) != .orderedSame {
+            VdpiHaptics.trigger(.success)
+            manager.updateSettings { $0.dnsAddr = trimmed }
+            manager.showToast("Updated DNS resolver")
+        }
     }
 
     private func addBypassDomain() {
         guard let normalized = VdpiFormatters.normalizeBypassDomain(bypassDraft) else {
             VdpiHaptics.trigger(.warning)
             bypassError = "Enter a valid domain such as example.com or *.example.com"
+            return
+        }
+        if manager.settings.bypassDomains.contains(normalized) {
+            VdpiHaptics.trigger(.warning)
+            bypassError = "Already in bypass list"
             return
         }
         focusedField = nil

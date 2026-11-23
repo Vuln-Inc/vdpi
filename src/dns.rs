@@ -434,7 +434,9 @@ impl DnsResolver {
                     }
                     Ok(DnsOutcome::Records(ips, ttl)) => {
                         let clean = filter_poisoned_ips(ips);
-                        if !clean.is_empty() || qtype == QTYPE_AAAA {
+                        let is_tc =
+                            buf.len() >= 4 && (u16::from_be_bytes([buf[2], buf[3]]) & 0x0200) != 0;
+                        if !clean.is_empty() || (qtype == QTYPE_AAAA && !is_tc) {
                             if offset > 0 && !clean.is_empty() {
                                 self.preferred_udp_idx.store(idx, Ordering::Relaxed);
                             }
@@ -965,8 +967,12 @@ fn decode_dns_outcome(buf: &[u8], expected_qtype: u16) -> Result<DnsOutcome> {
     if (flags & 0x8000) == 0 {
         bail!("DNS packet does not have QR response bit set");
     }
+    let truncated = (flags & 0x0200) != 0;
     let rcode = flags & 0x000f;
     if rcode == 3 {
+        if truncated {
+            bail!("DNS response truncated (TC=1)");
+        }
         return Ok(DnsOutcome::NxDomain(Duration::from_secs(30)));
     }
     if rcode != 0 {
@@ -1034,6 +1040,10 @@ fn decode_dns_outcome(buf: &[u8], expected_qtype: u16) -> Result<DnsOutcome> {
         }
 
         pos += rdlength;
+    }
+
+    if truncated && ips.is_empty() {
+        bail!("DNS response truncated (TC=1) with no matching answers");
     }
 
     let clamped_ttl = Duration::from_secs(min_ttl_secs.unwrap_or(120).clamp(30, 3600));
@@ -1194,5 +1204,92 @@ mod tests {
         // IPv6 literals must be bracketed in DoH URLs
         let endpoints = build_doh_endpoints("2606:4700:4700::1111");
         assert_eq!(endpoints[0], "https://[2606:4700:4700::1111]/dns-query");
+    }
+
+    #[test]
+    fn treats_truncated_tc_dns_reply_with_zero_answers_as_error() {
+        let q = encode_dns_query("truncated.example", QTYPE_A).unwrap();
+
+        // QR=1 (0x8000) | TC=1 (0x0200) | RD=1 (0x0100) | RA=1 (0x0080) => 0x8380, ANCOUNT=0
+        let mut tc_empty = vec![
+            0x00, 0x00, 0x83, 0x80, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        tc_empty.extend_from_slice(&q[12..]);
+        assert!(decode_dns_outcome(&tc_empty, QTYPE_A).is_err());
+        assert!(decode_dns_response(&tc_empty, QTYPE_A).is_err());
+        assert!(decode_dns_outcome(&tc_empty, QTYPE_AAAA).is_err());
+
+        // TC=1 with CNAME-only answer (no A record parsed) must also fail as truncated.
+        let mut tc_cname_only = vec![
+            0x00, 0x00, 0x83, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ];
+        tc_cname_only.extend_from_slice(&q[12..]);
+        tc_cname_only.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x02, 0xc0, 0x0c,
+        ]);
+        assert!(decode_dns_outcome(&tc_cname_only, QTYPE_A).is_err());
+
+        // TC=1 with a valid A answer still returns the parsed record.
+        let mut tc_with_a = vec![
+            0x00, 0x00, 0x83, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ];
+        tc_with_a.extend_from_slice(&q[12..]);
+        tc_with_a.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 93, 184, 216,
+            34,
+        ]);
+        let (ips, _) = decode_dns_response(&tc_with_a, QTYPE_A).unwrap();
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
+    }
+
+    #[tokio::test]
+    async fn resolve_via_udp_falls_through_after_tc_truncated_reply() {
+        let tc_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let tc_addr = tc_server.local_addr().unwrap();
+        let ok_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ok_addr = ok_server.local_addr().unwrap();
+
+        let tc_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = tc_server.recv_from(&mut buf).await.unwrap();
+            let parsed = parse_dns_question(&buf[..n]).unwrap();
+            let mut resp = Vec::new();
+            resp.extend_from_slice(&parsed.tx_id.to_be_bytes());
+            resp.extend_from_slice(&0x8380u16.to_be_bytes()); // QR=1, TC=1, RD=1, RA=1
+            resp.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT=1
+            resp.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT=0
+            resp.extend_from_slice(&0u16.to_be_bytes());
+            resp.extend_from_slice(&0u16.to_be_bytes());
+            resp.extend_from_slice(&buf[12..parsed.question_end]);
+            tc_server.send_to(&resp, peer).await.unwrap();
+        });
+
+        let ok_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = ok_server.recv_from(&mut buf).await.unwrap();
+            let parsed = parse_dns_question(&buf[..n]).unwrap();
+            let resp = build_dns_wire_response(
+                parsed.tx_id,
+                parsed.flags,
+                &buf[12..parsed.question_end],
+                0,
+                &[IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+                60,
+            );
+            ok_server.send_to(&resp, peer).await.unwrap();
+        });
+
+        let mut resolver = DnsResolver::new("127.0.0.1", 53, false, true).unwrap();
+        resolver.udp_dns_servers = vec![tc_addr, ok_addr];
+        let outcome = resolver.resolve_via_udp("example.com").await.unwrap();
+        tc_task.await.unwrap();
+        ok_task.await.unwrap();
+
+        match outcome {
+            DnsOutcome::Records(ips, _) => {
+                assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
+            }
+            DnsOutcome::NxDomain(_) => panic!("expected A record after TC=1 fallback"),
+        }
     }
 }

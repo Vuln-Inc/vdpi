@@ -155,11 +155,45 @@ class FormattersAndConfigTest {
         val baseline = VdpiSettings()
         assertEquals(
             emptyList<String>(),
+            computeSettingsChangeSummary(baseline.copy(theme = ThemePreference.DARK), baseline),
+        )
+        assertEquals(
+            emptyList<String>(),
             computeSettingsChangeSummary(baseline.copy(theme = ThemePreference.LIGHT), baseline),
         )
         assertEquals(
             emptyList<String>(),
             computeSettingsChangeSummary(baseline.copy(theme = ThemePreference.SYSTEM), baseline),
+        )
+    }
+
+    @Test
+    fun defaultThemeAndWireFallbackUseSystem() {
+        assertEquals(ThemePreference.SYSTEM, VdpiSettings().theme)
+        assertEquals(ThemePreference.SYSTEM, ThemePreference.fromWire(null))
+        assertEquals(ThemePreference.SYSTEM, ThemePreference.fromWire("unknown"))
+        assertEquals(ThemePreference.SYSTEM, ThemePreference.fromWire("system"))
+        assertEquals(ThemePreference.DARK, ThemePreference.fromWire("dark"))
+        assertEquals(ThemePreference.LIGHT, ThemePreference.fromWire("light"))
+    }
+
+    @Test
+    fun desyncModeSummariesMatchCrossPlatformCopy() {
+        assertEquals(
+            "4-record TLS split + adaptive 7-stage auto-heal",
+            DesyncMode.COMBO.summary,
+        )
+        assertEquals(
+            "Split ClientHello across two RFC TLS records",
+            DesyncMode.TLS_RECORD.summary,
+        )
+        assertEquals(
+            "Single outer TLS record sliced at SNI boundaries",
+            DesyncMode.FRAGMENT.summary,
+        )
+        assertEquals(
+            "Initial chunk-byte TCP split on first flight",
+            DesyncMode.SPLIT.summary,
         )
     }
 

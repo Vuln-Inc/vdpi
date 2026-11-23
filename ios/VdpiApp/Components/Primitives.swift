@@ -315,61 +315,6 @@ struct InsetGroupedCard<Content: View>: View {
     }
 }
 
-/// Source-compatible content-layer container backed by a clean opaque Apple grouped surface
-/// (zero blur/glass, zero drop shadow, zero outer border unless `borderAccent` is explicitly set).
-struct GlassPanel<Content: View>: View {
-    @Environment(\.vdpiPalette) private var palette
-    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
-
-    var cornerRadius: CGFloat
-    var tier: VdpiGlassTier
-    var tint: Color?
-    var borderAccent: Color?
-    @ViewBuilder let content: () -> Content
-
-    init(
-        cornerRadius: CGFloat = 16,
-        tier: VdpiGlassTier = .regular,
-        tint: Color? = nil,
-        borderAccent: Color? = nil,
-        @ViewBuilder content: @escaping () -> Content
-    ) {
-        self.cornerRadius = cornerRadius
-        self.tier = tier
-        self.tint = tint
-        self.borderAccent = borderAccent
-        self.content = content
-    }
-
-    var body: some View {
-        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-        content()
-            .background {
-                ZStack {
-                    shape.fill(palette.surface)
-                    if let tint {
-                        shape.fill(tint)
-                    }
-                }
-            }
-            .clipShape(shape)
-            .overlay {
-                if let borderAccent {
-                    shape
-                        .strokeBorder(
-                            borderAccent.opacity(colorSchemeContrast == .increased ? 0.85 : 0.45),
-                            lineWidth: colorSchemeContrast == .increased ? 1.0 : 0.75
-                        )
-                        .allowsHitTesting(false)
-                } else if colorSchemeContrast == .increased {
-                    shape
-                        .strokeBorder(palette.borderStrong, lineWidth: 1.0)
-                        .allowsHitTesting(false)
-                }
-            }
-    }
-}
-
 /// Refined 42x42 circular floating Liquid Glass toolbar button with 44x44 minimum hit target.
 struct GlassCircleButton: View {
     @Environment(\.vdpiPalette) private var palette
@@ -453,35 +398,6 @@ struct GlassCircleButton: View {
 
 // MARK: - Grouped List Chrome & Scroll Edge Scrim
 
-struct HairlinePanel<Content: View>: View {
-    var borderColor: Color?
-    var backgroundColor: Color?
-    var cornerRadius: CGFloat
-    @ViewBuilder let content: () -> Content
-
-    init(
-        borderColor: Color? = nil,
-        backgroundColor: Color? = nil,
-        cornerRadius: CGFloat = 16,
-        @ViewBuilder content: @escaping () -> Content
-    ) {
-        self.borderColor = borderColor
-        self.backgroundColor = backgroundColor
-        self.cornerRadius = cornerRadius
-        self.content = content
-    }
-
-    var body: some View {
-        GlassPanel(
-            cornerRadius: cornerRadius,
-            tier: .regular,
-            tint: backgroundColor,
-            borderAccent: borderColor,
-            content: content
-        )
-    }
-}
-
 /// Authentic 1-pixel (`1 / displayScale`) inset separator for Apple grouped list rows.
 struct InsetDivider: View {
     @Environment(\.vdpiPalette) private var palette
@@ -499,12 +415,6 @@ struct InsetDivider: View {
             .frame(height: 1.0 / max(displayScale, 1.0))
             .padding(.leading, leadingInset)
             .accessibilityHidden(true)
-    }
-}
-
-struct HairlineRule: View {
-    var body: some View {
-        InsetDivider(leadingInset: 0)
     }
 }
 
@@ -550,24 +460,6 @@ struct SectionFooter: View {
             .foregroundStyle(palette.inkMuted)
             .fixedSize(horizontal: false, vertical: true)
             .padding(.horizontal, 16)
-    }
-}
-
-/// Source-compatible section heading using Apple `.footnote` Dynamic Type (no monospace eyebrow).
-struct SectionOverline: View {
-    @Environment(\.vdpiPalette) private var palette
-    let title: String
-
-    init(title: String) {
-        self.title = title
-    }
-
-    var body: some View {
-        Text(title)
-            .font(.footnote)
-            .textCase(.uppercase)
-            .foregroundStyle(palette.inkMuted)
-            .accessibilityAddTraits(.isHeader)
     }
 }
 
@@ -638,67 +530,6 @@ struct VdpiPressButtonStyle: ButtonStyle {
     }
 }
 
-/// Signature fractured-V geometric brand emblem matching the Android app.
-struct VdpiBrandMark: View {
-    @Environment(\.vdpiPalette) private var palette
-    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    var isActive: Bool
-
-    init(isActive: Bool = true) {
-        self.isActive = isActive
-    }
-
-    var body: some View {
-        let shape = RoundedRectangle(cornerRadius: 9, style: .continuous)
-
-        Canvas { ctx, size in
-            let w = size.width
-            let h = size.height
-            // Left V stroke (solid)
-            var left = Path()
-            left.move(to: CGPoint(x: w * 0.22, y: h * 0.26))
-            left.addLine(to: CGPoint(x: w * 0.48, y: h * 0.74))
-            ctx.stroke(
-                left,
-                with: .color(palette.inkPrimary),
-                style: StrokeStyle(lineWidth: 2.3, lineCap: .round)
-            )
-            // Right V stroke (fractured into 2 desynced segments)
-            var rightBottom = Path()
-            rightBottom.move(to: CGPoint(x: w * 0.50, y: h * 0.74))
-            rightBottom.addLine(to: CGPoint(x: w * 0.62, y: h * 0.52))
-            ctx.stroke(
-                rightBottom,
-                with: .color(palette.inkPrimary),
-                style: StrokeStyle(lineWidth: 2.3, lineCap: .round)
-            )
-            var rightTop = Path()
-            rightTop.move(to: CGPoint(x: w * 0.69, y: h * 0.39))
-            rightTop.addLine(to: CGPoint(x: w * 0.78, y: h * 0.26))
-            ctx.stroke(
-                rightTop,
-                with: .color(isActive ? palette.signal : palette.inkMuted),
-                style: StrokeStyle(lineWidth: 2.3, lineCap: .round)
-            )
-        }
-        .frame(width: 22, height: 22)
-        .frame(width: 32, height: 32)
-        .background(shape.fill(isActive ? palette.signalTint : palette.surfaceRaised))
-        .clipShape(shape)
-        .overlay {
-            if colorSchemeContrast == .increased {
-                shape
-                    .strokeBorder(palette.borderStrong, lineWidth: 1.0)
-                    .allowsHitTesting(false)
-            }
-        }
-        .animation(reduceMotion ? nil : VdpiMotion.cardShift, value: isActive)
-        .accessibilityHidden(true)
-    }
-}
-
 /// Apple prominent capsule action button (primary system fill or quiet tonal capsule).
 struct PrimaryActionButton: View {
     @Environment(\.vdpiPalette) private var palette
@@ -751,152 +582,7 @@ struct PrimaryActionButton: View {
             }
             .contentShape(Capsule())
         }
-        .buttonStyle(VdpiPressButtonStyle(haptic: .medium))
+        .buttonStyle(VdpiPressButtonStyle(haptic: nil))
         .disabled(isLoading)
-    }
-}
-
-struct GhostActionButton: View {
-    @Environment(\.vdpiPalette) private var palette
-    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
-
-    let title: String
-    let systemImage: String
-    let action: () -> Void
-
-    init(
-        title: String,
-        systemImage: String,
-        action: @escaping () -> Void
-    ) {
-        self.title = title
-        self.systemImage = systemImage
-        self.action = action
-    }
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 6) {
-                Image(systemName: systemImage)
-                    .font(.subheadline.weight(.medium))
-                Text(title)
-                    .font(.subheadline.weight(.medium))
-                    .lineLimit(1)
-            }
-            .frame(maxWidth: .infinity)
-            .frame(minHeight: 44)
-            .padding(.horizontal, 14)
-            .foregroundStyle(palette.inkPrimary)
-            .background(Capsule().fill(palette.surfaceRaised))
-            .clipShape(Capsule())
-            .overlay {
-                if colorSchemeContrast == .increased {
-                    Capsule()
-                        .strokeBorder(palette.borderStrong, lineWidth: 1.0)
-                        .allowsHitTesting(false)
-                }
-            }
-            .contentShape(Capsule())
-        }
-        .buttonStyle(VdpiPressButtonStyle(haptic: .light))
-    }
-}
-
-/// Clean non-nested key-value metric cell (no inner card border or glass).
-struct MetricTile: View {
-    @Environment(\.vdpiPalette) private var palette
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    let label: String
-    let value: String
-    let systemImage: String?
-
-    init(label: String, value: String, systemImage: String? = nil) {
-        self.label = label
-        self.value = value
-        self.systemImage = systemImage
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 5) {
-                if let systemImage {
-                    Image(systemName: systemImage)
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(palette.inkMuted)
-                }
-                Text(label)
-                    .font(.subheadline)
-                    .foregroundStyle(palette.inkSecondary)
-                    .lineLimit(1)
-            }
-
-            Text(value)
-                .font(.body.weight(.medium))
-                .monospacedDigit()
-                .foregroundStyle(palette.inkPrimary)
-                .lineLimit(1)
-                .minimumScaleFactor(0.8)
-                .contentTransition(.numericText())
-                .animation(reduceMotion ? nil : VdpiMotion.cardShift, value: value)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, 6)
-        .padding(.horizontal, 4)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(label): \(value)")
-    }
-}
-
-/// Quiet, crisp Apple status badge (solid dot + `.footnote` semibold text, zero neon glow).
-struct StatusPill: View {
-    @Environment(\.vdpiPalette) private var palette
-    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
-
-    let text: String
-    let tint: Color
-    let background: Color?
-    let border: Color?
-    let isPulsing: Bool
-
-    init(
-        text: String,
-        tint: Color,
-        background: Color? = nil,
-        border: Color? = nil,
-        isPulsing: Bool = false
-    ) {
-        self.text = text
-        self.tint = tint
-        self.background = background
-        self.border = border
-        self.isPulsing = isPulsing
-    }
-
-    var body: some View {
-        let resolvedBackground = background ?? tint.opacity(palette.isDark ? 0.16 : 0.12)
-
-        HStack(spacing: 6) {
-            Circle()
-                .fill(tint)
-                .frame(width: 7, height: 7)
-
-            Text(text)
-                .font(.footnote.weight(.semibold))
-                .foregroundStyle(tint)
-                .lineLimit(1)
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 5)
-        .background(Capsule().fill(resolvedBackground))
-        .clipShape(Capsule())
-        .overlay {
-            if colorSchemeContrast == .increased {
-                Capsule()
-                    .strokeBorder(border ?? tint.opacity(0.55), lineWidth: 1.0)
-                    .allowsHitTesting(false)
-            }
-        }
-        .accessibilityElement(children: .combine)
     }
 }

@@ -44,8 +44,8 @@ enum class ThemePreference(val wireName: String, val label: String) {
 
     companion object {
         fun fromWire(raw: String?): ThemePreference {
-            if (raw == null) return DARK
-            return entries.firstOrNull { it.wireName == raw || it.name == raw } ?: DARK
+            if (raw == null) return SYSTEM
+            return entries.firstOrNull { it.wireName == raw || it.name == raw } ?: SYSTEM
         }
     }
 }
@@ -60,7 +60,7 @@ data class VdpiSettings(
     val bypassDomains: List<String> = emptyList(),
     val splitTunnelMode: SplitTunnelMode = SplitTunnelMode.BYPASS_SELECTED,
     val splitPackages: Set<String> = emptySet(),
-    val theme: ThemePreference = ThemePreference.DARK,
+    val theme: ThemePreference = ThemePreference.SYSTEM,
 ) {
     fun toNativeConfig(): NativeEngineConfig = NativeEngineConfig(
         mode = desyncMode,

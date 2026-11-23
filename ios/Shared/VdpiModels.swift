@@ -20,10 +20,10 @@ public enum DesyncMode: String, CaseIterable, Codable, Identifiable, Sendable {
 
     public var subtitle: String {
         switch self {
-        case .combo: return "Adaptive 7-stage multi-record + OOB desync"
-        case .tlsRecord: return "RFC-compliant multi-record ClientHello split"
-        case .fragment: return "Paced single-record TCP fragmentation"
-        case .split: return "Classic 2-segment SNI midpoint split"
+        case .combo: return "4-record TLS split + adaptive 7-stage auto-heal"
+        case .tlsRecord: return "Split ClientHello across two RFC TLS records"
+        case .fragment: return "Single outer TLS record sliced at SNI boundaries"
+        case .split: return "Initial chunk-byte TCP split on first flight"
         }
     }
 }
@@ -156,7 +156,7 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
         mtu: Int = 1400,
         bypassDomains: [String] = [],
         onDemandEnabled: Bool = false,
-        theme: ThemePreference = .dark
+        theme: ThemePreference = .system
     ) {
         self.desyncMode = desyncMode
         self.chunkSize = max(1, min(64, chunkSize))
@@ -183,7 +183,7 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
         self.mtu = max(1280, min(9000, rawMtu))
         self.bypassDomains = try c.decodeIfPresent([String].self, forKey: .bypassDomains) ?? []
         self.onDemandEnabled = try c.decodeIfPresent(Bool.self, forKey: .onDemandEnabled) ?? false
-        self.theme = try c.decodeIfPresent(ThemePreference.self, forKey: .theme) ?? .dark
+        self.theme = try c.decodeIfPresent(ThemePreference.self, forKey: .theme) ?? .system
     }
 
     public var clampedChunkSize: Int {

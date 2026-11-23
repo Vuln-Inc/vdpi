@@ -39,8 +39,11 @@ pub extern "system" fn Java_com_vulninc_vdpi_engine_NativeEngine_nativeStart(
     tun_fd: jint,
     config_json: JString,
 ) -> jstring {
-    // Adopt TUN fd ownership immediately so every error or panic path closes it via Drop.
+    // Adopt TUN fd ownership immediately before any fallible JNI call so every
+    // early error return or panic automatically closes the detached fd via Drop.
     let owned_fd = if tun_fd >= 0 {
+        // SAFETY: `tun_fd` is non-negative and exclusively detached by Android's
+        // `ParcelFileDescriptor.detachFd()` for transfer into native ownership.
         Some(unsafe { OwnedFd::from_raw_fd(tun_fd) })
     } else {
         None

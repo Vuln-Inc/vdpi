@@ -28,6 +28,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var stopping = false
     private var lastPathSignature: String?
     private var pathMonitor: NWPathMonitor?
+    private var pathUpdateWorkItem: DispatchWorkItem?
+    private var pathUpdateGeneration: UInt64 = 0
 
     private let lifecycleQueue = DispatchQueue(label: "com.vulninc.vdpi.tunnel.lifecycle", qos: .userInitiated)
     private let doctorQueue = DispatchQueue(label: "com.vulninc.vdpi.tunnel.doctor", qos: .utility)
@@ -243,23 +245,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         stopPathMonitoring()
         let monitor = NWPathMonitor(prohibitedInterfaceTypes: [.other])
         monitor.pathUpdateHandler = { [weak self] path in
-            guard let self, self.isRunning, path.status == .satisfied else { return }
-            let signature = path.availableInterfaces
-                .map { "\($0.name):\($0.type)" }
-                .sorted()
-                .joined(separator: ",")
-
-            self.stateLock.lock()
-            let previous = self.lastPathSignature
-            self.lastPathSignature = signature
-            self.stateLock.unlock()
-
-            if let previous, previous != signature {
-                self.lifecycleQueue.async { [weak self] in
-                    guard let self, self.isRunning else { return }
-                    VdpiNativeBridge.clearCache()
-                }
-            }
+            self?.handlePathUpdate(path)
         }
         stateLock.lock()
         pathMonitor = monitor
@@ -267,12 +253,65 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         monitor.start(queue: monitorQueue)
     }
 
+    private func handlePathUpdate(_ path: NWPath) {
+        guard isRunning, path.status == .satisfied else { return }
+        let signature = path.availableInterfaces
+            .map { "\($0.name):\($0.type)" }
+            .sorted()
+            .joined(separator: ",")
+
+        stateLock.lock()
+        if lastPathSignature == nil {
+            lastPathSignature = signature
+            stateLock.unlock()
+            return
+        }
+        if lastPathSignature == signature {
+            let pending = pathUpdateWorkItem
+            pathUpdateWorkItem = nil
+            pathUpdateGeneration &+= 1
+            stateLock.unlock()
+            pending?.cancel()
+            return
+        }
+
+        let previousPending = pathUpdateWorkItem
+        pathUpdateGeneration &+= 1
+        let generation = pathUpdateGeneration
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, self.isRunning else { return }
+            self.stateLock.lock()
+            guard self.pathUpdateGeneration == generation else {
+                self.stateLock.unlock()
+                return
+            }
+            self.pathUpdateWorkItem = nil
+            let previous = self.lastPathSignature
+            self.lastPathSignature = signature
+            self.stateLock.unlock()
+
+            if previous != signature {
+                VdpiNativeBridge.clearCache()
+            }
+        }
+        pathUpdateWorkItem = workItem
+        stateLock.unlock()
+
+        previousPending?.cancel()
+        lifecycleQueue.asyncAfter(deadline: .now() + .milliseconds(300), execute: workItem)
+    }
+
     private func stopPathMonitoring() {
         stateLock.lock()
         let monitor = pathMonitor
+        let pending = pathUpdateWorkItem
         pathMonitor = nil
+        pathUpdateWorkItem = nil
+        pathUpdateGeneration &+= 1
         lastPathSignature = nil
         stateLock.unlock()
+        pending?.cancel()
         monitor?.cancel()
     }
 }

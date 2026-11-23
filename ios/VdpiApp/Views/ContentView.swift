@@ -34,13 +34,25 @@ struct ContentView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorSchemeContrast) private var colorSchemeContrast
+    @Environment(\.layoutDirection) private var layoutDirection
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     @State private var selectedTab: VdpiTab = .tunnel
     @State private var popupDragOffset: CGFloat = 0
     @State private var bottomSafeInset: CGFloat = 0
     @State private var isKeyboardVisible: Bool = false
     @State private var tabBarWidth: CGFloat = 248
+    @State private var isDraggingTabBar: Bool = false
     @Namespace private var tabBarNamespace
+
+    private var isCompactHeight: Bool {
+        verticalSizeClass == .compact
+    }
+
+    private var contentMaxWidth: CGFloat {
+        (isCompactHeight || horizontalSizeClass == .regular) ? 980 : 680
+    }
 
     private var showReconnectPopup: Bool {
         (manager.phase == .connected || manager.phase == .connecting)
@@ -52,21 +64,35 @@ struct ContentView: View {
     }
 
     private var tabBarBottomOffset: CGFloat {
-        bottomSafeInset > 0 ? max(bottomSafeInset - 12, 12) : 12
+        if isCompactHeight {
+            return max(bottomSafeInset - 6, 8)
+        }
+        return bottomSafeInset > 0 ? max(bottomSafeInset - 12, 12) : 12
     }
 
     private var bottomScrimHeight: CGFloat {
-        showAccessoryPill
+        if isCompactHeight {
+            return showAccessoryPill
+                ? tabBarBottomOffset + 120
+                : max(72, tabBarBottomOffset + 72)
+        }
+        return showAccessoryPill
             ? tabBarBottomOffset + 148
             : max(96, tabBarBottomOffset + 90)
     }
 
     private var topContentInset: CGFloat {
-        showReconnectPopup ? 76 : 0
+        guard showReconnectPopup else { return 0 }
+        return isCompactHeight ? 62 : 76
     }
 
     private var bottomContentInset: CGFloat {
-        showAccessoryPill
+        if isCompactHeight {
+            return showAccessoryPill
+                ? tabBarBottomOffset + 108
+                : tabBarBottomOffset + 60
+        }
+        return showAccessoryPill
             ? tabBarBottomOffset + 136
             : tabBarBottomOffset + 78
     }
@@ -123,7 +149,7 @@ struct ContentView: View {
                     .allowsHitTesting(selectedTab == .settings)
                     .accessibilityHidden(selectedTab != .settings)
             }
-            .frame(maxWidth: 680, maxHeight: .infinity)
+            .frame(maxWidth: contentMaxWidth, maxHeight: .infinity)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .background(safeAreaReader)
@@ -148,7 +174,7 @@ struct ContentView: View {
             if showReconnectPopup {
                 reconnectPopup
                     .padding(.horizontal, 16)
-                    .padding(.top, 8)
+                    .padding(.top, isCompactHeight ? 4 : 8)
                     .transition(popupTransition)
             }
         }
@@ -280,9 +306,9 @@ struct ContentView: View {
         }
         .padding(.leading, 14)
         .padding(.trailing, 4)
-        .padding(.vertical, 6)
-        .frame(minHeight: 56)
-        .frame(maxWidth: 420)
+        .padding(.vertical, isCompactHeight ? 2 : 6)
+        .frame(minHeight: isCompactHeight ? 48 : 56)
+        .frame(maxWidth: 460)
         .vdpiGlass(in: Capsule(), tier: .elevated)
         .dynamicTypeSize(...DynamicTypeSize.xLarge)
         .offset(y: popupDragOffset)
@@ -331,13 +357,15 @@ struct ContentView: View {
     // MARK: - Z20: Bottom Floating HUD Stack
 
     private var bottomDockStack: some View {
-        VStack(spacing: 8) {
+        let stackSpacing: CGFloat = isCompactHeight ? 6 : 8
+
+        return VStack(spacing: stackSpacing) {
             if let toast = manager.toastMessage {
                 toastPill(toast)
                     .transition(bottomItemTransition)
             }
 
-            VdpiGlassGroupContainer(spacing: 8) {
+            VdpiGlassGroupContainer(spacing: stackSpacing) {
                 if showAccessoryPill {
                     liveTunnelAccessoryPill
                         .transition(bottomItemTransition)
@@ -363,7 +391,7 @@ struct ContentView: View {
                 .lineLimit(2)
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 10)
+        .padding(.vertical, isCompactHeight ? 8 : 10)
         .vdpiGlass(in: Capsule(), tier: .elevated)
         .dynamicTypeSize(...DynamicTypeSize.accessibility2)
         .padding(.horizontal, 12)
@@ -374,6 +402,7 @@ struct ContentView: View {
     private var liveTunnelAccessoryPill: some View {
         let isStopping = manager.phase == .disconnecting
         let isError = manager.phase == .error
+        let pillMinHeight: CGFloat = isCompactHeight ? 44 : 50
 
         return HStack(spacing: 10) {
             Button {
@@ -406,7 +435,7 @@ struct ContentView: View {
 
                     Spacer(minLength: 4)
                 }
-                .frame(maxWidth: .infinity, minHeight: 50, alignment: .leading)
+                .frame(maxWidth: .infinity, minHeight: pillMinHeight, alignment: .leading)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -418,7 +447,7 @@ struct ContentView: View {
                 ZStack {
                     Circle()
                         .fill(palette.inkPrimary.opacity(palette.isDark ? 0.12 : 0.10))
-                        .frame(width: 34, height: 34)
+                        .frame(width: isCompactHeight ? 32 : 34, height: isCompactHeight ? 32 : 34)
 
                     if isStopping {
                         ProgressView()
@@ -440,8 +469,8 @@ struct ContentView: View {
         }
         .padding(.leading, 14)
         .padding(.trailing, 3)
-        .frame(minHeight: 50)
-        .frame(maxWidth: 380)
+        .frame(minHeight: pillMinHeight)
+        .frame(maxWidth: 360)
         .vdpiGlass(in: Capsule(), tier: .elevated, interactive: true)
         .dynamicTypeSize(...DynamicTypeSize.xLarge)
     }
@@ -493,43 +522,54 @@ struct ContentView: View {
                 Button {
                     selectTab(tab)
                 } label: {
-                    VStack(spacing: 2) {
-                        Image(systemName: tab.systemImage(selected: isSelected))
-                            .font(.system(size: 20, weight: isSelected ? .semibold : .medium))
-                            .overlay(alignment: .topTrailing) {
-                                if tab == .tunnel, let dotColor = tunnelTabStatusDotColor {
-                                    Circle()
-                                        .fill(dotColor)
-                                        .frame(width: 6, height: 6)
-                                        .offset(x: 5, y: -2)
-                                        .accessibilityHidden(true)
-                                }
+                    tabSlotContent(for: tab, isSelected: isSelected)
+                        .foregroundStyle(isSelected ? palette.accent : palette.inkPrimary.opacity(0.62))
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background {
+                            if isSelected {
+                                tabBarLens
+                                    .scaleEffect(
+                                        x: (!reduceMotion && isDraggingTabBar) ? 1.07 : 1.0,
+                                        y: (!reduceMotion && isDraggingTabBar) ? 1.05 : 1.0
+                                    )
+                                    .animation(
+                                        reduceMotion ? nil : .spring(response: 0.28, dampingFraction: 0.72),
+                                        value: isDraggingTabBar
+                                    )
+                                    .matchedGeometryEffect(id: "vdpi.tab.lens", in: tabBarNamespace)
                             }
-
-                        Text(tab.title)
-                            .font(.caption2.weight(.medium))
-                            .dynamicTypeSize(...DynamicTypeSize.large)
-                            .lineLimit(1)
-                    }
-                    .foregroundStyle(isSelected ? palette.accent : palette.inkPrimary.opacity(0.60))
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background {
-                        if isSelected {
-                            tabBarLens
-                                .matchedGeometryEffect(id: "vdpi.tab.lens", in: tabBarNamespace)
                         }
-                    }
-                    .contentShape(Capsule())
+                        .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(tabAccessibilityLabel(for: tab))
                 .accessibilityAddTraits(isSelected ? .isSelected : [])
             }
         }
-        .padding(5)
-        .frame(maxWidth: 248)
-        .frame(height: 62)
+        .padding(isCompactHeight ? 3.5 : 4)
+        .frame(maxWidth: isCompactHeight ? 280 : 264)
+        .frame(height: isCompactHeight ? 48 : 62)
         .vdpiGlass(in: Capsule(), tier: .elevated)
+        .overlay(
+            Capsule()
+                .strokeBorder(
+                    LinearGradient(
+                        colors: palette.isDark
+                            ? [Color.white.opacity(0.36), Color.white.opacity(0.08), Color.white.opacity(0.16)]
+                            : [Color.white.opacity(0.95), Color.white.opacity(0.45), Color.white.opacity(0.65)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    lineWidth: colorSchemeContrast == .increased ? 1.0 : 0.75
+                )
+                .allowsHitTesting(false)
+        )
+        .shadow(
+            color: Color.black.opacity(palette.isDark ? 0.24 : 0.10),
+            radius: 18,
+            x: 0,
+            y: 8
+        )
         .background(
             GeometryReader { proxy in
                 Color.clear
@@ -544,34 +584,99 @@ struct ContentView: View {
         .simultaneousGesture(
             DragGesture(minimumDistance: 14, coordinateSpace: .local)
                 .onChanged { value in
+                    guard !tabs.isEmpty else { return }
                     guard abs(value.translation.width) > abs(value.translation.height) else { return }
-                    let segmentWidth = tabBarWidth / CGFloat(max(tabs.count, 1))
-                    let rawIndex = Int(value.location.x / max(segmentWidth, 1))
-                    let clampedIndex = min(max(rawIndex, 0), tabs.count - 1)
-                    selectTab(tabs[clampedIndex])
+                    if !isDraggingTabBar { isDraggingTabBar = true }
+                    let segmentWidth = tabBarWidth / CGFloat(tabs.count)
+                    let rawIdx = min(max(Int(value.location.x / max(segmentWidth, 1)), 0), tabs.count - 1)
+                    let targetIndex = layoutDirection == .rightToLeft ? (tabs.count - 1 - rawIdx) : rawIdx
+                    selectTab(tabs[targetIndex])
+                }
+                .onEnded { _ in
+                    isDraggingTabBar = false
                 }
         )
     }
 
+    @ViewBuilder
+    private func tabSlotContent(for tab: VdpiTab, isSelected: Bool) -> some View {
+        if isCompactHeight {
+            HStack(spacing: 6) {
+                Image(systemName: tab.systemImage(selected: isSelected))
+                    .font(.system(size: 16, weight: .semibold))
+                    .overlay(alignment: .topTrailing) {
+                        if tab == .tunnel, let dotColor = tunnelTabStatusDotColor {
+                            Circle()
+                                .fill(dotColor)
+                                .frame(width: 6, height: 6)
+                                .offset(x: 3, y: -2)
+                                .accessibilityHidden(true)
+                        }
+                    }
+
+                Text(tab.title)
+                    .font(.caption.weight(isSelected ? .semibold : .medium))
+                    .dynamicTypeSize(...DynamicTypeSize.large)
+                    .lineLimit(1)
+            }
+        } else {
+            VStack(spacing: 3) {
+                Image(systemName: tab.systemImage(selected: isSelected))
+                    .font(.system(size: 20, weight: isSelected ? .semibold : .medium))
+                    .overlay(alignment: .topTrailing) {
+                        if tab == .tunnel, let dotColor = tunnelTabStatusDotColor {
+                            Circle()
+                                .fill(dotColor)
+                                .frame(width: 6, height: 6)
+                                .offset(x: 5, y: -2)
+                                .accessibilityHidden(true)
+                        }
+                    }
+
+                Text(tab.title)
+                    .font(.caption2.weight(isSelected ? .semibold : .medium))
+                    .dynamicTypeSize(...DynamicTypeSize.large)
+                    .lineLimit(1)
+            }
+        }
+    }
+
     private var tabBarLens: some View {
-        let rimColor: Color = colorSchemeContrast == .increased
-            ? palette.borderStrong
-            : (palette.isDark ? Color.white.opacity(0.26) : Color.black.opacity(0.06))
-        let rimWidth: CGFloat = colorSchemeContrast == .increased ? 1.0 : 0.5
+        let rimGradient = LinearGradient(
+            colors: colorSchemeContrast == .increased
+                ? [palette.borderStrong, palette.borderStrong]
+                : (palette.isDark
+                    ? [Color.white.opacity(0.38), Color.white.opacity(0.06), Color.white.opacity(0.14)]
+                    : [Color.white, Color.white.opacity(0.65), Color.black.opacity(0.06)]),
+            startPoint: .top,
+            endPoint: .bottom
+        )
+        let rimWidth: CGFloat = colorSchemeContrast == .increased ? 1.0 : 0.67
 
         return Capsule()
-            .fill(reduceTransparency ? palette.surface : palette.glassLensFill)
-            .overlay {
-                if !reduceTransparency {
-                    Capsule()
-                        .fill(palette.topSheenGradient)
-                        .allowsHitTesting(false)
-                }
-            }
+            .fill(
+                reduceTransparency
+                    ? AnyShapeStyle(palette.surface)
+                    : AnyShapeStyle(
+                        LinearGradient(
+                            colors: palette.isDark
+                                ? [Color.white.opacity(0.16), Color.white.opacity(0.07)]
+                                : [Color.white.opacity(0.94), Color.white.opacity(0.80)],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+            )
             .overlay(
                 Capsule()
-                    .strokeBorder(rimColor, lineWidth: rimWidth)
+                    .strokeBorder(rimGradient, lineWidth: rimWidth)
                     .allowsHitTesting(false)
+            )
+            .shadow(
+                color: palette.isDark ? .clear : Color.black.opacity(0.08),
+                radius: palette.isDark ? 0 : 6,
+                x: 0,
+                y: palette.isDark ? 0 : 2
             )
     }
 
@@ -665,13 +770,6 @@ private struct AccessoryStopButtonStyle: ButtonStyle {
                 .scaleEffect(configuration.isPressed && !reduceMotion ? 0.92 : 1.0)
                 .opacity(configuration.isPressed ? 0.84 : 1.0)
                 .animation(reduceMotion ? nil : VdpiMotion.press, value: configuration.isPressed)
-                .vdpiOnChange(of: configuration.isPressed) { isPressed in
-                    if isPressed {
-                        Task { @MainActor in
-                            VdpiHaptics.trigger(.medium)
-                        }
-                    }
-                }
         }
     }
 }

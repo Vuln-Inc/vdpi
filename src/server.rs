@@ -10,8 +10,9 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinSet;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
+pub const REPOSITORY_URL: &str = "https://github.com/Vuln-Inc/vdpi";
 const PRIMARY_FALLBACK_PORTS: &[u16] = &[18080, 18081, 18082, 28080, 38080, 48080];
 const SOCKS_FALLBACK_PORTS: &[u16] = &[11080, 11081, 11082, 21080, 31080, 41080];
 const MAX_CLIENT_SESSIONS: usize = 256;
@@ -40,7 +41,13 @@ pub fn bind_listeners(ctx: &EngineContext) -> Result<BoundListeners> {
         )
     })?;
 
-    if ctx.config.port != 0 && primary_addr.port() != ctx.config.port {
+    if ctx.config.port == 0 {
+        debug!(
+            actual = primary_addr.port(),
+            addr = %primary_addr,
+            "bound primary listener on ephemeral port"
+        );
+    } else if primary_addr.port() != ctx.config.port {
         warn!(
             requested = ctx.config.port,
             actual = primary_addr.port(),
@@ -60,7 +67,13 @@ pub fn bind_listeners(ctx: &EngineContext) -> Result<BoundListeners> {
             Some(primary_addr.port()),
         ) {
             Ok((listener, addr)) => {
-                if sp != 0 && addr.port() != sp {
+                if sp == 0 {
+                    debug!(
+                        actual = addr.port(),
+                        addr = %addr,
+                        "bound SOCKS5 listener on ephemeral port"
+                    );
+                } else if addr.port() != sp {
                     warn!(
                         requested = sp,
                         actual = addr.port(),
@@ -163,6 +176,18 @@ pub async fn serve_until_shutdown(
     ctx: EngineContext,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
+    if !ctx.config.quiet {
+        let primary = listeners
+            .primary_listener
+            .local_addr()
+            .unwrap_or(listeners.primary_addr);
+        info!(
+            version = env!("CARGO_PKG_VERSION"),
+            source = REPOSITORY_URL,
+            primary = %primary,
+            "vdpi proxy listening"
+        );
+    }
     serve_with_limit(listeners, ctx, shutdown_rx, MAX_CLIENT_SESSIONS).await;
     Ok(())
 }
@@ -173,14 +198,23 @@ async fn serve_with_limit(
     shutdown_rx: watch::Receiver<bool>,
     limit: usize,
 ) {
+    let primary_addr = listeners
+        .primary_listener
+        .local_addr()
+        .unwrap_or(listeners.primary_addr);
+    let socks_addr = listeners
+        .socks_listener
+        .as_ref()
+        .and_then(|listener| listener.local_addr().ok())
+        .or(listeners.socks_addr);
     ctx.listener_addrs = [
-        Some(listeners.primary_addr),
-        listeners.socks_addr,
-        ipv4_companion(&listeners.primary_listener, listeners.primary_addr),
+        Some(primary_addr),
+        socks_addr,
+        ipv4_companion(&listeners.primary_listener, primary_addr),
         listeners
             .socks_listener
             .as_ref()
-            .zip(listeners.socks_addr)
+            .zip(socks_addr)
             .and_then(|(listener, addr)| ipv4_companion(listener, addr)),
     ];
     let slots = Arc::new(Semaphore::new(limit));
@@ -384,5 +418,46 @@ mod tests {
             .port();
         assert_ne!(socks_port, s0);
         assert_ne!(socks_port, bound.primary_addr.port());
+    }
+
+    #[tokio::test]
+    async fn ephemeral_port_zero_uses_os_assigned_ports_and_guards_self_loops() {
+        timeout(TEST_TIMEOUT, async {
+            let ctx = test_context("127.0.0.1");
+            let mut bound = bind_listeners(&ctx).unwrap();
+            let actual_primary = bound.primary_listener.local_addr().unwrap();
+            let actual_socks = bound
+                .socks_listener
+                .as_ref()
+                .unwrap()
+                .local_addr()
+                .unwrap();
+
+            assert_ne!(actual_primary.port(), 0);
+            assert_eq!(bound.primary_addr, actual_primary);
+            assert_ne!(actual_socks.port(), 0);
+            assert_eq!(bound.socks_addr, Some(actual_socks));
+
+            // Even if BoundListeners carries a stale 0 port, serve_with_limit must populate
+            // listener_addrs from the live listener's local_addr() so self-loops are blocked.
+            bound.primary_addr.set_port(0);
+            let (stop, rx) = watch::channel(false);
+            let server = tokio::spawn(serve_until_shutdown(bound, ctx, rx));
+
+            let mut stream = TcpStream::connect(actual_primary).await.unwrap();
+            let crlf = "\x0d\x0a";
+            let request = format!(
+                "CONNECT {actual_primary} HTTP/1.1{crlf}Host: {actual_primary}{crlf}{crlf}"
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            assert!(response.starts_with(b"HTTP/1.1 502 "));
+
+            stop.send(true).unwrap();
+            server.await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
     }
 }

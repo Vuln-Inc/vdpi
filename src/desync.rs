@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
-use tokio::io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{
+    copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, Interest, ReadBuf,
+};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tracing::debug;
@@ -1111,8 +1113,6 @@ async fn write_multi_record_oob(
 }
 
 async fn send_with_oob(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
-    use tokio::io::Interest;
-
     if data.is_empty() {
         return Ok(());
     }
@@ -1565,5 +1565,29 @@ mod tests {
         assert_eq!(snap.tls_handshakes, 1);
         assert!(snap.bytes_tx >= ch.len() as u64);
         assert!(snap.bytes_rx >= 10);
+    }
+
+    #[tokio::test]
+    async fn send_with_oob_delivers_payload_and_strips_urgent_byte() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            sock.read_to_end(&mut received).await.unwrap();
+            received
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.set_nodelay(true).unwrap();
+        send_with_oob(&mut client, b"").await.unwrap();
+        send_with_oob(&mut client, b"PINGa").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        client.write_all(b"PONG").await.unwrap();
+        drop(client);
+
+        let received = server.await.unwrap();
+        assert_eq!(received, b"PINGPONG");
     }
 }

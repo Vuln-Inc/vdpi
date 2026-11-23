@@ -251,7 +251,6 @@ final class TunnelManager: ObservableObject {
         if phase == .connected,
            let session = vpnManager?.connection as? NETunnelProviderSession
         {
-            let previousApplied = appliedConfig?.canonicalized()
             reloadGeneration &+= 1
             let generation = reloadGeneration
             isReloading = true
@@ -273,15 +272,11 @@ final class TunnelManager: ObservableObject {
                    response.ok
                 {
                     let persisted = VdpiAppGroup.loadAppliedConfig()?.canonicalized()
-                    let targetConfig = target.toNativeConfig()
-                    let applied: NativeEngineConfig
-                    if let persisted, persisted != previousApplied {
-                        applied = persisted
-                    } else {
-                        applied = targetConfig
-                    }
+                    let applied = persisted ?? target.toNativeConfig()
                     self.appliedConfig = applied
-                    VdpiAppGroup.saveAppliedConfig(applied)
+                    if persisted == nil {
+                        VdpiAppGroup.saveAppliedConfig(applied)
+                    }
                     self.clearPendingReconnect()
                     // Re-check in case another runtime setting changed while reload was in flight.
                     if self.settings.requiresTunnelReload(comparedToApplied: applied) {
@@ -334,8 +329,9 @@ final class TunnelManager: ObservableObject {
         connect()
     }
 
-    func clearCache() {
-        guard clearCacheTask == nil else { return }
+    @discardableResult
+    func clearCache() -> Bool {
+        guard clearCacheTask == nil else { return false }
         if phase == .connected,
            let session = vpnManager?.connection as? NETunnelProviderSession
         {
@@ -353,8 +349,10 @@ final class TunnelManager: ObservableObject {
                     self.showToast("Could not reach tunnel extension")
                 }
             }
+            return true
         } else {
             showToast("Cache resets automatically when disconnected")
+            return false
         }
     }
 

@@ -68,14 +68,13 @@ val LocalTopOverlayPadding = compositionLocalOf { 0.dp }
 val LocalGlassBackdropLayer = compositionLocalOf<GraphicsLayer?> { null }
 val LocalReduceTransparency = compositionLocalOf { false }
 val LocalIncreaseContrast = compositionLocalOf { false }
+val LocalReduceMotion = compositionLocalOf { false }
 
 object VdpiMotion {
     val tabLensSpring = spring<Dp>(dampingRatio = 0.78f, stiffness = 360f)
-    val tabLensFloatSpring = spring<Float>(dampingRatio = 0.78f, stiffness = 360f)
     val pressSpring = spring<Float>(dampingRatio = 0.85f, stiffness = 800f)
     val toggleSpring = spring<Float>(dampingRatio = 0.78f, stiffness = 620f)
     val popupSpring = spring<IntOffset>(dampingRatio = 0.82f, stiffness = 340f)
-    val miniBarSpring = spring<IntOffset>(dampingRatio = 0.86f, stiffness = 340f)
 }
 
 @RequiresApi(Build.VERSION_CODES.S)
@@ -88,6 +87,7 @@ fun Modifier.springPress(
     interactionSource: MutableInteractionSource,
     pressedScale: Float = 0.97f,
 ): Modifier = composed {
+    if (LocalReduceMotion.current) return@composed this
     val isPressed by interactionSource.collectIsPressedAsState()
     val scale by animateFloatAsState(
         targetValue = if (isPressed) pressedScale else 1f,
@@ -118,10 +118,11 @@ fun Modifier.liquidGlass(
     val increaseContrast = LocalIncreaseContrast.current
 
     if (reduceTransparency) {
+        val solidFill = if (palette.isDark) Color(0xEB1C1C1E) else Color(0xF2FFFFFF)
         val borderColor = if (increaseContrast) palette.borderStrong else palette.border
         return@composed this
             .clip(shape)
-            .background(palette.surface)
+            .background(solidFill)
             .border(width = 1.dp, color = borderColor, shape = shape)
     }
 
@@ -130,7 +131,7 @@ fun Modifier.liquidGlass(
     val useRealBlur = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && backdropLayer != null
     val blurLayer = if (useRealBlur) rememberGraphicsLayer() else null
     val blurRadiusPx = remember(density) {
-        with(density) { 22.dp.toPx() }
+        with(density) { 16.dp.toPx() }
     }
     val cachedBlurEffect = remember(useRealBlur, blurRadiusPx) {
         if (useRealBlur && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -141,26 +142,39 @@ fun Modifier.liquidGlass(
     }
     var boundsInRoot by remember { mutableStateOf(Rect.Zero) }
 
-    val baseFill = fillTint ?: if (elevated) palette.glassFillElevated else palette.glassFill
+    val rawFill = fillTint ?: if (elevated) palette.glassFillElevated else palette.glassFill
+    val baseFill = if (useRealBlur || fillTint != null) {
+        rawFill
+    } else {
+        rawFill.copy(alpha = (rawFill.alpha + 0.16f).coerceAtMost(0.92f))
+    }
     val topFill = baseFill.copy(
-        alpha = (baseFill.alpha * if (palette.isDark) 1.04f else 1.03f).coerceAtMost(0.95f),
+        alpha = (baseFill.alpha * if (palette.isDark) 1.03f else 1.04f).coerceAtMost(0.95f),
     )
     val bottomFill = baseFill.copy(
-        alpha = (baseFill.alpha * if (palette.isDark) 0.92f else 0.96f).coerceAtLeast(0.08f),
+        alpha = (baseFill.alpha * if (palette.isDark) 0.90f else 0.94f).coerceAtLeast(0.08f),
     )
     val bodyBrush = remember(topFill, bottomFill) {
         Brush.verticalGradient(colors = listOf(topFill, bottomFill))
     }
 
-    val sheenTop = remember(palette.isDark) {
-        Color.White.copy(alpha = if (palette.isDark) 0.06f else 0.22f)
+    // Subtle top specular + gentle bottom inner light bounce without clouding dark-mode active pill.
+    val sheenTopAlpha = if (palette.isDark) 0.045f else 0.24f
+    val sheenBottomAlpha = if (palette.isDark) 0.025f else 0.12f
+    val sheenBrush = remember(sheenTopAlpha, sheenBottomAlpha) {
+        Brush.verticalGradient(
+            0.00f to Color.White.copy(alpha = sheenTopAlpha),
+            0.26f to Color.Transparent,
+            0.78f to Color.Transparent,
+            1.00f to Color.White.copy(alpha = sheenBottomAlpha),
+        )
     }
 
     val rimTop = if (rimTint != null) {
         lerp(
             palette.glassRimTop,
-            rimTint.copy(alpha = if (palette.isDark) 0.42f else 0.36f),
-            0.40f,
+            rimTint.copy(alpha = if (palette.isDark) 0.44f else 0.42f),
+            0.38f,
         )
     } else {
         palette.glassRimTop
@@ -168,7 +182,7 @@ fun Modifier.liquidGlass(
     val rimSide = if (rimTint != null) {
         lerp(
             palette.glassRimSide,
-            rimTint.copy(alpha = if (palette.isDark) 0.18f else 0.16f),
+            rimTint.copy(alpha = if (palette.isDark) 0.16f else 0.20f),
             0.35f,
         )
     } else {
@@ -177,29 +191,30 @@ fun Modifier.liquidGlass(
     val rimBottom = if (rimTint != null) {
         lerp(
             palette.glassRimBottom,
-            rimTint.copy(alpha = if (palette.isDark) 0.24f else 0.20f),
+            rimTint.copy(alpha = if (palette.isDark) 0.24f else 0.28f),
             0.35f,
         )
     } else {
         palette.glassRimBottom
     }
 
+    // Apple iOS 26 Liquid Glass catchlight rim: bright top specular, refractive middle, bottom bounce.
     val rimBrush = remember(rimTop, rimSide, rimBottom) {
         Brush.verticalGradient(
             0.00f to rimTop,
             0.38f to rimSide,
-            0.78f to rimSide,
+            0.74f to rimSide,
             1.00f to rimBottom,
         )
     }
 
     val neutralShadow = remember(palette.isDark) {
-        Color.Black.copy(alpha = if (palette.isDark) 0.48f else 0.14f)
+        Color.Black.copy(alpha = if (palette.isDark) 0.56f else 0.16f)
     }
 
     val shadowModifier = if (elevated) {
         Modifier.shadow(
-            elevation = if (palette.isDark) 12.dp else 8.dp,
+            elevation = if (palette.isDark) 14.dp else 10.dp,
             shape = shape,
             clip = false,
             ambientColor = neutralShadow,
@@ -235,8 +250,8 @@ fun Modifier.liquidGlass(
                 cachedBlurEffect != null &&
                 backdropLayer.size.width > 0 &&
                 backdropLayer.size.height > 0 &&
-                size.width >= 1f &&
-                size.height >= 1f &&
+                size.width >= 32f &&
+                size.height >= 32f &&
                 !boundsInRoot.isEmpty
             ) {
                 runCatching {
@@ -257,56 +272,10 @@ fun Modifier.liquidGlass(
             drawRect(brush = bodyBrush)
 
             if (size.height > 0f) {
-                drawRect(
-                    brush = Brush.verticalGradient(
-                        colorStops = arrayOf(
-                            0.00f to sheenTop,
-                            0.30f to Color.Transparent,
-                        ),
-                        startY = 0f,
-                        endY = size.height,
-                    ),
-                )
+                drawRect(brush = sheenBrush)
             }
         }
         .then(borderModifier)
-}
-
-@Composable
-fun FloatingGlassCapsule(
-    modifier: Modifier = Modifier,
-    rimTint: Color? = null,
-    fillTint: Color? = null,
-    elevated: Boolean = true,
-    content: @Composable BoxScope.() -> Unit,
-) {
-    Box(
-        modifier = modifier.liquidGlass(
-            shape = CircleShape,
-            elevated = elevated,
-            rimTint = rimTint,
-            fillTint = fillTint,
-        ),
-        contentAlignment = Alignment.Center,
-        content = content,
-    )
-}
-
-@Composable
-fun LiquidGlassCapsule(
-    modifier: Modifier = Modifier,
-    rimTint: Color? = null,
-    fillTint: Color? = null,
-    elevated: Boolean = true,
-    content: @Composable BoxScope.() -> Unit,
-) {
-    FloatingGlassCapsule(
-        modifier = modifier,
-        rimTint = rimTint,
-        fillTint = fillTint,
-        elevated = elevated,
-        content = content,
-    )
 }
 
 @Composable
@@ -380,8 +349,8 @@ fun FloatingGlassIconButton(
 }
 
 /**
- * Apple HIG Scroll Edge Effect: dissolves scrolled content smoothly into the canvas edge
- * beneath floating chrome using a multi-stop EaseInCubic falloff.
+ * Apple HIG Scroll Edge Effect: dissolves scrolled content cleanly into the canvas edge
+ * behind the floating tab bar / 3-button nav bar (bottom) or status bar (top).
  */
 @Composable
 fun ScrollEdgeFadeScrim(
@@ -389,26 +358,28 @@ fun ScrollEdgeFadeScrim(
     height: Dp = 96.dp,
     fromBottom: Boolean = true,
 ) {
+    if (height <= 0.dp) return
     val canvas = VdpiThemeTokens.palette.canvas
     val brush = remember(canvas, fromBottom) {
-        val stops = arrayOf(
-            0.00f to canvas.copy(alpha = 0.000f),
-            0.20f to canvas.copy(alpha = 0.007f),
-            0.35f to canvas.copy(alpha = 0.039f),
-            0.50f to canvas.copy(alpha = 0.115f),
-            0.65f to canvas.copy(alpha = 0.253f),
-            0.78f to canvas.copy(alpha = 0.437f),
-            0.90f to canvas.copy(alpha = 0.671f),
-            1.00f to canvas.copy(alpha = 0.920f),
-        )
         if (fromBottom) {
-            Brush.verticalGradient(colorStops = stops)
+            Brush.verticalGradient(
+                0.00f to canvas.copy(alpha = 0.000f),
+                0.18f to canvas.copy(alpha = 0.280f),
+                0.36f to canvas.copy(alpha = 0.680f),
+                0.54f to canvas.copy(alpha = 0.880f),
+                0.72f to canvas.copy(alpha = 0.960f),
+                0.88f to canvas.copy(alpha = 0.995f),
+                1.00f to canvas,
+            )
         } else {
             Brush.verticalGradient(
-                colorStops = stops
-                    .map { (pos, color) -> (1f - pos) to color }
-                    .reversed()
-                    .toTypedArray(),
+                0.00f to canvas,
+                0.12f to canvas.copy(alpha = 0.995f),
+                0.28f to canvas.copy(alpha = 0.960f),
+                0.46f to canvas.copy(alpha = 0.880f),
+                0.64f to canvas.copy(alpha = 0.680f),
+                0.82f to canvas.copy(alpha = 0.280f),
+                1.00f to canvas.copy(alpha = 0.000f),
             )
         }
     }
@@ -433,7 +404,7 @@ fun InsetGroupedCard(
     content: @Composable ColumnScope.() -> Unit,
 ) {
     val increaseContrast = LocalIncreaseContrast.current
-    val shape = RoundedCornerShape(radius)
+    val shape = remember(radius) { RoundedCornerShape(radius) }
     val contrastBorder = if (increaseContrast) {
         Modifier.border(
             width = 1.dp,

@@ -292,15 +292,20 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
-          TAG_NOTES="$(git tag -l --format='%(contents)' "$TAG" | sed '/^[[:space:]]*$/d')"
+          git fetch origin "refs/tags/${TAG}:refs/tags/${TAG}" --force
+          TAG_TYPE="$(git cat-file -t "refs/tags/${TAG}" 2>/dev/null || true)"
+          TAG_NOTES=""
+          if [ "$TAG_TYPE" = "tag" ]; then
+            TAG_NOTES="$(git for-each-ref --format='%(contents)' "refs/tags/${TAG}" | sed '/^[[:space:]]*$/d')"
+          fi
           if [ -n "$TAG_NOTES" ] && [ "$TAG_NOTES" != "vdpi $TAG" ] && [ "$TAG_NOTES" != "$TAG" ]; then
             printf '%s\n' "$TAG_NOTES" > release-notes.md
           else
             PREV_TAG="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
             if [ -n "$PREV_TAG" ]; then
-              git log --no-merges --pretty=format:'- %s' "${PREV_TAG}..${TAG}" > release-notes.md
+              git log --no-merges --pretty=tformat:'- %s' "${PREV_TAG}..${TAG}" > release-notes.md
             else
-              git log --no-merges -n 20 --pretty=format:'- %s' "$TAG" > release-notes.md
+              git log --no-merges -n 20 --pretty=tformat:'- %s' "$TAG" > release-notes.md
             fi
           fi
           if [ ! -s release-notes.md ]; then
@@ -314,6 +319,10 @@ jobs:
             PRERELEASE_FLAG="--prerelease"
           fi
           if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              $PRERELEASE_FLAG \
+              --title "vdpi $TAG" \
+              --notes-file ../release-notes.md
             gh release upload "$TAG" --clobber \
               vdpi-windows-x86_64.zip \
               vdpi-macos-universal.tar.gz \
