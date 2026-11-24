@@ -85,34 +85,35 @@ impl Palette {
                 inactive_badge: Style::new().fg(SLATE_DIM),
                 inactive_title: Style::new().fg(TEXT_LIGHT),
                 inactive_hint: Style::new().fg(SLATE_DIM),
-                footer_key: Style::new().fg(STEEL_MUTED),
+                footer_key: Style::new().fg(TEXT_WHITE).add_modifier(Modifier::BOLD),
                 footer_text: Style::new().fg(SLATE_DIM),
             }
         } else {
             let plain = Style::new();
             let bold = Style::new().add_modifier(Modifier::BOLD);
+            let dim = Style::new().add_modifier(Modifier::DIM);
             Self {
                 border: plain,
-                divider: plain,
+                divider: dim,
                 brand: bold,
-                version: plain,
-                repo: plain,
-                status_label: plain,
-                status_active: plain,
-                status_accent: plain,
-                status_warn: plain,
+                version: dim,
+                repo: dim,
+                status_label: dim,
+                status_active: bold,
+                status_accent: bold,
+                status_warn: bold,
                 status_neutral: plain,
                 danger_bold: bold,
                 active_row: Style::new().add_modifier(Modifier::REVERSED),
                 active_marker: bold,
-                active_badge: plain,
+                active_badge: bold,
                 active_title: bold,
-                active_hint: plain,
-                inactive_badge: plain,
+                active_hint: dim,
+                inactive_badge: dim,
                 inactive_title: plain,
-                inactive_hint: plain,
-                footer_key: plain,
-                footer_text: plain,
+                inactive_hint: dim,
+                footer_key: bold,
+                footer_text: dim,
             }
         }
     }
@@ -324,6 +325,131 @@ impl LayoutPlan {
             visible_status_rows,
             show_notice,
             show_footer,
+            card_height: area_height,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConfirmLayoutPlan {
+    show_top_divider: bool,
+    show_status: bool,
+    show_status_divider: bool,
+    show_bottom_divider: bool,
+    show_footer: bool,
+    card_height: u16,
+}
+
+impl ConfirmLayoutPlan {
+    fn compute(area_height: u16, status_count: usize, body_lines: usize) -> Self {
+        let s = u16::try_from(status_count).unwrap_or(u16::MAX);
+        let b = u16::try_from(body_lines).unwrap_or(u16::MAX);
+        let has_status = status_count > 0;
+        let status_block = if has_status { s.saturating_add(1) } else { 0 };
+        // Tight confirm body: header(1) + wrapped body(b) + prompt(1).
+        let tight_body = b.saturating_add(2);
+
+        // Spacious: symmetric top(1) + mid(1) + mid(1) + bottom(1) gaps around confirm block.
+        // borders(2) + header(1) + top_div(1) + status_block + (tight_body + 4) + bot_div(1) + footer(1)
+        let spacious_h = 10u16
+            .saturating_add(status_block)
+            .saturating_add(tight_body);
+        if area_height >= spacious_h {
+            return Self {
+                show_top_divider: true,
+                show_status: has_status,
+                show_status_divider: has_status,
+                show_bottom_divider: true,
+                show_footer: true,
+                card_height: spacious_h,
+            };
+        }
+
+        // Cozy: header(1) + mid_gap_1(1) + body(b) + mid_gap_2(1) + prompt(1).
+        let cozy_h = 8u16.saturating_add(status_block).saturating_add(tight_body);
+        if area_height >= cozy_h {
+            return Self {
+                show_top_divider: true,
+                show_status: has_status,
+                show_status_divider: has_status,
+                show_bottom_divider: true,
+                show_footer: true,
+                card_height: cozy_h,
+            };
+        }
+
+        // Compact + prompt gap: header(1) + body(b) + mid_gap_2(1) + prompt(1).
+        let gap_h = 7u16.saturating_add(status_block).saturating_add(tight_body);
+        if area_height >= gap_h {
+            return Self {
+                show_top_divider: true,
+                show_status: has_status,
+                show_status_divider: has_status,
+                show_bottom_divider: true,
+                show_footer: true,
+                card_height: gap_h,
+            };
+        }
+
+        // Compact divided with status.
+        let divided_h = 6u16.saturating_add(status_block).saturating_add(tight_body);
+        if area_height >= divided_h {
+            return Self {
+                show_top_divider: true,
+                show_status: has_status,
+                show_status_divider: has_status,
+                show_bottom_divider: true,
+                show_footer: true,
+                card_height: divided_h,
+            };
+        }
+
+        // Tight with status (drop bottom divider).
+        let tight_status_h = 5u16.saturating_add(status_block).saturating_add(tight_body);
+        if area_height >= tight_status_h {
+            return Self {
+                show_top_divider: true,
+                show_status: has_status,
+                show_status_divider: has_status,
+                show_bottom_divider: false,
+                show_footer: true,
+                card_height: tight_status_h,
+            };
+        }
+
+        // Without status rows, keep dividers + footer.
+        let no_status_divided_h = 6u16.saturating_add(tight_body);
+        if area_height >= no_status_divided_h {
+            return Self {
+                show_top_divider: true,
+                show_status: false,
+                show_status_divider: false,
+                show_bottom_divider: true,
+                show_footer: true,
+                card_height: no_status_divided_h,
+            };
+        }
+
+        // Without status rows, drop bottom divider.
+        let no_status_tight_h = 5u16.saturating_add(tight_body);
+        if area_height >= no_status_tight_h {
+            return Self {
+                show_top_divider: true,
+                show_status: false,
+                show_status_divider: false,
+                show_bottom_divider: false,
+                show_footer: true,
+                card_height: no_status_tight_h,
+            };
+        }
+
+        // Short terminal fallback.
+        Self {
+            show_top_divider: area_height >= 8,
+            show_status: false,
+            show_status_divider: false,
+            show_bottom_divider: false,
+            show_footer: area_height >= 7,
             card_height: area_height,
         }
     }
@@ -605,26 +731,96 @@ fn render(frame: &mut Frame<'_>, state: &UiState, color: bool) {
         return;
     }
 
+    let card_width = area.width.min(MAX_CARD_WIDTH);
+    let padding = if card_width >= 20 {
+        Padding::horizontal(1)
+    } else {
+        Padding::ZERO
+    };
+    let inner_width = card_width
+        .saturating_sub(2)
+        .saturating_sub(padding.left.saturating_add(padding.right));
+    let inset = inner_width >= 36;
+
+    if state.confirming_uninstall {
+        let body_indent_len = if inset { 3usize } else { 2usize };
+        let right_margin = usize::from(inset);
+        let wrap_width = usize::from(inner_width)
+            .saturating_sub(body_indent_len + right_margin)
+            .max(1);
+        let body_lines = wrap_words(UNINSTALL_CONFIRM_BODY, wrap_width);
+        let confirm_plan =
+            ConfirmLayoutPlan::compute(area.height, menu.status_rows.len(), body_lines.len());
+        let card_area = centered_rect(area, card_width, confirm_plan.card_height);
+        let block = Block::bordered()
+            .border_type(if color {
+                BorderType::Rounded
+            } else {
+                BorderType::Plain
+            })
+            .border_style(palette.border)
+            .padding(padding);
+        let inner = block.inner(card_area);
+        frame.render_widget(block, card_area);
+
+        if inner.is_empty() {
+            return;
+        }
+
+        let ctx = RenderCtx { palette, inset };
+        let mut y = inner.y;
+        let bottom = inner.y.saturating_add(inner.height);
+        let row = |row_y: u16| Rect::new(inner.x, row_y, inner.width, 1);
+
+        if y < bottom {
+            render_header(frame, row(y), ctx);
+            y = y.saturating_add(1);
+        }
+
+        if confirm_plan.show_top_divider && y < bottom {
+            render_divider(frame, row(y), ctx);
+            y = y.saturating_add(1);
+        }
+
+        if confirm_plan.show_status {
+            for status_row in &menu.status_rows {
+                if y < bottom {
+                    render_status_row(frame, row(y), status_row, ctx);
+                    y = y.saturating_add(1);
+                }
+            }
+            if confirm_plan.show_status_divider && y < bottom {
+                render_divider(frame, row(y), ctx);
+                y = y.saturating_add(1);
+            }
+        }
+
+        let footer_reserve =
+            u16::from(confirm_plan.show_footer) + u16::from(confirm_plan.show_bottom_divider);
+        let body_bottom = bottom.saturating_sub(footer_reserve).max(y);
+        let body_area = Rect::new(inner.x, y, inner.width, body_bottom.saturating_sub(y));
+        render_uninstall_confirm(frame, body_area, &body_lines, ctx);
+
+        let mut footer_y = bottom;
+        if confirm_plan.show_footer && footer_y > y {
+            footer_y = footer_y.saturating_sub(1);
+            render_confirm_footer(frame, row(footer_y), ctx);
+        }
+        if confirm_plan.show_bottom_divider && footer_y > y {
+            footer_y = footer_y.saturating_sub(1);
+            render_divider(frame, row(footer_y), ctx);
+        }
+        return;
+    }
+
     let plan = LayoutPlan::compute(
         area.height,
         menu.items.len(),
         menu.status_rows.len(),
         menu.notice.is_some(),
     );
-    let card_width = area.width.min(MAX_CARD_WIDTH);
-    let card_height = if state.confirming_uninstall {
-        let target = plan.card_height.max(15);
-        target.min(area.height)
-    } else {
-        plan.card_height
-    };
-    let card_area = centered_rect(area, card_width, card_height);
+    let card_area = centered_rect(area, card_width, plan.card_height);
 
-    let padding = if card_area.width >= 20 {
-        Padding::horizontal(1)
-    } else {
-        Padding::ZERO
-    };
     let block = Block::bordered()
         .border_type(if color {
             BorderType::Rounded
@@ -640,10 +836,7 @@ fn render(frame: &mut Frame<'_>, state: &UiState, color: bool) {
         return;
     }
 
-    let ctx = RenderCtx {
-        palette,
-        inset: inner.width >= 36,
-    };
+    let ctx = RenderCtx { palette, inset };
 
     let mut y = inner.y;
     let bottom = inner.y.saturating_add(inner.height);
@@ -657,46 +850,6 @@ fn render(frame: &mut Frame<'_>, state: &UiState, color: bool) {
     if plan.top_divider() && y < bottom {
         render_divider(frame, row(y), ctx);
         y = y.saturating_add(1);
-    }
-
-    if state.confirming_uninstall {
-        let show_footer = inner.height >= 5;
-        let show_bot_div = plan.bottom_divider() && inner.height >= 10;
-        let footer_reserve = u16::from(show_footer) + u16::from(show_bot_div);
-        let confirm_min_body = 5u16;
-        let available_before_confirm = bottom.saturating_sub(y).saturating_sub(footer_reserve);
-        let status_need = u16::try_from(menu.status_rows.len())
-            .unwrap_or(u16::MAX)
-            .saturating_add(1)
-            .saturating_add(confirm_min_body);
-
-        if available_before_confirm >= status_need {
-            for status_row in &menu.status_rows {
-                if y < bottom {
-                    render_status_row(frame, row(y), status_row, ctx);
-                    y = y.saturating_add(1);
-                }
-            }
-            if !menu.status_rows.is_empty() && y < bottom {
-                render_divider(frame, row(y), ctx);
-                y = y.saturating_add(1);
-            }
-        }
-
-        let body_bottom = bottom.saturating_sub(footer_reserve).max(y);
-        let body_area = Rect::new(inner.x, y, inner.width, body_bottom.saturating_sub(y));
-        render_uninstall_confirm(frame, body_area, ctx);
-
-        let mut footer_y = bottom;
-        if show_footer && footer_y > y {
-            footer_y = footer_y.saturating_sub(1);
-            render_confirm_footer(frame, row(footer_y), ctx);
-        }
-        if show_bot_div && footer_y > y {
-            footer_y = footer_y.saturating_sub(1);
-            render_divider(frame, row(footer_y), ctx);
-        }
-        return;
     }
 
     for status_row in menu.status_rows.iter().take(plan.visible_status_rows) {
@@ -822,7 +975,10 @@ fn render_status_row(frame: &mut Frame<'_>, area: Rect, row: &StatusRow, ctx: Re
 
 fn is_warning_notice(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    lower.contains("failed") || lower.contains("error") || lower.contains("issues")
+    lower.contains("failed")
+        || lower.contains("error")
+        || lower.contains("issues")
+        || lower.contains("already running")
 }
 
 fn render_notice(frame: &mut Frame<'_>, area: Rect, notice: &str, ctx: RenderCtx) {
@@ -849,15 +1005,18 @@ fn render_notice(frame: &mut Frame<'_>, area: Rect, notice: &str, ctx: RenderCtx
     frame.render_widget(line, area);
 }
 
-fn render_uninstall_confirm(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx) {
+fn render_uninstall_confirm(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    body_lines: &[String],
+    ctx: RenderCtx,
+) {
     if area.is_empty() {
         return;
     }
     let pad = if ctx.inset { " " } else { "" };
     let body_indent = if ctx.inset { "   " } else { "  " };
     let right_margin = pad.len();
-    let wrap_width = usize::from(area.width).saturating_sub(body_indent.len() + right_margin);
-    let body_lines = wrap_words(UNINSTALL_CONFIRM_BODY, wrap_width.max(1));
 
     let needed_tight = 1 + body_lines.len() + 1;
     let avail = usize::from(area.height);
@@ -884,7 +1043,7 @@ fn render_uninstall_confirm(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx) {
     y = y.saturating_add(u16::try_from(mid_gap_1).unwrap_or(0));
 
     let body_limit = max_y.saturating_sub(1);
-    for text in &body_lines {
+    for text in body_lines {
         if y >= body_limit {
             break;
         }
@@ -902,8 +1061,11 @@ fn render_uninstall_confirm(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx) {
 
     if y < max_y {
         let prompt_area = Rect::new(area.x, y, area.width, 1);
+        let width = usize::from(area.width);
         let full_prompt_cols = body_indent.len() + 41 + right_margin;
-        let line = if usize::from(area.width) >= full_prompt_cols {
+        let compact_prompt_cols = body_indent.len() + 30 + right_margin;
+        let tiny_prompt_cols = pad.len() + 16 + right_margin;
+        let line = if width >= full_prompt_cols {
             Line::from(vec![
                 Span::raw(body_indent),
                 Span::styled("[y]", ctx.palette.danger_bold),
@@ -914,11 +1076,30 @@ fn render_uninstall_confirm(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx) {
                 Span::raw(" "),
                 Span::styled("Cancel", ctx.palette.inactive_title),
             ])
+        } else if width >= compact_prompt_cols {
+            Line::from(vec![
+                Span::raw(body_indent),
+                Span::styled("[y]", ctx.palette.danger_bold),
+                Span::raw(" "),
+                Span::styled("Uninstall", ctx.palette.active_title),
+                Span::styled(" · ", ctx.palette.footer_text),
+                Span::styled("[n/Esc]", ctx.palette.footer_key),
+                Span::raw(" "),
+                Span::styled("Cancel", ctx.palette.inactive_title),
+            ])
+        } else if width >= tiny_prompt_cols {
+            Line::from(vec![
+                Span::raw(pad),
+                Span::styled("[y]", ctx.palette.danger_bold),
+                Span::raw(" "),
+                Span::styled("Yes", ctx.palette.active_title),
+                Span::styled(" · ", ctx.palette.footer_text),
+                Span::styled("[n]", ctx.palette.footer_key),
+                Span::raw(" "),
+                Span::styled("No", ctx.palette.inactive_title),
+            ])
         } else {
-            let short = truncate_text(
-                "[y] Uninstall · [n/Esc] Cancel",
-                usize::from(area.width).saturating_sub(pad.len() + right_margin),
-            );
+            let short = truncate_text("[y]/[n]", width.saturating_sub(pad.len() + right_margin));
             Line::from(vec![
                 Span::raw(pad),
                 Span::styled(short, ctx.palette.danger_bold),
@@ -1463,11 +1644,40 @@ mod tests {
             .iter()
             .any(|c| c.symbol() == "●" && c.fg == RED_DANGER));
 
-        // Narrow 46x18 renders confirmation cleanly as well.
+        // Narrow 46x18 renders confirmation cleanly as well, keeping [y] red and Cancel neutral.
         let narrow_buf = render_state(46, 18, &state, true);
         let narrow_text = buffer_text(&narrow_buf);
         assert!(narrow_text.contains("● Confirm uninstall"));
-        assert!(narrow_text.contains("[y] Uninstall"));
+        assert!(narrow_text.contains("[y] Uninstall · [n/Esc] Cancel"));
+        let prompt_y = narrow_text
+            .lines()
+            .position(|line| line.contains("[y] Uninstall · [n/Esc] Cancel"))
+            .expect("narrow confirm prompt row");
+        let y_col = (0..narrow_buf.area.width)
+            .find(|&x| narrow_buf[(x, prompt_y as u16)].symbol() == "y")
+            .expect("y key cell");
+        let cancel_col = (0..narrow_buf.area.width)
+            .find(|&x| narrow_buf[(x, prompt_y as u16)].symbol() == "C")
+            .expect("Cancel cell");
+        assert_eq!(narrow_buf[(y_col, prompt_y as u16)].fg, RED_DANGER);
+        assert_eq!(narrow_buf[(cancel_col, prompt_y as u16)].fg, TEXT_LIGHT);
+
+        // Tall 120x30 confirm card stays compact (sized from status + confirm body, not menu items).
+        let tall_buf = render_state(120, 30, &state, true);
+        let tall_text = buffer_text(&tall_buf);
+        let top_border_y = tall_text
+            .lines()
+            .position(|line| line.contains('╭'))
+            .expect("top border");
+        let bot_border_y = tall_text
+            .lines()
+            .position(|line| line.contains('╰'))
+            .expect("bottom border");
+        let confirm_card_height = bot_border_y - top_border_y + 1;
+        assert_eq!(
+            confirm_card_height, 18,
+            "confirm card should not inherit menu height on 120x30:\n{tall_text}"
+        );
 
         // Repeat 'y' must be ignored so held keys cannot accidentally confirm.
         assert_eq!(
@@ -1606,6 +1816,20 @@ mod tests {
                     .iter()
                     .any(|c| c.modifier.contains(Modifier::REVERSED)));
             }
+            assert!(
+                no_color
+                    .content()
+                    .iter()
+                    .any(|c| c.modifier.contains(Modifier::BOLD)),
+                "NO_COLOR confirming={confirming} must apply BOLD hierarchy"
+            );
+            assert!(
+                no_color
+                    .content()
+                    .iter()
+                    .any(|c| c.modifier.contains(Modifier::DIM)),
+                "NO_COLOR confirming={confirming} must apply DIM hierarchy"
+            );
         }
     }
 

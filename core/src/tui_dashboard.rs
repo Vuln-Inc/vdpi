@@ -281,9 +281,16 @@ impl DiagnosticsState {
     }
 }
 
+const BORDER_SLATE: Color = Color::Rgb(58, 66, 78);
+const TEXT_WHITE: Color = Color::Rgb(248, 250, 252);
+const STEEL_MUTED: Color = Color::Rgb(148, 163, 184);
+const STEEL_DIM: Color = Color::Rgb(100, 116, 139);
+const EMERALD_ACTIVE: Color = Color::Rgb(62, 207, 142);
+const AMBER_WARN: Color = Color::Rgb(245, 185, 90);
+const RED_DANGER: Color = Color::Rgb(235, 96, 107);
+
 #[derive(Debug, Clone, Copy)]
 struct Palette {
-    color: bool,
     border_type: BorderType,
     border: Style,
     title: Style,
@@ -300,7 +307,6 @@ impl Palette {
     fn new(color: bool) -> Self {
         if !color {
             return Self {
-                color: false,
                 border_type: BorderType::Plain,
                 border: Style::default(),
                 title: Style::default().add_modifier(Modifier::BOLD),
@@ -314,26 +320,17 @@ impl Palette {
             };
         }
 
-        let border_fg = Color::Rgb(58, 66, 78);
-        let text_fg = Color::Rgb(236, 240, 246);
-        let label_fg = Color::Rgb(138, 150, 166);
-        let dim_fg = Color::Rgb(104, 116, 132);
-        let emerald_fg = Color::Rgb(62, 207, 142);
-        let amber_fg = Color::Rgb(235, 179, 68);
-        let red_fg = Color::Rgb(235, 96, 107);
-
         Self {
-            color: true,
             border_type: BorderType::Rounded,
-            border: Style::default().fg(border_fg),
-            title: Style::default().fg(text_fg).add_modifier(Modifier::BOLD),
-            text: Style::default().fg(text_fg),
-            label: Style::default().fg(label_fg),
-            dim: Style::default().fg(dim_fg),
-            emerald: Style::default().fg(emerald_fg),
-            amber: Style::default().fg(amber_fg),
-            red: Style::default().fg(red_fg),
-            key_hint: Style::default().fg(text_fg).add_modifier(Modifier::BOLD),
+            border: Style::default().fg(BORDER_SLATE),
+            title: Style::default().fg(TEXT_WHITE).add_modifier(Modifier::BOLD),
+            text: Style::default().fg(TEXT_WHITE),
+            label: Style::default().fg(STEEL_MUTED),
+            dim: Style::default().fg(STEEL_DIM),
+            emerald: Style::default().fg(EMERALD_ACTIVE),
+            amber: Style::default().fg(AMBER_WARN),
+            red: Style::default().fg(RED_DANGER),
+            key_hint: Style::default().fg(TEXT_WHITE).add_modifier(Modifier::BOLD),
         }
     }
 }
@@ -713,7 +710,7 @@ pub async fn run_dashboard<F>(
 where
     F: Future<Output = ()>,
 {
-    let color = std::env::var_os("NO_COLOR").is_none();
+    let color = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
     let mut guard = DashboardGuard::enter()?;
 
     let now = Instant::now();
@@ -858,7 +855,6 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
         return;
     }
 
-    let dot = if p.color { "●" } else { "*" };
     let version = env!("CARGO_PKG_VERSION");
     let primary = state.info.primary_addr.to_string();
     let socks = state.info.socks_addr.map(|sa| sa.to_string());
@@ -869,8 +865,9 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
     let w = inner.width as usize;
     let sep = Span::styled(" · ", p.dim);
 
-    let head = format!("{dot} vdpi v{version}");
-    let full_len = head.chars().count()
+    // "● vdpi v{version}" = 8 chars + version length.
+    let head_len = 8 + version.len();
+    let full_len = head_len
         + 3
         + "HTTP/SOCKS ".len()
         + primary.len()
@@ -884,7 +881,7 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
         + 3
         + "Uptime ".len()
         + uptime.len();
-    let med_len = head.chars().count()
+    let med_len = head_len
         + 3
         + "HTTP ".len()
         + primary.len()
@@ -896,10 +893,10 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
         + 3
         + "Uptime ".len()
         + uptime.len();
-    let compact_len = head.chars().count()
+    let compact_len = head_len
         + 3
         + primary.len()
-        + socks.as_ref().map_or(0, |s| 3 + "UDP ".len() + s.len())
+        + socks.as_ref().map_or(0, |s| 3 + "SOCKS ".len() + s.len())
         + 3
         + mode.len()
         + 1
@@ -908,9 +905,11 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
         + uptime.len();
 
     let mut spans = vec![
-        Span::styled(dot, p.emerald),
+        Span::styled("●", p.emerald),
         Span::raw(" "),
-        Span::styled(format!("vdpi v{version}"), p.title),
+        Span::styled("vdpi", p.title),
+        Span::raw(" "),
+        Span::styled(format!("v{version}"), p.label),
     ];
 
     if w >= full_len {
@@ -946,7 +945,7 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
         spans.push(Span::styled(primary, p.text));
         if let Some(sa) = socks {
             spans.push(sep.clone());
-            spans.push(Span::styled("UDP ", p.label));
+            spans.push(Span::styled("SOCKS ", p.label));
             spans.push(Span::styled(sa, p.text));
         }
         spans.push(sep.clone());
@@ -1157,37 +1156,79 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) {
         return;
     }
     let p = state.palette;
-    let sep = Span::styled("  ·  ", p.dim);
 
-    let legend = Line::from(vec![
-        Span::raw(" "),
-        Span::styled("d", p.key_hint),
-        Span::styled(" diagnostics", p.dim),
-        sep.clone(),
-        Span::styled("c", p.key_hint),
-        Span::styled(" clear cache", p.dim),
-        sep.clone(),
-        Span::styled("↑↓", p.key_hint),
-        Span::styled(" scroll", p.dim),
-        sep,
-        Span::styled("q", p.key_hint),
-        Span::styled(" quit", p.dim),
-    ]);
-
-    if let Some((notice, _)) = &state.notice {
+    let (legend_area, notice_slot) = if let Some((notice, _)) = &state.notice {
         let notice_text = format!("{notice} ");
         let notice_width = (notice_text.chars().count() as u16).min(area.width / 2);
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(0), Constraint::Length(notice_width)])
             .split(area);
-        frame.render_widget(Paragraph::new(legend), cols[0]);
+        (cols[0], Some((cols[1], notice_text)))
+    } else {
+        (area, None)
+    };
+
+    let w = usize::from(legend_area.width);
+    let legend = if w >= 57 {
+        let sep = Span::styled("  ·  ", p.dim);
+        Line::from(vec![
+            Span::raw(" "),
+            Span::styled("d", p.key_hint),
+            Span::styled(" diagnostics", p.dim),
+            sep.clone(),
+            Span::styled("c", p.key_hint),
+            Span::styled(" clear cache", p.dim),
+            sep.clone(),
+            Span::styled("↑↓", p.key_hint),
+            Span::styled(" scroll", p.dim),
+            sep,
+            Span::styled("q", p.key_hint),
+            Span::styled(" quit", p.dim),
+        ])
+    } else if w >= 38 {
+        let sep = Span::styled(" · ", p.dim);
+        Line::from(vec![
+            Span::raw(" "),
+            Span::styled("d", p.key_hint),
+            Span::styled(" diag", p.dim),
+            sep.clone(),
+            Span::styled("c", p.key_hint),
+            Span::styled(" cache", p.dim),
+            sep.clone(),
+            Span::styled("↑↓", p.key_hint),
+            Span::styled(" scroll", p.dim),
+            sep,
+            Span::styled("q", p.key_hint),
+            Span::styled(" quit", p.dim),
+        ])
+    } else if w >= 20 {
+        let sep = Span::styled(" · ", p.dim);
+        Line::from(vec![
+            Span::raw(" "),
+            Span::styled("d", p.key_hint),
+            sep.clone(),
+            Span::styled("c", p.key_hint),
+            sep.clone(),
+            Span::styled("↑↓", p.key_hint),
+            sep,
+            Span::styled("q", p.key_hint),
+            Span::styled(" quit", p.dim),
+        ])
+    } else {
+        Line::from(vec![
+            Span::raw(" "),
+            Span::styled("q", p.key_hint),
+            Span::styled(" quit", p.dim),
+        ])
+    };
+
+    frame.render_widget(Paragraph::new(legend), legend_area);
+    if let Some((notice_area, notice_text)) = notice_slot {
         frame.render_widget(
             Paragraph::new(Line::from(notice_text).style(p.emerald).right_aligned()),
-            cols[1],
+            notice_area,
         );
-    } else {
-        frame.render_widget(Paragraph::new(legend), area);
     }
 }
 
@@ -1350,7 +1391,7 @@ fn format_kv_line<'a>(
 fn format_desync_mode(mode: DesyncMode) -> &'static str {
     match mode {
         DesyncMode::Combo => "Combo",
-        DesyncMode::TlsRecord => "TLS-Record",
+        DesyncMode::TlsRecord => "TLS Record",
         DesyncMode::Fragment => "Fragment",
         DesyncMode::Split => "Split",
     }
@@ -1405,11 +1446,11 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
     }
-    if max_chars <= 3 {
-        return text.chars().take(max_chars).collect();
+    if max_chars == 1 {
+        return text.chars().take(1).collect();
     }
-    let mut out: String = text.chars().take(max_chars - 3).collect();
-    out.push_str("...");
+    let mut out: String = text.chars().take(max_chars - 1).collect();
+    out.push('…');
     out
 }
 
@@ -1616,6 +1657,7 @@ mod tests {
         let screen = buffer_to_string(terminal.backend());
         assert!(screen.contains('┌'));
         assert!(screen.contains('└'));
+        assert!(screen.contains('●'));
         assert!(!screen.contains('╭'));
         assert!(!screen.contains('╰'));
 
@@ -1627,6 +1669,62 @@ mod tests {
                 assert_eq!(cell.bg, Color::Reset, "unexpected bg color at ({x},{y})");
             }
         }
+    }
+
+    #[test]
+    fn narrow_footer_tiers_keep_quit_visible_with_notice_and_polish_invariants() {
+        // 60x22 with "Cache cleared" leaves 46 cols for legend -> compact tier.
+        let mut state = sample_state(true);
+        state.set_notice("Cache cleared", Instant::now());
+        let backend = TestBackend::new(60, 22);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_dashboard(frame, &mut state))
+            .unwrap();
+        let screen = buffer_to_string(terminal.backend());
+        assert!(screen.contains("d diag · c cache · ↑↓ scroll · q quit"));
+        assert!(screen.contains("Cache cleared"));
+
+        // 42x22 with "Cache cleared" leaves 28 cols for legend -> minimal tier.
+        let backend = TestBackend::new(42, 22);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_dashboard(frame, &mut state))
+            .unwrap();
+        let screen = buffer_to_string(terminal.backend());
+        assert!(screen.contains("d · c · ↑↓ · q quit"));
+        assert!(screen.contains("Cache cleared"));
+
+        // Compact status bar tier uses "SOCKS " label and split vdpi bold / version muted.
+        let mut compact_state = sample_state(true);
+        let backend = TestBackend::new(84, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_dashboard(frame, &mut compact_state))
+            .unwrap();
+        let screen = buffer_to_string(terminal.backend());
+        assert!(screen.contains("SOCKS 127.0.0.1:1080"));
+        assert!(!screen.contains("UDP 127.0.0.1:1080"));
+        let buf = terminal.backend().buffer();
+        let status_row = 1u16;
+        let vdpi_x = (0..buf.area.width.saturating_sub(1))
+            .find(|&x| {
+                buf[(x, status_row)].symbol() == "v" && buf[(x + 1, status_row)].symbol() == "d"
+            })
+            .expect("vdpi brand cell");
+        assert_eq!(buf[(vdpi_x, status_row)].fg, TEXT_WHITE);
+        assert!(buf[(vdpi_x, status_row)].modifier.contains(Modifier::BOLD));
+        let ver_x = vdpi_x + 5;
+        assert_eq!(buf[(ver_x, status_row)].symbol(), "v");
+        assert_eq!(buf[(ver_x, status_row)].fg, STEEL_MUTED);
+        assert!(!buf[(ver_x, status_row)].modifier.contains(Modifier::BOLD));
+
+        // Mode formatting and ellipsis truncation match launcher/tui.rs.
+        assert_eq!(format_desync_mode(DesyncMode::TlsRecord), "TLS Record");
+        assert_eq!(truncate_chars("hello world", 6), "hello…");
+        assert_eq!(truncate_chars("hello", 2), "h…");
+        assert_eq!(truncate_chars("hello", 1), "h");
+        assert_eq!(truncate_chars("hello", 0), "");
     }
 
     #[test]

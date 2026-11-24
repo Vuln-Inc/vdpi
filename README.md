@@ -98,7 +98,7 @@ https://vuln-inc.github.io/vdpi/apps.json
 
 ---
 
-## Desktop Features & Launcher
+## Desktop Features & Control Center
 
 | Capability | Details |
 | :--- | :--- |
@@ -109,7 +109,7 @@ https://vuln-inc.github.io/vdpi/apps.json
 | **Anti-Poisoning DNS Ring** | In-memory TTL-cached **RFC 8484 DoH** with sticky healthy failover across 4 independent networks (`1.1.1.1`, `8.8.8.8`, `94.140.14.140`, `9.9.9.9`), non-port-53 UDP fallback (`1253`, `443`, `5353`), and sinkhole IP filtering. |
 | **100% Desktop VPN Coexistence** | Pure userspace proxy (no WinDivert, kernel extensions, or fake-TTL injection) — coexists cleanly with WireGuard, Cloudflare WARP, OpenVPN, Mullvad, and ProtonVPN. |
 | **Smart Local & Portal Bypass** | Automatically bypasses LAN/private subnets (`localhost`, `10.0.0.0/8`, `192.168.0.0/16`, `*.local`), government/banking portals, and any custom `--bypass` rules. |
-| **`ratatui` Control Center & Live Dashboard** | Interactive `ratatui` Control Center with live Service and Anti-DPI telemetry, 1-press service pause/resume, diagnostics, and uninstall, plus a live foreground dashboard on `vdpi start` with a 60s `Sparkline`, traffic counters, scrollable log, and diagnostics overlay. |
+| **`ratatui` Control Center & Live Dashboard** | Interactive `ratatui` Control Center with live Service and Anti-DPI telemetry, 1-press service pause/resume, live diagnostics, and inline-confirmed uninstall, plus a live foreground dashboard on `vdpi start` with a 60s `Sparkline`, traffic counters, scrollable log, and diagnostics overlay. |
 
 ### Interactive Control Center & Live Dashboard
 
@@ -117,8 +117,8 @@ Open `vdpi.exe` from File Explorer, or run `vdpi` with no arguments (or `vdpi la
 
 - **Live Service & Anti-DPI Status Panel:** Shows current background service state alongside live Anti-DPI engine telemetry from the local daemon (desync mode, DoH status, QUIC blocking, active connections, and cached adaptive hosts). Press **`r`** at any time for a live refresh.
 - **Pause / Resume background service:** 1-press temporary toggle (`Pause` / `Resume`) that stops the background service and restores OS proxy settings without removing installed files or service registration, or restarts it cleanly.
-- **Run directly:** Start `vdpi` in the foreground. Closing it stops `vdpi` and releases its desktop proxy automatically, saving a `run-directly` preference next to the executable (`vdpi launcher` reopens the Control Center; `vdpi start` skips it).
-- **Install / Update / Repair:** Register automatic background startup, repair an existing service, or apply a 1-press in-place update when opening a newly downloaded binary over an older installation.
+- **Run directly:** Start `vdpi` in the foreground. Closing it stops `vdpi` and releases its desktop proxy automatically. When `vdpi` is not installed, this also saves a `run-directly` preference next to the executable (`vdpi launcher` reopens the Control Center; `vdpi start` skips it).
+- **Install / Update / Repair:** Register automatic background startup, repair an existing service, apply a 1-press in-place update when opening a newly downloaded binary over an older installation, or **Check for updates online** directly against GitHub Releases.
 - **Run diagnostics:** Execute live end-to-end HTTP `CONNECT`, SOCKS5h, and DoH checks directly from the Control Center.
 - **Uninstall vdpi:** Stop the service, remove files and startup registration, and restore OS proxy settings behind an inline confirmation prompt.
 - **Quit:** Exit without changing service state or saved preferences.
@@ -418,11 +418,10 @@ xcodebuild test -project Vdpi.xcodeproj -scheme VdpiApp -destination 'platform=i
 xcodebuild build -project Vdpi.xcodeproj -scheme VdpiApp -configuration Release -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO
 ```
 
-To sign and install on your own physical iPhone/iPad with your own paid Apple Developer Team, replace the bundle IDs (`com.vulninc.vdpi`, `com.vulninc.vdpi.packet-tunnel`) and App Group (`group.com.vulninc.vdpi`) with your own unique identifiers across all four locations before running `xcodegen generate`:
+To sign and install on your own physical iPhone/iPad with your own paid Apple Developer Team, replace the bundle IDs (`com.vulninc.vdpi`, `com.vulninc.vdpi.packet-tunnel`) and App Group (`group.com.vulninc.vdpi`) with your own unique identifiers across these three files before running `xcodegen generate` (`ios/Shared/VdpiAppGroup.swift` auto-detects `suiteName` and `extensionBundleId` at runtime since `v0.4.1`):
 1. `ios/project.yml` (`bundleIdPrefix` and both `PRODUCT_BUNDLE_IDENTIFIER` values)
 2. `ios/VdpiApp/VdpiApp.entitlements` (`com.apple.security.application-groups`)
 3. `ios/PacketTunnel/PacketTunnel.entitlements` (`com.apple.security.application-groups`)
-4. `ios/Shared/VdpiAppGroup.swift` (`suiteName` and `extensionBundleId`)
 
 <details>
 <summary>Repository layout</summary>

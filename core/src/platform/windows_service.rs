@@ -71,6 +71,7 @@ const ERROR_ACCESS_DENIED: Dword = 5;
 const ERROR_CALL_NOT_IMPLEMENTED: Dword = 120;
 const ERROR_SERVICE_ALREADY_RUNNING: Dword = 1056;
 const ERROR_SERVICE_DOES_NOT_EXIST: Dword = 1060;
+const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: Dword = 1061;
 const ERROR_SERVICE_NOT_ACTIVE: Dword = 1062;
 const ERROR_FAILED_SERVICE_CONTROLLER_CONNECT: Dword = 1063;
 const ERROR_SERVICE_MARKED_FOR_DELETE: Dword = 1072;
@@ -79,6 +80,7 @@ const ERROR_CANCELLED: Dword = 1223;
 const SEE_MASK_NOCLOSEPROCESS: Dword = 0x0000_0040;
 const SW_SHOWNORMAL: i32 = 1;
 const INFINITE: Dword = 0xFFFF_FFFF;
+const WAIT_OBJECT_0: Dword = 0;
 
 #[repr(C)]
 struct ShellExecuteInfoW {
@@ -326,9 +328,11 @@ pub fn relaunch_elevated_and_wait(args: &[String]) -> Result<()> {
         .collect::<Vec<_>>()
         .join(" ");
 
+    let temp_dir = crate::update::strip_windows_verbatim_prefix(&std::env::temp_dir());
     let verb_wide = to_wide_null("runas");
     let file_wide = to_wide_null(&current_exe.display().to_string());
     let params_wide = to_wide_null(&params);
+    let dir_wide = to_wide_null(&temp_dir.display().to_string());
 
     let mut info = ShellExecuteInfoW {
         cb_size: std::mem::size_of::<ShellExecuteInfoW>() as Dword,
@@ -341,7 +345,7 @@ pub fn relaunch_elevated_and_wait(args: &[String]) -> Result<()> {
         } else {
             params_wide.as_ptr()
         },
-        lp_directory: ptr::null(),
+        lp_directory: dir_wide.as_ptr(),
         n_show: SW_SHOWNORMAL,
         h_inst_app: ptr::null_mut(),
         lp_id_list: ptr::null_mut(),
@@ -363,16 +367,43 @@ pub fn relaunch_elevated_and_wait(args: &[String]) -> Result<()> {
         bail!("ShellExecuteExW(runas) failed with Win32 error {err}");
     }
 
-    if !info.h_process.is_null() {
-        let mut exit_code: Dword = 0;
-        unsafe {
-            let _ = WaitForSingleObject(info.h_process, INFINITE);
-            let _ = GetExitCodeProcess(info.h_process, &mut exit_code);
-            let _ = CloseHandle(info.h_process);
+    if info.h_process.is_null() {
+        bail!("ShellExecuteExW(runas) succeeded without returning an elevated process handle");
+    }
+
+    let mut exit_code: Dword = 0;
+    let wait_res = unsafe { WaitForSingleObject(info.h_process, INFINITE) };
+    let wait_err = if wait_res != WAIT_OBJECT_0 {
+        Some(unsafe { GetLastError() })
+    } else {
+        None
+    };
+
+    let exit_code_err = if wait_err.is_none() {
+        let got_exit = unsafe { GetExitCodeProcess(info.h_process, &mut exit_code) };
+        if got_exit == 0 {
+            Some(unsafe { GetLastError() })
+        } else {
+            None
         }
-        if exit_code != 0 {
-            bail!("elevated vdpi command exited with status code {exit_code}");
-        }
+    } else {
+        None
+    };
+
+    unsafe {
+        let _ = CloseHandle(info.h_process);
+    }
+
+    if let Some(err) = wait_err {
+        bail!(
+            "WaitForSingleObject for elevated vdpi command failed (result {wait_res}, Win32 error {err})"
+        );
+    }
+    if let Some(err) = exit_code_err {
+        bail!("GetExitCodeProcess for elevated vdpi command failed with Win32 error {err}");
+    }
+    if exit_code != 0 {
+        bail!("elevated vdpi command exited with status code {exit_code}");
     }
 
     Ok(())
@@ -697,12 +728,20 @@ pub fn start_windows_service() -> Result<bool> {
     if current.dw_current_state == SERVICE_RUNNING {
         return Ok(true);
     }
+    if current.dw_current_state == SERVICE_START_PENDING {
+        wait_for_service_running(svc.0, Duration::from_secs(10))?;
+        return Ok(true);
+    }
     if current.dw_current_state == SERVICE_STOP_PENDING {
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
             thread::sleep(Duration::from_millis(100));
             let state = query_service_status_process(svc.0)?.dw_current_state;
             if state == SERVICE_RUNNING {
+                return Ok(true);
+            }
+            if state == SERVICE_START_PENDING {
+                wait_for_service_running(svc.0, Duration::from_secs(10))?;
                 return Ok(true);
             }
             if state != SERVICE_STOP_PENDING {
@@ -848,10 +887,29 @@ pub fn query_windows_service_status() -> WindowsServiceInfo {
             SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG,
         )
     };
-    if raw.is_null() {
-        return not_installed;
-    }
-    let svc = ScmHandle(raw);
+    let (svc, can_query_config) = if raw.is_null() {
+        let err = unsafe { GetLastError() };
+        if err != ERROR_ACCESS_DENIED {
+            return not_installed;
+        }
+        let status_only = unsafe { OpenServiceW(scm.0, name_wide.as_ptr(), SERVICE_QUERY_STATUS) };
+        if status_only.is_null() {
+            let fallback_err = unsafe { GetLastError() };
+            if fallback_err == ERROR_ACCESS_DENIED {
+                return WindowsServiceInfo {
+                    installed: true,
+                    state: "UNKNOWN",
+                    start_type: "UNKNOWN",
+                    pid: None,
+                    binary_path: None,
+                };
+            }
+            return not_installed;
+        }
+        (ScmHandle(status_only), false)
+    } else {
+        (ScmHandle(raw), true)
+    };
 
     let (state, pid) = match query_service_status_process(svc.0) {
         Ok(ssp) => (
@@ -865,7 +923,11 @@ pub fn query_windows_service_status() -> WindowsServiceInfo {
         Err(_) => ("UNKNOWN", None),
     };
 
-    let (start_type, binary_path) = query_service_config(svc.0).unwrap_or(("UNKNOWN", None));
+    let (start_type, binary_path) = if can_query_config {
+        query_service_config(svc.0).unwrap_or(("UNKNOWN", None))
+    } else {
+        ("UNKNOWN", None)
+    };
 
     WindowsServiceInfo {
         installed: true,
@@ -990,37 +1052,45 @@ fn configure_service_metadata(svc: ScHandle) {
 }
 
 fn stop_service_handle(svc: ScHandle) -> Result<()> {
-    let current = query_service_status_process(svc)?;
-    if current.dw_current_state == SERVICE_STOPPED {
-        return Ok(());
-    }
-
-    if current.dw_current_state != SERVICE_STOP_PENDING {
-        let mut status = ServiceStatus {
-            dw_service_type: 0,
-            dw_current_state: 0,
-            dw_controls_accepted: 0,
-            dw_win32_exit_code: 0,
-            dw_service_specific_exit_code: 0,
-            dw_check_point: 0,
-            dw_wait_hint: 0,
-        };
-        let ok = unsafe { ControlService(svc, SERVICE_CONTROL_STOP, &mut status) };
-        if ok == 0 {
-            let err = unsafe { GetLastError() };
-            if err != ERROR_SERVICE_NOT_ACTIVE {
-                bail!("ControlService(STOP) failed with Win32 error {err}");
-            }
-            return Ok(());
-        }
-    }
-
     let deadline = Instant::now() + Duration::from_secs(15);
+    let mut stop_sent = false;
+
     loop {
         let ssp = query_service_status_process(svc)?;
         if ssp.dw_current_state == SERVICE_STOPPED {
             return Ok(());
         }
+
+        if !stop_sent
+            && ssp.dw_current_state != SERVICE_START_PENDING
+            && ssp.dw_current_state != SERVICE_STOP_PENDING
+        {
+            let mut status = ServiceStatus {
+                dw_service_type: 0,
+                dw_current_state: 0,
+                dw_controls_accepted: 0,
+                dw_win32_exit_code: 0,
+                dw_service_specific_exit_code: 0,
+                dw_check_point: 0,
+                dw_wait_hint: 0,
+            };
+            let ok = unsafe { ControlService(svc, SERVICE_CONTROL_STOP, &mut status) };
+            if ok != 0 {
+                if status.dw_current_state == SERVICE_STOPPED {
+                    return Ok(());
+                }
+                stop_sent = true;
+            } else {
+                let err = unsafe { GetLastError() };
+                if err == ERROR_SERVICE_NOT_ACTIVE {
+                    return Ok(());
+                }
+                if err != ERROR_SERVICE_CANNOT_ACCEPT_CTRL {
+                    bail!("ControlService(STOP) failed with Win32 error {err}");
+                }
+            }
+        }
+
         if Instant::now() >= deadline {
             bail!("timed out waiting for Windows service '{SERVICE_NAME}' to stop");
         }

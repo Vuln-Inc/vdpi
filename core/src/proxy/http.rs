@@ -71,6 +71,27 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
 
     // Built-in local health endpoint for `vdpi status` / `vdpi doctor` / Control Center TUI
     if target == "/vdpi-health" {
+        let is_loopback_peer = client
+            .peer_addr()
+            .is_ok_and(|p| p.ip().to_canonical().is_loopback());
+        if !is_loopback_peer || !is_local_health_host(header_str) {
+            let _ = write_health_response(
+                &mut client,
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+            return Ok(());
+        }
+
+        if !method.eq_ignore_ascii_case("GET") {
+            let _ = write_health_response(
+                &mut client,
+                b"HTTP/1.1 405 Method Not Allowed\r\nAllow: GET\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+            return Ok(());
+        }
+
         let snap = ctx.telemetry_snapshot();
         let payload = serde_json::json!({
             "status": "ok",
@@ -93,8 +114,7 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
-        client.write_all(resp.as_bytes()).await?;
-        client.flush().await?;
+        write_health_response(&mut client, resp.as_bytes()).await?;
         return Ok(());
     }
 
@@ -186,6 +206,34 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
             Err(e)
         }
     }
+}
+
+async fn write_health_response(client: &mut TcpStream, bytes: &[u8]) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        client.write_all(bytes).await?;
+        client.flush().await
+    })
+    .await??;
+    Ok(())
+}
+
+fn is_local_health_host(header_str: &str) -> bool {
+    for line in header_str.lines().skip(1) {
+        let line = line.trim_end_matches('\r');
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("host") {
+            continue;
+        }
+        let Ok((host, _)) = parse_authority(value, 80) else {
+            return false;
+        };
+        if !host.eq_ignore_ascii_case("localhost") && host != "127.0.0.1" && host != "::1" {
+            return false;
+        }
+    }
+    true
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
@@ -550,8 +598,11 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
-            let (sock, _) = listener.accept().await.unwrap();
-            handle_http_client(sock, ctx).await
+            for _ in 0..3 {
+                let (sock, _) = listener.accept().await.unwrap();
+                handle_http_client(sock, ctx.clone()).await?;
+            }
+            Ok::<(), anyhow::Error>(())
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -562,7 +613,6 @@ mod tests {
 
         let mut resp = Vec::new();
         client.read_to_end(&mut resp).await.unwrap();
-        server.await.unwrap().unwrap();
 
         let resp_str = String::from_utf8(resp).unwrap();
         let (headers, body) = resp_str.split_once("\r\n\r\n").unwrap();
@@ -584,5 +634,28 @@ mod tests {
         assert_eq!(json["auto_heal_escalations"].as_u64(), Some(3));
         assert_eq!(json["learned_hosts"].as_u64(), Some(4));
         assert_eq!(json["isp_stage"].as_str(), Some("OobSniDesync"));
+
+        let mut post_client = TcpStream::connect(addr).await.unwrap();
+        post_client
+            .write_all(b"POST /vdpi-health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut post_resp = Vec::new();
+        post_client.read_to_end(&mut post_resp).await.unwrap();
+        let post_str = String::from_utf8(post_resp).unwrap();
+        assert!(post_str.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
+        assert!(post_str.contains("Allow: GET\r\n"));
+
+        let mut foreign_client = TcpStream::connect(addr).await.unwrap();
+        foreign_client
+            .write_all(b"GET /vdpi-health HTTP/1.1\r\nHost: evil.example\r\n\r\n")
+            .await
+            .unwrap();
+        let mut foreign_resp = Vec::new();
+        foreign_client.read_to_end(&mut foreign_resp).await.unwrap();
+        let foreign_str = String::from_utf8(foreign_resp).unwrap();
+        assert!(foreign_str.starts_with("HTTP/1.1 403 Forbidden\r\n"));
+
+        server.await.unwrap().unwrap();
     }
 }

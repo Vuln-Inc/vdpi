@@ -25,10 +25,10 @@ pub enum DesyncMode {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
-    /// Start the vdpi engine in the foreground without opening the launcher
+    /// Start the vdpi engine in the foreground without opening the Control Center
     #[command(visible_alias = "run")]
     Start,
-    /// Open the run or install chooser, even if a preference was saved
+    /// Open the interactive Control Center TUI, even if a preference was saved
     Launcher,
     /// Install vdpi and enable automatic background startup (Windows Service / LaunchAgent / systemd)
     Install,
@@ -39,7 +39,7 @@ pub enum Command {
     Pause,
     /// Start a paused background service and re-enable anti-DPI protection
     Resume,
-    /// Display live daemon health, ports, system proxy state, and session environment
+    /// Display service state, live Anti-DPI engine telemetry, ports, and system proxy status
     Status,
     /// Run live end-to-end DPI bypass diagnostics (HTTP CONNECT + SOCKS5h + DoH)
     Doctor,

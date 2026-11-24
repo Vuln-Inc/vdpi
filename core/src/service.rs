@@ -257,7 +257,7 @@ pub fn detect_service_state() -> ServiceState {
         {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                if stdout.contains("state = running") {
+                if stdout.lines().any(|line| line.trim() == "state = running") {
                     return ServiceState::Running;
                 }
             }
@@ -302,7 +302,7 @@ pub fn parse_health_json(
 
     let status = obj.get("status").and_then(serde_json::Value::as_str);
     let service = obj.get("service").and_then(serde_json::Value::as_str);
-    if !matches!((status, service), (Some("ok"), _) | (None, Some("vdpi"))) {
+    if !matches!((status, service), (Some("ok") | None, Some("vdpi"))) {
         return None;
     }
 
@@ -338,8 +338,19 @@ pub fn parse_health_json(
     })
 }
 
+const MAX_HEALTH_RESPONSE_BYTES: usize = 8 * 1024;
+const CONTROL_CENTER_PROBE_BUDGET: Duration = Duration::from_millis(300);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProbeCandidate {
+    addr: IpAddr,
+    connect_ip: IpAddr,
+    port: u16,
+    socks_port: Option<u16>,
+}
+
 fn probe_connect_ip(addr: IpAddr) -> Option<IpAddr> {
-    match addr {
+    match addr.to_canonical() {
         IpAddr::V4(v4) if v4.is_unspecified() => Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
         IpAddr::V6(v6) if v6.is_unspecified() => Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
         ip if ip.is_loopback() => Some(ip),
@@ -347,14 +358,51 @@ fn probe_connect_ip(addr: IpAddr) -> Option<IpAddr> {
     }
 }
 
+fn build_probe_candidates(cfg: &RuntimeConfig, states: &[RuntimeState]) -> Vec<ProbeCandidate> {
+    let cfg_connect_ip = probe_connect_ip(cfg.addr);
+    let primary_socks = states
+        .iter()
+        .find(|s| {
+            s.port == cfg.port
+                && (s.addr == cfg.addr
+                    || cfg_connect_ip.is_some_and(|ip| probe_connect_ip(s.addr) == Some(ip)))
+        })
+        .map_or(cfg.socks_port, |s| s.socks_port);
+
+    let mut seen: Vec<(IpAddr, u16)> = Vec::new();
+    let mut out = Vec::new();
+
+    for (addr, port, socks_port) in std::iter::once((cfg.addr, cfg.port, primary_socks))
+        .chain(states.iter().map(|s| (s.addr, s.port, s.socks_port)))
+    {
+        if port == 0 {
+            continue;
+        }
+        let Some(connect_ip) = probe_connect_ip(addr) else {
+            continue;
+        };
+        if seen.contains(&(connect_ip, port)) {
+            continue;
+        }
+        seen.push((connect_ip, port));
+        out.push(ProbeCandidate {
+            addr,
+            connect_ip,
+            port,
+            socks_port,
+        });
+    }
+
+    out
+}
+
 fn probe_local_health(
     addr: IpAddr,
     port: u16,
     socks_port: Option<u16>,
+    deadline: Instant,
 ) -> Option<LiveEngineStatus> {
-    const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
-    const PROBE_TOTAL_TIMEOUT: Duration = Duration::from_millis(300);
-    const MAX_HEALTH_RESPONSE_BYTES: usize = 8 * 1024;
+    const PROBE_CONNECT_CAP: Duration = Duration::from_millis(250);
     const HEALTH_REQUEST: &[u8] =
         b"GET /vdpi-health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
 
@@ -362,24 +410,34 @@ fn probe_local_health(
         return None;
     }
 
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return None;
+    }
+
     let connect_ip = probe_connect_ip(addr)?;
     let sock = SocketAddr::new(connect_ip, port);
 
-    let mut stream = TcpStream::connect_timeout(&sock, PROBE_CONNECT_TIMEOUT).ok()?;
-    let _ = stream.set_write_timeout(Some(PROBE_CONNECT_TIMEOUT));
+    let connect_timeout = remaining.min(PROBE_CONNECT_CAP);
+    let mut stream = TcpStream::connect_timeout(&sock, connect_timeout).ok()?;
+
+    let write_remaining = deadline.saturating_duration_since(Instant::now());
+    if write_remaining.is_zero() {
+        return None;
+    }
+    let _ = stream.set_write_timeout(Some(write_remaining));
 
     stream.write_all(HEALTH_REQUEST).ok()?;
     let _ = stream.flush();
 
-    let deadline = Instant::now() + PROBE_TOTAL_TIMEOUT;
     let mut raw = Vec::with_capacity(512);
     let mut buf = [0u8; 1024];
     while raw.len() < MAX_HEALTH_RESPONSE_BYTES {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        let read_remaining = deadline.saturating_duration_since(Instant::now());
+        if read_remaining.is_zero() {
             break;
         }
-        let _ = stream.set_read_timeout(Some(remaining));
+        let _ = stream.set_read_timeout(Some(read_remaining));
         let to_read = buf.len().min(MAX_HEALTH_RESPONSE_BYTES - raw.len());
         match stream.read(&mut buf[..to_read]) {
             Ok(0) => break,
@@ -414,21 +472,21 @@ pub fn probe_control_center_status(cfg: &RuntimeConfig) -> ControlCenterStatus {
     let service_state = detect_service_state();
     let states = read_runtime_states();
 
-    let primary_socks = states
-        .iter()
-        .find(|s| s.addr == cfg.addr && s.port == cfg.port)
-        .map_or(cfg.socks_port, |s| s.socks_port);
+    let deadline = Instant::now() + CONTROL_CENTER_PROBE_BUDGET;
+    let mut live_engine = None;
 
-    let mut live_engine = probe_local_health(cfg.addr, cfg.port, primary_socks);
-    if live_engine.is_none() {
-        for st in states {
-            if st.addr == cfg.addr && st.port == cfg.port {
-                continue;
-            }
-            if let Some(status) = probe_local_health(st.addr, st.port, st.socks_port) {
-                live_engine = Some(status);
-                break;
-            }
+    for candidate in build_probe_candidates(cfg, &states) {
+        if Instant::now() >= deadline {
+            break;
+        }
+        if let Some(status) = probe_local_health(
+            candidate.addr,
+            candidate.port,
+            candidate.socks_port,
+            deadline,
+        ) {
+            live_engine = Some(status);
+            break;
         }
     }
 
@@ -1020,12 +1078,35 @@ fn install_linux_systemd_service(target_bin: &Path, cfg: &RuntimeConfig) -> Resu
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+const UNIX_SHELL_PATH_EXPORT: &str = r#"export PATH="$HOME/.vdpi/bin:$PATH""#;
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn strip_unix_shell_path_line(content: &str) -> Option<String> {
+    let mut removed = false;
+    let mut kept = Vec::new();
+    for line in content.lines() {
+        if line == UNIX_SHELL_PATH_EXPORT {
+            removed = true;
+        } else {
+            kept.push(line);
+        }
+    }
+    if !removed {
+        return None;
+    }
+    let mut next = kept.join("\n");
+    if !next.is_empty() && content.ends_with('\n') {
+        next.push('\n');
+    }
+    Some(next)
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn ensure_unix_shell_path() -> bool {
     let Ok(home) = home_dir() else {
         return false;
     };
-    let export_line = r#"export PATH="$HOME/.vdpi/bin:$PATH""#;
     let mut updated = false;
     for rc_name in [".zshrc", ".bashrc", ".profile"] {
         let rc_path = home.join(rc_name);
@@ -1042,8 +1123,32 @@ fn ensure_unix_shell_path() -> bool {
         if !next.ends_with('\n') {
             next.push('\n');
         }
-        next.push_str(export_line);
+        next.push_str(UNIX_SHELL_PATH_EXPORT);
         next.push('\n');
+        if fs::write(&rc_path, next).is_ok() {
+            updated = true;
+        }
+    }
+    updated
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn remove_unix_shell_path() -> bool {
+    let Ok(home) = home_dir() else {
+        return false;
+    };
+    let mut updated = false;
+    for rc_name in [".zshrc", ".bashrc", ".profile"] {
+        let rc_path = home.join(rc_name);
+        if !rc_path.is_file() {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(&rc_path) else {
+            continue;
+        };
+        let Some(next) = strip_unix_shell_path_line(&content) else {
+            continue;
+        };
         if fs::write(&rc_path, next).is_ok() {
             updated = true;
         }
@@ -1138,6 +1243,7 @@ fn schedule_delayed_windows_dir_cleanup(vdpi_root: &Path) {
         "for /L %i in (1,1,12) do (rmdir /S /Q \"{root_str}\" 2>nul & if not exist \"{root_str}\" (exit /b 0) else (ping -n 2 127.0.0.1 >nul))"
     );
     let _ = Command::new("cmd.exe")
+        .current_dir(std::env::temp_dir())
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1150,6 +1256,9 @@ fn schedule_delayed_windows_dir_cleanup(vdpi_root: &Path) {
 #[cfg(target_os = "windows")]
 fn cleanup_windows_install_files() {
     use crate::platform::windows::remove_dir_from_windows_path;
+
+    // Release any directory handle held on `C:\Program Files\vdpi\bin` via CWD.
+    let _ = std::env::set_current_dir(std::env::temp_dir());
 
     let Ok(vdpi_root) = vdpi_root_dir() else {
         return;
@@ -1164,13 +1273,14 @@ fn cleanup_windows_install_files() {
         .ok()
         .and_then(|p| fs::canonicalize(&p).ok());
 
-    if let Some(ref legacy) = legacy_root {
+    if let Some(legacy) = legacy_root.as_deref().filter(|p| p.exists()) {
         let running_from_legacy = current_exe
             .as_ref()
             .zip(fs::canonicalize(legacy).ok())
             .is_some_and(|(exe, root)| exe.starts_with(root));
-        if legacy.exists() && !running_from_legacy {
-            let _ = fs::remove_dir_all(legacy);
+        if running_from_legacy || fs::remove_dir_all(legacy).is_err() {
+            let _ = fs::remove_dir_all(legacy.join("logs"));
+            schedule_delayed_windows_dir_cleanup(legacy);
         }
     }
 
@@ -1201,19 +1311,38 @@ pub fn uninstall_service() -> Result<()> {
     {
         let uid = current_uid();
         let domain_target = format!("gui/{uid}");
+        let service_target = format!("{domain_target}/{LAUNCH_AGENT_LABEL}");
         let plist_path = launch_agent_plist_path()?;
 
+        // Always attempt service-target bootout even when the plist file is already missing.
+        let _ = Command::new("/bin/launchctl")
+            .args(["bootout", &service_target])
+            .stdin(Stdio::null())
+            .output();
+
         if plist_path.exists() {
+            let plist_str = plist_path.display().to_string();
             let _ = Command::new("/bin/launchctl")
-                .args(["bootout", &domain_target, &plist_path.display().to_string()])
+                .args(["bootout", &domain_target, &plist_str])
+                .stdin(Stdio::null())
                 .output();
             let _ = Command::new("/bin/launchctl")
-                .args(["unload", &plist_path.display().to_string()])
+                .args(["unload", &plist_str])
+                .stdin(Stdio::null())
                 .output();
             fs::remove_file(&plist_path)?;
             println!("Removed LaunchAgent: {}", plist_path.display());
         } else {
             println!("LaunchAgent {} is not installed", plist_path.display());
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while launchctl_service_loaded(&service_target) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        if remove_unix_shell_path() {
+            println!("Removed ~/.vdpi/bin from shell PATH profile.");
         }
         if let Ok(root) = vdpi_root_dir() {
             if root.exists() {
@@ -1227,18 +1356,26 @@ pub fn uninstall_service() -> Result<()> {
         let unit_path = systemd_user_unit_path()?;
         let _ = Command::new("systemctl")
             .args(["--user", "disable", "--now", SYSTEMD_UNIT_NAME])
+            .stdin(Stdio::null())
             .output();
         if unit_path.exists() {
             fs::remove_file(&unit_path)?;
             let _ = Command::new("systemctl")
                 .args(["--user", "daemon-reload"])
+                .stdin(Stdio::null())
                 .output();
             println!("Removed systemd user unit: {}", unit_path.display());
         } else {
             println!("Systemd unit {} is not installed", unit_path.display());
         }
         if let Ok(home) = home_dir() {
-            let _ = fs::remove_file(home.join(".local").join("bin").join("vdpi"));
+            let link_path = home.join(".local").join("bin").join("vdpi");
+            if fs::symlink_metadata(&link_path).is_ok_and(|meta| meta.is_symlink()) {
+                let _ = fs::remove_file(&link_path);
+            }
+        }
+        if remove_unix_shell_path() {
+            println!("Removed ~/.vdpi/bin from shell PATH profile.");
         }
         if let Ok(root) = vdpi_root_dir() {
             if root.exists() {
@@ -1255,6 +1392,7 @@ pub fn uninstall_service() -> Result<()> {
             println!(
                 "Requesting Administrator privileges to uninstall the vdpi Windows service..."
             );
+            let _ = std::env::set_current_dir(std::env::temp_dir());
             relaunch_elevated_and_wait(&["uninstall".to_string()])?;
             clear_all_system_proxies()?;
             println!(
@@ -1286,6 +1424,16 @@ pub fn uninstall_service() -> Result<()> {
 /// Temporarily stops the background `vdpi` service and restores system proxies without
 /// uninstalling installed files, PATH entries, or service registration.
 pub fn pause_service() -> Result<()> {
+    pause_service_impl(true)
+}
+
+/// Quiet variant of [`pause_service`] for interactive TUI callers that must not write
+/// status lines to stdout.
+pub fn pause_service_quiet() -> Result<()> {
+    pause_service_impl(false)
+}
+
+fn pause_service_impl(verbose: bool) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         use crate::platform::windows_service::{
@@ -1298,7 +1446,11 @@ pub fn pause_service() -> Result<()> {
         }
 
         if !is_elevated() {
-            println!("Requesting Administrator privileges to pause the vdpi Windows service...");
+            if verbose {
+                println!(
+                    "Requesting Administrator privileges to pause the vdpi Windows service..."
+                );
+            }
             relaunch_elevated_and_wait(&["pause".to_string()])?;
             clear_all_system_proxies()?;
             return Ok(());
@@ -1307,9 +1459,11 @@ pub fn pause_service() -> Result<()> {
         let _ = stop_windows_service_if_running()?;
         stop_windows_foreground_daemons();
         clear_all_system_proxies()?;
-        println!(
-            "Paused Windows service '{WINDOWS_SERVICE_NAME}' and restored Windows system proxies."
-        );
+        if verbose {
+            println!(
+                "Paused Windows service '{WINDOWS_SERVICE_NAME}' and restored Windows system proxies."
+            );
+        }
         Ok(())
     }
 
@@ -1324,12 +1478,31 @@ pub fn pause_service() -> Result<()> {
         }
         let uid = current_uid();
         let domain_target = format!("gui/{uid}");
+        let service_target = format!("{domain_target}/{LAUNCH_AGENT_LABEL}");
         let plist_str = plist_path.display().to_string();
-        let out = Command::new("/bin/launchctl")
-            .args(["bootout", &domain_target, &plist_str])
+
+        let mut out = Command::new("/bin/launchctl")
+            .args(["bootout", &service_target])
+            .stdin(Stdio::null())
             .output()
             .context("failed to execute '/bin/launchctl bootout'")?;
-        if !out.status.success() && detect_service_state() == ServiceState::Running {
+
+        if !out.status.success() && launchctl_service_loaded(&service_target) {
+            out = Command::new("/bin/launchctl")
+                .args(["bootout", &domain_target, &plist_str])
+                .stdin(Stdio::null())
+                .output()
+                .context("failed to execute '/bin/launchctl bootout'")?;
+        }
+
+        // Wait for launchd asynchronous bootout teardown so the exiting daemon
+        // does not race with clear_all_system_proxies().
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while launchctl_service_loaded(&service_target) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        if detect_service_state() == ServiceState::Running {
             let stderr = String::from_utf8_lossy(&out.stderr);
             let detail = stderr.trim();
             if detail.is_empty() {
@@ -1340,11 +1513,14 @@ pub fn pause_service() -> Result<()> {
             }
             bail!("failed to pause LaunchAgent '{LAUNCH_AGENT_LABEL}': {detail}");
         }
+
         clear_all_system_proxies()?;
-        println!(
-            "Paused LaunchAgent '{LAUNCH_AGENT_LABEL}' and restored {} system proxy settings.",
-            platform_name()
-        );
+        if verbose {
+            println!(
+                "Paused LaunchAgent '{LAUNCH_AGENT_LABEL}' and restored {} system proxy settings.",
+                platform_name()
+            );
+        }
         Ok(())
     }
 
@@ -1359,25 +1535,35 @@ pub fn pause_service() -> Result<()> {
         }
         let out = Command::new("systemctl")
             .args(["--user", "stop", SYSTEMD_UNIT_NAME])
+            .stdin(Stdio::null())
             .output()
             .context("failed to execute 'systemctl --user stop'")?;
-        if !out.status.success() {
+        let not_loaded_and_stopped =
+            out.status.code() == Some(5) && detect_service_state() != ServiceState::Running;
+        if !out.status.success() && !not_loaded_and_stopped {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            bail!(
-                "failed to pause systemd user unit '{SYSTEMD_UNIT_NAME}': {}",
-                stderr.trim()
-            );
+            let detail = stderr.trim();
+            if detail.is_empty() {
+                bail!(
+                    "failed to pause systemd user unit '{SYSTEMD_UNIT_NAME}' (exit status: {})",
+                    out.status
+                );
+            }
+            bail!("failed to pause systemd user unit '{SYSTEMD_UNIT_NAME}': {detail}");
         }
         clear_all_system_proxies()?;
-        println!(
-            "Paused systemd user unit '{SYSTEMD_UNIT_NAME}' and restored {} system proxy settings.",
-            platform_name()
-        );
+        if verbose {
+            println!(
+                "Paused systemd user unit '{SYSTEMD_UNIT_NAME}' and restored {} system proxy settings.",
+                platform_name()
+            );
+        }
         Ok(())
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
+        let _ = verbose;
         bail!(
             "pausing background service is not supported on {}",
             platform_name()
@@ -1387,8 +1573,19 @@ pub fn pause_service() -> Result<()> {
 
 /// Starts or restarts a previously installed/paused background `vdpi` service.
 pub fn resume_service() -> Result<()> {
+    resume_service_impl(true)
+}
+
+/// Quiet variant of [`resume_service`] for interactive TUI callers that must not write
+/// status lines to stdout.
+pub fn resume_service_quiet() -> Result<()> {
+    resume_service_impl(false)
+}
+
+fn resume_service_impl(verbose: bool) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
+        use crate::platform::windows::{broadcast_environment_change, notify_wininet_refresh};
         use crate::platform::windows_service::{
             is_elevated, query_windows_service_status, relaunch_elevated_and_wait,
             start_windows_service,
@@ -1399,13 +1596,27 @@ pub fn resume_service() -> Result<()> {
         }
 
         if !is_elevated() {
-            println!("Requesting Administrator privileges to resume the vdpi Windows service...");
+            if verbose {
+                println!(
+                    "Requesting Administrator privileges to resume the vdpi Windows service..."
+                );
+            }
             relaunch_elevated_and_wait(&["resume".to_string()])?;
+            notify_wininet_refresh();
+            broadcast_environment_change();
             return Ok(());
         }
 
-        start_windows_service()?;
-        println!("Resumed Windows service '{WINDOWS_SERVICE_NAME}' (anti-DPI protection active).");
+        if !start_windows_service()? {
+            bail!("vdpi Windows service is not installed. Run 'vdpi install' first.");
+        }
+        notify_wininet_refresh();
+        broadcast_environment_change();
+        if verbose {
+            println!(
+                "Resumed Windows service '{WINDOWS_SERVICE_NAME}' (anti-DPI protection active)."
+            );
+        }
         Ok(())
     }
 
@@ -1420,32 +1631,77 @@ pub fn resume_service() -> Result<()> {
         }
         let uid = current_uid();
         let domain_target = format!("gui/{uid}");
+        let service_target = format!("{domain_target}/{LAUNCH_AGENT_LABEL}");
         let plist_str = plist_path.display().to_string();
+
+        let _ = Command::new("/bin/launchctl")
+            .args(["enable", &service_target])
+            .stdin(Stdio::null())
+            .output();
+
         let boot = Command::new("/bin/launchctl")
             .args(["bootstrap", &domain_target, &plist_str])
+            .stdin(Stdio::null())
             .output()
             .context("failed to execute '/bin/launchctl bootstrap'")?;
-        let service_target = format!("{domain_target}/{LAUNCH_AGENT_LABEL}");
-        let kick = Command::new("/bin/launchctl")
-            .args(["kickstart", "-k", &service_target])
-            .output()
-            .context("failed to execute '/bin/launchctl kickstart'")?;
-        if !kick.status.success() {
-            let kick_err = String::from_utf8_lossy(&kick.stderr);
-            if !boot.status.success() {
-                let boot_err = String::from_utf8_lossy(&boot.stderr);
+
+        if boot.status.success() {
+            // `RunAtLoad=true` already spawns the agent; avoid racing a second
+            // instance with `kickstart -k` (which collides on proxy-lease.lock).
+            let deadline = Instant::now() + Duration::from_millis(1500);
+            while detect_service_state() != ServiceState::Running && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if detect_service_state() != ServiceState::Running {
+                let kick = Command::new("/bin/launchctl")
+                    .args(["kickstart", &service_target])
+                    .stdin(Stdio::null())
+                    .output()
+                    .context("failed to execute '/bin/launchctl kickstart'")?;
+                if !kick.status.success() && detect_service_state() != ServiceState::Running {
+                    let kick_err = String::from_utf8_lossy(&kick.stderr);
+                    let detail = kick_err.trim();
+                    if detail.is_empty() {
+                        bail!(
+                            "failed to resume LaunchAgent '{LAUNCH_AGENT_LABEL}' (exit status: {})",
+                            kick.status
+                        );
+                    }
+                    bail!("failed to resume LaunchAgent '{LAUNCH_AGENT_LABEL}': {detail}");
+                }
+            }
+        } else if launchctl_service_loaded(&service_target) {
+            let kick = Command::new("/bin/launchctl")
+                .args(["kickstart", "-k", &service_target])
+                .stdin(Stdio::null())
+                .output()
+                .context("failed to execute '/bin/launchctl kickstart'")?;
+            if !kick.status.success() {
+                let kick_err = String::from_utf8_lossy(&kick.stderr);
+                let detail = kick_err.trim();
+                if detail.is_empty() {
+                    bail!(
+                        "failed to resume LaunchAgent '{LAUNCH_AGENT_LABEL}' (exit status: {})",
+                        kick.status
+                    );
+                }
+                bail!("failed to resume LaunchAgent '{LAUNCH_AGENT_LABEL}': {detail}");
+            }
+        } else {
+            let boot_err = String::from_utf8_lossy(&boot.stderr);
+            let detail = boot_err.trim();
+            if detail.is_empty() {
                 bail!(
-                    "failed to resume LaunchAgent '{LAUNCH_AGENT_LABEL}': bootstrap failed ({}); kickstart failed ({})",
-                    boot_err.trim(),
-                    kick_err.trim()
+                    "failed to resume LaunchAgent '{LAUNCH_AGENT_LABEL}': bootstrap failed (exit status: {})",
+                    boot.status
                 );
             }
-            bail!(
-                "failed to resume LaunchAgent '{LAUNCH_AGENT_LABEL}': {}",
-                kick_err.trim()
-            );
+            bail!("failed to resume LaunchAgent '{LAUNCH_AGENT_LABEL}': {detail}");
         }
-        println!("Resumed LaunchAgent '{LAUNCH_AGENT_LABEL}' (anti-DPI protection active).");
+
+        if verbose {
+            println!("Resumed LaunchAgent '{LAUNCH_AGENT_LABEL}' (anti-DPI protection active).");
+        }
         Ok(())
     }
 
@@ -1458,28 +1714,81 @@ pub fn resume_service() -> Result<()> {
                 unit_path.display()
             );
         }
+        let _ = Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .stdin(Stdio::null())
+            .output();
         let out = Command::new("systemctl")
             .args(["--user", "start", SYSTEMD_UNIT_NAME])
+            .stdin(Stdio::null())
             .output()
             .context("failed to execute 'systemctl --user start'")?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            bail!(
-                "failed to resume systemd user unit '{SYSTEMD_UNIT_NAME}': {}",
-                stderr.trim()
+            let detail = stderr.trim();
+            if detail.is_empty() {
+                bail!(
+                    "failed to resume systemd user unit '{SYSTEMD_UNIT_NAME}' (exit status: {})",
+                    out.status
+                );
+            }
+            bail!("failed to resume systemd user unit '{SYSTEMD_UNIT_NAME}': {detail}");
+        }
+
+        // Briefly confirm the unit did not immediately crash into `failed` state.
+        let deadline = Instant::now() + Duration::from_millis(400);
+        loop {
+            if let Ok(state_out) = Command::new("systemctl")
+                .args(["--user", "is-active", SYSTEMD_UNIT_NAME])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+            {
+                let state = String::from_utf8_lossy(&state_out.stdout);
+                if state.trim() == "failed" {
+                    bail!(
+                        "systemd user unit '{SYSTEMD_UNIT_NAME}' entered failed state immediately after start"
+                    );
+                }
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        if verbose {
+            println!(
+                "Resumed systemd user unit '{SYSTEMD_UNIT_NAME}' (anti-DPI protection active)."
             );
         }
-        println!("Resumed systemd user unit '{SYSTEMD_UNIT_NAME}' (anti-DPI protection active).");
         Ok(())
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
+        let _ = verbose;
         bail!(
             "resuming background service is not supported on {}",
             platform_name()
         );
     }
+}
+
+async fn read_capped_health_body(mut resp: reqwest::Response) -> Option<String> {
+    let mut buf = Vec::with_capacity(512);
+    while buf.len() < MAX_HEALTH_RESPONSE_BYTES {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let remaining = MAX_HEALTH_RESPONSE_BYTES - buf.len();
+                let take = chunk.len().min(remaining);
+                buf.extend_from_slice(&chunk[..take]);
+            }
+            Ok(None) => break,
+            Err(_) => return None,
+        }
+    }
+    Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
 async fn discover_live_daemon(
@@ -1488,31 +1797,26 @@ async fn discover_live_daemon(
 ) -> (IpAddr, u16, Option<u16>, Option<String>) {
     let states = read_runtime_states();
 
-    let primary_socket = SocketAddr::new(cfg.addr, cfg.port);
-    let primary_url = format!("http://{primary_socket}/vdpi-health");
-    if let Ok(resp) = client.get(primary_url).send().await {
-        if resp.status().is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            let matching_socks = states
-                .iter()
-                .find(|s| s.addr == cfg.addr && s.port == cfg.port)
-                .map(|s| s.socks_port)
-                .unwrap_or(cfg.socks_port);
-            return (cfg.addr, cfg.port, matching_socks, Some(text));
-        }
-    }
-
-    for st in states {
-        if st.addr == cfg.addr && st.port == cfg.port {
+    for candidate in build_probe_candidates(cfg, &states) {
+        let socket = SocketAddr::new(candidate.connect_ip, candidate.port);
+        let url = format!("http://{socket}/vdpi-health");
+        let Ok(resp) = client.get(url).send().await else {
+            continue;
+        };
+        if !resp.status().is_success() {
             continue;
         }
-        let state_socket = SocketAddr::new(st.addr, st.port);
-        let url = format!("http://{state_socket}/vdpi-health");
-        if let Ok(resp) = client.get(url).send().await {
-            if resp.status().is_success() {
-                let text = resp.text().await.unwrap_or_default();
-                return (st.addr, st.port, st.socks_port, Some(text));
-            }
+        let Some(text) = read_capped_health_body(resp).await else {
+            continue;
+        };
+        if parse_health_json(&text, candidate.addr, candidate.port, candidate.socks_port).is_some()
+        {
+            return (
+                candidate.addr,
+                candidate.port,
+                candidate.socks_port,
+                Some(text),
+            );
         }
     }
 
@@ -1540,14 +1844,18 @@ pub async fn print_status(cfg: &RuntimeConfig) -> Result<()> {
     };
 
     let socks_state = if let Some(sp) = active_socks_port {
-        match tokio::time::timeout(
-            Duration::from_secs(1),
-            tokio::net::TcpStream::connect((active_addr, sp)),
-        )
-        .await
-        {
-            Ok(Ok(_)) => format!("LISTENING ({}:{})", active_addr, sp),
-            _ => format!("CLOSED ({}:{})", active_addr, sp),
+        if let Some(connect_ip) = probe_connect_ip(active_addr) {
+            match tokio::time::timeout(
+                Duration::from_secs(1),
+                tokio::net::TcpStream::connect((connect_ip, sp)),
+            )
+            .await
+            {
+                Ok(Ok(_)) => format!("LISTENING ({}:{})", active_addr, sp),
+                _ => format!("CLOSED ({}:{})", active_addr, sp),
+            }
+        } else {
+            format!("UNREACHABLE ({}:{})", active_addr, sp)
         }
     } else {
         "DISABLED (available via primary port auto-detect)".to_string()
@@ -1605,28 +1913,28 @@ pub async fn print_status(cfg: &RuntimeConfig) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         let plist_path = launch_agent_plist_path()?;
+        let state_label = match detect_service_state() {
+            ServiceState::Running => "running",
+            ServiceState::Stopped => "paused",
+            ServiceState::NotInstalled => "not installed",
+        };
         println!(
-            "LaunchAgent plist         : {} ({})",
-            plist_path.display(),
-            if plist_path.exists() {
-                "installed"
-            } else {
-                "not installed"
-            }
+            "LaunchAgent plist         : {} ({state_label})",
+            plist_path.display()
         );
     }
 
     #[cfg(target_os = "linux")]
     {
         let unit_path = systemd_user_unit_path()?;
+        let state_label = match detect_service_state() {
+            ServiceState::Running => "running",
+            ServiceState::Stopped => "paused",
+            ServiceState::NotInstalled => "not installed",
+        };
         println!(
-            "systemd user unit         : {} ({})",
-            unit_path.display(),
-            if unit_path.exists() {
-                "installed"
-            } else {
-                "not installed"
-            }
+            "systemd user unit         : {} ({state_label})",
+            unit_path.display()
         );
     }
 
@@ -1672,8 +1980,9 @@ pub async fn run_doctor(cfg: RuntimeConfig) -> Result<()> {
         discover_live_daemon(&direct_check, &cfg).await;
 
     let (http_proxy_addr, socks_proxy_addr, _guard_tx) = if live_health.is_some() {
-        let hp = SocketAddr::new(active_addr, active_port);
-        let sp = SocketAddr::new(active_addr, active_socks_port.unwrap_or(active_port));
+        let connect_ip = probe_connect_ip(active_addr).unwrap_or(active_addr);
+        let hp = SocketAddr::new(connect_ip, active_port);
+        let sp = SocketAddr::new(connect_ip, active_socks_port.unwrap_or(active_port));
         println!("Testing against running vdpi daemon at {hp} (SOCKS5: {sp})...\n");
         (hp, sp, None)
     } else {
@@ -1683,8 +1992,11 @@ pub async fn run_doctor(cfg: RuntimeConfig) -> Result<()> {
         ephemeral_cfg.system_proxy = false;
         let ctx = EngineContext::new(ephemeral_cfg)?;
         let bound = crate::server::bind_listeners(&ctx)?;
-        let hp = bound.primary_addr;
-        let sp = bound.socks_addr.unwrap_or(hp);
+        let hp_ip = probe_connect_ip(bound.primary_addr.ip()).unwrap_or(bound.primary_addr.ip());
+        let hp = SocketAddr::new(hp_ip, bound.primary_addr.port());
+        let sp = bound.socks_addr.map_or(hp, |a| {
+            SocketAddr::new(probe_connect_ip(a.ip()).unwrap_or(a.ip()), a.port())
+        });
         let (tx, rx) = tokio::sync::watch::channel(false);
         tokio::spawn(async move {
             let _ = crate::server::serve_until_shutdown(bound, ctx, rx).await;
@@ -1790,6 +2102,17 @@ pub async fn run_doctor(cfg: RuntimeConfig) -> Result<()> {
 
     println!("\nAll Discord & Roblox HTTP CONNECT and SOCKS5h checks passed.");
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_service_loaded(service_target: &str) -> bool {
+    Command::new("/bin/launchctl")
+        .args(["print", service_target])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 #[cfg(target_os = "macos")]
@@ -1974,9 +2297,6 @@ mod tests {
             .expect("service=vdpi payload without status should parse");
         assert_eq!(parsed_service_only.version, None);
         assert_eq!(parsed_service_only.socks_port, Some(1080));
-
-        let status_only = r#"{"status":"ok"}"#;
-        assert!(parse_health_json(status_only, addr, 8080, None).is_some());
     }
 
     #[test]
@@ -1995,6 +2315,14 @@ mod tests {
         assert_eq!(parse_health_json(r#"["ok"]"#, addr, 8080, None), None);
         assert_eq!(
             parse_health_json(r#"{"hello":"world"}"#, addr, 8080, None),
+            None
+        );
+        assert_eq!(
+            parse_health_json(r#"{"status":"ok"}"#, addr, 8080, None),
+            None
+        );
+        assert_eq!(
+            parse_health_json(r#"{"status":"ok","service":"other"}"#, addr, 8080, None),
             None
         );
         assert_eq!(
@@ -2022,9 +2350,88 @@ mod tests {
             Some(IpAddr::V6(Ipv6Addr::LOCALHOST))
         );
         assert_eq!(
+            probe_connect_ip(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 1))),
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        );
+        assert_eq!(
+            probe_connect_ip(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0, 0))),
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        );
+        assert_eq!(
+            probe_connect_ip(IpAddr::V6(Ipv6Addr::new(
+                0, 0, 0, 0, 0, 0xffff, 0x0808, 0x0808
+            ))),
+            None
+        );
+        assert_eq!(
             probe_connect_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
             None
         );
+    }
+
+    #[test]
+    fn build_probe_candidates_deduplicates_canonical_endpoints() {
+        let mut cfg = CliArgs::parse_from_iter(["vdpi"])
+            .unwrap()
+            .into_runtime_config();
+        cfg.addr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        cfg.port = 8080;
+        cfg.socks_port = Some(1080);
+
+        let states = vec![
+            RuntimeState {
+                pid: 1,
+                addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port: 8080,
+                socks_port: Some(1081),
+            },
+            RuntimeState {
+                pid: 2,
+                addr: IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 1)),
+                port: 8080,
+                socks_port: Some(1082),
+            },
+            RuntimeState {
+                pid: 3,
+                addr: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+                port: 8081,
+                socks_port: None,
+            },
+            RuntimeState {
+                pid: 4,
+                addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port: 8081,
+                socks_port: Some(1085),
+            },
+        ];
+
+        let candidates = build_probe_candidates(&cfg, &states);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].connect_ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(candidates[0].port, 8080);
+        assert_eq!(candidates[0].socks_port, Some(1081));
+        assert_eq!(candidates[1].connect_ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(candidates[1].port, 8081);
+        assert_eq!(candidates[1].socks_port, Some(1085));
+    }
+
+    #[test]
+    fn strips_exact_unix_shell_path_export_line() {
+        let content = format!("export FOO=1\n{UNIX_SHELL_PATH_EXPORT}\nexport BAR=2\n");
+        assert_eq!(
+            strip_unix_shell_path_line(&content).as_deref(),
+            Some("export FOO=1\nexport BAR=2\n")
+        );
+
+        let only_export = format!("{UNIX_SHELL_PATH_EXPORT}\n");
+        assert_eq!(
+            strip_unix_shell_path_line(&only_export).as_deref(),
+            Some("")
+        );
+
+        let custom = format!("{UNIX_SHELL_PATH_EXPORT} # custom\n");
+        assert_eq!(strip_unix_shell_path_line(&custom), None);
+        assert_eq!(strip_unix_shell_path_line("export FOO=1\n"), None);
     }
 
     #[test]
@@ -2061,7 +2468,8 @@ mod tests {
             }
         });
 
-        let ok_11 = probe_local_health(IpAddr::V4(Ipv4Addr::LOCALHOST), port, Some(1080))
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let ok_11 = probe_local_health(IpAddr::V4(Ipv4Addr::LOCALHOST), port, Some(1080), deadline)
             .expect("HTTP/1.1 200 response should succeed");
         assert_eq!(ok_11.addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(ok_11.port, port);
@@ -2075,11 +2483,13 @@ mod tests {
         assert_eq!(ok_11.learned_hosts, Some(5));
         assert_eq!(ok_11.isp_stage.as_deref(), Some("stage-1"));
 
-        let ok_10_wildcard = probe_local_health(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port, None)
-            .expect("HTTP/1.0 200 via 0.0.0.0 wildcard should normalize to 127.0.0.1");
+        let ok_10_wildcard =
+            probe_local_health(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port, None, deadline)
+                .expect("HTTP/1.0 200 via 0.0.0.0 wildcard should normalize to 127.0.0.1");
         assert_eq!(ok_10_wildcard.version.as_deref(), Some("0.4.2"));
 
-        let rejected_404 = probe_local_health(IpAddr::V4(Ipv4Addr::LOCALHOST), port, Some(1080));
+        let rejected_404 =
+            probe_local_health(IpAddr::V4(Ipv4Addr::LOCALHOST), port, Some(1080), deadline);
         assert_eq!(rejected_404, None);
 
         server.join().expect("server thread should finish cleanly");

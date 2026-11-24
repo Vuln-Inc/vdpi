@@ -1,4 +1,6 @@
 use anyhow::Result;
+use std::cell::RefCell;
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing::info;
 use vdpi::config::{CliArgs, Command, RuntimeConfig};
@@ -11,7 +13,7 @@ use vdpi::platform::windows::foreground;
 use vdpi::server::{bind_listeners, serve_until_shutdown};
 use vdpi::service::{
     clear_runtime_state, install_service, print_status, run_doctor, uninstall_service,
-    write_runtime_state,
+    write_runtime_state, ServiceState,
 };
 
 mod launcher;
@@ -46,14 +48,39 @@ fn main() -> Result<()> {
     if bare || matches!(command, Some(Command::Launcher)) {
         let mut notice: Option<String> = None;
         let mut explicit_launcher = !bare;
+        let mut cli_rt: Option<tokio::runtime::Runtime> = None;
         loop {
-            let status = vdpi::service::probe_control_center_status(&cfg);
+            let initial_status = vdpi::service::probe_control_center_status(&cfg);
+            let latest_status = RefCell::new(initial_status.clone());
+            let choice = launcher::choose(
+                explicit_launcher,
+                &initial_status,
+                notice.as_deref(),
+                || {
+                    let refreshed = vdpi::service::probe_control_center_status(&cfg);
+                    *latest_status.borrow_mut() = refreshed.clone();
+                    refreshed
+                },
+            )?;
+            let status = latest_status.into_inner();
             let installed_before = status.installed.clone();
-            match launcher::choose(explicit_launcher, &status, notice.as_deref(), || {
-                vdpi::service::probe_control_center_status(&cfg)
-            })? {
+            match choice {
                 launcher::Choice::Run => {
-                    if !cfg.quiet {
+                    if cfg.system_proxy
+                        && (status.service_state == ServiceState::Running
+                            || status.live_engine.is_some())
+                    {
+                        notice = Some(
+                            "Background service is already running. Pause it first or run with --no-system-proxy."
+                                .to_string(),
+                        );
+                        explicit_launcher = true;
+                        continue;
+                    }
+                    if !cfg.quiet
+                        && status.installed.is_none()
+                        && status.service_state == ServiceState::NotInstalled
+                    {
                         launcher::print_run_notice();
                     }
                     command = Some(Command::Start);
@@ -71,41 +98,42 @@ fn main() -> Result<()> {
                 }
                 launcher::Choice::Update => {
                     init_tracing(&cfg);
-                    let result = build_runtime()
+                    let result = get_or_init_cli_runtime(&mut cli_rt)
                         .and_then(|rt| rt.block_on(vdpi::update::run_update(false, false, &cfg)));
                     launcher::update_finished(&result);
                     return result;
                 }
                 launcher::Choice::PauseService => {
-                    match vdpi::service::pause_service() {
+                    match vdpi::service::pause_service_quiet() {
                         Ok(()) => {
                             notice = Some("Service paused - system proxies restored.".to_string());
                         }
                         Err(err) => {
-                            notice = Some(format!("Pause failed: {err:#}"));
+                            notice = Some(sanitize_notice(&format!("Pause failed: {err:#}")));
                         }
                     }
                     explicit_launcher = true;
                 }
                 launcher::Choice::ResumeService => {
-                    match vdpi::service::resume_service() {
+                    match vdpi::service::resume_service_quiet() {
                         Ok(()) => {
+                            wait_for_live_engine(&cfg);
                             notice = Some("Service resumed - anti-DPI active.".to_string());
                         }
                         Err(err) => {
-                            notice = Some(format!("Resume failed: {err:#}"));
+                            notice = Some(sanitize_notice(&format!("Resume failed: {err:#}")));
                         }
                     }
                     explicit_launcher = true;
                 }
                 launcher::Choice::Doctor => {
-                    let result =
-                        build_runtime().and_then(|rt| rt.block_on(run_doctor(cfg.clone())));
+                    let result = get_or_init_cli_runtime(&mut cli_rt)
+                        .and_then(|rt| rt.block_on(run_doctor(cfg.clone())));
                     notice = Some(match result {
                         Ok(()) => "Diagnostics complete.".to_string(),
                         Err(err) => {
                             eprintln!("\nDiagnostics error: {err:#}");
-                            format!("Diagnostics finished with issues: {err:#}")
+                            sanitize_notice(&format!("Diagnostics finished with issues: {err:#}"))
                         }
                     });
                     launcher::wait_for_continue_if_interactive();
@@ -132,7 +160,9 @@ fn main() -> Result<()> {
         Some(Command::Launcher) => unreachable!("handled by launcher"),
         Some(Command::Uninstall) => {
             init_tracing(&cfg);
-            uninstall_service()
+            uninstall_service()?;
+            launcher::clear_preference();
+            Ok(())
         }
         Some(Command::Pause) => {
             init_tracing(&cfg);
@@ -144,7 +174,7 @@ fn main() -> Result<()> {
         }
         Some(Command::Status) | Some(Command::Doctor) | Some(Command::Update { .. }) => {
             init_tracing(&cfg);
-            let rt = build_runtime()?;
+            let rt = build_cli_runtime()?;
             rt.block_on(async move {
                 match command {
                     Some(Command::Status) => print_status(&cfg).await,
@@ -182,6 +212,59 @@ fn build_runtime() -> Result<tokio::runtime::Runtime> {
         .enable_all()
         .build()
         .map_err(Into::into)
+}
+
+fn build_cli_runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(Into::into)
+}
+
+fn get_or_init_cli_runtime(
+    slot: &mut Option<tokio::runtime::Runtime>,
+) -> Result<&tokio::runtime::Runtime> {
+    if slot.is_none() {
+        *slot = Some(build_cli_runtime()?);
+    }
+    match slot.as_ref() {
+        Some(rt) => Ok(rt),
+        None => unreachable!("cli runtime was just initialized"),
+    }
+}
+
+fn wait_for_live_engine(cfg: &RuntimeConfig) {
+    let deadline = Instant::now() + Duration::from_millis(1200);
+    loop {
+        if vdpi::service::probe_control_center_status(cfg)
+            .live_engine
+            .is_some()
+        {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(150)));
+    }
+}
+
+fn sanitize_notice(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut prev_space = false;
+    for ch in input.chars() {
+        if matches!(ch, '\n' | '\r' | '\t' | ' ') {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else if !ch.is_control() {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    out.trim().to_string()
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -451,5 +534,32 @@ fn raise_fd_limit() {
                 let _ = setrlimit(RLIMIT_NOFILE, &lim);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_notice_collapses_multiline_and_tabs() {
+        assert_eq!(
+            sanitize_notice("Pause failed:\r\n\taccess\ndenied\x07  now"),
+            "Pause failed: access denied now"
+        );
+        assert_eq!(sanitize_notice("  ok\n"), "ok");
+    }
+
+    #[test]
+    fn get_or_init_cli_runtime_reuses_single_instance() {
+        let mut slot: Option<tokio::runtime::Runtime> = None;
+        let first_val = get_or_init_cli_runtime(&mut slot)
+            .unwrap()
+            .block_on(async { 41usize + 1 });
+        assert_eq!(first_val, 42);
+        let first_ptr: *const tokio::runtime::Runtime = slot.as_ref().unwrap();
+        let second_ptr: *const tokio::runtime::Runtime =
+            get_or_init_cli_runtime(&mut slot).unwrap();
+        assert_eq!(first_ptr, second_ptr);
     }
 }

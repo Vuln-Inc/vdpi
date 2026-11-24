@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use vdpi::server::REPOSITORY_URL;
 use vdpi::service::{ControlCenterStatus, InstalledInfo, LiveEngineStatus, ServiceState};
@@ -209,7 +210,7 @@ fn build_anti_dpi_row(live: &LiveEngineStatus) -> StatusRow {
     }
 
     let value = if parts.is_empty() {
-        format!("Active · {}:{}", live.addr, live.port)
+        format!("Active · {}", SocketAddr::new(live.addr, live.port))
     } else {
         format!("Active · {}", parts.join(" · "))
     };
@@ -217,7 +218,7 @@ fn build_anti_dpi_row(live: &LiveEngineStatus) -> StatusRow {
 }
 
 fn build_engine_row(live: &LiveEngineStatus) -> StatusRow {
-    let mut parts = vec![format!("{}:{}", live.addr, live.port)];
+    let mut parts = vec![SocketAddr::new(live.addr, live.port).to_string()];
     if let Some(active) = live.active_connections {
         parts.push(format!("{active} active"));
     }
@@ -482,7 +483,7 @@ pub fn choose<F>(
     explicit: bool,
     status: &ControlCenterStatus,
     notice: Option<&str>,
-    refresh: F,
+    mut refresh: F,
 ) -> Result<Choice>
 where
     F: FnMut() -> ControlCenterStatus,
@@ -492,7 +493,13 @@ where
         return Ok(Choice::Run);
     }
 
+    let mut latest_status = status.clone();
     let selected = if io::stdin().is_terminal() && io::stdout().is_terminal() {
+        let tracked_refresh = || {
+            let refreshed = refresh();
+            latest_status = refreshed.clone();
+            refreshed
+        };
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             if env::var("TERM").as_deref() == Ok("dumb") {
@@ -501,10 +508,11 @@ where
                     io::stderr().lock(),
                     status,
                     notice,
-                    refresh,
+                    tracked_refresh,
                 )?
             } else {
-                tui::choose(env::var_os("NO_COLOR").is_none(), status, notice, refresh)
+                let color = env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
+                tui::choose(color, status, notice, tracked_refresh)
                     .context("running the terminal launcher")?
             }
         }
@@ -515,7 +523,7 @@ where
                 io::stderr().lock(),
                 status,
                 notice,
-                refresh,
+                tracked_refresh,
             )?
         }
     } else if explicit {
@@ -526,8 +534,8 @@ where
     };
 
     if selected == Choice::Run
-        && status.installed.is_none()
-        && status.service_state == ServiceState::NotInstalled
+        && latest_status.installed.is_none()
+        && latest_status.service_state == ServiceState::NotInstalled
     {
         if let Err(e) = state
             .context("could not locate the vdpi executable directory")
@@ -1225,5 +1233,26 @@ mod tests {
         })();
         fs::remove_dir_all(dir).unwrap();
         assert!(result.unwrap());
+    }
+
+    #[test]
+    fn ipv6_live_engine_address_uses_brackets() {
+        let mut live = sample_minimal_live_engine();
+        live.addr = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        live.port = 8080;
+        let status = ControlCenterStatus {
+            installed: Some(sample_info(Some("0.4.1"), "0.4.1", VersionRelation::Same)),
+            service_state: ServiceState::Running,
+            live_engine: Some(live),
+        };
+        let menu = build_menu(&status, None);
+        assert_eq!(
+            menu.status_rows[1],
+            StatusRow::new("Anti-DPI", "Active · [::1]:8080", StatusTone::Active)
+        );
+        assert_eq!(
+            menu.status_rows[2],
+            StatusRow::new("Engine", "[::1]:8080", StatusTone::Neutral)
+        );
     }
 }

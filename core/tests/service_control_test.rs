@@ -65,7 +65,7 @@ fn parse_health_json_extracts_enriched_and_legacy_payloads() {
     assert_eq!(legacy.learned_hosts, None);
     assert_eq!(legacy.isp_stage, None);
 
-    // Malformed payloads and non-ok statuses must be rejected cleanly.
+    // Malformed payloads, non-ok statuses, and foreign services must be rejected cleanly.
     let rejected_payloads = [
         "",
         "not json",
@@ -74,6 +74,7 @@ fn parse_health_json_extracts_enriched_and_legacy_payloads() {
         r#"{"status":"error","service":"vdpi","version":"0.4.1"}"#,
         r#"{"status":"degraded","service":"vdpi","version":"0.4.1"}"#,
         r#"{"status":"starting","service":"other"}"#,
+        r#"{"status":"ok","service":"other-app"}"#,
         r#"{"version":"0.4.1"}"#,
     ];
     for payload in rejected_payloads {
@@ -83,6 +84,33 @@ fn parse_health_json_extracts_enriched_and_legacy_payloads() {
             "expected None for rejected health payload: {payload:?}"
         );
     }
+
+    // Malformed optional fields must degrade to None while keeping a valid vdpi status.
+    let degraded_body = r#"{
+        "status": "ok",
+        "service": "vdpi",
+        "version": "0.4.2",
+        "mode": 123,
+        "doh": "true",
+        "block_quic": 1,
+        "active_connections": -1,
+        "total_connections": "many",
+        "learned_hosts": -5,
+        "isp_stage": false
+    }"#;
+    let degraded = parse_health_json(degraded_body, addr, 8080, Some(1080))
+        .expect("valid vdpi status with malformed optional fields should gracefully degrade");
+    assert_eq!(degraded.addr, addr);
+    assert_eq!(degraded.port, 8080);
+    assert_eq!(degraded.socks_port, Some(1080));
+    assert_eq!(degraded.version.as_deref(), Some("0.4.2"));
+    assert_eq!(degraded.mode, None);
+    assert_eq!(degraded.doh, None);
+    assert_eq!(degraded.block_quic, None);
+    assert_eq!(degraded.active_connections, None);
+    assert_eq!(degraded.total_connections, None);
+    assert_eq!(degraded.learned_hosts, None);
+    assert_eq!(degraded.isp_stage, None);
 }
 
 #[test]
