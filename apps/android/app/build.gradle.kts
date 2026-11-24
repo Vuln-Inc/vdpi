@@ -10,7 +10,7 @@ plugins {
 fun readWorkspaceVersion(): String {
     val override = providers.gradleProperty("vdpiVersionName").orNull?.trim()
     if (!override.isNullOrEmpty()) return override.removePrefix("v")
-    val cargoToml = rootProject.projectDir.parentFile?.resolve("Cargo.toml")
+    val cargoToml = rootProject.projectDir.parentFile?.parentFile?.resolve("Cargo.toml")
     if (cargoToml != null && cargoToml.isFile) {
         val match = Regex("""(?m)^version\s*=\s*"([^"]+)"""").find(cargoToml.readText())
         if (match != null) return match.groupValues[1]
@@ -121,7 +121,7 @@ val verifyNativeLibs by tasks.registering {
         if (missing.isNotEmpty()) {
             throw GradleException(
                 "Missing native Rust JNI libraries for ABIs: ${missing.joinToString(", ")}. " +
-                    "Run ./android/scripts/build-native.sh first."
+                    "Run ./apps/android/scripts/build-native.sh first."
             )
         }
     }

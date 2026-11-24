@@ -84,7 +84,7 @@ Download **[`vdpi-ios-unsigned.ipa`](https://github.com/Vuln-Inc/vdpi/releases/l
 
 - **TrollStore (iOS 16.0 – 16.6.1 / 17.0):** Install `vdpi-ios-unsigned.ipa` directly in TrollStore — CoreTrust preserves the `packet-tunnel-provider` and `group.com.vulninc.vdpi` entitlements without an Apple Developer account.
 - **Paid Apple Developer certificate / third-party signer (Feather, ESign, Sideloadly, etc.):** Re-sign `vdpi-ios-unsigned.ipa` with a paid certificate & provisioning profile that explicitly grants `com.apple.developer.networking.networkextension` (`packet-tunnel-provider`) and matching App Groups on **both** `VdpiApp` and `PlugIns/VdpiPacketTunnel.appex`.
-- **Xcode (recommended for paid Apple Developer Teams):** Build and sign directly from `ios/Vdpi.xcodeproj` using the steps in [Building from Source](#ios-app-xcode--xcframework).
+- **Xcode (recommended for paid Apple Developer Teams):** Build and sign directly from `apps/ios/Vdpi.xcodeproj` using the steps in [Building from Source](#ios-app-xcode--xcframework).
 
 > **iOS signing & Simulator caveats:**
 > - **Free Apple ID sideloading does not work:** Apple blocks the `com.apple.developer.networking.networkextension` (`packet-tunnel-provider`) entitlement on free Apple IDs (AltStore / SideStore / free Sideloadly). Signing will fail or iOS will refuse to start the VPN tunnel.
@@ -333,25 +333,25 @@ Requires Rust Android targets (`aarch64-linux-android`, `armv7-linux-androideabi
 
 ```bash
 # 1. Cross-compile libvdpi_android.so for arm64-v8a, armeabi-v7a, and x86_64
-./android/scripts/build-native.sh
+./apps/android/scripts/build-native.sh
 
 # 2. Run Android unit tests, release lint, and assemble the universal APK
-cd android
+cd apps/android
 ./gradlew testDebugUnitTest lintRelease assembleRelease
 ```
 
-The signed universal APK is written to `android/app/build/outputs/apk/release/app-release.apk`.
+The signed universal APK is written to `apps/android/app/build/outputs/apk/release/app-release.apk`.
 
 ### iOS App (Xcode + XCFramework)
 
 Requires macOS with Xcode 16+, `xcodegen` (`brew install xcodegen`), and Rust Apple iOS targets (`aarch64-apple-ios`, `aarch64-apple-ios-sim`, `x86_64-apple-ios`):
 
 ```bash
-# 1. Cross-compile Rust static libs and package ios/Frameworks/VdpiCore.xcframework
-./ios/scripts/build-xcframework.sh
+# 1. Cross-compile Rust static libs and package apps/ios/Frameworks/VdpiCore.xcframework
+./apps/ios/scripts/build-xcframework.sh
 
-# 2. Generate ios/Vdpi.xcodeproj and open in Xcode
-cd ios
+# 2. Generate apps/ios/Vdpi.xcodeproj and open in Xcode
+cd apps/ios
 xcodegen generate
 open Vdpi.xcodeproj
 
@@ -361,82 +361,53 @@ xcodebuild build -project Vdpi.xcodeproj -scheme VdpiApp -configuration Release 
 ```
 
 To sign and install on your own physical iPhone/iPad with your own paid Apple Developer Team, replace the bundle IDs (`com.vulninc.vdpi`, `com.vulninc.vdpi.packet-tunnel`) and App Group (`group.com.vulninc.vdpi`) with your own unique identifiers across all four locations before running `xcodegen generate`:
-1. `ios/project.yml` (`bundleIdPrefix` and both `PRODUCT_BUNDLE_IDENTIFIER` values)
-2. `ios/VdpiApp/VdpiApp.entitlements` (`com.apple.security.application-groups`)
-3. `ios/PacketTunnel/PacketTunnel.entitlements` (`com.apple.security.application-groups`)
-4. `ios/Shared/VdpiAppGroup.swift` (`suiteName` and `extensionBundleId`)
+1. `apps/ios/project.yml` (`bundleIdPrefix` and both `PRODUCT_BUNDLE_IDENTIFIER` values)
+2. `apps/ios/VdpiApp/VdpiApp.entitlements` (`com.apple.security.application-groups`)
+3. `apps/ios/PacketTunnel/PacketTunnel.entitlements` (`com.apple.security.application-groups`)
+4. `apps/ios/Shared/VdpiAppGroup.swift` (`suiteName` and `extensionBundleId`)
 
 <details>
 <summary>Repository layout</summary>
 
 ```text
 vdpi/
-├── Cargo.toml                  # Workspace root (vdpi + vdpi-tun + vdpi-android + vdpi-ios)
-├── LICENSE                     # MIT License
-├── README.md                   # Documentation and installation guide
 ├── .github/workflows/
 │   └── release.yml             # Desktop, Android APK, iOS XCFramework/XCTest, and Release CI
-├── src/
-│   ├── main.rs                 # CLI entrypoint, Windows SCM dispatch, and signal handling
-│   ├── lib.rs                  # Public Rust core exports shared by desktop & mobile
-│   ├── config.rs               # CLI flags, desync modes, and runtime configuration
-│   ├── launcher.rs             # Interactive launcher state & preference handling
-│   ├── launcher/tui.rs         # Terminal launcher UI
-│   ├── tls.rs                  # Zero-panic TLS ClientHello SNI parser and record splitter
-│   ├── bypass.rs               # LAN, private subnet, regex, and portal bypass policy
-│   ├── dns.rs                  # Multi-tier RFC 8484 DoH + port-1253 anti-poisoning DNS resolver
-│   ├── desync.rs               # 7-stage adaptive OOB, multi-record, and paced SNI DPI desynchronizer
-│   ├── server.rs               # Protocol-autodetecting TCP listener and dual-port SOCKS5 server
-│   ├── service.rs              # Cross-platform self-installer, service manager, status, and doctor
-│   ├── platform/
-│   │   ├── mod.rs              # Cross-platform OS proxy and service abstraction
-│   │   ├── windows.rs          # Windows WinINET HKU/HKCU proxy, System PATH, and broadcasts
-│   │   ├── windows_service.rs  # Native Windows SCM service dispatcher, UAC elevation, and session sync
-│   │   ├── macos.rs            # macOS SystemConfiguration, launchd env, and VPN-aware watchdog
-│   │   ├── linux.rs            # Linux systemd --user, GNOME gsettings, and KDE kioslaverc
-│   │   └── unix_foreground.rs  # Unix foreground proxy lifecycle cleanup
-│   └── proxy/
-│       ├── mod.rs              # Proxy protocol dispatch
-│       ├── http.rs             # HTTP/1.1 forward proxy, HTTPS CONNECT tunnel, and health probe
-│       └── socks.rs            # RFC 1928 SOCKS5 (CONNECT + UDP ASSOCIATE) and SOCKS4a server
+├── apps/
+│   ├── android/                # Native Jetpack Compose Android app (minSdk 26 / targetSdk 35)
+│   │   ├── scripts/build-native.sh # cargo-ndk cross-compilation for arm64-v8a, armeabi-v7a, x86_64
+│   │   └── app/src/main/java/com/vulninc/vdpi/
+│   │       ├── MainActivity.kt # Compose host and activity lifecycle
+│   │       ├── vpn/            # VdpiVpnService (Always-On, reconnect, network callback) & QS Tile
+│   │       ├── engine/         # NativeEngine JNI bindings & Kotlinx models
+│   │       ├── data/           # DataStore settings repository & split-tunnel config
+│   │       └── ui/             # chrome/, components/, screens/ (Tunnel, Sheets, Apps, Settings), theme/
+│   └── ios/                    # Native SwiftUI iOS app + NEPacketTunnelProvider (iOS 16+)
+│       ├── project.yml         # XcodeGen project specification (VdpiApp, VdpiPacketTunnel, Tests)
+│       ├── scripts/build-xcframework.sh # Rust iOS + Simulator XCFramework build script
+│       ├── Shared/             # Models, App Group IPC, Formatters, NativeBridge, TunnelNetworkSettings
+│       ├── PacketTunnel/       # NEPacketTunnelProvider + NWPathMonitor + Info.plist + Entitlements
+│       ├── VdpiApp/            # SwiftUI Views (Tunnel, Sheets, Settings), Components/FloatingChrome, Theme
+│       └── VdpiAppTests/       # XCTest suite verifying wire JSON, IPC, routes, and live Rust FFI
 ├── crates/
+│   ├── vdpi/                   # Desktop CLI, service manager, and shared Rust anti-DPI core
+│   │   ├── Cargo.toml
+│   │   ├── src/                # main, tls, dns, desync, bypass, server, service, proxy/, platform/, launcher/
+│   │   └── tests/              # End-to-end TLS desync, auto-heal, SOCKS5/4a, and UDP relay tests
 │   ├── vdpi-tun/               # Shared pure-Rust mobile userspace TUN stack (smoltcp + doctor)
 │   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs          # Unified TelemetrySnapshot and public module exports
-│   │       ├── config.rs       # TunnelConfig JSON schema + Standard / LowMemory profiles
-│   │       ├── pipeline.rs     # Channel-driven IP/TCP/UDP/DNS pipeline, QUIC blocker, Cone-NAT
-│   │       ├── fd.rs           # Unix AsyncFd<OwnedFd> adapter (Android)
-│   │       ├── doctor.rs       # Native rustls TLS 1.3/1.2 + DoH connectivity probe runner
-│   │       └── events.rs       # Bounded in-memory event ring buffer
+│   │   └── src/                # lib, config, packet, pipeline, fd, doctor, events
 │   ├── vdpi-android/           # Thin Android JNI + OwnedFd adapter over vdpi-tun
 │   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs          # Android lifecycle manager (Standard profile)
-│   │       └── jni_bridge.rs   # Panic-safe JNI entrypoints for Kotlin
+│   │   └── src/                # lib, jni_bridge
 │   └── vdpi-ios/               # Thin iOS C-ABI staticlib adapter over vdpi-tun
 │       ├── Cargo.toml
 │       ├── include/            # vdpi_ios.h + module.modulemap for VdpiCore.xcframework
-│       └── src/
-│           ├── lib.rs          # iOS lifecycle manager (LowMemory profile, 2 workers)
-│           └── ffi.rs          # Panic-safe extern "C" FFI surface + C-ABI tests
-├── android/                    # Native Jetpack Compose Android app (minSdk 26 / targetSdk 35)
-│   ├── scripts/build-native.sh # cargo-ndk cross-compilation for arm64-v8a, armeabi-v7a, x86_64
-│   └── app/src/main/java/com/vulninc/vdpi/
-│       ├── MainActivity.kt     # Compose host and navigation
-│       ├── vpn/                # VdpiVpnService (Always-On, reconnect, network callback) & QS Tile
-│       ├── engine/             # NativeEngine JNI bindings & Kotlinx models
-│       ├── data/               # DataStore settings repository & split-tunnel config
-│       └── ui/                 # Tunnel, Apps, and Settings screens + Apple HIG & Liquid Glass theme
-├── ios/                        # Native SwiftUI iOS app + NEPacketTunnelProvider (iOS 16+)
-│   ├── project.yml             # XcodeGen project specification (VdpiApp, VdpiPacketTunnel, Tests)
-│   ├── scripts/build-xcframework.sh # Rust iOS + Simulator XCFramework build script
-│   ├── Shared/                 # Models, App Group IPC, Formatters, NativeBridge, TunnelNetworkSettings
-│   ├── PacketTunnel/           # NEPacketTunnelProvider + NWPathMonitor + Info.plist + Entitlements
-│   ├── VdpiApp/                # SwiftUI Tunnel & Settings views, TunnelManager, Apple HIG & Liquid Glass theme
-│   └── VdpiAppTests/           # XCTest suite verifying wire JSON, IPC, routes, and live Rust FFI
-└── tests/
-    └── integration_test.rs     # End-to-end TLS desync, auto-heal, SOCKS5/4a, and UDP relay tests
+│       └── src/                # lib, ffi
+├── Cargo.toml                  # Virtual Rust workspace root
+├── Cargo.lock
+├── LICENSE                     # MIT License
+└── README.md                   # Documentation and installation guide
 ```
 
 </details>

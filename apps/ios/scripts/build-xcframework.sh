@@ -2,8 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-OUT_DIR="$REPO_ROOT/ios/Frameworks"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+OUT_DIR="$REPO_ROOT/apps/ios/Frameworks"
 XCFRAMEWORK="$OUT_DIR/VdpiCore.xcframework"
 HEADERS_DIR="$REPO_ROOT/crates/vdpi-ios/include"
 
