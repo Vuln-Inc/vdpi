@@ -11,17 +11,18 @@
     }
     * { box-sizing: border-box; }
     body { margin: 0; font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); }
-    main { max-width: 680px; margin: 56px auto; padding: 0 20px; }
+    main { max-width: 720px; margin: 52px auto; padding: 0 20px; }
     h1 { font-size: 32px; letter-spacing: -0.02em; margin: 0 0 8px; }
     p.lead { color: var(--muted); margin: 0 0 28px; }
     .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; overflow: hidden; margin-bottom: 18px; }
-    .row { display: flex; justify-content: space-between; align-items: center; padding: 14px 16px; border-top: 1px solid var(--border); gap: 12px; }
+    .row { display: flex; justify-content: space-between; align-items: center; padding: 14px 16px; border-top: 1px solid var(--border); gap: 14px; flex-wrap: wrap; }
     .row:first-child { border-top: 0; }
     .label { font-weight: 500; }
-    .sub { font-size: 13px; color: var(--muted); }
+    .sub { font-size: 13px; color: var(--muted); margin-top: 2px; }
+    .links { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
     a { color: var(--accent); text-decoration: none; font-weight: 500; white-space: nowrap; }
     a:hover { text-decoration: underline; }
-    code { font: 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: rgba(127,127,127,0.12); padding: 2px 6px; border-radius: 6px; }
+    code { font: 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: rgba(127,127,127,0.12); padding: 2px 6px; border-radius: 6px; word-break: break-all; }
     footer { margin-top: 28px; font-size: 13px; color: var(--muted); display: flex; gap: 16px; flex-wrap: wrap; }
   </style>
 </head>
@@ -32,24 +33,45 @@
 
     <div class="card">
       <div class="row">
-        <div><div class="label">Windows</div><div class="sub"><code>scoop install https://vuln-inc.github.io/vdpi/vdpi.json</code></div></div>
-        <a href="https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-windows-x86_64.zip">Download .zip</a>
+        <div>
+          <div class="label">Windows (x86_64)</div>
+          <div class="sub"><code>irm https://vuln-inc.github.io/vdpi/install.ps1 | iex</code></div>
+          <div class="sub">Scoop: <code>scoop install https://vuln-inc.github.io/vdpi/vdpi.json</code></div>
+        </div>
+        <div class="links">
+          <a href="https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-windows-x86_64.zip">Download .zip</a>
+        </div>
       </div>
       <div class="row">
-        <div><div class="label">macOS (Apple Silicon &amp; Intel)</div><div class="sub">Universal binary &middot; native LaunchAgent &middot; <code>vdpi update</code></div></div>
-        <a href="https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-macos-universal.tar.gz">Download .tar.gz</a>
+        <div>
+          <div class="label">macOS &amp; Linux</div>
+          <div class="sub"><code>curl -fsSL https://vuln-inc.github.io/vdpi/install.sh | sh</code></div>
+        </div>
+        <div class="links">
+          <a href="https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-macos-universal.tar.gz">macOS .tar.gz</a>
+          <a href="https://github.com/Vuln-Inc/vdpi/releases/latest">Linux</a>
+        </div>
       </div>
       <div class="row">
-        <div><div class="label">Linux (x86_64 &amp; arm64)</div><div class="sub">Static musl binary &middot; <code>systemd --user</code> &middot; <code>vdpi update</code></div></div>
-        <a href="https://github.com/Vuln-Inc/vdpi/releases/latest">Releases</a>
+        <div>
+          <div class="label">Android</div>
+          <div class="sub">Universal APK (arm64-v8a, armeabi-v7a, x86_64) &middot; Obtainium compatible</div>
+        </div>
+        <div class="links">
+          <a href="https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-android-universal.apk">Download .apk</a>
+        </div>
       </div>
       <div class="row">
-        <div><div class="label">Android</div><div class="sub">Universal APK (arm64-v8a, armeabi-v7a, x86_64) &middot; Obtainium compatible</div></div>
-        <a href="https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-android-universal.apk">Download .apk</a>
-      </div>
-      <div class="row">
-        <div><div class="label">iOS / iPadOS</div><div class="sub">AltStore / SideStore / Feather source: <code>https://vuln-inc.github.io/vdpi/apps.json</code></div></div>
-        <a href="./apps.json">apps.json</a>
+        <div>
+          <div class="label">iOS / iPadOS</div>
+          <div class="sub">Source URL: <code>https://vuln-inc.github.io/vdpi/apps.json</code></div>
+        </div>
+        <div class="links">
+          <a href="altstore://source?url=https://vuln-inc.github.io/vdpi/apps.json">AltStore</a>
+          <a href="sidestore://source?url=https://vuln-inc.github.io/vdpi/apps.json">SideStore</a>
+          <a href="feather://source/https://vuln-inc.github.io/vdpi/apps.json">Feather</a>
+          <a href="./apps.json">apps.json</a>
+        </div>
       </div>
     </div>
 
