@@ -213,7 +213,9 @@ impl MacosProxySession {
                 if st.secure_enabled && st.secure_server == addr && st.secure_port == http {
                     let _ = run_networksetup(&["-setsecurewebproxystate", &st.service, "off"]);
                 }
-                if self.socks_configured && st.socks_enabled && st.socks_server == addr
+                if self.socks_configured
+                    && st.socks_enabled
+                    && st.socks_server == addr
                     && socks.as_deref() == Some(st.socks_port.as_str())
                 {
                     let _ = run_networksetup(&["-setsocksfirewallproxystate", &st.service, "off"]);

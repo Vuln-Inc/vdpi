@@ -189,15 +189,15 @@ mod tests {
         assert_eq!(take_owned_c_string(vdpi_ios_version()), engine_version());
 
         // 2. Reject missing callback cleanly.
-        let err_missing_cb = unsafe { vdpi_ios_start(std::ptr::null(), None, std::ptr::null_mut()) };
+        let err_missing_cb =
+            unsafe { vdpi_ios_start(std::ptr::null(), None, std::ptr::null_mut()) };
         let msg = take_owned_c_string(err_missing_cb);
         assert!(msg.contains("callback"));
 
         // 3. Reject malformed JSON cleanly.
         let bad_json = CString::new("{not-json").unwrap();
-        let err_bad_json = unsafe {
-            vdpi_ios_start(bad_json.as_ptr(), Some(capture_cb), std::ptr::null_mut())
-        };
+        let err_bad_json =
+            unsafe { vdpi_ios_start(bad_json.as_ptr(), Some(capture_cb), std::ptr::null_mut()) };
         let bad_msg = take_owned_c_string(err_bad_json);
         assert!(bad_msg.contains("invalid config JSON"));
 
@@ -222,8 +222,7 @@ mod tests {
         let mut dns_q = encode_dns_query("localhost", 1).unwrap();
         dns_q[0] = 0x13;
         dns_q[1] = 0x37;
-        let builder =
-            PacketBuilder::ipv4([10, 8, 0, 2], [198, 18, 0, 1], 64).udp(51000, 53);
+        let builder = PacketBuilder::ipv4([10, 8, 0, 2], [198, 18, 0, 1], 64).udp(51000, 53);
         let mut pkt = Vec::with_capacity(builder.size(dns_q.len()));
         builder.write(&mut pkt, &dns_q).unwrap();
 
@@ -268,7 +267,10 @@ mod tests {
     #[test]
     fn bounded_config_json_reader_rejects_oversized_unterminated_and_invalid_utf8() {
         // NULL pointer maps to empty default config string.
-        assert_eq!(unsafe { read_bounded_config_json(std::ptr::null()) }, Ok(""));
+        assert_eq!(
+            unsafe { read_bounded_config_json(std::ptr::null()) },
+            Ok("")
+        );
 
         // Valid NUL-terminated UTF-8 JSON succeeds.
         let valid = CString::new(r#"{"mtu":1400}"#).unwrap();

@@ -3,6 +3,7 @@ pub mod doctor;
 pub mod events;
 #[cfg(unix)]
 pub mod fd;
+mod packet;
 pub mod pipeline;
 
 use crate::events::EngineEvent;

@@ -426,12 +426,7 @@ mod tests {
             let ctx = test_context("127.0.0.1");
             let mut bound = bind_listeners(&ctx).unwrap();
             let actual_primary = bound.primary_listener.local_addr().unwrap();
-            let actual_socks = bound
-                .socks_listener
-                .as_ref()
-                .unwrap()
-                .local_addr()
-                .unwrap();
+            let actual_socks = bound.socks_listener.as_ref().unwrap().local_addr().unwrap();
 
             assert_ne!(actual_primary.port(), 0);
             assert_eq!(bound.primary_addr, actual_primary);

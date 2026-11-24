@@ -154,18 +154,28 @@ impl LinuxProxySession {
     pub(super) fn deactivate_foreground(&self) {
         if self.gnome_configured {
             let get = |schema, key| {
-                Command::new("gsettings").args(["get", schema, key]).output().ok()
+                Command::new("gsettings")
+                    .args(["get", schema, key])
+                    .output()
+                    .ok()
                     .filter(|out| out.status.success())
                     .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
             };
-            let owned = ["org.gnome.system.proxy.http", "org.gnome.system.proxy.https"]
-                .into_iter().any(|schema| {
-                    get(schema, "host").is_some_and(|host| host.trim_matches('\'') == self.addr.to_string())
-                        && get(schema, "port").is_some_and(|port| port.parse::<u16>() == Ok(self.http_port))
-                });
+            let owned = [
+                "org.gnome.system.proxy.http",
+                "org.gnome.system.proxy.https",
+            ]
+            .into_iter()
+            .any(|schema| {
+                get(schema, "host")
+                    .is_some_and(|host| host.trim_matches('\'') == self.addr.to_string())
+                    && get(schema, "port")
+                        .is_some_and(|port| port.parse::<u16>() == Ok(self.http_port))
+            });
             if owned && get("org.gnome.system.proxy", "mode").as_deref() == Some("'manual'") {
                 let _ = Command::new("gsettings")
-                    .args(["set", "org.gnome.system.proxy", "mode", "none"]).output();
+                    .args(["set", "org.gnome.system.proxy", "mode", "none"])
+                    .output();
             }
         }
         if let Some(writer) = &self.kde_bin {
@@ -173,12 +183,20 @@ impl LinuxProxySession {
             let config = ["--file", "kioslaverc", "--group", "Proxy Settings", "--key"];
             let expected = format!("http://{} {}", self.addr, self.http_port);
             let owned = ["httpProxy", "httpsProxy"].into_iter().any(|key| {
-                Command::new(&reader).args(config).arg(key).output().is_ok_and(|out| {
-                    out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == expected
-                })
+                Command::new(&reader)
+                    .args(config)
+                    .arg(key)
+                    .output()
+                    .is_ok_and(|out| {
+                        out.status.success()
+                            && String::from_utf8_lossy(&out.stdout).trim() == expected
+                    })
             });
             if owned {
-                let _ = Command::new(writer).args(config).args(["ProxyType", "0"]).output();
+                let _ = Command::new(writer)
+                    .args(config)
+                    .args(["ProxyType", "0"])
+                    .output();
                 notify_kde_reload();
             }
         }

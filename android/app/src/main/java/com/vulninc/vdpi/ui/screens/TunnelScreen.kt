@@ -1,10 +1,6 @@
 package com.vulninc.vdpi.ui.screens
 
-import android.content.ClipData
-import android.content.ClipboardManager
-import android.content.Context
 import android.content.res.Configuration
-import android.os.Build
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
@@ -35,7 +31,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
@@ -43,9 +38,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -57,9 +49,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -67,7 +57,6 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
@@ -80,28 +69,18 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalConfiguration
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
-import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.Role
-import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.DialogWindowProvider
-import androidx.core.view.WindowCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vulninc.vdpi.BuildConfig
 import com.vulninc.vdpi.data.SplitTunnelMode
 import com.vulninc.vdpi.data.VdpiSettings
-import com.vulninc.vdpi.engine.EngineEvent
 import com.vulninc.vdpi.engine.TelemetrySnapshot
 import com.vulninc.vdpi.ui.DoctorUiState
 import com.vulninc.vdpi.ui.components.FloatingGlassIconButton
@@ -111,24 +90,20 @@ import com.vulninc.vdpi.ui.components.InsetGroupedRow
 import com.vulninc.vdpi.ui.components.LocalBottomChromePadding
 import com.vulninc.vdpi.ui.components.LocalReduceMotion
 import com.vulninc.vdpi.ui.components.LocalTopOverlayPadding
-import com.vulninc.vdpi.ui.components.SectionFooter
 import com.vulninc.vdpi.ui.components.SectionOverline
 import com.vulninc.vdpi.ui.components.springPress
-import com.vulninc.vdpi.ui.theme.GeistMono
 import com.vulninc.vdpi.ui.theme.GeistSans
 import com.vulninc.vdpi.ui.theme.VdpiTextStyles
 import com.vulninc.vdpi.ui.theme.VdpiThemeTokens
 import com.vulninc.vdpi.util.formatBytes
-import com.vulninc.vdpi.util.formatEventTime
 import com.vulninc.vdpi.util.formatStageLabel
 import com.vulninc.vdpi.util.formatUptime
 import com.vulninc.vdpi.vpn.TunnelPhase
 import com.vulninc.vdpi.vpn.TunnelRuntimeSnapshot
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
 import java.util.Locale
 
-private val DarkLogWellBackground = Color(0xFF0D0D0F)
+// ── Tunnel Dashboard Screen ──
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -195,6 +170,16 @@ fun TunnelScreen(
         lastSeenAlertSeq = maxOf(lastSeenAlertSeq, latestAlertSeq)
     }
 
+    val toggleTunnelWithHaptic: () -> Unit = {
+        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+        onToggleTunnel()
+    }
+
+    val reconnectWithHaptic: () -> Unit = {
+        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+        onReconnect()
+    }
+
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE &&
         configuration.screenWidthDp >= 560
@@ -202,258 +187,39 @@ fun TunnelScreen(
     val bottomChromePadding = LocalBottomChromePadding.current
 
     if (isLandscape) {
-        Column(
-            modifier = modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .windowInsetsPadding(
-                    WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal),
-                ),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Column(
-                modifier = Modifier
-                    .widthIn(max = 880.dp)
-                    .fillMaxWidth()
-                    .padding(horizontal = 20.dp),
-            ) {
-                Spacer(Modifier.height(topOverlayPadding))
-
-                // Compact top header row for landscape
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = 6.dp, bottom = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                ) {
-                    Text(
-                        text = "vdpi",
-                        style = VdpiTextStyles.pageTitle.copy(
-                            fontSize = 24.sp,
-                            lineHeight = 28.sp,
-                            letterSpacing = (-0.3).sp,
-                        ),
-                        color = palette.inkPrimary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f),
-                    )
-
-                    Spacer(Modifier.width(12.dp))
-
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        FloatingGlassIconButton(
-                            onClick = openDiagnostics,
-                            contentDescription = "Diagnostics",
-                            size = 38.dp,
-                            badgeColor = doctorBadgeColor,
-                        ) {
-                            DiagnosticsGlyph(tint = palette.inkPrimary)
-                        }
-
-                        FloatingGlassIconButton(
-                            onClick = openLogs,
-                            contentDescription = "Engine logs",
-                            size = 38.dp,
-                            badgeColor = if (hasLogAlert) palette.danger else null,
-                        ) {
-                            EngineLogGlyph(tint = palette.inkPrimary)
-                        }
-                    }
-                }
-
-                // Adaptive two-pane landscape dashboard
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(16.dp),
-                    verticalAlignment = Alignment.Top,
-                ) {
-                    // Left pane: Compact Hero Card + inline reconnect banner
-                    Column(modifier = Modifier.weight(0.46f)) {
-                        TunnelHeroCard(
-                            runtime = runtime,
-                            settings = settings,
-                            reduceMotion = reduceMotion,
-                            compact = true,
-                            onToggleTunnel = {
-                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                onToggleTunnel()
-                            },
-                        )
-
-                        AnimatedVisibility(
-                            visible = pendingReconnect && isConnected,
-                            enter = if (reduceMotion) {
-                                fadeIn(tween(150))
-                            } else {
-                                fadeIn(tween(180)) + expandVertically(tween(200))
-                            },
-                            exit = if (reduceMotion) {
-                                fadeOut(tween(120))
-                            } else {
-                                fadeOut(tween(140)) + shrinkVertically(tween(160))
-                            },
-                        ) {
-                            Column {
-                                Spacer(Modifier.height(10.dp))
-                                InlineReconnectRow(
-                                    compact = true,
-                                    onReconnect = {
-                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                        onReconnect()
-                                    },
-                                )
-                            }
-                        }
-                    }
-
-                    // Right pane: Live Telemetry or Standby Profile beside the Hero Card
-                    Box(modifier = Modifier.weight(0.54f)) {
-                        AnimatedContent(
-                            targetState = isConnected,
-                            transitionSpec = {
-                                fadeIn(tween(180)) togetherWith fadeOut(tween(130))
-                            },
-                            label = "tunnelDetailsTransitionLandscape",
-                        ) { live ->
-                            if (live) {
-                                LiveTelemetrySection(
-                                    telemetry = runtime.telemetry,
-                                    settings = settings,
-                                )
-                            } else {
-                                StandbyProfileSection(
-                                    settings = settings,
-                                )
-                            }
-                        }
-                    }
-                }
-
-                Spacer(Modifier.height(bottomChromePadding + 8.dp))
-            }
-        }
+        LandscapeTunnelLayout(
+            runtime = runtime,
+            settings = settings,
+            isConnected = isConnected,
+            pendingReconnect = pendingReconnect,
+            reduceMotion = reduceMotion,
+            doctorBadgeColor = doctorBadgeColor,
+            hasLogAlert = hasLogAlert,
+            topOverlayPadding = topOverlayPadding,
+            bottomChromePadding = bottomChromePadding,
+            onOpenDiagnostics = openDiagnostics,
+            onOpenLogs = openLogs,
+            onToggleTunnel = toggleTunnelWithHaptic,
+            onReconnect = reconnectWithHaptic,
+            modifier = modifier,
+        )
     } else {
-        Column(
-            modifier = modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .windowInsetsPadding(
-                    WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal),
-                )
-                .padding(horizontal = 16.dp),
-        ) {
-            Spacer(Modifier.height(topOverlayPadding))
-            Spacer(Modifier.height(12.dp))
-
-            // Clean Apple Large Title header with two calm monochrome Liquid Glass action circles
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Text(
-                    text = "vdpi",
-                    style = VdpiTextStyles.pageTitle,
-                    color = palette.inkPrimary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f),
-                )
-
-                Spacer(Modifier.width(12.dp))
-
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    FloatingGlassIconButton(
-                        onClick = openDiagnostics,
-                        contentDescription = "Diagnostics",
-                        size = 42.dp,
-                        badgeColor = doctorBadgeColor,
-                    ) {
-                        DiagnosticsGlyph(tint = palette.inkPrimary)
-                    }
-
-                    FloatingGlassIconButton(
-                        onClick = openLogs,
-                        contentDescription = "Engine logs",
-                        size = 42.dp,
-                        badgeColor = if (hasLogAlert) palette.danger else null,
-                    ) {
-                        EngineLogGlyph(tint = palette.inkPrimary)
-                    }
-                }
-            }
-
-            Spacer(Modifier.height(16.dp))
-
-            // Serene opaque Apple Hero Card
-            TunnelHeroCard(
-                runtime = runtime,
-                settings = settings,
-                reduceMotion = reduceMotion,
-                onToggleTunnel = {
-                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                    onToggleTunnel()
-                },
-            )
-
-            // Persistent inline reconnect row when settings changed during an active tunnel
-            AnimatedVisibility(
-                visible = pendingReconnect && isConnected,
-                enter = if (reduceMotion) {
-                    fadeIn(tween(150))
-                } else {
-                    fadeIn(tween(180)) + expandVertically(tween(200))
-                },
-                exit = if (reduceMotion) {
-                    fadeOut(tween(120))
-                } else {
-                    fadeOut(tween(140)) + shrinkVertically(tween(160))
-                },
-            ) {
-                Column {
-                    Spacer(Modifier.height(12.dp))
-                    InlineReconnectRow(
-                        onReconnect = {
-                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                            onReconnect()
-                        },
-                    )
-                }
-            }
-
-            Spacer(Modifier.height(24.dp))
-
-            // Inset Grouped Telemetry or Standby Profile
-            AnimatedContent(
-                targetState = isConnected,
-                transitionSpec = {
-                    fadeIn(tween(180)) togetherWith fadeOut(tween(130))
-                },
-                label = "tunnelDetailsTransition",
-            ) { live ->
-                if (live) {
-                    LiveTelemetrySection(
-                        telemetry = runtime.telemetry,
-                        settings = settings,
-                    )
-                } else {
-                    StandbyProfileSection(
-                        settings = settings,
-                    )
-                }
-            }
-
-            Spacer(Modifier.height(24.dp))
-            Spacer(Modifier.height(bottomChromePadding))
-        }
+        PortraitTunnelLayout(
+            runtime = runtime,
+            settings = settings,
+            isConnected = isConnected,
+            pendingReconnect = pendingReconnect,
+            reduceMotion = reduceMotion,
+            doctorBadgeColor = doctorBadgeColor,
+            hasLogAlert = hasLogAlert,
+            topOverlayPadding = topOverlayPadding,
+            bottomChromePadding = bottomChromePadding,
+            onOpenDiagnostics = openDiagnostics,
+            onOpenLogs = openLogs,
+            onToggleTunnel = toggleTunnelWithHaptic,
+            onReconnect = reconnectWithHaptic,
+            modifier = modifier,
+        )
     }
 
     val sheetContainerColor = if (palette.isDark) palette.surface else palette.canvas
@@ -498,22 +264,281 @@ fun TunnelScreen(
     }
 }
 
+// ── Adaptive Dashboard Layouts ──
+
 @Composable
-private fun SyncModalSheetSystemBars(isDark: Boolean) {
-    val view = LocalView.current
-    SideEffect {
-        val window = (view.parent as? DialogWindowProvider)?.window ?: return@SideEffect
-        WindowCompat.getInsetsController(window, view).apply {
-            isAppearanceLightNavigationBars = !isDark
-            isAppearanceLightStatusBars = !isDark
-        }
-        @Suppress("DEPRECATION")
-        window.navigationBarColor = android.graphics.Color.TRANSPARENT
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            window.isNavigationBarContrastEnforced = false
+private fun LandscapeTunnelLayout(
+    runtime: TunnelRuntimeSnapshot,
+    settings: VdpiSettings,
+    isConnected: Boolean,
+    pendingReconnect: Boolean,
+    reduceMotion: Boolean,
+    doctorBadgeColor: Color?,
+    hasLogAlert: Boolean,
+    topOverlayPadding: Dp,
+    bottomChromePadding: Dp,
+    onOpenDiagnostics: () -> Unit,
+    onOpenLogs: () -> Unit,
+    onToggleTunnel: () -> Unit,
+    onReconnect: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .windowInsetsPadding(
+                WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal),
+            ),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Column(
+            modifier = Modifier
+                .widthIn(max = 880.dp)
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp),
+        ) {
+            Spacer(Modifier.height(topOverlayPadding))
+
+            TunnelHeaderRow(
+                compact = true,
+                doctorBadgeColor = doctorBadgeColor,
+                hasLogAlert = hasLogAlert,
+                onOpenDiagnostics = onOpenDiagnostics,
+                onOpenLogs = onOpenLogs,
+            )
+
+            // Adaptive two-pane landscape dashboard
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(16.dp),
+                verticalAlignment = Alignment.Top,
+            ) {
+                // Left pane: Compact Hero Card + inline reconnect banner
+                Column(modifier = Modifier.weight(0.46f)) {
+                    TunnelHeroCard(
+                        runtime = runtime,
+                        settings = settings,
+                        reduceMotion = reduceMotion,
+                        compact = true,
+                        onToggleTunnel = onToggleTunnel,
+                    )
+
+                    PendingReconnectSection(
+                        visible = pendingReconnect && isConnected,
+                        reduceMotion = reduceMotion,
+                        compact = true,
+                        onReconnect = onReconnect,
+                    )
+                }
+
+                // Right pane: Live Telemetry or Standby Profile beside the Hero Card
+                Box(modifier = Modifier.weight(0.54f)) {
+                    TunnelDetailsSection(
+                        isConnected = isConnected,
+                        telemetry = runtime.telemetry,
+                        settings = settings,
+                        transitionLabel = "tunnelDetailsTransitionLandscape",
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(bottomChromePadding + 8.dp))
         }
     }
 }
+
+@Composable
+private fun PortraitTunnelLayout(
+    runtime: TunnelRuntimeSnapshot,
+    settings: VdpiSettings,
+    isConnected: Boolean,
+    pendingReconnect: Boolean,
+    reduceMotion: Boolean,
+    doctorBadgeColor: Color?,
+    hasLogAlert: Boolean,
+    topOverlayPadding: Dp,
+    bottomChromePadding: Dp,
+    onOpenDiagnostics: () -> Unit,
+    onOpenLogs: () -> Unit,
+    onToggleTunnel: () -> Unit,
+    onReconnect: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .windowInsetsPadding(
+                WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal),
+            )
+            .padding(horizontal = 16.dp),
+    ) {
+        Spacer(Modifier.height(topOverlayPadding))
+        Spacer(Modifier.height(12.dp))
+
+        TunnelHeaderRow(
+            compact = false,
+            doctorBadgeColor = doctorBadgeColor,
+            hasLogAlert = hasLogAlert,
+            onOpenDiagnostics = onOpenDiagnostics,
+            onOpenLogs = onOpenLogs,
+        )
+
+        Spacer(Modifier.height(16.dp))
+
+        // Serene opaque Apple Hero Card
+        TunnelHeroCard(
+            runtime = runtime,
+            settings = settings,
+            reduceMotion = reduceMotion,
+            onToggleTunnel = onToggleTunnel,
+        )
+
+        // Persistent inline reconnect row when settings changed during an active tunnel
+        PendingReconnectSection(
+            visible = pendingReconnect && isConnected,
+            reduceMotion = reduceMotion,
+            compact = false,
+            onReconnect = onReconnect,
+        )
+
+        Spacer(Modifier.height(24.dp))
+
+        // Inset Grouped Telemetry or Standby Profile
+        TunnelDetailsSection(
+            isConnected = isConnected,
+            telemetry = runtime.telemetry,
+            settings = settings,
+            transitionLabel = "tunnelDetailsTransition",
+        )
+
+        Spacer(Modifier.height(24.dp))
+        Spacer(Modifier.height(bottomChromePadding))
+    }
+}
+
+@Composable
+private fun TunnelHeaderRow(
+    compact: Boolean,
+    doctorBadgeColor: Color?,
+    hasLogAlert: Boolean,
+    onOpenDiagnostics: () -> Unit,
+    onOpenLogs: () -> Unit,
+) {
+    val palette = VdpiThemeTokens.palette
+    val buttonSize = if (compact) 38.dp else 42.dp
+    val titleStyle = if (compact) {
+        VdpiTextStyles.pageTitle.copy(
+            fontSize = 24.sp,
+            lineHeight = 28.sp,
+            letterSpacing = (-0.3).sp,
+        )
+    } else {
+        VdpiTextStyles.pageTitle
+    }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(if (compact) Modifier.padding(top = 6.dp, bottom = 10.dp) else Modifier),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Text(
+            text = "vdpi",
+            style = titleStyle,
+            color = palette.inkPrimary,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+
+        Spacer(Modifier.width(12.dp))
+
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            FloatingGlassIconButton(
+                onClick = onOpenDiagnostics,
+                contentDescription = "Diagnostics",
+                size = buttonSize,
+                badgeColor = doctorBadgeColor,
+            ) {
+                DiagnosticsGlyph(tint = palette.inkPrimary)
+            }
+
+            FloatingGlassIconButton(
+                onClick = onOpenLogs,
+                contentDescription = "Engine logs",
+                size = buttonSize,
+                badgeColor = if (hasLogAlert) palette.danger else null,
+            ) {
+                EngineLogGlyph(tint = palette.inkPrimary)
+            }
+        }
+    }
+}
+
+@Composable
+private fun PendingReconnectSection(
+    visible: Boolean,
+    reduceMotion: Boolean,
+    compact: Boolean,
+    onReconnect: () -> Unit,
+) {
+    AnimatedVisibility(
+        visible = visible,
+        enter = if (reduceMotion) {
+            fadeIn(tween(150))
+        } else {
+            fadeIn(tween(180)) + expandVertically(tween(200))
+        },
+        exit = if (reduceMotion) {
+            fadeOut(tween(120))
+        } else {
+            fadeOut(tween(140)) + shrinkVertically(tween(160))
+        },
+    ) {
+        Column {
+            Spacer(Modifier.height(if (compact) 10.dp else 12.dp))
+            InlineReconnectRow(
+                compact = compact,
+                onReconnect = onReconnect,
+            )
+        }
+    }
+}
+
+@Composable
+private fun TunnelDetailsSection(
+    isConnected: Boolean,
+    telemetry: TelemetrySnapshot,
+    settings: VdpiSettings,
+    transitionLabel: String,
+) {
+    AnimatedContent(
+        targetState = isConnected,
+        transitionSpec = {
+            fadeIn(tween(180)) togetherWith fadeOut(tween(130))
+        },
+        label = transitionLabel,
+    ) { live ->
+        if (live) {
+            LiveTelemetrySection(
+                telemetry = telemetry,
+                settings = settings,
+            )
+        } else {
+            StandbyProfileSection(
+                settings = settings,
+            )
+        }
+    }
+}
+
+// ── Hero Card ──
 
 @Composable
 private fun TunnelHeroCard(
@@ -742,6 +767,8 @@ private fun PrimaryTunnelActionButton(
     }
 }
 
+// ── Inline Reconnect Row ──
+
 @Composable
 private fun InlineReconnectRow(
     onReconnect: () -> Unit,
@@ -831,6 +858,8 @@ private fun InlineReconnectRow(
         }
     }
 }
+
+// ── Live Telemetry & Standby Profile ──
 
 @Composable
 private fun LiveTelemetrySection(
@@ -922,464 +951,7 @@ private fun TabularRowValue(text: String) {
     )
 }
 
-@Composable
-private fun SheetGrabber(compact: Boolean = false) {
-    val palette = VdpiThemeTokens.palette
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(
-                top = if (compact) 6.dp else 10.dp,
-                bottom = if (compact) 4.dp else 6.dp,
-            ),
-        contentAlignment = Alignment.Center,
-    ) {
-        Box(
-            modifier = Modifier
-                .size(width = 36.dp, height = 5.dp)
-                .clip(CircleShape)
-                .background(palette.inkMuted.copy(alpha = 0.45f)),
-        )
-    }
-}
-
-@Composable
-private fun SheetTextButton(
-    label: String,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier,
-    emphasized: Boolean = false,
-    enabled: Boolean = true,
-) {
-    val palette = VdpiThemeTokens.palette
-    val haptic = LocalHapticFeedback.current
-    val interaction = remember { MutableInteractionSource() }
-
-    Box(
-        modifier = modifier
-            .widthIn(min = 44.dp)
-            .heightIn(min = 44.dp)
-            .alpha(if (enabled) 1f else 0.4f)
-            .clickable(
-                interactionSource = interaction,
-                indication = null,
-                enabled = enabled,
-                role = Role.Button,
-            ) {
-                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                onClick()
-            }
-            .padding(horizontal = 4.dp),
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(
-            text = label,
-            fontFamily = GeistSans,
-            fontWeight = if (emphasized) FontWeight.SemiBold else FontWeight.Normal,
-            fontSize = 16.sp,
-            color = palette.accent,
-            maxLines = 1,
-        )
-    }
-}
-
-@Composable
-private fun DoctorSheetContent(
-    doctorState: DoctorUiState,
-    isLandscape: Boolean,
-    onRerun: () -> Unit,
-    onDismiss: () -> Unit,
-) {
-    val palette = VdpiThemeTokens.palette
-    val cardBackground = if (palette.isDark) palette.surfaceRaised else palette.surface
-    val report = doctorState.report
-
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .then(
-                if (isLandscape) {
-                    Modifier.windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal))
-                } else {
-                    Modifier
-                },
-            )
-            .verticalScroll(rememberScrollState()),
-        contentAlignment = Alignment.TopCenter,
-    ) {
-        Column(
-            modifier = Modifier
-                .then(if (isLandscape) Modifier.widthIn(max = 580.dp) else Modifier)
-                .fillMaxWidth()
-                .then(
-                    if (isLandscape) {
-                        Modifier.windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Bottom))
-                    } else {
-                        Modifier.navigationBarsPadding()
-                    },
-                )
-                .padding(horizontal = 16.dp)
-                .padding(bottom = if (isLandscape) 14.dp else 24.dp),
-        ) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 44.dp),
-            ) {
-                SheetTextButton(
-                    label = "Re-run",
-                    enabled = !doctorState.running,
-                    onClick = onRerun,
-                    modifier = Modifier.align(Alignment.CenterStart),
-                )
-                Text(
-                    text = "Diagnostics",
-                    style = VdpiTextStyles.sheetTitle,
-                    color = palette.inkPrimary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.align(Alignment.Center),
-                )
-                SheetTextButton(
-                    label = "Done",
-                    emphasized = true,
-                    onClick = onDismiss,
-                    modifier = Modifier.align(Alignment.CenterEnd),
-                )
-            }
-
-            Spacer(Modifier.height(if (isLandscape) 8.dp else 14.dp))
-
-            SectionOverline(text = "Checks")
-
-            InsetGroupedCard(
-                modifier = Modifier.fillMaxWidth(),
-                radius = 16.dp,
-                backgroundColor = cardBackground,
-            ) {
-                when {
-                    doctorState.running -> {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .heightIn(min = if (isLandscape) 46.dp else 54.dp)
-                                .padding(
-                                    horizontal = 16.dp,
-                                    vertical = if (isLandscape) 10.dp else 14.dp,
-                                ),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(18.dp),
-                                strokeWidth = 2.dp,
-                                color = palette.inkSecondary,
-                            )
-                            Spacer(Modifier.width(12.dp))
-                            Text(
-                                text = "Verifying DNS, DoH, and TLS connectivity...",
-                                style = VdpiTextStyles.body,
-                                color = palette.inkSecondary,
-                            )
-                        }
-                    }
-
-                    report != null && report.checks.isNotEmpty() -> {
-                        val checks = report.checks
-                        checks.forEachIndexed { idx, check ->
-                            if (idx > 0) {
-                                HairlineRule(startIndent = 48.dp)
-                            }
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .heightIn(min = if (isLandscape) 44.dp else 50.dp)
-                                    .semantics(mergeDescendants = true) {
-                                        contentDescription =
-                                            "${check.name}, ${if (check.passed) "Passed" else "Failed"}, ${check.latencyMs} ms, ${check.detail}"
-                                    }
-                                    .padding(
-                                        horizontal = 16.dp,
-                                        vertical = if (isLandscape) 9.dp else 12.dp,
-                                    ),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                if (check.passed) {
-                                    CheckCircleGlyph(tint = palette.signal)
-                                } else {
-                                    CrossCircleGlyph(tint = palette.danger)
-                                }
-
-                                Spacer(Modifier.width(12.dp))
-
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = check.name,
-                                        style = VdpiTextStyles.rowTitle,
-                                        color = palette.inkPrimary,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                    )
-                                    if (check.detail.isNotBlank()) {
-                                        Spacer(Modifier.height(2.dp))
-                                        Text(
-                                            text = check.detail,
-                                            style = VdpiTextStyles.caption,
-                                            color = palette.inkSecondary,
-                                            maxLines = 2,
-                                            overflow = TextOverflow.Ellipsis,
-                                        )
-                                    }
-                                }
-
-                                Spacer(Modifier.width(12.dp))
-
-                                Text(
-                                    text = "${check.latencyMs} ms",
-                                    style = VdpiTextStyles.caption.copy(fontFeatureSettings = "tnum"),
-                                    color = palette.inkSecondary,
-                                    maxLines = 1,
-                                )
-                            }
-                        }
-                    }
-
-                    report != null -> {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(
-                                    horizontal = 16.dp,
-                                    vertical = if (isLandscape) 14.dp else 20.dp,
-                                ),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Text(
-                                text = "No diagnostic checks were returned. Tap Re-run to try again.",
-                                style = VdpiTextStyles.body,
-                                color = palette.inkSecondary,
-                                textAlign = TextAlign.Center,
-                            )
-                        }
-                    }
-
-                    else -> {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(
-                                    horizontal = 16.dp,
-                                    vertical = if (isLandscape) 14.dp else 20.dp,
-                                ),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Text(
-                                text = "Tap Re-run to verify DNS, DoH, and TLS endpoints.",
-                                style = VdpiTextStyles.body,
-                                color = palette.inkSecondary,
-                                textAlign = TextAlign.Center,
-                            )
-                        }
-                    }
-                }
-            }
-
-            if (!doctorState.running && report != null && report.checks.isNotEmpty()) {
-                val failedCount = report.checks.count { !it.passed }
-                val footerText = if (report.ok && failedCount == 0) {
-                    "All ${report.checks.size} checks passed"
-                } else {
-                    val noun = if (failedCount == 1) "issue" else "issues"
-                    "$failedCount $noun detected - check DNS or network settings"
-                }
-                SectionFooter(text = footerText)
-            }
-        }
-    }
-}
-
-@Composable
-private fun EngineLogSheetContent(
-    events: List<EngineEvent>,
-    isLandscape: Boolean,
-    onDismiss: () -> Unit,
-) {
-    val palette = VdpiThemeTokens.palette
-    val context = LocalContext.current
-    val listState = rememberLazyListState()
-    var copiedFeedback by remember { mutableStateOf(false) }
-    var copyTick by remember { mutableIntStateOf(0) }
-
-    LaunchedEffect(copyTick) {
-        if (copyTick > 0) {
-            delay(1800L)
-            copiedFeedback = false
-        }
-    }
-
-    LaunchedEffect(events.size) {
-        if (events.isNotEmpty()) {
-            val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index
-            val nearBottom = lastVisible == null || lastVisible >= (events.size - 3).coerceAtLeast(0)
-            if (nearBottom) {
-                listState.scrollToItem(events.lastIndex)
-            }
-        }
-    }
-
-    val logWellBackground = if (palette.isDark) DarkLogWellBackground else palette.surface
-
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .then(
-                if (isLandscape) {
-                    Modifier.windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal))
-                } else {
-                    Modifier
-                },
-            ),
-        contentAlignment = Alignment.TopCenter,
-    ) {
-        Column(
-            modifier = Modifier
-                .then(if (isLandscape) Modifier.widthIn(max = 580.dp) else Modifier)
-                .fillMaxWidth()
-                .then(
-                    if (isLandscape) {
-                        Modifier.windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Bottom))
-                    } else {
-                        Modifier.navigationBarsPadding()
-                    },
-                )
-                .padding(horizontal = 16.dp)
-                .padding(bottom = if (isLandscape) 14.dp else 24.dp),
-        ) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 44.dp),
-            ) {
-                SheetTextButton(
-                    label = if (copiedFeedback) "Copied" else "Copy",
-                    enabled = events.isNotEmpty(),
-                    onClick = {
-                        val dump = events.joinToString("\n") { ev ->
-                            val level = formatLogLevelTag(ev.level)
-                            "${formatEventTime(ev.tsMs)} $level [${ev.tag}] ${ev.message}"
-                        }
-                        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                        cm?.setPrimaryClip(ClipData.newPlainText("vdpi engine logs", dump))
-                        copiedFeedback = true
-                        copyTick++
-                    },
-                    modifier = Modifier.align(Alignment.CenterStart),
-                )
-                Text(
-                    text = "Engine Logs",
-                    style = VdpiTextStyles.sheetTitle,
-                    color = palette.inkPrimary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.align(Alignment.Center),
-                )
-                SheetTextButton(
-                    label = "Done",
-                    emphasized = true,
-                    onClick = onDismiss,
-                    modifier = Modifier.align(Alignment.CenterEnd),
-                )
-            }
-
-            Spacer(Modifier.height(if (isLandscape) 8.dp else 12.dp))
-
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f, fill = false)
-                    .heightIn(
-                        min = if (isLandscape) 100.dp else 140.dp,
-                        max = if (isLandscape) 220.dp else 380.dp,
-                    )
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(logWellBackground)
-                    .padding(if (isLandscape) 10.dp else 12.dp),
-            ) {
-                if (events.isEmpty()) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .align(Alignment.Center)
-                            .verticalScroll(rememberScrollState())
-                            .padding(
-                                vertical = if (isLandscape) 14.dp else 24.dp,
-                                horizontal = 16.dp,
-                            ),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                    ) {
-                        Text(
-                            text = "No Engine Logs Yet",
-                            style = VdpiTextStyles.rowTitle.copy(fontWeight = FontWeight.Medium),
-                            color = palette.inkPrimary,
-                            textAlign = TextAlign.Center,
-                        )
-                        Spacer(Modifier.height(4.dp))
-                        Text(
-                            text = "Connect the tunnel to record activity.",
-                            style = VdpiTextStyles.caption,
-                            color = palette.inkSecondary,
-                            textAlign = TextAlign.Center,
-                        )
-                    }
-                } else {
-                    LazyColumn(
-                        state = listState,
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
-                    ) {
-                        itemsIndexed(
-                            items = events,
-                            key = { idx, ev -> if (ev.seq > 0L) ev.seq else "${ev.tsMs}-${ev.tag}-$idx" },
-                        ) { _, ev ->
-                            val levelTag = formatLogLevelTag(ev.level)
-                            val levelColor = when (ev.level.lowercase(Locale.ROOT)) {
-                                "error", "err" -> palette.danger
-                                "warn", "warning" -> palette.warning
-                                else -> palette.inkSecondary
-                            }
-                            val line = remember(ev, levelColor, palette.inkMuted, palette.inkPrimary) {
-                                buildAnnotatedString {
-                                    withStyle(SpanStyle(color = palette.inkMuted)) {
-                                        append(formatEventTime(ev.tsMs))
-                                        append(' ')
-                                    }
-                                    withStyle(SpanStyle(color = levelColor, fontWeight = FontWeight.Medium)) {
-                                        append(levelTag)
-                                        append(' ')
-                                    }
-                                    withStyle(SpanStyle(color = palette.inkPrimary)) {
-                                        append('[')
-                                        append(ev.tag)
-                                        append("] ")
-                                        append(ev.message)
-                                    }
-                                }
-                            }
-                            Text(
-                                text = line,
-                                style = VdpiTextStyles.monoSmall.copy(
-                                    fontFamily = GeistMono,
-                                    fontSize = 12.sp,
-                                    lineHeight = 18.sp,
-                                    fontFeatureSettings = "tnum",
-                                ),
-                            )
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
+// ── Dashboard Glyphs ──
 
 @Composable
 private fun TunnelStatusGlyph(
@@ -1540,49 +1112,7 @@ private fun WarningCircleGlyph(tint: Color) {
     }
 }
 
-@Composable
-private fun CheckCircleGlyph(tint: Color) {
-    val checkColor = if (VdpiThemeTokens.palette.isDark) Color(0xFF000000) else Color.White
-    Canvas(modifier = Modifier.size(20.dp)) {
-        val w = size.width
-        val h = size.height
-        drawCircle(color = tint, radius = size.minDimension * 0.46f)
-        val check = Path().apply {
-            moveTo(w * 0.30f, h * 0.52f)
-            lineTo(w * 0.44f, h * 0.66f)
-            lineTo(w * 0.71f, h * 0.36f)
-        }
-        drawPath(
-            path = check,
-            color = checkColor,
-            style = Stroke(width = 1.9.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round),
-        )
-    }
-}
-
-@Composable
-private fun CrossCircleGlyph(tint: Color) {
-    Canvas(modifier = Modifier.size(20.dp)) {
-        val w = size.width
-        val h = size.height
-        val strokePx = 1.9.dp.toPx()
-        drawCircle(color = tint, radius = size.minDimension * 0.46f)
-        drawLine(
-            color = Color.White,
-            start = Offset(w * 0.34f, h * 0.34f),
-            end = Offset(w * 0.66f, h * 0.66f),
-            strokeWidth = strokePx,
-            cap = StrokeCap.Round,
-        )
-        drawLine(
-            color = Color.White,
-            start = Offset(w * 0.66f, h * 0.34f),
-            end = Offset(w * 0.34f, h * 0.66f),
-            strokeWidth = strokePx,
-            cap = StrokeCap.Round,
-        )
-    }
-}
+// ── Formatting Helpers ──
 
 private fun formatHeroUptime(totalSecs: Long): String {
     val safe = totalSecs.coerceAtLeast(0L)
@@ -1598,18 +1128,6 @@ private fun formatDnsDetail(settings: VdpiSettings): String {
     val addr = settings.dnsAddr.trim().ifBlank { "1.1.1.1" }
     val proto = if (settings.enableDoh) "DoH" else "UDP"
     return "$addr · $proto"
-}
-
-private fun isAlertLogLevel(level: String): Boolean =
-    level.equals("error", ignoreCase = true) ||
-        level.equals("err", ignoreCase = true) ||
-        level.equals("warn", ignoreCase = true) ||
-        level.equals("warning", ignoreCase = true)
-
-private fun formatLogLevelTag(level: String): String = when (level.lowercase(Locale.ROOT)) {
-    "error", "err" -> "[ERR]"
-    "warn", "warning" -> "[WARN]"
-    else -> "[INFO]"
 }
 
 private fun splitSummary(settings: VdpiSettings): String? {

@@ -427,11 +427,8 @@ unsafe extern "system" fn service_main(_argc: Dword, _argv: *mut *mut u16) {
     set_running_as_service(true);
 
     let name_wide = to_wide_null(SERVICE_NAME);
-    let handle = RegisterServiceCtrlHandlerExW(
-        name_wide.as_ptr(),
-        service_control_handler,
-        ptr::null_mut(),
-    );
+    let handle =
+        RegisterServiceCtrlHandlerExW(name_wide.as_ptr(), service_control_handler, ptr::null_mut());
     if handle.is_null() {
         return;
     }
@@ -646,7 +643,13 @@ fn report_service_status(
 pub fn stop_windows_service_if_running() -> Result<bool> {
     let scm = open_scm(SC_MANAGER_CONNECT)?;
     let name_wide = to_wide_null(SERVICE_NAME);
-    let raw = unsafe { OpenServiceW(scm.0, name_wide.as_ptr(), SERVICE_STOP | SERVICE_QUERY_STATUS) };
+    let raw = unsafe {
+        OpenServiceW(
+            scm.0,
+            name_wide.as_ptr(),
+            SERVICE_STOP | SERVICE_QUERY_STATUS,
+        )
+    };
     if raw.is_null() {
         let err = unsafe { GetLastError() };
         if err == ERROR_SERVICE_DOES_NOT_EXIST {

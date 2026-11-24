@@ -156,10 +156,7 @@ pub fn stop_tunnel() {
     let Ok(mgr) = manager() else {
         return;
     };
-    let _lifecycle = mgr
-        .lifecycle_lock
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _lifecycle = mgr.lifecycle_lock.lock().unwrap_or_else(|e| e.into_inner());
     stop_active_locked(mgr);
 }
 

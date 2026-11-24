@@ -5,12 +5,12 @@ use std::net::IpAddr;
 pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod unix_foreground;
 #[cfg(target_os = "windows")]
 pub mod windows;
 #[cfg(target_os = "windows")]
 pub mod windows_service;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub mod unix_foreground;
 
 /// Cross-platform system proxy session handle that configures OS-level HTTP/HTTPS/SOCKS5
 /// settings on startup, reconciles across network changes, and cleanly restores state on exit.

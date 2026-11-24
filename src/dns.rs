@@ -305,7 +305,10 @@ impl DnsResolver {
             return Ok(DnsOutcome::NxDomain(min_ttl.min(Duration::from_secs(30))));
         }
         if v4_succeeded {
-            return Ok(DnsOutcome::Records(Vec::new(), min_ttl.min(Duration::from_secs(60))));
+            return Ok(DnsOutcome::Records(
+                Vec::new(),
+                min_ttl.min(Duration::from_secs(60)),
+            ));
         }
         bail!("DoH transport failed for {domain}")
     }
@@ -1192,7 +1195,8 @@ mod tests {
         let mut nx_resp = vec![
             0x00, 0x01, 0x81, 0x83, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
-        nx_resp.extend_from_slice(&encode_dns_query("does-not-exist.invalid", QTYPE_A).unwrap()[12..]);
+        nx_resp
+            .extend_from_slice(&encode_dns_query("does-not-exist.invalid", QTYPE_A).unwrap()[12..]);
         assert!(matches!(
             decode_dns_outcome(&nx_resp, QTYPE_A).unwrap(),
             DnsOutcome::NxDomain(_)

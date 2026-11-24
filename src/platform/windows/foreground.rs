@@ -1,8 +1,6 @@
 //! Keep the foreground proxy settings tied to a detached process lease. Closing a
 //! Windows console can terminate its processes without running any Rust cleanup.
-use super::{
-    broadcast_environment_change, build_windows_proxy_override, notify_wininet_refresh,
-};
+use super::{broadcast_environment_change, build_windows_proxy_override, notify_wininet_refresh};
 use crate::bypass::build_no_proxy_value;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};

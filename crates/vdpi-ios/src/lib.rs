@@ -106,11 +106,7 @@ fn stop_active_locked(mgr: &IosTunnelManager) {
     // Drop the inbound sender immediately so no further packets enter the pipeline.
     *mgr.inbound_tx.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
-    let active = mgr
-        .active
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take();
+    let active = mgr.active.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(tunnel) = active {
         let _ = tunnel.shutdown_tx.send(true);
         let pipeline_task = tunnel.pipeline_task;
@@ -132,10 +128,7 @@ fn stop_active_locked(mgr: &IosTunnelManager) {
 /// Starts the iOS userspace TUN engine using `TunProfile::LOW_MEMORY`.
 pub fn start_tunnel(cfg: IosConfig, callback: PacketCallback) -> Result<()> {
     let mgr = manager()?;
-    let _lifecycle = mgr
-        .lifecycle_lock
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _lifecycle = mgr.lifecycle_lock.lock().unwrap_or_else(|e| e.into_inner());
 
     // Validate configuration and build EngineContext BEFORE stopping any active tunnel
     // so invalid config never tears down a healthy session.
@@ -243,10 +236,7 @@ pub fn stop_tunnel() {
     let Ok(mgr) = manager() else {
         return;
     };
-    let _lifecycle = mgr
-        .lifecycle_lock
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _lifecycle = mgr.lifecycle_lock.lock().unwrap_or_else(|e| e.into_inner());
     stop_active_locked(mgr);
 }
 

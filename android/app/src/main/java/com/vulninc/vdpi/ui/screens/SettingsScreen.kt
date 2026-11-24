@@ -121,6 +121,8 @@ private val DNS_PRESETS = listOf(
 private const val GITHUB_REPO_URL = "https://github.com/Vuln-Inc/vdpi"
 private const val GITHUB_REPO_LABEL = "github.com/Vuln-Inc/vdpi"
 
+// ── Screen ──
+
 @Composable
 fun SettingsScreen(
     settings: VdpiSettings,
@@ -138,60 +140,14 @@ fun SettingsScreen(
     onClearCache: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val palette = VdpiThemeTokens.palette
     val context = LocalContext.current
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE &&
         configuration.screenWidthDp >= 560
     val haptic = LocalHapticFeedback.current
-    val focusManager = LocalFocusManager.current
     val bottomChromePadding = LocalBottomChromePadding.current
     val topOverlayPadding = LocalTopOverlayPadding.current
     val sectionGap = if (isLandscape) 20.dp else 24.dp
-
-    val isPresetDns = DNS_PRESETS.any { it.address.equals(settings.dnsAddr, ignoreCase = true) }
-    var customDnsInput by remember(settings.dnsAddr) {
-        mutableStateOf(if (isPresetDns) "" else settings.dnsAddr)
-    }
-    var dnsError by remember(settings.dnsAddr) { mutableStateOf<String?>(null) }
-
-    var bypassInput by remember { mutableStateOf("") }
-    var bypassError by remember { mutableStateOf<String?>(null) }
-
-    val dnsTrimmed = customDnsInput.trim()
-    val dnsDirty = dnsTrimmed.isNotEmpty() && !dnsTrimmed.equals(settings.dnsAddr, ignoreCase = true)
-    val customDnsActive = !isPresetDns && !dnsDirty && dnsTrimmed.equals(settings.dnsAddr, ignoreCase = true)
-
-    fun submitDns() {
-        val candidate = customDnsInput.trim()
-        if (!isValidDnsInput(candidate)) {
-            dnsError = "Enter a valid IPv4, IPv6, or https:// DoH URL"
-            return
-        }
-        dnsError = null
-        focusManager.clearFocus()
-        if (!candidate.equals(settings.dnsAddr, ignoreCase = true)) {
-            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-            onSetDnsAddr(candidate)
-        }
-    }
-
-    fun submitBypass() {
-        val cleaned = sanitizeDomainInput(bypassInput)
-        if (!isValidBypassDomain(cleaned)) {
-            bypassError = "Enter a valid domain (e.g. example.com or *.example.com)"
-            return
-        }
-        if (cleaned in settings.bypassDomains) {
-            bypassError = "$cleaned is already in the bypass list"
-            return
-        }
-        bypassError = null
-        bypassInput = ""
-        focusManager.clearFocus()
-        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-        onAddBypassDomain(cleaned)
-    }
 
     fun openGitHubRepository() {
         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
@@ -220,306 +176,462 @@ fun SettingsScreen(
             },
         ) {
             Spacer(Modifier.height(topOverlayPadding + if (isLandscape) 6.dp else 12.dp))
-
-            // Clean Apple Large Title header
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = if (isLandscape) 34.dp else 44.dp),
-                contentAlignment = Alignment.CenterStart,
-            ) {
-                Text(
-                    text = "Settings",
-                    style = if (isLandscape) {
-                        VdpiTextStyles.pageTitle.copy(
-                            fontSize = 24.sp,
-                            lineHeight = 30.sp,
-                            letterSpacing = (-0.3).sp,
-                        )
-                    } else {
-                        VdpiTextStyles.pageTitle
-                    },
-                    color = palette.inkPrimary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-
+            SettingsHeader(isLandscape = isLandscape)
             Spacer(Modifier.height(if (isLandscape) 14.dp else 24.dp))
 
-            // 1. DESYNC ENGINE
-            SectionOverline("Desync Engine")
-            InsetGroupedCard(
-                modifier = Modifier.fillMaxWidth(),
-                radius = 16.dp,
-            ) {
-                DesyncMode.entries.forEachIndexed { idx, mode ->
-                    if (idx > 0) HairlineRule(startIndent = 16.dp)
-                    val isSelected = settings.desyncMode == mode
-                    InsetGroupedRow(
-                        title = mode.label,
-                        subtitle = mode.summary,
-                        modifier = Modifier.semantics { selected = isSelected },
-                        onClick = {
-                            if (!isSelected) {
-                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                onSetDesyncMode(mode)
-                            }
-                        },
-                        trailing = {
-                            SelectionCheckmark(visible = isSelected)
-                        },
-                    )
-                }
-
-                HairlineRule(startIndent = 16.dp)
-
-                ChunkSizeRow(
-                    chunkSize = settings.chunkSize,
-                    onDecrease = {
-                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        onSetChunkSize((settings.chunkSize - 1).coerceAtLeast(1))
-                    },
-                    onIncrease = {
-                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        onSetChunkSize((settings.chunkSize + 1).coerceAtMost(64))
-                    },
-                )
-            }
-            SectionFooter("Splits initial TLS ClientHello packets to evade DPI inspection. Chunk size sets the first fragment length (1–64 bytes).")
-
-            Spacer(Modifier.height(sectionGap))
-
-            // 2. DNS & PRIVACY
-            SectionOverline("DNS & Privacy")
-            InsetGroupedCard(
-                modifier = Modifier.fillMaxWidth(),
-                radius = 16.dp,
-            ) {
-                DNS_PRESETS.forEachIndexed { idx, preset ->
-                    if (idx > 0) HairlineRule(startIndent = 16.dp)
-                    val isSelected = settings.dnsAddr.equals(preset.address, ignoreCase = true)
-                    InsetGroupedRow(
-                        title = preset.name,
-                        subtitle = preset.address,
-                        modifier = Modifier.semantics { selected = isSelected },
-                        onClick = {
-                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            customDnsInput = ""
-                            dnsError = null
-                            focusManager.clearFocus()
-                            if (!isSelected) onSetDnsAddr(preset.address)
-                        },
-                        trailing = {
-                            SelectionCheckmark(visible = isSelected)
-                        },
-                    )
-                }
-
-                HairlineRule(startIndent = 16.dp)
-
-                BorderlessInputRow(
-                    value = customDnsInput,
-                    placeholder = "Custom DNS (IP or https://...)",
-                    actionLabel = "Apply",
-                    actionEnabled = dnsDirty,
-                    showCheckmark = customDnsActive,
-                    errorText = dnsError,
-                    onValueChange = { next ->
-                        customDnsInput = next
-                        val trimmed = next.trim()
-                        dnsError = when {
-                            trimmed.isEmpty() -> null
-                            dnsError != null && !isValidDnsInput(trimmed) -> dnsError
-                            else -> null
-                        }
-                    },
-                    onSubmit = ::submitDns,
-                )
-
-                HairlineRule(startIndent = 16.dp)
-
-                ToggleSettingRow(
-                    title = "DNS over HTTPS",
-                    subtitle = "Encrypt DNS queries with automatic failover",
-                    checked = settings.enableDoh,
-                    onCheckedChange = onSetEnableDoh,
-                )
-
-                HairlineRule(startIndent = 16.dp)
-
-                ToggleSettingRow(
-                    title = "Block QUIC",
-                    subtitle = "Drop UDP/443 so apps fall back to TCP TLS",
-                    checked = settings.blockQuic,
-                    onCheckedChange = onSetBlockQuic,
-                )
-
-                HairlineRule(startIndent = 16.dp)
-
-                ToggleSettingRow(
-                    title = "IPv4 Only",
-                    subtitle = "Skip AAAA lookups and IPv6 tunnel routes",
-                    checked = settings.ipv4Only,
-                    onCheckedChange = onSetIpv4Only,
-                )
-            }
-            SectionFooter("Blocking QUIC forces HTTP/3 traffic onto TCP where DPI desync applies.")
-
-            Spacer(Modifier.height(sectionGap))
-
-            // 3. BYPASS DOMAINS
-            SectionOverline("Bypass Domains")
-            InsetGroupedCard(
-                modifier = Modifier.fillMaxWidth(),
-                radius = 16.dp,
-            ) {
-                BorderlessInputRow(
-                    value = bypassInput,
-                    placeholder = "Add domain (e.g. example.com)",
-                    actionLabel = "Add",
-                    actionEnabled = bypassInput.isNotBlank(),
-                    showCheckmark = false,
-                    errorText = bypassError,
-                    onValueChange = { next ->
-                        bypassInput = next
-                        if (bypassError != null) bypassError = null
-                    },
-                    onSubmit = ::submitBypass,
-                )
-
-                settings.bypassDomains.forEach { domain ->
-                    HairlineRule(startIndent = 16.dp)
-                    InsetGroupedRow(
-                        title = domain,
-                        trailing = {
-                            RemoveDomainButton(
-                                domain = domain,
-                                onRemove = {
-                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                    focusManager.clearFocus()
-                                    onRemoveBypassDomain(domain)
-                                },
-                            )
-                        },
-                    )
-                }
-            }
-            SectionFooter("Matching domains and subdomains connect directly without DPI desync. Local networks are bypassed automatically.")
-
-            Spacer(Modifier.height(sectionGap))
-
-            // 4. APPEARANCE
-            SectionOverline("Appearance")
-            SegmentedControl(
-                options = ThemePreference.entries,
-                selected = settings.theme,
-                labelFor = { it.label },
-                onSelect = onSetTheme,
+            DesyncSettingsSection(
+                desyncMode = settings.desyncMode,
+                chunkSize = settings.chunkSize,
+                onSetDesyncMode = onSetDesyncMode,
+                onSetChunkSize = onSetChunkSize,
             )
-
             Spacer(Modifier.height(sectionGap))
 
-            // 5. SYSTEM
-            SectionOverline("System")
-            InsetGroupedCard(
-                modifier = Modifier.fillMaxWidth(),
-                radius = 16.dp,
-            ) {
-                InsetGroupedRow(
-                    title = "Clear Engine Cache",
-                    subtitle = "Reset learned TLS stages and DNS entries",
-                    onClick = {
-                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        onClearCache()
-                    },
-                )
-
-                HairlineRule(startIndent = 16.dp)
-
-                InsetGroupedRow(
-                    title = "System VPN Settings",
-                    subtitle = "Configure Always-on VPN in Android settings",
-                    onClick = {
-                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        onOpenAlwaysOnVpn()
-                    },
-                    trailing = {
-                        ChevronRightGlyph(tint = palette.inkMuted)
-                    },
-                )
-            }
-
+            DnsSettingsSection(
+                dnsAddr = settings.dnsAddr,
+                enableDoh = settings.enableDoh,
+                blockQuic = settings.blockQuic,
+                ipv4Only = settings.ipv4Only,
+                onSetDnsAddr = onSetDnsAddr,
+                onSetEnableDoh = onSetEnableDoh,
+                onSetBlockQuic = onSetBlockQuic,
+                onSetIpv4Only = onSetIpv4Only,
+            )
             Spacer(Modifier.height(sectionGap))
 
-            // 6. ABOUT
-            SectionOverline("About")
-            InsetGroupedCard(
-                modifier = Modifier.fillMaxWidth(),
-                radius = 16.dp,
-            ) {
-                InsetGroupedRow(
-                    title = "GitHub Repository",
-                    subtitle = GITHUB_REPO_LABEL,
-                    modifier = Modifier.heightIn(min = 52.dp),
-                    onClick = ::openGitHubRepository,
-                    trailing = {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(5.dp),
-                        ) {
-                            Text(
-                                text = "Open",
-                                fontFamily = GeistSans,
-                                fontWeight = FontWeight.Medium,
-                                fontSize = 14.sp,
-                                color = palette.accent,
-                                maxLines = 1,
-                            )
-                            ArrowUpRightGlyph(tint = palette.accent)
-                        }
-                    },
-                )
-            }
+            BypassDomainsSection(
+                bypassDomains = settings.bypassDomains,
+                onAddBypassDomain = onAddBypassDomain,
+                onRemoveBypassDomain = onRemoveBypassDomain,
+            )
+            Spacer(Modifier.height(sectionGap))
 
+            AppearanceSettingsSection(
+                theme = settings.theme,
+                onSetTheme = onSetTheme,
+            )
+            Spacer(Modifier.height(sectionGap))
+
+            SystemSettingsSection(
+                onClearCache = onClearCache,
+                onOpenAlwaysOnVpn = onOpenAlwaysOnVpn,
+            )
+            Spacer(Modifier.height(sectionGap))
+
+            AboutSettingsSection(onOpenGitHub = ::openGitHubRepository)
             Spacer(Modifier.height(if (isLandscape) 10.dp else 12.dp))
 
-            val versionLabel = if (engineVersion.startsWith("v", ignoreCase = true)) {
-                engineVersion
-            } else {
-                "v$engineVersion"
-            }
-            val footerInteraction = remember { MutableInteractionSource() }
-            val footerPressed by footerInteraction.collectIsPressedAsState()
-            val footerColor by animateColorAsState(
-                targetValue = if (footerPressed) palette.accent else palette.inkMuted,
-                animationSpec = tween(durationMillis = if (footerPressed) 60 else 160),
-                label = "versionFooterColor",
+            VersionAttributionFooter(
+                engineVersion = engineVersion,
+                onOpenGitHub = ::openGitHubRepository,
             )
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 44.dp)
-                    .clickable(
-                        interactionSource = footerInteraction,
-                        indication = null,
-                        role = Role.Button,
-                        onClick = ::openGitHubRepository,
-                    ),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(
-                    text = "vdpi $versionLabel · $GITHUB_REPO_LABEL",
-                    style = VdpiTextStyles.caption,
-                    color = footerColor,
-                    textAlign = TextAlign.Center,
-                )
-            }
-
             Spacer(Modifier.height(bottomChromePadding + 8.dp))
         }
     }
 }
+
+@Composable
+private fun SettingsHeader(isLandscape: Boolean) {
+    val palette = VdpiThemeTokens.palette
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = if (isLandscape) 34.dp else 44.dp),
+        contentAlignment = Alignment.CenterStart,
+    ) {
+        Text(
+            text = "Settings",
+            style = if (isLandscape) {
+                VdpiTextStyles.pageTitle.copy(
+                    fontSize = 24.sp,
+                    lineHeight = 30.sp,
+                    letterSpacing = (-0.3).sp,
+                )
+            } else {
+                VdpiTextStyles.pageTitle
+            },
+            color = palette.inkPrimary,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+// ── Sections ──
+
+@Composable
+private fun DesyncSettingsSection(
+    desyncMode: DesyncMode,
+    chunkSize: Int,
+    onSetDesyncMode: (DesyncMode) -> Unit,
+    onSetChunkSize: (Int) -> Unit,
+) {
+    val haptic = LocalHapticFeedback.current
+
+    Column(modifier = Modifier.fillMaxWidth()) {
+        SectionOverline("Desync Engine")
+        InsetGroupedCard(
+            modifier = Modifier.fillMaxWidth(),
+            radius = 16.dp,
+        ) {
+            DesyncMode.entries.forEachIndexed { idx, mode ->
+                if (idx > 0) HairlineRule(startIndent = 16.dp)
+                val isSelected = desyncMode == mode
+                InsetGroupedRow(
+                    title = mode.label,
+                    subtitle = mode.summary,
+                    modifier = Modifier.semantics { selected = isSelected },
+                    onClick = {
+                        if (!isSelected) {
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onSetDesyncMode(mode)
+                        }
+                    },
+                    trailing = {
+                        SelectionCheckmark(visible = isSelected)
+                    },
+                )
+            }
+
+            HairlineRule(startIndent = 16.dp)
+
+            ChunkSizeRow(
+                chunkSize = chunkSize,
+                onDecrease = {
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    onSetChunkSize((chunkSize - 1).coerceAtLeast(1))
+                },
+                onIncrease = {
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    onSetChunkSize((chunkSize + 1).coerceAtMost(64))
+                },
+            )
+        }
+        SectionFooter("Splits initial TLS ClientHello packets to evade DPI inspection. Chunk size sets the first fragment length (1–64 bytes).")
+    }
+}
+
+@Composable
+private fun DnsSettingsSection(
+    dnsAddr: String,
+    enableDoh: Boolean,
+    blockQuic: Boolean,
+    ipv4Only: Boolean,
+    onSetDnsAddr: (String) -> Unit,
+    onSetEnableDoh: (Boolean) -> Unit,
+    onSetBlockQuic: (Boolean) -> Unit,
+    onSetIpv4Only: (Boolean) -> Unit,
+) {
+    val haptic = LocalHapticFeedback.current
+    val focusManager = LocalFocusManager.current
+
+    val isPresetDns = DNS_PRESETS.any { it.address.equals(dnsAddr, ignoreCase = true) }
+    var customDnsInput by remember(dnsAddr) {
+        mutableStateOf(if (isPresetDns) "" else dnsAddr)
+    }
+    var dnsError by remember(dnsAddr) { mutableStateOf<String?>(null) }
+
+    val dnsTrimmed = customDnsInput.trim()
+    val dnsDirty = dnsTrimmed.isNotEmpty() && !dnsTrimmed.equals(dnsAddr, ignoreCase = true)
+    val customDnsActive = !isPresetDns && !dnsDirty && dnsTrimmed.equals(dnsAddr, ignoreCase = true)
+
+    fun submitDns() {
+        val candidate = customDnsInput.trim()
+        if (!isValidDnsInput(candidate)) {
+            dnsError = "Enter a valid IPv4, IPv6, or https:// DoH URL"
+            return
+        }
+        dnsError = null
+        focusManager.clearFocus()
+        if (!candidate.equals(dnsAddr, ignoreCase = true)) {
+            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+            onSetDnsAddr(candidate)
+        }
+    }
+
+    Column(modifier = Modifier.fillMaxWidth()) {
+        SectionOverline("DNS & Privacy")
+        InsetGroupedCard(
+            modifier = Modifier.fillMaxWidth(),
+            radius = 16.dp,
+        ) {
+            DNS_PRESETS.forEachIndexed { idx, preset ->
+                if (idx > 0) HairlineRule(startIndent = 16.dp)
+                val isSelected = dnsAddr.equals(preset.address, ignoreCase = true)
+                InsetGroupedRow(
+                    title = preset.name,
+                    subtitle = preset.address,
+                    modifier = Modifier.semantics { selected = isSelected },
+                    onClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        customDnsInput = ""
+                        dnsError = null
+                        focusManager.clearFocus()
+                        if (!isSelected) onSetDnsAddr(preset.address)
+                    },
+                    trailing = {
+                        SelectionCheckmark(visible = isSelected)
+                    },
+                )
+            }
+
+            HairlineRule(startIndent = 16.dp)
+
+            BorderlessInputRow(
+                value = customDnsInput,
+                placeholder = "Custom DNS (IP or https://...)",
+                actionLabel = "Apply",
+                actionEnabled = dnsDirty,
+                showCheckmark = customDnsActive,
+                errorText = dnsError,
+                onValueChange = { next ->
+                    customDnsInput = next
+                    val trimmed = next.trim()
+                    dnsError = when {
+                        trimmed.isEmpty() -> null
+                        dnsError != null && !isValidDnsInput(trimmed) -> dnsError
+                        else -> null
+                    }
+                },
+                onSubmit = ::submitDns,
+            )
+
+            HairlineRule(startIndent = 16.dp)
+
+            ToggleSettingRow(
+                title = "DNS over HTTPS",
+                subtitle = "Encrypt DNS queries with automatic failover",
+                checked = enableDoh,
+                onCheckedChange = onSetEnableDoh,
+            )
+
+            HairlineRule(startIndent = 16.dp)
+
+            ToggleSettingRow(
+                title = "Block QUIC",
+                subtitle = "Drop UDP/443 so apps fall back to TCP TLS",
+                checked = blockQuic,
+                onCheckedChange = onSetBlockQuic,
+            )
+
+            HairlineRule(startIndent = 16.dp)
+
+            ToggleSettingRow(
+                title = "IPv4 Only",
+                subtitle = "Skip AAAA lookups and IPv6 tunnel routes",
+                checked = ipv4Only,
+                onCheckedChange = onSetIpv4Only,
+            )
+        }
+        SectionFooter("Blocking QUIC forces HTTP/3 traffic onto TCP where DPI desync applies.")
+    }
+}
+
+@Composable
+private fun BypassDomainsSection(
+    bypassDomains: List<String>,
+    onAddBypassDomain: (String) -> Unit,
+    onRemoveBypassDomain: (String) -> Unit,
+) {
+    val haptic = LocalHapticFeedback.current
+    val focusManager = LocalFocusManager.current
+
+    var bypassInput by remember { mutableStateOf("") }
+    var bypassError by remember { mutableStateOf<String?>(null) }
+
+    fun submitBypass() {
+        val cleaned = sanitizeDomainInput(bypassInput)
+        if (!isValidBypassDomain(cleaned)) {
+            bypassError = "Enter a valid domain (e.g. example.com or *.example.com)"
+            return
+        }
+        if (cleaned in bypassDomains) {
+            bypassError = "$cleaned is already in the bypass list"
+            return
+        }
+        bypassError = null
+        bypassInput = ""
+        focusManager.clearFocus()
+        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+        onAddBypassDomain(cleaned)
+    }
+
+    Column(modifier = Modifier.fillMaxWidth()) {
+        SectionOverline("Bypass Domains")
+        InsetGroupedCard(
+            modifier = Modifier.fillMaxWidth(),
+            radius = 16.dp,
+        ) {
+            BorderlessInputRow(
+                value = bypassInput,
+                placeholder = "Add domain (e.g. example.com)",
+                actionLabel = "Add",
+                actionEnabled = bypassInput.isNotBlank(),
+                showCheckmark = false,
+                errorText = bypassError,
+                onValueChange = { next ->
+                    bypassInput = next
+                    if (bypassError != null) bypassError = null
+                },
+                onSubmit = ::submitBypass,
+            )
+
+            bypassDomains.forEach { domain ->
+                HairlineRule(startIndent = 16.dp)
+                InsetGroupedRow(
+                    title = domain,
+                    trailing = {
+                        RemoveDomainButton(
+                            domain = domain,
+                            onRemove = {
+                                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                focusManager.clearFocus()
+                                onRemoveBypassDomain(domain)
+                            },
+                        )
+                    },
+                )
+            }
+        }
+        SectionFooter("Matching domains and subdomains connect directly without DPI desync. Local networks are bypassed automatically.")
+    }
+}
+
+@Composable
+private fun AppearanceSettingsSection(
+    theme: ThemePreference,
+    onSetTheme: (ThemePreference) -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        SectionOverline("Appearance")
+        SegmentedControl(
+            options = ThemePreference.entries,
+            selected = theme,
+            labelFor = { it.label },
+            onSelect = onSetTheme,
+        )
+    }
+}
+
+@Composable
+private fun SystemSettingsSection(
+    onClearCache: () -> Unit,
+    onOpenAlwaysOnVpn: () -> Unit,
+) {
+    val palette = VdpiThemeTokens.palette
+    val haptic = LocalHapticFeedback.current
+
+    Column(modifier = Modifier.fillMaxWidth()) {
+        SectionOverline("System")
+        InsetGroupedCard(
+            modifier = Modifier.fillMaxWidth(),
+            radius = 16.dp,
+        ) {
+            InsetGroupedRow(
+                title = "Clear Engine Cache",
+                subtitle = "Reset learned TLS stages and DNS entries",
+                onClick = {
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    onClearCache()
+                },
+            )
+
+            HairlineRule(startIndent = 16.dp)
+
+            InsetGroupedRow(
+                title = "System VPN Settings",
+                subtitle = "Configure Always-on VPN in Android settings",
+                onClick = {
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    onOpenAlwaysOnVpn()
+                },
+                trailing = {
+                    ChevronRightGlyph(tint = palette.inkMuted)
+                },
+            )
+        }
+    }
+}
+
+@Composable
+private fun AboutSettingsSection(
+    onOpenGitHub: () -> Unit,
+) {
+    val palette = VdpiThemeTokens.palette
+
+    Column(modifier = Modifier.fillMaxWidth()) {
+        SectionOverline("About")
+        InsetGroupedCard(
+            modifier = Modifier.fillMaxWidth(),
+            radius = 16.dp,
+        ) {
+            InsetGroupedRow(
+                title = "GitHub Repository",
+                subtitle = GITHUB_REPO_LABEL,
+                modifier = Modifier.heightIn(min = 52.dp),
+                onClick = onOpenGitHub,
+                trailing = {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(5.dp),
+                    ) {
+                        Text(
+                            text = "Open",
+                            fontFamily = GeistSans,
+                            fontWeight = FontWeight.Medium,
+                            fontSize = 14.sp,
+                            color = palette.accent,
+                            maxLines = 1,
+                        )
+                        ArrowUpRightGlyph(tint = palette.accent)
+                    }
+                },
+            )
+        }
+    }
+}
+
+@Composable
+private fun VersionAttributionFooter(
+    engineVersion: String,
+    onOpenGitHub: () -> Unit,
+) {
+    val palette = VdpiThemeTokens.palette
+    val versionLabel = if (engineVersion.startsWith("v", ignoreCase = true)) {
+        engineVersion
+    } else {
+        "v$engineVersion"
+    }
+    val footerInteraction = remember { MutableInteractionSource() }
+    val footerPressed by footerInteraction.collectIsPressedAsState()
+    val footerColor by animateColorAsState(
+        targetValue = if (footerPressed) palette.accent else palette.inkMuted,
+        animationSpec = tween(durationMillis = if (footerPressed) 60 else 160),
+        label = "versionFooterColor",
+    )
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 44.dp)
+            .clickable(
+                interactionSource = footerInteraction,
+                indication = null,
+                role = Role.Button,
+                onClick = onOpenGitHub,
+            ),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = "vdpi $versionLabel · $GITHUB_REPO_LABEL",
+            style = VdpiTextStyles.caption,
+            color = footerColor,
+            textAlign = TextAlign.Center,
+        )
+    }
+}
+
+// ── Rows & Inputs ──
 
 @Composable
 private fun ChunkSizeRow(
@@ -937,6 +1049,8 @@ private fun RemoveDomainButton(
         }
     }
 }
+
+// ── Glyphs ──
 
 @Composable
 private fun SelectionCheckmark(visible: Boolean) {

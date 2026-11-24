@@ -11,6 +11,8 @@ struct SettingsView: View {
     @Environment(\.verticalSizeClass) private var verticalSizeClass
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
+    // MARK: - Types & Constants
+
     private static let githubRepositoryURL = URL(string: "https://github.com/Vuln-Inc/vdpi")!
 
     private enum Field: Hashable {
@@ -24,19 +26,23 @@ struct SettingsView: View {
         var id: String { value }
     }
 
-    @State private var dnsDraft: String = ""
-    @State private var dnsError: String? = nil
-    @State private var bypassDraft: String = ""
-    @State private var bypassError: String? = nil
-    @State private var showResetConfirm = false
-    @FocusState private var focusedField: Field?
-
     private let dnsPresets: [DnsPreset] = [
         DnsPreset(label: "Cloudflare", value: "1.1.1.1"),
         DnsPreset(label: "Google", value: "8.8.8.8"),
         DnsPreset(label: "AdGuard", value: "94.140.14.140"),
         DnsPreset(label: "Quad9", value: "9.9.9.9"),
     ]
+
+    // MARK: - Local State
+
+    @State private var dnsDraft: String = ""
+    @State private var dnsError: String?
+    @State private var bypassDraft: String = ""
+    @State private var bypassError: String?
+    @State private var showResetConfirm = false
+    @FocusState private var focusedField: Field?
+
+    // MARK: - Derived State
 
     private func isPresetDns(_ addr: String) -> Bool {
         dnsPresets.contains { $0.value.caseInsensitiveCompare(addr) == .orderedSame }
@@ -70,6 +76,8 @@ struct SettingsView: View {
     private var isCompactHeight: Bool {
         verticalSizeClass == .compact
     }
+
+    // MARK: - Body
 
     var body: some View {
         ScrollView {
@@ -160,7 +168,7 @@ struct SettingsView: View {
         .frame(minHeight: 44)
     }
 
-    // MARK: - 1. Desync Engine
+    // MARK: - Desync Engine
 
     private var desyncSection: some View {
         let chunkSize = manager.settings.clampedChunkSize
@@ -291,7 +299,7 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - 2. DNS & Privacy
+    // MARK: - DNS & Privacy
 
     private var dnsSection: some View {
         VStack(alignment: .leading, spacing: 7) {
@@ -430,7 +438,7 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - 3. Tunnel
+    // MARK: - Tunnel
 
     private var tunnelSection: some View {
         VStack(alignment: .leading, spacing: 7) {
@@ -452,7 +460,7 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - 4. Bypass Domains
+    // MARK: - Bypass Domains
 
     private var bypassDomainsSection: some View {
         VStack(alignment: .leading, spacing: 7) {
@@ -538,7 +546,7 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - 5. Appearance
+    // MARK: - Appearance
 
     private var appearanceSection: some View {
         VStack(alignment: .leading, spacing: 7) {
@@ -569,7 +577,7 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - 6. Reset
+    // MARK: - Reset
 
     private var resetSection: some View {
         InsetGroupedCard(cornerRadius: 16) {
@@ -590,7 +598,7 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - 7. About
+    // MARK: - About
 
     private var aboutSection: some View {
         VStack(alignment: .leading, spacing: 7) {
@@ -642,7 +650,7 @@ struct SettingsView: View {
             .padding(.top, -4)
     }
 
-    // MARK: - Row Helpers & Actions
+    // MARK: - Row Helpers
 
     private func toggleRow(title: String, isOn: Binding<Bool>) -> some View {
         Toggle(isOn: isOn) {
@@ -655,6 +663,8 @@ struct SettingsView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 6)
     }
+
+    // MARK: - Actions
 
     private func commitDns() {
         let trimmed = dnsDraft.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -704,6 +714,8 @@ struct SettingsView: View {
         }
     }
 }
+
+// MARK: - Row Button Style
 
 private struct SettingsRowButtonStyle: ButtonStyle {
     let highlightColor: Color

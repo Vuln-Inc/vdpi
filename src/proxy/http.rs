@@ -233,19 +233,20 @@ pub fn parse_authority(authority: &str, default_port: u16) -> Result<(String, u1
 }
 
 fn parse_http_proxy_target(target: &str, header_str: &str) -> Result<(String, u16, String)> {
-    let absolute_rest = if target.len() >= 7
-        && target.as_bytes()[..7].eq_ignore_ascii_case(b"http://")
-    {
-        Some(&target[7..])
-    } else if target.len() >= 5 && target.as_bytes()[..5].eq_ignore_ascii_case(b"ws://") {
-        Some(&target[5..])
-    } else {
-        None
-    };
+    let absolute_rest =
+        if target.len() >= 7 && target.as_bytes()[..7].eq_ignore_ascii_case(b"http://") {
+            Some(&target[7..])
+        } else if target.len() >= 5 && target.as_bytes()[..5].eq_ignore_ascii_case(b"ws://") {
+            Some(&target[5..])
+        } else {
+            None
+        };
 
     if let Some(rest) = absolute_rest {
         let (authority, path) = match rest.find(['/', '?']) {
-            Some(idx) if rest.as_bytes()[idx] == b'?' => (&rest[..idx], format!("/{}", &rest[idx..])),
+            Some(idx) if rest.as_bytes()[idx] == b'?' => {
+                (&rest[..idx], format!("/{}", &rest[idx..]))
+            }
             Some(idx) => (&rest[..idx], rest[idx..].to_string()),
             None => (rest, "/".to_string()),
         };
@@ -389,7 +390,8 @@ mod tests {
         assert!(!mixed_s.to_ascii_lowercase().contains("connection: close"));
 
         // If `Upgrade:` is present without a `Connection:` header, add `Connection: Upgrade`.
-        let no_conn = "GET http://example.com/ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\n\r\n";
+        let no_conn =
+            "GET http://example.com/ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\n\r\n";
         let no_conn_rewritten = rewrite_http_request("GET", "/ws", "HTTP/1.1", no_conn, b"");
         let no_conn_s = String::from_utf8(no_conn_rewritten).unwrap();
         assert!(no_conn_s.contains("Upgrade: websocket\r\n"));
@@ -487,9 +489,8 @@ mod tests {
         });
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
-        let req = format!(
-            "GET http://{upstream_addr}/ping HTTP/1.1\r\nHost: {upstream_addr}\r\n\r\n"
-        );
+        let req =
+            format!("GET http://{upstream_addr}/ping HTTP/1.1\r\nHost: {upstream_addr}\r\n\r\n");
         client.write_all(req.as_bytes()).await.unwrap();
         let mut resp = Vec::new();
         client.read_to_end(&mut resp).await.unwrap();

@@ -346,7 +346,10 @@ fn xml_escape(s: &str) -> String {
 /// Service under SCM, or Linux systemd user unit).
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn install_service(_cfg: &RuntimeConfig) -> Result<()> {
-    bail!("service installation is not supported on {}", platform_name());
+    bail!(
+        "service installation is not supported on {}",
+        platform_name()
+    );
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -748,7 +751,9 @@ pub fn uninstall_service() -> Result<()> {
         use crate::platform::windows_service::{is_elevated, relaunch_elevated_and_wait};
 
         if !is_elevated() {
-            println!("Requesting Administrator privileges to uninstall the vdpi Windows service...");
+            println!(
+                "Requesting Administrator privileges to uninstall the vdpi Windows service..."
+            );
             relaunch_elevated_and_wait(&["uninstall".to_string()])?;
             clear_all_system_proxies()?;
             println!(
@@ -1070,10 +1075,8 @@ mod tests {
         assert!(unit.contains("ExecStart=\"/home/test/.vdpi/bin/vdpi\""));
         assert!(unit.contains("LimitNOFILE=65536"));
 
-        let win_bin = build_windows_service_bin_path(
-            Path::new(r"C:\Program Files\vdpi\bin\vdpi.exe"),
-            &cfg,
-        );
+        let win_bin =
+            build_windows_service_bin_path(Path::new(r"C:\Program Files\vdpi\bin\vdpi.exe"), &cfg);
         assert!(win_bin.starts_with(r#""C:\Program Files\vdpi\bin\vdpi.exe" --service "#));
         assert!(win_bin.contains("--bind 127.0.0.1"));
         assert!(win_bin.contains("--port 8080"));
@@ -1096,10 +1099,8 @@ mod tests {
         ])
         .unwrap();
         let cfg = cli.into_runtime_config();
-        let win_bin = build_windows_service_bin_path(
-            Path::new(r"C:\Program Files\vdpi\bin\vdpi.exe"),
-            &cfg,
-        );
+        let win_bin =
+            build_windows_service_bin_path(Path::new(r"C:\Program Files\vdpi\bin\vdpi.exe"), &cfg);
         assert!(win_bin.contains("--service"));
         assert!(win_bin.contains("--mode tls-record"));
         assert!(win_bin.contains("--dns 8.8.8.8"));

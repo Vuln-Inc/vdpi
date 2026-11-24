@@ -11,7 +11,8 @@ use tracing::{debug, info, warn};
 pub mod foreground;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const INTERNET_SETTINGS_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+const INTERNET_SETTINGS_SUBKEY: &str =
+    r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 const USER_ENV_SUBKEY: &str = "Environment";
 const SYSTEM_ENV_KEY: &str = r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
 
@@ -147,7 +148,8 @@ impl WindowsProxySession {
             let inet_key = internet_settings_key(root);
             let (enabled, current_server) = query_wininet_state(&inet_key);
             if !enabled || !current_server.eq_ignore_ascii_case(&expected_server) {
-                if let Err(e) = apply_wininet_proxy(&inet_key, &expected_server, &self.proxy_override)
+                if let Err(e) =
+                    apply_wininet_proxy(&inet_key, &expected_server, &self.proxy_override)
                 {
                     warn!(hive = %root, error = %e, "failed to reconcile Windows proxy settings");
                 } else {
@@ -258,8 +260,7 @@ pub fn print_windows_proxy_status() {
     let inet_key = internet_settings_key("HKCU");
     let env_key = user_env_key("HKCU");
     let (enabled, server) = query_wininet_state(&inet_key);
-    let override_val =
-        query_reg_sz(&inet_key, "ProxyOverride").unwrap_or_else(|| "<unset>".into());
+    let override_val = query_reg_sz(&inet_key, "ProxyOverride").unwrap_or_else(|| "<unset>".into());
     let https_env = query_reg_sz(&env_key, "HTTPS_PROXY").unwrap_or_else(|| "<unset>".into());
 
     println!("\n=== Windows System Proxy (WinINET) ===");
@@ -387,27 +388,11 @@ fn apply_wininet_proxy(inet_key: &str, server: &str, proxy_override: &str) -> Re
 fn set_windows_user_env(env_key: &str, proxy_url: &str, no_proxy: &str) {
     for key in ["HTTP_PROXY", "HTTPS_PROXY"] {
         let _ = run_reg(&[
-            "add",
-            env_key,
-            "/v",
-            key,
-            "/t",
-            "REG_SZ",
-            "/d",
-            proxy_url,
-            "/f",
+            "add", env_key, "/v", key, "/t", "REG_SZ", "/d", proxy_url, "/f",
         ]);
     }
     let _ = run_reg(&[
-        "add",
-        env_key,
-        "/v",
-        "NO_PROXY",
-        "/t",
-        "REG_SZ",
-        "/d",
-        no_proxy,
-        "/f",
+        "add", env_key, "/v", "NO_PROXY", "/t", "REG_SZ", "/d", no_proxy, "/f",
     ]);
     let _ = run_reg(&["delete", env_key, "/v", "ALL_PROXY", "/f"]);
 }
