@@ -144,9 +144,8 @@ Binary installation, `PATH` registration, background service setup, and OS proxy
 Install via **[Scoop](https://scoop.sh)** or download **[`vdpi-windows-x86_64.zip`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-windows-x86_64.zip)**:
 
 ```powershell
-# Scoop (recommended)
-scoop bucket add vuln-inc https://github.com/Vuln-Inc/scoop-bucket
-scoop install vuln-inc/vdpi
+# Scoop (direct manifest, no extra bucket required)
+scoop install https://vuln-inc.github.io/vdpi/vdpi.json
 
 # Install as a native Windows Service (auto-prompts UAC, starts at boot, adds to System PATH)
 vdpi install
@@ -160,17 +159,16 @@ vdpi uninstall
 
 ### macOS (Apple Silicon & Intel)
 
-Install via **[Homebrew](https://brew.sh)** or download **[`vdpi-macos-universal.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-macos-universal.tar.gz)**:
+Download **[`vdpi-macos-universal.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-macos-universal.tar.gz)**, extract it, and run:
 
 ```bash
-# Homebrew (recommended)
-brew install vuln-inc/tap/vdpi
+tar -xzf vdpi-macos-universal.tar.gz
 
 # Install to ~/.vdpi/bin/vdpi, codesign, register LaunchAgent, and configure proxies
-vdpi install
+./vdpi install
 
 # Or run for the current terminal session only (Ctrl+C restores proxies)
-vdpi start
+./vdpi start
 
 # Stop LaunchAgent, remove files, and restore macOS network settings
 vdpi uninstall
@@ -178,7 +176,7 @@ vdpi uninstall
 
 ### Linux (`x86_64` & `arm64`)
 
-Install via **[Homebrew](https://brew.sh)** (`brew install vuln-inc/tap/vdpi`) or download **[`vdpi-linux-x86_64.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-linux-x86_64.tar.gz)** / **[`vdpi-linux-arm64.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-linux-arm64.tar.gz)**:
+Download **[`vdpi-linux-x86_64.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-linux-x86_64.tar.gz)** (or **[`vdpi-linux-arm64.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-linux-arm64.tar.gz)**), extract it, and run:
 
 ```bash
 tar -xzf vdpi-linux-x86_64.tar.gz
