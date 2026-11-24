@@ -51,7 +51,7 @@ Download the latest build for your device from **[GitHub Releases](https://githu
 
 ### Installing on Android
 
-1. Download **[`vdpi-android-universal.apk`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-android-universal.apk)** on your phone and install it (allow installing from your browser/file manager if prompted).
+1. Download **[`vdpi-android-universal.apk`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-android-universal.apk)** directly from GitHub Releases, or track automatic updates with **[Obtainium](https://github.com/ImranR98/Obtainium)** using `https://github.com/Vuln-Inc/vdpi`.
 2. Open **vdpi**, tap **Connect**, and accept the Android VPN connection prompt.
 3. Tap **Diagnostics** to verify live DoH resolution and TLS bypass checks against your network.
 
@@ -60,7 +60,7 @@ Download the latest build for your device from **[GitHub Releases](https://githu
 
 - **Private DNS:** If Android's system Private DNS is set to a custom hostname that your ISP blocks, switch Private DNS to *Automatic* or *Off* while using `vdpi` so DNS goes through `vdpi`'s built-in RFC 8484 DoH ring.
 - **Battery optimization:** Some OEMs (Xiaomi/MIUI/HyperOS, Samsung, Oppo, Huawei) aggressively kill background VPN services. Set **vdpi** to *Unrestricted* / *No restrictions* in battery settings if the tunnel stops when the screen turns off.
-- **APK signing:** Release APKs built in CI without repository signing secrets (`VDPI_KEYSTORE_BASE64`, `VDPI_KEYSTORE_PASSWORD`, `VDPI_KEY_ALIAS`, `VDPI_KEY_PASSWORD`) are signed with an ephemeral debug keystore. If a future release switches to a persistent release keystore, uninstall the older APK before installing the new one.
+- **APK signing:** Releases starting after `v0.4.0` are signed with the persistent repository release keystore (`VDPI_KEYSTORE_BASE64`) so future updates install in-place without clearing settings (upgrading from `v0.4.0` or earlier requires one clean reinstall when the signing key transitions).
 
 </details>
 
@@ -82,7 +82,11 @@ Download the latest build for your device from **[GitHub Releases](https://githu
 
 ### Installing on iOS / iPadOS
 
-Download **[`vdpi-ios-unsigned.ipa`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-ios-unsigned.ipa)** from GitHub Releases (includes both `VdpiApp.app` and `PlugIns/VdpiPacketTunnel.appex` with ad-hoc embedded entitlements):
+Download **[`vdpi-ios-unsigned.ipa`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-ios-unsigned.ipa)** from GitHub Releases (includes both `VdpiApp.app` and `PlugIns/VdpiPacketTunnel.appex` with ad-hoc embedded entitlements), or add the official AltStore / SideStore / Feather source URL for 1-tap updates:
+
+```text
+https://vuln-inc.github.io/vdpi/apps.json
+```
 
 - **TrollStore (iOS 16.0 – 16.6.1 / 17.0):** Install `vdpi-ios-unsigned.ipa` directly in TrollStore — CoreTrust preserves the `packet-tunnel-provider` and `group.com.vulninc.vdpi` entitlements without an Apple Developer account.
 - **Paid Apple Developer certificate / third-party signer (Feather, ESign, Sideloadly, etc.):** Re-sign `vdpi-ios-unsigned.ipa` with a paid certificate & provisioning profile that explicitly grants `com.apple.developer.networking.networkextension` (`packet-tunnel-provider`) and matching App Groups on **both** `VdpiApp` and `PlugIns/VdpiPacketTunnel.appex`.
@@ -137,14 +141,18 @@ Binary installation, `PATH` registration, background service setup, and OS proxy
 
 ### Windows (Windows 10 & 11 `x86_64`)
 
-Download **[`vdpi-windows-x86_64.zip`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-windows-x86_64.zip)**, extract it, and run in PowerShell or Command Prompt:
+Install via **[Scoop](https://scoop.sh)** or download **[`vdpi-windows-x86_64.zip`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-windows-x86_64.zip)**:
 
 ```powershell
+# Scoop (recommended)
+scoop bucket add vuln-inc https://github.com/Vuln-Inc/scoop-bucket
+scoop install vuln-inc/vdpi
+
 # Install as a native Windows Service (auto-prompts UAC, starts at boot, adds to System PATH)
-.\vdpi.exe install
+vdpi install
 
 # Or run for the current session only (no Admin required; Ctrl+C restores proxies)
-.\vdpi.exe start
+vdpi start
 
 # Stop & remove the Windows Service, clean files & PATH, and restore Windows proxies
 vdpi uninstall
@@ -152,16 +160,17 @@ vdpi uninstall
 
 ### macOS (Apple Silicon & Intel)
 
-Download **[`vdpi-macos-universal.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-macos-universal.tar.gz)**, extract it, and run:
+Install via **[Homebrew](https://brew.sh)** or download **[`vdpi-macos-universal.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-macos-universal.tar.gz)**:
 
 ```bash
-tar -xzf vdpi-macos-universal.tar.gz
+# Homebrew (recommended)
+brew install vuln-inc/tap/vdpi
 
 # Install to ~/.vdpi/bin/vdpi, codesign, register LaunchAgent, and configure proxies
-./vdpi install
+vdpi install
 
 # Or run for the current terminal session only (Ctrl+C restores proxies)
-./vdpi start
+vdpi start
 
 # Stop LaunchAgent, remove files, and restore macOS network settings
 vdpi uninstall
@@ -169,7 +178,7 @@ vdpi uninstall
 
 ### Linux (`x86_64` & `arm64`)
 
-Download **[`vdpi-linux-x86_64.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-linux-x86_64.tar.gz)** (or **[`vdpi-linux-arm64.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-linux-arm64.tar.gz)**), extract it, and run:
+Install via **[Homebrew](https://brew.sh)** (`brew install vuln-inc/tap/vdpi`) or download **[`vdpi-linux-x86_64.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-linux-x86_64.tar.gz)** / **[`vdpi-linux-arm64.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-linux-arm64.tar.gz)**:
 
 ```bash
 tar -xzf vdpi-linux-x86_64.tar.gz
