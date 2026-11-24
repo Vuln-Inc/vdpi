@@ -32,11 +32,15 @@
 
     <div class="card">
       <div class="row">
-        <div><div class="label">Windows</div><div class="sub"><code>scoop bucket add vuln-inc https://github.com/Vuln-Inc/scoop-bucket &amp;&amp; scoop install vuln-inc/vdpi</code></div></div>
+        <div><div class="label">Windows</div><div class="sub"><code>scoop install https://vuln-inc.github.io/vdpi/vdpi.json</code></div></div>
         <a href="https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-windows-x86_64.zip">Download .zip</a>
       </div>
       <div class="row">
-        <div><div class="label">macOS &amp; Linux</div><div class="sub"><code>brew install vuln-inc/tap/vdpi</code></div></div>
+        <div><div class="label">macOS (Apple Silicon &amp; Intel)</div><div class="sub">Universal binary &middot; native LaunchAgent &middot; <code>vdpi update</code></div></div>
+        <a href="https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-macos-universal.tar.gz">Download .tar.gz</a>
+      </div>
+      <div class="row">
+        <div><div class="label">Linux (x86_64 &amp; arm64)</div><div class="sub">Static musl binary &middot; <code>systemd --user</code> &middot; <code>vdpi update</code></div></div>
         <a href="https://github.com/Vuln-Inc/vdpi/releases/latest">Releases</a>
       </div>
       <div class="row">
