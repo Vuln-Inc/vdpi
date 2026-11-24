@@ -1,0 +1,43 @@
+{
+  "name": "Vuln-Inc",
+  "identifier": "com.vulninc.vdpi.source",
+  "subtitle": "Official vdpi releases for iOS",
+  "description": "Zero-hassle, self-healing anti-DPI engine in Rust. Runs 100% on-device with zero remote servers or telemetry.",
+  "iconURL": "https://raw.githubusercontent.com/Vuln-Inc/vdpi/main/ios/VdpiApp/Resources/Assets.xcassets/AppIcon.appiconset/AppIcon.png",
+  "website": "https://github.com/Vuln-Inc/vdpi",
+  "tintColor": "#0A84FF",
+  "featuredApps": [
+    "com.vulninc.vdpi"
+  ],
+  "apps": [
+    {
+      "name": "vdpi",
+      "bundleIdentifier": "com.vulninc.vdpi",
+      "developerName": "Vuln-Inc",
+      "subtitle": "On-device anti-DPI engine in Rust",
+      "localizedDescription": "Zero-hassle, self-healing anti-DPI engine running 100% locally via NEPacketTunnelProvider. Supports 7-stage adaptive TLS desync, encrypted DNS-over-HTTPS, QUIC blocking, persistent adaptive stage caching, Siri Shortcuts, and zero external VPN servers.",
+      "iconURL": "https://raw.githubusercontent.com/Vuln-Inc/vdpi/main/ios/VdpiApp/Resources/Assets.xcassets/AppIcon.appiconset/AppIcon.png",
+      "tintColor": "#0A84FF",
+      "category": "utilities",
+      "versions": [
+        {
+          "version": "0.4.0",
+          "buildVersion": "4",
+          "date": "2026-11-24T04:10:00Z",
+          "localizedDescription": "- Persistent adaptive stage cache in App Group container\n- Activity throughput sparkline and smooth numeric counters\n- Quiet GitHub Releases update checker\n- Siri Shortcuts and iOS Automations (AppIntents)\n- Settings JSON backup/restore and 1-tap shareable diagnostics",
+          "downloadURL": "https://github.com/Vuln-Inc/vdpi/releases/download/v0.4.0/vdpi-ios-unsigned.ipa",
+          "size": 7390515,
+          "minOSVersion": "16.0"
+        }
+      ],
+      "appPermissions": {
+        "entitlements": [
+          "com.apple.developer.networking.networkextension",
+          "com.apple.security.application-groups"
+        ],
+        "privacy": {}
+      }
+    }
+  ],
+  "news": []
+}
