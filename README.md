@@ -136,7 +136,7 @@ If an older Windows build left a dead proxy behind, open **Settings > Network & 
 
 ## Desktop Installation
 
-Download the release archive for your OS from **[Releases](https://github.com/Vuln-Inc/vdpi/releases/latest)**, extract it, and run `vdpi install`.  
+Download the release archive for your OS from **[Releases](https://github.com/Vuln-Inc/vdpi/releases/latest)**, install with `cargo install vdpi` from **[crates.io](https://crates.io/crates/vdpi)**, or use the one-line SHA-256-verified installers below.  
 Binary installation, `PATH` registration, background service setup, and OS proxy configuration are handled natively by `vdpi`.
 
 ### Windows (Windows 10 & 11 `x86_64`)
