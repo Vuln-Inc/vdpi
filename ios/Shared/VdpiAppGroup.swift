@@ -2,10 +2,94 @@ import Foundation
 
 /// App Group identifier and IPC message codec shared between `VdpiApp` and `VdpiPacketTunnel`.
 public enum VdpiAppGroup {
-    public static let suiteName = "group.com.vulninc.vdpi"
-    public static let extensionBundleId = "com.vulninc.vdpi.packet-tunnel"
+    private static let defaultSuiteName = "group.com.vulninc.vdpi"
+    private static let defaultExtensionBundleId = "com.vulninc.vdpi.packet-tunnel"
+    private static let packetTunnelExtensionPoint = "com.apple.networkextension.packet-tunnel"
+
+    /// Resolves the active App Group dynamically from the signed `embedded.mobileprovision`
+    /// profile (so paid Apple Developer / Sideloadly / Feather re-signing under any custom
+    /// Team ID or bundle ID works without editing Swift source), falling back to the default
+    /// group for TrollStore and Simulator builds.
+    public static let suiteName: String = resolveSuiteName()
+
+    /// Resolves the embedded `VdpiPacketTunnel.appex` bundle identifier dynamically from
+    /// `PlugIns/*.appex/Info.plist`, falling back to `<mainBundleId>.packet-tunnel` and
+    /// finally the default bundle ID.
+    public static let extensionBundleId: String = resolveExtensionBundleId()
+
     private static let settingsKey = "vdpi_settings_v1"
     private static let appliedConfigKey = "vdpi_applied_config_v1"
+
+    public static func resolveSuiteName(bundle: Bundle = .main) -> String {
+        if let profileURL = bundle.url(forResource: "embedded", withExtension: "mobileprovision"),
+           let data = try? Data(contentsOf: profileURL),
+           let group = extractAppGroupFromProvisioningProfile(data) {
+            return group
+        }
+        return defaultSuiteName
+    }
+
+    public static func extractAppGroupFromProvisioningProfile(_ data: Data) -> String? {
+        let startMarker = Data("<plist".utf8)
+        let endMarker = Data("</plist>".utf8)
+        guard let startRange = data.range(of: startMarker),
+              let endRange = data.range(of: endMarker, in: startRange.lowerBound..<data.endIndex)
+        else {
+            return nil
+        }
+
+        let plistData = data.subdata(in: startRange.lowerBound..<endRange.upperBound)
+        guard let plist = try? PropertyListSerialization.propertyList(
+            from: plistData,
+            options: [],
+            format: nil
+        ) as? [String: Any],
+              let entitlements = plist["Entitlements"] as? [String: Any],
+              let groups = entitlements["com.apple.security.application-groups"] as? [String]
+        else {
+            return nil
+        }
+
+        return groups
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { $0.hasPrefix("group.") && $0.count > 6 }
+    }
+
+    public static func resolveExtensionBundleId(bundle: Bundle = .main) -> String {
+        if let plugInsURL = bundle.builtInPlugInsURL,
+           let entries = try? FileManager.default.contentsOfDirectory(
+               at: plugInsURL,
+               includingPropertiesForKeys: nil,
+               options: [.skipsHiddenFiles]
+           ) {
+            for entry in entries where entry.pathExtension.lowercased() == "appex" {
+                let infoURL = entry.appendingPathComponent("Info.plist")
+                guard let infoData = try? Data(contentsOf: infoURL),
+                      let info = try? PropertyListSerialization.propertyList(
+                          from: infoData,
+                          options: [],
+                          format: nil
+                      ) as? [String: Any],
+                      let nsExt = info["NSExtension"] as? [String: Any],
+                      let point = nsExt["NSExtensionPointIdentifier"] as? String,
+                      point == packetTunnelExtensionPoint,
+                      let bundleId = info["CFBundleIdentifier"] as? String,
+                      !bundleId.isEmpty
+                else {
+                    continue
+                }
+                return bundleId
+            }
+        }
+
+        if let mainId = bundle.bundleIdentifier, !mainId.isEmpty {
+            if mainId.hasSuffix(".packet-tunnel") {
+                return mainId
+            }
+            return "\(mainId).packet-tunnel"
+        }
+        return defaultExtensionBundleId
+    }
 
     public static var defaults: UserDefaults {
         UserDefaults(suiteName: suiteName) ?? .standard

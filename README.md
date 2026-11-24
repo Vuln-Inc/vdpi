@@ -60,7 +60,7 @@ Download the latest build for your device from **[GitHub Releases](https://githu
 
 - **Private DNS:** If Android's system Private DNS is set to a custom hostname that your ISP blocks, switch Private DNS to *Automatic* or *Off* while using `vdpi` so DNS goes through `vdpi`'s built-in RFC 8484 DoH ring.
 - **Battery optimization:** Some OEMs (Xiaomi/MIUI/HyperOS, Samsung, Oppo, Huawei) aggressively kill background VPN services. Set **vdpi** to *Unrestricted* / *No restrictions* in battery settings if the tunnel stops when the screen turns off.
-- **APK signing:** Releases starting after `v0.4.0` are signed with the persistent repository release keystore (`VDPI_KEYSTORE_BASE64`) so future updates install in-place without clearing settings (upgrading from `v0.4.0` or earlier requires one clean reinstall when the signing key transitions).
+- **APK signing:** Releases starting with `v0.4.1` are signed with the persistent repository release keystore (`VDPI_KEYSTORE_BASE64`) so future updates install in-place without clearing settings (upgrading from `v0.4.0` or earlier requires one clean reinstall when the signing key transitions).
 
 </details>
 
@@ -141,10 +141,13 @@ Binary installation, `PATH` registration, background service setup, and OS proxy
 
 ### Windows (Windows 10 & 11 `x86_64`)
 
-Install via **[Scoop](https://scoop.sh)** or download **[`vdpi-windows-x86_64.zip`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-windows-x86_64.zip)**:
+Install with the one-line SHA-256-verified PowerShell installer, **[Scoop](https://scoop.sh)**, or download **[`vdpi-windows-x86_64.zip`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-windows-x86_64.zip)**:
 
 ```powershell
-# Scoop (direct manifest, no extra bucket required)
+# One-line installer (verifies SHA-256 against SHA256SUMS.txt)
+irm https://vuln-inc.github.io/vdpi/install.ps1 | iex
+
+# Or Scoop (direct manifest, no extra bucket required)
 scoop install https://vuln-inc.github.io/vdpi/vdpi.json
 
 # Install as a native Windows Service (auto-prompts UAC, starts at boot, adds to System PATH)
@@ -159,16 +162,17 @@ vdpi uninstall
 
 ### macOS (Apple Silicon & Intel)
 
-Download **[`vdpi-macos-universal.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-macos-universal.tar.gz)**, extract it, and run:
+Install with the one-line SHA-256-verified shell installer or download **[`vdpi-macos-universal.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-macos-universal.tar.gz)**:
 
 ```bash
-tar -xzf vdpi-macos-universal.tar.gz
+# One-line installer (macOS & Linux, verifies SHA-256 against SHA256SUMS.txt)
+curl -fsSL https://vuln-inc.github.io/vdpi/install.sh | sh
 
 # Install to ~/.vdpi/bin/vdpi, codesign, register LaunchAgent, and configure proxies
-./vdpi install
+vdpi install
 
 # Or run for the current terminal session only (Ctrl+C restores proxies)
-./vdpi start
+vdpi start
 
 # Stop LaunchAgent, remove files, and restore macOS network settings
 vdpi uninstall
@@ -176,7 +180,7 @@ vdpi uninstall
 
 ### Linux (`x86_64` & `arm64`)
 
-Download **[`vdpi-linux-x86_64.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-linux-x86_64.tar.gz)** (or **[`vdpi-linux-arm64.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-linux-arm64.tar.gz)**), extract it, and run:
+Install with the one-line SHA-256-verified shell installer (`curl -fsSL https://vuln-inc.github.io/vdpi/install.sh | sh`) or download **[`vdpi-linux-x86_64.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-linux-x86_64.tar.gz)** / **[`vdpi-linux-arm64.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-linux-arm64.tar.gz)**:
 
 ```bash
 tar -xzf vdpi-linux-x86_64.tar.gz

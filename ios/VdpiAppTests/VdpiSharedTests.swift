@@ -365,4 +365,32 @@ final class VdpiSharedTests: XCTestCase {
         XCTAssertEqual(legacyDecoded.mtu, 1400)
         XCTAssertEqual(legacyDecoded.bypassDomains, ["example.com"])
     }
+
+    func testProvisioningProfileAppGroupExtraction() throws {
+        let xml = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+            <key>Entitlements</key>
+            <dict>
+                <key>com.apple.security.application-groups</key>
+                <array>
+                    <string>group.com.custom.vdpi.TEAM123</string>
+                </array>
+            </dict>
+        </dict>
+        </plist>
+        """
+        var cmsWrapped = Data([0x30, 0x82, 0x01, 0x00, 0x06, 0x09])
+        cmsWrapped.append(Data(xml.utf8))
+        cmsWrapped.append(Data([0x00, 0xFF, 0xA1, 0xB2]))
+
+        XCTAssertEqual(
+            VdpiAppGroup.extractAppGroupFromProvisioningProfile(cmsWrapped),
+            "group.com.custom.vdpi.TEAM123"
+        )
+        XCTAssertNil(VdpiAppGroup.extractAppGroupFromProvisioningProfile(Data("not a plist".utf8)))
+        XCTAssertNil(VdpiAppGroup.extractAppGroupFromProvisioningProfile(Data()))
+    }
 }

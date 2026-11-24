@@ -4,6 +4,17 @@ All notable changes to `vdpi` are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-11-24
+
+### Added
+
+- Dynamic iOS App Group and PacketTunnel extension bundle ID auto-detection (`embedded.mobileprovision` + `PlugIns/*.appex/Info.plist`) so paid Apple Developer / Sideloadly / Feather re-signing connects without manual Swift edits.
+- One-line SHA-256-verified desktop install scripts (`install.sh` for macOS/Linux and `install.ps1` for Windows) hosted on GitHub Pages alongside direct Scoop (`vdpi.json`) and AltStore/SideStore/Feather (`apps.json`) feeds.
+
+### Changed
+
+- Android release APKs are now signed with the persistent repository release keystore (`VDPI_KEYSTORE_BASE64`) for seamless in-place upgrades via GitHub Releases and Obtainium.
+
 ## [0.4.0] - 2026-11-24
 
 ### Added
