@@ -23,10 +23,10 @@
         {
           "version": "0.4.1",
           "buildVersion": "5",
-          "date": "2026-11-24T19:08:00Z",
+          "date": "2026-11-24T19:10:00Z",
           "localizedDescription": "- Dynamic iOS App Group and PacketTunnel extension bundle ID auto-detection for paid Apple Developer / Sideloadly / Feather re-signing\n- Persistent adaptive stage cache, Activity sparkline, quiet GitHub update checker, and Siri Shortcuts",
           "downloadURL": "https://github.com/Vuln-Inc/vdpi/releases/download/v0.4.1/vdpi-ios-unsigned.ipa",
-          "size": 7406024,
+          "size": 7399709,
           "minOSVersion": "16.0"
         },
         {

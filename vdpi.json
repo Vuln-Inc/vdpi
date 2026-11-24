@@ -6,7 +6,7 @@
     "architecture": {
         "64bit": {
             "url": "https://github.com/Vuln-Inc/vdpi/releases/download/v0.4.1/vdpi-windows-x86_64.zip",
-            "hash": "894b34e2a8981ecdc943568aa7d39b96f9d292d19555926867f003999bb32645"
+            "hash": "6a6512b4c4a65c14466c1d0b3ad0c7216d69099ad8ea819b5821d6e1104b349a"
         }
     },
     "bin": "vdpi.exe",
