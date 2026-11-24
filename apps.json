@@ -21,6 +21,14 @@
       "category": "utilities",
       "versions": [
         {
+          "version": "0.4.2",
+          "date": "2026-11-24",
+          "localizedDescription": "Desktop Control Center release with live service/DPI status, temporary pause/resume, and inline-confirmed uninstall.",
+          "downloadURL": "https://github.com/Vuln-Inc/vdpi/releases/download/v0.4.2/vdpi-ios-unsigned.ipa",
+          "size": 7399911,
+          "minOSVersion": "17.0"
+        },
+        {
           "version": "0.4.1",
           "buildVersion": "5",
           "date": "2026-11-24T19:10:00Z",
@@ -45,7 +53,12 @@
           "com.apple.security.application-groups"
         ],
         "privacy": {}
-      }
+      },
+      "version": "0.4.2",
+      "versionDate": "2026-11-24",
+      "versionDescription": "Desktop Control Center release with live service/DPI status, temporary pause/resume, and inline-confirmed uninstall.",
+      "downloadURL": "https://github.com/Vuln-Inc/vdpi/releases/download/v0.4.2/vdpi-ios-unsigned.ipa",
+      "size": 7399911
     }
   ],
   "news": []
