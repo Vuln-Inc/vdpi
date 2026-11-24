@@ -109,17 +109,21 @@ https://vuln-inc.github.io/vdpi/apps.json
 | **Anti-Poisoning DNS Ring** | In-memory TTL-cached **RFC 8484 DoH** with sticky healthy failover across 4 independent networks (`1.1.1.1`, `8.8.8.8`, `94.140.14.140`, `9.9.9.9`), non-port-53 UDP fallback (`1253`, `443`, `5353`), and sinkhole IP filtering. |
 | **100% Desktop VPN Coexistence** | Pure userspace proxy (no WinDivert, kernel extensions, or fake-TTL injection) — coexists cleanly with WireGuard, Cloudflare WARP, OpenVPN, Mullvad, and ProtonVPN. |
 | **Smart Local & Portal Bypass** | Automatically bypasses LAN/private subnets (`localhost`, `10.0.0.0/8`, `192.168.0.0/16`, `*.local`), government/banking portals, and any custom `--bypass` rules. |
-| **`ratatui` Launcher & Live Dashboard** | Version-aware interactive launcher plus a lightweight live foreground dashboard on `vdpi start` with a 60s `Sparkline`, traffic counters, scrollable log, and diagnostics overlay. |
+| **`ratatui` Control Center & Live Dashboard** | Interactive `ratatui` Control Center with live Service and Anti-DPI telemetry, 1-press service pause/resume, diagnostics, and uninstall, plus a live foreground dashboard on `vdpi start` with a 60s `Sparkline`, traffic counters, scrollable log, and diagnostics overlay. |
 
-### Interactive Launcher & Live Dashboard
+### Interactive Control Center & Live Dashboard
 
-Open `vdpi.exe` from File Explorer, or run `vdpi` with no arguments in an interactive terminal, to open the version-aware `ratatui` launcher. It offers three choices:
+Open `vdpi.exe` from File Explorer, or run `vdpi` with no arguments (or `vdpi launcher`) in an interactive terminal, to open the version-aware `ratatui` **Control Center**.
 
-- **Run directly:** Start `vdpi` in the foreground. Closing it stops `vdpi` and releases its desktop proxy automatically.
-- **Install for automatic startup:** Register a background service that runs independently of the launcher window.
-- **Quit:** Leave without starting or saving a preference.
+- **Live Service & Anti-DPI Status Panel:** Shows current background service state alongside live Anti-DPI engine telemetry from the local daemon (desync mode, DoH status, QUIC blocking, active connections, and cached adaptive hosts). Press **`r`** at any time for a live refresh.
+- **Pause / Resume background service:** 1-press temporary toggle (`Pause` / `Resume`) that stops the background service and restores OS proxy settings without removing installed files or service registration, or restarts it cleanly.
+- **Run directly:** Start `vdpi` in the foreground. Closing it stops `vdpi` and releases its desktop proxy automatically, saving a `run-directly` preference next to the executable (`vdpi launcher` reopens the Control Center; `vdpi start` skips it).
+- **Install / Update / Repair:** Register automatic background startup, repair an existing service, or apply a 1-press in-place update when opening a newly downloaded binary over an older installation.
+- **Run diagnostics:** Execute live end-to-end HTTP `CONNECT`, SOCKS5h, and DoH checks directly from the Control Center.
+- **Uninstall vdpi:** Stop the service, remove files and startup registration, and restore OS proxy settings behind an inline confirmation prompt.
+- **Quit:** Exit without changing service state or saved preferences.
 
-Use **Up/Down** or **Tab** to move, **Enter** to select, and **Esc** to quit (press **1** to run directly or **2** to install; falls back to a numbered prompt when `TERM=dumb`). **Run directly** saves your preference as `run-directly` next to the executable; use `vdpi launcher` to reopen the chooser or `vdpi start` to skip it. Opening a newly downloaded `vdpi` binary automatically detects an older installed version and offers a 1-press in-place update.
+Use **Up/Down** (**j/k** or **Tab**) to move, **Enter** or number keys (**1–9**) to select, **`r`** to refresh live status, and **Esc** / **`q`** to quit (falls back to a numbered prompt when `TERM=dumb`).
 
 Running `vdpi start` (or choosing **Run directly**) in an interactive terminal launches a lightweight `ratatui` live foreground dashboard displaying a 60s throughput `Sparkline`, live traffic and connection counters, and a scrollable 150-line activity log. Press `d` to open the live diagnostics overlay, `c` to clear the adaptive stage cache, or `q` for a clean shutdown. Non-interactive runs (`--service`, `--quiet`, `--debug`, `TERM=dumb`, or non-TTY streams) automatically fall back to plain-text output.
 
@@ -153,6 +157,10 @@ scoop install https://vuln-inc.github.io/vdpi/vdpi.json
 # Install as a native Windows Service (auto-prompts UAC, starts at boot, adds to System PATH)
 vdpi install
 
+# Temporarily pause / resume the background service without uninstalling
+vdpi pause    # alias: vdpi stop
+vdpi resume
+
 # Or run for the current session only (no Admin required; Ctrl+C restores proxies)
 vdpi start
 
@@ -171,6 +179,10 @@ curl -fsSL https://vuln-inc.github.io/vdpi/install.sh | sh
 # Install to ~/.vdpi/bin/vdpi, codesign, register LaunchAgent, and configure proxies
 vdpi install
 
+# Temporarily pause / resume the LaunchAgent without uninstalling
+vdpi pause    # alias: vdpi stop
+vdpi resume
+
 # Or run for the current terminal session only (Ctrl+C restores proxies)
 vdpi start
 
@@ -187,6 +199,10 @@ tar -xzf vdpi-linux-x86_64.tar.gz
 
 # Install static musl binary to ~/.vdpi/bin/vdpi, enable systemd --user service, and configure proxies
 ./vdpi install
+
+# Temporarily pause / resume the systemd --user service without uninstalling
+vdpi pause    # alias: vdpi stop
+vdpi resume
 
 # Or run in the foreground for the current session (Ctrl+C restores proxies)
 ./vdpi start
@@ -260,7 +276,7 @@ On **Android** and **iOS**, tap **Diagnostics** from the main Tunnel screen to r
 On **Desktop**, run:
 
 ```bash
-# Inspect live daemon health, service state, ports, and OS proxy settings
+# Inspect live daemon health, Anti-DPI telemetry, service state, ports, and OS proxy settings
 vdpi status
 
 # Run live end-to-end HTTP CONNECT + SOCKS5h + DoH connectivity checks
@@ -305,12 +321,14 @@ All Discord & Roblox HTTP CONNECT and SOCKS5h checks passed.
 Usage: vdpi [OPTIONS] [COMMAND]
 
 Commands:
-  start      Start the vdpi engine in the foreground without opening the launcher [aliases: run]
-  launcher   Open the run or install chooser, even if a preference was saved
+  start      Start the vdpi engine in the foreground without opening the Control Center [aliases: run]
+  launcher   Open the interactive Control Center TUI, even if a run-directly preference was saved
   install    Install vdpi and enable automatic background startup (Windows Service / LaunchAgent / systemd)
+  pause      Temporarily stop the background service and restore proxies without uninstalling [aliases: stop]
+  resume     Start the paused background service and re-apply system proxy settings
   uninstall  Stop vdpi, remove startup registration, and restore system proxy settings
   update     Check for and install the latest vdpi release with SHA-256 verification and automatic service upgrade
-  status     Display live daemon health, ports, system proxy state, and session environment
+  status     Display live daemon health, Anti-DPI telemetry, service state, ports, and system proxy settings
   doctor     Run live end-to-end DPI bypass diagnostics (HTTP CONNECT + SOCKS5h + DoH)
   help       Print this message or the help of the given subcommand(s)
 ```
@@ -413,7 +431,7 @@ To sign and install on your own physical iPhone/iPad with your own paid Apple De
 vdpi/
 ├── core/                       # Shared Rust anti-DPI engine, desktop CLI/service, and mobile TUN core
 │   ├── src/                    # main, tls, dns, desync, bypass, server, service, proxy/, platform/
-│   │   ├── launcher/           # ratatui version-aware interactive launcher
+│   │   ├── launcher/           # ratatui Control Center TUI (live status, service pause/resume, diagnostics, uninstall)
 │   │   ├── tui_dashboard.rs    # Lightweight ratatui live foreground dashboard (Sparkline, log ring, overlays)
 │   │   └── update.rs           # GitHub Releases SHA-256-verified self-updater
 │   ├── tests/                  # End-to-end TLS desync, auto-heal, SOCKS5/4a, and UDP relay tests

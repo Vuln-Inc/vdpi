@@ -69,16 +69,29 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
         bail!("malformed HTTP request line");
     }
 
-    // Built-in local health endpoint for `vdpi status` / `vdpi doctor`
+    // Built-in local health endpoint for `vdpi status` / `vdpi doctor` / Control Center TUI
     if target == "/vdpi-health" {
-        let body = format!(
-            "{{\"status\":\"ok\",\"service\":\"vdpi\",\"version\":\"{}\"}}\n",
-            env!("CARGO_PKG_VERSION")
-        );
+        let snap = ctx.telemetry_snapshot();
+        let payload = serde_json::json!({
+            "status": "ok",
+            "service": "vdpi",
+            "version": env!("CARGO_PKG_VERSION"),
+            "mode": ctx.config.mode,
+            "doh": ctx.config.enable_doh,
+            "block_quic": ctx.config.block_quic,
+            "active_connections": snap.active_connections,
+            "total_connections": snap.total_connections,
+            "bytes_tx": snap.bytes_tx,
+            "bytes_rx": snap.bytes_rx,
+            "tls_handshakes": snap.tls_handshakes,
+            "auto_heal_escalations": snap.auto_heal_escalations,
+            "learned_hosts": snap.learned_hosts,
+            "isp_stage": ctx.preferred_stage().label(),
+        });
+        let body = format!("{payload}\n");
         let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
         );
         client.write_all(resp.as_bytes()).await?;
         client.flush().await?;
@@ -505,5 +518,71 @@ mod tests {
         assert_eq!(snap.total_connections, 1);
         assert!(snap.bytes_tx > 0);
         assert!(snap.bytes_rx >= resp.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_returns_enriched_live_engine_json() {
+        use crate::desync::LearnedStrategy;
+        use std::sync::atomic::Ordering;
+
+        let cli = CliArgs::parse_from_iter([
+            "vdpi",
+            "--no-system-proxy",
+            "--mode",
+            "tls-record",
+            "--no-doh",
+        ])
+        .unwrap();
+        let ctx = EngineContext::new(cli.into_runtime_config()).unwrap();
+        ctx.telemetry.active_connections.store(2, Ordering::Relaxed);
+        ctx.telemetry.total_connections.store(15, Ordering::Relaxed);
+        ctx.telemetry.bytes_tx.store(1234, Ordering::Relaxed);
+        ctx.telemetry.bytes_rx.store(5678, Ordering::Relaxed);
+        ctx.telemetry.tls_handshakes.store(9, Ordering::Relaxed);
+        ctx.telemetry
+            .auto_heal_escalations
+            .store(3, Ordering::Relaxed);
+        ctx.telemetry.learned_hosts.store(4, Ordering::Relaxed);
+        ctx.preferred_isp_stage
+            .store(LearnedStrategy::OobSniDesync as u8, Ordering::Relaxed);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            handle_http_client(sock, ctx).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET /vdpi-health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        server.await.unwrap().unwrap();
+
+        let resp_str = String::from_utf8(resp).unwrap();
+        let (headers, body) = resp_str.split_once("\r\n\r\n").unwrap();
+        assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(headers.contains("Content-Type: application/json\r\n"));
+
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(json["status"].as_str(), Some("ok"));
+        assert_eq!(json["service"].as_str(), Some("vdpi"));
+        assert_eq!(json["version"].as_str(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(json["mode"].as_str(), Some("tls-record"));
+        assert_eq!(json["doh"].as_bool(), Some(false));
+        assert_eq!(json["block_quic"].as_bool(), Some(true));
+        assert_eq!(json["active_connections"].as_u64(), Some(2));
+        assert_eq!(json["total_connections"].as_u64(), Some(15));
+        assert_eq!(json["bytes_tx"].as_u64(), Some(1234));
+        assert_eq!(json["bytes_rx"].as_u64(), Some(5678));
+        assert_eq!(json["tls_handshakes"].as_u64(), Some(9));
+        assert_eq!(json["auto_heal_escalations"].as_u64(), Some(3));
+        assert_eq!(json["learned_hosts"].as_u64(), Some(4));
+        assert_eq!(json["isp_stage"].as_str(), Some("OobSniDesync"));
     }
 }

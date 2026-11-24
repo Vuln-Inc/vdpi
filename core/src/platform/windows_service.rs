@@ -29,6 +29,7 @@ const SC_MANAGER_ALL_ACCESS: Dword = 0x000F_003F;
 
 const SERVICE_QUERY_CONFIG: Dword = 0x0001;
 const SERVICE_QUERY_STATUS: Dword = 0x0004;
+const SERVICE_START: Dword = 0x0010;
 const SERVICE_STOP: Dword = 0x0020;
 const DELETE: Dword = 0x0001_0000;
 const SERVICE_ALL_ACCESS: Dword = 0x000F_01FF;
@@ -662,6 +663,63 @@ pub fn stop_windows_service_if_running() -> Result<bool> {
     let svc = ScmHandle(raw);
     stop_service_handle(svc.0)?;
     thread::sleep(Duration::from_millis(150));
+    Ok(true)
+}
+
+/// Starts the `vdpi` Windows service if it is currently installed and waits until it is `RUNNING`.
+/// Returns `Ok(true)` if the service exists and is running, `Ok(false)` if not installed.
+pub fn start_windows_service() -> Result<bool> {
+    let scm = open_scm(SC_MANAGER_CONNECT)?;
+    let name_wide = to_wide_null(SERVICE_NAME);
+    let raw = unsafe {
+        OpenServiceW(
+            scm.0,
+            name_wide.as_ptr(),
+            SERVICE_START | SERVICE_QUERY_STATUS,
+        )
+    };
+    if raw.is_null() {
+        let err = unsafe { GetLastError() };
+        if err == ERROR_SERVICE_DOES_NOT_EXIST {
+            return Ok(false);
+        }
+        if err == ERROR_ACCESS_DENIED {
+            bail!(
+                "Administrator privileges are required to start the '{SERVICE_NAME}' Windows service. \
+                 Please accept the UAC prompt or run from an elevated Administrator terminal."
+            );
+        }
+        bail!("OpenServiceW('{SERVICE_NAME}') failed with Win32 error {err}");
+    }
+    let svc = ScmHandle(raw);
+
+    let current = query_service_status_process(svc.0)?;
+    if current.dw_current_state == SERVICE_RUNNING {
+        return Ok(true);
+    }
+    if current.dw_current_state == SERVICE_STOP_PENDING {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(100));
+            let state = query_service_status_process(svc.0)?.dw_current_state;
+            if state == SERVICE_RUNNING {
+                return Ok(true);
+            }
+            if state != SERVICE_STOP_PENDING {
+                break;
+            }
+        }
+    }
+
+    let started = unsafe { StartServiceW(svc.0, 0, ptr::null()) };
+    if started == 0 {
+        let err = unsafe { GetLastError() };
+        if err != ERROR_SERVICE_ALREADY_RUNNING {
+            bail!("StartServiceW('{SERVICE_NAME}') failed with Win32 error {err}");
+        }
+    }
+
+    wait_for_service_running(svc.0, Duration::from_secs(10))?;
     Ok(true)
 }
 

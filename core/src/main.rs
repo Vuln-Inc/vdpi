@@ -44,29 +44,81 @@ fn main() -> Result<()> {
     }
 
     if bare || matches!(command, Some(Command::Launcher)) {
-        let installed_before = vdpi::service::detect_installed_info();
-        match launcher::choose(!bare, installed_before.as_ref())? {
-            launcher::Choice::Run => {
-                if !cfg.quiet {
-                    launcher::print_run_notice();
+        let mut notice: Option<String> = None;
+        let mut explicit_launcher = !bare;
+        loop {
+            let status = vdpi::service::probe_control_center_status(&cfg);
+            let installed_before = status.installed.clone();
+            match launcher::choose(explicit_launcher, &status, notice.as_deref(), || {
+                vdpi::service::probe_control_center_status(&cfg)
+            })? {
+                launcher::Choice::Run => {
+                    if !cfg.quiet {
+                        launcher::print_run_notice();
+                    }
+                    command = Some(Command::Start);
+                    break;
                 }
-                command = Some(Command::Start);
+                launcher::Choice::Unattended => {
+                    command = Some(Command::Start);
+                    break;
+                }
+                launcher::Choice::Install => {
+                    init_tracing(&cfg);
+                    let result = install_service(&cfg);
+                    launcher::install_finished(&result, installed_before.as_ref());
+                    return result;
+                }
+                launcher::Choice::Update => {
+                    init_tracing(&cfg);
+                    let result = build_runtime()
+                        .and_then(|rt| rt.block_on(vdpi::update::run_update(false, false, &cfg)));
+                    launcher::update_finished(&result);
+                    return result;
+                }
+                launcher::Choice::PauseService => {
+                    match vdpi::service::pause_service() {
+                        Ok(()) => {
+                            notice = Some("Service paused - system proxies restored.".to_string());
+                        }
+                        Err(err) => {
+                            notice = Some(format!("Pause failed: {err:#}"));
+                        }
+                    }
+                    explicit_launcher = true;
+                }
+                launcher::Choice::ResumeService => {
+                    match vdpi::service::resume_service() {
+                        Ok(()) => {
+                            notice = Some("Service resumed - anti-DPI active.".to_string());
+                        }
+                        Err(err) => {
+                            notice = Some(format!("Resume failed: {err:#}"));
+                        }
+                    }
+                    explicit_launcher = true;
+                }
+                launcher::Choice::Doctor => {
+                    let result =
+                        build_runtime().and_then(|rt| rt.block_on(run_doctor(cfg.clone())));
+                    notice = Some(match result {
+                        Ok(()) => "Diagnostics complete.".to_string(),
+                        Err(err) => {
+                            eprintln!("\nDiagnostics error: {err:#}");
+                            format!("Diagnostics finished with issues: {err:#}")
+                        }
+                    });
+                    launcher::wait_for_continue_if_interactive();
+                    explicit_launcher = true;
+                }
+                launcher::Choice::Uninstall => {
+                    init_tracing(&cfg);
+                    let result = uninstall_service();
+                    launcher::uninstall_finished(&result);
+                    return result;
+                }
+                launcher::Choice::Cancel => return Ok(()),
             }
-            launcher::Choice::Unattended => command = Some(Command::Start),
-            launcher::Choice::Install => {
-                init_tracing(&cfg);
-                let result = install_service(&cfg);
-                launcher::install_finished(&result, installed_before.as_ref());
-                return result;
-            }
-            launcher::Choice::Update => {
-                init_tracing(&cfg);
-                let result = build_runtime()
-                    .and_then(|rt| rt.block_on(vdpi::update::run_update(false, false, &cfg)));
-                launcher::update_finished(&result);
-                return result;
-            }
-            launcher::Choice::Cancel => return Ok(()),
         }
     }
 
@@ -81,6 +133,14 @@ fn main() -> Result<()> {
         Some(Command::Uninstall) => {
             init_tracing(&cfg);
             uninstall_service()
+        }
+        Some(Command::Pause) => {
+            init_tracing(&cfg);
+            vdpi::service::pause_service()
+        }
+        Some(Command::Resume) => {
+            init_tracing(&cfg);
+            vdpi::service::resume_service()
         }
         Some(Command::Status) | Some(Command::Doctor) | Some(Command::Update { .. }) => {
             init_tracing(&cfg);

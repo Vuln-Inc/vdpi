@@ -1,4 +1,4 @@
-use super::{Choice, LauncherMenu, MenuItem};
+use super::{build_menu, Choice, LauncherMenu, MenuItem, StatusRow, StatusTone};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -12,33 +12,30 @@ use ratatui::{Frame, Terminal};
 use std::borrow::Cow;
 use std::io;
 use vdpi::server::REPOSITORY_URL;
+use vdpi::service::ControlCenterStatus;
 
-const MAX_CARD_WIDTH: u16 = 66;
+const MAX_CARD_WIDTH: u16 = 72;
 const VERSION_LABEL: &str = concat!("v", env!("CARGO_PKG_VERSION"));
-const MAX_RULE_COLS: usize = 64;
-const RULE: &str = "────────────────────────────────────────────────────────────────";
+const MAX_RULE_COLS: usize = 68;
+const RULE: &str = "────────────────────────────────────────────────────────────────────";
 const KEY_BADGES: [&str; 9] = [
     "[1]", "[2]", "[3]", "[4]", "[5]", "[6]", "[7]", "[8]", "[9]",
 ];
 const RANGE_LABELS: [&str; 9] = ["1", "1-2", "1-3", "1-4", "1-5", "1-6", "1-7", "1-8", "1-9"];
+const UNINSTALL_CONFIRM_BODY: &str = "This stops the background service, removes installed files and PATH entries, and restores system proxies.";
 
-// Restrained cool slate / white / ice-blue / semantic amber palette.
+// Restrained cool slate / white / emerald / ice-blue / semantic amber & red palette.
 const BORDER_SLATE: Color = Color::Rgb(58, 66, 78);
 const DIVIDER_SLATE: Color = Color::Rgb(48, 55, 66);
 const ACTIVE_BG: Color = Color::Rgb(28, 35, 45);
+const EMERALD_ACTIVE: Color = Color::Rgb(62, 207, 142);
 const ICE_BLUE: Color = Color::Rgb(110, 180, 255);
 const STEEL_MUTED: Color = Color::Rgb(148, 163, 184);
 const SLATE_DIM: Color = Color::Rgb(100, 116, 139);
 const TEXT_WHITE: Color = Color::Rgb(248, 250, 252);
 const TEXT_LIGHT: Color = Color::Rgb(203, 213, 225);
 const AMBER_WARN: Color = Color::Rgb(245, 185, 90);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StatusIntent {
-    UpdateAvailable,
-    UpToDate,
-    Caution,
-}
+const RED_DANGER: Color = Color::Rgb(235, 96, 107);
 
 #[derive(Debug, Clone, Copy)]
 struct Palette {
@@ -47,9 +44,12 @@ struct Palette {
     brand: Style,
     version: Style,
     repo: Style,
-    status_update: Style,
-    status_same: Style,
+    status_label: Style,
+    status_active: Style,
+    status_accent: Style,
     status_warn: Style,
+    status_neutral: Style,
+    danger_bold: Style,
     active_row: Style,
     active_marker: Style,
     active_badge: Style,
@@ -71,9 +71,12 @@ impl Palette {
                 brand: Style::new().fg(TEXT_WHITE).add_modifier(Modifier::BOLD),
                 version: Style::new().fg(STEEL_MUTED),
                 repo: Style::new().fg(SLATE_DIM),
-                status_update: Style::new().fg(ICE_BLUE),
-                status_same: Style::new().fg(STEEL_MUTED),
+                status_label: Style::new().fg(SLATE_DIM),
+                status_active: Style::new().fg(EMERALD_ACTIVE),
+                status_accent: Style::new().fg(ICE_BLUE),
                 status_warn: Style::new().fg(AMBER_WARN),
+                status_neutral: Style::new().fg(STEEL_MUTED),
+                danger_bold: Style::new().fg(RED_DANGER).add_modifier(Modifier::BOLD),
                 active_row: Style::new().bg(ACTIVE_BG),
                 active_marker: Style::new().fg(ICE_BLUE).add_modifier(Modifier::BOLD),
                 active_badge: Style::new().fg(STEEL_MUTED),
@@ -94,9 +97,12 @@ impl Palette {
                 brand: bold,
                 version: plain,
                 repo: plain,
-                status_update: plain,
-                status_same: plain,
+                status_label: plain,
+                status_active: plain,
+                status_accent: plain,
                 status_warn: plain,
+                status_neutral: plain,
+                danger_bold: bold,
                 active_row: Style::new().add_modifier(Modifier::REVERSED),
                 active_marker: bold,
                 active_badge: plain,
@@ -111,11 +117,12 @@ impl Palette {
         }
     }
 
-    const fn status(self, intent: StatusIntent) -> Style {
-        match intent {
-            StatusIntent::UpdateAvailable => self.status_update,
-            StatusIntent::UpToDate => self.status_same,
-            StatusIntent::Caution => self.status_warn,
+    const fn status(self, tone: StatusTone) -> Style {
+        match tone {
+            StatusTone::Active => self.status_active,
+            StatusTone::Accent => self.status_accent,
+            StatusTone::Warning => self.status_warn,
+            StatusTone::Neutral => self.status_neutral,
         }
     }
 }
@@ -126,10 +133,28 @@ struct RenderCtx {
     inset: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UiState {
+    menu: LauncherMenu,
+    selected: usize,
+    confirming_uninstall: bool,
+}
+
+impl UiState {
+    fn new(status: &ControlCenterStatus, notice: Option<&str>) -> Self {
+        Self {
+            menu: build_menu(status, notice),
+            selected: 0,
+            confirming_uninstall: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Density {
     Spacious,
     Cozy,
+    CompactActiveHint,
     CompactDivided,
     CompactTight,
     CompactMinimal,
@@ -138,14 +163,19 @@ enum Density {
 #[derive(Debug, Clone, Copy)]
 struct LayoutPlan {
     density: Density,
-    show_status: bool,
+    visible_status_rows: usize,
+    show_notice: bool,
     show_footer: bool,
     card_height: u16,
 }
 
 impl LayoutPlan {
-    const fn show_hints(self) -> bool {
+    const fn show_all_hints(self) -> bool {
         matches!(self.density, Density::Spacious | Density::Cozy)
+    }
+
+    const fn show_active_hint(self) -> bool {
+        matches!(self.density, Density::CompactActiveHint)
     }
 
     const fn item_gap(self) -> bool {
@@ -160,83 +190,140 @@ impl LayoutPlan {
         !matches!(self.density, Density::CompactMinimal)
     }
 
+    const fn status_divider(self) -> bool {
+        !matches!(self.density, Density::CompactMinimal)
+            && (self.visible_status_rows > 0 || self.show_notice)
+    }
+
     const fn bottom_divider(self) -> bool {
         matches!(
             self.density,
-            Density::Spacious | Density::Cozy | Density::CompactDivided
+            Density::Spacious
+                | Density::Cozy
+                | Density::CompactActiveHint
+                | Density::CompactDivided
         )
     }
 
-    fn compute(area_height: u16, item_count: usize, has_status: bool) -> Self {
+    fn compute(area_height: u16, item_count: usize, status_count: usize, has_notice: bool) -> Self {
         let n = u16::try_from(item_count).unwrap_or(u16::MAX);
-        let status = u16::from(has_status);
+        let s = u16::try_from(status_count).unwrap_or(u16::MAX);
+        let m = u16::from(has_notice);
+        let status_div = u16::from(status_count > 0 || has_notice);
+        let status_block = s.saturating_add(m).saturating_add(status_div);
 
-        // borders(2) + header(1) + top_div(1) + status + top_gap(1) + items + bot_gap(1) + bot_div(1) + footer(1)
-        let spacious_items = if n == 0 {
-            0
-        } else {
-            n.saturating_mul(2).saturating_add(n - 1)
-        };
-        let spacious_h = 8u16.saturating_add(status).saturating_add(spacious_items);
-        if area_height >= spacious_h {
+        // Tall terminals (>= 28 rows) can expand to show per-item hints for every entry.
+        if area_height >= 28 {
+            let spacious_items = if n == 0 {
+                0
+            } else {
+                n.saturating_mul(2).saturating_add(n - 1)
+            };
+            // borders(2) + header(1) + top_div(1) + status_block + top_gap(1) + items + bot_gap(1) + bot_div(1) + footer(1)
+            let spacious_h = 8u16
+                .saturating_add(status_block)
+                .saturating_add(spacious_items);
+            if area_height >= spacious_h {
+                return Self {
+                    density: Density::Spacious,
+                    visible_status_rows: status_count,
+                    show_notice: has_notice,
+                    show_footer: true,
+                    card_height: spacious_h,
+                };
+            }
+
+            // borders(2) + header(1) + top_div(1) + status_block + items(2*n) + bot_div(1) + footer(1)
+            let cozy_h = 6u16
+                .saturating_add(status_block)
+                .saturating_add(n.saturating_mul(2));
+            if area_height >= cozy_h {
+                return Self {
+                    density: Density::Cozy,
+                    visible_status_rows: status_count,
+                    show_notice: has_notice,
+                    show_footer: true,
+                    card_height: cozy_h,
+                };
+            }
+        }
+
+        // Compact 1-line items + 1-line hint right below the selected item: fits 80x24 and 46x18 cleanly.
+        // borders(2) + header(1) + top_div(1) + status_block + items(n) + active_hint(0|1) + bot_div(1) + footer(1)
+        let active_hint_h = 6u16
+            .saturating_add(status_block)
+            .saturating_add(n)
+            .saturating_add(u16::from(n > 0));
+        if area_height >= active_hint_h {
             return Self {
-                density: Density::Spacious,
-                show_status: has_status,
+                density: Density::CompactActiveHint,
+                visible_status_rows: status_count,
+                show_notice: has_notice,
                 show_footer: true,
-                card_height: spacious_h,
+                card_height: active_hint_h,
             };
         }
 
-        // borders(2) + header(1) + top_div(1) + status + items(2*n) + bot_div(1) + footer(1)
-        let cozy_h = 6u16
-            .saturating_add(status)
-            .saturating_add(n.saturating_mul(2));
-        if area_height >= cozy_h {
-            return Self {
-                density: Density::Cozy,
-                show_status: has_status,
-                show_footer: true,
-                card_height: cozy_h,
-            };
-        }
-
-        // borders(2) + header(1) + top_div(1) + status + items(n) + bot_div(1) + footer(1)
-        let compact_divided_h = 6u16.saturating_add(status).saturating_add(n);
+        // borders(2) + header(1) + top_div(1) + status_block + items(n) + bot_div(1) + footer(1)
+        let compact_divided_h = 6u16.saturating_add(status_block).saturating_add(n);
         if area_height >= compact_divided_h {
             return Self {
                 density: Density::CompactDivided,
-                show_status: has_status,
+                visible_status_rows: status_count,
+                show_notice: has_notice,
                 show_footer: true,
                 card_height: compact_divided_h,
             };
         }
 
-        // borders(2) + header(1) + top_div(1) + status + items(n) + footer(1)
-        let compact_tight_h = 5u16.saturating_add(status).saturating_add(n);
+        // borders(2) + header(1) + top_div(1) + status_block + items(n) + footer(1)
+        let compact_tight_h = 5u16.saturating_add(status_block).saturating_add(n);
         if area_height >= compact_tight_h {
             return Self {
                 density: Density::CompactTight,
-                show_status: has_status,
+                visible_status_rows: status_count,
+                show_notice: has_notice,
                 show_footer: true,
                 card_height: compact_tight_h,
             };
         }
 
-        // borders(2) + header(1) + status + items(n) + footer(1), or clamped fallback
-        let compact_minimal_h = 4u16.saturating_add(status).saturating_add(n);
+        // borders(2) + header(1) + status(s) + notice(m) + items(n) + footer(1)
+        let compact_minimal_h = 4u16.saturating_add(s).saturating_add(m).saturating_add(n);
         if area_height >= compact_minimal_h {
             return Self {
                 density: Density::CompactMinimal,
-                show_status: has_status,
+                visible_status_rows: status_count,
+                show_notice: has_notice,
                 show_footer: true,
                 card_height: compact_minimal_h,
             };
         }
 
+        // Short terminal fallback: guarantee header and visible selected item(s), scrolling if needed.
+        let show_footer = area_height >= 5;
+        let inner_height = area_height.saturating_sub(2);
+        let remaining = inner_height
+            .saturating_sub(1) // header
+            .saturating_sub(u16::from(show_footer));
+        let min_items = n.min(2);
+
+        let (visible_status_rows, show_notice) =
+            if remaining >= s.saturating_add(m).saturating_add(min_items) {
+                (status_count, has_notice)
+            } else if remaining >= s.saturating_add(min_items) {
+                (status_count, false)
+            } else if status_count > 0 && remaining >= 1u16.saturating_add(min_items) {
+                (1, false)
+            } else {
+                (0, false)
+            };
+
         Self {
             density: Density::CompactMinimal,
-            show_status: has_status && area_height >= 6,
-            show_footer: area_height >= 5,
+            visible_status_rows,
+            show_notice,
+            show_footer,
             card_height: area_height,
         }
     }
@@ -280,26 +367,41 @@ impl Drop for TerminalGuard {
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
     Redraw,
+    Refresh,
     Finish(Choice),
     Ignore,
 }
 
-pub(super) fn choose(color: bool, menu: &LauncherMenu) -> io::Result<Choice> {
-    if menu.items.is_empty() {
+pub(super) fn choose<F>(
+    color: bool,
+    initial_status: &ControlCenterStatus,
+    notice: Option<&str>,
+    mut refresh: F,
+) -> io::Result<Choice>
+where
+    F: FnMut() -> ControlCenterStatus,
+{
+    let mut state = UiState::new(initial_status, notice);
+    if state.menu.items.is_empty() {
         return Ok(Choice::Cancel);
     }
     let mut guard = TerminalGuard::enter()?;
-    let mut selected = 0usize;
 
     loop {
-        guard
-            .terminal
-            .draw(|frame| render(frame, menu, selected, color))?;
+        guard.terminal.draw(|frame| render(frame, &state, color))?;
         loop {
             match event::read()? {
                 Event::Resize(..) => break,
-                Event::Key(key) => match handle_key(&mut selected, key, menu) {
+                Event::Key(key) => match handle_key(&mut state, key) {
                     Action::Redraw => break,
+                    Action::Refresh => {
+                        let latest = refresh();
+                        apply_refresh(&mut state, &latest);
+                        if state.menu.items.is_empty() {
+                            return Ok(Choice::Cancel);
+                        }
+                        break;
+                    }
                     Action::Finish(choice) => return Ok(choice),
                     Action::Ignore => {}
                 },
@@ -309,14 +411,17 @@ pub(super) fn choose(color: bool, menu: &LauncherMenu) -> io::Result<Choice> {
     }
 }
 
-fn handle_key(selected: &mut usize, key: KeyEvent, menu: &LauncherMenu) -> Action {
-    let count = menu.items.len();
-    if count == 0 {
-        return Action::Finish(Choice::Cancel);
+fn apply_refresh(state: &mut UiState, latest: &ControlCenterStatus) {
+    state.menu = build_menu(latest, Some("Status refreshed."));
+    state.confirming_uninstall = false;
+    if state.menu.items.is_empty() {
+        state.selected = 0;
+    } else {
+        state.selected = state.selected.min(state.menu.items.len() - 1);
     }
-    if *selected >= count {
-        *selected = count - 1;
-    }
+}
+
+fn handle_key(state: &mut UiState, key: KeyEvent) -> Action {
     if key.kind == KeyEventKind::Release {
         return Action::Ignore;
     }
@@ -330,20 +435,56 @@ fn handle_key(selected: &mut usize, key: KeyEvent, menu: &LauncherMenu) -> Actio
     {
         return Action::Ignore;
     }
+
+    if state.confirming_uninstall {
+        if key.kind != KeyEventKind::Press {
+            return Action::Ignore;
+        }
+        return match key.code {
+            KeyCode::Char('y' | 'Y') => Action::Finish(Choice::Uninstall),
+            KeyCode::Char('n' | 'N' | 'q' | 'Q') | KeyCode::Esc => {
+                state.confirming_uninstall = false;
+                Action::Redraw
+            }
+            _ => Action::Ignore,
+        };
+    }
+
+    let count = state.menu.items.len();
+    if count == 0 {
+        return Action::Finish(Choice::Cancel);
+    }
+    if state.selected >= count {
+        state.selected = count - 1;
+    }
+
     match key.code {
         KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
-            *selected = (*selected + count - 1) % count;
+            state.selected = (state.selected + count - 1) % count;
         }
         KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
-            *selected = (*selected + 1) % count;
+            state.selected = (state.selected + 1) % count;
         }
-        KeyCode::Home => *selected = 0,
-        KeyCode::End => *selected = count - 1,
+        KeyCode::Home => state.selected = 0,
+        KeyCode::End => state.selected = count - 1,
         _ if key.kind != KeyEventKind::Press => return Action::Ignore,
-        KeyCode::Enter => return Action::Finish(menu.items[*selected].choice),
+        KeyCode::Char('r' | 'R') => return Action::Refresh,
+        KeyCode::Enter => {
+            let choice = state.menu.items[state.selected].choice;
+            if choice == Choice::Uninstall {
+                state.confirming_uninstall = true;
+                return Action::Redraw;
+            }
+            return Action::Finish(choice);
+        }
         KeyCode::Char(c @ '1'..='9') => {
             let index = usize::from(c as u8 - b'1');
-            if let Some(item) = menu.items.get(index) {
+            if let Some(item) = state.menu.items.get(index) {
+                if item.choice == Choice::Uninstall {
+                    state.selected = index;
+                    state.confirming_uninstall = true;
+                    return Action::Redraw;
+                }
                 return Action::Finish(item.choice);
             }
             return Action::Ignore;
@@ -358,22 +499,6 @@ fn repo_display() -> &'static str {
     REPOSITORY_URL
         .trim_start_matches("https://")
         .trim_start_matches("http://")
-}
-
-fn status_intent(menu: &LauncherMenu) -> StatusIntent {
-    match menu.items.first().map(|item| item.choice) {
-        Some(Choice::Update) => StatusIntent::UpToDate,
-        Some(Choice::Install)
-            if menu
-                .status_line
-                .as_deref()
-                .is_some_and(|s| s.contains("->")) =>
-        {
-            StatusIntent::UpdateAvailable
-        }
-        Some(Choice::Run | Choice::Install) => StatusIntent::Caution,
-        _ => StatusIntent::UpToDate,
-    }
 }
 
 fn truncate_text(text: &str, max_chars: usize) -> Cow<'_, str> {
@@ -396,6 +521,44 @@ fn truncate_text(text: &str, max_chars: usize) -> Cow<'_, str> {
     }
     out.push('…');
     Cow::Owned(out)
+}
+
+fn wrap_words(text: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_len = 0usize;
+
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+        if current.is_empty() {
+            if word_len <= max_width {
+                current.push_str(word);
+                current_len = word_len;
+            } else {
+                lines.push(truncate_text(word, max_width).into_owned());
+            }
+        } else if current_len + 1 + word_len <= max_width {
+            current.push(' ');
+            current.push_str(word);
+            current_len += 1 + word_len;
+        } else {
+            lines.push(std::mem::take(&mut current));
+            if word_len <= max_width {
+                current.push_str(word);
+                current_len = word_len;
+            } else {
+                lines.push(truncate_text(word, max_width).into_owned());
+                current_len = 0;
+            }
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 fn key_badge(index: usize) -> Cow<'static, str> {
@@ -427,23 +590,35 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     centered
 }
 
-fn render(frame: &mut Frame<'_>, menu: &LauncherMenu, selected: usize, color: bool) {
+fn render(frame: &mut Frame<'_>, state: &UiState, color: bool) {
     let area = frame.area();
     if area.is_empty() {
         return;
     }
 
     let palette = Palette::for_color(color);
-    let selected = selected.min(menu.items.len().saturating_sub(1));
+    let menu = &state.menu;
+    let selected = state.selected.min(menu.items.len().saturating_sub(1));
 
     if area.width < 14 || area.height < 5 {
-        render_minimal(frame, area, menu, selected, palette);
+        render_minimal(frame, area, state, selected, palette);
         return;
     }
 
-    let plan = LayoutPlan::compute(area.height, menu.items.len(), menu.status_line.is_some());
+    let plan = LayoutPlan::compute(
+        area.height,
+        menu.items.len(),
+        menu.status_rows.len(),
+        menu.notice.is_some(),
+    );
     let card_width = area.width.min(MAX_CARD_WIDTH);
-    let card_area = centered_rect(area, card_width, plan.card_height);
+    let card_height = if state.confirming_uninstall {
+        let target = plan.card_height.max(15);
+        target.min(area.height)
+    } else {
+        plan.card_height
+    };
+    let card_area = centered_rect(area, card_width, card_height);
 
     let padding = if card_area.width >= 20 {
         Padding::horizontal(1)
@@ -484,12 +659,64 @@ fn render(frame: &mut Frame<'_>, menu: &LauncherMenu, selected: usize, color: bo
         y = y.saturating_add(1);
     }
 
-    if let Some(status) = menu
-        .status_line
+    if state.confirming_uninstall {
+        let show_footer = inner.height >= 5;
+        let show_bot_div = plan.bottom_divider() && inner.height >= 10;
+        let footer_reserve = u16::from(show_footer) + u16::from(show_bot_div);
+        let confirm_min_body = 5u16;
+        let available_before_confirm = bottom.saturating_sub(y).saturating_sub(footer_reserve);
+        let status_need = u16::try_from(menu.status_rows.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(1)
+            .saturating_add(confirm_min_body);
+
+        if available_before_confirm >= status_need {
+            for status_row in &menu.status_rows {
+                if y < bottom {
+                    render_status_row(frame, row(y), status_row, ctx);
+                    y = y.saturating_add(1);
+                }
+            }
+            if !menu.status_rows.is_empty() && y < bottom {
+                render_divider(frame, row(y), ctx);
+                y = y.saturating_add(1);
+            }
+        }
+
+        let body_bottom = bottom.saturating_sub(footer_reserve).max(y);
+        let body_area = Rect::new(inner.x, y, inner.width, body_bottom.saturating_sub(y));
+        render_uninstall_confirm(frame, body_area, ctx);
+
+        let mut footer_y = bottom;
+        if show_footer && footer_y > y {
+            footer_y = footer_y.saturating_sub(1);
+            render_confirm_footer(frame, row(footer_y), ctx);
+        }
+        if show_bot_div && footer_y > y {
+            footer_y = footer_y.saturating_sub(1);
+            render_divider(frame, row(footer_y), ctx);
+        }
+        return;
+    }
+
+    for status_row in menu.status_rows.iter().take(plan.visible_status_rows) {
+        if y < bottom {
+            render_status_row(frame, row(y), status_row, ctx);
+            y = y.saturating_add(1);
+        }
+    }
+
+    if let Some(notice) = menu
+        .notice
         .as_deref()
-        .filter(|_| plan.show_status && y < bottom)
+        .filter(|_| plan.show_notice && y < bottom)
     {
-        render_status(frame, row(y), status, status_intent(menu), ctx);
+        render_notice(frame, row(y), notice, ctx);
+        y = y.saturating_add(1);
+    }
+
+    if plan.status_divider() && y < bottom {
+        render_divider(frame, row(y), ctx);
         y = y.saturating_add(1);
     }
 
@@ -556,27 +783,149 @@ fn render_divider(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx) {
     frame.render_widget(line, area);
 }
 
-fn render_status(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    status: &str,
-    intent: StatusIntent,
-    ctx: RenderCtx,
-) {
+fn render_status_row(frame: &mut Frame<'_>, area: Rect, row: &StatusRow, ctx: RenderCtx) {
     if area.is_empty() {
         return;
     }
     let pad = if ctx.inset { " " } else { "" };
-    let prefix_cols = pad.len() + 2;
-    let budget = usize::from(area.width).saturating_sub(prefix_cols + pad.len());
-    let text = truncate_text(status, budget);
-    let style = ctx.palette.status(intent);
+    let tone_style = ctx.palette.status(row.tone);
+    let label_width = 8usize;
+    let prefix_cols = pad.len() + 2 + label_width + 2;
+    let right_margin = pad.len();
+    let width = usize::from(area.width);
+
+    if width <= prefix_cols + 4 {
+        let compact = format!("{}: {}", row.label, row.value);
+        let budget = width.saturating_sub(pad.len() + 2 + right_margin);
+        let text = truncate_text(&compact, budget);
+        let line = Line::from(vec![
+            Span::raw(pad),
+            Span::styled("● ", tone_style),
+            Span::styled(text, tone_style),
+        ]);
+        frame.render_widget(line, area);
+        return;
+    }
+
+    let label = format!("{:<width$}", row.label, width = label_width);
+    let budget = width.saturating_sub(prefix_cols + right_margin);
+    let value = truncate_text(&row.value, budget);
     let line = Line::from(vec![
         Span::raw(pad),
-        Span::styled("● ", style),
+        Span::styled("● ", tone_style),
+        Span::styled(label, ctx.palette.status_label),
+        Span::raw("  "),
+        Span::styled(value, tone_style),
+    ]);
+    frame.render_widget(line, area);
+}
+
+fn is_warning_notice(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("failed") || lower.contains("error") || lower.contains("issues")
+}
+
+fn render_notice(frame: &mut Frame<'_>, area: Rect, notice: &str, ctx: RenderCtx) {
+    if area.is_empty() {
+        return;
+    }
+    let pad = if ctx.inset { " " } else { "" };
+    let cleaned = notice
+        .strip_prefix("✓ ")
+        .or_else(|| notice.strip_prefix("! "))
+        .unwrap_or(notice);
+    let (prefix, style) = if is_warning_notice(cleaned) {
+        ("! ", ctx.palette.status_warn)
+    } else {
+        ("✓ ", ctx.palette.status_active)
+    };
+    let budget = usize::from(area.width).saturating_sub(pad.len() + 2 + pad.len());
+    let text = truncate_text(cleaned, budget);
+    let line = Line::from(vec![
+        Span::raw(pad),
+        Span::styled(prefix, style),
         Span::styled(text, style),
     ]);
     frame.render_widget(line, area);
+}
+
+fn render_uninstall_confirm(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx) {
+    if area.is_empty() {
+        return;
+    }
+    let pad = if ctx.inset { " " } else { "" };
+    let body_indent = if ctx.inset { "   " } else { "  " };
+    let right_margin = pad.len();
+    let wrap_width = usize::from(area.width).saturating_sub(body_indent.len() + right_margin);
+    let body_lines = wrap_words(UNINSTALL_CONFIRM_BODY, wrap_width.max(1));
+
+    let needed_tight = 1 + body_lines.len() + 1;
+    let avail = usize::from(area.height);
+    let extra = avail.saturating_sub(needed_tight);
+    let top_gap = usize::from(extra >= 3);
+    let mid_gap_1 = usize::from(extra >= 2);
+    let mid_gap_2 = usize::from(extra >= 1);
+
+    let mut y = area.y.saturating_add(u16::try_from(top_gap).unwrap_or(0));
+    let max_y = area.y.saturating_add(area.height);
+
+    if y < max_y {
+        let header_budget = usize::from(area.width).saturating_sub(pad.len() + 2 + right_margin);
+        let header_text = truncate_text("Confirm uninstall", header_budget);
+        let line = Line::from(vec![
+            Span::raw(pad),
+            Span::styled("● ", ctx.palette.danger_bold),
+            Span::styled(header_text, ctx.palette.danger_bold),
+        ]);
+        frame.render_widget(line, Rect::new(area.x, y, area.width, 1));
+        y = y.saturating_add(1);
+    }
+
+    y = y.saturating_add(u16::try_from(mid_gap_1).unwrap_or(0));
+
+    let body_limit = max_y.saturating_sub(1);
+    for text in &body_lines {
+        if y >= body_limit {
+            break;
+        }
+        let line = Line::from(vec![
+            Span::raw(body_indent),
+            Span::styled(text.as_str(), ctx.palette.inactive_title),
+        ]);
+        frame.render_widget(line, Rect::new(area.x, y, area.width, 1));
+        y = y.saturating_add(1);
+    }
+
+    if mid_gap_2 > 0 && y.saturating_add(1) < max_y {
+        y = y.saturating_add(1);
+    }
+
+    if y < max_y {
+        let prompt_area = Rect::new(area.x, y, area.width, 1);
+        let full_prompt_cols = body_indent.len() + 41 + right_margin;
+        let line = if usize::from(area.width) >= full_prompt_cols {
+            Line::from(vec![
+                Span::raw(body_indent),
+                Span::styled("[y]", ctx.palette.danger_bold),
+                Span::raw(" "),
+                Span::styled("Uninstall vdpi", ctx.palette.active_title),
+                Span::styled("   ·   ", ctx.palette.footer_text),
+                Span::styled("[n / Esc]", ctx.palette.footer_key),
+                Span::raw(" "),
+                Span::styled("Cancel", ctx.palette.inactive_title),
+            ])
+        } else {
+            let short = truncate_text(
+                "[y] Uninstall · [n/Esc] Cancel",
+                usize::from(area.width).saturating_sub(pad.len() + right_margin),
+            );
+            Line::from(vec![
+                Span::raw(pad),
+                Span::styled(short, ctx.palette.danger_bold),
+            ])
+        };
+        frame.render_widget(line, prompt_area);
+    }
 }
 
 fn render_items(
@@ -591,12 +940,18 @@ fn render_items(
         return;
     }
 
-    let show_hints = plan.show_hints();
+    let show_all_hints = plan.show_all_hints();
+    let show_active_hint = plan.show_active_hint();
     let item_gap = plan.item_gap();
-    let visible_slots = match (show_hints, item_gap) {
-        (true, true) => usize::from(area.height.saturating_add(1) / 3),
-        (true, false) => usize::from(area.height / 2),
-        (false, _) => usize::from(area.height),
+
+    let visible_slots = if show_all_hints && item_gap {
+        usize::from(area.height.saturating_add(1) / 3)
+    } else if show_all_hints {
+        usize::from(area.height / 2)
+    } else if show_active_hint {
+        usize::from(area.height.saturating_sub(1)).max(1)
+    } else {
+        usize::from(area.height)
     };
     if visible_slots == 0 {
         return;
@@ -626,7 +981,8 @@ fn render_items(
         render_item_title(frame, title_area, index, item, is_selected, ctx);
         cursor_y = cursor_y.saturating_add(1);
 
-        if show_hints && cursor_y < max_y {
+        let should_render_hint = show_all_hints || (show_active_hint && is_selected);
+        if should_render_hint && cursor_y < max_y {
             let hint_area = Rect::new(area.x, cursor_y, area.width, 1);
             render_item_hint(frame, hint_area, item, is_selected, ctx);
             cursor_y = cursor_y.saturating_add(1);
@@ -680,7 +1036,7 @@ fn render_item_hint(
     is_selected: bool,
     ctx: RenderCtx,
 ) {
-    let indent = if ctx.inset { "   " } else { "  " };
+    let indent = if ctx.inset { "       " } else { "      " };
     let right_margin = usize::from(ctx.inset);
     let budget = usize::from(area.width).saturating_sub(indent.len() + right_margin);
     let hint = truncate_text(&item.hint, budget);
@@ -690,6 +1046,34 @@ fn render_item_hint(
         ctx.palette.inactive_hint
     };
     let line = Line::from(vec![Span::raw(indent), Span::styled(hint, style)]);
+    frame.render_widget(line, area);
+}
+
+fn render_confirm_footer(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx) {
+    if area.is_empty() {
+        return;
+    }
+    let pad = if ctx.inset { " " } else { "" };
+    let key = ctx.palette.footer_key;
+    let text = ctx.palette.footer_text;
+    let width = usize::from(area.width);
+
+    let line = if width >= pad.len() * 2 + 30 {
+        Line::from(vec![
+            Span::raw(pad),
+            Span::styled("y", ctx.palette.danger_bold),
+            Span::styled(" uninstall  ·  ", text),
+            Span::styled("n / esc", key),
+            Span::styled(" cancel", text),
+        ])
+    } else {
+        Line::from(vec![
+            Span::raw(pad),
+            Span::styled("y", ctx.palette.danger_bold),
+            Span::styled(" · ", text),
+            Span::styled("n/esc", key),
+        ])
+    };
     frame.render_widget(line, area);
 }
 
@@ -713,9 +1097,10 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, item_count: usize, ctx: Rend
 
     let range = range_label(item_count);
     let width = usize::from(area.width);
-    let full_cols = pad.len() + 48 + range.len();
-    let medium_cols = pad.len() + 29 + range.len();
-    let short_cols = pad.len() + 17 + range.len();
+    let full_cols = pad.len() * 2 + 62 + range.len();
+    let medium_cols = pad.len() * 2 + 41 + range.len();
+    let compact_medium_cols = pad.len() * 2 + 34 + range.len();
+    let short_cols = pad.len() * 2 + 21 + range.len();
 
     let line = if width >= full_cols {
         Line::from(vec![
@@ -724,6 +1109,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, item_count: usize, ctx: Rend
             Span::styled(" move  ·  ", text),
             Span::styled(range, key),
             Span::styled(" select  ·  ", text),
+            Span::styled("r", key),
+            Span::styled(" refresh  ·  ", text),
             Span::styled("enter", key),
             Span::styled(" confirm  ·  ", text),
             Span::styled("q", key),
@@ -736,6 +1123,22 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, item_count: usize, ctx: Rend
             Span::styled(" · ", text),
             Span::styled(range, key),
             Span::styled(" select · ", text),
+            Span::styled("r", key),
+            Span::styled(" refresh · ", text),
+            Span::styled("enter", key),
+            Span::styled(" · ", text),
+            Span::styled("q", key),
+            Span::styled(" quit", text),
+        ])
+    } else if width >= compact_medium_cols {
+        Line::from(vec![
+            Span::raw(pad),
+            Span::styled("↑↓", key),
+            Span::styled(" · ", text),
+            Span::styled(range, key),
+            Span::styled(" · ", text),
+            Span::styled("r", key),
+            Span::styled(" refresh · ", text),
             Span::styled("enter", key),
             Span::styled(" · ", text),
             Span::styled("q", key),
@@ -748,6 +1151,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, item_count: usize, ctx: Rend
             Span::styled(" · ", text),
             Span::styled(range, key),
             Span::styled(" · ", text),
+            Span::styled("r", key),
+            Span::styled(" · ", text),
             Span::styled("enter", key),
             Span::styled(" · ", text),
             Span::styled("q", key),
@@ -756,6 +1161,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, item_count: usize, ctx: Rend
         Line::from(vec![
             Span::raw(pad),
             Span::styled(range, key),
+            Span::styled(" · ", text),
+            Span::styled("r", key),
             Span::styled(" · ", text),
             Span::styled("q", key),
         ])
@@ -766,7 +1173,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, item_count: usize, ctx: Rend
 fn render_minimal(
     frame: &mut Frame<'_>,
     area: Rect,
-    menu: &LauncherMenu,
+    state: &UiState,
     selected: usize,
     palette: Palette,
 ) {
@@ -778,33 +1185,41 @@ fn render_minimal(
     ]);
     frame.render_widget(header, header_area);
 
-    if let Some(item) = menu.items.get(selected).filter(|_| area.height >= 2) {
+    let ctx = RenderCtx {
+        palette,
+        inset: false,
+    };
+
+    if state.confirming_uninstall {
+        if area.height >= 2 {
+            let prompt = truncate_text("Uninstall? [y/n]", usize::from(area.width));
+            frame.render_widget(
+                Line::styled(prompt, palette.danger_bold),
+                Rect::new(area.x, area.y + 1, area.width, 1),
+            );
+        }
+        return;
+    }
+
+    if let Some(item) = state.menu.items.get(selected).filter(|_| area.height >= 2) {
         let item_area = Rect::new(area.x, area.y + 1, area.width, 1);
-        let ctx = RenderCtx {
-            palette,
-            inset: false,
-        };
         render_item_title(frame, item_area, selected, item, true, ctx);
     }
 
     if area.height >= 3 {
         let footer_area = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
-        let ctx = RenderCtx {
-            palette,
-            inset: false,
-        };
-        render_footer(frame, footer_area, menu.items.len(), ctx);
+        render_footer(frame, footer_area, state.menu.items.len(), ctx);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::build_menu;
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::path::PathBuf;
-    use vdpi::service::InstalledInfo;
+    use vdpi::service::{InstalledInfo, LiveEngineStatus, ServiceState};
     use vdpi::update::VersionRelation;
 
     fn sample_info(
@@ -821,17 +1236,59 @@ mod tests {
         }
     }
 
-    fn render_to_buffer(
-        width: u16,
-        height: u16,
-        menu: &LauncherMenu,
-        selected: usize,
-        color: bool,
-    ) -> Buffer {
+    fn sample_live_engine() -> LiveEngineStatus {
+        LiveEngineStatus {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 8080,
+            socks_port: Some(1080),
+            version: Some("0.4.1".to_string()),
+            mode: Some("combo".to_string()),
+            doh: Some(true),
+            block_quic: Some(true),
+            active_connections: Some(4),
+            total_connections: Some(90),
+            learned_hosts: Some(12),
+            isp_stage: Some("balanced".to_string()),
+        }
+    }
+
+    fn status_running_live() -> ControlCenterStatus {
+        ControlCenterStatus {
+            installed: Some(sample_info(Some("0.4.1"), "0.4.1", VersionRelation::Same)),
+            service_state: ServiceState::Running,
+            live_engine: Some(sample_live_engine()),
+        }
+    }
+
+    fn status_paused() -> ControlCenterStatus {
+        ControlCenterStatus {
+            installed: Some(sample_info(Some("0.4.1"), "0.4.1", VersionRelation::Same)),
+            service_state: ServiceState::Stopped,
+            live_engine: None,
+        }
+    }
+
+    fn status_not_installed() -> ControlCenterStatus {
+        ControlCenterStatus {
+            installed: None,
+            service_state: ServiceState::NotInstalled,
+            live_engine: None,
+        }
+    }
+
+    fn status_update_available() -> ControlCenterStatus {
+        ControlCenterStatus {
+            installed: Some(sample_info(Some("0.3.0"), "0.4.1", VersionRelation::Newer)),
+            service_state: ServiceState::Running,
+            live_engine: Some(sample_live_engine()),
+        }
+    }
+
+    fn render_state(width: u16, height: u16, state: &UiState, color: bool) -> Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("create test terminal");
         terminal
-            .draw(|frame| render(frame, menu, selected, color))
+            .draw(|frame| render(frame, state, color))
             .expect("draw launcher frame");
         terminal.backend().buffer().clone()
     }
@@ -847,479 +1304,431 @@ mod tests {
         out
     }
 
-    fn all_five_menus() -> [(&'static str, LauncherMenu); 5] {
-        [
-            ("fresh", build_menu(None)),
-            (
-                "newer",
-                build_menu(Some(&sample_info(
-                    Some("0.3.0"),
-                    "0.4.0",
-                    VersionRelation::Newer,
-                ))),
-            ),
-            (
-                "same",
-                build_menu(Some(&sample_info(
-                    Some("0.4.0"),
-                    "0.4.0",
-                    VersionRelation::Same,
-                ))),
-            ),
-            (
-                "older",
-                build_menu(Some(&sample_info(
-                    Some("0.5.0"),
-                    "0.4.0",
-                    VersionRelation::Older,
-                ))),
-            ),
-            (
-                "unknown",
-                build_menu(Some(&sample_info(None, "0.4.0", VersionRelation::Unknown))),
-            ),
-        ]
+    #[test]
+    fn renders_running_with_live_engine_at_80x24() {
+        let state = UiState::new(&status_running_live(), None);
+        let buf = render_state(80, 24, &state, true);
+        let text = buffer_text(&buf);
+
+        assert!(text.contains('╭') && text.contains('╰'));
+        assert!(text.contains("vdpi") && text.contains(VERSION_LABEL));
+        assert!(text.contains(repo_display()));
+        assert!(text.contains("Service"));
+        assert!(text.contains("Running · v0.4.1"));
+        assert!(text.contains("Anti-DPI"));
+        assert!(text.contains("Active · Combo · DoH on · QUIC blocked"));
+        assert!(text.contains("Engine"));
+        assert!(text.contains("127.0.0.1:8080 · 4 active · 12 cached hosts"));
+
+        for (idx, item) in state.menu.items.iter().enumerate() {
+            assert!(
+                text.contains(&format!("[{}]", idx + 1)),
+                "missing badge {}:\n{text}",
+                idx + 1
+            );
+            assert!(
+                text.contains(&item.title),
+                "missing item title '{}':\n{text}",
+                item.title
+            );
+        }
+        assert!(
+            text.contains(&state.menu.items[0].hint),
+            "missing selected item hint:\n{text}"
+        );
+        assert!(
+            text.contains("↑↓ move  ·  1-6 select  ·  r refresh  ·  enter confirm  ·  q quit"),
+            "missing full footer:\n{text}"
+        );
+        assert!(buf
+            .content()
+            .iter()
+            .any(|c| c.symbol() == "●" && c.fg == EMERALD_ACTIVE));
+        assert!(buf.content().iter().any(|c| c.bg == ACTIVE_BG));
     }
 
     #[test]
-    fn renders_all_five_states_across_standard_narrow_and_tiny_sizes() {
-        let menus = all_five_menus();
-        let sizes = [(80u16, 24u16), (42, 16), (28, 10)];
+    fn renders_paused_with_all_seven_items_and_notice_at_80x24() {
+        let state = UiState::new(
+            &status_paused(),
+            Some("Service paused - system proxies restored."),
+        );
+        let buf = render_state(80, 24, &state, true);
+        let text = buffer_text(&buf);
 
-        for (label, menu) in &menus {
-            for &(width, height) in &sizes {
-                for color in [true, false] {
-                    let buf = render_to_buffer(width, height, menu, 0, color);
-                    let text = buffer_text(&buf);
+        assert!(text.contains("Paused · v0.4.1 (temporarily stopped)"));
+        assert!(text.contains("Offline · system proxies restored"));
+        assert!(text.contains("✓ Service paused - system proxies restored."));
+        assert_eq!(state.menu.items.len(), 7);
+        for (idx, item) in state.menu.items.iter().enumerate() {
+            assert!(
+                text.contains(&format!("[{}]", idx + 1)),
+                "missing badge {}:\n{text}",
+                idx + 1
+            );
+            assert!(
+                text.contains(&item.title),
+                "missing item title '{}':\n{text}",
+                item.title
+            );
+        }
+        assert!(text.contains(&state.menu.items[0].hint));
+        assert!(
+            text.contains("↑↓ move  ·  1-7 select  ·  r refresh  ·  enter confirm  ·  q quit"),
+            "missing full 1-7 footer:\n{text}"
+        );
+        assert!(buf
+            .content()
+            .iter()
+            .any(|c| c.symbol() == "●" && c.fg == AMBER_WARN));
 
-                    // Frame border type and color discipline.
-                    if color {
-                        assert!(
-                            text.contains('╭') && text.contains('╰'),
-                            "{label} {width}x{height} color=true missing rounded corners:\n{text}"
-                        );
-                        assert!(
-                            buf.content().iter().any(|c| c.fg == BORDER_SLATE),
-                            "{label} {width}x{height} missing slate border color"
-                        );
-                        assert!(
-                            buf.content().iter().any(|c| c.bg == ACTIVE_BG),
-                            "{label} {width}x{height} missing active highlight bg"
-                        );
-                    } else {
-                        assert!(
-                            text.contains('┌') && text.contains('└') && !text.contains('╭'),
-                            "{label} {width}x{height} color=false should use plain border:\n{text}"
-                        );
-                        assert!(
-                            buf.content()
-                                .iter()
-                                .all(|c| c.fg == Color::Reset && c.bg == Color::Reset),
-                            "{label} {width}x{height} color=false must not emit RGB colors"
-                        );
-                        assert!(
-                            buf.content()
-                                .iter()
-                                .any(|c| c.modifier.contains(Modifier::REVERSED)),
-                            "{label} {width}x{height} color=false missing REVERSED active row"
-                        );
-                    }
+        // Failure notice renders amber warning icon.
+        let warn_state = UiState::new(&status_paused(), Some("Pause failed: access denied"));
+        let warn_buf = render_state(80, 24, &warn_state, true);
+        let warn_text = buffer_text(&warn_buf);
+        assert!(warn_text.contains("! Pause failed: access denied"));
+        assert!(warn_buf
+            .content()
+            .iter()
+            .any(|c| c.symbol() == "!" && c.fg == AMBER_WARN));
+    }
 
-                    // Header, divider, active marker, and all key badges always present.
-                    assert!(
-                        text.contains("vdpi") && text.contains(VERSION_LABEL),
-                        "{label} {width}x{height} missing header:\n{text}"
-                    );
-                    assert!(
-                        text.contains('─'),
-                        "{label} {width}x{height} missing divider:\n{text}"
-                    );
-                    assert!(
-                        text.contains('▸'),
-                        "{label} {width}x{height} missing active marker:\n{text}"
-                    );
-                    for idx in 0..menu.items.len() {
-                        let badge = format!("[{}]", idx + 1);
-                        assert!(
-                            text.contains(&badge),
-                            "{label} {width}x{height} missing badge {badge}:\n{text}"
-                        );
-                    }
+    #[test]
+    fn renders_not_installed_and_update_available_at_80x24() {
+        let fresh = UiState::new(&status_not_installed(), None);
+        let fresh_buf = render_state(80, 24, &fresh, true);
+        let fresh_text = buffer_text(&fresh_buf);
+        assert!(fresh_text.contains("Not installed"));
+        assert!(fresh_text.contains("Offline · system proxies restored"));
+        assert!(fresh_text.contains("Run directly"));
+        assert!(fresh_text.contains("Install for automatic startup"));
+        assert!(fresh_text.contains("Run diagnostics"));
+        assert!(fresh_text.contains("Quit"));
+        assert!(fresh_text
+            .contains("↑↓ move  ·  1-4 select  ·  r refresh  ·  enter confirm  ·  q quit"));
 
-                    // Status pill present whenever menu.status_line is Some.
-                    if let Some(status) = &menu.status_line {
-                        assert!(
-                            text.contains('●'),
-                            "{label} {width}x{height} missing status dot:\n{text}"
-                        );
-                        if color {
-                            let expected_fg = match status_intent(menu) {
-                                StatusIntent::UpdateAvailable => ICE_BLUE,
-                                StatusIntent::UpToDate => STEEL_MUTED,
-                                StatusIntent::Caution => AMBER_WARN,
-                            };
-                            assert!(
-                                buf.content()
-                                    .iter()
-                                    .any(|c| c.symbol() == "●" && c.fg == expected_fg),
-                                "{label} {width}x{height} wrong status dot color"
-                            );
-                        }
-                        if width == 80 {
-                            assert!(
-                                text.contains(status),
-                                "{label} 80x24 truncated status:\n{text}"
-                            );
-                        }
-                    } else {
-                        assert!(
-                            !text.contains('●'),
-                            "{label} {width}x{height} unexpected status dot:\n{text}"
-                        );
-                    }
+        let update = UiState::new(&status_update_available(), None);
+        let update_buf = render_state(80, 24, &update, true);
+        let update_text = buffer_text(&update_buf);
+        assert!(update_text.contains("Running · v0.3.0 -> v0.4.1 update ready"));
+        assert!(update_text.contains("Update installed vdpi (v0.3.0 -> v0.4.1)"));
+        assert!(update_text.contains("Pause background service"));
+        assert!(update_text.contains("Uninstall vdpi"));
+        assert!(update_buf
+            .content()
+            .iter()
+            .any(|c| c.symbol() == "●" && c.fg == ICE_BLUE));
 
-                    // Standard 80x24 shows full repo, full titles, full hints, and full footer.
-                    if width == 80 && height == 24 {
-                        assert!(text.contains(repo_display()));
-                        for item in &menu.items {
-                            assert!(
-                                text.contains(&item.title),
-                                "{label} 80x24 missing title '{}':\n{text}",
-                                item.title
-                            );
-                            assert!(
-                                text.contains(&item.hint),
-                                "{label} 80x24 missing hint '{}':\n{text}",
-                                item.hint
-                            );
-                        }
-                        let expected_footer = format!(
-                            "↑↓ move  ·  1-{} select  ·  enter confirm  ·  q quit",
-                            menu.items.len()
-                        );
-                        assert!(
-                            text.contains(&expected_footer),
-                            "{label} 80x24 missing full footer '{expected_footer}':\n{text}"
-                        );
-                    }
+        // Tall terminal (>= 28 rows) expands to display every item's hint.
+        let tall_buf = render_state(80, 32, &fresh, true);
+        let tall_text = buffer_text(&tall_buf);
+        for item in &fresh.menu.items {
+            assert!(
+                tall_text.contains(&item.hint),
+                "tall 80x32 missing hint '{}':\n{tall_text}",
+                item.hint
+            );
+        }
+    }
 
-                    // Narrow 42x16 omits repo cleanly while keeping hints and footer.
-                    if width == 42 && height == 16 {
-                        assert!(!text.contains(repo_display()));
-                        assert!(text.contains("q quit"));
-                    }
+    #[test]
+    fn inline_uninstall_confirmation_flow_and_rendering() {
+        let mut state = UiState::new(&status_running_live(), None);
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
 
-                    // Tiny 28x10 auto-compacts to single-line per item with short footer.
-                    if width == 28 && height == 10 {
-                        assert!(!text.contains(repo_display()));
-                        assert!(text.contains("enter · q"));
-                    }
-                }
+        // Select Uninstall via number key '5' -> enters confirmation instead of finishing.
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('5'))),
+            Action::Redraw
+        );
+        assert!(state.confirming_uninstall);
+
+        let buf = render_state(80, 24, &state, true);
+        let text = buffer_text(&buf);
+        assert!(
+            text.contains("● Confirm uninstall"),
+            "missing confirm header:\n{text}"
+        );
+        assert!(
+            text.contains("stops the background service")
+                && text.contains("restores system proxies."),
+            "missing confirm body:\n{text}"
+        );
+        assert!(
+            text.contains("[y] Uninstall vdpi   ·   [n / Esc] Cancel"),
+            "missing confirm prompt:\n{text}"
+        );
+        assert!(buf
+            .content()
+            .iter()
+            .any(|c| c.symbol() == "●" && c.fg == RED_DANGER));
+
+        // Narrow 46x18 renders confirmation cleanly as well.
+        let narrow_buf = render_state(46, 18, &state, true);
+        let narrow_text = buffer_text(&narrow_buf);
+        assert!(narrow_text.contains("● Confirm uninstall"));
+        assert!(narrow_text.contains("[y] Uninstall"));
+
+        // Repeat 'y' must be ignored so held keys cannot accidentally confirm.
+        assert_eq!(
+            handle_key(
+                &mut state,
+                KeyEvent::new_with_kind(
+                    KeyCode::Char('y'),
+                    KeyModifiers::NONE,
+                    KeyEventKind::Repeat
+                )
+            ),
+            Action::Ignore
+        );
+        assert!(state.confirming_uninstall);
+
+        // 'n' cancels safely back to menu.
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('n'))),
+            Action::Redraw
+        );
+        assert!(!state.confirming_uninstall);
+
+        // Re-enter via Enter on Uninstall item, then cancel with Esc.
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Enter)),
+            Action::Redraw
+        );
+        assert!(state.confirming_uninstall);
+        assert_eq!(handle_key(&mut state, press(KeyCode::Esc)), Action::Redraw);
+        assert!(!state.confirming_uninstall);
+
+        // Re-enter and cancel with 'q'.
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Enter)),
+            Action::Redraw
+        );
+        assert!(state.confirming_uninstall);
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('q'))),
+            Action::Redraw
+        );
+        assert!(!state.confirming_uninstall);
+
+        // Re-enter and confirm with 'y' and 'Y'.
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Enter)),
+            Action::Redraw
+        );
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('y'))),
+            Action::Finish(Choice::Uninstall)
+        );
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('Y'))),
+            Action::Finish(Choice::Uninstall)
+        );
+    }
+
+    #[test]
+    fn live_refresh_hotkey_updates_menu_and_clamps_selection() {
+        let mut state = UiState::new(&status_paused(), None);
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        // Move to last item (index 6 of 7).
+        assert_eq!(handle_key(&mut state, press(KeyCode::End)), Action::Redraw);
+        assert_eq!(state.selected, 6);
+
+        // Pressing 'r' or 'R' requests refresh.
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('r'))),
+            Action::Refresh
+        );
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('R'))),
+            Action::Refresh
+        );
+
+        // Apply refresh to NotInstalled (4 items): selection clamps cleanly to 3 and notice updates.
+        apply_refresh(&mut state, &status_not_installed());
+        assert_eq!(state.selected, 3);
+        assert_eq!(state.menu.notice.as_deref(), Some("Status refreshed."));
+        assert!(!state.confirming_uninstall);
+
+        let buf = render_state(80, 24, &state, true);
+        let text = buffer_text(&buf);
+        assert!(text.contains("✓ Status refreshed."));
+        assert!(text.contains("▸ [4] Quit"));
+    }
+
+    #[test]
+    fn renders_narrow_46x18_and_no_color_cleanly() {
+        let running = UiState::new(&status_running_live(), None);
+        let buf = render_state(46, 18, &running, true);
+        let text = buffer_text(&buf);
+        assert!(text.contains("vdpi"));
+        assert!(text.contains(repo_display()));
+        assert!(text.contains("Service"));
+        assert!(text.contains("Anti-DPI"));
+        assert!(text.contains("r refresh"));
+        for idx in 0..running.menu.items.len() {
+            assert!(
+                text.contains(&format!("[{}]", idx + 1)),
+                "narrow 46x18 missing badge {}:\n{text}",
+                idx + 1
+            );
+        }
+
+        // Below the header fit threshold, the repo URL hides cleanly.
+        let tighter_buf = render_state(36, 18, &running, true);
+        let tighter_text = buffer_text(&tighter_buf);
+        assert!(tighter_text.contains("vdpi"));
+        assert!(!tighter_text.contains(repo_display()));
+
+        // NO_COLOR across normal and confirm modes: plain border, zero RGB colors, REVERSED active row.
+        for confirming in [false, true] {
+            let mut state = UiState::new(&status_running_live(), Some("Status refreshed."));
+            state.confirming_uninstall = confirming;
+            let no_color = render_state(80, 24, &state, false);
+            let no_color_text = buffer_text(&no_color);
+            assert!(
+                no_color_text.contains('┌')
+                    && no_color_text.contains('└')
+                    && !no_color_text.contains('╭'),
+                "NO_COLOR confirming={confirming} must use plain border:\n{no_color_text}"
+            );
+            assert!(
+                no_color
+                    .content()
+                    .iter()
+                    .all(|c| c.fg == Color::Reset && c.bg == Color::Reset),
+                "NO_COLOR confirming={confirming} must not emit RGB colors"
+            );
+            if !confirming {
+                assert!(no_color
+                    .content()
+                    .iter()
+                    .any(|c| c.modifier.contains(Modifier::REVERSED)));
             }
         }
     }
 
     #[test]
     fn renders_degenerate_and_scrolled_sizes_without_panicking() {
-        let same = build_menu(Some(&sample_info(
-            Some("0.4.0"),
-            "0.4.0",
-            VersionRelation::Same,
-        )));
-        let empty = LauncherMenu {
-            status_line: None,
-            items: Vec::new(),
+        let mut paused = UiState::new(&status_paused(), Some("Service paused."));
+        let mut confirm = UiState::new(&status_running_live(), None);
+        confirm.confirming_uninstall = true;
+        let empty = UiState {
+            menu: LauncherMenu {
+                status_rows: Vec::new(),
+                notice: None,
+                items: Vec::new(),
+            },
+            selected: 0,
+            confirming_uninstall: false,
         };
 
-        for menu in [&same, &empty] {
-            for (width, height) in [(20, 7), (14, 5), (12, 4), (8, 3), (4, 1), (0, 0)] {
-                for selected in [0, 2, 3, 99] {
-                    for color in [true, false] {
-                        let _ = render_to_buffer(width, height, menu, selected, color);
-                    }
+        for state in [&paused, &confirm, &empty] {
+            for (width, height) in [
+                (46, 18),
+                (28, 10),
+                (20, 7),
+                (14, 5),
+                (12, 4),
+                (8, 3),
+                (4, 1),
+                (0, 0),
+            ] {
+                for color in [true, false] {
+                    let _ = render_state(width, height, state, color);
                 }
             }
         }
 
         // Verify scrolled selection on a very short framed terminal keeps selected item visible.
-        let buf = render_to_buffer(40, 6, &same, 3, true);
+        paused.selected = 6;
+        let buf = render_state(40, 6, &paused, true);
         let text = buffer_text(&buf);
         assert!(
-            text.contains("▸ [4] Quit"),
+            text.contains("▸ [7] Quit"),
             "expected scrolled item:\n{text}"
         );
     }
 
     #[test]
-    fn keyboard_navigation_wraps_and_filters_confirmation_kinds() {
-        let menu = build_menu(None);
-        let mut selected = 0;
+    fn keyboard_navigation_wraps_and_filters_event_kinds() {
+        let mut state = UiState::new(&status_not_installed(), None);
         let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
 
-        // Wrap upward with Up, k, BackTab.
+        assert_eq!(handle_key(&mut state, press(KeyCode::Up)), Action::Redraw);
+        assert_eq!(state.selected, 3);
         assert_eq!(
-            handle_key(&mut selected, press(KeyCode::Up), &menu),
+            handle_key(&mut state, press(KeyCode::Char('k'))),
             Action::Redraw
         );
-        assert_eq!(selected, 2);
-        assert_eq!(
-            handle_key(&mut selected, press(KeyCode::Char('k')), &menu),
-            Action::Redraw
-        );
-        assert_eq!(selected, 1);
+        assert_eq!(state.selected, 2);
         assert_eq!(
             handle_key(
-                &mut selected,
-                KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
-                &menu,
+                &mut state,
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)
             ),
             Action::Redraw
         );
-        assert_eq!(selected, 0);
+        assert_eq!(state.selected, 1);
+        assert_eq!(handle_key(&mut state, press(KeyCode::Home)), Action::Redraw);
+        assert_eq!(state.selected, 0);
+        assert_eq!(handle_key(&mut state, press(KeyCode::Down)), Action::Redraw);
+        assert_eq!(state.selected, 1);
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('j'))),
+            Action::Redraw
+        );
+        assert_eq!(state.selected, 2);
+        assert_eq!(handle_key(&mut state, press(KeyCode::Tab)), Action::Redraw);
+        assert_eq!(state.selected, 3);
+        assert_eq!(handle_key(&mut state, press(KeyCode::Tab)), Action::Redraw);
+        assert_eq!(state.selected, 0);
 
-        // Wrap downward with Down, j, Tab, and Repeat navigation.
-        assert_eq!(
-            handle_key(&mut selected, press(KeyCode::Down), &menu),
-            Action::Redraw
-        );
-        assert_eq!(selected, 1);
-        assert_eq!(
-            handle_key(&mut selected, press(KeyCode::Char('j')), &menu),
-            Action::Redraw
-        );
-        assert_eq!(selected, 2);
-        assert_eq!(
-            handle_key(&mut selected, press(KeyCode::Tab), &menu),
-            Action::Redraw
-        );
-        assert_eq!(selected, 0);
-        assert_eq!(
-            handle_key(
-                &mut selected,
-                KeyEvent::new_with_kind(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Repeat),
-                &menu,
-            ),
-            Action::Redraw
-        );
-        assert_eq!(selected, 1);
-
-        // Home and End.
-        assert_eq!(
-            handle_key(&mut selected, press(KeyCode::End), &menu),
-            Action::Redraw
-        );
-        assert_eq!(selected, 2);
-        assert_eq!(
-            handle_key(&mut selected, press(KeyCode::Home), &menu),
-            Action::Redraw
-        );
-        assert_eq!(selected, 0);
-
-        // Confirmations must ignore Repeat and Release.
         for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
             for code in [
                 KeyCode::Enter,
                 KeyCode::Char('1'),
-                KeyCode::Char('2'),
+                KeyCode::Char('r'),
                 KeyCode::Esc,
                 KeyCode::Char('q'),
             ] {
                 assert_eq!(
                     handle_key(
-                        &mut selected,
-                        KeyEvent::new_with_kind(code, KeyModifiers::NONE, kind),
-                        &menu,
+                        &mut state,
+                        KeyEvent::new_with_kind(code, KeyModifiers::NONE, kind)
                     ),
                     Action::Ignore
                 );
             }
         }
 
-        // Release navigation is also ignored.
         assert_eq!(
-            handle_key(
-                &mut selected,
-                KeyEvent::new_with_kind(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Release),
-                &menu,
-            ),
-            Action::Ignore
-        );
-        assert_eq!(selected, 0);
-
-        // Confirm, Escape, q/Q, Ctrl-C, and Alt-modified ignore.
-        assert_eq!(
-            handle_key(&mut selected, press(KeyCode::Enter), &menu),
+            handle_key(&mut state, press(KeyCode::Enter)),
             Action::Finish(Choice::Run)
         );
         assert_eq!(
-            handle_key(&mut selected, press(KeyCode::Esc), &menu),
-            Action::Finish(Choice::Cancel)
-        );
-        assert_eq!(
-            handle_key(&mut selected, press(KeyCode::Char('q')), &menu),
-            Action::Finish(Choice::Cancel)
-        );
-        assert_eq!(
-            handle_key(&mut selected, press(KeyCode::Char('Q')), &menu),
-            Action::Finish(Choice::Cancel)
+            handle_key(&mut state, press(KeyCode::Char('3'))),
+            Action::Finish(Choice::Doctor)
         );
         assert_eq!(
             handle_key(
-                &mut selected,
-                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-                &menu,
+                &mut state,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
             ),
             Action::Finish(Choice::Cancel)
         );
         assert_eq!(
             handle_key(
-                &mut selected,
-                KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT),
-                &menu,
+                &mut state,
+                KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT)
             ),
             Action::Ignore
         );
     }
 
     #[test]
-    fn dynamic_number_keys_match_all_version_states() {
-        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
-        let mut selected = 0;
-
-        let fresh = build_menu(None);
-        assert_eq!(
-            handle_key(&mut selected, key(KeyCode::Char('1')), &fresh),
-            Action::Finish(Choice::Run)
-        );
-        assert_eq!(
-            handle_key(&mut selected, key(KeyCode::Char('2')), &fresh),
-            Action::Finish(Choice::Install)
-        );
-        assert_eq!(
-            handle_key(&mut selected, key(KeyCode::Char('3')), &fresh),
-            Action::Finish(Choice::Cancel)
-        );
-        assert_eq!(
-            handle_key(&mut selected, key(KeyCode::Char('4')), &fresh),
-            Action::Ignore
-        );
-
-        let newer = build_menu(Some(&sample_info(
-            Some("0.3.0"),
-            "0.4.0",
-            VersionRelation::Newer,
-        )));
-        assert_eq!(
-            handle_key(&mut selected, key(KeyCode::Enter), &newer),
-            Action::Finish(Choice::Install)
-        );
-        assert_eq!(
-            handle_key(&mut selected, key(KeyCode::Char('1')), &newer),
-            Action::Finish(Choice::Install)
-        );
-        assert_eq!(
-            handle_key(&mut selected, key(KeyCode::Char('2')), &newer),
-            Action::Finish(Choice::Run)
-        );
-        assert_eq!(
-            handle_key(&mut selected, key(KeyCode::Char('3')), &newer),
-            Action::Finish(Choice::Cancel)
-        );
-
-        let same = build_menu(Some(&sample_info(
-            Some("0.4.0"),
-            "0.4.0",
-            VersionRelation::Same,
-        )));
-        assert_eq!(
-            handle_key(&mut selected, key(KeyCode::Char('1')), &same),
-            Action::Finish(Choice::Update)
-        );
-        assert_eq!(
-            handle_key(&mut selected, key(KeyCode::Char('2')), &same),
-            Action::Finish(Choice::Install)
-        );
-        assert_eq!(
-            handle_key(&mut selected, key(KeyCode::Char('3')), &same),
-            Action::Finish(Choice::Run)
-        );
-        assert_eq!(
-            handle_key(&mut selected, key(KeyCode::Char('4')), &same),
-            Action::Finish(Choice::Cancel)
-        );
-        assert_eq!(
-            handle_key(&mut selected, key(KeyCode::Char('5')), &same),
-            Action::Ignore
-        );
-
-        let older = build_menu(Some(&sample_info(
-            Some("0.5.0"),
-            "0.4.0",
-            VersionRelation::Older,
-        )));
-        assert_eq!(
-            handle_key(&mut selected, key(KeyCode::Char('1')), &older),
-            Action::Finish(Choice::Run)
-        );
-        assert_eq!(
-            handle_key(&mut selected, key(KeyCode::Char('2')), &older),
-            Action::Finish(Choice::Install)
-        );
-        assert_eq!(
-            handle_key(&mut selected, key(KeyCode::Char('3')), &older),
-            Action::Finish(Choice::Cancel)
-        );
-
-        let unknown = build_menu(Some(&sample_info(None, "0.4.0", VersionRelation::Unknown)));
-        assert_eq!(
-            handle_key(&mut selected, key(KeyCode::Char('1')), &unknown),
-            Action::Finish(Choice::Install)
-        );
-        assert_eq!(
-            handle_key(&mut selected, key(KeyCode::Char('2')), &unknown),
-            Action::Finish(Choice::Run)
-        );
-        assert_eq!(
-            handle_key(&mut selected, key(KeyCode::Char('3')), &unknown),
-            Action::Finish(Choice::Cancel)
-        );
-    }
-
-    #[test]
-    fn status_intent_and_palette_match_version_relations() {
-        let palette = Palette::for_color(true);
-        let newer = build_menu(Some(&sample_info(
-            Some("0.3.0"),
-            "0.4.0",
-            VersionRelation::Newer,
-        )));
-        let same = build_menu(Some(&sample_info(
-            Some("0.4.0"),
-            "0.4.0",
-            VersionRelation::Same,
-        )));
-        let older = build_menu(Some(&sample_info(
-            Some("0.5.0"),
-            "0.4.0",
-            VersionRelation::Older,
-        )));
-        let unknown = build_menu(Some(&sample_info(None, "0.4.0", VersionRelation::Unknown)));
-
-        assert_eq!(status_intent(&newer), StatusIntent::UpdateAvailable);
-        assert_eq!(palette.status(status_intent(&newer)).fg, Some(ICE_BLUE));
-
-        assert_eq!(status_intent(&same), StatusIntent::UpToDate);
-        assert_eq!(palette.status(status_intent(&same)).fg, Some(STEEL_MUTED));
-
-        assert_eq!(status_intent(&older), StatusIntent::Caution);
-        assert_eq!(palette.status(status_intent(&older)).fg, Some(AMBER_WARN));
-
-        assert_eq!(status_intent(&unknown), StatusIntent::Caution);
-        assert_eq!(palette.status(status_intent(&unknown)).fg, Some(AMBER_WARN));
-    }
-
-    #[test]
-    fn truncate_text_and_rule_invariants() {
+    fn truncate_text_wrap_words_and_rule_invariants() {
         assert_eq!(RULE.chars().count(), MAX_RULE_COLS);
         assert_eq!(RULE.len(), MAX_RULE_COLS * '─'.len_utf8());
 
@@ -1329,5 +1738,8 @@ mod tests {
         assert_eq!(truncate_text("hello", 2), "h…");
         assert!(matches!(truncate_text("hello", 1), Cow::Borrowed("h")));
         assert!(matches!(truncate_text("hello", 0), Cow::Borrowed("")));
+
+        assert_eq!(wrap_words("one two three", 7), vec!["one two", "three"]);
+        assert!(wrap_words("hello", 0).is_empty());
     }
 }

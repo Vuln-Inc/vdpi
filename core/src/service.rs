@@ -8,8 +8,8 @@ use anyhow::{bail, Result};
 use reqwest::{Client, Proxy};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::Read;
-use std::net::{IpAddr, SocketAddr};
+use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -194,6 +194,249 @@ pub fn detect_installed_info() -> Option<InstalledInfo> {
         relation,
         running_from_installed,
     })
+}
+
+/// Registration and runtime status of the OS background service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceState {
+    Running,
+    Stopped,
+    NotInstalled,
+}
+
+/// Live telemetry parsed from the local daemon `/vdpi-health` endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveEngineStatus {
+    pub addr: IpAddr,
+    pub port: u16,
+    pub socks_port: Option<u16>,
+    pub version: Option<String>,
+    pub mode: Option<String>,
+    pub doh: Option<bool>,
+    pub block_quic: Option<bool>,
+    pub active_connections: Option<usize>,
+    pub total_connections: Option<u64>,
+    pub learned_hosts: Option<usize>,
+    pub isp_stage: Option<String>,
+}
+
+/// Combined local snapshot for the interactive Control Center.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlCenterStatus {
+    pub installed: Option<InstalledInfo>,
+    pub service_state: ServiceState,
+    pub live_engine: Option<LiveEngineStatus>,
+}
+
+/// Detects whether the background `vdpi` service is installed and currently running.
+pub fn detect_service_state() -> ServiceState {
+    #[cfg(target_os = "windows")]
+    {
+        let svc = crate::platform::windows_service::query_windows_service_status();
+        if !svc.installed {
+            ServiceState::NotInstalled
+        } else if matches!(svc.state, "RUNNING" | "START_PENDING") {
+            ServiceState::Running
+        } else {
+            ServiceState::Stopped
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if !launch_agent_plist_path().ok().is_some_and(|p| p.exists()) {
+            return ServiceState::NotInstalled;
+        }
+        let uid = current_uid();
+        let target = format!("gui/{uid}/{LAUNCH_AGENT_LABEL}");
+        if let Ok(output) = Command::new("/bin/launchctl")
+            .args(["print", &target])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if stdout.contains("state = running") {
+                    return ServiceState::Running;
+                }
+            }
+        }
+        ServiceState::Stopped
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if !systemd_user_unit_path().ok().is_some_and(|p| p.exists()) {
+            return ServiceState::NotInstalled;
+        }
+        if let Ok(output) = Command::new("systemctl")
+            .args(["--user", "is-active", SYSTEMD_UNIT_NAME])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if output.status.success() || stdout.trim() == "active" {
+                return ServiceState::Running;
+            }
+        }
+        ServiceState::Stopped
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        ServiceState::NotInstalled
+    }
+}
+
+/// Parses a `/vdpi-health` JSON payload into a structured [`LiveEngineStatus`].
+pub fn parse_health_json(
+    body: &str,
+    addr: IpAddr,
+    port: u16,
+    socks_port: Option<u16>,
+) -> Option<LiveEngineStatus> {
+    let value: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    let obj = value.as_object()?;
+
+    let status = obj.get("status").and_then(serde_json::Value::as_str);
+    let service = obj.get("service").and_then(serde_json::Value::as_str);
+    if !matches!((status, service), (Some("ok"), _) | (None, Some("vdpi"))) {
+        return None;
+    }
+
+    Some(LiveEngineStatus {
+        addr,
+        port,
+        socks_port,
+        version: obj
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        mode: obj
+            .get("mode")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        doh: obj.get("doh").and_then(serde_json::Value::as_bool),
+        block_quic: obj.get("block_quic").and_then(serde_json::Value::as_bool),
+        active_connections: obj
+            .get("active_connections")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|v| usize::try_from(v).ok()),
+        total_connections: obj
+            .get("total_connections")
+            .and_then(serde_json::Value::as_u64),
+        learned_hosts: obj
+            .get("learned_hosts")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|v| usize::try_from(v).ok()),
+        isp_stage: obj
+            .get("isp_stage")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+fn probe_connect_ip(addr: IpAddr) -> Option<IpAddr> {
+    match addr {
+        IpAddr::V4(v4) if v4.is_unspecified() => Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        IpAddr::V6(v6) if v6.is_unspecified() => Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+        ip if ip.is_loopback() => Some(ip),
+        _ => None,
+    }
+}
+
+fn probe_local_health(
+    addr: IpAddr,
+    port: u16,
+    socks_port: Option<u16>,
+) -> Option<LiveEngineStatus> {
+    const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
+    const PROBE_TOTAL_TIMEOUT: Duration = Duration::from_millis(300);
+    const MAX_HEALTH_RESPONSE_BYTES: usize = 8 * 1024;
+    const HEALTH_REQUEST: &[u8] =
+        b"GET /vdpi-health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+
+    if port == 0 {
+        return None;
+    }
+
+    let connect_ip = probe_connect_ip(addr)?;
+    let sock = SocketAddr::new(connect_ip, port);
+
+    let mut stream = TcpStream::connect_timeout(&sock, PROBE_CONNECT_TIMEOUT).ok()?;
+    let _ = stream.set_write_timeout(Some(PROBE_CONNECT_TIMEOUT));
+
+    stream.write_all(HEALTH_REQUEST).ok()?;
+    let _ = stream.flush();
+
+    let deadline = Instant::now() + PROBE_TOTAL_TIMEOUT;
+    let mut raw = Vec::with_capacity(512);
+    let mut buf = [0u8; 1024];
+    while raw.len() < MAX_HEALTH_RESPONSE_BYTES {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let _ = stream.set_read_timeout(Some(remaining));
+        let to_read = buf.len().min(MAX_HEALTH_RESPONSE_BYTES - raw.len());
+        match stream.read(&mut buf[..to_read]) {
+            Ok(0) => break,
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+
+    if raw.is_empty() {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&raw);
+    let status_line = text.lines().next()?;
+    let status_rest = status_line
+        .strip_prefix("HTTP/1.1 200")
+        .or_else(|| status_line.strip_prefix("HTTP/1.0 200"))?;
+    if !status_rest.is_empty() && !status_rest.starts_with(' ') {
+        return None;
+    }
+    let (_, body) = text.split_once("\r\n\r\n")?;
+
+    parse_health_json(body, addr, port, socks_port)
+}
+
+/// Performs a fast, synchronous, local-only status probe of installation, background
+/// service registration, and live loopback daemon health (zero internet calls, zero
+/// async runtime spawn).
+pub fn probe_control_center_status(cfg: &RuntimeConfig) -> ControlCenterStatus {
+    let installed = detect_installed_info();
+    let service_state = detect_service_state();
+    let states = read_runtime_states();
+
+    let primary_socks = states
+        .iter()
+        .find(|s| s.addr == cfg.addr && s.port == cfg.port)
+        .map_or(cfg.socks_port, |s| s.socks_port);
+
+    let mut live_engine = probe_local_health(cfg.addr, cfg.port, primary_socks);
+    if live_engine.is_none() {
+        for st in states {
+            if st.addr == cfg.addr && st.port == cfg.port {
+                continue;
+            }
+            if let Some(status) = probe_local_health(st.addr, st.port, st.socks_port) {
+                live_engine = Some(status);
+                break;
+            }
+        }
+    }
+
+    ControlCenterStatus {
+        installed,
+        service_state,
+        live_engine,
+    }
 }
 
 /// Extracts and normalizes a semantic version (`X.Y.Z`) from `vdpi --version` stdout.
@@ -878,10 +1121,35 @@ fn stop_windows_foreground_daemons() {
 }
 
 #[cfg(target_os = "windows")]
-fn cleanup_windows_install_files() {
-    use crate::platform::windows::remove_dir_from_windows_path;
+fn schedule_delayed_windows_dir_cleanup(vdpi_root: &Path) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let Some(root_str) = vdpi_root.to_str() else {
+        return;
+    };
+    if root_str.is_empty()
+        || root_str.contains(['"', '&', '|', '%', '^', '<', '>', '\r', '\n', '\0'])
+    {
+        return;
+    }
+
+    let cleanup_cmd = format!(
+        "for /L %i in (1,1,12) do (rmdir /S /Q \"{root_str}\" 2>nul & if not exist \"{root_str}\" (exit /b 0) else (ping -n 2 127.0.0.1 >nul))"
+    );
+    let _ = Command::new("cmd.exe")
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .raw_arg("/C")
+        .raw_arg(cleanup_cmd)
+        .spawn();
+}
+
+#[cfg(target_os = "windows")]
+fn cleanup_windows_install_files() {
+    use crate::platform::windows::remove_dir_from_windows_path;
 
     let Ok(vdpi_root) = vdpi_root_dir() else {
         return;
@@ -919,19 +1187,9 @@ fn cleanup_windows_install_files() {
             .as_ref()
             .zip(fs::canonicalize(&vdpi_root).ok())
             .is_some_and(|(exe, root)| exe.starts_with(root));
-        if running_from_root {
+        if running_from_root || fs::remove_dir_all(&vdpi_root).is_err() {
             let _ = fs::remove_dir_all(vdpi_root.join("logs"));
-            // Schedule silent removal of the install folder right after this process exits.
-            let cleanup_cmd = format!(
-                "timeout /t 1 /nobreak >nul & rmdir /S /Q \"{}\"",
-                vdpi_root.display()
-            );
-            let _ = Command::new("cmd.exe")
-                .creation_flags(CREATE_NO_WINDOW)
-                .args(["/C", &cleanup_cmd])
-                .spawn();
-        } else {
-            let _ = fs::remove_dir_all(&vdpi_root);
+            schedule_delayed_windows_dir_cleanup(&vdpi_root);
         }
     }
 }
@@ -1025,6 +1283,205 @@ pub fn uninstall_service() -> Result<()> {
     Ok(())
 }
 
+/// Temporarily stops the background `vdpi` service and restores system proxies without
+/// uninstalling installed files, PATH entries, or service registration.
+pub fn pause_service() -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        use crate::platform::windows_service::{
+            is_elevated, query_windows_service_status, relaunch_elevated_and_wait,
+            stop_windows_service_if_running,
+        };
+
+        if !query_windows_service_status().installed {
+            bail!("vdpi Windows service is not installed.");
+        }
+
+        if !is_elevated() {
+            println!("Requesting Administrator privileges to pause the vdpi Windows service...");
+            relaunch_elevated_and_wait(&["pause".to_string()])?;
+            clear_all_system_proxies()?;
+            return Ok(());
+        }
+
+        let _ = stop_windows_service_if_running()?;
+        stop_windows_foreground_daemons();
+        clear_all_system_proxies()?;
+        println!(
+            "Paused Windows service '{WINDOWS_SERVICE_NAME}' and restored Windows system proxies."
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let plist_path = launch_agent_plist_path()?;
+        if !plist_path.exists() {
+            bail!(
+                "vdpi LaunchAgent is not installed ({}).",
+                plist_path.display()
+            );
+        }
+        let uid = current_uid();
+        let domain_target = format!("gui/{uid}");
+        let plist_str = plist_path.display().to_string();
+        let out = Command::new("/bin/launchctl")
+            .args(["bootout", &domain_target, &plist_str])
+            .output()
+            .context("failed to execute '/bin/launchctl bootout'")?;
+        if !out.status.success() && detect_service_state() == ServiceState::Running {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let detail = stderr.trim();
+            if detail.is_empty() {
+                bail!(
+                    "failed to pause LaunchAgent '{LAUNCH_AGENT_LABEL}' (exit status: {})",
+                    out.status
+                );
+            }
+            bail!("failed to pause LaunchAgent '{LAUNCH_AGENT_LABEL}': {detail}");
+        }
+        clear_all_system_proxies()?;
+        println!(
+            "Paused LaunchAgent '{LAUNCH_AGENT_LABEL}' and restored {} system proxy settings.",
+            platform_name()
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let unit_path = systemd_user_unit_path()?;
+        if !unit_path.exists() {
+            bail!(
+                "vdpi systemd user unit is not installed ({}).",
+                unit_path.display()
+            );
+        }
+        let out = Command::new("systemctl")
+            .args(["--user", "stop", SYSTEMD_UNIT_NAME])
+            .output()
+            .context("failed to execute 'systemctl --user stop'")?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            bail!(
+                "failed to pause systemd user unit '{SYSTEMD_UNIT_NAME}': {}",
+                stderr.trim()
+            );
+        }
+        clear_all_system_proxies()?;
+        println!(
+            "Paused systemd user unit '{SYSTEMD_UNIT_NAME}' and restored {} system proxy settings.",
+            platform_name()
+        );
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        bail!(
+            "pausing background service is not supported on {}",
+            platform_name()
+        );
+    }
+}
+
+/// Starts or restarts a previously installed/paused background `vdpi` service.
+pub fn resume_service() -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        use crate::platform::windows_service::{
+            is_elevated, query_windows_service_status, relaunch_elevated_and_wait,
+            start_windows_service,
+        };
+
+        if !query_windows_service_status().installed {
+            bail!("vdpi Windows service is not installed. Run 'vdpi install' first.");
+        }
+
+        if !is_elevated() {
+            println!("Requesting Administrator privileges to resume the vdpi Windows service...");
+            relaunch_elevated_and_wait(&["resume".to_string()])?;
+            return Ok(());
+        }
+
+        start_windows_service()?;
+        println!("Resumed Windows service '{WINDOWS_SERVICE_NAME}' (anti-DPI protection active).");
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let plist_path = launch_agent_plist_path()?;
+        if !plist_path.exists() {
+            bail!(
+                "vdpi LaunchAgent is not installed ({}). Run 'vdpi install' first.",
+                plist_path.display()
+            );
+        }
+        let uid = current_uid();
+        let domain_target = format!("gui/{uid}");
+        let plist_str = plist_path.display().to_string();
+        let boot = Command::new("/bin/launchctl")
+            .args(["bootstrap", &domain_target, &plist_str])
+            .output()
+            .context("failed to execute '/bin/launchctl bootstrap'")?;
+        let service_target = format!("{domain_target}/{LAUNCH_AGENT_LABEL}");
+        let kick = Command::new("/bin/launchctl")
+            .args(["kickstart", "-k", &service_target])
+            .output()
+            .context("failed to execute '/bin/launchctl kickstart'")?;
+        if !kick.status.success() {
+            let kick_err = String::from_utf8_lossy(&kick.stderr);
+            if !boot.status.success() {
+                let boot_err = String::from_utf8_lossy(&boot.stderr);
+                bail!(
+                    "failed to resume LaunchAgent '{LAUNCH_AGENT_LABEL}': bootstrap failed ({}); kickstart failed ({})",
+                    boot_err.trim(),
+                    kick_err.trim()
+                );
+            }
+            bail!(
+                "failed to resume LaunchAgent '{LAUNCH_AGENT_LABEL}': {}",
+                kick_err.trim()
+            );
+        }
+        println!("Resumed LaunchAgent '{LAUNCH_AGENT_LABEL}' (anti-DPI protection active).");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let unit_path = systemd_user_unit_path()?;
+        if !unit_path.exists() {
+            bail!(
+                "vdpi systemd user unit is not installed ({}). Run 'vdpi install' first.",
+                unit_path.display()
+            );
+        }
+        let out = Command::new("systemctl")
+            .args(["--user", "start", SYSTEMD_UNIT_NAME])
+            .output()
+            .context("failed to execute 'systemctl --user start'")?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            bail!(
+                "failed to resume systemd user unit '{SYSTEMD_UNIT_NAME}': {}",
+                stderr.trim()
+            );
+        }
+        println!("Resumed systemd user unit '{SYSTEMD_UNIT_NAME}' (anti-DPI protection active).");
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        bail!(
+            "resuming background service is not supported on {}",
+            platform_name()
+        );
+    }
+}
+
 async fn discover_live_daemon(
     client: &Client,
     cfg: &RuntimeConfig,
@@ -1073,6 +1530,10 @@ pub async fn print_status(cfg: &RuntimeConfig) -> Result<()> {
     let (active_addr, active_port, active_socks_port, health_body) =
         discover_live_daemon(&client, cfg).await;
 
+    let live_status = health_body
+        .as_deref()
+        .and_then(|text| parse_health_json(text, active_addr, active_port, active_socks_port));
+
     let daemon_state = match health_body {
         Some(text) => format!("RUNNING ({})", text.trim()),
         None => "NOT RESPONDING".to_string(),
@@ -1098,6 +1559,48 @@ pub async fn print_status(cfg: &RuntimeConfig) -> Result<()> {
         active_addr, active_port, daemon_state
     );
     println!("Dedicated SOCKS5 (TCP/UDP): {}", socks_state);
+
+    if let Some(live) = live_status {
+        let mut engine_parts = Vec::new();
+        if let Some(mode) = live.mode.as_deref() {
+            engine_parts.push(format!("mode={mode}"));
+        }
+        if let Some(doh) = live.doh {
+            engine_parts.push(format!("DoH={}", if doh { "on" } else { "off" }));
+        }
+        if let Some(block_quic) = live.block_quic {
+            engine_parts.push(format!(
+                "QUIC={}",
+                if block_quic { "blocked" } else { "allowed" }
+            ));
+        }
+        if let Some(stage) = live.isp_stage.as_deref() {
+            engine_parts.push(format!("ISP stage={stage}"));
+        }
+        if !engine_parts.is_empty() {
+            println!("Anti-DPI Engine           : {}", engine_parts.join(", "));
+        }
+
+        let mut telemetry_parts = Vec::new();
+        match (live.active_connections, live.total_connections) {
+            (Some(active), Some(total)) => {
+                telemetry_parts.push(format!("{active} active / {total} total connections"));
+            }
+            (Some(active), None) => {
+                telemetry_parts.push(format!("{active} active connections"));
+            }
+            (None, Some(total)) => {
+                telemetry_parts.push(format!("{total} total connections"));
+            }
+            (None, None) => {}
+        }
+        if let Some(hosts) = live.learned_hosts {
+            telemetry_parts.push(format!("{hosts} cached hosts"));
+        }
+        if !telemetry_parts.is_empty() {
+            println!("Live Telemetry            : {}", telemetry_parts.join(", "));
+        }
+    }
 
     #[cfg(target_os = "macos")]
     {
@@ -1404,5 +1907,181 @@ mod tests {
         assert!(!unit.contains("\nExecStartPost="));
         assert!(unit.contains(r#"ExecStart="/home/u%%1/my \"dir\"\\vdpi""#));
         assert!(unit.contains(r#""100%%\"a\\b""#));
+    }
+
+    #[test]
+    fn parses_enriched_v0_4_2_health_json() {
+        let body = r#"{
+            "status": "ok",
+            "service": "vdpi",
+            "version": "0.4.2",
+            "mode": "combo",
+            "doh": true,
+            "block_quic": true,
+            "active_connections": 7,
+            "total_connections": 420,
+            "learned_hosts": 19,
+            "isp_stage": "stage-1"
+        }"#;
+        let addr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let parsed = parse_health_json(body, addr, 8080, Some(1080))
+            .expect("enriched health payload should parse");
+
+        assert_eq!(
+            parsed,
+            LiveEngineStatus {
+                addr,
+                port: 8080,
+                socks_port: Some(1080),
+                version: Some("0.4.2".to_string()),
+                mode: Some("combo".to_string()),
+                doh: Some(true),
+                block_quic: Some(true),
+                active_connections: Some(7),
+                total_connections: Some(420),
+                learned_hosts: Some(19),
+                isp_stage: Some("stage-1".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_legacy_minimal_v0_4_0_health_json() {
+        let addr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let legacy = "{\"status\":\"ok\",\"service\":\"vdpi\",\"version\":\"0.4.0\"}\n";
+        let parsed = parse_health_json(legacy, addr, 8080, None)
+            .expect("legacy minimal health payload should parse");
+
+        assert_eq!(
+            parsed,
+            LiveEngineStatus {
+                addr,
+                port: 8080,
+                socks_port: None,
+                version: Some("0.4.0".to_string()),
+                mode: None,
+                doh: None,
+                block_quic: None,
+                active_connections: None,
+                total_connections: None,
+                learned_hosts: None,
+                isp_stage: None,
+            }
+        );
+
+        let service_only = r#"{"service":"vdpi"}"#;
+        let parsed_service_only = parse_health_json(service_only, addr, 8080, Some(1080))
+            .expect("service=vdpi payload without status should parse");
+        assert_eq!(parsed_service_only.version, None);
+        assert_eq!(parsed_service_only.socks_port, Some(1080));
+
+        let status_only = r#"{"status":"ok"}"#;
+        assert!(parse_health_json(status_only, addr, 8080, None).is_some());
+    }
+
+    #[test]
+    fn rejects_invalid_health_json() {
+        let addr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert_eq!(parse_health_json("", addr, 8080, None), None);
+        assert_eq!(parse_health_json("   \r\n", addr, 8080, None), None);
+        assert_eq!(
+            parse_health_json("<html>200 OK</html>", addr, 8080, None),
+            None
+        );
+        assert_eq!(
+            parse_health_json(r#"{"status":"ok""#, addr, 8080, None),
+            None
+        );
+        assert_eq!(parse_health_json(r#"["ok"]"#, addr, 8080, None), None);
+        assert_eq!(
+            parse_health_json(r#"{"hello":"world"}"#, addr, 8080, None),
+            None
+        );
+        assert_eq!(
+            parse_health_json(r#"{"status":"error","service":"vdpi"}"#, addr, 8080, None),
+            None
+        );
+    }
+
+    #[test]
+    fn probe_connect_ip_normalizes_wildcards_and_rejects_remote() {
+        assert_eq!(
+            probe_connect_ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        );
+        assert_eq!(
+            probe_connect_ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+            Some(IpAddr::V6(Ipv6Addr::LOCALHOST))
+        );
+        assert_eq!(
+            probe_connect_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        );
+        assert_eq!(
+            probe_connect_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            Some(IpAddr::V6(Ipv6Addr::LOCALHOST))
+        );
+        assert_eq!(
+            probe_connect_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            None
+        );
+    }
+
+    #[test]
+    fn probe_local_health_accepts_200_and_rejects_non_200() {
+        use std::net::{Shutdown, TcpListener};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let port = listener.local_addr().expect("listener addr").port();
+
+        let body = r#"{"status":"ok","service":"vdpi","version":"0.4.2","mode":"combo","doh":true,"block_quic":true,"active_connections":3,"total_connections":42,"learned_hosts":5,"isp_stage":"stage-1"}"#;
+        let responses = [
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}"
+            ),
+            format!(
+                "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}"
+            ),
+            format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}"
+            ),
+        ];
+
+        let server = std::thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("accept probe connection");
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut req_buf = [0u8; 512];
+                let _ = stream.read(&mut req_buf);
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write HTTP response");
+                let _ = stream.flush();
+                let _ = stream.shutdown(Shutdown::Write);
+            }
+        });
+
+        let ok_11 = probe_local_health(IpAddr::V4(Ipv4Addr::LOCALHOST), port, Some(1080))
+            .expect("HTTP/1.1 200 response should succeed");
+        assert_eq!(ok_11.addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(ok_11.port, port);
+        assert_eq!(ok_11.socks_port, Some(1080));
+        assert_eq!(ok_11.version.as_deref(), Some("0.4.2"));
+        assert_eq!(ok_11.mode.as_deref(), Some("combo"));
+        assert_eq!(ok_11.doh, Some(true));
+        assert_eq!(ok_11.block_quic, Some(true));
+        assert_eq!(ok_11.active_connections, Some(3));
+        assert_eq!(ok_11.total_connections, Some(42));
+        assert_eq!(ok_11.learned_hosts, Some(5));
+        assert_eq!(ok_11.isp_stage.as_deref(), Some("stage-1"));
+
+        let ok_10_wildcard = probe_local_health(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port, None)
+            .expect("HTTP/1.0 200 via 0.0.0.0 wildcard should normalize to 127.0.0.1");
+        assert_eq!(ok_10_wildcard.version.as_deref(), Some("0.4.2"));
+
+        let rejected_404 = probe_local_health(IpAddr::V4(Ipv4Addr::LOCALHOST), port, Some(1080));
+        assert_eq!(rejected_404, None);
+
+        server.join().expect("server thread should finish cleanly");
     }
 }

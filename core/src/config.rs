@@ -34,6 +34,11 @@ pub enum Command {
     Install,
     /// Stop vdpi, remove startup registration, and restore system proxy settings
     Uninstall,
+    /// Temporarily stop the installed background service and restore system proxies
+    #[command(visible_alias = "stop")]
+    Pause,
+    /// Start a paused background service and re-enable anti-DPI protection
+    Resume,
     /// Display live daemon health, ports, system proxy state, and session environment
     Status,
     /// Run live end-to-end DPI bypass diagnostics (HTTP CONNECT + SOCKS5h + DoH)
@@ -402,5 +407,20 @@ mod tests {
         let err = CliArgs::parse_from_iter(["vdpi", "update", "--check", "--force"])
             .expect_err("--check and --force must conflict");
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn parses_pause_subcommand_and_stop_alias() {
+        let pause = CliArgs::parse_from_iter(["vdpi", "pause"]).expect("valid pause subcommand");
+        assert!(matches!(pause.command, Some(Command::Pause)));
+
+        let stop = CliArgs::parse_from_iter(["vdpi", "stop"]).expect("valid stop alias");
+        assert!(matches!(stop.command, Some(Command::Pause)));
+    }
+
+    #[test]
+    fn parses_resume_subcommand() {
+        let resume = CliArgs::parse_from_iter(["vdpi", "resume"]).expect("valid resume subcommand");
+        assert!(matches!(resume.command, Some(Command::Resume)));
     }
 }
