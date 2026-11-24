@@ -7,7 +7,7 @@ description = "Zero-hassle, self-healing anti-DPI engine in Rust - native across
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-readme = "../../README.md"
+readme = "../README.md"
 keywords = ["dpi", "proxy", "socks5", "doh", "network"]
 categories = ["command-line-utilities", "network-programming"]
 

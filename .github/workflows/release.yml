@@ -55,7 +55,7 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --version 4.1.2 --locked
       - name: Build Native Rust JNI Libraries
-        run: ./apps/android/scripts/build-native.sh
+        run: ./android/scripts/build-native.sh
       - name: Decode Optional Release Keystore
         env:
           VDPI_KEYSTORE_BASE64: ${{ secrets.VDPI_KEYSTORE_BASE64 }}
@@ -65,7 +65,7 @@ jobs:
             echo "VDPI_KEYSTORE_PATH=$RUNNER_TEMP/vdpi-release.jks" >> "$GITHUB_ENV"
           fi
       - name: Run Android Unit Tests, Lint & Assemble Release APK
-        working-directory: apps/android
+        working-directory: android
         env:
           VDPI_KEYSTORE_PASSWORD: ${{ secrets.VDPI_KEYSTORE_PASSWORD }}
           VDPI_KEY_ALIAS: ${{ secrets.VDPI_KEY_ALIAS }}
@@ -73,7 +73,7 @@ jobs:
         run: ./gradlew testDebugUnitTest lintRelease assembleRelease --no-daemon
       - name: Verify APK Native ABIs & Package Artifact
         run: |
-          APK="apps/android/app/build/outputs/apk/release/app-release.apk"
+          APK="android/app/build/outputs/apk/release/app-release.apk"
           for abi in arm64-v8a armeabi-v7a x86_64; do
             unzip -l "$APK" | grep -q "lib/${abi}/libvdpi_android.so" || {
               echo "ERROR: Missing lib/${abi}/libvdpi_android.so in $APK" >&2
@@ -104,12 +104,12 @@ jobs:
           HOMEBREW_NO_INSTALL_CLEANUP: "1"
         run: brew install xcodegen ldid-procursus
       - name: Build VdpiCore.xcframework (Rust iOS + Simulator)
-        run: ./apps/ios/scripts/build-xcframework.sh
+        run: ./ios/scripts/build-xcframework.sh
       - name: Generate Xcode Project
-        working-directory: apps/ios
+        working-directory: ios
         run: xcodegen generate
       - name: Build & Run XCTests on iOS Simulator
-        working-directory: apps/ios
+        working-directory: ios
         run: |
           set -euo pipefail
           SIM_UDID=$(xcrun simctl list devices available -j | python3 -c "
@@ -136,9 +136,9 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             DEVELOPMENT_TEAM=""
       - name: Build Physical iOS arm64 Device App & Package Unsigned IPA
-        working-directory: apps/ios
+        working-directory: ios
         run: |
-          rm -rf build ../../dist/ios
+          rm -rf build ../dist/ios
           xcodebuild build \
             -project Vdpi.xcodeproj \
             -scheme VdpiApp \
@@ -158,19 +158,19 @@ jobs:
           ldid -e "$APPEX_PATH/VdpiPacketTunnel" | tee /dev/stderr | grep -q "packet-tunnel-provider"
           ldid -e "$APP_PATH/VdpiApp" | tee /dev/stderr | grep -q "group.com.vulninc.vdpi"
 
-          mkdir -p ../../dist/ios/ipa-stage/Payload
-          cp -R "$APP_PATH" ../../dist/ios/ipa-stage/Payload/VdpiApp.app
-          (cd ../../dist/ios/ipa-stage && zip -qry ../vdpi-ios-unsigned.ipa Payload)
-          rm -rf ../../dist/ios/ipa-stage build
+          mkdir -p ../dist/ios/ipa-stage/Payload
+          cp -R "$APP_PATH" ../dist/ios/ipa-stage/Payload/VdpiApp.app
+          (cd ../dist/ios/ipa-stage && zip -qry ../vdpi-ios-unsigned.ipa Payload)
+          rm -rf ../dist/ios/ipa-stage build
 
           # Verify IPA layout contains both main app and embedded NetworkExtension
-          unzip -l ../../dist/ios/vdpi-ios-unsigned.ipa | grep -q "Payload/VdpiApp.app/Info.plist"
-          unzip -l ../../dist/ios/vdpi-ios-unsigned.ipa | grep -q "Payload/VdpiApp.app/PlugIns/VdpiPacketTunnel.appex/Info.plist"
-          ls -lh ../../dist/ios/vdpi-ios-unsigned.ipa
+          unzip -l ../dist/ios/vdpi-ios-unsigned.ipa | grep -q "Payload/VdpiApp.app/Info.plist"
+          unzip -l ../dist/ios/vdpi-ios-unsigned.ipa | grep -q "Payload/VdpiApp.app/PlugIns/VdpiPacketTunnel.appex/Info.plist"
+          ls -lh ../dist/ios/vdpi-ios-unsigned.ipa
       - name: Package VdpiCore.xcframework Artifact
         run: |
           mkdir -p dist/ios
-          ditto -c -k --sequesterRsrc --keepParent apps/ios/Frameworks/VdpiCore.xcframework dist/ios/VdpiCore.xcframework.zip
+          ditto -c -k --sequesterRsrc --keepParent ios/Frameworks/VdpiCore.xcframework dist/ios/VdpiCore.xcframework.zip
       - uses: actions/upload-artifact@v4
         with:
           name: release-ios

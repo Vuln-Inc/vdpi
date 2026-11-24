@@ -17,7 +17,7 @@ serde_json = "1.0"
 socket2 = { version = "0.5", features = ["all"] }
 tokio = { version = "1.50", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
 tracing = "0.1"
-vdpi = { path = "../vdpi" }
+vdpi = { path = ".." }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

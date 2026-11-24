@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/vdpi",
-    "crates/vdpi-tun",
-    "crates/vdpi-android",
-    "crates/vdpi-ios",
+    "core",
+    "core/tun",
+    "android/native",
+    "ios/native",
 ]
-default-members = ["crates/vdpi"]
+default-members = ["core"]
 
 [workspace.package]
 version = "0.3.4"
