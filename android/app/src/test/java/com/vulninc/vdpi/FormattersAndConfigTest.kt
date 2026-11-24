@@ -1,12 +1,21 @@
 package com.vulninc.vdpi
 
+import com.vulninc.vdpi.data.SettingsRepository
 import com.vulninc.vdpi.data.SplitTunnelMode
 import com.vulninc.vdpi.data.ThemePreference
+import com.vulninc.vdpi.data.UpdateChecker
 import com.vulninc.vdpi.data.VdpiSettings
 import com.vulninc.vdpi.engine.DesyncMode
+import com.vulninc.vdpi.engine.DoctorCheck
+import com.vulninc.vdpi.engine.DoctorReport
 import com.vulninc.vdpi.engine.NativeEngine
 import com.vulninc.vdpi.engine.NativeEngineConfig
+import com.vulninc.vdpi.engine.TelemetrySnapshot
+import com.vulninc.vdpi.ui.appendThroughputSample
+import com.vulninc.vdpi.ui.buildDiagnosticsReport
 import com.vulninc.vdpi.ui.computeSettingsChangeSummary
+import com.vulninc.vdpi.vpn.TunnelPhase
+import com.vulninc.vdpi.vpn.TunnelRuntimeSnapshot
 import com.vulninc.vdpi.util.formatBytes
 import com.vulninc.vdpi.util.formatEventTime
 import com.vulninc.vdpi.util.formatStageLabel
@@ -79,10 +88,25 @@ class FormattersAndConfigTest {
         assertTrue(isValidDnsInput("1.1.1.1"))
         assertTrue(isValidDnsInput("9.9.9.9"))
         assertTrue(isValidDnsInput("2606:4700:4700::1111"))
+        assertTrue(isValidDnsInput("[2606:4700:4700::1111]"))
+        assertTrue(isValidDnsInput("2001:4860:4860:0:0:0:0:8888"))
         assertTrue(isValidDnsInput("https://dns.quad9.net/dns-query"))
+        assertTrue(isValidDnsInput("https://dns.quad9.net:443/dns-query"))
         assertFalse(isValidDnsInput("foo bar"))
         assertFalse(isValidDnsInput("999.999.999.999"))
         assertFalse(isValidDnsInput("http://1.1.1.1/dns-query"))
+        assertFalse(isValidDnsInput("https://dns.quad9.net:0/dns-query"))
+        assertFalse(isValidDnsInput("https://dns.quad9.net:70000/dns-query"))
+        assertFalse(isValidDnsInput("https://dns.quad9.net:-1/dns-query"))
+        assertFalse(isValidDnsInput("[2606:4700:4700::1111"))
+        assertFalse(isValidDnsInput("2606:4700:4700::1111]"))
+        assertFalse(isValidDnsInput(":2606:4700:4700::1111"))
+        assertFalse(isValidDnsInput("2606:4700:4700::1111:"))
+        assertFalse(isValidDnsInput("1:2:3:4:5:6:7"))
+        assertFalse(isValidDnsInput("1:2:3:4:5:6:7:8::"))
+        assertFalse(isValidDnsInput("::"))
+        assertFalse(isValidDnsInput("2606::4700::1111"))
+        assertFalse(isValidDnsInput("2606:::1111"))
 
         assertTrue(isValidBypassDomain("example.com"))
         assertTrue(isValidBypassDomain("*.bank.gov.tr"))
@@ -327,5 +351,245 @@ class FormattersAndConfigTest {
             splitPackages = baseline.splitPackages,
         )
         assertEquals(emptyList<String>(), computeSettingsChangeSummary(reverted, baseline))
+    }
+
+    @Test
+    fun updateCheckerIsNewerVersionMatrix() {
+        assertTrue(UpdateChecker.isNewerVersion("v0.4.1", "0.4.0"))
+        assertTrue(UpdateChecker.isNewerVersion("V1.2.3", "1.2.2"))
+        assertTrue(UpdateChecker.isNewerVersion("V1.2.3", "V1.2.2"))
+        assertTrue(UpdateChecker.isNewerVersion("V1.2.3", "V1.2.2-debug"))
+        assertTrue(UpdateChecker.isNewerVersion("0.10.0", "0.9.9"))
+        assertTrue(UpdateChecker.isNewerVersion("1.0.0", "0.99.99"))
+        assertTrue(UpdateChecker.isNewerVersion("v0.4.1", "0.4.0-debug"))
+
+        // Equal versions
+        assertFalse(UpdateChecker.isNewerVersion("0.4.0", "0.4.0"))
+        assertFalse(UpdateChecker.isNewerVersion("v0.4.0", "0.4.0"))
+        assertFalse(UpdateChecker.isNewerVersion("V1.2.3", "1.2.3"))
+        assertFalse(UpdateChecker.isNewerVersion("0.4.0", "0.4.0-debug"))
+
+        // Older versions
+        assertFalse(UpdateChecker.isNewerVersion("0.3.9", "0.4.0"))
+        assertFalse(UpdateChecker.isNewerVersion("v0.3.4", "0.4.0"))
+        assertFalse(UpdateChecker.isNewerVersion("V1.2.2", "V1.2.3"))
+        assertFalse(UpdateChecker.isNewerVersion("0.9.9", "0.10.0"))
+
+        // Prerelease and build metadata rejected
+        assertFalse(UpdateChecker.isNewerVersion("v0.5.0-beta.1", "0.4.0"))
+        assertFalse(UpdateChecker.isNewerVersion("0.5.0-rc.1", "0.4.0"))
+        assertFalse(UpdateChecker.isNewerVersion("0.4.1+20260101", "0.4.0"))
+
+        // Garbage / malformed versions rejected
+        assertFalse(UpdateChecker.isNewerVersion("", "0.4.0"))
+        assertFalse(UpdateChecker.isNewerVersion("invalid", "0.4.0"))
+        assertFalse(UpdateChecker.isNewerVersion("0.4", "0.3.0"))
+        assertFalse(UpdateChecker.isNewerVersion("0.4.1.0", "0.4.0"))
+        assertFalse(UpdateChecker.isNewerVersion("v0.a.1", "0.4.0"))
+        assertFalse(UpdateChecker.isNewerVersion("-1.0.0", "0.4.0"))
+        assertFalse(UpdateChecker.isNewerVersion("0.4.1", "not-a-version"))
+        assertFalse(UpdateChecker.isNewerVersion("0.4.1", ""))
+    }
+
+    @Test
+    fun settingsJsonExportImportRoundtripAndSanitization() {
+        val original = VdpiSettings(
+            desyncMode = DesyncMode.TLS_RECORD,
+            chunkSize = 18,
+            dnsAddr = "9.9.9.9",
+            enableDoh = false,
+            ipv4Only = true,
+            blockQuic = false,
+            bypassDomains = listOf("*.bank.example", "portal.gov.tr"),
+            splitTunnelMode = SplitTunnelMode.ONLY_SELECTED,
+            splitPackages = setOf("com.example.alpha", "org.example.beta"),
+            theme = ThemePreference.DARK,
+        )
+
+        val encoded = SettingsRepository.exportSettingsJson(original)
+        val parsed = SettingsRepository.parseSettingsJson(encoded)
+        assertTrue(parsed.isSuccess)
+        assertEquals(original, parsed.getOrThrow())
+
+        val messy = """
+            {
+              "version": 1,
+              "desync_mode": "fragment",
+              "chunk_size": 999,
+              "dns_addr": " 1.1.1.1 ",
+              "enable_doh": true,
+              "ipv4_only": false,
+              "block_quic": true,
+              "bypass_domains": ["  HTTPS://Example.COM/path ", "not a domain", "example.com"],
+              "split_tunnel_mode": "bypass_selected",
+              "split_packages": ["com.example.good", "invalid package"],
+              "theme": "light"
+            }
+        """.trimIndent()
+        val sanitized = SettingsRepository.parseSettingsJson(messy).getOrThrow()
+        assertEquals(DesyncMode.FRAGMENT, sanitized.desyncMode)
+        assertEquals(64, sanitized.chunkSize)
+        assertEquals("1.1.1.1", sanitized.dnsAddr)
+        assertEquals(listOf("example.com"), sanitized.bypassDomains)
+        assertEquals(setOf("com.example.good"), sanitized.splitPackages)
+        assertEquals(ThemePreference.LIGHT, sanitized.theme)
+
+        val lowChunk = """{"desync_mode":"split","chunk_size":0,"dns_addr":"8.8.8.8"}"""
+        assertEquals(1, SettingsRepository.parseSettingsJson(lowChunk).getOrThrow().chunkSize)
+    }
+
+    @Test
+    fun settingsJsonRejectsCorruptAndInvalidPayloads() {
+        assertTrue(SettingsRepository.parseSettingsJson("").isFailure)
+        assertTrue(SettingsRepository.parseSettingsJson("   ").isFailure)
+        assertTrue(SettingsRepository.parseSettingsJson("{not valid json").isFailure)
+        assertTrue(SettingsRepository.parseSettingsJson("[]").isFailure)
+        assertTrue(SettingsRepository.parseSettingsJson("{}").isFailure)
+        assertTrue(SettingsRepository.parseSettingsJson("""{"unrelated":"value"}""").isFailure)
+        assertTrue(
+            SettingsRepository.parseSettingsJson(
+                """{"version":99,"desync_mode":"combo","dns_addr":"1.1.1.1"}"""
+            ).isFailure
+        )
+        assertTrue(
+            SettingsRepository.parseSettingsJson(
+                """{"desync_mode":"combo","dns_addr":"999.999.999.999"}"""
+            ).isFailure
+        )
+        assertTrue(
+            SettingsRepository.parseSettingsJson(
+                """{"desync_mode":"combo","dns_addr":"http://1.1.1.1/dns-query"}"""
+            ).isFailure
+        )
+        assertTrue(
+            SettingsRepository.parseSettingsJson(
+                """{"desync_mode":"unknown-mode","dns_addr":"1.1.1.1"}"""
+            ).isFailure
+        )
+        assertTrue(
+            SettingsRepository.parseSettingsJson(
+                """{"desync_mode":"combo","dns_addr":"1.1.1.1","split_tunnel_mode":"weird"}"""
+            ).isFailure
+        )
+        assertTrue(
+            SettingsRepository.parseSettingsJson(
+                """{"desync_mode":"combo","dns_addr":"1.1.1.1","theme":"neon"}"""
+            ).isFailure
+        )
+        assertTrue(
+            SettingsRepository.parseSettingsJson(
+                """{"desync_mode":"combo","dns_addr":"1.1.1.1","theme":""}"""
+            ).isFailure
+        )
+        assertTrue(
+            SettingsRepository.parseSettingsJson(
+                """{"version":{},"desync_mode":"combo","dns_addr":"1.1.1.1"}"""
+            ).isFailure
+        )
+        assertTrue(
+            SettingsRepository.parseSettingsJson(
+                """{"version":[1],"desync_mode":"combo","dns_addr":"1.1.1.1"}"""
+            ).isFailure
+        )
+        assertTrue(
+            SettingsRepository.parseSettingsJson(
+                """{"version":"1","desync_mode":"combo","dns_addr":"1.1.1.1"}"""
+            ).isFailure
+        )
+        assertTrue(
+            SettingsRepository.parseSettingsJson(
+                """{"version":null,"desync_mode":"combo","dns_addr":"1.1.1.1"}"""
+            ).isFailure
+        )
+        assertTrue(
+            SettingsRepository.parseSettingsJson(
+                """{"version":true,"desync_mode":"combo","dns_addr":"1.1.1.1"}"""
+            ).isFailure
+        )
+    }
+
+    @Test
+    fun nativeConfigSerializesCachePath() {
+        val cfg = NativeEngineConfig(
+            cachePath = "/data/user/0/com.vulninc.vdpi/files/adaptive-cache.json",
+        )
+        val encoded = NativeEngine.encodeConfig(cfg)
+        assertTrue(
+            encoded.contains(
+                "\"cache_path\":\"/data/user/0/com.vulninc.vdpi/files/adaptive-cache.json\""
+            )
+        )
+    }
+
+    @Test
+    fun throughputRingCapsAt24SamplesAndClampsNegatives() {
+        var ring = emptyList<Long>()
+        for (i in 1L..30L) {
+            ring = appendThroughputSample(ring, i * 100L)
+        }
+        assertEquals(24, ring.size)
+        assertEquals(700L, ring.first())
+        assertEquals(3000L, ring.last())
+
+        val clamped = appendThroughputSample(ring, -500L)
+        assertEquals(24, clamped.size)
+        assertEquals(0L, clamped.last())
+    }
+
+    @Test
+    fun diagnosticsReportFormatsAndRedactsSensitiveFields() {
+        val settings = VdpiSettings(
+            desyncMode = DesyncMode.COMBO,
+            chunkSize = 10,
+            dnsAddr = "https://dns.custom.example/secret-token-123",
+            enableDoh = true,
+            ipv4Only = false,
+            blockQuic = true,
+            bypassDomains = listOf("private-bank.example", "secret.internal.org"),
+            splitTunnelMode = SplitTunnelMode.BYPASS_SELECTED,
+            splitPackages = setOf("com.secret.wallet"),
+        )
+        val runtime = TunnelRuntimeSnapshot(
+            phase = TunnelPhase.CONNECTED,
+            telemetry = TelemetrySnapshot(
+                running = true,
+                uptimeSecs = 95,
+                stageNumber = 2,
+                stageLabel = "OobSniDesync",
+            ),
+        )
+        val report = DoctorReport(
+            ok = true,
+            checks = listOf(
+                DoctorCheck(
+                    name = "DoH",
+                    target = "1.1.1.1",
+                    passed = true,
+                    latencyMs = 28L,
+                    detail = "HTTP/2 OK",
+                ),
+            ),
+        )
+
+        val text = buildDiagnosticsReport(
+            appVersion = "0.4.0",
+            engineVersion = "0.4.0",
+            settings = settings,
+            runtime = runtime,
+            doctorReport = report,
+            androidRelease = "15",
+            androidSdk = 35,
+        )
+
+        assertTrue(text.contains("App Version: v0.4.0"))
+        assertTrue(text.contains("Desync Mode: Combo (combo), chunk=10"))
+        assertTrue(text.contains("https://dns.custom.example/<redacted>"))
+        assertTrue(text.contains("QUIC Blocking: enabled"))
+        assertTrue(text.contains("Bypass Domains: 2 configured (redacted)"))
+        assertTrue(text.contains("Split Tunnel: Bypass selected (1 apps, redacted)"))
+        assertTrue(text.contains("- [PASS] DoH (1.1.1.1): 28 ms - HTTP/2 OK"))
+        assertFalse(text.contains("secret-token-123"))
+        assertFalse(text.contains("private-bank.example"))
+        assertFalse(text.contains("com.secret.wallet"))
     }
 }

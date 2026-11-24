@@ -38,6 +38,15 @@ pub enum Command {
     Status,
     /// Run live end-to-end DPI bypass diagnostics (HTTP CONNECT + SOCKS5h + DoH)
     Doctor,
+    /// Check GitHub Releases for a newer vdpi version and update in place
+    Update {
+        /// Only check whether a newer release is available without installing
+        #[arg(long, default_value_t = false, conflicts_with = "force")]
+        check: bool,
+        /// Reinstall the latest release even if the current version matches
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -348,5 +357,50 @@ mod tests {
         let cfg = cli.into_runtime_config();
         assert!(cfg.windows_service);
         assert!(cfg.quiet);
+    }
+
+    #[test]
+    fn parses_update_subcommand_defaults() {
+        let cli = CliArgs::parse_from_iter(["vdpi", "update"]).expect("valid update subcommand");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Update {
+                check: false,
+                force: false,
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_update_check_flag() {
+        let cli = CliArgs::parse_from_iter(["vdpi", "update", "--check"])
+            .expect("valid update --check subcommand");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Update {
+                check: true,
+                force: false,
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_update_force_flag() {
+        let cli = CliArgs::parse_from_iter(["vdpi", "update", "--force"])
+            .expect("valid update --force subcommand");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Update {
+                check: false,
+                force: true,
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_conflicting_update_check_and_force_flags() {
+        let err = CliArgs::parse_from_iter(["vdpi", "update", "--check", "--force"])
+            .expect_err("--check and --force must conflict");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }

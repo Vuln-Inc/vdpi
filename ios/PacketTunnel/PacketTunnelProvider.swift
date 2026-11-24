@@ -97,9 +97,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         return
                     }
 
-                    var effectiveSettings = settings
-                    effectiveSettings.ipv4Only = effectiveIpv4Only
-                    let configJson = effectiveSettings.toNativeConfigJSON()
+                    let configJson = Self.buildEngineConfigJSON(
+                        from: settings,
+                        effectiveIpv4Only: effectiveIpv4Only
+                    )
                     let ctxPtr = Unmanaged.passUnretained(self).toOpaque()
                     if let errMsg = VdpiNativeBridge.start(
                         configJson: configJson,
@@ -110,6 +111,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                             domain: "com.vulninc.vdpi.tunnel",
                             code: 1001,
                             userInfo: [NSLocalizedDescriptionKey: errMsg]
+                        ))
+                        return
+                    }
+
+                    if self.isStopping {
+                        withExtendedLifetime(self) {
+                            VdpiNativeBridge.stop()
+                        }
+                        completionHandler(NSError(
+                            domain: "com.vulninc.vdpi.tunnel",
+                            code: 1002,
+                            userInfo: [NSLocalizedDescriptionKey: "Tunnel stopped during startup"]
                         ))
                         return
                     }
@@ -134,7 +147,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // Execute teardown on lifecycleQueue so any in-flight start/reload finishes before
         // VdpiNativeBridge.stop() joins the Rust writer task and completionHandler returns.
         lifecycleQueue.async {
-            VdpiNativeBridge.stop()
+            self.stopPathMonitoring()
+            withExtendedLifetime(self) {
+                VdpiNativeBridge.stop()
+            }
             VdpiAppGroup.saveAppliedConfig(nil)
             completionHandler()
         }
@@ -157,6 +173,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         case .clearCache:
             lifecycleQueue.async {
                 VdpiNativeBridge.clearCache()
+                Self.removeAdaptiveCacheFile()
                 completionHandler?(ProviderCommandResponse(ok: true).encodeData())
             }
 
@@ -186,7 +203,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         return
                     }
                     self.lifecycleQueue.async {
-                        self.reasserting = false
+                        defer {
+                            self.reasserting = false
+                        }
                         guard self.isRunning else {
                             completionHandler?(ProviderCommandResponse(ok: false, error: "Tunnel stopped during reload").encodeData())
                             return
@@ -195,15 +214,22 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                             completionHandler?(ProviderCommandResponse(ok: false, error: error.localizedDescription).encodeData())
                             return
                         }
-                        var effectiveSettings = settings
-                        effectiveSettings.ipv4Only = effectiveIpv4Only
+                        let configJson = Self.buildEngineConfigJSON(
+                            from: settings,
+                            effectiveIpv4Only: effectiveIpv4Only
+                        )
                         let ctxPtr = Unmanaged.passUnretained(self).toOpaque()
                         if let errMsg = VdpiNativeBridge.start(
-                            configJson: effectiveSettings.toNativeConfigJSON(),
+                            configJson: configJson,
                             writeCallback: vdpiOutboundPacketCallback,
                             userContext: ctxPtr
                         ) {
                             completionHandler?(ProviderCommandResponse(ok: false, error: errMsg).encodeData())
+                        } else if !self.isRunning {
+                            withExtendedLifetime(self) {
+                                VdpiNativeBridge.stop()
+                            }
+                            completionHandler?(ProviderCommandResponse(ok: false, error: "Tunnel stopped during reload").encodeData())
                         } else {
                             VdpiAppGroup.saveAppliedConfig(settings.toNativeConfig())
                             completionHandler?(ProviderCommandResponse(ok: true).encodeData())
@@ -313,5 +339,40 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         stateLock.unlock()
         pending?.cancel()
         monitor?.cancel()
+    }
+
+    private static func adaptiveCacheFileURL() -> URL? {
+        FileManager.default
+            .containerURL(forSecurityApplicationGroupIdentifier: VdpiAppGroup.suiteName)?
+            .appendingPathComponent("adaptive-cache.json")
+    }
+
+    private static func buildEngineConfigJSON(
+        from settings: VdpiSettings,
+        effectiveIpv4Only: Bool
+    ) -> String {
+        var effectiveSettings = settings
+        effectiveSettings.ipv4Only = effectiveIpv4Only
+        var tunnelConfig = effectiveSettings.toNativeConfig()
+        tunnelConfig.cachePath = adaptiveCacheFileURL()?.path
+        let encoder = JSONEncoder()
+        guard let data = try? encoder.encode(tunnelConfig),
+              let json = String(data: data, encoding: .utf8)
+        else {
+            return "{}"
+        }
+        return json
+    }
+
+    private static func removeAdaptiveCacheFile() {
+        guard let containerURL = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: VdpiAppGroup.suiteName
+        ) else { return }
+        for filename in ["adaptive-cache.json", "adaptive-cache.tmp", "adaptive-cache.json.tmp"] {
+            let fileURL = containerURL.appendingPathComponent(filename)
+            if FileManager.default.fileExists(atPath: fileURL.path) {
+                try? FileManager.default.removeItem(at: fileURL)
+            }
+        }
     }
 }

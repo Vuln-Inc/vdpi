@@ -548,6 +548,8 @@ pub async fn run_tun_pipeline(
     }
     tun_stats.udp_flows_active.store(0, Ordering::Relaxed);
 
+    crate::flush_engine_cache(&ctx).await;
+
     if *shutdown_rx.borrow() {
         Ok(())
     } else {

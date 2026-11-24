@@ -649,7 +649,7 @@ private fun formatCompactUptime(totalSecs: Long): String {
     }
 }
 
-// ── Floating Liquid Glass Tab Bar ──
+// ── Floating Tab Bar ──
 
 @Composable
 internal fun FloatingLiquidGlassTabBar(
@@ -662,6 +662,7 @@ internal fun FloatingLiquidGlassTabBar(
     increaseContrast: Boolean,
     onSelect: (MainTab) -> Unit,
     modifier: Modifier = Modifier,
+    showSettingsBadge: Boolean = false,
 ) {
     val palette = VdpiThemeTokens.palette
     val haptic = LocalHapticFeedback.current
@@ -783,7 +784,7 @@ internal fun FloatingLiquidGlassTabBar(
                         )
                     },
             ) {
-                // Sliding Apple iOS 26 Liquid Glass puck lens
+                // Sliding active tab indicator
                 val lensShadowModifier = if (reduceTransparency) {
                     Modifier
                 } else {
@@ -843,10 +844,12 @@ internal fun FloatingLiquidGlassTabBar(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     tabs.forEach { tab ->
-                        val statusDotColor = if (tab == MainTab.TUNNEL && tunnelPhase == TunnelPhase.CONNECTED) {
-                            if (pendingReconnect) palette.warning else palette.signal
-                        } else {
-                            null
+                        val statusDotColor = when {
+                            tab == MainTab.TUNNEL && tunnelPhase == TunnelPhase.CONNECTED ->
+                                if (pendingReconnect) palette.warning else palette.signal
+                            tab == MainTab.SETTINGS && showSettingsBadge ->
+                                palette.accent
+                            else -> null
                         }
                         FloatingTabBarItem(
                             tab = tab,
@@ -934,8 +937,8 @@ private fun RowScope.FloatingTabBarItem(
                         Box(
                             modifier = Modifier
                                 .align(Alignment.TopEnd)
-                                .offset(x = 3.dp, y = (-2).dp)
-                                .size(5.dp)
+                                .offset(x = 4.dp, y = (-2).dp)
+                                .size(6.dp)
                                 .clip(CircleShape)
                                 .background(statusDotColor),
                         )
@@ -950,7 +953,8 @@ private fun RowScope.FloatingTabBarItem(
                     color = tint,
                     maxLines = 1,
                     softWrap = false,
-                    overflow = TextOverflow.Clip,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(horizontal = 4.dp),
                 )
             }
         } else {
@@ -989,7 +993,8 @@ private fun RowScope.FloatingTabBarItem(
                     color = tint,
                     maxLines = 1,
                     softWrap = false,
-                    overflow = TextOverflow.Clip,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(horizontal = 4.dp),
                 )
             }
         }

@@ -315,4 +315,54 @@ final class VdpiSharedTests: XCTestCase {
             "Initial chunk-byte TCP split on first flight"
         )
     }
+
+    func testUpdateCheckerSemverComparison() {
+        XCTAssertTrue(VdpiUpdateChecker.isNewerVersion("v0.4.1", than: "0.4.0"))
+        XCTAssertTrue(VdpiUpdateChecker.isNewerVersion("0.10.0", than: "0.9.9"))
+        XCTAssertFalse(VdpiUpdateChecker.isNewerVersion("0.4.0", than: "v0.4.0"))
+        XCTAssertFalse(VdpiUpdateChecker.isNewerVersion("0.3.9", than: "0.4.0"))
+        XCTAssertFalse(VdpiUpdateChecker.isNewerVersion("0.4.1-beta.1", than: "0.4.0"))
+    }
+
+    func testNativeEngineConfigCachePathJsonRoundTripAndLegacyDecode() throws {
+        var config = NativeEngineConfig(
+            mode: .combo,
+            chunkSize: 10,
+            dnsAddr: "1.1.1.1",
+            enableDoh: true,
+            ipv4Only: false,
+            blockQuic: true,
+            mtu: 1400,
+            bypassDomains: ["example.com"]
+        )
+        config.cachePath = "/tmp/vdpi/strategy_cache.json"
+
+        let encoded = try JSONEncoder().encode(config)
+        let dict = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        XCTAssertEqual(dict["cache_path"] as? String, "/tmp/vdpi/strategy_cache.json")
+
+        let decoded = try JSONDecoder().decode(NativeEngineConfig.self, from: encoded)
+        XCTAssertEqual(decoded, config)
+        XCTAssertEqual(decoded.cachePath, "/tmp/vdpi/strategy_cache.json")
+
+        let legacyJson = """
+        {
+            "mode": "combo",
+            "chunk_size": 10,
+            "dns_addr": "1.1.1.1",
+            "enable_doh": true,
+            "ipv4_only": false,
+            "block_quic": true,
+            "timeout_ms": 8000,
+            "mtu": 1400,
+            "bypass_domains": ["example.com"]
+        }
+        """
+        let legacyData = try XCTUnwrap(legacyJson.data(using: .utf8))
+        let legacyDecoded = try JSONDecoder().decode(NativeEngineConfig.self, from: legacyData)
+        XCTAssertNil(legacyDecoded.cachePath)
+        XCTAssertEqual(legacyDecoded.mode, .combo)
+        XCTAssertEqual(legacyDecoded.mtu, 1400)
+        XCTAssertEqual(legacyDecoded.bypassDomains, ["example.com"])
+    }
 }

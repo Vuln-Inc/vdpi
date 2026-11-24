@@ -6,19 +6,220 @@ use crate::tls::{
     split_tls_records_deep, split_tls_records_multi, ClientHelloInfo,
 };
 use anyhow::{anyhow, bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{
     copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, Interest, ReadBuf,
 };
 use tokio::net::TcpStream;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::debug;
+
+pub const PERSISTED_CACHE_VERSION: u32 = 1;
+pub const MAX_PERSISTED_HOSTS: usize = 256;
+pub const PERSISTED_CACHE_TTL_SECS: u64 = 7 * 24 * 3600;
+pub const PERSIST_DEBOUNCE_SECS: u64 = 10;
+const MAX_PERSISTED_FILE_BYTES: u64 = 512 * 1024;
+const MAX_HOSTNAME_LEN: usize = 255;
+
+/// Single learned hostname entry persisted in the adaptive stage cache file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedHostEntry {
+    pub host: String,
+    pub stage: u8,
+    pub updated_at: u64,
+}
+
+/// Bounded, versioned on-disk snapshot of learned TLS desync strategies and
+/// the promoted ISP-wide stage.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedAdaptiveCache {
+    pub version: u32,
+    pub global_isp_stage: u8,
+    pub entries: Vec<PersistedHostEntry>,
+}
+
+/// Returns the platform-standard desktop cache file path for persisting learned
+/// adaptive TLS desync stages across restarts. Returns `None` on mobile targets
+/// (Android/iOS), where the host app provides its sandboxed cache path via `TunnelConfig`.
+pub fn default_desktop_cache_path() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("LOCALAPPDATA")
+            .filter(|v| !v.is_empty())
+            .map(|dir| PathBuf::from(dir).join("vdpi").join("adaptive-cache.json"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .map(|home| {
+                PathBuf::from(home)
+                    .join("Library")
+                    .join("Caches")
+                    .join("vdpi")
+                    .join("adaptive-cache.json")
+            })
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
+            return Some(PathBuf::from(xdg).join("vdpi").join("adaptive-cache.json"));
+        }
+        std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .map(|home| {
+                PathBuf::from(home)
+                    .join(".cache")
+                    .join("vdpi")
+                    .join("adaptive-cache.json")
+            })
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn is_valid_cache_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= MAX_HOSTNAME_LEN
+        && !host
+            .bytes()
+            .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+}
+
+fn read_bounded_cache_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    let mut buf = Vec::new();
+    file.take(MAX_PERSISTED_FILE_BYTES + 1)
+        .read_to_end(&mut buf)?;
+    if (buf.len() as u64) > MAX_PERSISTED_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "persisted adaptive cache exceeds size cap",
+        ));
+    }
+    Ok(buf)
+}
+
+#[cfg(windows)]
+fn replace_file_safely(tmp_path: &Path, target_path: &Path, backup_path: &Path) -> Result<()> {
+    let mut attempt = 0u64;
+    let initial_err = loop {
+        match std::fs::rename(tmp_path, target_path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && attempt < 3 => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(15 * attempt));
+            }
+            Err(e) => break e,
+        }
+    };
+
+    // Never delete the existing cache without first moving it to a sibling backup
+    // so a second rename failure can roll back and leave the previous cache intact.
+    if target_path.exists() && std::fs::rename(target_path, backup_path).is_ok() {
+        match std::fs::rename(tmp_path, target_path) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(backup_path);
+                return Ok(());
+            }
+            Err(retry_err) => {
+                let _ = std::fs::rename(backup_path, target_path);
+                let _ = std::fs::remove_file(tmp_path);
+                return Err(retry_err).with_context(|| {
+                    format!(
+                        "failed to atomically replace cache file {} (initial error: {initial_err})",
+                        target_path.display()
+                    )
+                });
+            }
+        }
+    }
+
+    let _ = std::fs::remove_file(tmp_path);
+    Err(initial_err).with_context(|| {
+        format!(
+            "failed to atomically replace cache file {}",
+            target_path.display()
+        )
+    })
+}
+
+fn atomic_write_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let parent_dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(parent) = parent_dir {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create cache directory {}", parent.display()))?;
+    }
+
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let base_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .filter(|n| !n.is_empty())
+        .unwrap_or(std::borrow::Cow::Borrowed("adaptive-cache"));
+    let tmp_name = format!("{base_name}.{pid}.{seq}.tmp");
+    let tmp_path = match parent_dir {
+        Some(parent) => parent.join(&tmp_name),
+        None => PathBuf::from(&tmp_name),
+    };
+
+    {
+        let mut file = std::fs::File::create(&tmp_path)
+            .with_context(|| format!("failed to create temp cache file {}", tmp_path.display()))?;
+        if let Err(e) = file.write_all(bytes) {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e).with_context(|| {
+                format!("failed to write temp cache file {}", tmp_path.display())
+            });
+        }
+        let _ = file.sync_all();
+    }
+
+    #[cfg(windows)]
+    {
+        let bak_name = format!("{base_name}.{pid}.{seq}.bak");
+        let backup_path = match parent_dir {
+            Some(parent) => parent.join(&bak_name),
+            None => PathBuf::from(&bak_name),
+        };
+        replace_file_safely(&tmp_path, path, &backup_path)?;
+    }
+
+    #[cfg(not(windows))]
+    if let Err(rename_err) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(rename_err).with_context(|| {
+            format!(
+                "failed to atomically rename cache file to {}",
+                path.display()
+            )
+        });
+    }
+
+    Ok(())
+}
 
 /// Strategy learned per-hostname (and globally per ISP network) by the 7-Stage Adaptive
 /// Auto-Heal TLS Engine.
@@ -81,6 +282,46 @@ impl LearnedStrategy {
     fn is_desync(self) -> bool {
         !matches!(self, Self::DirectPassthrough)
     }
+}
+
+fn evict_oldest_adaptive_entries(
+    cache: &mut HashMap<String, LearnedStrategy>,
+    timestamps: &mut HashMap<String, u64>,
+    max_entries: usize,
+) {
+    while cache.len() > max_entries {
+        let oldest = cache
+            .keys()
+            .min_by(|a, b| {
+                let ta = timestamps.get(*a).copied().unwrap_or(0);
+                let tb = timestamps.get(*b).copied().unwrap_or(0);
+                ta.cmp(&tb).then_with(|| a.cmp(b))
+            })
+            .cloned();
+        let Some(victim) = oldest else {
+            break;
+        };
+        cache.remove(&victim);
+        timestamps.remove(&victim);
+    }
+}
+
+fn upsert_adaptive_entry(
+    cache: &mut HashMap<String, LearnedStrategy>,
+    timestamps: &mut HashMap<String, u64>,
+    key: String,
+    stage: LearnedStrategy,
+    now: u64,
+) -> bool {
+    if !is_valid_cache_host(&key) {
+        return false;
+    }
+    if !cache.contains_key(&key) && cache.len() >= MAX_PERSISTED_HOSTS {
+        evict_oldest_adaptive_entries(cache, timestamps, MAX_PERSISTED_HOSTS.saturating_sub(1));
+    }
+    let prev = cache.insert(key.clone(), stage);
+    timestamps.insert(key, now);
+    prev != Some(stage)
 }
 
 /// Lock-free live engine counters shared across proxy and TUN sessions.
@@ -203,6 +444,11 @@ pub struct EngineContext {
     pub preferred_isp_stage: Arc<AtomicU8>,
     pub telemetry: Arc<EngineTelemetry>,
     pub(crate) listener_addrs: [Option<SocketAddr>; 4],
+    adaptive_timestamps: Arc<RwLock<HashMap<String, u64>>>,
+    cache_path: Arc<RwLock<Option<PathBuf>>>,
+    last_persist_epoch: Arc<AtomicU64>,
+    persist_scheduled: Arc<AtomicBool>,
+    persist_lock: Arc<Mutex<()>>,
 }
 
 impl EngineContext {
@@ -222,6 +468,11 @@ impl EngineContext {
             preferred_isp_stage: Arc::new(AtomicU8::new(LearnedStrategy::Primary as u8)),
             telemetry: Arc::new(EngineTelemetry::default()),
             listener_addrs: [None; 4],
+            adaptive_timestamps: Arc::new(RwLock::new(HashMap::new())),
+            cache_path: Arc::new(RwLock::new(None)),
+            last_persist_epoch: Arc::new(AtomicU64::new(0)),
+            persist_scheduled: Arc::new(AtomicBool::new(false)),
+            persist_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -245,11 +496,259 @@ impl EngineContext {
         self.adaptive_cache.read().await.len()
     }
 
+    /// Attaches an on-disk cache path and immediately loads any valid non-expired entries.
+    pub async fn attach_cache_file(&self, path: PathBuf) {
+        *self.cache_path.write().await = Some(path.clone());
+        let loaded = self.load_persisted_cache(&path).await;
+        if loaded > 0 {
+            debug!(
+                path = %path.display(),
+                loaded,
+                preferred_stage = self.preferred_stage().label(),
+                "restored persisted adaptive TLS stage cache"
+            );
+        }
+    }
+
+    /// Returns `true` when a persistent cache file path is currently attached.
+    pub async fn has_cache_file(&self) -> bool {
+        self.cache_path.read().await.is_some()
+    }
+
+    /// Loads valid, non-expired adaptive TLS strategies from `path` into memory.
+    /// Missing, unreadable, oversized, or corrupt files silently return `0`.
+    pub async fn load_persisted_cache(&self, path: &Path) -> usize {
+        let path_owned = path.to_path_buf();
+        let Ok(Ok(raw)) =
+            tokio::task::spawn_blocking(move || read_bounded_cache_file(&path_owned)).await
+        else {
+            return 0;
+        };
+
+        let Ok(parsed) = serde_json::from_slice::<PersistedAdaptiveCache>(&raw) else {
+            return 0;
+        };
+
+        if parsed.version != PERSISTED_CACHE_VERSION {
+            return 0;
+        }
+
+        let now = unix_now_secs();
+        let max_stage = LearnedStrategy::DirectPassthrough as u8;
+
+        let mut deduped: HashMap<String, (LearnedStrategy, u64)> =
+            HashMap::with_capacity(parsed.entries.len().min(MAX_PERSISTED_HOSTS));
+        for entry in parsed.entries {
+            if entry.stage > max_stage {
+                continue;
+            }
+            if now.saturating_sub(entry.updated_at) > PERSISTED_CACHE_TTL_SECS {
+                continue;
+            }
+            let host = entry.host.trim().to_ascii_lowercase();
+            if !is_valid_cache_host(&host) {
+                continue;
+            }
+            let strategy = LearnedStrategy::from_u8(entry.stage);
+            deduped
+                .entry(host)
+                .and_modify(|existing| {
+                    if entry.updated_at > existing.1 {
+                        *existing = (strategy, entry.updated_at);
+                    }
+                })
+                .or_insert((strategy, entry.updated_at));
+        }
+
+        let mut valid_entries: Vec<(String, LearnedStrategy, u64)> = deduped
+            .into_iter()
+            .map(|(host, (stage, updated_at))| (host, stage, updated_at))
+            .collect();
+        valid_entries.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        valid_entries.truncate(MAX_PERSISTED_HOSTS);
+
+        let loaded = valid_entries.len();
+        {
+            let mut cache_guard = self.adaptive_cache.write().await;
+            let mut ts_guard = self.adaptive_timestamps.write().await;
+            for (host, stage, updated_at) in valid_entries {
+                cache_guard.insert(host.clone(), stage);
+                ts_guard.insert(host, updated_at);
+            }
+            evict_oldest_adaptive_entries(&mut cache_guard, &mut ts_guard, MAX_PERSISTED_HOSTS);
+            self.telemetry
+                .learned_hosts
+                .store(cache_guard.len(), Ordering::Relaxed);
+        }
+
+        // Restore ISP-wide promoted desync stage only for escalated desync stages (1..=5).
+        // Never restore DirectPassthrough (6) as the global ISP stage.
+        if (1..=5).contains(&parsed.global_isp_stage) {
+            self.preferred_isp_stage
+                .store(parsed.global_isp_stage, Ordering::Relaxed);
+        }
+
+        loaded
+    }
+
+    /// Snapshots learned adaptive TLS strategies (capped to `MAX_PERSISTED_HOSTS`) and
+    /// writes them atomically to `path` via a sibling temporary file and rename.
+    pub async fn save_persisted_cache(&self, path: &Path) -> Result<()> {
+        self.save_persisted_cache_locked(path, false).await
+    }
+
+    async fn save_persisted_cache_locked(
+        &self,
+        path: &Path,
+        skip_if_empty_and_missing: bool,
+    ) -> Result<()> {
+        // Strict lock order: persist_lock -> adaptive_cache -> adaptive_timestamps.
+        // Holding persist_lock across snapshot + disk write prevents stale background
+        // saves from resurrecting entries wiped by `clear_adaptive_cache`.
+        let _persist_guard = self.persist_lock.lock().await;
+        let now = unix_now_secs();
+        let mut entries: Vec<PersistedHostEntry> = {
+            let cache_guard = self.adaptive_cache.read().await;
+            let ts_guard = self.adaptive_timestamps.read().await;
+            cache_guard
+                .iter()
+                .filter_map(|(host, &strategy)| {
+                    let normalized = host.trim().to_ascii_lowercase();
+                    if !is_valid_cache_host(&normalized) {
+                        return None;
+                    }
+                    let updated_at = ts_guard.get(host).copied().unwrap_or(now);
+                    if now.saturating_sub(updated_at) > PERSISTED_CACHE_TTL_SECS {
+                        return None;
+                    }
+                    Some(PersistedHostEntry {
+                        host: normalized,
+                        stage: strategy as u8,
+                        updated_at,
+                    })
+                })
+                .collect()
+        };
+
+        entries.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.host.cmp(&b.host))
+        });
+        entries.truncate(MAX_PERSISTED_HOSTS);
+
+        let raw_global = self.preferred_isp_stage.load(Ordering::Relaxed);
+        let global_isp_stage = if (1..=5).contains(&raw_global) {
+            raw_global
+        } else {
+            LearnedStrategy::Primary as u8
+        };
+
+        if skip_if_empty_and_missing
+            && entries.is_empty()
+            && global_isp_stage == LearnedStrategy::Primary as u8
+            && !tokio::fs::try_exists(path).await.unwrap_or(false)
+        {
+            return Ok(());
+        }
+
+        let snapshot = PersistedAdaptiveCache {
+            version: PERSISTED_CACHE_VERSION,
+            global_isp_stage,
+            entries,
+        };
+        let bytes =
+            serde_json::to_vec(&snapshot).context("failed to serialize adaptive cache JSON")?;
+
+        let path_owned = path.to_path_buf();
+        tokio::task::spawn_blocking(move || atomic_write_file(&path_owned, &bytes))
+            .await
+            .context("adaptive cache persistence task panicked")??;
+        self.last_persist_epoch.store(now.max(1), Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Flushes the in-memory adaptive cache to the attached disk path (if any).
+    pub async fn flush_persisted_cache(&self) -> Result<()> {
+        let path = self.cache_path.read().await.clone();
+        let Some(path) = path else {
+            return Ok(());
+        };
+        self.save_persisted_cache_locked(&path, true).await
+    }
+
+    fn maybe_persist_cache(&self) {
+        let has_path = match self.cache_path.try_read() {
+            Ok(guard) => guard.is_some(),
+            Err(_) => return,
+        };
+        if !has_path {
+            return;
+        }
+
+        let now = unix_now_secs().max(1);
+        let last = self.last_persist_epoch.load(Ordering::Relaxed);
+        if (last == 0 || now.saturating_sub(last) >= PERSIST_DEBOUNCE_SECS)
+            && self
+                .last_persist_epoch
+                .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            let ctx = self.clone();
+            tokio::spawn(async move {
+                if let Err(e) = ctx.flush_persisted_cache().await {
+                    debug!(error = %e, "background adaptive cache persist failed");
+                }
+            });
+            return;
+        }
+
+        // Inside the debounce window: schedule a single trailing-edge flush so burst-learned
+        // hosts are still persisted once the debounce interval elapses.
+        if self
+            .persist_scheduled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let elapsed = now.saturating_sub(self.last_persist_epoch.load(Ordering::Relaxed));
+        let wait_secs = PERSIST_DEBOUNCE_SECS.saturating_sub(elapsed).max(1);
+        let ctx = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+            ctx.persist_scheduled.store(false, Ordering::Release);
+            if let Err(e) = ctx.flush_persisted_cache().await {
+                debug!(error = %e, "delayed adaptive cache persist failed");
+            }
+        });
+    }
+
     pub async fn clear_adaptive_cache(&self) {
-        self.adaptive_cache.write().await.clear();
+        // Strict lock order: persist_lock -> adaptive_cache -> adaptive_timestamps.
+        // Drop map guards before spawn_blocking disk removal.
+        let _persist_guard = self.persist_lock.lock().await;
+        {
+            let mut guard = self.adaptive_cache.write().await;
+            let mut ts_guard = self.adaptive_timestamps.write().await;
+            guard.clear();
+            ts_guard.clear();
+        }
         self.telemetry.learned_hosts.store(0, Ordering::Relaxed);
         self.preferred_isp_stage
             .store(LearnedStrategy::Primary as u8, Ordering::Relaxed);
+        self.last_persist_epoch.store(0, Ordering::Relaxed);
+
+        let path = self.cache_path.read().await.clone();
+        if let Some(path) = path {
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = std::fs::remove_file(&path);
+                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    let _ = std::fs::remove_file(parent.join("adaptive-cache.tmp"));
+                }
+            })
+            .await;
+        }
     }
 
     /// Connects directly to an already-resolved upstream `SocketAddr` with `connect_timeout`
@@ -481,7 +980,9 @@ impl EngineContext {
                 return Ok(());
             }
 
-            let cache_key = effective_host.map(|h| h.to_ascii_lowercase());
+            let cache_key = effective_host
+                .map(|h| h.trim().to_ascii_lowercase())
+                .filter(|k| is_valid_cache_host(k));
             let cached_stage = match cache_key.as_ref() {
                 Some(key) => self.adaptive_cache.read().await.get(key).copied(),
                 None => None,
@@ -586,12 +1087,15 @@ impl EngineContext {
                         }
 
                         if is_valid_tls_server_hello {
-                            if let Some(key) = cache_key {
+                            let mut cache_changed = false;
+                            if let Some(key) = cache_key.filter(|k| is_valid_cache_host(k)) {
+                                let now = unix_now_secs();
                                 let mut guard = self.adaptive_cache.write().await;
-                                if guard.len() > 4096 {
-                                    guard.clear();
+                                let mut ts_guard = self.adaptive_timestamps.write().await;
+                                if upsert_adaptive_entry(&mut guard, &mut ts_guard, key, stage, now)
+                                {
+                                    cache_changed = true;
                                 }
-                                guard.insert(key, stage);
                                 self.telemetry
                                     .learned_hosts
                                     .store(guard.len(), Ordering::Relaxed);
@@ -600,8 +1104,16 @@ impl EngineContext {
                             // If earlier desync stage failed due to ISP RST/block/timeout (not server TLS Alert),
                             // promote this winning desync stage globally so subsequent domains skip failed probes.
                             if idx > 0 && saw_network_block && !saw_tls_alert && stage.is_desync() {
-                                self.preferred_isp_stage
-                                    .store(stage as u8, Ordering::Relaxed);
+                                let prev_stage = self
+                                    .preferred_isp_stage
+                                    .swap(stage as u8, Ordering::Relaxed);
+                                if prev_stage != stage as u8 {
+                                    cache_changed = true;
+                                }
+                            }
+
+                            if cache_changed {
+                                self.maybe_persist_cache();
                             }
                         }
 
@@ -638,11 +1150,19 @@ impl EngineContext {
             // If all stages failed and we had a stale cached strategy, clear it so the next attempt probes fresh.
             if cached_stage.is_some() {
                 if let Some(key) = cache_key {
-                    let mut guard = self.adaptive_cache.write().await;
-                    guard.remove(&key);
-                    self.telemetry
-                        .learned_hosts
-                        .store(guard.len(), Ordering::Relaxed);
+                    let removed = {
+                        let mut guard = self.adaptive_cache.write().await;
+                        let mut ts_guard = self.adaptive_timestamps.write().await;
+                        ts_guard.remove(&key);
+                        let removed = guard.remove(&key).is_some();
+                        self.telemetry
+                            .learned_hosts
+                            .store(guard.len(), Ordering::Relaxed);
+                        removed
+                    };
+                    if removed {
+                        self.maybe_persist_cache();
+                    }
                 }
             }
 
@@ -1589,5 +2109,327 @@ mod tests {
 
         let received = server.await.unwrap();
         assert_eq!(received, b"PINGPONG");
+    }
+
+    struct TempCacheDir(PathBuf);
+
+    impl TempCacheDir {
+        fn new(label: &str) -> Self {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let id = SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "vdpi-cache-test-{}-{}-{}",
+                std::process::id(),
+                label,
+                id
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn file(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for TempCacheDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn test_engine_context() -> EngineContext {
+        let cli = CliArgs::parse_from_iter(["vdpi", "--no-system-proxy"]).unwrap();
+        EngineContext::new(cli.into_runtime_config()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn persisted_cache_roundtrip_restores_hosts_stage_and_telemetry() {
+        let tmp = TempCacheDir::new("roundtrip");
+        let cache_file = tmp.file("nested/adaptive-cache.json");
+
+        let ctx1 = test_engine_context();
+        {
+            let mut guard = ctx1.adaptive_cache.write().await;
+            guard.insert("discord.com".to_string(), LearnedStrategy::OobSniDesync);
+            guard.insert(
+                "media.example".to_string(),
+                LearnedStrategy::DeepRecordStorm,
+            );
+            ctx1.telemetry
+                .learned_hosts
+                .store(guard.len(), Ordering::Relaxed);
+        }
+        ctx1.preferred_isp_stage
+            .store(LearnedStrategy::DeepRecordStorm as u8, Ordering::Relaxed);
+        ctx1.save_persisted_cache(&cache_file).await.unwrap();
+        assert!(cache_file.exists());
+
+        let ctx2 = test_engine_context();
+        ctx2.attach_cache_file(cache_file.clone()).await;
+        assert!(ctx2.has_cache_file().await);
+        assert_eq!(ctx2.learned_host_count().await, 2);
+        assert_eq!(ctx2.telemetry_snapshot().learned_hosts, 2);
+        assert_eq!(ctx2.preferred_stage(), LearnedStrategy::DeepRecordStorm);
+        assert_eq!(
+            ctx2.adaptive_cache.read().await.get("discord.com").copied(),
+            Some(LearnedStrategy::OobSniDesync)
+        );
+        assert_eq!(
+            ctx2.adaptive_cache
+                .read()
+                .await
+                .get("media.example")
+                .copied(),
+            Some(LearnedStrategy::DeepRecordStorm)
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_cache_prunes_expired_entries_and_ignores_direct_passthrough_global_stage() {
+        let tmp = TempCacheDir::new("expired");
+        let cache_file = tmp.file("adaptive-cache.json");
+        let now = unix_now_secs();
+
+        let payload = PersistedAdaptiveCache {
+            version: PERSISTED_CACHE_VERSION,
+            global_isp_stage: LearnedStrategy::DirectPassthrough as u8,
+            entries: vec![
+                PersistedHostEntry {
+                    host: "Fresh.Example".to_string(),
+                    stage: LearnedStrategy::FineFragment as u8,
+                    updated_at: now.saturating_sub(60),
+                },
+                PersistedHostEntry {
+                    host: "stale.example".to_string(),
+                    stage: LearnedStrategy::OobSniDesync as u8,
+                    updated_at: now.saturating_sub(PERSISTED_CACHE_TTL_SECS + 60),
+                },
+                PersistedHostEntry {
+                    host: "   ".to_string(),
+                    stage: LearnedStrategy::Primary as u8,
+                    updated_at: now,
+                },
+                PersistedHostEntry {
+                    host: "a".repeat(300),
+                    stage: LearnedStrategy::Primary as u8,
+                    updated_at: now,
+                },
+            ],
+        };
+        std::fs::write(&cache_file, serde_json::to_vec(&payload).unwrap()).unwrap();
+
+        let ctx = test_engine_context();
+        let loaded = ctx.load_persisted_cache(&cache_file).await;
+        assert_eq!(loaded, 1);
+        assert_eq!(ctx.learned_host_count().await, 1);
+        assert_eq!(ctx.telemetry_snapshot().learned_hosts, 1);
+        assert_eq!(
+            ctx.adaptive_cache
+                .read()
+                .await
+                .get("fresh.example")
+                .copied(),
+            Some(LearnedStrategy::FineFragment)
+        );
+        assert_eq!(ctx.preferred_stage(), LearnedStrategy::Primary);
+    }
+
+    #[tokio::test]
+    async fn persisted_cache_caps_entries_at_max_persisted_hosts() {
+        let tmp = TempCacheDir::new("cap");
+        let save_file = tmp.file("save-cap.json");
+        let load_file = tmp.file("load-cap.json");
+        let now = unix_now_secs();
+
+        let ctx_save = test_engine_context();
+        {
+            let mut guard = ctx_save.adaptive_cache.write().await;
+            for idx in 0..300usize {
+                guard.insert(
+                    format!("save-host-{idx}.example"),
+                    LearnedStrategy::OobSniDesync,
+                );
+            }
+        }
+        ctx_save.save_persisted_cache(&save_file).await.unwrap();
+        let saved: PersistedAdaptiveCache =
+            serde_json::from_slice(&std::fs::read(&save_file).unwrap()).unwrap();
+        assert_eq!(saved.entries.len(), MAX_PERSISTED_HOSTS);
+
+        let entries: Vec<PersistedHostEntry> = (0..300u64)
+            .map(|idx| PersistedHostEntry {
+                host: format!("load-host-{idx}.example"),
+                stage: LearnedStrategy::MultiRecordOob as u8,
+                updated_at: now.saturating_sub(idx),
+            })
+            .collect();
+        let raw = PersistedAdaptiveCache {
+            version: PERSISTED_CACHE_VERSION,
+            global_isp_stage: LearnedStrategy::MultiRecordOob as u8,
+            entries,
+        };
+        std::fs::write(&load_file, serde_json::to_vec(&raw).unwrap()).unwrap();
+
+        let ctx_load = test_engine_context();
+        let loaded = ctx_load.load_persisted_cache(&load_file).await;
+        assert_eq!(loaded, MAX_PERSISTED_HOSTS);
+        assert_eq!(ctx_load.learned_host_count().await, MAX_PERSISTED_HOSTS);
+        assert_eq!(
+            ctx_load.telemetry_snapshot().learned_hosts,
+            MAX_PERSISTED_HOSTS
+        );
+        let guard = ctx_load.adaptive_cache.read().await;
+        assert!(guard.contains_key("load-host-0.example"));
+        assert!(!guard.contains_key("load-host-299.example"));
+    }
+
+    #[tokio::test]
+    async fn persisted_cache_returns_zero_on_missing_corrupt_or_bad_version_file() {
+        let tmp = TempCacheDir::new("corrupt");
+        let missing = tmp.file("does-not-exist.json");
+        let corrupt = tmp.file("corrupt.json");
+        let bad_ver = tmp.file("bad-version.json");
+
+        std::fs::write(&corrupt, b"{not-valid-json!!!").unwrap();
+        std::fs::write(
+            &bad_ver,
+            br#"{"version":99,"global_isp_stage":2,"entries":[{"host":"x.example","stage":1,"updated_at":9999999999}]}"#,
+        )
+        .unwrap();
+
+        let ctx = test_engine_context();
+        assert_eq!(ctx.load_persisted_cache(&missing).await, 0);
+        assert_eq!(ctx.load_persisted_cache(&corrupt).await, 0);
+        assert_eq!(ctx.load_persisted_cache(&bad_ver).await, 0);
+        assert_eq!(ctx.learned_host_count().await, 0);
+        assert_eq!(ctx.telemetry_snapshot().learned_hosts, 0);
+    }
+
+    #[tokio::test]
+    async fn clear_adaptive_cache_resets_stage_and_deletes_persisted_file() {
+        let tmp = TempCacheDir::new("clear");
+        let cache_file = tmp.file("adaptive-cache.json");
+
+        let ctx = test_engine_context();
+        ctx.attach_cache_file(cache_file.clone()).await;
+        {
+            let mut guard = ctx.adaptive_cache.write().await;
+            guard.insert("blocked.example".to_string(), LearnedStrategy::SlowSniSlice);
+            ctx.telemetry
+                .learned_hosts
+                .store(guard.len(), Ordering::Relaxed);
+        }
+        ctx.preferred_isp_stage
+            .store(LearnedStrategy::SlowSniSlice as u8, Ordering::Relaxed);
+        ctx.save_persisted_cache(&cache_file).await.unwrap();
+        assert!(cache_file.exists());
+
+        ctx.clear_adaptive_cache().await;
+        assert!(!cache_file.exists());
+        assert_eq!(ctx.learned_host_count().await, 0);
+        assert_eq!(ctx.telemetry_snapshot().learned_hosts, 0);
+        assert_eq!(ctx.preferred_stage(), LearnedStrategy::Primary);
+    }
+
+    #[test]
+    fn live_adaptive_cache_rejects_invalid_hosts_and_evicts_oldest_at_cap() {
+        let mut cache = HashMap::new();
+        let mut timestamps = HashMap::new();
+
+        assert!(!upsert_adaptive_entry(
+            &mut cache,
+            &mut timestamps,
+            String::new(),
+            LearnedStrategy::OobSniDesync,
+            100,
+        ));
+        assert!(!upsert_adaptive_entry(
+            &mut cache,
+            &mut timestamps,
+            "bad host.example".to_string(),
+            LearnedStrategy::OobSniDesync,
+            100,
+        ));
+        assert!(!upsert_adaptive_entry(
+            &mut cache,
+            &mut timestamps,
+            "x".repeat(MAX_HOSTNAME_LEN + 1),
+            LearnedStrategy::OobSniDesync,
+            100,
+        ));
+        assert!(cache.is_empty());
+
+        for idx in 0..MAX_PERSISTED_HOSTS {
+            let ts = if idx == 17 { 50 } else { 100 + idx as u64 };
+            assert!(upsert_adaptive_entry(
+                &mut cache,
+                &mut timestamps,
+                format!("host-{idx}.example"),
+                LearnedStrategy::OobSniDesync,
+                ts,
+            ));
+        }
+        assert_eq!(cache.len(), MAX_PERSISTED_HOSTS);
+
+        assert!(upsert_adaptive_entry(
+            &mut cache,
+            &mut timestamps,
+            "newest.example".to_string(),
+            LearnedStrategy::MultiRecordOob,
+            999,
+        ));
+        assert_eq!(cache.len(), MAX_PERSISTED_HOSTS);
+        assert!(!cache.contains_key("host-17.example"));
+        assert!(!timestamps.contains_key("host-17.example"));
+        assert_eq!(
+            cache.get("newest.example").copied(),
+            Some(LearnedStrategy::MultiRecordOob)
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_persist_cache_schedules_single_trailing_flush_inside_debounce_window() {
+        let tmp = TempCacheDir::new("trailing");
+        let cache_file = tmp.file("adaptive-cache.json");
+
+        let ctx = test_engine_context();
+        ctx.attach_cache_file(cache_file).await;
+        ctx.last_persist_epoch
+            .store(unix_now_secs().max(1), Ordering::Relaxed);
+        assert!(!ctx.persist_scheduled.load(Ordering::Relaxed));
+
+        ctx.maybe_persist_cache();
+        assert!(ctx.persist_scheduled.load(Ordering::Relaxed));
+
+        // Second call within the same debounce window stays coalesced.
+        ctx.maybe_persist_cache();
+        assert!(ctx.persist_scheduled.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn atomic_write_file_overwrites_safely_without_leaving_temp_files() {
+        let tmp = TempCacheDir::new("atomic");
+        let cache_file = tmp.file("adaptive-cache.json");
+
+        atomic_write_file(&cache_file, br#"{"version":1,"v":"first"}"#).unwrap();
+        assert_eq!(
+            std::fs::read(&cache_file).unwrap(),
+            br#"{"version":1,"v":"first"}"#
+        );
+
+        atomic_write_file(&cache_file, br#"{"version":1,"v":"second"}"#).unwrap();
+        assert_eq!(
+            std::fs::read(&cache_file).unwrap(),
+            br#"{"version":1,"v":"second"}"#
+        );
+
+        let names: Vec<String> = std::fs::read_dir(&tmp.0)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["adaptive-cache.json"]);
     }
 }

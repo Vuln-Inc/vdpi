@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct SettingsView: View {
     var topInset: CGFloat = 0
@@ -40,6 +41,9 @@ struct SettingsView: View {
     @State private var bypassDraft: String = ""
     @State private var bypassError: String?
     @State private var showResetConfirm = false
+    @State private var showSettingsExporter = false
+    @State private var exportDocument = VdpiSettingsDocument()
+    @State private var showSettingsImporter = false
     @FocusState private var focusedField: Field?
 
     // MARK: - Derived State
@@ -89,6 +93,8 @@ struct SettingsView: View {
                 tunnelSection
                 bypassDomainsSection
                 appearanceSection
+                backupSection
+                updatesSection
                 resetSection
                 aboutSection
                 versionFooter
@@ -137,6 +143,43 @@ struct SettingsView: View {
                 bypassError = nil
             }
             Button("Cancel", role: .cancel) {}
+        }
+        .fileExporter(
+            isPresented: $showSettingsExporter,
+            document: exportDocument,
+            contentType: .json,
+            defaultFilename: "vdpi-settings.json"
+        ) { result in
+            switch result {
+            case .success:
+                VdpiHaptics.trigger(.success)
+                manager.showToast("Exported settings")
+            case .failure(let error):
+                let nsError = error as NSError
+                if nsError.domain == NSCocoaErrorDomain && nsError.code == NSUserCancelledError {
+                    return
+                }
+                VdpiHaptics.trigger(.warning)
+                manager.showToast("Export failed")
+            }
+        }
+        .fileImporter(
+            isPresented: $showSettingsImporter,
+            allowedContentTypes: [.json, .plainText],
+            allowsMultipleSelection: false
+        ) { result in
+            switch result {
+            case .success(let urls):
+                guard let url = urls.first else { return }
+                importSettings(from: url)
+            case .failure(let error):
+                let nsError = error as NSError
+                if nsError.domain == NSCocoaErrorDomain && nsError.code == NSUserCancelledError {
+                    return
+                }
+                VdpiHaptics.trigger(.warning)
+                manager.showToast("Import failed")
+            }
         }
     }
 
@@ -577,6 +620,167 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - Backup & Restore
+
+    private var backupSection: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            SectionHeader("Backup & Restore")
+
+            InsetGroupedCard(cornerRadius: 16) {
+                VStack(spacing: 0) {
+                    Button {
+                        VdpiHaptics.trigger(.light)
+                        focusedField = nil
+                        if let json = manager.exportSettingsJSON() {
+                            exportDocument = VdpiSettingsDocument(jsonText: json)
+                            showSettingsExporter = true
+                        } else {
+                            VdpiHaptics.trigger(.warning)
+                            manager.showToast("Could not export settings")
+                        }
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "square.and.arrow.up")
+                                .font(.body)
+                                .foregroundStyle(palette.accent)
+                                .frame(width: 24)
+                                .accessibilityHidden(true)
+
+                            Text("Export Settings")
+                                .font(.body)
+                                .foregroundStyle(palette.inkPrimary)
+
+                            Spacer(minLength: 8)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 6)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(SettingsRowButtonStyle(highlightColor: palette.surfaceRaised))
+
+                    InsetDivider(leadingInset: 16)
+
+                    Button {
+                        VdpiHaptics.trigger(.light)
+                        focusedField = nil
+                        showSettingsImporter = true
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "square.and.arrow.down")
+                                .font(.body)
+                                .foregroundStyle(palette.accent)
+                                .frame(width: 24)
+                                .accessibilityHidden(true)
+
+                            Text("Import Settings")
+                                .font(.body)
+                                .foregroundStyle(palette.inkPrimary)
+
+                            Spacer(minLength: 8)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 6)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(SettingsRowButtonStyle(highlightColor: palette.surfaceRaised))
+                }
+            }
+
+            SectionFooter("Save your desync, DNS, and bypass configuration as JSON or restore from a previous backup.")
+        }
+    }
+
+    // MARK: - Updates
+
+    private var updatesSection: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            SectionHeader("Updates")
+
+            InsetGroupedCard(cornerRadius: 16) {
+                if let update = manager.availableUpdate {
+                    let latest = formattedVersion(update.latestVersion)
+                    let destination = URL(string: update.releaseURL) ?? Self.githubRepositoryURL
+                    Link(destination: destination) {
+                        HStack(spacing: 10) {
+                            Circle()
+                                .fill(palette.accent)
+                                .frame(width: 6, height: 6)
+                                .accessibilityHidden(true)
+
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Update Available · \(latest)")
+                                    .font(.body)
+                                    .foregroundStyle(palette.inkPrimary)
+
+                                Text("Current \(formattedVersion(manager.appVersion)) · Open GitHub Release")
+                                    .font(.footnote)
+                                    .foregroundStyle(palette.inkSecondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                            }
+
+                            Spacer(minLength: 8)
+
+                            Image(systemName: "arrow.up.right")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(palette.accent)
+                                .accessibilityHidden(true)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(SettingsRowButtonStyle(highlightColor: palette.surfaceRaised))
+                    .accessibilityLabel("Update available, \(latest). Open GitHub release")
+                } else {
+                    Button {
+                        VdpiHaptics.trigger(.light)
+                        focusedField = nil
+                        manager.checkForUpdates(manual: true)
+                    } label: {
+                        HStack(spacing: 12) {
+                            Text("Check for Updates")
+                                .font(.body)
+                                .foregroundStyle(palette.inkPrimary)
+
+                            Spacer(minLength: 8)
+
+                            if manager.isCheckingUpdate {
+                                ProgressView()
+                                    .progressViewStyle(.circular)
+                                    .controlSize(.small)
+                                    .tint(palette.inkSecondary)
+                                    .accessibilityLabel("Checking for updates")
+                            } else {
+                                let statusText: String = {
+                                    if let msg = manager.updateStatusMessage, !msg.isEmpty {
+                                        return msg
+                                    }
+                                    return formattedVersion(manager.appVersion)
+                                }()
+                                Text(statusText)
+                                    .font(.subheadline)
+                                    .monospacedDigit()
+                                    .foregroundStyle(palette.inkSecondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 6)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(SettingsRowButtonStyle(highlightColor: palette.surfaceRaised))
+                    .disabled(manager.isCheckingUpdate)
+                }
+            }
+        }
+    }
+
     // MARK: - Reset
 
     private var resetSection: some View {
@@ -639,15 +843,19 @@ struct SettingsView: View {
     // MARK: - Version Footer
 
     private var versionFooter: some View {
-        let ver = manager.engineVersion.lowercased().hasPrefix("v")
-            ? manager.engineVersion
-            : "v\(manager.engineVersion)"
+        let ver = formattedVersion(manager.appVersion)
         return Text("vdpi \(ver) · github.com/Vuln-Inc/vdpi")
             .font(.footnote)
             .foregroundStyle(palette.inkMuted)
             .multilineTextAlignment(.center)
             .frame(maxWidth: .infinity, alignment: .center)
             .padding(.top, -4)
+    }
+
+    private func formattedVersion(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "v0.4.0" }
+        return trimmed.lowercased().hasPrefix("v") ? trimmed : "v\(trimmed)"
     }
 
     // MARK: - Row Helpers
@@ -712,6 +920,63 @@ struct SettingsView: View {
                 }
             }
         }
+    }
+
+    private func importSettings(from url: URL) {
+        let didAccess = url.startAccessingSecurityScopedResource()
+        defer {
+            if didAccess {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+        do {
+            let resourceValues = try url.resourceValues(forKeys: [.fileSizeKey])
+            if let fileSize = resourceValues.fileSize, fileSize > 262_144 {
+                VdpiHaptics.trigger(.warning)
+                manager.showToast("Invalid settings file")
+                return
+            }
+            let data = try Data(contentsOf: url)
+            guard data.count <= 262_144, let rawJSON = String(data: data, encoding: .utf8) else {
+                VdpiHaptics.trigger(.warning)
+                manager.showToast("Invalid settings file")
+                return
+            }
+            try manager.importSettingsJSON(rawJSON)
+            dnsDraft = draftValue(for: manager.settings.dnsAddr)
+            dnsError = nil
+            bypassError = nil
+            VdpiHaptics.trigger(.success)
+        } catch {
+            VdpiHaptics.trigger(.warning)
+            manager.showToast("Invalid settings file")
+        }
+    }
+}
+
+// MARK: - Settings Export Document
+
+private struct VdpiSettingsDocument: FileDocument {
+    static var readableContentTypes: [UTType] { [.json, .plainText] }
+
+    var jsonText: String
+
+    init(jsonText: String = "{}") {
+        self.jsonText = jsonText
+    }
+
+    init(configuration: ReadConfiguration) throws {
+        if let data = configuration.file.regularFileContents,
+           let text = String(data: data, encoding: .utf8)
+        {
+            self.jsonText = text
+        } else {
+            self.jsonText = "{}"
+        }
+    }
+
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: Data(jsonText.utf8))
     }
 }
 

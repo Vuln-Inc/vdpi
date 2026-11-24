@@ -45,6 +45,8 @@ public enum ThemePreference: String, CaseIterable, Codable, Identifiable, Sendab
 }
 
 /// Wire JSON passed into `vdpi_ios_start` / `vdpi_ios_run_doctor_json` (matches `vdpi_tun::config::TunnelConfig`).
+public typealias VdpiTunnelConfig = NativeEngineConfig
+
 public struct NativeEngineConfig: Codable, Equatable, Sendable {
     public var mode: DesyncMode
     public var chunkSize: Int
@@ -55,6 +57,7 @@ public struct NativeEngineConfig: Codable, Equatable, Sendable {
     public var timeoutMs: UInt64
     public var mtu: Int
     public var bypassDomains: [String]
+    public var cachePath: String?
 
     enum CodingKeys: String, CodingKey {
         case mode
@@ -66,6 +69,7 @@ public struct NativeEngineConfig: Codable, Equatable, Sendable {
         case timeoutMs = "timeout_ms"
         case mtu
         case bypassDomains = "bypass_domains"
+        case cachePath = "cache_path"
     }
 
     public init(
@@ -77,7 +81,8 @@ public struct NativeEngineConfig: Codable, Equatable, Sendable {
         blockQuic: Bool = true,
         timeoutMs: UInt64 = 8000,
         mtu: Int = 1400,
-        bypassDomains: [String] = []
+        bypassDomains: [String] = [],
+        cachePath: String? = nil
     ) {
         self.mode = mode
         self.chunkSize = max(1, min(64, chunkSize))
@@ -89,6 +94,33 @@ public struct NativeEngineConfig: Codable, Equatable, Sendable {
         self.timeoutMs = timeoutMs
         self.mtu = max(1280, min(9000, mtu))
         self.bypassDomains = bypassDomains
+        self.cachePath = cachePath
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let mode = try c.decodeIfPresent(DesyncMode.self, forKey: .mode) ?? .combo
+        let chunkSize = try c.decodeIfPresent(Int.self, forKey: .chunkSize) ?? 10
+        let dnsAddr = try c.decodeIfPresent(String.self, forKey: .dnsAddr) ?? "1.1.1.1"
+        let enableDoh = try c.decodeIfPresent(Bool.self, forKey: .enableDoh) ?? true
+        let ipv4Only = try c.decodeIfPresent(Bool.self, forKey: .ipv4Only) ?? false
+        let blockQuic = try c.decodeIfPresent(Bool.self, forKey: .blockQuic) ?? true
+        let timeoutMs = try c.decodeIfPresent(UInt64.self, forKey: .timeoutMs) ?? 8000
+        let mtu = try c.decodeIfPresent(Int.self, forKey: .mtu) ?? 1400
+        let bypassDomains = try c.decodeIfPresent([String].self, forKey: .bypassDomains) ?? []
+        let cachePath = try c.decodeIfPresent(String.self, forKey: .cachePath)
+        self.init(
+            mode: mode,
+            chunkSize: chunkSize,
+            dnsAddr: dnsAddr,
+            enableDoh: enableDoh,
+            ipv4Only: ipv4Only,
+            blockQuic: blockQuic,
+            timeoutMs: timeoutMs,
+            mtu: mtu,
+            bypassDomains: bypassDomains,
+            cachePath: cachePath
+        )
     }
 
     public func canonicalized() -> NativeEngineConfig {
@@ -101,7 +133,8 @@ public struct NativeEngineConfig: Codable, Equatable, Sendable {
             blockQuic: blockQuic,
             timeoutMs: timeoutMs,
             mtu: mtu,
-            bypassDomains: Self.canonicalBypassDomains(bypassDomains)
+            bypassDomains: Self.canonicalBypassDomains(bypassDomains),
+            cachePath: cachePath
         )
     }
 
@@ -249,7 +282,7 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
         return "\(head) +\(labels.count - 2) more"
     }
 
-    public func toNativeConfig() -> NativeEngineConfig {
+    public func toNativeConfig(cachePath: String? = nil) -> NativeEngineConfig {
         NativeEngineConfig(
             mode: desyncMode,
             chunkSize: clampedChunkSize,
@@ -259,13 +292,14 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
             blockQuic: blockQuic,
             timeoutMs: 8000,
             mtu: clampedMtu,
-            bypassDomains: NativeEngineConfig.canonicalBypassDomains(bypassDomains)
+            bypassDomains: NativeEngineConfig.canonicalBypassDomains(bypassDomains),
+            cachePath: cachePath
         )
     }
 
-    public func toNativeConfigJSON() -> String {
+    public func toNativeConfigJSON(cachePath: String? = nil) -> String {
         let encoder = JSONEncoder()
-        guard let data = try? encoder.encode(toNativeConfig()),
+        guard let data = try? encoder.encode(toNativeConfig(cachePath: cachePath)),
               let json = String(data: data, encoding: .utf8)
         else {
             return "{}"
@@ -280,6 +314,20 @@ public struct EngineEvent: Codable, Equatable, Identifiable, Sendable {
     public var level: String
     public var tag: String
     public var message: String
+
+    public init(
+        seq: UInt64? = nil,
+        tsMs: UInt64,
+        level: String,
+        tag: String,
+        message: String
+    ) {
+        self.seq = seq
+        self.tsMs = tsMs
+        self.level = level
+        self.tag = tag
+        self.message = message
+    }
 
     public var id: String {
         if let seq {
@@ -423,6 +471,20 @@ public struct DoctorCheck: Codable, Equatable, Identifiable, Sendable {
     public var latencyMs: UInt64
     public var detail: String
 
+    public init(
+        name: String,
+        target: String,
+        passed: Bool,
+        latencyMs: UInt64,
+        detail: String
+    ) {
+        self.name = name
+        self.target = target
+        self.passed = passed
+        self.latencyMs = latencyMs
+        self.detail = detail
+    }
+
     public var id: String { "\(name)-\(target)" }
 
     enum CodingKeys: String, CodingKey {
@@ -437,6 +499,11 @@ public struct DoctorCheck: Codable, Equatable, Identifiable, Sendable {
 public struct DoctorReport: Codable, Equatable, Sendable {
     public var ok: Bool
     public var checks: [DoctorCheck]
+
+    public init(ok: Bool, checks: [DoctorCheck]) {
+        self.ok = ok
+        self.checks = checks
+    }
 
     public static let empty = DoctorReport(ok: false, checks: [])
 }

@@ -15,12 +15,15 @@ use vdpi::service::{
 };
 
 mod launcher;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod tui_dashboard;
 
 fn main() -> Result<()> {
     #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(foreground::GUARD_ARG)) {
         return foreground::run_guard();
     }
+    vdpi::update::cleanup_stale_old_binary();
     raise_fd_limit();
 
     let args: Vec<_> = std::env::args_os().collect();
@@ -28,10 +31,10 @@ fn main() -> Result<()> {
     let cli = CliArgs::parse_from_iter(args).unwrap_or_else(|e| e.exit());
     let mut command = cli.command.clone();
     let cfg = cli.into_runtime_config();
-    init_tracing(&cfg);
 
     #[cfg(target_os = "windows")]
     if cfg.windows_service && matches!(command, Some(Command::Start) | None) {
+        init_tracing(&cfg);
         return vdpi::platform::windows_service::run_windows_service(cfg);
     }
 
@@ -41,7 +44,8 @@ fn main() -> Result<()> {
     }
 
     if bare || matches!(command, Some(Command::Launcher)) {
-        match launcher::choose(!bare)? {
+        let installed_before = vdpi::service::detect_installed_info();
+        match launcher::choose(!bare, installed_before.as_ref())? {
             launcher::Choice::Run => {
                 if !cfg.quiet {
                     launcher::print_run_notice();
@@ -50,8 +54,16 @@ fn main() -> Result<()> {
             }
             launcher::Choice::Unattended => command = Some(Command::Start),
             launcher::Choice::Install => {
+                init_tracing(&cfg);
                 let result = install_service(&cfg);
-                launcher::install_finished(&result);
+                launcher::install_finished(&result, installed_before.as_ref());
+                return result;
+            }
+            launcher::Choice::Update => {
+                init_tracing(&cfg);
+                let result = build_runtime()
+                    .and_then(|rt| rt.block_on(vdpi::update::run_update(false, false, &cfg)));
+                launcher::update_finished(&result);
                 return result;
             }
             launcher::Choice::Cancel => return Ok(()),
@@ -60,30 +72,74 @@ fn main() -> Result<()> {
 
     match command {
         Some(Command::Install) => {
+            init_tracing(&cfg);
             install_service(&cfg)?;
             launcher::clear_preference();
             Ok(())
         }
         Some(Command::Launcher) => unreachable!("handled by launcher"),
-        Some(Command::Uninstall) => uninstall_service(),
-        Some(Command::Status) | Some(Command::Doctor) | Some(Command::Start) | None => {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?;
+        Some(Command::Uninstall) => {
+            init_tracing(&cfg);
+            uninstall_service()
+        }
+        Some(Command::Status) | Some(Command::Doctor) | Some(Command::Update { .. }) => {
+            init_tracing(&cfg);
+            let rt = build_runtime()?;
             rt.block_on(async move {
                 match command {
                     Some(Command::Status) => print_status(&cfg).await,
                     Some(Command::Doctor) => run_doctor(cfg).await,
-                    Some(Command::Start) | None => run_daemon(cfg).await,
+                    Some(Command::Update { check, force }) => {
+                        vdpi::update::run_update(check, force, &cfg).await
+                    }
                     _ => unreachable!(),
                 }
             })
         }
+        Some(Command::Start) | None => {
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            let dashboard_tracing =
+                if tui_dashboard::should_enable_dashboard(&cfg, is_service_mode(&cfg)) {
+                    Some(init_tui_tracing())
+                } else {
+                    init_tracing(&cfg);
+                    None
+                };
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            init_tracing(&cfg);
+            let rt = build_runtime()?;
+            rt.block_on(run_daemon(
+                cfg,
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                dashboard_tracing,
+            ))
+        }
     }
 }
 
-async fn run_daemon(cfg: RuntimeConfig) -> Result<()> {
+fn build_runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(Into::into)
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+struct DashboardTracing {
+    logs: tui_dashboard::SharedLogRing,
+    passthrough_stderr: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+async fn run_daemon(
+    cfg: RuntimeConfig,
+    #[cfg(not(any(target_os = "android", target_os = "ios")))] dashboard_tracing: Option<
+        DashboardTracing,
+    >,
+) -> Result<()> {
     let ctx = EngineContext::new(cfg.clone())?;
+    if let Some(cache_path) = vdpi::desync::default_desktop_cache_path() {
+        ctx.attach_cache_file(cache_path).await;
+    }
     let bound = bind_listeners(&ctx)?;
 
     let primary_addr = bound.primary_addr;
@@ -112,20 +168,28 @@ async fn run_daemon(cfg: RuntimeConfig) -> Result<()> {
     };
     write_runtime_state(primary_addr, socks_addr);
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let use_dashboard = dashboard_tracing.is_some();
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let use_dashboard = false;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let proxy_summary = proxy_session.as_ref().map(|s| s.summary.clone());
+    #[cfg(windows)]
+    let proxy_summary = proxy_session.as_ref().map(|_| {
+        if cfg.env_proxy {
+            "active (WinINET + HTTP_PROXY/HTTPS_PROXY with auto-cleanup)".to_string()
+        } else {
+            "active (WinINET proxy with auto-cleanup)".to_string()
+        }
+    });
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    let proxy_summary: Option<String> = None;
+
     if !cfg.quiet {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let proxy_summary = proxy_session.as_ref().map(|s| s.summary.clone());
-        #[cfg(windows)]
-        let proxy_summary = proxy_session.as_ref().map(|_| {
-            if cfg.env_proxy {
-                "active (WinINET + HTTP_PROXY/HTTPS_PROXY with auto-cleanup)".to_string()
-            } else {
-                "active (WinINET proxy with auto-cleanup)".to_string()
-            }
-        });
-        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-        let proxy_summary = None;
-        print_startup_banner(&cfg, primary_addr, socks_addr, proxy_summary);
+        if !use_dashboard {
+            print_startup_banner(&cfg, primary_addr, socks_addr, proxy_summary.as_deref());
+        }
         info!(
             platform = platform_name(),
             mode = ?cfg.mode,
@@ -137,6 +201,47 @@ async fn run_daemon(cfg: RuntimeConfig) -> Result<()> {
     }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    if let Some(dashboard) = dashboard_tracing {
+        let dash_ctx = ctx.clone();
+        let dash_info = tui_dashboard::DashboardInfo {
+            primary_addr,
+            socks_addr,
+            mode: cfg.mode,
+            enable_doh: cfg.enable_doh,
+            system_proxy: cfg.system_proxy,
+        };
+        let server_task = tokio::spawn(serve_until_shutdown(bound, ctx, shutdown_rx));
+
+        if let Err(err) = tui_dashboard::run_dashboard(
+            dash_info,
+            dash_ctx,
+            dashboard.logs,
+            shutdown_tx.clone(),
+            wait_for_shutdown_signal(),
+        )
+        .await
+        {
+            dashboard
+                .passthrough_stderr
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            eprintln!("vdpi dashboard unavailable ({err}); running in headless mode");
+            if !cfg.quiet {
+                print_startup_banner(&cfg, primary_addr, socks_addr, proxy_summary.as_deref());
+            }
+            wait_for_shutdown_signal().await;
+        }
+
+        info!("received shutdown signal; stopping vdpi cleanly");
+        #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+        drop(proxy_session);
+        let _ = shutdown_tx.send(true);
+        clear_runtime_state(std::process::id());
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_task).await;
+        return Ok(());
+    }
 
     let server_task = tokio::spawn(serve_until_shutdown(bound, ctx, shutdown_rx));
 
@@ -156,7 +261,7 @@ fn print_startup_banner(
     cfg: &RuntimeConfig,
     primary_addr: std::net::SocketAddr,
     socks_addr: Option<std::net::SocketAddr>,
-    proxy_summary: Option<String>,
+    proxy_summary: Option<&str>,
 ) {
     println!(
         "\n  __   ____| |_ __ (_)\n  \\ \\ / / _` | '_ \\| |\n   \\ V / (_| | |_) | |\n    \\_/ \\__,_| .__/|_|\n             |_|        v{} ({})\n",
@@ -181,7 +286,7 @@ fn print_startup_banner(
     );
     println!(
         "  System Integration  : {}\n",
-        proxy_summary.unwrap_or_else(|| "disabled (--no-system-proxy)".to_string())
+        proxy_summary.unwrap_or("disabled (--no-system-proxy)")
     );
     #[cfg(windows)]
     if cfg.system_proxy && cfg.env_proxy {
@@ -203,6 +308,42 @@ fn init_tracing(cfg: &RuntimeConfig) {
         .with_target(false)
         .compact()
         .try_init();
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn is_service_mode(cfg: &RuntimeConfig) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        cfg.windows_service || vdpi::platform::windows::is_running_as_service()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        cfg.windows_service
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn init_tui_tracing() -> DashboardTracing {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let logs = tui_dashboard::new_log_ring();
+    let passthrough_stderr = Arc::new(AtomicBool::new(false));
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("vdpi=info"));
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(tui_dashboard::TuiLogLayer::new(
+            Arc::clone(&logs),
+            Arc::clone(&passthrough_stderr),
+        ))
+        .try_init();
+    DashboardTracing {
+        logs,
+        passthrough_stderr,
+    }
 }
 
 async fn wait_for_shutdown_signal() {

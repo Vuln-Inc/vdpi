@@ -7,3 +7,4 @@ pub mod proxy;
 pub mod server;
 pub mod service;
 pub mod tls;
+pub mod update;

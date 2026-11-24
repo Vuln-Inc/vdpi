@@ -76,6 +76,8 @@ pub struct TunnelConfig {
     pub timeout_ms: u64,
     pub mtu: usize,
     pub bypass_domains: Vec<String>,
+    #[serde(default)]
+    pub cache_path: Option<String>,
 }
 
 impl Default for TunnelConfig {
@@ -90,6 +92,7 @@ impl Default for TunnelConfig {
             timeout_ms: 8000,
             mtu: 1400,
             bypass_domains: Vec::new(),
+            cache_path: None,
         }
     }
 }
@@ -184,6 +187,24 @@ mod tests {
         assert_eq!(cfg.connect_timeout, Duration::from_millis(1500));
         assert_eq!(cfg.dns_addr, "1.1.1.1");
         assert!(!cfg.system_proxy);
+    }
+
+    #[test]
+    fn parses_cache_path_option_with_and_without_field() {
+        let without = TunnelConfig::from_json_str(r#"{"dns_addr":"8.8.8.8"}"#).unwrap();
+        assert_eq!(without.cache_path, None);
+
+        let with_path = TunnelConfig::from_json_str(
+            r#"{"dns_addr":"1.1.1.1","cache_path":"/data/user/0/com.vulninc.vdpi/cache/adaptive-cache.json"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            with_path.cache_path.as_deref(),
+            Some("/data/user/0/com.vulninc.vdpi/cache/adaptive-cache.json")
+        );
+
+        let with_null = TunnelConfig::from_json_str(r#"{"cache_path":null}"#).unwrap();
+        assert_eq!(with_null.cache_path, None);
     }
 
     #[test]

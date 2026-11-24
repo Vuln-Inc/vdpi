@@ -224,9 +224,70 @@ struct ContentView: View {
                     pendingReconnect: manager.pendingReconnect,
                     isCompactHeight: isCompactHeight
                 )
+                .overlay {
+                    if manager.availableUpdate != nil {
+                        settingsTabBadgeOverlay
+                            .allowsHitTesting(false)
+                            .accessibilityHidden(true)
+                    }
+                }
             }
         }
         .padding(.horizontal, 16)
+    }
+
+    private var settingsTabBadgeOverlay: some View {
+        HStack(spacing: 0) {
+            ForEach(VdpiTab.allCases) { tab in
+                if tab == .settings {
+                    let isSelected = (selectedTab == .settings)
+                    Group {
+                        if isCompactHeight {
+                            HStack(spacing: 6) {
+                                Image(systemName: tab.systemImage(selected: isSelected))
+                                    .font(.system(size: 16, weight: .semibold))
+                                    .hidden()
+                                    .overlay(alignment: .topTrailing) {
+                                        Circle()
+                                            .fill(palette.accent)
+                                            .frame(width: 6, height: 6)
+                                            .offset(x: 3, y: -2)
+                                    }
+
+                                Text(tab.title)
+                                    .font(.caption.weight(isSelected ? .semibold : .medium))
+                                    .dynamicTypeSize(...DynamicTypeSize.large)
+                                    .lineLimit(1)
+                                    .hidden()
+                            }
+                        } else {
+                            VStack(spacing: 3) {
+                                Image(systemName: tab.systemImage(selected: isSelected))
+                                    .font(.system(size: 20, weight: isSelected ? .semibold : .medium))
+                                    .hidden()
+                                    .overlay(alignment: .topTrailing) {
+                                        Circle()
+                                            .fill(palette.accent)
+                                            .frame(width: 6, height: 6)
+                                            .offset(x: 5, y: -2)
+                                    }
+
+                                Text(tab.title)
+                                    .font(.caption2.weight(isSelected ? .semibold : .medium))
+                                    .dynamicTypeSize(...DynamicTypeSize.large)
+                                    .lineLimit(1)
+                                    .hidden()
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    Color.clear
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+        }
+        .padding(isCompactHeight ? 3.5 : 4)
     }
 }
 

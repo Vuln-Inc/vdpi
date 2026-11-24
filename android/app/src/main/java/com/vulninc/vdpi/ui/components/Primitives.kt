@@ -52,6 +52,7 @@ import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDirection
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
@@ -69,7 +70,7 @@ private val AppleSegmentedThumbDark = Color(0xFF636366)
 private val AppleSegmentedThumbLight = Color(0xFFFFFFFF)
 
 /**
- * Crisp 0.5dp Apple Inset Grouped separator with optional leading inset.
+ * 0.5dp horizontal separator with optional leading inset.
  */
 @Composable
 fun HairlineRule(
@@ -88,7 +89,7 @@ fun HairlineRule(
 }
 
 /**
- * Apple Inset Grouped section header label.
+ * Section header label for grouped cards.
  */
 @Composable
 fun SectionOverline(
@@ -105,7 +106,7 @@ fun SectionOverline(
 }
 
 /**
- * Apple Inset Grouped explanatory section footer.
+ * Explanatory footer label for grouped cards.
  */
 @Composable
 fun SectionFooter(
@@ -122,8 +123,7 @@ fun SectionFooter(
 }
 
 /**
- * Apple Settings Inset Grouped list row with quiet press highlight wash,
- * optional subtitle, and leading/trailing accessories.
+ * Grouped list row with press highlight, optional subtitle, and leading/trailing accessories.
  */
 @Composable
 fun InsetGroupedRow(
@@ -133,6 +133,8 @@ fun InsetGroupedRow(
     onClick: (() -> Unit)? = null,
     leading: (@Composable () -> Unit)? = null,
     trailing: (@Composable () -> Unit)? = null,
+    titleTextDirection: TextDirection = TextDirection.Unspecified,
+    subtitleTextDirection: TextDirection = TextDirection.Unspecified,
 ) {
     val palette = VdpiThemeTokens.palette
     val interactionSource = remember { MutableInteractionSource() }
@@ -175,7 +177,11 @@ fun InsetGroupedRow(
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = title,
-                style = VdpiTextStyles.rowTitle,
+                style = if (titleTextDirection != TextDirection.Unspecified) {
+                    VdpiTextStyles.rowTitle.copy(textDirection = titleTextDirection)
+                } else {
+                    VdpiTextStyles.rowTitle
+                },
                 color = palette.inkPrimary,
                 maxLines = 1,
                 softWrap = false,
@@ -185,7 +191,11 @@ fun InsetGroupedRow(
                 Spacer(Modifier.height(2.dp))
                 Text(
                     text = subtitle,
-                    style = VdpiTextStyles.caption,
+                    style = if (subtitleTextDirection != TextDirection.Unspecified) {
+                        VdpiTextStyles.caption.copy(textDirection = subtitleTextDirection)
+                    } else {
+                        VdpiTextStyles.caption
+                    },
                     color = palette.inkSecondary,
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
@@ -203,9 +213,9 @@ fun InsetGroupedRow(
 }
 
 /**
- * Native-feel iOS / BitChord switch (51dp x 31dp track, 27dp white thumb with subtle
- * press stretch to 31dp). Pass `onCheckedChange = null` when embedded inside a
- * `Modifier.toggleable` row to avoid duplicate TalkBack focus targets.
+ * Toggle switch (51dp x 31dp track, 27dp thumb with press stretch to 31dp).
+ * Pass `onCheckedChange = null` when embedded inside a `Modifier.toggleable`
+ * row to avoid duplicate TalkBack focus targets.
  */
 @Composable
 fun PrecisionSwitch(
@@ -291,8 +301,8 @@ fun PrecisionSwitch(
 }
 
 /**
- * Apple Segmented Control with recessed neutral track, subtle inter-segment dividers,
- * and a spring-sliding solid active segment.
+ * Segmented control with recessed track, inter-segment dividers,
+ * and an animated active segment indicator.
  */
 @Composable
 fun <T> SegmentedControl(
@@ -419,7 +429,7 @@ fun <T> SegmentedControl(
 }
 
 /**
- * Clean Apple tonal secondary pill button without decorative glass border.
+ * Tonal secondary pill button.
  */
 @Composable
 fun GhostActionButton(
@@ -489,8 +499,7 @@ fun GhostActionButton(
 }
 
 /**
- * Floating Liquid Glass snackbar capsule with compact layout and a single
- * high-contrast accent action button.
+ * Floating snackbar capsule with compact layout and an optional action button.
  */
 @Composable
 fun MinimalSnackbarHost(
@@ -573,8 +582,7 @@ fun MinimalSnackbarHost(
 }
 
 /**
- * SF-Symbol-proportioned vector tab icon (22dp default) with clean outlined and
- * filled platform-consistent variants.
+ * Vector tab icon (22dp default) with outlined and filled variants.
  */
 @Composable
 fun MinimalTabIcon(

@@ -3,9 +3,11 @@ package com.vulninc.vdpi.ui.screens
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.os.Build
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
@@ -78,6 +80,7 @@ import com.vulninc.vdpi.ui.components.HairlineRule
 import com.vulninc.vdpi.ui.components.InsetGroupedCard
 import com.vulninc.vdpi.ui.components.SectionFooter
 import com.vulninc.vdpi.ui.components.SectionOverline
+import com.vulninc.vdpi.ui.components.sculptedDarkCardBorder
 import com.vulninc.vdpi.ui.theme.GeistMono
 import com.vulninc.vdpi.ui.theme.GeistSans
 import com.vulninc.vdpi.ui.theme.VdpiTextStyles
@@ -177,33 +180,74 @@ private fun SheetHeaderBar(
     leadingEnabled: Boolean,
     onLeadingClick: () -> Unit,
     onDismiss: () -> Unit,
+    leadingExtra: (@Composable () -> Unit)? = null,
 ) {
     val palette = VdpiThemeTokens.palette
-    Box(
+    Row(
         modifier = Modifier
             .fillMaxWidth()
             .heightIn(min = 44.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        SheetTextButton(
-            label = leadingLabel,
-            enabled = leadingEnabled,
-            onClick = onLeadingClick,
-            modifier = Modifier.align(Alignment.CenterStart),
-        )
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            SheetTextButton(
+                label = leadingLabel,
+                enabled = leadingEnabled,
+                onClick = onLeadingClick,
+            )
+            if (leadingExtra != null) {
+                leadingExtra()
+            }
+        }
         Text(
             text = title,
             style = VdpiTextStyles.sheetTitle,
             color = palette.inkPrimary,
+            textAlign = TextAlign.Center,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.align(Alignment.Center),
+            modifier = Modifier
+                .weight(1f)
+                .padding(horizontal = 8.dp),
         )
         SheetTextButton(
             label = "Done",
             emphasized = true,
             onClick = onDismiss,
-            modifier = Modifier.align(Alignment.CenterEnd),
         )
+    }
+}
+
+@Composable
+private fun SheetIconButton(
+    contentDescription: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    content: @Composable () -> Unit,
+) {
+    val haptic = LocalHapticFeedback.current
+    val interaction = remember { MutableInteractionSource() }
+
+    Box(
+        modifier = modifier
+            .size(44.dp)
+            .alpha(if (enabled) 1f else 0.4f)
+            .semantics { this.contentDescription = contentDescription }
+            .clickable(
+                interactionSource = interaction,
+                indication = null,
+                enabled = enabled,
+                role = Role.Button,
+            ) {
+                haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                onClick()
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        content()
     }
 }
 
@@ -214,11 +258,14 @@ internal fun DoctorSheetContent(
     doctorState: DoctorUiState,
     isLandscape: Boolean,
     onRerun: () -> Unit,
+    onFormatDiagnosticsReport: () -> String,
     onDismiss: () -> Unit,
 ) {
     val palette = VdpiThemeTokens.palette
+    val context = LocalContext.current
     val cardBackground = if (palette.isDark) palette.surfaceRaised else palette.surface
     val report = doctorState.report
+    val canShare = !doctorState.running && report != null
 
     Box(
         modifier = Modifier
@@ -253,14 +300,38 @@ internal fun DoctorSheetContent(
                 leadingEnabled = !doctorState.running,
                 onLeadingClick = onRerun,
                 onDismiss = onDismiss,
+                leadingExtra = {
+                    SheetIconButton(
+                        contentDescription = "Share diagnostics report",
+                        enabled = canShare,
+                        onClick = {
+                            shareDiagnosticsReport(
+                                context = context,
+                                reportText = onFormatDiagnosticsReport(),
+                            )
+                        },
+                    ) {
+                        ShareGlyph(tint = palette.accent)
+                    }
+                },
             )
 
             Spacer(Modifier.height(if (isLandscape) 8.dp else 14.dp))
 
+            if (!doctorState.running && report != null && report.checks.isNotEmpty()) {
+                DoctorSummaryStrip(
+                    report = report,
+                    isLandscape = isLandscape,
+                )
+                Spacer(Modifier.height(if (isLandscape) 10.dp else 14.dp))
+            }
+
             SectionOverline(text = "Checks")
 
             InsetGroupedCard(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .sculptedDarkCardBorder(16.dp),
                 radius = 16.dp,
                 backgroundColor = cardBackground,
             ) {
@@ -405,6 +476,110 @@ private fun DoctorMessageBox(
             color = palette.inkSecondary,
             textAlign = TextAlign.Center,
         )
+    }
+}
+
+@Composable
+private fun DoctorSummaryStrip(
+    report: DoctorReport,
+    isLandscape: Boolean,
+) {
+    val palette = VdpiThemeTokens.palette
+    val total = report.checks.size
+    val passedCount = report.checks.count { it.passed }
+    val allPassed = report.ok && passedCount == total
+    val stripFill = if (allPassed) palette.signalTint else palette.warningTint
+    val stripInk = if (allPassed) palette.signal else palette.warning
+    val borderColor = stripInk.copy(alpha = if (palette.isDark) 0.24f else 0.18f)
+    val summaryText = if (allPassed) {
+        "All $total checks passed"
+    } else {
+        "$passedCount of $total passed"
+    }
+    val shape = remember { RoundedCornerShape(12.dp) }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(shape)
+            .background(stripFill)
+            .border(width = 0.5.dp, color = borderColor, shape = shape)
+            .semantics(mergeDescendants = true) {
+                contentDescription = summaryText
+            }
+            .padding(
+                horizontal = 14.dp,
+                vertical = if (isLandscape) 8.dp else 10.dp,
+            ),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            modifier = Modifier
+                .size(7.dp)
+                .clip(CircleShape)
+                .background(stripInk),
+        )
+        Spacer(Modifier.width(10.dp))
+        Text(
+            text = summaryText,
+            style = VdpiTextStyles.body.copy(
+                fontWeight = FontWeight.Medium,
+                fontSize = 14.sp,
+                lineHeight = 19.sp,
+            ),
+            color = stripInk,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+@Composable
+private fun ShareGlyph(tint: Color) {
+    Canvas(modifier = Modifier.size(18.dp)) {
+        val w = size.width
+        val h = size.height
+        val strokePx = 1.7.dp.toPx()
+        val stroke = Stroke(width = strokePx, cap = StrokeCap.Round, join = StrokeJoin.Round)
+
+        // Upward shaft
+        drawLine(
+            color = tint,
+            start = Offset(w * 0.50f, h * 0.12f),
+            end = Offset(w * 0.50f, h * 0.62f),
+            strokeWidth = strokePx,
+            cap = StrokeCap.Round,
+        )
+        // Arrow head
+        val head = Path().apply {
+            moveTo(w * 0.30f, h * 0.30f)
+            lineTo(w * 0.50f, h * 0.12f)
+            lineTo(w * 0.70f, h * 0.30f)
+        }
+        drawPath(path = head, color = tint, style = stroke)
+
+        // Open tray box
+        val tray = Path().apply {
+            moveTo(w * 0.32f, h * 0.42f)
+            lineTo(w * 0.20f, h * 0.42f)
+            lineTo(w * 0.20f, h * 0.86f)
+            lineTo(w * 0.80f, h * 0.86f)
+            lineTo(w * 0.80f, h * 0.42f)
+            lineTo(w * 0.68f, h * 0.42f)
+        }
+        drawPath(path = tray, color = tint, style = stroke)
+    }
+}
+
+private fun shareDiagnosticsReport(context: Context, reportText: String) {
+    if (reportText.isBlank()) return
+    val sendIntent = Intent(Intent.ACTION_SEND).apply {
+        type = "text/plain"
+        putExtra(Intent.EXTRA_SUBJECT, "vdpi Diagnostics Report")
+        putExtra(Intent.EXTRA_TEXT, reportText)
+    }
+    runCatching {
+        context.startActivity(Intent.createChooser(sendIntent, "Share Diagnostics"))
     }
 }
 

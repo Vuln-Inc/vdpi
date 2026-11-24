@@ -6,12 +6,39 @@ pub mod fd;
 mod packet;
 pub mod pipeline;
 
+use crate::config::TunnelConfig;
 use crate::events::EngineEvent;
 use crate::pipeline::TunStats;
+use anyhow::Result;
 use serde::Serialize;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
+use tracing::debug;
 use vdpi::desync::EngineContext;
+
+/// Builds an [`EngineContext`] from a mobile [`TunnelConfig`], attaching and pre-loading
+/// the persistent adaptive stage cache file whenever `config.cache_path` is provided.
+pub async fn build_engine_context(config: TunnelConfig) -> Result<EngineContext> {
+    let cache_path = config
+        .cache_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from);
+    let ctx = EngineContext::new(config.into_runtime_config())?;
+    if let Some(path) = cache_path {
+        ctx.attach_cache_file(path).await;
+    }
+    Ok(ctx)
+}
+
+/// Flushes any attached persistent adaptive stage cache once during clean tunnel stop.
+pub async fn flush_engine_cache(ctx: &EngineContext) {
+    if let Err(e) = ctx.flush_persisted_cache().await {
+        debug!(error = %e, "failed to flush persisted adaptive cache on tunnel stop");
+    }
+}
 
 /// Unified JSON telemetry payload shared by Android and iOS clients.
 #[derive(Debug, Clone, Serialize)]
@@ -90,5 +117,58 @@ impl TelemetrySnapshot {
             doh_enabled: ctx.config.enable_doh,
             events,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+    use vdpi::desync::LearnedStrategy;
+
+    #[tokio::test]
+    async fn build_engine_context_attaches_and_flushes_persisted_cache() {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "vdpi-tun-cache-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache_file = dir.join("adaptive-cache.json");
+
+        let cfg1 = TunnelConfig {
+            cache_path: Some(cache_file.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let ctx1 = build_engine_context(cfg1).await.unwrap();
+        assert!(ctx1.has_cache_file().await);
+        {
+            let mut guard = ctx1.adaptive_cache.write().await;
+            guard.insert("discord.com".to_string(), LearnedStrategy::MultiRecordOob);
+            ctx1.telemetry
+                .learned_hosts
+                .store(guard.len(), Ordering::Relaxed);
+        }
+        ctx1.preferred_isp_stage
+            .store(LearnedStrategy::MultiRecordOob as u8, Ordering::Relaxed);
+        flush_engine_cache(&ctx1).await;
+        assert!(cache_file.exists());
+
+        let cfg2 = TunnelConfig {
+            cache_path: Some(cache_file.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let ctx2 = build_engine_context(cfg2).await.unwrap();
+        assert_eq!(ctx2.learned_host_count().await, 1);
+        assert_eq!(ctx2.telemetry_snapshot().learned_hosts, 1);
+        assert_eq!(ctx2.preferred_stage(), LearnedStrategy::MultiRecordOob);
+        assert_eq!(
+            ctx2.adaptive_cache.read().await.get("discord.com").copied(),
+            Some(LearnedStrategy::MultiRecordOob)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

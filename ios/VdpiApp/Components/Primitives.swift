@@ -284,9 +284,10 @@ extension View {
 
 // MARK: - Content Layer Containers (Opaque Apple Grouped Surfaces)
 
-/// Clean opaque Apple grouped surface container (zero blur, zero shadow, zero outer border).
+/// Clean opaque Apple grouped surface container with sculpted dark-mode hairline.
 struct InsetGroupedCard<Content: View>: View {
     @Environment(\.vdpiPalette) private var palette
+    @Environment(\.colorScheme) private var colorScheme
     @Environment(\.colorSchemeContrast) private var colorSchemeContrast
 
     var cornerRadius: CGFloat
@@ -309,6 +310,17 @@ struct InsetGroupedCard<Content: View>: View {
                 if colorSchemeContrast == .increased {
                     shape
                         .strokeBorder(palette.borderStrong, lineWidth: 1.0)
+                        .allowsHitTesting(false)
+                } else if colorScheme == .dark {
+                    shape
+                        .strokeBorder(
+                            LinearGradient(
+                                colors: [Color.white.opacity(0.09), Color.white.opacity(0.02)],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            ),
+                            lineWidth: 0.5
+                        )
                         .allowsHitTesting(false)
                 }
             }

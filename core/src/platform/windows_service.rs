@@ -316,16 +316,12 @@ pub fn is_elevated() -> bool {
 /// Relaunches the current `vdpi.exe` with explicit CLI arguments under UAC elevation (`runas`)
 /// and waits for the elevated process to finish.
 pub fn relaunch_elevated_and_wait(args: &[String]) -> Result<()> {
-    let current_exe = std::env::current_exe().context("failed to determine current executable")?;
+    let current_exe = crate::update::strip_windows_verbatim_prefix(
+        &std::env::current_exe().context("failed to determine current executable")?,
+    );
     let params: String = args
         .iter()
-        .map(|arg| {
-            if arg.is_empty() || arg.contains([' ', '\t', '"']) {
-                format!("\"{}\"", arg.replace('"', "\\\""))
-            } else {
-                arg.clone()
-            }
-        })
+        .map(|arg| crate::service::quote_windows_arg(arg))
         .collect::<Vec<_>>()
         .join(" ");
 

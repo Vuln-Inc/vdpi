@@ -1,16 +1,17 @@
 use crate::config::{DesyncMode, RuntimeConfig};
 use crate::desync::EngineContext;
 use crate::platform::{clear_all_system_proxies, platform_name, print_platform_proxy_status};
+use crate::update::{compare_versions, parse_semver, VersionRelation};
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use anyhow::Context;
 use anyhow::{bail, Result};
 use reqwest::{Client, Proxy};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub const LAUNCH_AGENT_LABEL: &str = "com.vdpi";
@@ -146,6 +147,136 @@ pub fn installed_binary_path() -> Result<PathBuf> {
     Ok(vdpi_root_dir()?.join("bin").join(bin_name))
 }
 
+/// Snapshot of an existing `vdpi` installation discovered on this machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledInfo {
+    pub binary_path: PathBuf,
+    pub installed_version: Option<String>,
+    pub current_version: &'static str,
+    pub relation: VersionRelation,
+    pub running_from_installed: bool,
+}
+
+/// Detects whether `vdpi` is installed in its standard service location and
+/// probes the installed binary's version offline without network requests.
+pub fn detect_installed_info() -> Option<InstalledInfo> {
+    let binary_path = installed_binary_path().ok()?;
+    if !binary_path.is_file() {
+        return None;
+    }
+
+    let running_from_installed = std::env::current_exe().ok().is_some_and(|current_exe| {
+        match (
+            fs::canonicalize(&current_exe),
+            fs::canonicalize(&binary_path),
+        ) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => current_exe == binary_path,
+        }
+    });
+
+    let current_version = env!("CARGO_PKG_VERSION");
+
+    let (installed_version, relation) = if running_from_installed {
+        (Some(current_version.to_string()), VersionRelation::Same)
+    } else {
+        let installed = probe_binary_version(&binary_path);
+        let rel = installed.as_deref().map_or(VersionRelation::Unknown, |v| {
+            compare_versions(current_version, v)
+        });
+        (installed, rel)
+    };
+
+    Some(InstalledInfo {
+        binary_path,
+        installed_version,
+        current_version,
+        relation,
+        running_from_installed,
+    })
+}
+
+/// Extracts and normalizes a semantic version (`X.Y.Z`) from `vdpi --version` stdout.
+pub fn parse_version_from_cli_output(stdout: &str) -> Option<String> {
+    let first_line = stdout.lines().find(|line| !line.trim().is_empty())?;
+    first_line.split_whitespace().find_map(|token| {
+        let (major, minor, patch) =
+            parse_semver(token).or_else(|| token.strip_prefix('v').and_then(parse_semver))?;
+        Some(format!("{major}.{minor}.{patch}"))
+    })
+}
+
+fn probe_binary_version(path: &Path) -> Option<String> {
+    const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+    const POLL_INTERVAL: Duration = Duration::from_millis(25);
+    const MAX_PROBE_STDOUT_BYTES: usize = 4 * 1024;
+
+    let mut cmd = Command::new(path);
+    cmd.arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = cmd.spawn().ok()?;
+    let stdout_pipe = child.stdout.take()?;
+
+    let reader_handle = std::thread::spawn(move || {
+        let mut pipe = stdout_pipe;
+        let mut retained = Vec::new();
+        let mut scratch = [0u8; 1024];
+        loop {
+            match pipe.read(&mut scratch) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if retained.len() < MAX_PROBE_STDOUT_BYTES {
+                        let keep = (MAX_PROBE_STDOUT_BYTES - retained.len()).min(n);
+                        retained.extend_from_slice(&scratch[..keep]);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        retained
+    });
+
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if start.elapsed() >= PROBE_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+
+    let raw_stdout = reader_handle.join().ok()?;
+    let status = status?;
+    if !status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&raw_stdout);
+    parse_version_from_cli_output(&stdout)
+}
+
 pub fn launch_agent_plist_path() -> Result<PathBuf> {
     Ok(home_dir()?
         .join("Library")
@@ -175,12 +306,38 @@ pub fn build_windows_service_bin_path(bin_path: &Path, cfg: &RuntimeConfig) -> S
     format!("\"{}\" {}", bin_path.display(), quoted_args.join(" "))
 }
 
-fn quote_windows_arg(arg: &str) -> String {
-    if arg.is_empty() || arg.contains([' ', '\t', '"']) {
-        format!("\"{}\"", arg.replace('"', "\\\""))
-    } else {
-        arg.to_string()
+pub(crate) fn quote_windows_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        return arg.to_string();
     }
+
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                for _ in 0..(backslashes * 2 + 1) {
+                    out.push('\\');
+                }
+                out.push('"');
+                backslashes = 0;
+            }
+            c => {
+                for _ in 0..backslashes {
+                    out.push('\\');
+                }
+                backslashes = 0;
+                out.push(c);
+            }
+        }
+    }
+    for _ in 0..(backslashes * 2) {
+        out.push('\\');
+    }
+    out.push('"');
+    out
 }
 
 pub fn build_service_cli_args(cfg: &RuntimeConfig) -> Vec<String> {
@@ -311,8 +468,29 @@ pub fn generate_launch_agent_plist(bin_path: &Path, cfg: &RuntimeConfig) -> Stri
     )
 }
 
+fn quote_systemd_arg(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 2);
+    out.push('"');
+    for ch in raw.chars() {
+        match ch {
+            '\r' | '\n' | '\0' => {}
+            '\\' => out.push_str(r"\\"),
+            '"' => out.push_str(r#"\""#),
+            '%' => out.push_str("%%"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 pub fn generate_systemd_unit(bin_path: &Path, cfg: &RuntimeConfig) -> String {
-    let args = build_service_cli_args(cfg).join(" ");
+    let bin_str = bin_path.display().to_string();
+    let mut exec_parts = vec![quote_systemd_arg(&bin_str)];
+    for arg in build_service_cli_args(cfg) {
+        exec_parts.push(quote_systemd_arg(&arg));
+    }
+    let exec_start = exec_parts.join(" ");
     format!(
         "[Unit]\n\
 Description=vdpi Anti-DPI Local Proxy Engine\n\
@@ -321,16 +499,14 @@ Wants=network-online.target\n\
 \n\
 [Service]\n\
 Type=simple\n\
-ExecStart=\"{}\" {}\n\
+ExecStart={exec_start}\n\
 KillMode=mixed\n\
 Restart=always\n\
 RestartSec=2\n\
 LimitNOFILE=65536\n\
 \n\
 [Install]\n\
-WantedBy=default.target\n",
-        bin_path.display(),
-        args
+WantedBy=default.target\n"
     )
 }
 
@@ -397,26 +573,83 @@ pub fn install_service(cfg: &RuntimeConfig) -> Result<()> {
 
     if !same_binary {
         let tmp_name = if cfg!(windows) {
-            "vdpi.tmp.exe"
+            format!("vdpi.tmp.{}.exe", std::process::id())
         } else {
-            "vdpi.tmp"
+            format!(".vdpi.tmp.{}", std::process::id())
         };
         let tmp_bin = bin_dir.join(tmp_name);
-        fs::copy(&current_exe, &tmp_bin)
-            .with_context(|| format!("failed to copy {:?} to {:?}", current_exe, tmp_bin))?;
+        if let Err(err) = fs::copy(&current_exe, &tmp_bin)
+            .with_context(|| format!("failed to copy {:?} to {:?}", current_exe, tmp_bin))
+        {
+            let _ = fs::remove_file(&tmp_bin);
+            return Err(err);
+        }
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&tmp_bin, fs::Permissions::from_mode(0o755))?;
+            if let Err(err) = fs::set_permissions(&tmp_bin, fs::Permissions::from_mode(0o755)) {
+                let _ = fs::remove_file(&tmp_bin);
+                return Err(err)
+                    .with_context(|| format!("failed to chmod 0755 {}", tmp_bin.display()));
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let _ = Command::new("/usr/bin/codesign")
+                    .args(["-fs", "-"])
+                    .arg(&tmp_bin)
+                    .output();
+            }
+            if let Err(err) = fs::rename(&tmp_bin, &target_bin) {
+                let _ = fs::remove_file(&tmp_bin);
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to atomically replace {} with {}",
+                        target_bin.display(),
+                        tmp_bin.display()
+                    )
+                });
+            }
         }
-        #[cfg(target_os = "macos")]
+
+        #[cfg(target_os = "windows")]
         {
-            let _ = Command::new("/usr/bin/codesign")
-                .args(["-fs", "-", &tmp_bin.display().to_string()])
-                .output();
+            let backup_path = if target_bin.exists() {
+                let preferred = bin_dir.join("vdpi.old.exe");
+                let backup = if preferred.exists() && fs::remove_file(&preferred).is_err() {
+                    bin_dir.join(format!("vdpi.old.{}.exe", std::process::id()))
+                } else {
+                    preferred
+                };
+                if let Err(err) = fs::rename(&target_bin, &backup) {
+                    let _ = fs::remove_file(&tmp_bin);
+                    return Err(err).with_context(|| {
+                        format!(
+                            "failed to move existing binary {} aside to {}",
+                            target_bin.display(),
+                            backup.display()
+                        )
+                    });
+                }
+                Some(backup)
+            } else {
+                None
+            };
+
+            if let Err(err) = fs::rename(&tmp_bin, &target_bin) {
+                let _ = fs::remove_file(tmp_bin);
+                if let Some(backup) = backup_path {
+                    let _ = fs::rename(backup, &target_bin);
+                }
+                return Err(err).with_context(|| {
+                    format!("failed to install new binary to {}", target_bin.display())
+                });
+            }
+
+            if let Some(backup) = backup_path {
+                let _ = fs::remove_file(backup);
+            }
         }
-        let _ = fs::remove_file(&target_bin);
-        fs::rename(&tmp_bin, &target_bin)?;
     }
 
     #[cfg(target_os = "macos")]
@@ -494,8 +727,7 @@ fn install_linux_systemd_service(target_bin: &Path, cfg: &RuntimeConfig) -> Resu
         if fs::create_dir_all(&local_bin).is_ok() {
             let link_path = local_bin.join("vdpi");
             let _ = fs::remove_file(&link_path);
-            #[cfg(unix)]
-            let _ = std::os::unix::fs::symlink(target_bin, &link_path);
+            let _ = std::os::unix::fs::symlink(target_bin, link_path);
         }
     }
 
@@ -511,17 +743,28 @@ fn install_linux_systemd_service(target_bin: &Path, cfg: &RuntimeConfig) -> Resu
         .args(["--user", "daemon-reload"])
         .output();
     let enable = Command::new("systemctl")
-        .args(["--user", "enable", "--now", SYSTEMD_UNIT_NAME])
+        .args(["--user", "enable", SYSTEMD_UNIT_NAME])
         .output();
 
-    if let Ok(out) = enable {
-        if !out.status.success() {
-            println!(
-                "Note: systemd user session not active ({}). Wrote unit file to {}",
-                String::from_utf8_lossy(&out.stderr).trim(),
-                unit_path.display()
-            );
+    let mut systemd_note = enable
+        .ok()
+        .filter(|out| !out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stderr).trim().to_string());
+
+    if systemd_note.is_none() {
+        let restart = Command::new("systemctl")
+            .args(["--user", "restart", SYSTEMD_UNIT_NAME])
+            .output();
+        if let Some(out) = restart.ok().filter(|out| !out.status.success()) {
+            systemd_note = Some(String::from_utf8_lossy(&out.stderr).trim().to_string());
         }
+    }
+
+    if let Some(reason) = systemd_note {
+        println!(
+            "Note: systemd user session not active ({reason}). Wrote unit file to {}",
+            unit_path.display()
+        );
     }
 
     let path_updated = ensure_unix_shell_path();
@@ -788,8 +1031,9 @@ async fn discover_live_daemon(
 ) -> (IpAddr, u16, Option<u16>, Option<String>) {
     let states = read_runtime_states();
 
-    let primary_url = format!("http://{}:{}/vdpi-health", cfg.addr, cfg.port);
-    if let Ok(resp) = client.get(&primary_url).send().await {
+    let primary_socket = SocketAddr::new(cfg.addr, cfg.port);
+    let primary_url = format!("http://{primary_socket}/vdpi-health");
+    if let Ok(resp) = client.get(primary_url).send().await {
         if resp.status().is_success() {
             let text = resp.text().await.unwrap_or_default();
             let matching_socks = states
@@ -805,8 +1049,9 @@ async fn discover_live_daemon(
         if st.addr == cfg.addr && st.port == cfg.port {
             continue;
         }
-        let url = format!("http://{}:{}/vdpi-health", st.addr, st.port);
-        if let Ok(resp) = client.get(&url).send().await {
+        let state_socket = SocketAddr::new(st.addr, st.port);
+        let url = format!("http://{state_socket}/vdpi-health");
+        if let Ok(resp) = client.get(url).send().await {
             if resp.status().is_success() {
                 let text = resp.text().await.unwrap_or_default();
                 return (st.addr, st.port, st.socks_port, Some(text));
@@ -1106,5 +1351,58 @@ mod tests {
         assert!(win_bin.contains("--dns 8.8.8.8"));
         assert!(win_bin.contains("--bypass *.example.com"));
         assert!(win_bin.contains("--no-env-proxy"));
+    }
+
+    #[test]
+    fn parses_version_from_cli_output() {
+        assert_eq!(
+            parse_version_from_cli_output("vdpi 0.3.3\n").as_deref(),
+            Some("0.3.3")
+        );
+        assert_eq!(
+            parse_version_from_cli_output("vdpi 0.3.4\r\n").as_deref(),
+            Some("0.3.4")
+        );
+        assert_eq!(
+            parse_version_from_cli_output("vdpi v1.2.3\n").as_deref(),
+            Some("1.2.3")
+        );
+        assert_eq!(
+            parse_version_from_cli_output("0.3.4\n").as_deref(),
+            Some("0.3.4")
+        );
+        assert_eq!(parse_version_from_cli_output(""), None);
+        assert_eq!(parse_version_from_cli_output("   \r\n"), None);
+        assert_eq!(parse_version_from_cli_output("garbage output\n"), None);
+        assert_eq!(parse_version_from_cli_output("vdpi not-a-version\n"), None);
+    }
+
+    #[test]
+    fn quotes_windows_args_with_backslashes_and_quotes() {
+        assert_eq!(quote_windows_arg("simple"), "simple");
+        assert_eq!(quote_windows_arg(""), r#""""#);
+        assert_eq!(quote_windows_arg("a b"), r#""a b""#);
+        assert_eq!(quote_windows_arg(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(quote_windows_arg(r#"a\"b"#), r#""a\\\"b""#);
+        assert_eq!(
+            quote_windows_arg(r"C:\Program Files\vdpi\"),
+            r#""C:\Program Files\vdpi\\""#
+        );
+        assert_eq!(quote_windows_arg(r#"a\\""#), r#""a\\\\\"""#);
+    }
+
+    #[test]
+    fn escapes_systemd_unit_execstart_arguments() {
+        let mut cli = CliArgs::parse_from_iter(["vdpi"]).unwrap();
+        cli.bypass_domains = vec![
+            "evil\nExecStartPost=/bin/sh".to_string(),
+            r#"100%"a\b"#.to_string(),
+        ];
+        let cfg = cli.into_runtime_config();
+        let unit = generate_systemd_unit(Path::new("/home/u%1/my \"dir\"\\vdpi"), &cfg);
+
+        assert!(!unit.contains("\nExecStartPost="));
+        assert!(unit.contains(r#"ExecStart="/home/u%%1/my \"dir\"\\vdpi""#));
+        assert!(unit.contains(r#""100%%\"a\\b""#));
     }
 }

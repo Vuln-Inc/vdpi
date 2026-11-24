@@ -1,0 +1,176 @@
+import AppIntents
+import Foundation
+import NetworkExtension
+
+// MARK: - App Intents (Siri Shortcuts & iOS Automations)
+
+struct ConnectVdpiIntent: AppIntent {
+    static let title: LocalizedStringResource = "Connect vdpi"
+    static let description: IntentDescription? = IntentDescription("Starts the local vdpi anti-DPI tunnel.")
+    static let openAppWhenRun: Bool = false
+
+    func perform() async throws -> some IntentResult & ProvidesDialog {
+        let dialog = try await VdpiTunnelIntentController.connect()
+        return .result(dialog: IntentDialog(stringLiteral: dialog))
+    }
+}
+
+struct DisconnectVdpiIntent: AppIntent {
+    static let title: LocalizedStringResource = "Disconnect vdpi"
+    static let description: IntentDescription? = IntentDescription("Stops the local vdpi anti-DPI tunnel.")
+    static let openAppWhenRun: Bool = false
+
+    func perform() async throws -> some IntentResult & ProvidesDialog {
+        let dialog = try await VdpiTunnelIntentController.disconnect()
+        return .result(dialog: IntentDialog(stringLiteral: dialog))
+    }
+}
+
+struct ToggleVdpiIntent: AppIntent {
+    static let title: LocalizedStringResource = "Toggle vdpi"
+    static let description: IntentDescription? = IntentDescription("Turns the local vdpi anti-DPI tunnel on or off.")
+    static let openAppWhenRun: Bool = false
+
+    func perform() async throws -> some IntentResult & ProvidesDialog {
+        let dialog = try await VdpiTunnelIntentController.toggle()
+        return .result(dialog: IntentDialog(stringLiteral: dialog))
+    }
+}
+
+struct VdpiShortcutsProvider: AppShortcutsProvider {
+    static var appShortcuts: [AppShortcut] {
+        AppShortcut(
+            intent: ConnectVdpiIntent(),
+            phrases: [
+                "Turn on \(.applicationName)",
+                "Connect \(.applicationName)",
+            ]
+        )
+        AppShortcut(
+            intent: DisconnectVdpiIntent(),
+            phrases: [
+                "Turn off \(.applicationName)",
+                "Disconnect \(.applicationName)",
+            ]
+        )
+        AppShortcut(
+            intent: ToggleVdpiIntent(),
+            phrases: [
+                "Toggle \(.applicationName)",
+            ]
+        )
+    }
+}
+
+// MARK: - Background-Safe NetworkExtension Controller
+
+private enum VdpiTunnelIntentController {
+    static func connect() async throws -> String {
+        let existingManagers = try await NETunnelProviderManager.loadAllFromPreferences()
+        let existing = findManager(in: existingManagers)
+        if let existing {
+            let existingStatus = existing.connection.status
+            if existingStatus == .connected || existingStatus == .connecting || existingStatus == .reasserting {
+                return "vdpi is already connected."
+            }
+        }
+
+        let settings = VdpiAppGroup.loadSettings()
+        let manager = try await loadOrCreateManager(settings: settings, existingManager: existing)
+        let status = manager.connection.status
+        if status == .connected || status == .connecting || status == .reasserting {
+            return "vdpi is already connected."
+        }
+
+        VdpiAppGroup.saveSettings(settings)
+        VdpiAppGroup.saveAppliedConfig(settings.toNativeConfig())
+        do {
+            try manager.connection.startVPNTunnel()
+        } catch {
+            VdpiAppGroup.saveAppliedConfig(nil)
+            throw error
+        }
+        return "Connected vdpi."
+    }
+
+    static func disconnect() async throws -> String {
+        let managers = try await NETunnelProviderManager.loadAllFromPreferences()
+        guard let manager = findManager(in: managers) else {
+            VdpiAppGroup.saveAppliedConfig(nil)
+            return "vdpi is already disconnected."
+        }
+
+        let status = manager.connection.status
+        VdpiAppGroup.saveAppliedConfig(nil)
+        if status == .disconnected || status == .invalid {
+            return "vdpi is already disconnected."
+        }
+
+        if manager.isOnDemandEnabled {
+            manager.isOnDemandEnabled = false
+            try await manager.saveToPreferences()
+            try await manager.loadFromPreferences()
+        }
+
+        manager.connection.stopVPNTunnel()
+        return "Disconnected vdpi."
+    }
+
+    static func toggle() async throws -> String {
+        let managers = try await NETunnelProviderManager.loadAllFromPreferences()
+        if let manager = findManager(in: managers) {
+            switch manager.connection.status {
+            case .connected, .connecting, .reasserting:
+                return try await disconnect()
+            case .disconnected, .disconnecting, .invalid:
+                return try await connect()
+            @unknown default:
+                return try await connect()
+            }
+        }
+        return try await connect()
+    }
+
+    private static func findManager(
+        in managers: [NETunnelProviderManager]
+    ) -> NETunnelProviderManager? {
+        managers.first {
+            ($0.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier
+                == VdpiAppGroup.extensionBundleId
+        }
+    }
+
+    private static func loadOrCreateManager(
+        settings: VdpiSettings,
+        existingManager: NETunnelProviderManager? = nil
+    ) async throws -> NETunnelProviderManager {
+        let manager: NETunnelProviderManager
+        if let existingManager {
+            manager = existingManager
+        } else {
+            let managers = try await NETunnelProviderManager.loadAllFromPreferences()
+            manager = findManager(in: managers) ?? NETunnelProviderManager()
+        }
+
+        let proto = NETunnelProviderProtocol()
+        proto.providerBundleIdentifier = VdpiAppGroup.extensionBundleId
+        proto.serverAddress = TunnelNetworkSettingsBuilder.tunnelRemoteAddress
+        proto.includeAllNetworks = false
+
+        manager.protocolConfiguration = proto
+        manager.localizedDescription = "vdpi"
+        manager.isEnabled = true
+        manager.isOnDemandEnabled = settings.onDemandEnabled
+        if settings.onDemandEnabled {
+            let connectRule = NEOnDemandRuleConnect()
+            connectRule.interfaceTypeMatch = .any
+            manager.onDemandRules = [connectRule]
+        } else {
+            manager.onDemandRules = nil
+        }
+
+        try await manager.saveToPreferences()
+        try await manager.loadFromPreferences()
+        return manager
+    }
+}

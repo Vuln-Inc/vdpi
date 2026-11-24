@@ -70,6 +70,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.lifecycleScope
 import com.vulninc.vdpi.ui.VdpiViewModel
 import com.vulninc.vdpi.ui.chrome.FloatingLiquidGlassTabBar
 import com.vulninc.vdpi.ui.chrome.FloatingLiveTunnelAccessoryPill
@@ -88,13 +89,20 @@ import com.vulninc.vdpi.ui.components.VdpiMotion
 import com.vulninc.vdpi.ui.screens.AppsScreen
 import com.vulninc.vdpi.ui.screens.SettingsScreen
 import com.vulninc.vdpi.ui.screens.TunnelScreen
+import com.vulninc.vdpi.ui.screens.UpdateBannerInfo
 import com.vulninc.vdpi.ui.theme.VdpiTheme
 import com.vulninc.vdpi.ui.theme.VdpiThemeTokens
 import com.vulninc.vdpi.vpn.TunnelPhase
 import com.vulninc.vdpi.vpn.VdpiVpnService
-import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
+
+private class SettingsFileTooLargeException : Exception()
 
 private data class UiFeedbackEvent(
     val message: String,
@@ -106,7 +114,8 @@ private data class UiFeedbackEvent(
 class MainActivity : ComponentActivity() {
 
     private val viewModel: VdpiViewModel by viewModels()
-    private val uiFeedback = MutableSharedFlow<UiFeedbackEvent>(extraBufferCapacity = 4)
+    private val uiFeedback = Channel<UiFeedbackEvent>(Channel.BUFFERED)
+    private val uiFeedbackEvents: Flow<UiFeedbackEvent> = uiFeedback.receiveAsFlow()
     private var notificationPermissionRequestedThisSession = false
 
     private val vpnPermissionLauncher = registerForActivityResult(
@@ -115,7 +124,7 @@ class MainActivity : ComponentActivity() {
         if (result.resultCode == Activity.RESULT_OK) {
             startVpnServiceWithPermissions()
         } else {
-            uiFeedback.tryEmit(UiFeedbackEvent(message = "VPN permission was denied"))
+            uiFeedback.trySend(UiFeedbackEvent(message = "VPN permission was denied"))
         }
     }
 
@@ -123,7 +132,7 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
         if (!granted) {
-            uiFeedback.tryEmit(
+            uiFeedback.trySend(
                 UiFeedbackEvent(
                     message = getString(R.string.notification_permission_hint),
                     actionLabel = getString(R.string.notification_settings_action),
@@ -136,7 +145,82 @@ class MainActivity : ComponentActivity() {
         if (VpnService.prepare(this) == null) {
             VdpiVpnService.start(this)
         } else {
-            uiFeedback.tryEmit(UiFeedbackEvent(message = "VPN permission required"))
+            uiFeedback.trySend(UiFeedbackEvent(message = "VPN permission required"))
+        }
+    }
+
+    private val exportSettingsLauncher = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json"),
+    ) { uri ->
+        if (uri == null) return@registerForActivityResult
+        lifecycleScope.launch(Dispatchers.IO) {
+            val payload = runCatching { viewModel.exportSettingsJsonSnapshot() }.getOrElse {
+                uiFeedback.trySend(UiFeedbackEvent(message = "Failed to serialize settings"))
+                return@launch
+            }
+            val written = runCatching {
+                val stream = runCatching {
+                    contentResolver.openOutputStream(uri, "wt")
+                }.getOrElse {
+                    contentResolver.openOutputStream(uri)
+                }
+                stream?.use { out ->
+                    out.write(payload.toByteArray(Charsets.UTF_8))
+                    out.flush()
+                    true
+                } ?: false
+            }.getOrDefault(false)
+            uiFeedback.trySend(
+                UiFeedbackEvent(
+                    message = if (written) "Settings exported" else "Failed to export settings",
+                ),
+            )
+        }
+    }
+
+    private val importSettingsLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri == null) return@registerForActivityResult
+        lifecycleScope.launch(Dispatchers.IO) {
+            val readResult = runCatching {
+                contentResolver.openInputStream(uri)?.use { stream ->
+                    val buffer = ByteArray(8192)
+                    val out = ByteArrayOutputStream()
+                    var total = 0
+                    while (true) {
+                        val read = stream.read(buffer)
+                        if (read < 0) break
+                        if (read > 0) {
+                            total += read
+                            if (total > MAX_IMPORT_BYTES) {
+                                throw SettingsFileTooLargeException()
+                            }
+                            out.write(buffer, 0, read)
+                        }
+                    }
+                    out.toString(Charsets.UTF_8.name()).removePrefix("\uFEFF")
+                } ?: error("Could not open settings file")
+            }
+
+            if (readResult.isFailure) {
+                val message = when (readResult.exceptionOrNull()) {
+                    is SettingsFileTooLargeException -> "Settings file too large (max 256 KB)"
+                    else -> "Could not read settings file"
+                }
+                uiFeedback.trySend(UiFeedbackEvent(message = message))
+                return@launch
+            }
+
+            val rawJson = readResult.getOrThrow()
+            if (rawJson.isBlank()) {
+                uiFeedback.trySend(UiFeedbackEvent(message = "Settings file is empty"))
+                return@launch
+            }
+
+            withContext(Dispatchers.Main.immediate) {
+                viewModel.importSettingsJson(rawJson)
+            }
         }
     }
 
@@ -154,13 +238,15 @@ class MainActivity : ComponentActivity() {
         setContent {
             VdpiAppRoot(
                 viewModel = viewModel,
-                uiFeedback = uiFeedback,
+                uiFeedback = uiFeedbackEvents,
                 onSystemBarStyleChange = ::applySystemBarStyle,
                 onToggleTunnel = ::toggleTunnel,
                 onDisconnectTunnel = ::disconnectTunnel,
                 onTriggerReconnect = ::triggerReconnect,
                 onRequestConnect = ::requestConnect,
                 onOpenAlwaysOnVpn = ::openAlwaysOnVpnSettings,
+                onExportSettings = ::launchExportSettings,
+                onImportSettings = ::launchImportSettings,
             )
         }
     }
@@ -248,24 +334,49 @@ class MainActivity : ComponentActivity() {
     private fun openAlwaysOnVpnSettings(): Boolean =
         runCatching { startActivity(Intent(Settings.ACTION_VPN_SETTINGS)) }.isSuccess
 
+    private fun launchExportSettings() {
+        runCatching {
+            exportSettingsLauncher.launch(SETTINGS_EXPORT_FILENAME)
+        }.onFailure {
+            uiFeedback.trySend(UiFeedbackEvent(message = "File picker unavailable"))
+        }
+    }
+
+    private fun launchImportSettings() {
+        runCatching {
+            importSettingsLauncher.launch(
+                arrayOf("application/json", "text/plain", "application/octet-stream"),
+            )
+        }.onFailure {
+            uiFeedback.trySend(UiFeedbackEvent(message = "File picker unavailable"))
+        }
+    }
+
     companion object {
         const val EXTRA_AUTO_CONNECT = "com.vulninc.vdpi.extra.AUTO_CONNECT"
         private const val KEY_NOTIF_PERMISSION_REQUESTED = "notif_permission_requested_session"
+        private const val SETTINGS_EXPORT_FILENAME = "vdpi-settings.json"
+        private const val MAX_IMPORT_BYTES = 256 * 1024
     }
 }
 
 @Composable
 private fun VdpiAppRoot(
     viewModel: VdpiViewModel,
-    uiFeedback: SharedFlow<UiFeedbackEvent>,
+    uiFeedback: Flow<UiFeedbackEvent>,
     onSystemBarStyleChange: (isDark: Boolean) -> Unit,
     onToggleTunnel: () -> Unit,
     onDisconnectTunnel: () -> Unit,
     onTriggerReconnect: () -> Unit,
     onRequestConnect: () -> Unit,
     onOpenAlwaysOnVpn: () -> Boolean,
+    onExportSettings: () -> Unit,
+    onImportSettings: () -> Unit,
 ) {
     val settings by viewModel.settings.collectAsStateWithLifecycle()
+    val availableUpdate by viewModel.availableUpdate.collectAsStateWithLifecycle()
+    val isCheckingUpdate by viewModel.isCheckingUpdate.collectAsStateWithLifecycle()
+    val updateStatusMessage by viewModel.updateStatusMessage.collectAsStateWithLifecycle()
     val apps by viewModel.installedApps.collectAsStateWithLifecycle()
     val appsLoading by viewModel.appsLoading.collectAsStateWithLifecycle()
     val doctorState by viewModel.doctorState.collectAsStateWithLifecycle()
@@ -273,6 +384,14 @@ private fun VdpiAppRoot(
     val pendingReconnect by viewModel.pendingReconnect.collectAsStateWithLifecycle()
     val reconnectPopupVisible by viewModel.reconnectPopupVisible.collectAsStateWithLifecycle()
     val pendingChangeSummary by viewModel.pendingChangeSummary.collectAsStateWithLifecycle()
+
+    val availableUpdateInfo = availableUpdate?.let { update ->
+        UpdateBannerInfo(
+            latestVersion = update.latestVersion,
+            releaseUrl = update.releaseUrl,
+        )
+    }
+    val appVersion = viewModel.appVersion.ifBlank { viewModel.engineVersion }
 
     VdpiTheme(preference = settings.theme) {
         val palette = VdpiThemeTokens.palette
@@ -284,7 +403,7 @@ private fun VdpiAppRoot(
             onSystemBarStyleChange(palette.isDark)
         }
 
-        LaunchedEffect(Unit) {
+        LaunchedEffect(uiFeedback) {
             uiFeedback.collect { event ->
                 snackbarHostState.currentSnackbarData?.dismiss()
                 val result = snackbarHostState.showSnackbar(
@@ -295,6 +414,16 @@ private fun VdpiAppRoot(
                 if (result == SnackbarResult.ActionPerformed) {
                     event.onAction?.invoke()
                 }
+            }
+        }
+
+        LaunchedEffect(viewModel) {
+            viewModel.userMessages.collect { message ->
+                snackbarHostState.currentSnackbarData?.dismiss()
+                snackbarHostState.showSnackbar(
+                    message = message,
+                    duration = SnackbarDuration.Short,
+                )
             }
         }
 
@@ -409,7 +538,7 @@ private fun VdpiAppRoot(
             LocalIncreaseContrast provides chromeA11y.increaseContrast,
         ) {
             Box(modifier = Modifier.fillMaxSize()) {
-                // Z0: Full-bleed Content Layer on clean solid canvas (recorded into backdropLayer on API 31+).
+                // Z0: Full-bleed content layer on canvas (recorded into backdropLayer on API 31+).
                 // Override LocalGlassBackdropLayer to null inside recorded content so zero feedback loops occur.
                 val contentBackdropModifier = if (sharedBackdropLayer != null) {
                     Modifier.drawWithContent {
@@ -442,13 +571,17 @@ private fun VdpiAppRoot(
                                     when (tab) {
                                         MainTab.TUNNEL -> TunnelScreen(
                                             tunnelState = viewModel.tunnelState,
+                                            throughputSamples = viewModel.throughputSamples,
+                                            currentRateBytesPerSec = viewModel.currentRateBytesPerSec,
                                             settings = settings,
                                             doctorState = doctorState,
-                                            engineVersion = viewModel.engineVersion,
                                             pendingReconnect = pendingReconnect && !showReconnectPopup,
                                             onToggleTunnel = onToggleTunnel,
                                             onReconnect = onTriggerReconnect,
                                             onRunDoctor = viewModel::runDiagnostics,
+                                            availableUpdate = availableUpdateInfo,
+                                            onFormatDiagnosticsReport = viewModel::formatDiagnosticsReport,
+                                            onDismissUpdate = viewModel::dismissAvailableUpdate,
                                         )
 
                                         MainTab.APPS -> AppsScreen(
@@ -470,7 +603,7 @@ private fun VdpiAppRoot(
 
                                         MainTab.SETTINGS -> SettingsScreen(
                                             settings = settings,
-                                            engineVersion = viewModel.engineVersion,
+                                            engineVersion = appVersion,
                                             onSetDesyncMode = viewModel::setDesyncMode,
                                             onSetChunkSize = viewModel::setChunkSize,
                                             onSetDnsAddr = { addr ->
@@ -502,11 +635,17 @@ private fun VdpiAppRoot(
                                                         if (cleared) {
                                                             "Adaptive cache cleared"
                                                         } else {
-                                                            "Cache resets when disconnected"
+                                                            "Failed to clear adaptive cache"
                                                         },
                                                     )
                                                 }
                                             },
+                                            availableUpdate = availableUpdateInfo,
+                                            isCheckingUpdate = isCheckingUpdate,
+                                            updateStatusMessage = updateStatusMessage,
+                                            onCheckForUpdates = { viewModel.checkForUpdates(manual = true) },
+                                            onExportSettings = onExportSettings,
+                                            onImportSettings = onImportSettings,
                                         )
                                     }
                                 }
@@ -515,7 +654,7 @@ private fun VdpiAppRoot(
                     }
                 }
 
-                // Z10: Non-interactive Scroll Edge Dissolution scrim behind floating bottom dock.
+                // Z10: Non-interactive bottom fade scrim behind floating navigation bar.
                 if (scrimAlpha > 0.01f) {
                     ScrollEdgeFadeScrim(
                         modifier = Modifier
@@ -600,6 +739,7 @@ private fun VdpiAppRoot(
                                     viewModel.loadInstalledApps()
                                 }
                             },
+                            showSettingsBadge = availableUpdate != null,
                         )
                     }
                 }
@@ -614,7 +754,7 @@ private fun VdpiAppRoot(
                         .padding(bottom = snackbarBottomOffset),
                 )
 
-                // Z30: Top-Floating "Settings Changed" Liquid Glass Popup across ALL tabs.
+                // Z30: Top-floating "Settings Changed" reconnect popup across all tabs.
                 val popupSlidePx = with(density) { -24.dp.roundToPx() }
                 Box(
                     modifier = Modifier

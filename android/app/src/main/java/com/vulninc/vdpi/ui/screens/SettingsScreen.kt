@@ -49,6 +49,7 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -75,6 +76,7 @@ import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.selected
@@ -83,7 +85,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextDirection
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.vulninc.vdpi.data.ThemePreference
@@ -99,6 +103,7 @@ import com.vulninc.vdpi.ui.components.PrecisionSwitch
 import com.vulninc.vdpi.ui.components.SectionFooter
 import com.vulninc.vdpi.ui.components.SectionOverline
 import com.vulninc.vdpi.ui.components.SegmentedControl
+import com.vulninc.vdpi.ui.components.sculptedDarkCardBorder
 import com.vulninc.vdpi.ui.theme.GeistSans
 import com.vulninc.vdpi.ui.theme.VdpiTextStyles
 import com.vulninc.vdpi.ui.theme.VdpiThemeTokens
@@ -139,6 +144,12 @@ fun SettingsScreen(
     onOpenAlwaysOnVpn: () -> Unit,
     onClearCache: () -> Unit,
     modifier: Modifier = Modifier,
+    availableUpdate: UpdateBannerInfo? = null,
+    isCheckingUpdate: Boolean = false,
+    updateStatusMessage: String? = null,
+    onCheckForUpdates: () -> Unit = {},
+    onExportSettings: () -> Unit = {},
+    onImportSettings: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val configuration = LocalConfiguration.current
@@ -149,13 +160,18 @@ fun SettingsScreen(
     val topOverlayPadding = LocalTopOverlayPadding.current
     val sectionGap = if (isLandscape) 20.dp else 24.dp
 
-    fun openGitHubRepository() {
+    fun openExternalUrl(url: String) {
+        if (url.isBlank()) return
         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
         runCatching {
             context.startActivity(
-                Intent(Intent.ACTION_VIEW, Uri.parse(GITHUB_REPO_URL)),
+                Intent(Intent.ACTION_VIEW, Uri.parse(url)),
             )
         }
+    }
+
+    fun openGitHubRepository() {
+        openExternalUrl(GITHUB_REPO_URL)
     }
 
     Column(
@@ -218,6 +234,22 @@ fun SettingsScreen(
             )
             Spacer(Modifier.height(sectionGap))
 
+            BackupRestoreSection(
+                onExportSettings = onExportSettings,
+                onImportSettings = onImportSettings,
+            )
+            Spacer(Modifier.height(sectionGap))
+
+            UpdatesSettingsSection(
+                appVersion = engineVersion,
+                availableUpdate = availableUpdate,
+                isCheckingUpdate = isCheckingUpdate,
+                updateStatusMessage = updateStatusMessage,
+                onCheckForUpdates = onCheckForUpdates,
+                onOpenReleaseUrl = ::openExternalUrl,
+            )
+            Spacer(Modifier.height(sectionGap))
+
             AboutSettingsSection(onOpenGitHub = ::openGitHubRepository)
             Spacer(Modifier.height(if (isLandscape) 10.dp else 12.dp))
 
@@ -271,7 +303,9 @@ private fun DesyncSettingsSection(
     Column(modifier = Modifier.fillMaxWidth()) {
         SectionOverline("Desync Engine")
         InsetGroupedCard(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .sculptedDarkCardBorder(16.dp),
             radius = 16.dp,
         ) {
             DesyncMode.entries.forEachIndexed { idx, mode ->
@@ -352,7 +386,9 @@ private fun DnsSettingsSection(
     Column(modifier = Modifier.fillMaxWidth()) {
         SectionOverline("DNS & Privacy")
         InsetGroupedCard(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .sculptedDarkCardBorder(16.dp),
             radius = 16.dp,
         ) {
             DNS_PRESETS.forEachIndexed { idx, preset ->
@@ -361,6 +397,7 @@ private fun DnsSettingsSection(
                 InsetGroupedRow(
                     title = preset.name,
                     subtitle = preset.address,
+                    subtitleTextDirection = TextDirection.Ltr,
                     modifier = Modifier.semantics { selected = isSelected },
                     onClick = {
                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
@@ -459,7 +496,9 @@ private fun BypassDomainsSection(
     Column(modifier = Modifier.fillMaxWidth()) {
         SectionOverline("Bypass Domains")
         InsetGroupedCard(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .sculptedDarkCardBorder(16.dp),
             radius = 16.dp,
         ) {
             BorderlessInputRow(
@@ -480,6 +519,7 @@ private fun BypassDomainsSection(
                 HairlineRule(startIndent = 16.dp)
                 InsetGroupedRow(
                     title = domain,
+                    titleTextDirection = TextDirection.Ltr,
                     trailing = {
                         RemoveDomainButton(
                             domain = domain,
@@ -524,7 +564,9 @@ private fun SystemSettingsSection(
     Column(modifier = Modifier.fillMaxWidth()) {
         SectionOverline("System")
         InsetGroupedCard(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .sculptedDarkCardBorder(16.dp),
             radius = 16.dp,
         ) {
             InsetGroupedRow(
@@ -554,6 +596,146 @@ private fun SystemSettingsSection(
 }
 
 @Composable
+private fun BackupRestoreSection(
+    onExportSettings: () -> Unit,
+    onImportSettings: () -> Unit,
+) {
+    val palette = VdpiThemeTokens.palette
+    val haptic = LocalHapticFeedback.current
+
+    Column(modifier = Modifier.fillMaxWidth()) {
+        SectionOverline("Backup & Restore")
+        InsetGroupedCard(
+            modifier = Modifier
+                .fillMaxWidth()
+                .sculptedDarkCardBorder(16.dp),
+            radius = 16.dp,
+        ) {
+            InsetGroupedRow(
+                title = "Export Settings",
+                subtitle = "Save configuration as JSON",
+                onClick = {
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    onExportSettings()
+                },
+                trailing = {
+                    ChevronRightGlyph(tint = palette.inkMuted)
+                },
+            )
+
+            HairlineRule(startIndent = 16.dp)
+
+            InsetGroupedRow(
+                title = "Import Settings",
+                subtitle = "Restore configuration from JSON",
+                onClick = {
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    onImportSettings()
+                },
+                trailing = {
+                    ChevronRightGlyph(tint = palette.inkMuted)
+                },
+            )
+        }
+        SectionFooter("Exports desync, DNS, bypass domains, split tunnel, and theme preferences.")
+    }
+}
+
+@Composable
+private fun UpdatesSettingsSection(
+    appVersion: String,
+    availableUpdate: UpdateBannerInfo?,
+    isCheckingUpdate: Boolean,
+    updateStatusMessage: String?,
+    onCheckForUpdates: () -> Unit,
+    onOpenReleaseUrl: (String) -> Unit,
+) {
+    val palette = VdpiThemeTokens.palette
+    val haptic = LocalHapticFeedback.current
+    val currentVersionTag = formatVersionTag(appVersion)
+
+    Column(modifier = Modifier.fillMaxWidth()) {
+        SectionOverline("Updates")
+        InsetGroupedCard(
+            modifier = Modifier
+                .fillMaxWidth()
+                .sculptedDarkCardBorder(16.dp),
+            radius = 16.dp,
+        ) {
+            if (availableUpdate != null) {
+                val latestTag = formatVersionTag(availableUpdate.latestVersion)
+                InsetGroupedRow(
+                    title = "Update Available · $latestTag",
+                    subtitle = "Open release on GitHub",
+                    modifier = Modifier.heightIn(min = 52.dp),
+                    onClick = { onOpenReleaseUrl(availableUpdate.releaseUrl) },
+                    leading = {
+                        Box(
+                            modifier = Modifier
+                                .size(6.dp)
+                                .clip(CircleShape)
+                                .background(palette.accent),
+                        )
+                    },
+                    trailing = {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(5.dp),
+                        ) {
+                            Text(
+                                text = "Download",
+                                fontFamily = GeistSans,
+                                fontWeight = FontWeight.Medium,
+                                fontSize = 14.sp,
+                                color = palette.accent,
+                                maxLines = 1,
+                            )
+                            ArrowUpRightGlyph(tint = palette.accent)
+                        }
+                    },
+                )
+            } else {
+                val statusText = updateStatusMessage?.trim()?.takeIf { it.isNotEmpty() }
+                val shortStatus = statusText?.takeIf { it.length <= 18 }
+                val subtitleText = if (!isCheckingUpdate && shortStatus == null) statusText else null
+                val trailingText = shortStatus ?: currentVersionTag
+
+                InsetGroupedRow(
+                    title = "Check for Updates",
+                    subtitle = subtitleText,
+                    modifier = Modifier.heightIn(min = 52.dp),
+                    onClick = if (isCheckingUpdate) {
+                        null
+                    } else {
+                        {
+                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            onCheckForUpdates()
+                        }
+                    },
+                    trailing = {
+                        if (isCheckingUpdate) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                strokeWidth = 1.8.dp,
+                                color = palette.inkSecondary,
+                            )
+                        } else {
+                            Text(
+                                text = trailingText,
+                                style = VdpiTextStyles.monoMetric.copy(fontSize = 14.sp),
+                                color = palette.inkSecondary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    },
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun AboutSettingsSection(
     onOpenGitHub: () -> Unit,
 ) {
@@ -562,12 +744,15 @@ private fun AboutSettingsSection(
     Column(modifier = Modifier.fillMaxWidth()) {
         SectionOverline("About")
         InsetGroupedCard(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .sculptedDarkCardBorder(16.dp),
             radius = 16.dp,
         ) {
             InsetGroupedRow(
                 title = "GitHub Repository",
                 subtitle = GITHUB_REPO_LABEL,
+                subtitleTextDirection = TextDirection.Ltr,
                 modifier = Modifier.heightIn(min = 52.dp),
                 onClick = onOpenGitHub,
                 trailing = {
@@ -597,11 +782,7 @@ private fun VersionAttributionFooter(
     onOpenGitHub: () -> Unit,
 ) {
     val palette = VdpiThemeTokens.palette
-    val versionLabel = if (engineVersion.startsWith("v", ignoreCase = true)) {
-        engineVersion
-    } else {
-        "v$engineVersion"
-    }
+    val versionLabel = formatVersionTag(engineVersion)
     val footerInteraction = remember { MutableInteractionSource() }
     val footerPressed by footerInteraction.collectIsPressedAsState()
     val footerColor by animateColorAsState(
@@ -664,7 +845,7 @@ private fun ChunkSizeRow(
                 .padding(end = 12.dp),
         )
 
-        // Apple capsule stepper: 34dp visual pill in surfaceRaised with 44dp hit targets
+        // Capsule stepper: 34dp visual pill in surfaceRaised with 44dp hit targets
         Row(
             modifier = Modifier
                 .drawBehind {
@@ -865,6 +1046,7 @@ private fun BorderlessInputRow(
                 textStyle = VdpiTextStyles.rowTitle.copy(
                     color = palette.inkPrimary,
                     fontFeatureSettings = "tnum",
+                    textDirection = TextDirection.Ltr,
                 ),
                 cursorBrush = SolidColor(palette.accent),
                 modifier = Modifier
@@ -1094,7 +1276,12 @@ private fun SelectionCheckmark(visible: Boolean) {
 
 @Composable
 private fun ChevronRightGlyph(tint: Color) {
-    Canvas(modifier = Modifier.size(13.dp)) {
+    val isRtl = LocalLayoutDirection.current == LayoutDirection.Rtl
+    Canvas(
+        modifier = Modifier
+            .size(13.dp)
+            .graphicsLayer { if (isRtl) scaleX = -1f },
+    ) {
         val stroke = Stroke(
             width = 1.75.dp.toPx(),
             cap = StrokeCap.Round,
@@ -1111,7 +1298,12 @@ private fun ChevronRightGlyph(tint: Color) {
 
 @Composable
 private fun ArrowUpRightGlyph(tint: Color) {
-    Canvas(modifier = Modifier.size(13.dp)) {
+    val isRtl = LocalLayoutDirection.current == LayoutDirection.Rtl
+    Canvas(
+        modifier = Modifier
+            .size(13.dp)
+            .graphicsLayer { if (isRtl) scaleX = -1f },
+    ) {
         val strokeWidth = 1.7.dp.toPx()
         val stroke = Stroke(
             width = strokeWidth,

@@ -1,6 +1,8 @@
 package com.vulninc.vdpi.ui.screens
 
+import android.content.Intent
 import android.content.res.Configuration
+import android.net.Uri
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
@@ -61,6 +63,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
@@ -69,16 +72,22 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextDirection
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.vulninc.vdpi.BuildConfig
 import com.vulninc.vdpi.data.SplitTunnelMode
 import com.vulninc.vdpi.data.VdpiSettings
 import com.vulninc.vdpi.engine.TelemetrySnapshot
@@ -91,6 +100,7 @@ import com.vulninc.vdpi.ui.components.LocalBottomChromePadding
 import com.vulninc.vdpi.ui.components.LocalReduceMotion
 import com.vulninc.vdpi.ui.components.LocalTopOverlayPadding
 import com.vulninc.vdpi.ui.components.SectionOverline
+import com.vulninc.vdpi.ui.components.sculptedDarkCardBorder
 import com.vulninc.vdpi.ui.components.springPress
 import com.vulninc.vdpi.ui.theme.GeistSans
 import com.vulninc.vdpi.ui.theme.VdpiTextStyles
@@ -103,29 +113,49 @@ import com.vulninc.vdpi.vpn.TunnelRuntimeSnapshot
 import kotlinx.coroutines.flow.StateFlow
 import java.util.Locale
 
+// ── Shared Update Presentation Model ──
+
+data class UpdateBannerInfo(
+    val latestVersion: String,
+    val releaseUrl: String,
+)
+
+internal fun formatVersionTag(version: String): String {
+    val trimmed = version.trim()
+    if (trimmed.isEmpty()) return ""
+    return if (trimmed.startsWith("v", ignoreCase = true)) trimmed else "v$trimmed"
+}
+
 // ── Tunnel Dashboard Screen ──
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TunnelScreen(
     tunnelState: StateFlow<TunnelRuntimeSnapshot>,
+    throughputSamples: StateFlow<List<Long>>,
+    currentRateBytesPerSec: StateFlow<Long>,
     settings: VdpiSettings,
     doctorState: DoctorUiState,
-    @Suppress("UNUSED_PARAMETER") engineVersion: String = BuildConfig.VERSION_NAME,
     pendingReconnect: Boolean,
     onToggleTunnel: () -> Unit,
     onReconnect: () -> Unit,
     onRunDoctor: () -> Unit,
     modifier: Modifier = Modifier,
+    availableUpdate: UpdateBannerInfo? = null,
+    onFormatDiagnosticsReport: () -> String = { "" },
+    onDismissUpdate: () -> Unit = {},
 ) {
     // Scoped locally so 1Hz telemetry updates never recompose MainActivity, Apps, or Settings.
     val runtime by tunnelState.collectAsStateWithLifecycle()
+    val samples by throughputSamples.collectAsStateWithLifecycle()
+    val currentRate by currentRateBytesPerSec.collectAsStateWithLifecycle()
     val palette = VdpiThemeTokens.palette
+    val context = LocalContext.current
     val haptic = LocalHapticFeedback.current
     val reduceMotion = LocalReduceMotion.current
 
-    var showDoctorSheet by remember { mutableStateOf(false) }
-    var showLogSheet by remember { mutableStateOf(false) }
+    var showDoctorSheet by rememberSaveable { mutableStateOf(false) }
+    var showLogSheet by rememberSaveable { mutableStateOf(false) }
     var lastSeenAlertSeq by rememberSaveable { mutableLongStateOf(-1L) }
 
     val isConnected = runtime.phase == TunnelPhase.CONNECTED
@@ -180,6 +210,20 @@ fun TunnelScreen(
         onReconnect()
     }
 
+    val openUpdateRelease: (String) -> Unit = { url ->
+        if (url.isNotBlank()) {
+            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+            runCatching {
+                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+            }
+        }
+    }
+
+    val dismissUpdateWithHaptic: () -> Unit = {
+        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+        onDismissUpdate()
+    }
+
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE &&
         configuration.screenWidthDp >= 560
@@ -190,6 +234,9 @@ fun TunnelScreen(
         LandscapeTunnelLayout(
             runtime = runtime,
             settings = settings,
+            throughputSamples = samples,
+            currentRateBytesPerSec = currentRate,
+            availableUpdate = availableUpdate,
             isConnected = isConnected,
             pendingReconnect = pendingReconnect,
             reduceMotion = reduceMotion,
@@ -201,12 +248,17 @@ fun TunnelScreen(
             onOpenLogs = openLogs,
             onToggleTunnel = toggleTunnelWithHaptic,
             onReconnect = reconnectWithHaptic,
+            onDownloadUpdate = openUpdateRelease,
+            onDismissUpdate = dismissUpdateWithHaptic,
             modifier = modifier,
         )
     } else {
         PortraitTunnelLayout(
             runtime = runtime,
             settings = settings,
+            throughputSamples = samples,
+            currentRateBytesPerSec = currentRate,
+            availableUpdate = availableUpdate,
             isConnected = isConnected,
             pendingReconnect = pendingReconnect,
             reduceMotion = reduceMotion,
@@ -218,6 +270,8 @@ fun TunnelScreen(
             onOpenLogs = openLogs,
             onToggleTunnel = toggleTunnelWithHaptic,
             onReconnect = reconnectWithHaptic,
+            onDownloadUpdate = openUpdateRelease,
+            onDismissUpdate = dismissUpdateWithHaptic,
             modifier = modifier,
         )
     }
@@ -239,6 +293,7 @@ fun TunnelScreen(
                 doctorState = doctorState,
                 isLandscape = isLandscape,
                 onRerun = onRunDoctor,
+                onFormatDiagnosticsReport = onFormatDiagnosticsReport,
                 onDismiss = { showDoctorSheet = false },
             )
         }
@@ -270,6 +325,9 @@ fun TunnelScreen(
 private fun LandscapeTunnelLayout(
     runtime: TunnelRuntimeSnapshot,
     settings: VdpiSettings,
+    throughputSamples: List<Long>,
+    currentRateBytesPerSec: Long,
+    availableUpdate: UpdateBannerInfo?,
     isConnected: Boolean,
     pendingReconnect: Boolean,
     reduceMotion: Boolean,
@@ -281,6 +339,8 @@ private fun LandscapeTunnelLayout(
     onOpenLogs: () -> Unit,
     onToggleTunnel: () -> Unit,
     onReconnect: () -> Unit,
+    onDownloadUpdate: (String) -> Unit,
+    onDismissUpdate: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -308,27 +368,39 @@ private fun LandscapeTunnelLayout(
                 onOpenLogs = onOpenLogs,
             )
 
+            PendingReconnectSection(
+                visible = pendingReconnect && isConnected,
+                reduceMotion = reduceMotion,
+                compact = true,
+                topSpacing = 0.dp,
+                bottomSpacing = 10.dp,
+                onReconnect = onReconnect,
+            )
+
+            AvailableUpdateSection(
+                update = availableUpdate,
+                reduceMotion = reduceMotion,
+                compact = true,
+                topSpacing = 0.dp,
+                bottomSpacing = 10.dp,
+                onDownload = onDownloadUpdate,
+                onDismiss = onDismissUpdate,
+            )
+
             // Adaptive two-pane landscape dashboard
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(16.dp),
                 verticalAlignment = Alignment.Top,
             ) {
-                // Left pane: Compact Hero Card + inline reconnect banner
-                Column(modifier = Modifier.weight(0.46f)) {
+                // Left pane: Compact Hero Card
+                Box(modifier = Modifier.weight(0.46f)) {
                     TunnelHeroCard(
                         runtime = runtime,
                         settings = settings,
                         reduceMotion = reduceMotion,
                         compact = true,
                         onToggleTunnel = onToggleTunnel,
-                    )
-
-                    PendingReconnectSection(
-                        visible = pendingReconnect && isConnected,
-                        reduceMotion = reduceMotion,
-                        compact = true,
-                        onReconnect = onReconnect,
                     )
                 }
 
@@ -337,7 +409,10 @@ private fun LandscapeTunnelLayout(
                     TunnelDetailsSection(
                         isConnected = isConnected,
                         telemetry = runtime.telemetry,
+                        throughputSamples = throughputSamples,
+                        currentRateBytesPerSec = currentRateBytesPerSec,
                         settings = settings,
+                        reduceMotion = reduceMotion,
                         transitionLabel = "tunnelDetailsTransitionLandscape",
                     )
                 }
@@ -352,6 +427,9 @@ private fun LandscapeTunnelLayout(
 private fun PortraitTunnelLayout(
     runtime: TunnelRuntimeSnapshot,
     settings: VdpiSettings,
+    throughputSamples: List<Long>,
+    currentRateBytesPerSec: Long,
+    availableUpdate: UpdateBannerInfo?,
     isConnected: Boolean,
     pendingReconnect: Boolean,
     reduceMotion: Boolean,
@@ -363,6 +441,8 @@ private fun PortraitTunnelLayout(
     onOpenLogs: () -> Unit,
     onToggleTunnel: () -> Unit,
     onReconnect: () -> Unit,
+    onDownloadUpdate: (String) -> Unit,
+    onDismissUpdate: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -387,7 +467,7 @@ private fun PortraitTunnelLayout(
 
         Spacer(Modifier.height(16.dp))
 
-        // Serene opaque Apple Hero Card
+        // Primary tunnel status card
         TunnelHeroCard(
             runtime = runtime,
             settings = settings,
@@ -403,13 +483,25 @@ private fun PortraitTunnelLayout(
             onReconnect = onReconnect,
         )
 
+        // Dismissible update card when a newer GitHub release is available
+        AvailableUpdateSection(
+            update = availableUpdate,
+            reduceMotion = reduceMotion,
+            compact = false,
+            onDownload = onDownloadUpdate,
+            onDismiss = onDismissUpdate,
+        )
+
         Spacer(Modifier.height(24.dp))
 
         // Inset Grouped Telemetry or Standby Profile
         TunnelDetailsSection(
             isConnected = isConnected,
             telemetry = runtime.telemetry,
+            throughputSamples = throughputSamples,
+            currentRateBytesPerSec = currentRateBytesPerSec,
             settings = settings,
+            reduceMotion = reduceMotion,
             transitionLabel = "tunnelDetailsTransition",
         )
 
@@ -487,6 +579,8 @@ private fun PendingReconnectSection(
     reduceMotion: Boolean,
     compact: Boolean,
     onReconnect: () -> Unit,
+    topSpacing: Dp = if (compact) 10.dp else 12.dp,
+    bottomSpacing: Dp = 0.dp,
 ) {
     AnimatedVisibility(
         visible = visible,
@@ -502,11 +596,63 @@ private fun PendingReconnectSection(
         },
     ) {
         Column {
-            Spacer(Modifier.height(if (compact) 10.dp else 12.dp))
+            if (topSpacing > 0.dp) {
+                Spacer(Modifier.height(topSpacing))
+            }
             InlineReconnectRow(
                 compact = compact,
                 onReconnect = onReconnect,
             )
+            if (bottomSpacing > 0.dp) {
+                Spacer(Modifier.height(bottomSpacing))
+            }
+        }
+    }
+}
+
+@Composable
+private fun AvailableUpdateSection(
+    update: UpdateBannerInfo?,
+    reduceMotion: Boolean,
+    compact: Boolean,
+    onDownload: (String) -> Unit,
+    onDismiss: () -> Unit,
+    topSpacing: Dp = if (compact) 10.dp else 12.dp,
+    bottomSpacing: Dp = 0.dp,
+) {
+    var lastUpdate by remember { mutableStateOf(update) }
+    if (update != null) {
+        lastUpdate = update
+    }
+    AnimatedVisibility(
+        visible = update != null,
+        enter = if (reduceMotion) {
+            fadeIn(tween(150))
+        } else {
+            fadeIn(tween(180)) + expandVertically(tween(200))
+        },
+        exit = if (reduceMotion) {
+            fadeOut(tween(120))
+        } else {
+            fadeOut(tween(140)) + shrinkVertically(tween(160))
+        },
+    ) {
+        val current = lastUpdate
+        if (current != null) {
+            Column {
+                if (topSpacing > 0.dp) {
+                    Spacer(Modifier.height(topSpacing))
+                }
+                InlineUpdateRow(
+                    update = current,
+                    compact = compact,
+                    onDownload = { onDownload(current.releaseUrl) },
+                    onDismiss = onDismiss,
+                )
+                if (bottomSpacing > 0.dp) {
+                    Spacer(Modifier.height(bottomSpacing))
+                }
+            }
         }
     }
 }
@@ -515,7 +661,10 @@ private fun PendingReconnectSection(
 private fun TunnelDetailsSection(
     isConnected: Boolean,
     telemetry: TelemetrySnapshot,
+    throughputSamples: List<Long>,
+    currentRateBytesPerSec: Long,
     settings: VdpiSettings,
+    reduceMotion: Boolean,
     transitionLabel: String,
 ) {
     AnimatedContent(
@@ -528,7 +677,10 @@ private fun TunnelDetailsSection(
         if (live) {
             LiveTelemetrySection(
                 telemetry = telemetry,
+                throughputSamples = throughputSamples,
+                currentRateBytesPerSec = currentRateBytesPerSec,
                 settings = settings,
+                reduceMotion = reduceMotion,
             )
         } else {
             StandbyProfileSection(
@@ -597,7 +749,7 @@ private fun TunnelHeroCard(
         TunnelPhase.ERROR -> "Connection Error"
     }
 
-    val dnsCompact = "${settings.dnsAddr.trim().ifBlank { "1.1.1.1" }} ${if (settings.enableDoh) "DoH" else "UDP"}"
+    val dnsCompact = "${formatDnsDisplayAddr(settings.dnsAddr)} ${if (settings.enableDoh) "DoH" else "UDP"}"
     val subtitle = when (phase) {
         TunnelPhase.CONNECTED -> "$dnsCompact · ${formatHeroUptime(snap.uptimeSecs)}"
         TunnelPhase.CONNECTING -> "Establishing local tunnel..."
@@ -606,7 +758,9 @@ private fun TunnelHeroCard(
     }
 
     InsetGroupedCard(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .sculptedDarkCardBorder(16.dp),
         radius = 16.dp,
     ) {
         Column(
@@ -665,9 +819,21 @@ private fun TunnelHeroCard(
                         fontSize = 14.sp,
                         lineHeight = 19.sp,
                         fontFeatureSettings = "tnum",
+                        textDirection = if (phase == TunnelPhase.CONNECTED) {
+                            TextDirection.Ltr
+                        } else {
+                            TextDirection.Unspecified
+                        },
                     )
                 } else {
-                    VdpiTextStyles.body.copy(fontFeatureSettings = "tnum")
+                    VdpiTextStyles.body.copy(
+                        fontFeatureSettings = "tnum",
+                        textDirection = if (phase == TunnelPhase.CONNECTED) {
+                            TextDirection.Ltr
+                        } else {
+                            TextDirection.Unspecified
+                        },
+                    )
                 },
                 color = palette.inkSecondary,
                 textAlign = TextAlign.Center,
@@ -784,7 +950,9 @@ private fun InlineReconnectRow(
     )
 
     InsetGroupedCard(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .sculptedDarkCardBorder(16.dp),
         radius = 16.dp,
     ) {
         Row(
@@ -859,28 +1027,179 @@ private fun InlineReconnectRow(
     }
 }
 
+// ── Inline Update Row ──
+
+@Composable
+private fun InlineUpdateRow(
+    update: UpdateBannerInfo,
+    onDownload: () -> Unit,
+    onDismiss: () -> Unit,
+    compact: Boolean = false,
+) {
+    val palette = VdpiThemeTokens.palette
+    val downloadInteraction = remember { MutableInteractionSource() }
+    val downloadPressed by downloadInteraction.collectIsPressedAsState()
+    val downloadColor by animateColorAsState(
+        targetValue = if (downloadPressed) palette.accent.copy(alpha = 0.65f) else palette.accent,
+        animationSpec = tween(durationMillis = if (downloadPressed) 60 else 150),
+        label = "updateDownloadColor",
+    )
+    val dismissInteraction = remember { MutableInteractionSource() }
+    val dismissPressed by dismissInteraction.collectIsPressedAsState()
+    val dismissWash by animateColorAsState(
+        targetValue = if (dismissPressed) palette.inkPrimary.copy(alpha = 0.08f) else Color.Transparent,
+        animationSpec = tween(durationMillis = if (dismissPressed) 60 else 150),
+        label = "updateDismissWash",
+    )
+    val versionTag = formatVersionTag(update.latestVersion)
+
+    InsetGroupedCard(
+        modifier = Modifier
+            .fillMaxWidth()
+            .sculptedDarkCardBorder(16.dp),
+        radius = 16.dp,
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(
+                    start = if (compact) 12.dp else 16.dp,
+                    end = 4.dp,
+                    top = if (compact) 6.dp else 8.dp,
+                    bottom = if (compact) 6.dp else 8.dp,
+                ),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(6.dp)
+                    .clip(CircleShape)
+                    .background(palette.accent),
+            )
+
+            Spacer(Modifier.width(if (compact) 10.dp else 12.dp))
+
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "Update available",
+                    style = VdpiTextStyles.body.copy(fontWeight = FontWeight.SemiBold),
+                    color = palette.inkPrimary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Spacer(Modifier.height(1.dp))
+                Text(
+                    text = "$versionTag on GitHub",
+                    style = VdpiTextStyles.caption,
+                    color = palette.inkSecondary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+
+            Spacer(Modifier.width(6.dp))
+
+            Box(
+                modifier = Modifier
+                    .heightIn(min = 44.dp)
+                    .clickable(
+                        interactionSource = downloadInteraction,
+                        indication = null,
+                        role = Role.Button,
+                        onClick = onDownload,
+                    )
+                    .padding(horizontal = 8.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = "Download",
+                    fontFamily = GeistSans,
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 14.sp,
+                    color = downloadColor,
+                    maxLines = 1,
+                )
+            }
+
+            Box(
+                modifier = Modifier
+                    .size(44.dp)
+                    .clickable(
+                        interactionSource = dismissInteraction,
+                        indication = null,
+                        role = Role.Button,
+                        onClick = onDismiss,
+                    )
+                    .semantics { contentDescription = "Dismiss update notice" },
+                contentAlignment = Alignment.Center,
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(28.dp)
+                        .clip(CircleShape)
+                        .background(dismissWash),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    DismissCrossGlyph(tint = palette.inkMuted)
+                }
+            }
+        }
+    }
+}
+
 // ── Live Telemetry & Standby Profile ──
 
 @Composable
 private fun LiveTelemetrySection(
     telemetry: TelemetrySnapshot,
+    throughputSamples: List<Long>,
+    currentRateBytesPerSec: Long,
     settings: VdpiSettings,
+    reduceMotion: Boolean,
 ) {
     Column(modifier = Modifier.fillMaxWidth()) {
         SectionOverline(text = "Connection")
 
         InsetGroupedCard(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .sculptedDarkCardBorder(16.dp),
             radius = 16.dp,
         ) {
             InsetGroupedRow(
                 title = "Download",
-                trailing = { TabularRowValue(text = formatBytes(telemetry.bytesRx)) },
+                trailing = {
+                    AnimatedTabularValue(
+                        text = formatBytes(telemetry.bytesRx),
+                        reduceMotion = reduceMotion,
+                    )
+                },
             )
             HairlineRule(startIndent = 16.dp)
             InsetGroupedRow(
                 title = "Upload",
-                trailing = { TabularRowValue(text = formatBytes(telemetry.bytesTx)) },
+                trailing = {
+                    AnimatedTabularValue(
+                        text = formatBytes(telemetry.bytesTx),
+                        reduceMotion = reduceMotion,
+                    )
+                },
+            )
+            HairlineRule(startIndent = 16.dp)
+            InsetGroupedRow(
+                title = "Uptime",
+                trailing = {
+                    AnimatedTabularValue(
+                        text = formatUptime(telemetry.uptimeSecs),
+                        reduceMotion = reduceMotion,
+                    )
+                },
+            )
+            HairlineRule(startIndent = 16.dp)
+            ThroughputSparkline(
+                samples = throughputSamples,
+                currentRateBytesPerSec = currentRateBytesPerSec,
+                reduceMotion = reduceMotion,
             )
             HairlineRule(startIndent = 16.dp)
             InsetGroupedRow(
@@ -890,7 +1209,12 @@ private fun LiveTelemetrySection(
             HairlineRule(startIndent = 16.dp)
             InsetGroupedRow(
                 title = "DNS",
-                trailing = { TabularRowValue(text = formatDnsDetail(settings)) },
+                trailing = {
+                    TabularRowValue(
+                        text = formatDnsDetail(settings),
+                        textDirection = TextDirection.Ltr,
+                    )
+                },
             )
             HairlineRule(startIndent = 16.dp)
             InsetGroupedRow(
@@ -906,6 +1230,148 @@ private fun LiveTelemetrySection(
 }
 
 @Composable
+private fun ThroughputSparkline(
+    samples: List<Long>,
+    currentRateBytesPerSec: Long,
+    reduceMotion: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val palette = VdpiThemeTokens.palette
+    val lineColor = palette.signal
+    val baselineColor = palette.border.copy(alpha = 0.55f)
+    val rateLabel = formatRate(currentRateBytesPerSec)
+    val strokePath = remember { Path() }
+    val fillPath = remember { Path() }
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text(
+                text = "Activity",
+                style = VdpiTextStyles.caption,
+                color = palette.inkMuted,
+                maxLines = 1,
+            )
+            AnimatedTabularValue(
+                text = rateLabel,
+                reduceMotion = reduceMotion,
+                style = VdpiTextStyles.monoSmall.copy(
+                    fontWeight = FontWeight.Medium,
+                    fontSize = 12.sp,
+                ),
+                color = palette.inkSecondary,
+            )
+        }
+
+        Spacer(Modifier.height(8.dp))
+
+        Canvas(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(44.dp)
+                .semantics { contentDescription = "Live throughput $rateLabel" },
+        ) {
+            val w = size.width
+            val h = size.height
+            if (w <= 0f || h <= 0f) return@Canvas
+
+            val baselineY = h - 1.dp.toPx()
+            val baselineStrokePx = 0.5.dp.toPx()
+            drawLine(
+                color = baselineColor,
+                start = Offset(0f, baselineY),
+                end = Offset(w, baselineY),
+                strokeWidth = baselineStrokePx,
+            )
+
+            val maxSample = samples.maxOrNull()?.coerceAtLeast(0L) ?: 0L
+            if (samples.isEmpty() || maxSample <= 0L) {
+                return@Canvas
+            }
+
+            val topPad = 3.dp.toPx()
+            val usableH = (baselineY - topPad).coerceAtLeast(1f)
+            val lineStroke = Stroke(
+                width = 1.5.dp.toPx(),
+                cap = StrokeCap.Round,
+                join = StrokeJoin.Round,
+            )
+
+            strokePath.reset()
+            fillPath.reset()
+
+            if (samples.size == 1) {
+                val ratio = (samples[0].coerceAtLeast(0L).toDouble() / maxSample.toDouble()).toFloat()
+                val y = baselineY - ratio * usableH
+                strokePath.moveTo(0f, y)
+                strokePath.lineTo(w, y)
+
+                fillPath.moveTo(0f, y)
+                fillPath.lineTo(w, y)
+                fillPath.lineTo(w, baselineY)
+                fillPath.lineTo(0f, baselineY)
+                fillPath.close()
+            } else {
+                val count = samples.size
+                val stepX = w / (count - 1).toFloat()
+                var prevX = 0f
+                var prevY = baselineY - (samples[0].coerceAtLeast(0L).toDouble() / maxSample.toDouble()).toFloat() * usableH
+
+                strokePath.moveTo(prevX, prevY)
+                fillPath.moveTo(prevX, prevY)
+
+                for (i in 1 until count) {
+                    val currX = i * stepX
+                    val ratio = (samples[i].coerceAtLeast(0L).toDouble() / maxSample.toDouble()).toFloat()
+                    val currY = baselineY - ratio * usableH
+                    val midX = (prevX + currX) * 0.5f
+                    val midY = (prevY + currY) * 0.5f
+                    if (i == 1) {
+                        strokePath.lineTo(midX, midY)
+                        fillPath.lineTo(midX, midY)
+                    } else {
+                        strokePath.quadraticTo(prevX, prevY, midX, midY)
+                        fillPath.quadraticTo(prevX, prevY, midX, midY)
+                    }
+                    prevX = currX
+                    prevY = currY
+                }
+
+                strokePath.lineTo(prevX, prevY)
+                fillPath.lineTo(prevX, prevY)
+                fillPath.lineTo(prevX, baselineY)
+                fillPath.lineTo(0f, baselineY)
+                fillPath.close()
+            }
+
+            drawPath(
+                path = fillPath,
+                brush = Brush.verticalGradient(
+                    colors = listOf(
+                        lineColor.copy(alpha = 0.10f),
+                        Color.Transparent,
+                    ),
+                    startY = topPad,
+                    endY = baselineY,
+                ),
+            )
+            drawPath(
+                path = strokePath,
+                color = lineColor,
+                style = lineStroke,
+            )
+        }
+    }
+}
+
+@Composable
 private fun StandbyProfileSection(
     settings: VdpiSettings,
 ) {
@@ -913,7 +1379,9 @@ private fun StandbyProfileSection(
         SectionOverline(text = "Profile")
 
         InsetGroupedCard(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .sculptedDarkCardBorder(16.dp),
             radius = 16.dp,
         ) {
             InsetGroupedRow(
@@ -923,7 +1391,12 @@ private fun StandbyProfileSection(
             HairlineRule(startIndent = 16.dp)
             InsetGroupedRow(
                 title = "DNS",
-                trailing = { TabularRowValue(text = formatDnsDetail(settings)) },
+                trailing = {
+                    TabularRowValue(
+                        text = formatDnsDetail(settings),
+                        textDirection = TextDirection.Ltr,
+                    )
+                },
             )
             HairlineRule(startIndent = 16.dp)
             InsetGroupedRow(
@@ -940,14 +1413,57 @@ private fun StandbyProfileSection(
 }
 
 @Composable
-private fun TabularRowValue(text: String) {
+private fun AnimatedTabularValue(
+    text: String,
+    reduceMotion: Boolean,
+    style: TextStyle = VdpiTextStyles.monoMetric,
+    color: Color = VdpiThemeTokens.palette.inkSecondary,
+) {
+    if (reduceMotion) {
+        Text(
+            text = text,
+            style = style,
+            color = color,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    } else {
+        AnimatedContent(
+            targetState = text,
+            transitionSpec = {
+                fadeIn(tween(140)) togetherWith fadeOut(tween(110))
+            },
+            label = "tabularMetricTransition",
+        ) { value ->
+            Text(
+                text = value,
+                style = style,
+                color = color,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+@Composable
+private fun TabularRowValue(
+    text: String,
+    modifier: Modifier = Modifier,
+    textDirection: TextDirection = TextDirection.Unspecified,
+) {
     val palette = VdpiThemeTokens.palette
     Text(
         text = text,
-        style = VdpiTextStyles.monoMetric,
+        style = if (textDirection != TextDirection.Unspecified) {
+            VdpiTextStyles.monoMetric.copy(textDirection = textDirection)
+        } else {
+            VdpiTextStyles.monoMetric
+        },
         color = palette.inkSecondary,
         maxLines = 1,
         overflow = TextOverflow.Ellipsis,
+        modifier = modifier.widthIn(max = 190.dp),
     )
 }
 
@@ -1046,7 +1562,12 @@ private fun DiagnosticsGlyph(tint: Color) {
 
 @Composable
 private fun EngineLogGlyph(tint: Color) {
-    Canvas(modifier = Modifier.size(20.dp)) {
+    val isRtl = LocalLayoutDirection.current == LayoutDirection.Rtl
+    Canvas(
+        modifier = Modifier
+            .size(20.dp)
+            .graphicsLayer { if (isRtl) scaleX = -1f },
+    ) {
         val w = size.width
         val h = size.height
         val strokePx = 1.65.dp.toPx()
@@ -1112,7 +1633,41 @@ private fun WarningCircleGlyph(tint: Color) {
     }
 }
 
+@Composable
+private fun DismissCrossGlyph(tint: Color) {
+    Canvas(modifier = Modifier.size(11.dp)) {
+        val stroke = 1.7.dp.toPx()
+        val inset = stroke * 0.5f
+        drawLine(
+            color = tint,
+            start = Offset(inset, inset),
+            end = Offset(size.width - inset, size.height - inset),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round,
+        )
+        drawLine(
+            color = tint,
+            start = Offset(size.width - inset, inset),
+            end = Offset(inset, size.height - inset),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round,
+        )
+    }
+}
+
 // ── Formatting Helpers ──
+
+private fun formatRate(bytesPerSec: Long): String {
+    val safe = bytesPerSec.coerceAtLeast(0L)
+    if (safe < 1024L) return "$safe B/s"
+    val kb = safe / 1024.0
+    if (kb < 100.0) return String.format(Locale.US, "%.1f KB/s", kb)
+    if (kb < 1024.0) return String.format(Locale.US, "%.0f KB/s", kb)
+    val mb = kb / 1024.0
+    if (mb < 100.0) return String.format(Locale.US, "%.1f MB/s", mb)
+    if (mb < 1024.0) return String.format(Locale.US, "%.0f MB/s", mb)
+    return String.format(Locale.US, "%.2f GB/s", mb / 1024.0)
+}
 
 private fun formatHeroUptime(totalSecs: Long): String {
     val safe = totalSecs.coerceAtLeast(0L)
@@ -1124,8 +1679,17 @@ private fun formatHeroUptime(totalSecs: Long): String {
     return String.format(Locale.US, "%02d:%02d", m, s)
 }
 
+private fun formatDnsDisplayAddr(rawAddr: String): String {
+    val addr = rawAddr.trim().ifBlank { "1.1.1.1" }
+    return if (addr.startsWith("https://", ignoreCase = true)) {
+        runCatching { java.net.URI(addr).host }.getOrNull()?.takeIf { it.isNotBlank() } ?: addr
+    } else {
+        addr
+    }
+}
+
 private fun formatDnsDetail(settings: VdpiSettings): String {
-    val addr = settings.dnsAddr.trim().ifBlank { "1.1.1.1" }
+    val addr = formatDnsDisplayAddr(settings.dnsAddr)
     val proto = if (settings.enableDoh) "DoH" else "UDP"
     return "$addr · $proto"
 }

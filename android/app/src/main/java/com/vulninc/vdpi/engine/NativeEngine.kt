@@ -31,7 +31,10 @@ data class NativeEngineConfig(
     @SerialName("timeout_ms") val timeoutMs: Long = 8000L,
     val mtu: Int = 1400,
     @SerialName("bypass_domains") val bypassDomains: List<String> = emptyList(),
+    @SerialName("cache_path") val cachePath: String? = null,
 )
+
+typealias TunnelConfig = NativeEngineConfig
 
 @Serializable
 data class EngineEvent(

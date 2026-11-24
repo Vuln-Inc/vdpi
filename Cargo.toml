@@ -9,7 +9,7 @@ members = [
 default-members = ["core"]
 
 [workspace.package]
-version = "0.3.4"
+version = "0.4.0"
 edition = "2021"
 authors = ["Vuln-Inc"]
 license = "MIT"

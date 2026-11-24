@@ -10,4 +10,11 @@
     <string name="notification_subtitle_connecting">Starting local tunnel</string>
     <string name="notification_permission_hint">Allow notifications to keep vdpi visible while connected</string>
     <string name="notification_settings_action">Settings</string>
+    <string name="widget_description">Toggle the vdpi tunnel from your home screen</string>
+    <string name="widget_status_connected">Protected</string>
+    <string name="widget_status_connecting">Connecting&#8230;</string>
+    <string name="widget_status_off">Off</string>
+    <string name="widget_status_error">Needs attention</string>
+    <string name="widget_action_connect">Connect</string>
+    <string name="widget_action_disconnect">Disconnect</string>
 </resources>

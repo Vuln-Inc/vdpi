@@ -75,6 +75,10 @@ fn stop_active_locked(mgr: &TunnelManager) {
         });
         if !finished {
             handle.abort();
+            let _ = mgr.runtime.block_on(tokio::time::timeout(
+                Duration::from_millis(500),
+                vdpi_tun::flush_engine_cache(&tunnel.ctx),
+            ));
         }
         mgr.events.push("info", "tunnel", "disconnect completed");
     }
@@ -97,7 +101,7 @@ pub fn start_tunnel(owned_fd: std::os::unix::io::OwnedFd, cfg: AndroidConfig) ->
     let dns_label = cfg.dns_addr.clone();
     let doh_enabled = cfg.enable_doh;
 
-    let ctx = EngineContext::new(cfg.into_runtime_config())?;
+    let ctx = mgr.runtime.block_on(vdpi_tun::build_engine_context(cfg))?;
     let async_fd = {
         let _enter = mgr.runtime.enter();
         vdpi_tun::fd::register_tun_fd(owned_fd).context("failed to register Android TUN fd")?

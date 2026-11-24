@@ -95,11 +95,13 @@ pub fn engine_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-async fn join_or_abort(mut handle: JoinHandle<()>, budget: Duration) {
+async fn join_or_abort(mut handle: JoinHandle<()>, budget: Duration) -> bool {
     if tokio::time::timeout(budget, &mut handle).await.is_err() {
         handle.abort();
         let _ = handle.await;
+        return false;
     }
+    true
 }
 
 fn stop_active_locked(mgr: &IosTunnelManager) {
@@ -114,12 +116,19 @@ fn stop_active_locked(mgr: &IosTunnelManager) {
 
         // Await both tasks concurrently with bounded timeout and abort-on-timeout without
         // ever double-polling a completed JoinHandle.
-        mgr.runtime.block_on(async {
+        let (pipeline_finished, _) = mgr.runtime.block_on(async {
             tokio::join!(
                 join_or_abort(pipeline_task, Duration::from_millis(1200)),
                 join_or_abort(writer_task, Duration::from_millis(1200)),
-            );
+            )
         });
+
+        if !pipeline_finished {
+            let _ = mgr.runtime.block_on(tokio::time::timeout(
+                Duration::from_millis(500),
+                vdpi_tun::flush_engine_cache(&tunnel.ctx),
+            ));
+        }
 
         mgr.events.push("info", "tunnel", "disconnect completed");
     }
@@ -137,9 +146,18 @@ pub fn start_tunnel(cfg: IosConfig, callback: PacketCallback) -> Result<()> {
     let mode_label = format!("{:?}", cfg.mode);
     let dns_label = cfg.dns_addr.clone();
     let doh_enabled = cfg.enable_doh;
+    let cache_path = cfg
+        .cache_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from);
     let ctx = EngineContext::new(cfg.into_runtime_config())?;
 
     stop_active_locked(mgr);
+    if let Some(path) = cache_path {
+        mgr.runtime.block_on(ctx.attach_cache_file(path));
+    }
     let tun_stats = Arc::new(TunStats::default());
     let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>(profile.channel_capacity);
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(profile.channel_capacity);

@@ -1,0 +1,61 @@
+name: Bug report
+description: Report a bug or connectivity issue in vdpi
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - Android
+        - iOS
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: vdpi version
+      placeholder: "e.g. v0.4.0"
+    validations:
+      required: true
+
+  - type: input
+    id: isp
+    attributes:
+      label: ISP / Country (optional)
+      description: Helps identify regional DPI behavior.
+      placeholder: "e.g. Turk Telekom / TR"
+    validations:
+      required: false
+
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: What happened
+      description: Describe the actual behavior and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start vdpi with ...
+        2. Open ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Diagnostics Report / Engine Logs
+      description: Paste output from `vdpi doctor` / console logs (desktop) or the 1-tap Diagnostics report (Android/iOS). Remove any private domains or IPs before submitting.
+      render: text
+    validations:
+      required: false

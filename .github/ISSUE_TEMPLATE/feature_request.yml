@@ -1,0 +1,33 @@
+name: Feature request
+description: Propose a new feature or improvement for vdpi
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - All platforms
+        - Windows
+        - macOS
+        - Linux
+        - Android
+        - iOS
+    validations:
+      required: true
+
+  - type: input
+    id: summary
+    attributes:
+      label: Summary
+      placeholder: "Short, specific description of the change"
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation / Use case
+      description: Explain what problem this solves and how you would use it.
+    validations:
+      required: true

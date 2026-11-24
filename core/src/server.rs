@@ -188,7 +188,11 @@ pub async fn serve_until_shutdown(
             "vdpi proxy listening"
         );
     }
-    serve_with_limit(listeners, ctx, shutdown_rx, MAX_CLIENT_SESSIONS).await;
+    serve_with_limit(listeners, ctx.clone(), shutdown_rx, MAX_CLIENT_SESSIONS).await;
+
+    if let Err(e) = ctx.flush_persisted_cache().await {
+        debug!(error = %e, "failed to flush adaptive cache on shutdown");
+    }
     Ok(())
 }
 

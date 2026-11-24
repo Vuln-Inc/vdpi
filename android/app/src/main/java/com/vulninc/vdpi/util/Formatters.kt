@@ -88,15 +88,30 @@ fun isValidDnsInput(raw: String): Boolean {
     if (lower.startsWith("https://")) {
         return runCatching {
             val uri = URI(trimmed)
-            uri.scheme.equals("https", ignoreCase = true) && !uri.host.isNullOrBlank()
+            uri.scheme.equals("https", ignoreCase = true) &&
+                !uri.host.isNullOrBlank() &&
+                (uri.port == -1 || uri.port in 1..65535)
         }.getOrDefault(false)
     }
     if (IPV4_REGEX.matches(trimmed)) return true
-    val unbracketed = trimmed.removePrefix("[").removeSuffix("]")
+    val hasLeadingBracket = trimmed.startsWith("[")
+    val hasTrailingBracket = trimmed.endsWith("]")
+    if (hasLeadingBracket != hasTrailingBracket) return false
+    val unbracketed = if (hasLeadingBracket) {
+        trimmed.substring(1, trimmed.length - 1)
+    } else {
+        trimmed
+    }
     if (unbracketed.contains(':') && IPV6_CHARS_REGEX.matches(unbracketed)) {
+        if (unbracketed.contains(":::")) return false
+        val hasLeadingSingleColon = unbracketed.startsWith(":") && !unbracketed.startsWith("::")
+        val hasTrailingSingleColon = unbracketed.endsWith(":") && !unbracketed.endsWith("::")
+        if (hasLeadingSingleColon || hasTrailingSingleColon) return false
         val doubleColons = unbracketed.windowed(2).count { it == "::" }
         val groups = unbracketed.split(':').filter { it.isNotEmpty() }
-        return doubleColons <= 1 && groups.size in 1..8 && groups.all { it.length <= 4 }
+        val validGroupCount = (doubleColons == 0 && groups.size == 8) ||
+            (doubleColons == 1 && groups.size in 1..7)
+        return validGroupCount && groups.all { it.length <= 4 }
     }
     return false
 }

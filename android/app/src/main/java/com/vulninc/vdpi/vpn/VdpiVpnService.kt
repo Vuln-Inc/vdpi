@@ -43,6 +43,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import java.io.File
 import java.net.Inet6Address
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -304,6 +305,7 @@ class VdpiVpnService : VpnService() {
                 val nativeConfig = settings.toNativeConfig().copy(
                     ipv4Only = effectiveIpv4Only,
                     mtu = TUN_MTU,
+                    cachePath = File(filesDir, "adaptive-cache.json").absolutePath,
                 )
                 val preparedConfig = NativeEngine.prepareStart(nativeConfig)
                 if (preparedConfig.isFailure) {
@@ -534,11 +536,11 @@ class VdpiVpnService : VpnService() {
     private fun registerNetworkMonitor() {
         unregisterNetworkMonitor()
         val cm = getSystemService(ConnectivityManager::class.java) ?: return
-        lastNetworkId = cm.activeNetwork?.networkHandle
+        lastNetworkId = null
         lastHasGlobalIpv6 = hasGlobalIpv6Connectivity()
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                if (!serviceActive.get()) return
+                if (!serviceActive.get() || networkCallback !== this) return
                 val handle = network.networkHandle
                 val prev = lastNetworkId
                 val prevIpv6 = lastHasGlobalIpv6
@@ -546,7 +548,8 @@ class VdpiVpnService : VpnService() {
                 lastNetworkId = handle
                 lastHasGlobalIpv6 = nowIpv6
                 if (prev != null && prev != handle && TunnelRuntimeState.state.value.phase == TunnelPhase.CONNECTED) {
-                    if (prevIpv6 != null && prevIpv6 != nowIpv6) {
+                    val userForcesIpv4Only = TunnelRuntimeState.appliedSettings.value?.ipv4Only == true
+                    if (!userForcesIpv4Only && prevIpv6 != null && prevIpv6 != nowIpv6) {
                         // Underlying network changed between IPv4-only and IPv6-capable; rebuild TUN routes.
                         scheduleStart(startId = latestStartId)
                     } else {
@@ -558,9 +561,13 @@ class VdpiVpnService : VpnService() {
                 }
             }
         }
-        runCatching {
+        networkCallback = cb
+        val registered = runCatching {
             cm.registerDefaultNetworkCallback(cb)
-            networkCallback = cb
+            true
+        }.getOrDefault(false)
+        if (!registered && networkCallback === cb) {
+            networkCallback = null
         }
     }
 
@@ -858,6 +865,7 @@ class VdpiVpnService : VpnService() {
                 ComponentName(applicationContext, VdpiTileService::class.java),
             )
         }
+        requestWidgetSync(applicationContext)
     }
 
     companion object {
@@ -883,6 +891,12 @@ class VdpiVpnService : VpnService() {
 
         private val serviceActive = AtomicBoolean(false)
 
+        private fun requestWidgetSync(context: Context) {
+            runCatching {
+                com.vulninc.vdpi.widget.VdpiWidgetProvider.requestUpdate(context.applicationContext)
+            }
+        }
+
         fun start(context: Context): Boolean {
             val intent = Intent(context, VdpiVpnService::class.java).apply {
                 action = ACTION_START
@@ -898,6 +912,7 @@ class VdpiVpnService : VpnService() {
                     )
                 }
                 TunnelRuntimeState.setAppliedSettings(null)
+                requestWidgetSync(context)
                 false
             }
         }
@@ -917,13 +932,15 @@ class VdpiVpnService : VpnService() {
                     )
                 }
                 TunnelRuntimeState.setAppliedSettings(null)
+                requestWidgetSync(context)
                 false
             }
         }
 
         fun stop(context: Context) {
+            val appContext = context.applicationContext
             if (!serviceActive.get()) {
-                runCatching { context.stopService(Intent(context, VdpiVpnService::class.java)) }
+                runCatching { appContext.stopService(Intent(appContext, VdpiVpnService::class.java)) }
                 CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
                     if (!serviceActive.get()) {
                         NativeEngine.stop()
@@ -936,18 +953,19 @@ class VdpiVpnService : VpnService() {
                                 )
                             }
                             TunnelRuntimeState.setAppliedSettings(null)
+                            requestWidgetSync(appContext)
                         }
                     }
                 }
                 return
             }
-            val intent = Intent(context, VdpiVpnService::class.java).apply {
+            val intent = Intent(appContext, VdpiVpnService::class.java).apply {
                 action = ACTION_STOP
             }
             runCatching {
-                context.startService(intent)
+                appContext.startService(intent)
             }.onFailure {
-                runCatching { context.stopService(Intent(context, VdpiVpnService::class.java)) }
+                runCatching { appContext.stopService(Intent(appContext, VdpiVpnService::class.java)) }
                 CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
                     if (!serviceActive.get()) {
                         NativeEngine.stop()
@@ -960,6 +978,7 @@ class VdpiVpnService : VpnService() {
                                 )
                             }
                             TunnelRuntimeState.setAppliedSettings(null)
+                            requestWidgetSync(appContext)
                         }
                     }
                 }

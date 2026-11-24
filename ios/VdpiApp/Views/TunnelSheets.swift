@@ -23,14 +23,19 @@ struct DiagnosticsSheet: View {
                     .ignoresSafeArea()
 
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 8) {
-                        SectionHeader(title: "Checks")
-
+                    VStack(alignment: .leading, spacing: 10) {
                         if manager.doctorState.running {
+                            SectionHeader(title: "Checks")
                             runningCard
                         } else if let doctorError = manager.doctorState.error {
+                            SectionHeader(title: "Checks")
                             errorCard(doctorError)
                         } else if let report = manager.doctorState.report, !report.checks.isEmpty {
+                            summaryStrip(for: report)
+
+                            SectionHeader(title: "Checks")
+                                .padding(.top, 4)
+
                             SheetInsetCard(cornerRadius: 16) {
                                 VStack(spacing: 0) {
                                     ForEach(Array(report.checks.enumerated()), id: \.element.id) { idx, check in
@@ -42,8 +47,11 @@ struct DiagnosticsSheet: View {
                                 }
                             }
 
-                            SectionFooter(text: summaryFooter(for: report))
+                            if let footer = summaryFooter(for: report) {
+                                SectionFooter(text: footer)
+                            }
                         } else {
+                            SectionHeader(title: "Checks")
                             emptyCard
                         }
                     }
@@ -56,16 +64,23 @@ struct DiagnosticsSheet: View {
             .navigationTitle("Diagnostics")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
+                ToolbarItemGroup(placement: .topBarLeading) {
                     Button("Re-run") {
                         VdpiHaptics.trigger(.light)
                         manager.runDiagnostics()
                     }
                     .foregroundStyle(manager.doctorState.running ? palette.inkMuted : palette.accent)
                     .disabled(manager.doctorState.running)
+
+                    ShareLink(item: manager.formattedDiagnosticsReport()) {
+                        Image(systemName: "square.and.arrow.up")
+                    }
+                    .foregroundStyle(canShareReport ? palette.accent : palette.inkMuted)
+                    .disabled(!canShareReport)
+                    .accessibilityLabel("Share diagnostics report")
                 }
 
-                ToolbarItem(placement: .navigationBarTrailing) {
+                ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") {
                         dismiss()
                     }
@@ -74,6 +89,13 @@ struct DiagnosticsSheet: View {
                 }
             }
         }
+    }
+
+    private var canShareReport: Bool {
+        guard !manager.doctorState.running,
+              let report = manager.doctorState.report
+        else { return false }
+        return !report.checks.isEmpty
     }
 
     // MARK: - State Cards
@@ -188,11 +210,46 @@ struct DiagnosticsSheet: View {
         )
     }
 
-    private func summaryFooter(for report: DoctorReport) -> String {
-        let failedCount = report.checks.filter { !$0.passed }.count
-        if failedCount == 0 {
-            return "All \(report.checks.count) checks passed."
+    private func summaryStrip(for report: DoctorReport) -> some View {
+        let total = report.checks.count
+        let passed = report.checks.filter(\.passed).count
+        let failed = total - passed
+        let allPassed = failed == 0
+        let statusColor: Color = allPassed ? palette.signal : (passed == 0 ? palette.danger : palette.warning)
+        let title = allPassed
+            ? "All \(total) checks passed"
+            : "\(passed) of \(total) passed"
+
+        return SheetInsetCard(cornerRadius: 14) {
+            HStack(spacing: 10) {
+                Image(systemName: allPassed ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(statusColor)
+                    .accessibilityHidden(true)
+
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(palette.inkPrimary)
+
+                Spacer(minLength: 8)
+
+                Text(allPassed ? "Healthy" : "\(failed) failed")
+                    .font(.footnote.weight(.medium))
+                    .monospacedDigit()
+                    .foregroundStyle(allPassed ? palette.signal : palette.danger)
+            }
+            .frame(minHeight: 44)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 6)
         }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(allPassed ? "All \(total) checks passed, healthy" : "\(passed) of \(total) checks passed, \(failed) failed")
+    }
+
+    private func summaryFooter(for report: DoctorReport) -> String? {
+        let failedCount = report.checks.filter { !$0.passed }.count
+        guard failedCount > 0 else { return nil }
         let noun = failedCount == 1 ? "issue" : "issues"
         return "\(failedCount) \(noun) detected - check DNS or network settings."
     }
@@ -243,7 +300,7 @@ struct EngineLogsSheet: View {
             .navigationTitle("Engine Logs")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItemGroup(placement: .navigationBarLeading) {
+                ToolbarItemGroup(placement: .topBarLeading) {
                     Button {
                         copyLogsToClipboard()
                     } label: {
@@ -265,7 +322,7 @@ struct EngineLogsSheet: View {
                     .accessibilityLabel("Share logs")
                 }
 
-                ToolbarItem(placement: .navigationBarTrailing) {
+                ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") {
                         dismiss()
                     }
