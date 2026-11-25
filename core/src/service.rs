@@ -536,6 +536,35 @@ pub struct ControlCenterStatus {
 }
 
 fn load_configured_engine(fallback: EngineMode) -> EngineMode {
+    #[cfg(target_os = "macos")]
+    if launch_daemon_plist_path().exists() {
+        let sys_path = config_file::system_config_path();
+        return config_file::load_file_config(Some(&sys_path), true)
+            .ok()
+            .and_then(|(_, file_cfg)| file_cfg.engine)
+            .unwrap_or(EngineMode::Tun);
+    }
+
+    #[cfg(target_os = "linux")]
+    if systemd_system_unit_path().exists() {
+        let sys_path = config_file::system_config_path();
+        return config_file::load_file_config(Some(&sys_path), true)
+            .ok()
+            .and_then(|(_, file_cfg)| file_cfg.engine)
+            .unwrap_or(EngineMode::Tun);
+    }
+
+    #[cfg(target_os = "windows")]
+    if crate::platform::windows_service::query_windows_service_status().installed {
+        let sys_path = config_file::system_config_path();
+        if let Some(engine) = config_file::load_file_config(Some(&sys_path), true)
+            .ok()
+            .and_then(|(_, file_cfg)| file_cfg.engine)
+        {
+            return engine;
+        }
+    }
+
     let user_path = resolved_user_config_path();
     if let Some(engine) = config_file::load_file_config(Some(&user_path), false)
         .ok()
@@ -2079,9 +2108,12 @@ pub fn install_service_with_options(cfg: &RuntimeConfig, upgrade: bool) -> Resul
 
         if effective_cfg.engine == EngineMode::Tun {
             if !is_unix_root() {
-                bail!(
-                    "installing vdpi in TUN mode requires root privileges; run with sudo (e.g. 'sudo vdpi --tun install')."
-                );
+                let mut sudo_args = build_service_cli_args(&effective_cfg);
+                sudo_args.push("install".to_string());
+                if upgrade {
+                    sudo_args.push("--upgrade".to_string());
+                }
+                return relaunch_unix_sudo_and_wait(&sudo_args, "install vdpi in TUN mode");
             }
             let sys_config_path = config_file::system_config_path();
             if !upgrade || !sys_config_path.is_file() {
@@ -2201,6 +2233,58 @@ fn remove_macos_launch_daemon_if_present() -> Result<bool> {
 }
 
 #[cfg(target_os = "macos")]
+fn start_macos_launch_daemon(plist_path: &Path) -> Result<()> {
+    let service_target = format!("system/{LAUNCH_DAEMON_LABEL}");
+    let plist_str = plist_path.display().to_string();
+
+    let _ = Command::new("/bin/launchctl")
+        .args(["enable", &service_target])
+        .stdin(Stdio::null())
+        .output();
+
+    let boot = Command::new("/bin/launchctl")
+        .args(["bootstrap", "system", &plist_str])
+        .stdin(Stdio::null())
+        .output()
+        .context("failed to execute '/bin/launchctl bootstrap'")?;
+    if !boot.status.success() && !launchctl_service_loaded(&service_target) {
+        let detail = String::from_utf8_lossy(&boot.stderr).trim().to_string();
+        if detail.is_empty() {
+            bail!(
+                "failed to start LaunchDaemon '{LAUNCH_DAEMON_LABEL}' (exit status: {})",
+                boot.status
+            );
+        }
+        bail!("failed to start LaunchDaemon '{LAUNCH_DAEMON_LABEL}': {detail}");
+    }
+
+    // `RunAtLoad=true` starts the daemon automatically after `bootstrap`; wait briefly
+    // before issuing a non-destructive `kickstart` so we do not SIGKILL it mid-utun startup.
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    while !launchctl_service_running(&service_target) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if !launchctl_service_running(&service_target) {
+        let kick = Command::new("/bin/launchctl")
+            .args(["kickstart", &service_target])
+            .stdin(Stdio::null())
+            .output()
+            .context("failed to execute '/bin/launchctl kickstart'")?;
+        if !kick.status.success() && !launchctl_service_running(&service_target) {
+            let detail = String::from_utf8_lossy(&kick.stderr).trim().to_string();
+            if detail.is_empty() {
+                bail!(
+                    "failed to kickstart LaunchDaemon '{LAUNCH_DAEMON_LABEL}' (exit status: {})",
+                    kick.status
+                );
+            }
+            bail!("failed to kickstart LaunchDaemon '{LAUNCH_DAEMON_LABEL}': {detail}");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 fn install_macos_launch_daemon(target_bin: &Path, cfg: &RuntimeConfig) -> Result<()> {
     // Mutual exclusion: unload any user LaunchAgent and clear system proxies before starting TUN.
     remove_macos_launch_agent_if_present();
@@ -2222,6 +2306,9 @@ fn install_macos_launch_daemon(target_bin: &Path, cfg: &RuntimeConfig) -> Result
         wait_launchctl_unloaded(&service_target);
     }
 
+    if let Some(parent) = plist_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let plist_xml = generate_launch_daemon_plist(target_bin, cfg);
     fs::write(&plist_path, plist_xml)
         .with_context(|| format!("failed to write {}", plist_path.display()))?;
@@ -2230,22 +2317,7 @@ fn install_macos_launch_daemon(target_bin: &Path, cfg: &RuntimeConfig) -> Result
         let _ = fs::set_permissions(&plist_path, fs::Permissions::from_mode(0o644));
     }
 
-    let boot = Command::new("/bin/launchctl")
-        .args(["bootstrap", "system", &plist_str])
-        .stdin(Stdio::null())
-        .output()?;
-    if !boot.status.success() && !launchctl_service_loaded(&service_target) {
-        bail!(
-            "failed to load LaunchDaemon {}: {}",
-            plist_path.display(),
-            String::from_utf8_lossy(&boot.stderr).trim()
-        );
-    }
-
-    let _ = Command::new("/bin/launchctl")
-        .args(["kickstart", "-k", &service_target])
-        .stdin(Stdio::null())
-        .output();
+    start_macos_launch_daemon(&plist_path)?;
 
     println!("Installed binary : {}", target_bin.display());
     println!("Loaded daemon    : {} (TUN)", plist_path.display());
@@ -2909,10 +2981,13 @@ fn switch_service_engine_impl(
         let was_running = detect_service_state() == ServiceState::Running;
 
         if service_installed && (target == EngineMode::Tun || daemon_exists) && !is_unix_root() {
-            bail!(
-                "switching the macOS background service to/from TUN mode requires root privileges; run 'sudo vdpi engine {}'.",
+            let args = vec!["engine".to_string(), target.as_str().to_string()];
+            let action = format!(
+                "switch the macOS background service to {} mode",
                 target.as_str()
             );
+            relaunch_unix_sudo_and_wait(&args, &action)?;
+            return Ok(());
         }
 
         let config_path = if target == EngineMode::Tun && (service_installed || is_unix_root()) {
@@ -2945,9 +3020,7 @@ fn switch_service_engine_impl(
                     remove_macos_launch_agent_if_present();
                     let _ = clear_all_system_proxies();
                     let target_bin = PathBuf::from(UNIX_SYSTEM_BIN_PATH);
-                    if !target_bin.is_file() {
-                        copy_binary_atomically(&current_exe, &target_bin)?;
-                    }
+                    copy_binary_atomically(&current_exe, &target_bin)?;
                     let plist_path = launch_daemon_plist_path();
                     let service_target = format!("system/{LAUNCH_DAEMON_LABEL}");
                     let plist_str = plist_path.display().to_string();
@@ -2962,6 +3035,9 @@ fn switch_service_engine_impl(
                             .output();
                         wait_launchctl_unloaded(&service_target);
                     }
+                    if let Some(parent) = plist_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
                     fs::write(
                         &plist_path,
                         generate_launch_daemon_plist(&target_bin, &target_cfg),
@@ -2971,51 +3047,18 @@ fn switch_service_engine_impl(
                         let _ = fs::set_permissions(&plist_path, fs::Permissions::from_mode(0o644));
                     }
                     if was_running {
-                        let boot = Command::new("/bin/launchctl")
-                            .args(["bootstrap", "system", &plist_str])
-                            .stdin(Stdio::null())
-                            .output()
-                            .context("failed to execute '/bin/launchctl bootstrap'")?;
-                        if !boot.status.success() && !launchctl_service_loaded(&service_target) {
-                            let detail = String::from_utf8_lossy(&boot.stderr).trim().to_string();
-                            if detail.is_empty() {
-                                bail!(
-                                    "failed to start LaunchDaemon '{LAUNCH_DAEMON_LABEL}' (exit status: {})",
-                                    boot.status
-                                );
-                            }
-                            bail!("failed to start LaunchDaemon '{LAUNCH_DAEMON_LABEL}': {detail}");
-                        }
-                        let kick = Command::new("/bin/launchctl")
-                            .args(["kickstart", "-k", &service_target])
-                            .stdin(Stdio::null())
-                            .output()
-                            .context("failed to execute '/bin/launchctl kickstart'")?;
-                        if !kick.status.success() && !launchctl_service_running(&service_target) {
-                            let detail = String::from_utf8_lossy(&kick.stderr).trim().to_string();
-                            if detail.is_empty() {
-                                bail!(
-                                    "failed to kickstart LaunchDaemon '{LAUNCH_DAEMON_LABEL}' (exit status: {})",
-                                    kick.status
-                                );
-                            }
-                            bail!(
-                                "failed to kickstart LaunchDaemon '{LAUNCH_DAEMON_LABEL}': {detail}"
-                            );
-                        }
+                        start_macos_launch_daemon(&plist_path)?;
                     }
                 }
                 EngineMode::Proxy => {
                     let _ = remove_macos_launch_daemon_if_present()?;
                     let target_bin = installed_binary_path()?;
-                    if !target_bin.is_file() {
-                        copy_binary_atomically(&current_exe, &target_bin)?;
-                        chown_to_sudo_user(&target_bin);
-                        if let Some(bin_dir) = target_bin.parent() {
-                            chown_to_sudo_user(bin_dir);
-                            if let Some(root) = bin_dir.parent() {
-                                chown_to_sudo_user(root);
-                            }
+                    copy_binary_atomically(&current_exe, &target_bin)?;
+                    chown_to_sudo_user(&target_bin);
+                    if let Some(bin_dir) = target_bin.parent() {
+                        chown_to_sudo_user(bin_dir);
+                        if let Some(root) = bin_dir.parent() {
+                            chown_to_sudo_user(root);
                         }
                     }
                     let plist_path = launch_agent_plist_path()?;
@@ -3098,10 +3141,13 @@ fn switch_service_engine_impl(
         let was_running = detect_service_state() == ServiceState::Running;
 
         if service_installed && (target == EngineMode::Tun || system_exists) && !is_unix_root() {
-            bail!(
-                "switching the Linux background service to/from TUN mode requires root privileges; run 'sudo vdpi engine {}'.",
+            let args = vec!["engine".to_string(), target.as_str().to_string()];
+            let action = format!(
+                "switch the Linux background service to {} mode",
                 target.as_str()
             );
+            relaunch_unix_sudo_and_wait(&args, &action)?;
+            return Ok(());
         }
 
         let config_path = if target == EngineMode::Tun && (service_installed || is_unix_root()) {
@@ -3134,9 +3180,7 @@ fn switch_service_engine_impl(
                     remove_linux_user_unit_if_present();
                     let _ = clear_all_system_proxies();
                     let target_bin = PathBuf::from(UNIX_SYSTEM_BIN_PATH);
-                    if !target_bin.is_file() {
-                        copy_binary_atomically(&current_exe, &target_bin)?;
-                    }
+                    copy_binary_atomically(&current_exe, &target_bin)?;
                     let unit_path = systemd_system_unit_path();
                     if let Some(parent) = unit_path.parent() {
                         fs::create_dir_all(parent)?;
@@ -3271,6 +3315,16 @@ pub fn uninstall_service() -> Result<()> {
 pub fn uninstall_service_with_options(purge: bool) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
+        let daemon_present = launch_daemon_plist_path().exists()
+            || launchctl_service_loaded(&format!("system/{LAUNCH_DAEMON_LABEL}"))
+            || fs::symlink_metadata(UNIX_SYSTEM_BIN_PATH).is_ok();
+        if daemon_present && !is_unix_root() {
+            let mut args = vec!["uninstall".to_string()];
+            if purge {
+                args.push("--purge".to_string());
+            }
+            return relaunch_unix_sudo_and_wait(&args, "uninstall the vdpi TUN background service");
+        }
         if remove_macos_launch_daemon_if_present()? {
             println!(
                 "Removed LaunchDaemon: {}",
@@ -3346,6 +3400,15 @@ pub fn uninstall_service_with_options(purge: bool) -> Result<()> {
 
     #[cfg(target_os = "linux")]
     {
+        let system_present = systemd_system_unit_path().exists()
+            || fs::symlink_metadata(UNIX_SYSTEM_BIN_PATH).is_ok();
+        if system_present && !is_unix_root() {
+            let mut args = vec!["uninstall".to_string()];
+            if purge {
+                args.push("--purge".to_string());
+            }
+            return relaunch_unix_sudo_and_wait(&args, "uninstall the vdpi TUN background service");
+        }
         if remove_linux_system_unit_if_present()? {
             println!(
                 "Removed systemd system unit: {}",
@@ -3505,9 +3568,9 @@ fn pause_service_impl(verbose: bool) -> Result<()> {
         let daemon_path = launch_daemon_plist_path();
         if daemon_path.exists() {
             if !is_unix_root() {
-                bail!(
-                    "pausing the root LaunchDaemon ({}) requires root privileges; run 'sudo vdpi pause'.",
-                    daemon_path.display()
+                return relaunch_unix_sudo_and_wait(
+                    &["pause".to_string()],
+                    "pause the vdpi TUN background service",
                 );
             }
             let service_target = format!("system/{LAUNCH_DAEMON_LABEL}");
@@ -3601,9 +3664,9 @@ fn pause_service_impl(verbose: bool) -> Result<()> {
         let system_unit = systemd_system_unit_path();
         if system_unit.exists() {
             if !is_unix_root() {
-                bail!(
-                    "pausing the systemd system unit ({}) requires root privileges; run 'sudo vdpi pause'.",
-                    system_unit.display()
+                return relaunch_unix_sudo_and_wait(
+                    &["pause".to_string()],
+                    "pause the vdpi TUN background service",
                 );
             }
             let out = Command::new("systemctl")
@@ -3731,30 +3794,12 @@ fn resume_service_impl(verbose: bool) -> Result<()> {
         let daemon_path = launch_daemon_plist_path();
         if daemon_path.exists() {
             if !is_unix_root() {
-                bail!(
-                    "resuming the root LaunchDaemon ({}) requires root privileges; run 'sudo vdpi resume'.",
-                    daemon_path.display()
+                return relaunch_unix_sudo_and_wait(
+                    &["resume".to_string()],
+                    "resume the vdpi TUN background service",
                 );
             }
-            let service_target = format!("system/{LAUNCH_DAEMON_LABEL}");
-            let plist_str = daemon_path.display().to_string();
-            let _ = Command::new("/bin/launchctl")
-                .args(["enable", &service_target])
-                .stdin(Stdio::null())
-                .output();
-            let boot = Command::new("/bin/launchctl")
-                .args(["bootstrap", "system", &plist_str])
-                .stdin(Stdio::null())
-                .output()
-                .context("failed to execute '/bin/launchctl bootstrap'")?;
-            if !boot.status.success() && !launchctl_service_loaded(&service_target) {
-                let detail = String::from_utf8_lossy(&boot.stderr).trim().to_string();
-                bail!("failed to resume LaunchDaemon '{LAUNCH_DAEMON_LABEL}': {detail}");
-            }
-            let _ = Command::new("/bin/launchctl")
-                .args(["kickstart", "-k", &service_target])
-                .stdin(Stdio::null())
-                .output();
+            start_macos_launch_daemon(&daemon_path)?;
             if verbose {
                 println!(
                     "Resumed LaunchDaemon '{LAUNCH_DAEMON_LABEL}' (TUN anti-DPI protection active)."
@@ -3851,9 +3896,9 @@ fn resume_service_impl(verbose: bool) -> Result<()> {
         let system_unit = systemd_system_unit_path();
         if system_unit.exists() {
             if !is_unix_root() {
-                bail!(
-                    "resuming the systemd system unit ({}) requires root privileges; run 'sudo vdpi resume'.",
-                    system_unit.display()
+                return relaunch_unix_sudo_and_wait(
+                    &["resume".to_string()],
+                    "resume the vdpi TUN background service",
                 );
             }
             let _ = Command::new("systemctl")
@@ -4815,8 +4860,45 @@ fn current_uid() -> u32 {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn is_unix_root() -> bool {
+pub fn is_unix_root() -> bool {
     unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn relaunch_unix_sudo_and_wait(args: &[String], action_description: &str) -> Result<()> {
+    use std::io::IsTerminal;
+
+    let cmd_hint = args.join(" ");
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        bail!("Root required - run: sudo vdpi {cmd_hint}");
+    }
+
+    let exe = std::env::current_exe().context("failed to determine current executable")?;
+    let sudo_bin = ["/usr/bin/sudo", "/bin/sudo", "/usr/local/bin/sudo"]
+        .into_iter()
+        .find(|p| Path::new(p).is_file())
+        .unwrap_or("sudo");
+
+    println!("\nAdministrator privileges required to {action_description}.");
+    println!("Enter your password (or Touch ID) if prompted by sudo...");
+
+    let status = Command::new(sudo_bin)
+        .arg("--")
+        .arg(exe)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .with_context(|| format!("Root required - run: sudo vdpi {cmd_hint}"))?;
+
+    if !status.success() {
+        let code = status
+            .code()
+            .map_or_else(|| "signal".to_string(), |c| c.to_string());
+        bail!("sudo canceled or failed (exit {code}) - try: sudo vdpi {cmd_hint}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

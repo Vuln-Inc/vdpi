@@ -85,7 +85,7 @@ public final class TunnelManager: ObservableObject {
                 return trimmed
             }
         }
-        return "0.5.0"
+        return "0.5.1"
     }
 
     private static let maxThroughputSamples = 24

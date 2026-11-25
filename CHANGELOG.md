@@ -6,6 +6,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-25
+
+### Fixed
+
+- macOS and Linux interactive `sudo` elevation prompt when switching between Proxy and TUN mode, installing/pausing/resuming/uninstalling a root TUN service, or starting foreground TUN from the Control Center TUI (matching Windows UAC elevation).
+- Windows foreground TUN start from Control Center now prompts for UAC elevation when not running as Administrator.
+- macOS `LaunchDaemon` engine switch and resume no longer `kickstart -k` immediately after `bootstrap` (`RunAtLoad=true`), always updates `/usr/local/bin/vdpi` to the current binary, and waits up to 2.5s for TUN `/vdpi-health` readiness.
+- `load_configured_engine()` now prefers system `config.toml` when a TUN system daemon or Windows service is installed so paused TUN services display the correct engine mode in Control Center and `vdpi status`.
+
 ## [0.5.0] - 2026-11-25
 
 ### Added

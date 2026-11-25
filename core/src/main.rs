@@ -157,6 +157,38 @@ fn main() -> Result<()> {
                             continue;
                         }
                     }
+                    #[cfg(target_os = "windows")]
+                    if cfg.engine == EngineMode::Tun
+                        && !vdpi::platform::windows_service::is_elevated()
+                    {
+                        match vdpi::platform::windows_service::relaunch_elevated_and_wait(&[
+                            "--tun".to_string(),
+                            "start".to_string(),
+                        ]) {
+                            Ok(()) => return Ok(()),
+                            Err(err) => {
+                                notice =
+                                    Some(sanitize_notice(&format!("TUN start failed: {err:#}")));
+                                explicit_launcher = true;
+                                continue;
+                            }
+                        }
+                    }
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
+                    if cfg.engine == EngineMode::Tun && !vdpi::service::is_unix_root() {
+                        match vdpi::service::relaunch_unix_sudo_and_wait(
+                            &["--tun".to_string(), "start".to_string()],
+                            "run vdpi in TUN mode",
+                        ) {
+                            Ok(()) => return Ok(()),
+                            Err(err) => {
+                                notice =
+                                    Some(sanitize_notice(&format!("TUN start failed: {err:#}")));
+                                explicit_launcher = true;
+                                continue;
+                            }
+                        }
+                    }
                     if !cfg.quiet
                         && status.installed.is_none()
                         && status.service_state == ServiceState::NotInstalled
@@ -643,7 +675,11 @@ fn get_or_init_cli_runtime(
 }
 
 fn wait_for_live_engine(cfg: &RuntimeConfig, target: EngineMode) {
-    let deadline = Instant::now() + Duration::from_millis(1200);
+    let wait_ms = match target {
+        EngineMode::Tun => 2500,
+        EngineMode::Proxy => 1200,
+    };
+    let deadline = Instant::now() + Duration::from_millis(wait_ms);
     loop {
         if vdpi::service::probe_control_center_status(cfg)
             .live_engine
