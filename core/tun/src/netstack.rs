@@ -289,12 +289,12 @@ enum EnqueueOutcome {
 
 fn internet_checksum_sum(data: &[u8]) -> u32 {
     let mut sum: u32 = 0;
-    let mut chunks = data.chunks_exact(2);
-    for chunk in &mut chunks {
-        sum += u32::from(u16::from_be_bytes([chunk[0], chunk[1]]));
+    let (chunks, rem) = data.as_chunks::<2>();
+    for &[hi, lo] in chunks {
+        sum += u32::from(u16::from_be_bytes([hi, lo]));
     }
-    if let Some(&rem) = chunks.remainder().first() {
-        sum += u32::from(u16::from_be_bytes([rem, 0]));
+    if let Some(&byte) = rem.first() {
+        sum += u32::from(u16::from_be_bytes([byte, 0]));
     }
     sum
 }
