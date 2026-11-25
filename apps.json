@@ -21,6 +21,15 @@
       "category": "utilities",
       "versions": [
         {
+          "version": "0.5.4",
+          "buildVersion": "11",
+          "date": "2026-11-25T12:01:10Z",
+          "localizedDescription": "Desktop TUI DNS server preset picker and vdpi dns CLI command (keeps all v0.5.3 iOS netstack/utun/TLS/DoH fixes).",
+          "downloadURL": "https://github.com/Vuln-Inc/vdpi/releases/download/v0.5.4/vdpi-ios-unsigned.ipa",
+          "size": 7641900,
+          "minOSVersion": "16.0"
+        },
+        {
           "version": "0.5.3",
           "buildVersion": "10",
           "date": "2026-11-25T11:02:27Z",
@@ -91,11 +100,11 @@
         ],
         "privacy": {}
       },
-      "version": "0.5.3",
-      "versionDate": "2026-11-25T11:02:27Z",
-      "versionDescription": "- Fixed smoltcp 0.14 SynReceived+RST->Listen revert 30s deadlock and replaced single pending_frame halt with non-blocking deferred_syns queue\n- Fixed iOS TCP session starvation: active-only session counting, fast 2s TimeWait / 5s closing reapers, TCP RST+ACK on overflow, raised LOW_MEMORY cap 64->128, added 120s idle relay timeout\n- Fixed XNU Skywalk utun ENOSPC/ENOBUFS silent drops with bounded backoff retries and matched 20-byte UTUN_FLAGS_ENABLE_PROC_UUID TX framing\n- Isolated TUN L3 demux (non-blocking TCP try_send, off-loop UDP NAT, TCP/53 bypass) and eliminated Akamai MSG_OOB blackholes, TLS 1.3 HRR/0-RTT stalls, and sinkholed DoH 30s blackouts\n- Fixed Sideloadly live-reload (ProviderMessage.reloadEngineWithSettings), Personal Hotspot Wi-Fi IPv6 detection, and automatic mtu 1400->4064 migration",
-      "downloadURL": "https://github.com/Vuln-Inc/vdpi/releases/download/v0.5.3/vdpi-ios-unsigned.ipa",
-      "size": 7642152
+      "version": "0.5.4",
+      "versionDate": "2026-11-25T12:01:10Z",
+      "versionDescription": "Desktop TUI DNS server preset picker and vdpi dns CLI command (keeps all v0.5.3 iOS netstack/utun/TLS/DoH fixes).",
+      "downloadURL": "https://github.com/Vuln-Inc/vdpi/releases/download/v0.5.4/vdpi-ios-unsigned.ipa",
+      "size": 7641900
     }
   ],
   "news": []
