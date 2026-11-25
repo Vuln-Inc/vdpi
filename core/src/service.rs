@@ -3487,7 +3487,8 @@ fn set_service_dns_impl(dns_addr: &str, cfg: &RuntimeConfig, verbose: bool) -> R
         } else if agent_exists {
             let target_bin = installed_binary_path()?;
             let plist_path = launch_agent_plist_path()?;
-            let domain = launchctl_gui_domain();
+            let uid = current_uid();
+            let domain = format!("gui/{uid}");
             let service_target = format!("{domain}/{LAUNCH_AGENT_LABEL}");
             let plist_str = plist_path.display().to_string();
             if was_running || launchctl_service_loaded(&service_target) {
@@ -3503,8 +3504,9 @@ fn set_service_dns_impl(dns_addr: &str, cfg: &RuntimeConfig, verbose: bool) -> R
             }
             fs::write(
                 &plist_path,
-                generate_launchd_plist(&target_bin, &target_cfg),
+                generate_launch_agent_plist(&target_bin, &target_cfg),
             )?;
+            chown_to_sudo_user(&plist_path);
             if was_running {
                 let boot = Command::new("/bin/launchctl")
                     .args(["bootstrap", &domain, &plist_str])
