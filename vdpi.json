@@ -1,12 +1,12 @@
 {
-    "version": "0.5.2",
+    "version": "0.5.3",
     "description": "Zero-hassle, self-healing anti-DPI engine in Rust",
     "homepage": "https://github.com/Vuln-Inc/vdpi",
     "license": "MIT",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/Vuln-Inc/vdpi/releases/download/v0.5.2/vdpi-windows-x86_64.zip",
-            "hash": "998162d11b640cabb696b2a94929e940cf37673dd2ea061699856ac54f2fbc48"
+            "url": "https://github.com/Vuln-Inc/vdpi/releases/download/v0.5.3/vdpi-windows-x86_64.zip",
+            "hash": "e3134cdc7f0e1075ad08890bc0215986942ae092778258a4869e2267f14ad7ab"
         }
     },
     "bin": "vdpi.exe",
