@@ -15,11 +15,17 @@
     h1 { font-size: 32px; letter-spacing: -0.02em; margin: 0 0 8px; }
     p.lead { color: var(--muted); margin: 0 0 28px; }
     .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; overflow: hidden; margin-bottom: 18px; }
-    .row { display: flex; justify-content: space-between; align-items: center; padding: 14px 16px; border-top: 1px solid var(--border); gap: 14px; flex-wrap: wrap; }
+    .row { display: flex; justify-content: space-between; align-items: center; padding: 16px 18px; border-top: 1px solid var(--border); gap: 16px; }
     .row:first-child { border-top: 0; }
+    .info { min-width: 0; }
     .label { font-weight: 500; }
-    .sub { font-size: 13px; color: var(--muted); margin-top: 2px; }
-    .links { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    .sub { font-size: 13px; color: var(--muted); margin-top: 4px; }
+    .sub-links a { font-weight: 400; }
+    .links { display: flex; gap: 14px; align-items: center; flex-shrink: 0; }
+    @media (max-width: 560px) {
+      .row { flex-wrap: wrap; }
+      .links { width: 100%; }
+    }
     a { color: var(--accent); text-decoration: none; font-weight: 500; white-space: nowrap; }
     a:hover { text-decoration: underline; }
     code { font: 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: rgba(127,127,127,0.12); padding: 2px 6px; border-radius: 6px; word-break: break-all; }
@@ -33,7 +39,7 @@
 
     <div class="card">
       <div class="row">
-        <div>
+        <div class="info">
           <div class="label">Windows (x86_64)</div>
           <div class="sub"><code>irm https://vuln-inc.github.io/vdpi/install.ps1 | iex</code></div>
           <div class="sub">Scoop: <code>scoop install https://vuln-inc.github.io/vdpi/vdpi.json</code></div>
@@ -43,7 +49,7 @@
         </div>
       </div>
       <div class="row">
-        <div>
+        <div class="info">
           <div class="label">macOS &amp; Linux</div>
           <div class="sub"><code>curl -fsSL https://vuln-inc.github.io/vdpi/install.sh | sh</code></div>
           <div class="sub">Cargo: <code>cargo install vdpi</code></div>
@@ -54,7 +60,7 @@
         </div>
       </div>
       <div class="row">
-        <div>
+        <div class="info">
           <div class="label">Android</div>
           <div class="sub">Universal APK (arm64-v8a, armeabi-v7a, x86_64) &middot; Obtainium compatible</div>
         </div>
@@ -63,16 +69,13 @@
         </div>
       </div>
       <div class="row">
-        <div>
+        <div class="info">
           <div class="label">iOS / iPadOS</div>
           <div class="sub">Source URL: <code>https://vuln-inc.github.io/vdpi/apps.json</code></div>
+          <div class="sub sub-links">Stores: <a href="altstore://source?url=https://vuln-inc.github.io/vdpi/apps.json">AltStore</a> &middot; <a href="sidestore://source?url=https://vuln-inc.github.io/vdpi/apps.json">SideStore</a> &middot; <a href="feather://source/https://vuln-inc.github.io/vdpi/apps.json">Feather</a> &middot; <a href="./apps.json">apps.json</a></div>
         </div>
         <div class="links">
-          <a href="altstore://source?url=https://vuln-inc.github.io/vdpi/apps.json">AltStore</a>
-          <a href="sidestore://source?url=https://vuln-inc.github.io/vdpi/apps.json">SideStore</a>
           <a href="https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-ios-unsigned.ipa">Download .ipa</a>
-          <a href="feather://source/https://vuln-inc.github.io/vdpi/apps.json">Feather</a>
-          <a href="./apps.json">apps.json</a>
         </div>
       </div>
     </div>
