@@ -706,10 +706,10 @@ mod imp {
     fn open_tun_device_named(name: &str) -> Result<(OwnedFd, String)> {
         validate_tun_iface_name(name)?;
 
-        // SAFETY: `b"/dev/net/tun\0"` is a static NUL-terminated path passed to `open(2)`.
+        // SAFETY: `c"/dev/net/tun"` is a static NUL-terminated C string passed to `open(2)`.
         let raw_fd = unsafe {
             libc::open(
-                b"/dev/net/tun\0".as_ptr().cast::<libc::c_char>(),
+                c"/dev/net/tun".as_ptr(),
                 libc::O_RDWR | libc::O_CLOEXEC | libc::O_NONBLOCK,
             )
         };

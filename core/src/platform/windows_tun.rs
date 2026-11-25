@@ -719,16 +719,16 @@ mod win32 {
             let api = unsafe {
                 Self {
                     module: SendHandle(module),
-                    create_adapter: load_proc(module, b"WintunCreateAdapter\0")?,
-                    close_adapter: load_proc(module, b"WintunCloseAdapter\0")?,
-                    get_adapter_luid: load_proc(module, b"WintunGetAdapterLUID\0")?,
-                    start_session: load_proc(module, b"WintunStartSession\0")?,
-                    end_session: load_proc(module, b"WintunEndSession\0")?,
-                    get_read_wait_event: load_proc(module, b"WintunGetReadWaitEvent\0")?,
-                    receive_packet: load_proc(module, b"WintunReceivePacket\0")?,
-                    release_receive_packet: load_proc(module, b"WintunReleaseReceivePacket\0")?,
-                    allocate_send_packet: load_proc(module, b"WintunAllocateSendPacket\0")?,
-                    send_packet: load_proc(module, b"WintunSendPacket\0")?,
+                    create_adapter: load_proc(module, c"WintunCreateAdapter")?,
+                    close_adapter: load_proc(module, c"WintunCloseAdapter")?,
+                    get_adapter_luid: load_proc(module, c"WintunGetAdapterLUID")?,
+                    start_session: load_proc(module, c"WintunStartSession")?,
+                    end_session: load_proc(module, c"WintunEndSession")?,
+                    get_read_wait_event: load_proc(module, c"WintunGetReadWaitEvent")?,
+                    receive_packet: load_proc(module, c"WintunReceivePacket")?,
+                    release_receive_packet: load_proc(module, c"WintunReleaseReceivePacket")?,
+                    allocate_send_packet: load_proc(module, c"WintunAllocateSendPacket")?,
+                    send_packet: load_proc(module, c"WintunSendPacket")?,
                 }
             };
             let _ = guard.into_raw();
@@ -813,12 +813,11 @@ mod win32 {
         }
     }
 
-    unsafe fn load_proc<T>(module: HMODULE, symbol: &'static [u8]) -> Result<T> {
-        debug_assert!(symbol.ends_with(b"\0"));
+    unsafe fn load_proc<T>(module: HMODULE, symbol: &'static std::ffi::CStr) -> Result<T> {
         debug_assert_eq!(mem::size_of::<T>(), mem::size_of::<usize>());
-        let proc = GetProcAddress(module, symbol.as_ptr()).ok_or_else(|| {
+        let proc = GetProcAddress(module, symbol.as_ptr().cast::<u8>()).ok_or_else(|| {
             let err = GetLastError();
-            let name = String::from_utf8_lossy(&symbol[..symbol.len().saturating_sub(1)]);
+            let name = symbol.to_string_lossy();
             anyhow!("GetProcAddress({name}) failed with Win32 error {err}")
         })?;
         Ok(mem::transmute_copy(&proc))
@@ -1289,9 +1288,9 @@ mod win32 {
         };
         if !hmod.is_null() {
             let _guard = ModuleGuard(hmod);
-            if let Ok(set_dns) = unsafe {
-                load_proc::<SetInterfaceDnsSettingsFn>(hmod, b"SetInterfaceDnsSettings\0")
-            } {
+            if let Ok(set_dns) =
+                unsafe { load_proc::<SetInterfaceDnsSettingsFn>(hmod, c"SetInterfaceDnsSettings") }
+            {
                 let mut dns_w = encode_wide(&dns_server.to_string());
                 let flags = if is_v6 {
                     u64::from(DNS_SETTING_IPV6 | DNS_SETTING_NAMESERVER)
@@ -1418,7 +1417,7 @@ mod win32 {
         }
         let _guard = ModuleGuard(hmod);
         if let Ok(flush_fn) =
-            unsafe { load_proc::<DnsFlushResolverCacheFn>(hmod, b"DnsFlushResolverCache\0") }
+            unsafe { load_proc::<DnsFlushResolverCacheFn>(hmod, c"DnsFlushResolverCache") }
         {
             let ok = unsafe { flush_fn() };
             trace!(ok = (ok != 0), "invoked DnsFlushResolverCache()");
