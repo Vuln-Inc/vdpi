@@ -84,6 +84,11 @@ pub struct RuntimeConfig {
     pub dns_port: u16,
     pub dns_ipv4_only: bool,
     pub enable_doh: bool,
+    /// Disables OS `lookup_host` fallback, mDNS `.local` OS resolution, and hostname-based DoH
+    /// endpoints even when `outbound_binder` is `None` (e.g. iOS NEPacketTunnelProvider where
+    /// NECP auto-excludes extension sockets, avoiding per-query HTTP/1.1 TLS while preventing
+    /// `mDNSResponder` -> `utun` recursion loops).
+    pub disable_system_dns_fallback: bool,
     pub chunk_size: usize,
     pub mode: DesyncMode,
     pub patterns: Vec<String>,
@@ -111,6 +116,7 @@ impl Default for RuntimeConfig {
             dns_port: 53,
             dns_ipv4_only: false,
             enable_doh: true,
+            disable_system_dns_fallback: false,
             chunk_size: 10,
             mode: DesyncMode::Combo,
             patterns: Vec::new(),

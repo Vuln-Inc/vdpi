@@ -28,6 +28,7 @@ const MAX_DNS_NAME_BYTES: usize = 253;
 const MAX_DNS_MESSAGE_BYTES: usize = u16::MAX as usize;
 const MAX_BOUND_DOH_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BOUND_DOH_RAW_BYTES: usize = MAX_DNS_MESSAGE_BYTES + MAX_BOUND_DOH_HEADER_BYTES;
+const MAX_DOH_FAILOVER_CONCURRENCY: usize = 2;
 const FIREFOX_CANARY_DOMAIN: &str = "use-application-dns.net";
 
 static PROCESS_EPOCH: OnceLock<Instant> = OnceLock::new();
@@ -91,10 +92,13 @@ enum DohError {
     ProtocolError { endpoint: String, rcode: u16 },
 }
 
+type DohAttemptResult = (usize, String, std::result::Result<DnsOutcome, DohError>);
+
 #[derive(Clone)]
 pub struct DnsResolver {
     enable_doh: bool,
     ipv4_only: bool,
+    disable_system_dns_fallback: bool,
     udp_dns_servers: Vec<SocketAddr>,
     doh_endpoints: Vec<String>,
     preferred_doh_idx: Arc<AtomicUsize>,
@@ -109,7 +113,7 @@ pub struct DnsResolver {
 
 impl DnsResolver {
     pub fn new(dns_addr: &str, dns_port: u16, enable_doh: bool, ipv4_only: bool) -> Result<Self> {
-        Self::new_with_binder(dns_addr, dns_port, enable_doh, ipv4_only, None)
+        Self::new_with_options(dns_addr, dns_port, enable_doh, ipv4_only, false, None)
     }
 
     pub fn new_with_binder(
@@ -117,6 +121,24 @@ impl DnsResolver {
         dns_port: u16,
         enable_doh: bool,
         ipv4_only: bool,
+        outbound_binder: Option<Arc<dyn OutboundBinder>>,
+    ) -> Result<Self> {
+        Self::new_with_options(
+            dns_addr,
+            dns_port,
+            enable_doh,
+            ipv4_only,
+            false,
+            outbound_binder,
+        )
+    }
+
+    pub fn new_with_options(
+        dns_addr: impl AsRef<str>,
+        dns_port: u16,
+        enable_doh: bool,
+        ipv4_only: bool,
+        disable_system_dns_fallback: bool,
         outbound_binder: Option<Arc<dyn OutboundBinder>>,
     ) -> Result<Self> {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -127,7 +149,7 @@ impl DnsResolver {
             .no_proxy()
             .timeout(Duration::from_millis(2000))
             .connect_timeout(Duration::from_millis(1200))
-            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_idle_timeout(Duration::from_secs(30))
             .pool_max_idle_per_host(2)
             .tcp_nodelay(true)
             .build()
@@ -141,11 +163,18 @@ impl DnsResolver {
 
         let dns_addr = dns_addr.as_ref();
         let udp_dns_servers = build_udp_dns_servers(dns_addr, dns_port);
-        let doh_endpoints = build_doh_endpoints(dns_addr, outbound_binder.is_some());
+        let require_ip_literal = disable_system_dns_fallback || outbound_binder.is_some();
+        let doh_endpoints = build_doh_endpoints(
+            dns_addr,
+            outbound_binder.is_some(),
+            require_ip_literal,
+            ipv4_only,
+        );
 
         Ok(Self {
             enable_doh,
             ipv4_only,
+            disable_system_dns_fallback,
             udp_dns_servers,
             doh_endpoints,
             preferred_doh_idx: Arc::new(AtomicUsize::new(0)),
@@ -157,6 +186,10 @@ impl DnsResolver {
             bound_tls_connector,
             cache: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    fn is_system_dns_disabled(&self) -> bool {
+        self.disable_system_dns_fallback || self.outbound_binder.is_some()
     }
 
     pub fn query_count(&self) -> u64 {
@@ -237,9 +270,9 @@ impl DnsResolver {
         }
 
         // 3. mDNS (.local) via OS resolver (unfiltered because LAN IPs are expected).
-        //    Disabled when outbound_binder is active (TUN mode) to prevent system DNS recursion.
+        //    Disabled in TUN mode / when system DNS fallback is disabled to prevent recursion.
         if normalized.ends_with(".local") {
-            if self.outbound_binder.is_some() {
+            if self.is_system_dns_disabled() {
                 return Ok(DnsOutcome::NxDomain(Duration::from_secs(30)));
             }
             let ips = self.resolve_via_system(&normalized, false).await?;
@@ -345,7 +378,7 @@ impl DnsResolver {
         if count_metric {
             self.query_count.fetch_add(1, Ordering::Relaxed);
         }
-        let no_system_fallback = disable_system_fallback || self.outbound_binder.is_some();
+        let no_system_fallback = disable_system_fallback || self.is_system_dns_disabled();
         let normalized = host
             .trim()
             .trim_matches(|c| c == '[' || c == ']')
@@ -528,8 +561,8 @@ impl DnsResolver {
             Ok(resolved) => match &resolved.outcome {
                 DnsOutcome::NxDomain(_) => Ok(resolved),
                 DnsOutcome::Records(ips, _) if !ips.is_empty() => Ok(resolved),
-                DnsOutcome::Records(_, _) if self.outbound_binder.is_some() => {
-                    bail!("UDP DNS returned no records for {domain} (system DNS disabled in TUN mode)")
+                DnsOutcome::Records(_, _) if self.is_system_dns_disabled() => {
+                    bail!("UDP DNS returned no records for {domain} (system DNS disabled)")
                 }
                 DnsOutcome::Records(_, _) => {
                     let sys = self.resolve_via_system(domain, true).await?;
@@ -540,7 +573,7 @@ impl DnsResolver {
                     })
                 }
             },
-            Err(e) if self.outbound_binder.is_some() => Err(e),
+            Err(e) if self.is_system_dns_disabled() => Err(e),
             Err(_) => {
                 let sys = self.resolve_via_system(domain, true).await?;
                 Ok(ResolvedOutcome {
@@ -558,7 +591,7 @@ impl DnsResolver {
         qtype: u16,
         disable_system_fallback: bool,
     ) -> Result<DnsOutcome> {
-        let no_system = disable_system_fallback || self.outbound_binder.is_some();
+        let no_system = disable_system_fallback || self.is_system_dns_disabled();
         match self.query_udp_type(domain, qtype).await {
             Ok(DnsOutcome::NxDomain(ttl)) => Ok(DnsOutcome::NxDomain(ttl)),
             Ok(DnsOutcome::Records(ips, ttl))
@@ -684,6 +717,34 @@ impl DnsResolver {
         )))
     }
 
+    fn spawn_doh_attempt(
+        &self,
+        join_set: &mut tokio::task::JoinSet<DohAttemptResult>,
+        idx: usize,
+        wire_query: &[u8],
+        qtype: u16,
+    ) {
+        let http = self.http.clone();
+        let outbound_binder = self.outbound_binder.clone();
+        let bound_tls = self.bound_tls_connector.clone();
+        let endpoint = self.doh_endpoints[idx].clone();
+        let query = wire_query.to_vec();
+        let require_ip_literal = self.is_system_dns_disabled();
+        join_set.spawn(async move {
+            let res = send_doh_request(
+                &http,
+                outbound_binder.as_deref(),
+                bound_tls.as_ref(),
+                &endpoint,
+                &query,
+                qtype,
+                require_ip_literal,
+            )
+            .await;
+            (idx, endpoint, res)
+        });
+    }
+
     async fn query_doh_type(
         &self,
         domain: &str,
@@ -697,6 +758,7 @@ impl DnsResolver {
 
         let mut protocol_err: Option<DohError> = None;
         let mut last_transport_err: Option<anyhow::Error> = None;
+        let require_ip_literal = self.is_system_dns_disabled();
 
         // Fast-path: try the currently sticky healthy DoH endpoint first.
         let start = self.preferred_doh_idx.load(Ordering::Relaxed) % count;
@@ -707,6 +769,7 @@ impl DnsResolver {
             &self.doh_endpoints[start],
             &wire_query,
             qtype,
+            require_ip_literal,
         )
         .await
         {
@@ -727,27 +790,16 @@ impl DnsResolver {
             }
         }
 
-        // Preferred DoH endpoint failed: race ALL remaining DoH endpoints concurrently.
-        let mut join_set = tokio::task::JoinSet::new();
-        for offset in 1..count {
-            let idx = (start + offset) % count;
-            let http = self.http.clone();
-            let outbound_binder = self.outbound_binder.clone();
-            let bound_tls = self.bound_tls_connector.clone();
-            let endpoint = self.doh_endpoints[idx].clone();
-            let query = wire_query.clone();
-            join_set.spawn(async move {
-                let res = send_doh_request(
-                    &http,
-                    outbound_binder.as_deref(),
-                    bound_tls.as_ref(),
-                    &endpoint,
-                    &query,
-                    qtype,
-                )
-                .await;
-                (idx, endpoint, res)
-            });
+        // Preferred DoH endpoint failed: race remaining endpoints with bounded concurrency
+        // (at most MAX_DOH_FAILOVER_CONCURRENCY = 2 in flight per query) so concurrent bursts
+        // cannot exhaust tight mobile FD limits (e.g. iOS 256 RLIMIT_NOFILE -> EMFILE).
+        let mut remaining_indices = (1..count).map(|offset| (start + offset) % count);
+        let mut join_set: tokio::task::JoinSet<DohAttemptResult> = tokio::task::JoinSet::new();
+        for _ in 0..MAX_DOH_FAILOVER_CONCURRENCY {
+            let Some(idx) = remaining_indices.next() else {
+                break;
+            };
+            self.spawn_doh_attempt(&mut join_set, idx, &wire_query, qtype);
         }
 
         while let Some(joined) = join_set.join_next().await {
@@ -771,6 +823,9 @@ impl DnsResolver {
                     }
                     Err(DohError::Transport(e)) => last_transport_err = Some(e),
                 }
+            }
+            if let Some(next_idx) = remaining_indices.next() {
+                self.spawn_doh_attempt(&mut join_set, next_idx, &wire_query, qtype);
             }
         }
 
@@ -905,10 +960,8 @@ impl DnsResolver {
     }
 
     async fn resolve_via_system(&self, domain: &str, filter_poison: bool) -> Result<Vec<IpAddr>> {
-        if self.outbound_binder.is_some() {
-            bail!(
-                "system DNS lookup disabled when outbound_binder is active (TUN recursion guard)"
-            );
+        if self.is_system_dns_disabled() {
+            bail!("system DNS lookup disabled (TUN recursion guard)");
         }
         let addrs = lookup_host((domain, 443u16))
             .await
@@ -1080,6 +1133,7 @@ impl DnsResolver {
             normalized_query[1] = 0;
         }
         let start = self.preferred_doh_idx.load(Ordering::Relaxed) % count;
+        let require_ip_literal = self.is_system_dns_disabled();
         for offset in 0..count.min(3) {
             let idx = (start + offset) % count;
             let Ok(bytes) = send_doh_wire(
@@ -1088,6 +1142,7 @@ impl DnsResolver {
                 self.bound_tls_connector.as_ref(),
                 &self.doh_endpoints[idx],
                 &normalized_query,
+                require_ip_literal,
             )
             .await
             else {
@@ -1746,15 +1801,26 @@ async fn send_doh_wire(
     bound_tls: Option<&TlsConnector>,
     endpoint: &str,
     wire_query: &[u8],
+    require_ip_literal: bool,
 ) -> Result<Vec<u8>> {
     if let (Some(binder), Some(connector)) = (outbound_binder, bound_tls) {
         send_doh_bound_tls(binder, connector, endpoint, wire_query).await
     } else {
-        send_doh_request_raw(http, endpoint, wire_query).await
+        send_doh_request_raw(http, endpoint, wire_query, require_ip_literal).await
     }
 }
 
-async fn send_doh_request_raw(http: &Client, endpoint: &str, wire_query: &[u8]) -> Result<Vec<u8>> {
+async fn send_doh_request_raw(
+    http: &Client,
+    endpoint: &str,
+    wire_query: &[u8],
+    require_ip_literal: bool,
+) -> Result<Vec<u8>> {
+    if require_ip_literal && !is_ip_literal_doh_endpoint(endpoint) {
+        bail!(
+            "hostname-based DoH endpoint rejected when system DNS fallback is disabled: {endpoint}"
+        );
+    }
     let mut resp = http
         .post(endpoint)
         .header("content-type", "application/dns-message")
@@ -1788,10 +1854,18 @@ async fn send_doh_request(
     endpoint: &str,
     wire_query: &[u8],
     qtype: u16,
+    require_ip_literal: bool,
 ) -> std::result::Result<DnsOutcome, DohError> {
-    let bytes = send_doh_wire(http, outbound_binder, bound_tls, endpoint, wire_query)
-        .await
-        .map_err(DohError::Transport)?;
+    let bytes = send_doh_wire(
+        http,
+        outbound_binder,
+        bound_tls,
+        endpoint,
+        wire_query,
+        require_ip_literal,
+    )
+    .await
+    .map_err(DohError::Transport)?;
     match decode_dns_outcome_classified(&bytes, qtype) {
         Ok(DnsOutcome::NxDomain(ttl)) => Ok(DnsOutcome::NxDomain(ttl)),
         Ok(DnsOutcome::Records(ips, ttl)) => {
@@ -1813,6 +1887,10 @@ async fn send_doh_request(
     }
 }
 
+fn is_ip_literal_doh_endpoint(endpoint: &str) -> bool {
+    parse_bound_doh_endpoint(endpoint).is_ok()
+}
+
 fn is_http2_only_doh_endpoint(endpoint: &str) -> bool {
     let Ok(target) = parse_bound_doh_endpoint(endpoint) else {
         return false;
@@ -1828,11 +1906,18 @@ fn is_http2_only_doh_endpoint(endpoint: &str) -> bool {
     }
 }
 
-fn build_doh_endpoints(dns_addr: &str, bound_http1: bool) -> Vec<String> {
+fn build_doh_endpoints(
+    dns_addr: &str,
+    bound_http1: bool,
+    require_ip_literal: bool,
+    ipv4_only: bool,
+) -> Vec<String> {
     let mut list = Vec::new();
     let trimmed = dns_addr.trim();
     if trimmed.starts_with("https://") {
-        list.push(trimmed.to_string());
+        if !require_ip_literal || is_ip_literal_doh_endpoint(trimmed) {
+            list.push(trimmed.to_string());
+        }
     } else if !trimmed.is_empty() {
         let stripped = trimmed.trim_matches(|c| c == '[' || c == ']');
         let primary = match stripped {
@@ -1863,9 +1948,24 @@ fn build_doh_endpoints(dns_addr: &str, bound_http1: bool) -> Vec<String> {
         }
     }
 
+    if !ipv4_only {
+        // IPv6 IP-literal DoH fallbacks so IPv6-only cellular networks (NAT64/DNS64) remain reachable.
+        for fallback_v6 in [
+            "https://[2606:4700:4700::1111]/dns-query",
+            "https://[2001:4860:4860::8888]/dns-query",
+        ] {
+            if !list.iter().any(|x| x == fallback_v6) {
+                list.push(fallback_v6.to_string());
+            }
+        }
+    }
+
     if bound_http1 {
         // Bound TLS DoH speaks HTTP/1.1 ALPN; Quad9 rejects HTTP/1.1 with HTTP 505.
         list.retain(|ep| !is_http2_only_doh_endpoint(ep));
+    }
+    if require_ip_literal {
+        list.retain(|ep| is_ip_literal_doh_endpoint(ep));
     }
     list
 }
@@ -2308,7 +2408,7 @@ mod tests {
         assert!(parse_dns_question(&nx_resp).is_err());
 
         // IPv6 literals must be bracketed in DoH URLs
-        let endpoints = build_doh_endpoints("2606:4700:4700::1111", false);
+        let endpoints = build_doh_endpoints("2606:4700:4700::1111", false, false, false);
         assert_eq!(endpoints[0], "https://[2606:4700:4700::1111]/dns-query");
     }
 
@@ -3201,17 +3301,17 @@ mod tests {
 
     #[test]
     fn bound_doh_skips_quad9_http2_only_endpoints() {
-        let bound_q9 = build_doh_endpoints("9.9.9.9", true);
+        let bound_q9 = build_doh_endpoints("9.9.9.9", true, true, false);
         assert!(!bound_q9.is_empty());
         assert!(!bound_q9.iter().any(|ep| ep.contains("9.9.9.9")));
         assert!(!bound_q9.iter().any(|ep| ep.contains("149.112.112.112")));
         assert!(bound_q9.iter().any(|ep| ep == "https://1.1.1.1/dns-query"));
 
-        let bound_q9_alt = build_doh_endpoints("149.112.112.112", true);
+        let bound_q9_alt = build_doh_endpoints("149.112.112.112", true, true, false);
         assert!(!bound_q9_alt.iter().any(|ep| ep.contains("9.9.9.9")));
         assert!(!bound_q9_alt.iter().any(|ep| ep.contains("149.112.112.112")));
 
-        let unbound_q9 = build_doh_endpoints("9.9.9.9", false);
+        let unbound_q9 = build_doh_endpoints("9.9.9.9", false, false, false);
         assert_eq!(unbound_q9[0], "https://9.9.9.9/dns-query");
         assert!(unbound_q9
             .iter()
@@ -3457,5 +3557,159 @@ mod tests {
         let (doh_ips, _) = decode_dns_response(&raw_doh, QTYPE_A).unwrap();
         assert_eq!(doh_ips, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
         assert_eq!(doh_resolver.preferred_doh_idx.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn disable_system_dns_fallback_blocks_os_dns_without_forcing_bound_tls() {
+        let mut resolver =
+            DnsResolver::new_with_options("1.1.1.1", 53, false, false, true, None).unwrap();
+        resolver.udp_dns_servers = Vec::new();
+
+        assert!(resolver.outbound_binder.is_none());
+        assert!(resolver.bound_tls_connector.is_none());
+        assert!(resolver.is_system_dns_disabled());
+
+        // Direct system lookup must fail closed even when outbound_binder is None.
+        assert!(resolver
+            .resolve_via_system("localhost", false)
+            .await
+            .is_err());
+
+        // `.local` must return synthetic NXDOMAIN without calling OS resolver.
+        assert!(matches!(
+            resolver
+                .resolve_outcome("printer.local", false)
+                .await
+                .unwrap(),
+            DnsOutcome::NxDomain(_)
+        ));
+        assert!(resolver.resolve("printer.local").await.is_err());
+
+        // UDP fallback paths must fail closed instead of falling back to OS lookup_host.
+        assert!(resolver.resolve_udp_or_system("example.com").await.is_err());
+        assert!(resolver
+            .resolve_single_qtype("example.com", QTYPE_A, false, false)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn hostname_doh_filtering_and_ipv6_doh_fallback_endpoints() {
+        let v6_cf = "https://[2606:4700:4700::1111]/dns-query";
+        let v6_google = "https://[2001:4860:4860::8888]/dns-query";
+
+        // When system DNS fallback is disabled (e.g. iOS TUN with outbound_binder == None),
+        // hostname-based custom DoH URLs are stripped to prevent GaiResolver -> utun deadlocks,
+        // pooled HTTP/2 Quad9 remains enabled, and IPv6 IP-literal fallbacks are appended.
+        let strict = build_doh_endpoints("https://dns.google/dns-query", false, true, false);
+        assert!(!strict.iter().any(|ep| ep.contains("dns.google")));
+        assert!(strict.iter().all(|ep| is_ip_literal_doh_endpoint(ep)));
+        assert!(strict.iter().any(|ep| ep == "https://9.9.9.9/dns-query"));
+        assert_eq!(strict[strict.len() - 2], v6_cf);
+        assert_eq!(strict[strict.len() - 1], v6_google);
+
+        // When system DNS fallback is enabled (proxy mode), custom hostname DoH URLs are kept.
+        let permissive = build_doh_endpoints("https://dns.google/dns-query", false, false, false);
+        assert_eq!(permissive[0], "https://dns.google/dns-query");
+        assert!(permissive.iter().any(|ep| ep == v6_cf));
+        assert!(permissive.iter().any(|ep| ep == v6_google));
+
+        // When ipv4_only is set, IPv6 DoH fallbacks are omitted.
+        let v4_only = build_doh_endpoints("1.1.1.1", false, true, true);
+        assert!(!v4_only.iter().any(|ep| ep == v6_cf));
+        assert!(!v4_only.iter().any(|ep| ep == v6_google));
+
+        // DnsResolver::new_with_options filters hostname DoH and rejects it at send time too.
+        let resolver = DnsResolver::new_with_options(
+            "https://dns.google/dns-query",
+            53,
+            true,
+            false,
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(!resolver
+            .doh_endpoints
+            .iter()
+            .any(|ep| ep.contains("dns.google")));
+        assert!(resolver.doh_endpoints.iter().any(|ep| ep == v6_cf));
+        assert!(resolver.doh_endpoints.iter().any(|ep| ep == v6_google));
+
+        let q = encode_dns_query("example.com", QTYPE_A).unwrap();
+        assert!(
+            send_doh_request_raw(&resolver.http, "https://dns.google/dns-query", &q, true)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn doh_failover_caps_concurrent_backup_attempts_at_two() {
+        let (server_cfg, connector) = make_local_doh_tls_pair();
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+
+        let mut endpoints = Vec::new();
+        let mut tasks = Vec::new();
+
+        for idx in 0..4usize {
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::clone(&server_cfg));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            endpoints.push(format!("https://127.0.0.1:{}/dns-query", addr.port()));
+
+            let in_flight_srv = Arc::clone(&in_flight);
+            let peak_srv = Arc::clone(&peak_in_flight);
+            tasks.push(tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut tls = acceptor.accept(tcp).await.unwrap();
+                let query = read_doh_test_request(&mut tls).await;
+                let parsed = parse_dns_question(&query).unwrap();
+
+                if idx > 0 {
+                    let cur = in_flight_srv.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak_srv.fetch_max(cur, Ordering::SeqCst);
+                    let delay_ms = if idx == 1 { 20 } else { 40 };
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    in_flight_srv.fetch_sub(1, Ordering::SeqCst);
+                }
+
+                let ip = if idx == 3 {
+                    IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))
+                } else {
+                    IpAddr::V4(Ipv4Addr::new(195, 175, 39, 39))
+                };
+                let wire_resp = build_dns_wire_response(
+                    parsed.tx_id,
+                    parsed.flags,
+                    &query[12..parsed.question_end],
+                    0,
+                    &[ip],
+                    60,
+                );
+                write_doh_test_response(&mut tls, &wire_resp).await;
+            }));
+        }
+
+        let binder: Arc<dyn OutboundBinder> = Arc::new(NoopBinder);
+        let mut resolver =
+            DnsResolver::new_with_binder("127.0.0.1", 53, true, true, Some(binder)).unwrap();
+        resolver.bound_tls_connector = Some(connector);
+        resolver.doh_endpoints = endpoints;
+        resolver.udp_dns_servers = Vec::new();
+
+        let ips = resolver.resolve("bounded-failover.example").await.unwrap();
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
+        assert_eq!(resolver.preferred_doh_idx.load(Ordering::Relaxed), 3);
+        assert!(
+            peak_in_flight.load(Ordering::SeqCst) <= MAX_DOH_FAILOVER_CONCURRENCY,
+            "DoH failover exceeded 2 concurrent backup requests: peak={}",
+            peak_in_flight.load(Ordering::SeqCst)
+        );
     }
 }

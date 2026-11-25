@@ -80,19 +80,19 @@ impl TunProfile {
         stack_buffer_size: 96,
         tcp_buffer_size: 64,
         udp_buffer_size: 64,
-        tcp_recv_buffer_size: 16 * 1024,
-        tcp_send_buffer_size: 16 * 1024,
-        max_tcp_sessions: 48,
+        tcp_recv_buffer_size: 32 * 1024,
+        tcp_send_buffer_size: 32 * 1024,
+        max_tcp_sessions: 64,
         max_udp_flows: 64,
-        max_dns_inflight: 24,
-        max_reverse_dns_entries: 512,
-        channel_capacity: 96,
-        udp_reply_capacity: 96,
+        max_dns_inflight: 32,
+        max_reverse_dns_entries: 1024,
+        channel_capacity: 128,
+        udp_reply_capacity: 128,
         tcp_relay_buf_size: 16 * 1024,
         packet_pool_size: 128,
-        batch_size: 16,
+        batch_size: 32,
         udp_socket_buf_bytes: 0,
-        emit_quic_icmp_reject: false,
+        emit_quic_icmp_reject: true,
     };
 }
 
@@ -259,19 +259,36 @@ mod tests {
     fn low_memory_profile_stays_strictly_bounded_for_ios_jetsam() {
         let low = TunProfile::LOW_MEMORY;
         let std = TunProfile::STANDARD;
+        assert_eq!(low.tcp_recv_buffer_size, 32 * 1024);
+        assert_eq!(low.tcp_send_buffer_size, 32 * 1024);
+        assert_eq!(low.max_tcp_sessions, 64);
+        assert_eq!(low.max_udp_flows, 64);
+        assert_eq!(low.max_dns_inflight, 32);
+        assert_eq!(low.max_reverse_dns_entries, 1024);
+        assert_eq!(low.channel_capacity, 128);
+        assert_eq!(low.udp_reply_capacity, 128);
+        assert_eq!(low.batch_size, 32);
         assert!(low.tcp_recv_buffer_size < std.tcp_recv_buffer_size);
         assert!(low.max_tcp_sessions < std.max_tcp_sessions);
         assert!(low.max_udp_flows < std.max_udp_flows);
         assert!(low.tcp_relay_buf_size < std.tcp_relay_buf_size);
         assert!(low.packet_pool_size < std.packet_pool_size);
-        assert!(low.batch_size < std.batch_size);
+        assert!(low.batch_size <= std.batch_size);
         assert_eq!(low.udp_socket_buf_bytes, 0);
-        assert!(!low.emit_quic_icmp_reject);
+        assert!(low.emit_quic_icmp_reject);
         assert!(!std.emit_quic_icmp_reject);
-        // Worst-case concurrent smoltcp TCP buffer footprint stays <= 6 MiB for iOS Jetsam.
-        let max_tcp_mem = low.max_tcp_sessions
+        // iOS 256 RLIMIT_NOFILE headroom: 64 TCP + 64 UDP + 32 DNS = 160 (+ ~30 OS FDs < 256).
+        assert!(low.max_tcp_sessions + low.max_udp_flows + low.max_dns_inflight <= 192);
+        // Real worst-case dynamic RSS budget (smoltcp + decoupled 16 KiB control rings +
+        // 2x relay copy buffers + packet queues) stays well under 25 MiB (< 50 MiB Jetsam).
+        let smoltcp_tcp_mem = low.max_tcp_sessions
             * (low.tcp_recv_buffer_size as usize + low.tcp_send_buffer_size as usize);
-        assert!(max_tcp_mem <= 6 * 1024 * 1024);
+        let control_ring_mem = low.max_tcp_sessions * (2 * 16 * 1024);
+        let relay_buf_mem = low.max_tcp_sessions * (2 * low.tcp_relay_buf_size);
+        let queue_mem = 4 * low.channel_capacity * 1500;
+        let estimated_rss_budget = smoltcp_tcp_mem + control_ring_mem + relay_buf_mem + queue_mem;
+        assert!(smoltcp_tcp_mem <= 4 * 1024 * 1024);
+        assert!(estimated_rss_budget < 25 * 1024 * 1024);
     }
 
     #[test]

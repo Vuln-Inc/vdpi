@@ -302,7 +302,7 @@ struct TunnelView: View {
                 .font(.subheadline)
                 .foregroundStyle(palette.danger)
                 .multilineTextAlignment(alignment)
-                .lineLimit(2)
+                .lineLimit(4)
                 .fixedSize(horizontal: false, vertical: true)
         } else if isConnected {
             let t = manager.telemetry
@@ -470,7 +470,8 @@ struct TunnelView: View {
     private var connectionSection: some View {
         let t = manager.telemetry
         let dnsValue = t.dohEnabled ? "\(t.dnsAddr) (DoH)" : t.dnsAddr
-        let quicValue = manager.settings.blockQuic ? "\(t.quicBlocked)" : "Allowed"
+        let effectiveBlockQuic = manager.appliedConfig?.blockQuic ?? manager.settings.blockQuic
+        let quicValue = effectiveBlockQuic ? "\(t.quicBlocked)" : "Allowed"
 
         return VStack(alignment: .leading, spacing: 8) {
             SectionHeader(title: "Connection")

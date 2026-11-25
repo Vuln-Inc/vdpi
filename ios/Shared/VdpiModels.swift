@@ -80,7 +80,7 @@ public struct NativeEngineConfig: Codable, Equatable, Sendable {
         ipv4Only: Bool = false,
         blockQuic: Bool = true,
         timeoutMs: UInt64 = 8000,
-        mtu: Int = 1400,
+        mtu: Int = 4064,
         bypassDomains: [String] = [],
         cachePath: String? = nil
     ) {
@@ -92,7 +92,7 @@ public struct NativeEngineConfig: Codable, Equatable, Sendable {
         self.ipv4Only = ipv4Only
         self.blockQuic = blockQuic
         self.timeoutMs = timeoutMs
-        self.mtu = max(1280, min(9000, mtu))
+        self.mtu = max(1280, min(4064, mtu))
         self.bypassDomains = bypassDomains
         self.cachePath = cachePath
     }
@@ -106,7 +106,7 @@ public struct NativeEngineConfig: Codable, Equatable, Sendable {
         let ipv4Only = try c.decodeIfPresent(Bool.self, forKey: .ipv4Only) ?? false
         let blockQuic = try c.decodeIfPresent(Bool.self, forKey: .blockQuic) ?? true
         let timeoutMs = try c.decodeIfPresent(UInt64.self, forKey: .timeoutMs) ?? 8000
-        let mtu = try c.decodeIfPresent(Int.self, forKey: .mtu) ?? 1400
+        let mtu = try c.decodeIfPresent(Int.self, forKey: .mtu) ?? 4064
         let bypassDomains = try c.decodeIfPresent([String].self, forKey: .bypassDomains) ?? []
         let cachePath = try c.decodeIfPresent(String.self, forKey: .cachePath)
         self.init(
@@ -155,6 +155,11 @@ public struct NativeEngineConfig: Codable, Equatable, Sendable {
 
 /// Persistent user settings shared between `VdpiApp` and `VdpiPacketTunnel` via App Group.
 public struct VdpiSettings: Codable, Equatable, Sendable {
+    /// Shared `providerConfiguration` / `startVPNTunnel(options:)` key used to deliver
+    /// JSON-encoded `VdpiSettings` directly to `PacketTunnelProvider` even when App Group
+    /// `UserDefaults` sharing is broken by third-party re-signers.
+    public static let providerConfigSettingsKey = "vdpiSettingsJSON"
+
     public var desyncMode: DesyncMode
     public var chunkSize: Int
     public var dnsAddr: String
@@ -186,7 +191,7 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
         enableDoh: Bool = true,
         ipv4Only: Bool = false,
         blockQuic: Bool = true,
-        mtu: Int = 1400,
+        mtu: Int = 4064,
         bypassDomains: [String] = [],
         onDemandEnabled: Bool = false,
         theme: ThemePreference = .system
@@ -197,7 +202,7 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
         self.enableDoh = enableDoh
         self.ipv4Only = ipv4Only
         self.blockQuic = blockQuic
-        self.mtu = max(1280, min(9000, mtu))
+        self.mtu = max(1280, min(4064, mtu))
         self.bypassDomains = bypassDomains
         self.onDemandEnabled = onDemandEnabled
         self.theme = theme
@@ -212,8 +217,8 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
         self.enableDoh = try c.decodeIfPresent(Bool.self, forKey: .enableDoh) ?? true
         self.ipv4Only = try c.decodeIfPresent(Bool.self, forKey: .ipv4Only) ?? false
         self.blockQuic = try c.decodeIfPresent(Bool.self, forKey: .blockQuic) ?? true
-        let rawMtu = try c.decodeIfPresent(Int.self, forKey: .mtu) ?? 1400
-        self.mtu = max(1280, min(9000, rawMtu))
+        let rawMtu = try c.decodeIfPresent(Int.self, forKey: .mtu) ?? 4064
+        self.mtu = max(1280, min(4064, rawMtu))
         self.bypassDomains = try c.decodeIfPresent([String].self, forKey: .bypassDomains) ?? []
         self.onDemandEnabled = try c.decodeIfPresent(Bool.self, forKey: .onDemandEnabled) ?? false
         self.theme = try c.decodeIfPresent(ThemePreference.self, forKey: .theme) ?? .system
@@ -224,7 +229,7 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
     }
 
     public var clampedMtu: Int {
-        max(1280, min(9000, mtu))
+        max(1280, min(4064, mtu))
     }
 
     /// Compares only settings that require a tunnel restart/reload when changed.

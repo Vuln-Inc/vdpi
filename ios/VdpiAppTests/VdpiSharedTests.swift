@@ -92,13 +92,17 @@ final class VdpiSharedTests: XCTestCase {
             effectiveIpv4Only: false
         )
         XCTAssertEqual(dualStack.mtu, 1450)
+        // iOS mDNSResponder resolves both A and AAAA cleanly over the virtual IPv4 DNS server,
+        // avoiding any IPv6 DNS routing/exclusion mismatch.
         XCTAssertEqual(
             dualStack.dnsSettings?.servers,
-            [TunnelNetworkSettingsBuilder.tunnelDnsServer, TunnelNetworkSettingsBuilder.tunnelIpv6DnsServer]
+            [TunnelNetworkSettingsBuilder.tunnelDnsServer]
         )
+        XCTAssertFalse(TunnelNetworkSettingsBuilder.tunnelIpv6Address.lowercased().hasPrefix("fd"))
+        XCTAssertFalse(TunnelNetworkSettingsBuilder.tunnelIpv6Address.lowercased().hasPrefix("fc"))
         XCTAssertNotNil(dualStack.ipv4Settings)
         XCTAssertNotNil(dualStack.ipv6Settings)
-        XCTAssertGreaterThanOrEqual(dualStack.ipv4Settings?.excludedRoutes?.count ?? 0, 8)
+        XCTAssertGreaterThanOrEqual(dualStack.ipv4Settings?.excludedRoutes?.count ?? 0, 10)
 
         let v4Only = TunnelNetworkSettingsBuilder.build(
             settings: VdpiSettings(ipv4Only: true),

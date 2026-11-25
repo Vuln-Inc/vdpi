@@ -23,9 +23,8 @@ use tokio::sync::{mpsc, watch, Notify};
 use tracing::{debug, trace};
 
 const INGRESS_DRAIN_LIMIT: usize = 128;
-const TX_QUEUE_HIGH_WATER: usize = 512;
 const POLL_BURST_LIMIT: usize = 8;
-const ACCEPTED_STREAM_QUEUE_CAP: usize = 256;
+const FIN_WAIT_2_TIMEOUT: SmolDuration = SmolDuration::from_secs(15);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum HalfState {
@@ -208,16 +207,19 @@ impl TxToken for VirtualTxToken<'_> {
 
 struct VirtualDevice {
     mtu: usize,
+    tx_queue_high_water: usize,
     rx_queue: VecDeque<Vec<u8>>,
     tx_queue: VecDeque<Vec<u8>>,
 }
 
 impl VirtualDevice {
-    fn new(mtu: usize) -> Self {
+    fn new(mtu: usize, tx_queue_high_water: usize) -> Self {
+        let tx_queue_high_water = tx_queue_high_water.max(16);
         Self {
             mtu,
+            tx_queue_high_water,
             rx_queue: VecDeque::with_capacity(INGRESS_DRAIN_LIMIT),
-            tx_queue: VecDeque::with_capacity(INGRESS_DRAIN_LIMIT),
+            tx_queue: VecDeque::with_capacity(INGRESS_DRAIN_LIMIT.min(tx_queue_high_water)),
         }
     }
 }
@@ -236,7 +238,7 @@ impl Device for VirtualDevice {
         &mut self,
         _timestamp: SmolInstant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        if self.tx_queue.len() >= TX_QUEUE_HIGH_WATER {
+        if self.tx_queue.len() >= self.tx_queue_high_water {
             return None;
         }
         let pkt = self.rx_queue.pop_front()?;
@@ -244,7 +246,7 @@ impl Device for VirtualDevice {
     }
 
     fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
-        if self.tx_queue.len() >= TX_QUEUE_HIGH_WATER {
+        if self.tx_queue.len() >= self.tx_queue_high_water {
             return None;
         }
         Some(VirtualTxToken(&mut self.tx_queue))
@@ -267,6 +269,23 @@ impl Device for VirtualDevice {
 struct SocketEntry {
     control: SharedControl,
     endpoints: (SocketAddr, SocketAddr),
+    fin_wait_2_shortened: bool,
+}
+
+enum EnqueueOutcome {
+    Enqueued,
+    Dropped,
+    Deferred(Vec<u8>),
+}
+
+/// Decouples `TcpSocketControl` ring sizes from `smoltcp`'s `TcpSocketBuffer` so iOS
+/// (`<= 32 KiB`) uses 16 KiB control rings while desktop (`512 KiB`) caps rings at 128 KiB.
+fn control_ring_size(tcp_buffer_size: usize) -> usize {
+    if tcp_buffer_size <= 32 * 1024 {
+        tcp_buffer_size.min(16 * 1024)
+    } else {
+        tcp_buffer_size.min(128 * 1024)
+    }
 }
 
 fn generate_random_seed() -> u64 {
@@ -333,7 +352,7 @@ fn inspect_tcp_frame(frame: &[u8]) -> Option<(SocketAddr, SocketAddr, bool)> {
     let tcp = TcpPacket::new_checked(payload).ok()?;
     let src_addr = SocketAddr::new(src_ip, tcp.src_port());
     let dst_addr = SocketAddr::new(dst_ip, tcp.dst_port());
-    let is_initial_syn = tcp.syn() && !tcp.ack();
+    let is_initial_syn = tcp.syn() && !tcp.ack() && !tcp.rst() && !tcp.fin();
     Some((src_addr, dst_addr, is_initial_syn))
 }
 
@@ -351,27 +370,35 @@ async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
 /// Spawns the in-tree `smoltcp` 0.14 TCP netstack runner directly bridging `tcp_in_rx`
 /// and `outbound_tx` with zero intermediate channels/tasks, `ack_delay = None`,
 /// `nagle = false`, `Checksum::Tx`, and poll-to-quiescence batching.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_tcp_netstack(
     mut tcp_in_rx: mpsc::Receiver<Vec<u8>>,
     outbound_tx: mpsc::Sender<Vec<u8>>,
     mtu: usize,
     tcp_recv_buffer_size: usize,
     tcp_send_buffer_size: usize,
+    max_tcp_sessions: usize,
+    tx_queue_high_water: usize,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(
     mpsc::Receiver<TunNetstackTcpStream>,
     tokio::task::JoinHandle<()>,
 )> {
-    let mut device = VirtualDevice::new(mtu);
+    let max_tcp_sessions = max_tcp_sessions.max(1);
+    let control_recv_size = control_ring_size(tcp_recv_buffer_size);
+    let control_send_size = control_ring_size(tcp_send_buffer_size);
+    let mut device = VirtualDevice::new(mtu, tx_queue_high_water);
     let mut iface = create_interface(&mut device)?;
-    let (stream_tx, stream_rx) = mpsc::channel(ACCEPTED_STREAM_QUEUE_CAP);
+    let (stream_tx, stream_rx) = mpsc::channel(max_tcp_sessions.clamp(16, 128));
     let notify = Arc::new(Notify::new());
 
     let handle = tokio::spawn(async move {
         let mut socket_set = SocketSet::new(Vec::new());
         let mut sockets: HashMap<SocketHandle, SocketEntry> = HashMap::new();
         let mut active_endpoints: HashSet<(SocketAddr, SocketAddr)> = HashSet::new();
+        let mut listening_dsts: HashSet<SocketAddr> = HashSet::new();
         let mut sockets_to_remove: Vec<SocketHandle> = Vec::new();
+        let mut pending_frame: Option<Vec<u8>> = None;
         let mut burst_iters: usize = 0;
 
         let enqueue_inbound = |frame: Vec<u8>,
@@ -379,13 +406,36 @@ pub(crate) fn spawn_tcp_netstack(
                                socket_set: &mut SocketSet<'static>,
                                sockets: &mut HashMap<SocketHandle, SocketEntry>,
                                active_endpoints: &mut HashSet<(SocketAddr, SocketAddr)>,
+                               listening_dsts: &mut HashSet<SocketAddr>,
                                stream_tx: &mpsc::Sender<TunNetstackTcpStream>,
-                               notify: &Arc<Notify>| {
+                               notify: &Arc<Notify>|
+         -> EnqueueOutcome {
             let Some((src_addr, dst_addr, is_initial_syn)) = inspect_tcp_frame(&frame) else {
-                return;
+                return EnqueueOutcome::Dropped;
             };
 
             if is_initial_syn && !active_endpoints.contains(&(src_addr, dst_addr)) {
+                // Prevent smoltcp SocketSet slot-reuse cross-wiring when multiple parallel
+                // SYNs target the same dst_addr in one ingress batch: defer the second SYN
+                // until after iface.poll() binds the first listening socket.
+                if listening_dsts.contains(&dst_addr) {
+                    return EnqueueOutcome::Deferred(frame);
+                }
+
+                // Enforce the TCP session ceiling BEFORE allocating TcpSocket/RingBuffers so
+                // excess SYNs are dropped cleanly and retried by the OS instead of completing
+                // local SYN-ACK handshakes and causing an iOS Jetsam RSS spike.
+                if sockets.len() >= max_tcp_sessions {
+                    debug!(
+                        %src_addr,
+                        %dst_addr,
+                        active = sockets.len(),
+                        limit = max_tcp_sessions,
+                        "TCP session limit reached; dropping SYN"
+                    );
+                    return EnqueueOutcome::Dropped;
+                }
+
                 let mut socket = TcpSocket::new(
                     TcpSocketBuffer::new(vec![0u8; tcp_recv_buffer_size]),
                     TcpSocketBuffer::new(vec![0u8; tcp_send_buffer_size]),
@@ -399,13 +449,13 @@ pub(crate) fn spawn_tcp_netstack(
 
                 if let Err(err) = socket.listen(dst_addr) {
                     debug!(%src_addr, %dst_addr, error = ?err, "smoltcp listen failed");
-                    return;
+                    return EnqueueOutcome::Dropped;
                 }
 
                 let control = Arc::new(Mutex::new(TcpSocketControl {
-                    send_buffer: RingBuffer::new(vec![0u8; tcp_send_buffer_size]),
+                    send_buffer: RingBuffer::new(vec![0u8; control_send_size]),
                     send_waker: None,
-                    recv_buffer: RingBuffer::new(vec![0u8; tcp_recv_buffer_size]),
+                    recv_buffer: RingBuffer::new(vec![0u8; control_recv_size]),
                     recv_waker: None,
                     recv_state: HalfState::Normal,
                     send_state: HalfState::Normal,
@@ -420,22 +470,25 @@ pub(crate) fn spawn_tcp_netstack(
 
                 if stream_tx.try_send(stream).is_err() {
                     debug!(%src_addr, %dst_addr, "accepted TCP queue full; dropping SYN");
-                    return;
+                    return EnqueueOutcome::Dropped;
                 }
 
                 let handle = socket_set.add(socket);
                 active_endpoints.insert((src_addr, dst_addr));
+                listening_dsts.insert(dst_addr);
                 sockets.insert(
                     handle,
                     SocketEntry {
                         control,
                         endpoints: (src_addr, dst_addr),
+                        fin_wait_2_shortened: false,
                     },
                 );
                 trace!(%src_addr, %dst_addr, "created TUN TCP socket");
             }
 
             device.rx_queue.push_back(frame);
+            EnqueueOutcome::Enqueued
         };
 
         'runner: loop {
@@ -445,33 +498,62 @@ pub(crate) fn spawn_tcp_netstack(
 
             // 1. Drain ready inbound TCP packets without waiting.
             let mut ingress_drained = 0usize;
+            let mut enqueued_any = false;
             while ingress_drained < INGRESS_DRAIN_LIMIT {
-                match tcp_in_rx.try_recv() {
-                    Ok(frame) => {
-                        enqueue_inbound(
-                            frame,
-                            &mut device,
-                            &mut socket_set,
-                            &mut sockets,
-                            &mut active_endpoints,
-                            &stream_tx,
-                            &notify,
-                        );
+                let frame = if let Some(frame) = pending_frame.take() {
+                    frame
+                } else {
+                    match tcp_in_rx.try_recv() {
+                        Ok(frame) => frame,
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => break 'runner,
+                    }
+                };
+                match enqueue_inbound(
+                    frame,
+                    &mut device,
+                    &mut socket_set,
+                    &mut sockets,
+                    &mut active_endpoints,
+                    &mut listening_dsts,
+                    &stream_tx,
+                    &notify,
+                ) {
+                    EnqueueOutcome::Enqueued => {
+                        ingress_drained += 1;
+                        enqueued_any = true;
+                    }
+                    EnqueueOutcome::Dropped => {
                         ingress_drained += 1;
                     }
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => break 'runner,
+                    EnqueueOutcome::Deferred(frame) => {
+                        pending_frame = Some(frame);
+                        break;
+                    }
                 }
             }
 
             // 2. Drain application TX buffers into smoltcp BEFORE polling so segments emit immediately.
-            let mut made_progress = ingress_drained > 0;
+            let mut made_progress = enqueued_any;
             for (&handle, entry) in &sockets {
                 let socket = socket_set.get_mut::<TcpSocket>(handle);
                 let mut control = entry
                     .control
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+                // If the application dropped the stream before the handshake completed,
+                // abort immediately so it does not stall in Listen/SynReceived/FinWait1.
+                if matches!(control.recv_state, HalfState::Close)
+                    && matches!(control.send_state, HalfState::Close)
+                    && matches!(socket.state(), TcpState::Listen | TcpState::SynReceived)
+                {
+                    socket.abort();
+                    control.send_state = HalfState::Closed;
+                    control.recv_state = HalfState::Closed;
+                    made_progress = true;
+                    continue;
+                }
 
                 let mut wake_sender = false;
                 while socket.can_send() && !control.send_buffer.is_empty() {
@@ -521,7 +603,8 @@ pub(crate) fn spawn_tcp_netstack(
 
             // 4. Drain smoltcp RX buffers into application buffers, refill TX if freed, reap closed.
             sockets_to_remove.clear();
-            for (&handle, entry) in &sockets {
+            listening_dsts.clear();
+            for (&handle, entry) in &mut sockets {
                 let socket = socket_set.get_mut::<TcpSocket>(handle);
                 let mut control = entry
                     .control
@@ -539,6 +622,27 @@ pub(crate) fn spawn_tcp_netstack(
                         waker.wake();
                     }
                     continue;
+                }
+
+                // Catch streams dropped mid-tick while still in Listen/SynReceived so they
+                // abort immediately and reap on the very next tick.
+                if matches!(control.recv_state, HalfState::Close)
+                    && matches!(control.send_state, HalfState::Close | HalfState::Closing)
+                    && matches!(socket.state(), TcpState::Listen | TcpState::SynReceived)
+                {
+                    socket.abort();
+                    control.send_state = HalfState::Closed;
+                    control.recv_state = HalfState::Closed;
+                    made_progress = true;
+                    continue;
+                }
+
+                // Prevent infinite FIN_WAIT_2 permit leaks: disable keep-alive probes that
+                // would keep resetting smoltcp's idle timer and bound FIN_WAIT_2 to 15s.
+                if socket.state() == TcpState::FinWait2 && !entry.fin_wait_2_shortened {
+                    socket.set_keep_alive(None);
+                    socket.set_timeout(Some(FIN_WAIT_2_TIMEOUT));
+                    entry.fin_wait_2_shortened = true;
                 }
 
                 let mut wake_receiver = false;
@@ -641,6 +745,10 @@ pub(crate) fn spawn_tcp_netstack(
                         waker.wake();
                     }
                 }
+
+                if socket.state() == TcpState::Listen {
+                    listening_dsts.insert(entry.endpoints.1);
+                }
             }
 
             for handle in sockets_to_remove.drain(..) {
@@ -671,8 +779,13 @@ pub(crate) fn spawn_tcp_netstack(
             }
 
             let next_delay = iface.poll_delay(now, &socket_set);
+            let pending_ready = pending_frame.as_ref().is_some_and(|frame| {
+                inspect_tcp_frame(frame)
+                    .is_none_or(|(_, dst_addr, _)| !listening_dsts.contains(&dst_addr))
+            });
             let immediate_poll = made_progress
                 || !device.rx_queue.is_empty()
+                || pending_ready
                 || next_delay == Some(SmolDuration::ZERO);
 
             if immediate_poll {
@@ -696,15 +809,20 @@ pub(crate) fn spawn_tcp_netstack(
                         _ = wait_shutdown(&mut shutdown_rx) => break 'runner,
                         maybe_pkt = tcp_in_rx.recv() => {
                             match maybe_pkt {
-                                Some(frame) => enqueue_inbound(
-                                    frame,
-                                    &mut device,
-                                    &mut socket_set,
-                                    &mut sockets,
-                                    &mut active_endpoints,
-                                    &stream_tx,
-                                    &notify,
-                                ),
+                                Some(frame) => {
+                                    if let EnqueueOutcome::Deferred(deferred) = enqueue_inbound(
+                                        frame,
+                                        &mut device,
+                                        &mut socket_set,
+                                        &mut sockets,
+                                        &mut active_endpoints,
+                                        &mut listening_dsts,
+                                        &stream_tx,
+                                        &notify,
+                                    ) {
+                                        pending_frame.get_or_insert(deferred);
+                                    }
+                                }
                                 None => break 'runner,
                             }
                         }
@@ -718,15 +836,20 @@ pub(crate) fn spawn_tcp_netstack(
                         _ = wait_shutdown(&mut shutdown_rx) => break 'runner,
                         maybe_pkt = tcp_in_rx.recv() => {
                             match maybe_pkt {
-                                Some(frame) => enqueue_inbound(
-                                    frame,
-                                    &mut device,
-                                    &mut socket_set,
-                                    &mut sockets,
-                                    &mut active_endpoints,
-                                    &stream_tx,
-                                    &notify,
-                                ),
+                                Some(frame) => {
+                                    if let EnqueueOutcome::Deferred(deferred) = enqueue_inbound(
+                                        frame,
+                                        &mut device,
+                                        &mut socket_set,
+                                        &mut sockets,
+                                        &mut active_endpoints,
+                                        &mut listening_dsts,
+                                        &stream_tx,
+                                        &notify,
+                                    ) {
+                                        pending_frame.get_or_insert(deferred);
+                                    }
+                                }
                                 None => break 'runner,
                             }
                         }
@@ -745,6 +868,14 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    #[test]
+    fn control_ring_size_decouples_ios_and_desktop_buffers() {
+        assert_eq!(control_ring_size(16 * 1024), 16 * 1024);
+        assert_eq!(control_ring_size(32 * 1024), 16 * 1024);
+        assert_eq!(control_ring_size(64 * 1024), 64 * 1024);
+        assert_eq!(control_ring_size(512 * 1024), 128 * 1024);
+    }
+
     #[tokio::test]
     async fn tcp_netstack_jumbo_mtu_handshake_window_scaling_4mib_transfer_and_shutdown() {
         const MTU: usize = 16_384;
@@ -756,10 +887,10 @@ mod tests {
         let (stop_tx, stop_rx) = watch::channel(false);
 
         let (mut stream_rx, runner_handle) =
-            spawn_tcp_netstack(in_rx, out_tx, MTU, BUF, BUF, stop_rx).unwrap();
+            spawn_tcp_netstack(in_rx, out_tx, MTU, BUF, BUF, 64, 512, stop_rx).unwrap();
 
         // Build a peer smoltcp TCP client speaking raw IPv4 frames across in_tx / out_rx.
-        let mut client_dev = VirtualDevice::new(MTU);
+        let mut client_dev = VirtualDevice::new(MTU, 512);
         let mut client_cfg = InterfaceConfig::new(HardwareAddress::Ip);
         client_cfg.random_seed = 0x1234_5678_9abc_def0;
         let mut client_iface = Interface::new(client_cfg, &mut client_dev, SmolInstant::now());
@@ -886,6 +1017,96 @@ mod tests {
         );
 
         server_task.await.unwrap();
+        let _ = stop_tx.send(true);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), runner_handle).await;
+    }
+
+    #[tokio::test]
+    async fn parallel_syns_to_same_dst_enforce_session_cap_and_reap_dropped_syn_received() {
+        const MTU: usize = 1500;
+        const BUF: usize = 32 * 1024;
+        const MAX_SESSIONS: usize = 4;
+
+        let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (stop_tx, stop_rx) = watch::channel(false);
+
+        let (mut stream_rx, runner_handle) =
+            spawn_tcp_netstack(in_rx, out_tx, MTU, BUF, BUF, MAX_SESSIONS, 128, stop_rx).unwrap();
+
+        let mut client_dev = VirtualDevice::new(MTU, 128);
+        let mut client_cfg = InterfaceConfig::new(HardwareAddress::Ip);
+        client_cfg.random_seed = 0x0fed_cba9_8765_4321;
+        let mut client_iface = Interface::new(client_cfg, &mut client_dev, SmolInstant::now());
+        client_iface.update_ip_addrs(|addrs| {
+            let _ = addrs.push(IpCidr::new(IpAddress::v4(198, 18, 0, 1), 30));
+        });
+        client_iface
+            .routes_mut()
+            .add_default_ipv4_route(Ipv4Address::new(198, 18, 0, 2))
+            .unwrap();
+
+        let mut client_sockets = SocketSet::new(Vec::new());
+        for offset in 0..6u16 {
+            let mut sock = TcpSocket::new(
+                TcpSocketBuffer::new(vec![0u8; 4096]),
+                TcpSocketBuffer::new(vec![0u8; 4096]),
+            );
+            sock.connect(
+                client_iface.context(),
+                (Ipv4Address::new(1, 1, 1, 1), 443),
+                46_000 + offset,
+            )
+            .unwrap();
+            client_sockets.add(sock);
+        }
+
+        client_iface.poll(SmolInstant::now(), &mut client_dev, &mut client_sockets);
+        let syn_pkts: Vec<Vec<u8>> = client_dev.tx_queue.drain(..).collect();
+        assert_eq!(syn_pkts.len(), 6);
+
+        let expected_srcs: Vec<SocketAddr> = syn_pkts
+            .iter()
+            .map(|pkt| inspect_tcp_frame(pkt).unwrap().0)
+            .collect();
+
+        // Send all 6 parallel SYNs targeting the same 1.1.1.1:443 in a single burst.
+        for pkt in &syn_pkts {
+            in_tx.send(pkt.clone()).await.unwrap();
+        }
+
+        let mut accepted = Vec::with_capacity(MAX_SESSIONS);
+        for expected_src in expected_srcs.iter().take(MAX_SESSIONS) {
+            let stream = tokio::time::timeout(std::time::Duration::from_secs(3), stream_rx.recv())
+                .await
+                .expect("accept timeout")
+                .expect("accepted stream");
+            assert_eq!(stream.local_addr(), *expected_src);
+            assert_eq!(stream.remote_addr(), "1.1.1.1:443".parse().unwrap());
+            accepted.push(stream);
+        }
+
+        // Excess SYNs beyond max_tcp_sessions must be dropped cleanly.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            stream_rx.try_recv().is_err(),
+            "SYNs beyond max_tcp_sessions must be dropped"
+        );
+        while out_rx.try_recv().is_ok() {}
+
+        // Dropping all 4 SynReceived streams must abort and reap them immediately,
+        // freeing capacity so the 5th SYN is accepted cleanly.
+        drop(accepted);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        in_tx.send(syn_pkts[4].clone()).await.unwrap();
+
+        let fifth = tokio::time::timeout(std::time::Duration::from_secs(3), stream_rx.recv())
+            .await
+            .expect("post-drop accept timeout")
+            .expect("post-drop accepted stream");
+        assert_eq!(fifth.local_addr(), expected_srcs[4]);
+        assert_eq!(fifth.remote_addr(), "1.1.1.1:443".parse().unwrap());
+
         let _ = stop_tx.send(true);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), runner_handle).await;
     }

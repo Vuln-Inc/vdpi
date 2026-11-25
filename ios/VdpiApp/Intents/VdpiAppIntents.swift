@@ -84,8 +84,11 @@ private enum VdpiTunnelIntentController {
 
         VdpiAppGroup.saveSettings(settings)
         VdpiAppGroup.saveAppliedConfig(settings.toNativeConfig())
+        let startOptions: [String: NSObject]? = encodeSettingsJSON(settings).map {
+            [providerConfigSettingsKey: $0 as NSObject]
+        }
         do {
-            try manager.connection.startVPNTunnel()
+            try manager.connection.startVPNTunnel(options: startOptions)
         } catch {
             VdpiAppGroup.saveAppliedConfig(nil)
             throw error
@@ -102,14 +105,14 @@ private enum VdpiTunnelIntentController {
 
         let status = manager.connection.status
         VdpiAppGroup.saveAppliedConfig(nil)
-        if status == .disconnected || status == .invalid {
-            return "vdpi is already disconnected."
-        }
-
         if manager.isOnDemandEnabled {
             manager.isOnDemandEnabled = false
+            manager.onDemandRules = nil
             try await manager.saveToPreferences()
             try await manager.loadFromPreferences()
+        }
+        if status == .disconnected || status == .invalid {
+            return "vdpi is already disconnected."
         }
 
         manager.connection.stopVPNTunnel()
@@ -129,6 +132,15 @@ private enum VdpiTunnelIntentController {
             }
         }
         return try await connect()
+    }
+
+    private static let providerConfigSettingsKey = "vdpiSettingsJSON"
+
+    private static func encodeSettingsJSON(_ settings: VdpiSettings) -> String? {
+        guard let data = try? JSONEncoder().encode(settings) else {
+            return nil
+        }
+        return String(data: data, encoding: .utf8)
     }
 
     private static func findManager(
@@ -156,6 +168,14 @@ private enum VdpiTunnelIntentController {
         proto.providerBundleIdentifier = VdpiAppGroup.extensionBundleId
         proto.serverAddress = TunnelNetworkSettingsBuilder.tunnelRemoteAddress
         proto.includeAllNetworks = false
+        proto.excludeLocalNetworks = true
+        if #available(iOS 16.4, *) {
+            proto.excludeAPNs = true
+            proto.excludeCellularServices = true
+        }
+        if let settingsJSON = encodeSettingsJSON(settings) {
+            proto.providerConfiguration = [providerConfigSettingsKey: settingsJSON]
+        }
 
         manager.protocolConfiguration = proto
         manager.localizedDescription = "vdpi"

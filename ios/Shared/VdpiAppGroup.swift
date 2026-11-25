@@ -23,13 +23,16 @@ public enum VdpiAppGroup {
     public static func resolveSuiteName(bundle: Bundle = .main) -> String {
         if let profileURL = bundle.url(forResource: "embedded", withExtension: "mobileprovision"),
            let data = try? Data(contentsOf: profileURL),
-           let group = extractAppGroupFromProvisioningProfile(data) {
+           let group = extractAppGroupFromProvisioningProfile(data, bundle: bundle) {
             return group
         }
         return defaultSuiteName
     }
 
-    public static func extractAppGroupFromProvisioningProfile(_ data: Data) -> String? {
+    public static func extractAppGroupFromProvisioningProfile(
+        _ data: Data,
+        bundle: Bundle = .main
+    ) -> String? {
         let startMarker = Data("<plist".utf8)
         let endMarker = Data("</plist>".utf8)
         guard let startRange = data.range(of: startMarker),
@@ -50,9 +53,43 @@ public enum VdpiAppGroup {
             return nil
         }
 
-        return groups
+        let candidates = groups
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first { $0.hasPrefix("group.") && $0.count > 6 }
+            .filter { group in
+                group.hasPrefix("group.") && group.count > 6 && !group.contains("*")
+            }
+        guard !candidates.isEmpty else { return nil }
+
+        let accessible = candidates.filter { group in
+            FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group) != nil
+        }
+        let pool = accessible.isEmpty ? candidates : accessible
+
+        if let exact = pool.first(where: { $0 == defaultSuiteName }) {
+            return exact
+        }
+
+        if let rawBundleId = bundle.bundleIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !rawBundleId.isEmpty
+        {
+            let baseBundleId = rawBundleId
+                .replacingOccurrences(of: ".packet-tunnel", with: "")
+                .lowercased()
+            if !baseBundleId.isEmpty,
+               let bundleMatch = pool.first(where: { group in
+                   let lowered = group.lowercased()
+                   return lowered == "group.\(baseBundleId)" || lowered.hasSuffix(".\(baseBundleId)")
+               })
+            {
+                return bundleMatch
+            }
+        }
+
+        if let vdpiMatch = pool.first(where: { $0.lowercased().contains("vdpi") }) {
+            return vdpiMatch
+        }
+
+        return pool.first
     }
 
     public static func resolveExtensionBundleId(bundle: Bundle = .main) -> String {
@@ -83,7 +120,7 @@ public enum VdpiAppGroup {
         }
 
         if let mainId = bundle.bundleIdentifier, !mainId.isEmpty {
-            if mainId.hasSuffix(".packet-tunnel") {
+            if mainId.contains(".packet-tunnel") {
                 return mainId
             }
             return "\(mainId).packet-tunnel"

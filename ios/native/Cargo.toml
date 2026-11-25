@@ -14,7 +14,7 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 anyhow = "1.0"
 serde_json = "1.0"
-tokio = { version = "1.50", features = ["rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.50", features = ["rt-multi-thread", "net", "sync", "time"] }
 vdpi-core.workspace = true
 vdpi-tun.workspace = true
 

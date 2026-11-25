@@ -779,6 +779,7 @@ impl CliArgs {
             dns_port,
             dns_ipv4_only,
             enable_doh,
+            disable_system_dns_fallback: false,
             chunk_size,
             mode,
             patterns,

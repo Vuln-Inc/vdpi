@@ -1786,11 +1786,10 @@ mod imp {
 
         if let Some(ref gw) = route.gateway {
             args.push(gw);
-        } else if let Some(ref iface) = route.interface {
+        } else {
+            let iface = route.interface.as_deref()?;
             args.push("-interface");
             args.push(iface);
-        } else {
-            return None;
         }
 
         if let Some(ref scope) = route.ifscope {

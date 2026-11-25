@@ -933,13 +933,17 @@ struct SettingsView: View {
             let resourceValues = try url.resourceValues(forKeys: [.fileSizeKey])
             if let fileSize = resourceValues.fileSize, fileSize > 262_144 {
                 VdpiHaptics.trigger(.warning)
-                manager.showToast("Invalid settings file")
+                manager.showToast("Settings file is too large (max 256 KB).")
                 return
             }
             let data = try Data(contentsOf: url)
             guard data.count <= 262_144, let rawJSON = String(data: data, encoding: .utf8) else {
                 VdpiHaptics.trigger(.warning)
-                manager.showToast("Invalid settings file")
+                manager.showToast(
+                    data.count > 262_144
+                        ? "Settings file is too large (max 256 KB)."
+                        : SettingsImportError.invalidJSON.localizedDescription
+                )
                 return
             }
             try manager.importSettingsJSON(rawJSON)
@@ -947,9 +951,13 @@ struct SettingsView: View {
             dnsError = nil
             bypassError = nil
             VdpiHaptics.trigger(.success)
+        } catch let importError as SettingsImportError {
+            VdpiHaptics.trigger(.warning)
+            manager.showToast(importError.localizedDescription)
         } catch {
             VdpiHaptics.trigger(.warning)
-            manager.showToast("Invalid settings file")
+            let message = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+            manager.showToast(message.isEmpty ? "Invalid settings file" : message)
         }
     }
 }

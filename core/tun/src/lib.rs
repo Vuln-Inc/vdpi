@@ -40,7 +40,9 @@ pub async fn build_engine_context_with_binder(
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .map(PathBuf::from);
-    let ctx = EngineContext::new_with_binder(config.into_runtime_config(), binder)?;
+    let mut runtime_cfg = config.into_runtime_config();
+    runtime_cfg.disable_system_dns_fallback = true;
+    let ctx = EngineContext::new_with_binder(runtime_cfg, binder)?;
     if let Some(path) = cache_path {
         ctx.attach_cache_file(path).await;
     }
@@ -148,9 +150,11 @@ mod tests {
             .await
             .unwrap();
         assert!(ctx_bound.outbound_binder.is_some());
+        assert!(ctx_bound.config.disable_system_dns_fallback);
 
         let ctx_default = build_engine_context(TunnelConfig::default()).await.unwrap();
         assert!(ctx_default.outbound_binder.is_none());
+        assert!(ctx_default.config.disable_system_dns_fallback);
     }
 
     #[tokio::test]

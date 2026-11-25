@@ -475,7 +475,7 @@ pub async fn run_tun_pipeline_with_route_watch(
 
     // Dedicated bounded TCP ingress queue so smoltcp TCP backpressure never stalls
     // zero-lag UDP / DNS ingress while preserving lossless async backpressure for TCP.
-    let (tcp_in_tx, tcp_in_rx) = mpsc::channel::<Vec<u8>>(profile.channel_capacity.max(256));
+    let (tcp_in_tx, tcp_in_rx) = mpsc::channel::<Vec<u8>>(profile.channel_capacity.max(64));
 
     let (mut tcp_stream_rx, netstack_handle) = spawn_tcp_netstack(
         tcp_in_rx,
@@ -483,6 +483,8 @@ pub async fn run_tun_pipeline_with_route_watch(
         clamped_mtu,
         profile.tcp_recv_buffer_size as usize,
         profile.tcp_send_buffer_size as usize,
+        profile.max_tcp_sessions,
+        profile.channel_capacity.clamp(128, 512),
         internal_stop_rx.clone(),
     )
     .context("failed to build smoltcp netstack")?;
@@ -1344,6 +1346,20 @@ mod tests {
         }
         assert_eq!(tun_stats.quic_blocked.load(Ordering::Relaxed), 3);
         assert_eq!(ctx.telemetry.quic_blocked.load(Ordering::Relaxed), 3);
+
+        if profile.emit_quic_icmp_reject {
+            for _ in 0..3 {
+                let icmp_raw = tokio::time::timeout(Duration::from_secs(3), out_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(icmp_raw.len() >= 28);
+                assert_eq!(icmp_raw[0] >> 4, 4);
+                assert_eq!(icmp_raw[9], 1); // IPv4 ICMP
+                assert_eq!(icmp_raw[20], 3); // Destination Unreachable
+                assert_eq!(icmp_raw[21], 3); // Port Unreachable
+            }
+        }
 
         // 3. Send a regular UDP packet to a local echo server -> Cone NAT must relay both ways
         let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();

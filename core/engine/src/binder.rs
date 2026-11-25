@@ -33,9 +33,9 @@ impl OutboundBinder for NoopBinder {
 pub struct OutboundTarget {
     /// Physical NIC human-readable label (e.g. `"Ethernet"`, `"en0"`, `"eth0"`).
     pub nic_name: Option<String>,
-    /// Physical IPv4 interface index (Windows `IP_UNICAST_IF`, macOS `IP_BOUND_IF`).
+    /// Physical IPv4 interface index (Windows `IP_UNICAST_IF`, macOS/iOS `IP_BOUND_IF`).
     pub if_index_v4: Option<u32>,
-    /// Physical IPv6 interface index (Windows `IPV6_UNICAST_IF`, macOS `IPV6_BOUND_IF`).
+    /// Physical IPv6 interface index (Windows `IPV6_UNICAST_IF`, macOS/iOS `IPV6_BOUND_IF`).
     pub if_index_v6: Option<u32>,
     /// Linux `SO_MARK` fwmark (e.g. `0x5644`).
     pub fwmark: Option<u32>,
@@ -135,7 +135,7 @@ impl OutboundBinder for DynamicOutboundBinder {
             Ok(())
         }
 
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         {
             use std::os::fd::AsRawFd;
             const IP_BOUND_IF: libc::c_int = 25;
@@ -200,7 +200,7 @@ impl OutboundBinder for DynamicOutboundBinder {
             }
         }
 
-        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+        #[cfg(not(any(target_os = "windows", target_vendor = "apple", target_os = "linux")))]
         {
             let _ = (sock, is_ipv4);
             if tgt.fail_closed {

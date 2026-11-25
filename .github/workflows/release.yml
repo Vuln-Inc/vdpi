@@ -183,6 +183,7 @@ jobs:
       - name: Build Physical iOS arm64 Device App & Package Unsigned IPA
         working-directory: ios
         run: |
+          set -euo pipefail
           rm -rf build ../dist/ios
           xcodebuild build \
             -project Vdpi.xcodeproj \
@@ -197,11 +198,19 @@ jobs:
           test -d "$APP_PATH"
           test -d "$APPEX_PATH"
 
-          # Ad-hoc sign with ldid so iOS arm64 entitlements are preserved (required for TrollStore; re-signers replace this cleanly)
-          ldid -SPacketTunnel/PacketTunnel.entitlements "$APPEX_PATH/VdpiPacketTunnel"
-          ldid -SVdpiApp/VdpiApp.entitlements "$APP_PATH/VdpiApp"
-          ldid -e "$APPEX_PATH/VdpiPacketTunnel" | tee /dev/stderr | grep -q "packet-tunnel-provider"
-          ldid -e "$APP_PATH/VdpiApp" | tee /dev/stderr | grep -q "group.com.vulninc.vdpi"
+          # Ad-hoc sign with ldid so iOS arm64 entitlements and signing identifiers are preserved (required for TrollStore; re-signers replace this cleanly)
+          ldid -Icom.vulninc.vdpi.packet-tunnel -SPacketTunnel/PacketTunnel.entitlements "$APPEX_PATH/VdpiPacketTunnel"
+          ldid -Icom.vulninc.vdpi -SVdpiApp/VdpiApp.entitlements "$APP_PATH/VdpiApp"
+
+          APPEX_ENTITLEMENTS="$(ldid -e "$APPEX_PATH/VdpiPacketTunnel")"
+          printf '%s\n' "$APPEX_ENTITLEMENTS" >&2
+          printf '%s\n' "$APPEX_ENTITLEMENTS" | grep -q "packet-tunnel-provider"
+          printf '%s\n' "$APPEX_ENTITLEMENTS" | grep -q "group.com.vulninc.vdpi"
+
+          APP_ENTITLEMENTS="$(ldid -e "$APP_PATH/VdpiApp")"
+          printf '%s\n' "$APP_ENTITLEMENTS" >&2
+          printf '%s\n' "$APP_ENTITLEMENTS" | grep -q "packet-tunnel-provider"
+          printf '%s\n' "$APP_ENTITLEMENTS" | grep -q "group.com.vulninc.vdpi"
 
           mkdir -p ../dist/ios/ipa-stage/Payload
           cp -R "$APP_PATH" ../dist/ios/ipa-stage/Payload/VdpiApp.app

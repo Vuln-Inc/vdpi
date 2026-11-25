@@ -13,10 +13,19 @@ use tokio::task::AbortHandle;
 use tracing::{debug, warn};
 use vdpi_core::desync::EngineContext;
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 const TUN_PI_LEN: usize = 4;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(target_vendor = "apple"))]
 const TUN_PI_LEN: usize = 0;
+
+#[cfg(target_vendor = "apple")]
+const UTUN_RX_PROC_UUID_LEN: usize = 16;
+#[cfg(target_vendor = "apple")]
+const SYSPROTO_CONTROL: libc::c_int = 2;
+#[cfg(target_vendor = "apple")]
+const UTUN_OPT_FLAGS: libc::c_int = 1;
+#[cfg(target_vendor = "apple")]
+const UTUN_FLAGS_ENABLE_PROC_UUID: u32 = 0x0004;
 
 struct AbortOnDrop(Vec<AbortHandle>);
 
@@ -90,10 +99,11 @@ pub async fn run_registered_tun_fd_with_route_watch(
         let _ = ext_bridge_tx.send(true);
     });
 
+    let rx_pi_len = detect_rx_pi_len(async_fd.as_raw_fd());
     let read_fd = Arc::clone(&async_fd);
     let mut stop_read = fd_stop_rx.clone();
     let read_stop_tx = fd_stop_tx.clone();
-    let read_buf_size = clamped_mtu + TUN_PI_LEN + 128;
+    let read_buf_size = clamped_mtu + rx_pi_len + 128;
     let reader_task = tokio::spawn(async move {
         let mut buf = vec![0u8; read_buf_size];
         'outer: loop {
@@ -119,7 +129,7 @@ pub async fn run_registered_tun_fd_with_route_watch(
                     }
                     Ok(Ok(n)) => {
                         drained += 1;
-                        let Some(ip_pkt) = strip_tun_pi(&buf[..n]) else {
+                        let Some(ip_pkt) = strip_tun_pi(&buf[..n], rx_pi_len) else {
                             debug!(bytes = n, "dropping malformed or non-IP TUN frame");
                             continue;
                         };
@@ -278,20 +288,55 @@ fn set_nonblocking(fd: i32) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn strip_tun_pi(frame: &[u8]) -> Option<&[u8]> {
-    if frame.len() <= TUN_PI_LEN {
+#[cfg(target_vendor = "apple")]
+fn detect_rx_pi_len(fd: i32) -> usize {
+    let mut flags: u32 = 0;
+    let mut len = std::mem::size_of::<u32>() as libc::socklen_t;
+    // SAFETY: `flags` is an initialized `u32` whose byte size matches `len`; `getsockopt`
+    // writes at most `len` bytes into `flags` and returns 0 only on valid Darwin utun fds.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            SYSPROTO_CONTROL,
+            UTUN_OPT_FLAGS,
+            std::ptr::addr_of_mut!(flags).cast::<libc::c_void>(),
+            std::ptr::addr_of_mut!(len),
+        )
+    };
+    if rc == 0
+        && (len as usize) >= std::mem::size_of::<u32>()
+        && (flags & UTUN_FLAGS_ENABLE_PROC_UUID) != 0
+    {
+        debug!(
+            flags,
+            "Darwin utun UTUN_FLAGS_ENABLE_PROC_UUID enabled; stripping 20-byte RX header"
+        );
+        TUN_PI_LEN + UTUN_RX_PROC_UUID_LEN
+    } else {
+        TUN_PI_LEN
+    }
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn detect_rx_pi_len(_fd: i32) -> usize {
+    TUN_PI_LEN
+}
+
+#[cfg(target_vendor = "apple")]
+fn strip_tun_pi(frame: &[u8], rx_pi_len: usize) -> Option<&[u8]> {
+    let header_len = rx_pi_len.max(TUN_PI_LEN);
+    if frame.len() <= header_len {
         return None;
     }
     let family = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]);
     if family != libc::AF_INET as u32 && family != libc::AF_INET6 as u32 {
         return None;
     }
-    Some(&frame[TUN_PI_LEN..])
+    Some(&frame[header_len..])
 }
 
-#[cfg(not(target_os = "macos"))]
-fn strip_tun_pi(frame: &[u8]) -> Option<&[u8]> {
+#[cfg(not(target_vendor = "apple"))]
+fn strip_tun_pi(frame: &[u8], _rx_pi_len: usize) -> Option<&[u8]> {
     if frame.is_empty() {
         None
     } else {
@@ -299,7 +344,7 @@ fn strip_tun_pi(frame: &[u8]) -> Option<&[u8]> {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn tun_pi_header(pkt: &[u8]) -> std::io::Result<[u8; TUN_PI_LEN]> {
     let Some(&first) = pkt.first() else {
         return Err(std::io::Error::new(
@@ -313,7 +358,7 @@ fn tun_pi_header(pkt: &[u8]) -> std::io::Result<[u8; TUN_PI_LEN]> {
         _ => {
             return Err(std::io::Error::new(
                 ErrorKind::InvalidInput,
-                "unsupported IP version for macOS utun frame",
+                "unsupported IP version for Apple utun frame",
             ));
         }
     };
@@ -329,7 +374,7 @@ fn read_raw_fd(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 fn write_raw_fd(fd: i32, buf: &[u8]) -> std::io::Result<usize> {
     let header = tun_pi_header(buf)?;
     let iov = [
@@ -352,7 +397,7 @@ fn write_raw_fd(fd: i32, buf: &[u8]) -> std::io::Result<usize> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(target_vendor = "apple"))]
 fn write_raw_fd(fd: i32, buf: &[u8]) -> std::io::Result<usize> {
     let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
     if n < 0 {
@@ -374,6 +419,8 @@ mod tests {
         assert_eq!(rc, 0);
         let tx = unsafe { OwnedFd::from_raw_fd(fds[0]) };
         let rx = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let rx_pi_len = detect_rx_pi_len(rx.as_raw_fd());
+        assert_eq!(rx_pi_len, TUN_PI_LEN);
 
         let ipv4 = [0x45u8, 0x00, 0x00, 0x14, 1, 2, 3, 4];
         let written = write_raw_fd(tx.as_raw_fd(), &ipv4).unwrap();
@@ -382,12 +429,12 @@ mod tests {
         let mut buf = [0u8; 64];
         let read = read_raw_fd(rx.as_raw_fd(), &mut buf).unwrap();
         assert_eq!(read, TUN_PI_LEN + ipv4.len());
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         assert_eq!(
             &buf[..TUN_PI_LEN],
             (libc::AF_INET as u32).to_be_bytes().as_slice()
         );
-        assert_eq!(strip_tun_pi(&buf[..read]), Some(ipv4.as_slice()));
+        assert_eq!(strip_tun_pi(&buf[..read], rx_pi_len), Some(ipv4.as_slice()));
 
         let ipv6 = [0x60u8, 0x00, 0x00, 0x00, 5, 6, 7, 8];
         let written6 = write_raw_fd(tx.as_raw_fd(), &ipv6).unwrap();
@@ -395,20 +442,23 @@ mod tests {
 
         let read6 = read_raw_fd(rx.as_raw_fd(), &mut buf).unwrap();
         assert_eq!(read6, TUN_PI_LEN + ipv6.len());
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         assert_eq!(
             &buf[..TUN_PI_LEN],
             (libc::AF_INET6 as u32).to_be_bytes().as_slice()
         );
-        assert_eq!(strip_tun_pi(&buf[..read6]), Some(ipv6.as_slice()));
+        assert_eq!(
+            strip_tun_pi(&buf[..read6], rx_pi_len),
+            Some(ipv6.as_slice())
+        );
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     #[test]
-    fn macos_pi_validation_rejects_bad_frames_and_versions() {
-        assert_eq!(strip_tun_pi(&[]), None);
-        assert_eq!(strip_tun_pi(&[0, 0, 0, 2]), None);
-        assert_eq!(strip_tun_pi(&[0, 0, 0, 99, 0x45, 0x00]), None);
+    fn apple_pi_validation_rejects_bad_frames_and_strips_proc_uuid() {
+        assert_eq!(strip_tun_pi(&[], TUN_PI_LEN), None);
+        assert_eq!(strip_tun_pi(&[0, 0, 0, 2], TUN_PI_LEN), None);
+        assert_eq!(strip_tun_pi(&[0, 0, 0, 99, 0x45, 0x00], TUN_PI_LEN), None);
         assert_eq!(
             tun_pi_header(&[]).unwrap_err().kind(),
             ErrorKind::InvalidInput
@@ -417,13 +467,24 @@ mod tests {
             tun_pi_header(&[0x30, 0x00]).unwrap_err().kind(),
             ErrorKind::InvalidInput
         );
+
+        let proc_uuid_pi_len = TUN_PI_LEN + UTUN_RX_PROC_UUID_LEN;
+        let mut frame = Vec::with_capacity(proc_uuid_pi_len + 4);
+        frame.extend_from_slice(&(libc::AF_INET as u32).to_be_bytes());
+        frame.extend_from_slice(&[0xAAu8; UTUN_RX_PROC_UUID_LEN]);
+        assert_eq!(strip_tun_pi(&frame, proc_uuid_pi_len), None);
+        frame.extend_from_slice(&[0x45, 0x00, 0x00, 0x14]);
+        assert_eq!(
+            strip_tun_pi(&frame, proc_uuid_pi_len),
+            Some([0x45u8, 0x00, 0x00, 0x14].as_slice())
+        );
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(target_vendor = "apple"))]
     #[test]
-    fn non_macos_strip_pi_passthrough() {
-        assert_eq!(strip_tun_pi(&[]), None);
+    fn non_apple_strip_pi_passthrough() {
+        assert_eq!(strip_tun_pi(&[], TUN_PI_LEN), None);
         let pkt = [0x45u8, 0x00, 0x00, 0x14];
-        assert_eq!(strip_tun_pi(&pkt), Some(pkt.as_slice()));
+        assert_eq!(strip_tun_pi(&pkt, TUN_PI_LEN), Some(pkt.as_slice()));
     }
 }

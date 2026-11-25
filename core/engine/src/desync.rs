@@ -39,7 +39,8 @@ const MAX_PROMOTION_VOTE_HOSTS: usize = 64;
 const PROMOTION_VOTE_WINDOW_SECS: u64 = 15 * 60;
 const FAST_EOF_THRESHOLD: Duration = Duration::from_millis(800);
 const FAST_SERVER_HELLO_THRESHOLD: Duration = Duration::from_millis(800);
-const MAX_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
+const MAX_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(12);
+const DIRECT_PASSTHROUGH_FALLBACK_BUDGET: Duration = Duration::from_millis(2000);
 const RETRY_DNS_TIMEOUT: Duration = Duration::from_millis(1500);
 
 #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -569,11 +570,12 @@ impl EngineContext {
         config: RuntimeConfig,
         binder: Option<Arc<dyn OutboundBinder>>,
     ) -> Result<Self> {
-        let dns = DnsResolver::new_with_binder(
+        let dns = DnsResolver::new_with_options(
             &config.dns_addr,
             config.dns_port,
             config.enable_doh,
             config.dns_ipv4_only,
+            config.disable_system_dns_fallback,
             binder.clone(),
         )?;
         let bypass = BypassPolicy::new(&config.bypass_domains, &config.patterns)?;
@@ -1300,10 +1302,33 @@ impl EngineContext {
     async fn establish_initial_flight<C>(
         &self,
         client: &mut C,
+        remote: TcpStream,
+        payload: &[u8],
+        known_host: Option<&str>,
+        remote_addr: SocketAddr,
+    ) -> Result<TcpStream>
+    where
+        C: AsyncRead + AsyncWrite + Unpin,
+    {
+        self.establish_initial_flight_with_deadline(
+            client,
+            remote,
+            payload,
+            known_host,
+            remote_addr,
+            MAX_HANDSHAKE_DEADLINE,
+        )
+        .await
+    }
+
+    async fn establish_initial_flight_with_deadline<C>(
+        &self,
+        client: &mut C,
         mut remote: TcpStream,
         payload: &[u8],
         known_host: Option<&str>,
         remote_addr: SocketAddr,
+        handshake_budget: Duration,
     ) -> Result<TcpStream>
     where
         C: AsyncRead + AsyncWrite + Unpin,
@@ -1332,17 +1357,6 @@ impl EngineContext {
                 None => None,
             };
 
-            // If additional bytes were coalesced after the first TLS record, send with preferred strategy.
-            if payload.len() != ch_info.record_total_len {
-                let stage = cached_stage.unwrap_or_else(|| self.preferred_stage());
-                self.write_tls_strategy(&mut remote, payload, &ch_info, stage)
-                    .await?;
-                self.telemetry
-                    .bytes_tx
-                    .fetch_add(payload.len() as u64, Ordering::Relaxed);
-                return Ok(remote);
-            }
-
             let current_global_stage = self.preferred_stage();
             let stages = self.build_stage_order(cached_stage);
             let mut retry_addrs: Option<Vec<SocketAddr>> = None;
@@ -1352,45 +1366,58 @@ impl EngineContext {
             let mut current_global_hard_blocked = false;
             let mut current_global_timed_out = false;
             let mut saw_tls_alert = false;
-            let handshake_deadline = Instant::now() + MAX_HANDSHAKE_DEADLINE;
+            let handshake_deadline = Instant::now() + handshake_budget;
+            let mut tried_direct_passthrough = false;
+            let mut deadline_exceeded = false;
 
             for (idx, &stage) in stages.iter().enumerate() {
-                let remaining = handshake_deadline.saturating_duration_since(Instant::now());
+                let is_direct_passthrough = stage == LearnedStrategy::DirectPassthrough;
+                if deadline_exceeded && (!is_direct_passthrough || tried_direct_passthrough) {
+                    continue;
+                }
+
+                let now = Instant::now();
+                let stage_deadline = compute_stage_deadline(now, handshake_deadline, stage);
+                let remaining = stage_deadline.saturating_duration_since(now);
                 if remaining.is_zero() {
+                    deadline_exceeded = true;
                     debug!(
                         host = ?effective_host,
                         idx,
                         ?stage,
-                        "adaptive TLS handshake deadline exceeded; aborting remaining stages"
+                        "adaptive TLS handshake deadline exceeded; skipping remaining desync stages"
                     );
-                    break;
+                    continue;
+                }
+
+                if is_direct_passthrough {
+                    tried_direct_passthrough = true;
                 }
 
                 let is_last_stage = idx + 1 == stages.len();
                 let (mut stream, stream_addr) = match current_remote.take() {
                     Some(s) => (s, remote_addr),
                     None => {
-                        let addrs = match retry_addrs.as_ref() {
-                            Some(a) => a,
-                            None => {
-                                let resolved = self
-                                    .collect_retry_addrs(effective_host, remote_addr, remaining)
-                                    .await;
-                                retry_addrs.insert(resolved)
+                        let alt_target = if deadline_exceeded {
+                            remote_addr
+                        } else {
+                            let addrs = match retry_addrs.as_ref() {
+                                Some(a) => a,
+                                None => {
+                                    let resolved = self
+                                        .collect_retry_addrs(effective_host, remote_addr, remaining)
+                                        .await;
+                                    retry_addrs.insert(resolved)
+                                }
+                            };
+                            if addrs.len() > 1 {
+                                addrs[1 + (idx.saturating_sub(1) % (addrs.len() - 1))]
+                            } else {
+                                remote_addr
                             }
                         };
-                        let alt_target = if addrs.len() > 1 {
-                            addrs[1 + (idx.saturating_sub(1) % (addrs.len() - 1))]
-                        } else {
-                            remote_addr
-                        };
-                        match connect_retry_stream(
-                            self,
-                            remote_addr,
-                            alt_target,
-                            handshake_deadline,
-                        )
-                        .await
+                        match connect_retry_stream(self, remote_addr, alt_target, stage_deadline)
+                            .await
                         {
                             Some(pair) => pair,
                             None => continue,
@@ -1398,14 +1425,18 @@ impl EngineContext {
                     }
                 };
 
-                let write_remaining = handshake_deadline.saturating_duration_since(Instant::now());
+                let write_remaining = stage_deadline.saturating_duration_since(Instant::now());
                 if write_remaining.is_zero() {
-                    break;
+                    if is_direct_passthrough {
+                        break;
+                    }
+                    deadline_exceeded = true;
+                    continue;
                 }
 
                 match tokio::time::timeout(
                     write_remaining,
-                    self.write_tls_strategy(&mut stream, payload, &ch_info, stage),
+                    self.write_tls_flight(&mut stream, payload, &ch_info, stage),
                 )
                 .await
                 {
@@ -1427,13 +1458,21 @@ impl EngineContext {
                             ?stage,
                             "adaptive TLS handshake deadline exceeded during strategy write"
                         );
-                        break;
+                        if is_direct_passthrough {
+                            break;
+                        }
+                        deadline_exceeded = true;
+                        continue;
                     }
                 }
 
-                let read_remaining = handshake_deadline.saturating_duration_since(Instant::now());
+                let read_remaining = stage_deadline.saturating_duration_since(Instant::now());
                 if read_remaining.is_zero() {
-                    break;
+                    if is_direct_passthrough {
+                        break;
+                    }
+                    deadline_exceeded = true;
+                    continue;
                 }
 
                 let wait_ms = match stage {
@@ -1734,6 +1773,29 @@ impl EngineContext {
         addrs
     }
 
+    async fn write_tls_flight(
+        &self,
+        remote: &mut TcpStream,
+        payload: &[u8],
+        ch_info: &ClientHelloInfo,
+        strategy: LearnedStrategy,
+    ) -> Result<()> {
+        if strategy == LearnedStrategy::DirectPassthrough
+            || payload.len() <= ch_info.record_total_len
+        {
+            return self
+                .write_tls_strategy(remote, payload, ch_info, strategy)
+                .await;
+        }
+        // Coalesced TLS 1.3 0-RTT early data: apply DPI desync ONLY to the leading
+        // ClientHello record, then immediately follow with the trailing early-data bytes.
+        let (client_hello, trailing) = payload.split_at(ch_info.record_total_len);
+        self.write_tls_strategy(remote, client_hello, ch_info, strategy)
+            .await?;
+        remote.write_all(trailing).await?;
+        Ok(())
+    }
+
     async fn write_tls_strategy(
         &self,
         remote: &mut TcpStream,
@@ -1867,7 +1929,7 @@ impl EngineContext {
                 return Ok(());
             }
             return self
-                .write_tls_strategy(remote, payload, &ch_info, LearnedStrategy::Primary)
+                .write_tls_flight(remote, payload, &ch_info, LearnedStrategy::Primary)
                 .await;
         }
 
@@ -1900,6 +1962,23 @@ impl EngineContext {
 
         remote.write_all(payload).await?;
         Ok(())
+    }
+}
+
+fn compute_stage_deadline(
+    now: Instant,
+    handshake_deadline: Instant,
+    stage: LearnedStrategy,
+) -> Instant {
+    if stage == LearnedStrategy::DirectPassthrough {
+        let min_fallback_deadline = now + DIRECT_PASSTHROUGH_FALLBACK_BUDGET;
+        if handshake_deadline > min_fallback_deadline {
+            handshake_deadline
+        } else {
+            min_fallback_deadline
+        }
+    } else {
+        handshake_deadline
     }
 }
 
@@ -3418,5 +3497,218 @@ mod tests {
             0
         );
         assert_eq!(ctx.learned_host_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn coalesced_tls13_zero_rtt_auto_heals_and_preserves_trailing_early_data() {
+        let config = RuntimeConfig {
+            system_proxy: false,
+            chunk_size: 10,
+            patterns: vec!["zero-rtt\\.example$".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let ctx = EngineContext::new(config).unwrap();
+
+        let ch = build_synthetic_client_hello("api.zero-rtt.example", 256);
+        let orig_rec_len = u16::from_be_bytes([ch[3], ch[4]]) as usize;
+        // Simulated coalesced TLS 1.3 ChangeCipherSpec + 0-RTT ApplicationData trailing bytes.
+        let trailing: Vec<u8> = vec![
+            0x14, 0x03, 0x03, 0x00, 0x01, 0x01, // CCS
+            0x17, 0x03, 0x03, 0x00, 0x08, b'0', b'R', b'T', b'T', b'D', b'A', b'T', b'A',
+        ];
+        let mut coalesced = ch.clone();
+        coalesced.extend_from_slice(&trailing);
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_srv = Arc::clone(&attempts);
+        let trailing_expected = trailing.clone();
+        let trailing_ok = Arc::new(AtomicBool::new(false));
+        let trailing_ok_srv = Arc::clone(&trailing_ok);
+
+        // Reject split ClientHello (Stage 1 Combo) with a TLS Alert, then accept intact
+        // single-record ClientHello (Stage 2 OobSniDesync) and verify trailing 0-RTT bytes arrive intact.
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = upstream.accept().await else {
+                    break;
+                };
+                let attempts_conn = Arc::clone(&attempts_srv);
+                let trailing_exp = trailing_expected.clone();
+                let trailing_flag = Arc::clone(&trailing_ok_srv);
+                tokio::spawn(async move {
+                    attempts_conn.fetch_add(1, Ordering::SeqCst);
+                    let mut hdr = [0u8; 5];
+                    if sock.read_exact(&mut hdr).await.is_err() {
+                        return;
+                    }
+                    let rec_len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                    let mut body = vec![0u8; rec_len];
+                    if sock.read_exact(&mut body).await.is_err() {
+                        return;
+                    }
+
+                    if rec_len < orig_rec_len {
+                        let _ = sock
+                            .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x2f])
+                            .await;
+                    } else {
+                        let mut got_trailing = vec![0u8; trailing_exp.len()];
+                        if sock.read_exact(&mut got_trailing).await.is_ok()
+                            && got_trailing == trailing_exp
+                        {
+                            trailing_flag.store(true, Ordering::SeqCst);
+                            let _ = sock
+                                .write_all(&[
+                                    0x16, 0x03, 0x03, 0x00, 0x05, b'0', b'R', b'T', b'T', b'!',
+                                ])
+                                .await;
+                        }
+                    }
+
+                    let _ = sock.shutdown().await;
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        tokio::io::copy(&mut sock, &mut tokio::io::sink()),
+                    )
+                    .await;
+                });
+            }
+        });
+
+        let (mut app_side, mut tun_side) = tokio::io::duplex(8192);
+        let reader_task = tokio::spawn(async move {
+            let mut reply = [0u8; 10];
+            app_side.read_exact(&mut reply).await.unwrap();
+            reply
+        });
+
+        let initial_remote = TcpStream::connect(upstream_addr).await.unwrap();
+        let _established = ctx
+            .establish_initial_flight(
+                &mut tun_side,
+                initial_remote,
+                &coalesced,
+                Some("api.zero-rtt.example"),
+                upstream_addr,
+            )
+            .await
+            .unwrap();
+
+        let reply = reader_task.await.unwrap();
+        assert_eq!(
+            &reply,
+            &[0x16, 0x03, 0x03, 0x00, 0x05, b'0', b'R', b'T', b'T', b'!']
+        );
+        assert!(trailing_ok.load(Ordering::SeqCst));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            ctx.adaptive_cache
+                .read()
+                .await
+                .get("api.zero-rtt.example")
+                .copied(),
+            Some(LearnedStrategy::OobSniDesync)
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_passthrough_fallback_still_runs_when_handshake_deadline_expires() {
+        let now = Instant::now();
+        let expired = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
+        assert_eq!(
+            compute_stage_deadline(now, expired, LearnedStrategy::SlowSniSlice),
+            expired
+        );
+        assert!(
+            compute_stage_deadline(now, expired, LearnedStrategy::DirectPassthrough)
+                >= now + DIRECT_PASSTHROUGH_FALLBACK_BUDGET
+        );
+        let generous = now + Duration::from_secs(10);
+        assert_eq!(
+            compute_stage_deadline(now, generous, LearnedStrategy::DirectPassthrough),
+            generous
+        );
+
+        let config = RuntimeConfig {
+            system_proxy: false,
+            chunk_size: 10,
+            patterns: vec!["strict-passthrough\\.example$".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let ctx = EngineContext::new(config).unwrap();
+        let ch = build_synthetic_client_hello("ookla.strict-passthrough.example", 256);
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_srv = Arc::clone(&attempts);
+
+        // Attempt 1 (Stage 1 Primary) stalls past the short 120ms handshake budget so stages 2..6
+        // are skipped, and Attempt 2 must be the guaranteed bounded DirectPassthrough fallback.
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = upstream.accept().await else {
+                    break;
+                };
+                let step = attempts_srv.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    if step == 0 {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        drop(sock);
+                    } else {
+                        let mut hdr = [0u8; 5];
+                        if sock.read_exact(&mut hdr).await.is_ok() {
+                            let rec_len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                            let mut body = vec![0u8; rec_len];
+                            if sock.read_exact(&mut body).await.is_ok() {
+                                let _ = sock
+                                    .write_all(&[
+                                        0x16, 0x03, 0x03, 0x00, 0x05, b'P', b'A', b'S', b'S', b'7',
+                                    ])
+                                    .await;
+                            }
+                        }
+                        let _ = sock.shutdown().await;
+                    }
+                });
+            }
+        });
+
+        let (mut app_side, mut tun_side) = tokio::io::duplex(8192);
+        let reader_task = tokio::spawn(async move {
+            let mut reply = [0u8; 10];
+            app_side.read_exact(&mut reply).await.unwrap();
+            reply
+        });
+
+        let initial_remote = TcpStream::connect(upstream_addr).await.unwrap();
+        let _established = ctx
+            .establish_initial_flight_with_deadline(
+                &mut tun_side,
+                initial_remote,
+                &ch,
+                Some("ookla.strict-passthrough.example"),
+                upstream_addr,
+                Duration::from_millis(120),
+            )
+            .await
+            .unwrap();
+
+        let reply = reader_task.await.unwrap();
+        assert_eq!(
+            &reply,
+            &[0x16, 0x03, 0x03, 0x00, 0x05, b'P', b'A', b'S', b'S', b'7']
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            ctx.adaptive_cache
+                .read()
+                .await
+                .get("ookla.strict-passthrough.example")
+                .copied(),
+            Some(LearnedStrategy::DirectPassthrough)
+        );
     }
 }
