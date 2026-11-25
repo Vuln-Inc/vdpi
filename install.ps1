@@ -48,6 +48,12 @@ try {
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     $TargetExe = Join-Path $InstallDir 'vdpi.exe'
     Copy-Item -Path $ExtractedExe -Destination $TargetExe -Force
+    foreach ($Companion in @('wintun.dll', 'WINTUN-LICENSE.txt')) {
+        $ExtractedCompanion = Join-Path $ExtractDir $Companion
+        if (Test-Path $ExtractedCompanion) {
+            Copy-Item -Path $ExtractedCompanion -Destination (Join-Path $InstallDir $Companion) -Force
+        }
+    }
 
     $UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     if (-not $UserPath) { $UserPath = '' }

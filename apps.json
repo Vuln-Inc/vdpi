@@ -21,6 +21,15 @@
       "category": "utilities",
       "versions": [
         {
+          "version": "0.5.0",
+          "buildVersion": "7",
+          "date": "2026-11-25T02:35:00Z",
+          "localizedDescription": "- Shared vdpi-core engine and zero-lag UDP bypass (smoltcp UDP removed, STUN/TURN UDP/443 pass-through)\n- Hardened Turkish ISP anti-DPI (Superonline/TTNet/Kablonet/Vodafone TR), webpki-roots verified bound DoH, and expanded bank/payment/Riot/CIDR bypass defaults\n- Fixed iOS live-reload disconnect race, overlapping reload IPCs, CIDR bypass normalization, and Jetsam thread pool bounds",
+          "downloadURL": "https://github.com/Vuln-Inc/vdpi/releases/download/v0.5.0/vdpi-ios-unsigned.ipa",
+          "size": 7474063,
+          "minOSVersion": "16.0"
+        },
+        {
           "version": "0.4.2",
           "date": "2026-11-24",
           "localizedDescription": "Desktop Control Center release with live service/DPI status, temporary pause/resume, and inline-confirmed uninstall.",
@@ -54,11 +63,11 @@
         ],
         "privacy": {}
       },
-      "version": "0.4.2",
-      "versionDate": "2026-11-24",
-      "versionDescription": "Desktop Control Center release with live service/DPI status, temporary pause/resume, and inline-confirmed uninstall.",
-      "downloadURL": "https://github.com/Vuln-Inc/vdpi/releases/download/v0.4.2/vdpi-ios-unsigned.ipa",
-      "size": 7399911
+      "version": "0.5.0",
+      "versionDate": "2026-11-25T02:35:00Z",
+      "versionDescription": "- Shared vdpi-core engine and zero-lag UDP bypass (smoltcp UDP removed, STUN/TURN UDP/443 pass-through)\n- Hardened Turkish ISP anti-DPI (Superonline/TTNet/Kablonet/Vodafone TR), webpki-roots verified bound DoH, and expanded bank/payment/Riot/CIDR bypass defaults\n- Fixed iOS live-reload disconnect race, overlapping reload IPCs, CIDR bypass normalization, and Jetsam thread pool bounds",
+      "downloadURL": "https://github.com/Vuln-Inc/vdpi/releases/download/v0.5.0/vdpi-ios-unsigned.ipa",
+      "size": 7474063
     }
   ],
   "news": []
