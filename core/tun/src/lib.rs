@@ -4,6 +4,7 @@ pub mod doctor;
 pub mod events;
 #[cfg(unix)]
 pub mod fd;
+mod netstack;
 pub mod packet;
 pub mod pipeline;
 

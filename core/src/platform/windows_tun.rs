@@ -66,8 +66,13 @@ pub const VDPI_TUN_PREFIX_V6: u8 = 126;
 /// Virtual IPv6 DNS server configured on `vdpi0` when IPv6 TUN mode is active
 /// (intercepted by the userspace TUN stack).
 pub const VDPI_TUN_DNS_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x7664, 0x7069, 0, 0, 0, 0, 2);
+/// Link MTU configured on `vdpi0` (matches `vdpi_tun::config::DESKTOP_MTU`; Wintun 0.14.1
+/// supports up to 65,535 bytes natively via `NlMtu`).
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub const VDPI_TUN_MTU: u32 = vdpi_tun::config::DESKTOP_MTU as u32;
 /// Link MTU configured on `vdpi0`.
-pub const VDPI_TUN_MTU: u32 = 1500;
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub const VDPI_TUN_MTU: u32 = 16_384;
 
 /// Windows NDIS `IF_TYPE_ETHERNET_CSMACD`.
 pub const NDIS_IF_TYPE_ETHERNET: u32 = 6;
@@ -450,10 +455,18 @@ mod win32 {
     const VDPI_WINTUN_GUID: GUID = GUID::from_u128(0x7664_7069_5769_6e74_756e_5630_3530_0001);
     /// Wintun adapter tunnel type label shown in Device Manager / NDIS.
     const VDPI_WINTUN_TUNNEL_TYPE: &str = "vdpi";
-    /// Wintun ring buffer capacity: 4 MiB per direction.
-    const WINTUN_RING_CAPACITY: u32 = 0x0040_0000;
-    /// Bounded Tokio channel depth for inbound/outbound IP packets.
-    const TUN_CHANNEL_CAPACITY: usize = 512;
+    /// Wintun ring buffer capacity: 16 MiB per direction (32 MiB total kernel ring).
+    const WINTUN_RING_CAPACITY: u32 = 0x0100_0000;
+    /// Bounded Tokio channel depth for inbound/outbound IP packets (matches `TunProfile::DESKTOP`).
+    const TUN_CHANNEL_CAPACITY: usize = vdpi_tun::config::TunProfile::DESKTOP.channel_capacity;
+    /// Maximum outbound IP packets drained per wakeup via `blocking_recv_many`.
+    const TX_BATCH_LIMIT: usize = 64;
+    /// Brief retries on `ERROR_BUFFER_OVERFLOW` before dropping an outbound packet.
+    const TX_OVERFLOW_MAX_RETRIES: usize = 5;
+    /// Short sleep duration on later `ERROR_BUFFER_OVERFLOW` retries (50 us).
+    const TX_OVERFLOW_RETRY_SLEEP: Duration = Duration::from_micros(50);
+    /// Success return code from `winmm.dll`'s `timeBeginPeriod` / `timeEndPeriod`.
+    const TIMERR_NOERROR: u32 = 0;
     /// Maximum IP packet size supported by Wintun.
     const WINTUN_MAX_IP_PACKET_SIZE: usize = 65_535;
     /// Interface metric assigned to `vdpi0`.
@@ -514,6 +527,7 @@ mod win32 {
     type SetInterfaceDnsSettingsFn =
         unsafe extern "system" fn(interface: GUID, settings: *const DNS_INTERFACE_SETTINGS) -> u32;
     type DnsFlushResolverCacheFn = unsafe extern "system" fn() -> i32;
+    type TimePeriodFn = unsafe extern "system" fn(period_ms: u32) -> u32;
 
     /// Send/Sync wrapper around an opaque Win32 handle (`HANDLE`, `HMODULE`, Wintun handles).
     #[derive(Clone, Copy)]
@@ -1424,6 +1438,61 @@ mod win32 {
         }
     }
 
+    /// RAII guard holding a 1 ms Windows multimedia timer period (`timeBeginPeriod(1)`)
+    /// so Tokio timers and TCP pacing/retransmit wakeups are not quantized to 15.625 ms.
+    struct TimerResolutionGuard {
+        module: SendHandle,
+        end_fn: TimePeriodFn,
+        period_ms: u32,
+    }
+
+    impl TimerResolutionGuard {
+        fn acquire(period_ms: u32) -> Option<Self> {
+            let winmm_w = encode_wide("winmm.dll");
+            let hmod = unsafe {
+                LoadLibraryExW(
+                    winmm_w.as_ptr(),
+                    ptr::null_mut(),
+                    LOAD_LIBRARY_SEARCH_SYSTEM32,
+                )
+            };
+            if hmod.is_null() {
+                debug!("could not load winmm.dll for high-resolution timer period");
+                return None;
+            }
+            let guard = ModuleGuard(hmod);
+            let begin_fn = unsafe { load_proc::<TimePeriodFn>(hmod, c"timeBeginPeriod") }.ok()?;
+            let end_fn = unsafe { load_proc::<TimePeriodFn>(hmod, c"timeEndPeriod") }.ok()?;
+            let rc = unsafe { begin_fn(period_ms) };
+            if rc != TIMERR_NOERROR {
+                debug!(
+                    period_ms,
+                    rc, "timeBeginPeriod failed; keeping default Windows timer resolution"
+                );
+                return None;
+            }
+            let _ = guard.into_raw();
+            debug!(period_ms, "enabled high-resolution Windows timer period");
+            Some(Self {
+                module: SendHandle(hmod),
+                end_fn,
+                period_ms,
+            })
+        }
+    }
+
+    impl Drop for TimerResolutionGuard {
+        fn drop(&mut self) {
+            if !self.module.is_null() {
+                unsafe {
+                    let _ = (self.end_fn)(self.period_ms);
+                    let _ = FreeLibrary(self.module.as_raw());
+                }
+                self.module = SendHandle(ptr::null_mut());
+            }
+        }
+    }
+
     /// Lock-free shared state read inside the `NotifyRouteChange2` callback.
     struct RouteNotifyContext {
         vdpi_luid: u64,
@@ -1598,8 +1667,15 @@ mod win32 {
 
                             match inbound_tx.try_send(pkt) {
                                 Ok(()) => {}
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    trace!("Wintun RX channel full; dropping inbound packet");
+                                Err(mpsc::error::TrySendError::Full(pkt)) => {
+                                    // Backpressure rather than silently dropping TCP segments
+                                    // (smoltcp lacks sender SACK, so a single drop triggers an RTO stall).
+                                    if stop_flag.load(Ordering::Acquire) {
+                                        break 'outer;
+                                    }
+                                    if inbound_tx.blocking_send(pkt).is_err() {
+                                        break 'outer;
+                                    }
                                 }
                                 Err(mpsc::error::TrySendError::Closed(_)) => {
                                     break 'outer;
@@ -1639,6 +1715,63 @@ mod win32 {
             .context("failed to spawn Wintun RX thread")
     }
 
+    fn send_wintun_packet(
+        wintun: &WintunApi,
+        session: SendHandle,
+        stop_flag: &AtomicBool,
+        pkt: &[u8],
+    ) -> bool {
+        if pkt.is_empty() || pkt.len() > WINTUN_MAX_IP_PACKET_SIZE {
+            return true;
+        }
+        let mut dst = unsafe { (wintun.allocate_send_packet)(session.as_raw(), pkt.len() as u32) };
+        if dst.is_null() {
+            let mut err = unsafe { GetLastError() };
+            if err == ERROR_BUFFER_OVERFLOW {
+                for attempt in 0..TX_OVERFLOW_MAX_RETRIES {
+                    if stop_flag.load(Ordering::Acquire) {
+                        return false;
+                    }
+                    if attempt < 2 {
+                        thread::yield_now();
+                    } else {
+                        thread::sleep(TX_OVERFLOW_RETRY_SLEEP);
+                    }
+                    dst = unsafe {
+                        (wintun.allocate_send_packet)(session.as_raw(), pkt.len() as u32)
+                    };
+                    if !dst.is_null() {
+                        break;
+                    }
+                    err = unsafe { GetLastError() };
+                    if err != ERROR_BUFFER_OVERFLOW {
+                        break;
+                    }
+                }
+            }
+            if dst.is_null() {
+                if err == ERROR_BUFFER_OVERFLOW {
+                    trace!(
+                        len = pkt.len(),
+                        "Wintun TX ring full after retries; dropping outbound packet"
+                    );
+                    return true;
+                }
+                if err == ERROR_HANDLE_EOF {
+                    debug!("Wintun TX ring reached EOF; exiting TX thread");
+                    return false;
+                }
+                warn!(error = err, "WintunAllocateSendPacket failed");
+                return true;
+            }
+        }
+        unsafe {
+            ptr::copy_nonoverlapping(pkt.as_ptr(), dst, pkt.len());
+            (wintun.send_packet)(session.as_raw(), dst);
+        }
+        true
+    }
+
     fn spawn_tx_thread(
         wintun: Arc<WintunApi>,
         session: SendHandle,
@@ -1648,35 +1781,20 @@ mod win32 {
         thread::Builder::new()
             .name("vdpi-wintun-tx".to_string())
             .spawn(move || {
-                while let Some(pkt) = outbound_rx.blocking_recv() {
-                    if stop_flag.load(Ordering::Acquire) {
+                let mut batch: Vec<Vec<u8>> = Vec::with_capacity(TX_BATCH_LIMIT);
+                'outer: loop {
+                    batch.clear();
+                    let count = outbound_rx.blocking_recv_many(&mut batch, TX_BATCH_LIMIT);
+                    if count == 0 || stop_flag.load(Ordering::Acquire) {
                         break;
                     }
-                    if pkt.is_empty() || pkt.len() > WINTUN_MAX_IP_PACKET_SIZE {
-                        continue;
-                    }
-                    let dst = unsafe {
-                        (wintun.allocate_send_packet)(session.as_raw(), pkt.len() as u32)
-                    };
-                    if dst.is_null() {
-                        let err = unsafe { GetLastError() };
-                        if err == ERROR_BUFFER_OVERFLOW {
-                            trace!(
-                                len = pkt.len(),
-                                "Wintun TX ring full; dropping outbound packet"
-                            );
-                            continue;
+                    for pkt in batch.drain(..) {
+                        if stop_flag.load(Ordering::Acquire) {
+                            break 'outer;
                         }
-                        if err == ERROR_HANDLE_EOF {
-                            debug!("Wintun TX ring reached EOF; exiting TX thread");
-                            break;
+                        if !send_wintun_packet(&wintun, session, &stop_flag, &pkt) {
+                            break 'outer;
                         }
-                        warn!(error = err, "WintunAllocateSendPacket failed");
-                        continue;
-                    }
-                    unsafe {
-                        ptr::copy_nonoverlapping(pkt.as_ptr(), dst, pkt.len());
-                        (wintun.send_packet)(session.as_raw(), dst);
                     }
                 }
             })
@@ -1700,6 +1818,7 @@ mod win32 {
         tx_thread: Option<JoinHandle<()>>,
         vdpi_luid: u64,
         ipv6_enabled: bool,
+        _timer_resolution: Option<TimerResolutionGuard>,
     }
 
     /// Tuple returned by [`WindowsTunSession::start`]: the running session handle,
@@ -1774,7 +1893,7 @@ mod win32 {
 
             flush_dns_resolver_cache();
 
-            // Start Wintun packet ring session (4 MiB per ring).
+            // Start Wintun packet ring session (16 MiB per ring).
             let raw_session = unsafe {
                 (wintun.start_session)(adapter_guard.handle.as_raw(), WINTUN_RING_CAPACITY)
             };
@@ -1841,6 +1960,7 @@ mod win32 {
                 tx_thread: None,
                 vdpi_luid,
                 ipv6_enabled,
+                _timer_resolution: TimerResolutionGuard::acquire(1),
             };
             binder_guard.disarm();
 
@@ -2040,6 +2160,8 @@ mod tests {
             Ipv6Addr::new(0xfd00, 0x7664, 0x7069, 0, 0, 0, 0, 2)
         );
         assert_eq!(VDPI_TUN_DNS_V6.to_string(), "fd00:7664:7069::2");
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        assert_eq!(VDPI_TUN_MTU, vdpi_tun::config::DESKTOP_MTU as u32);
     }
 
     #[test]

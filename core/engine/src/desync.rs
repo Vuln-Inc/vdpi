@@ -45,7 +45,7 @@ const RETRY_DNS_TIMEOUT: Duration = Duration::from_millis(1500);
 #[cfg(any(target_os = "android", target_os = "ios"))]
 const RELAY_BUF_SIZE: usize = 16 * 1024;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-const RELAY_BUF_SIZE: usize = 32 * 1024;
+const RELAY_BUF_SIZE: usize = 128 * 1024;
 
 /// Single learned hostname entry persisted in the adaptive stage cache file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

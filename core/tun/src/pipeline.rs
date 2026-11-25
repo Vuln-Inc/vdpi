@@ -1,11 +1,11 @@
 use crate::config::{TunProfile, MAX_MTU, MIN_MTU};
 use crate::events::EventRing;
+use crate::netstack::{spawn_tcp_netstack, TunNetstackTcpStream};
 use crate::packet::{
-    build_icmp_port_unreachable, build_truncated_dns_reply, max_udp_payload_for_mtu,
+    build_icmp_port_unreachable, build_truncated_dns_reply, max_dns_udp_payload_for_mtu,
+    max_udp_payload_for_mtu,
 };
 use anyhow::{anyhow, Context, Result};
-use futures::{SinkExt, StreamExt};
-use netstack_smoltcp::StackBuilder;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::ErrorKind;
@@ -34,17 +34,17 @@ const TCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const STUN_FLOW_MAX_ENTRIES: usize = 256;
 const STUN_FLOW_TTL_SECS: u64 = 120;
 
-/// Wraps `netstack_smoltcp::TcpStream` so `poll_shutdown` flushes buffered writes and
+/// Wraps `TunNetstackTcpStream` so `poll_shutdown` flushes buffered writes and
 /// polls TCP FIN cleanly within a bounded 2-second deadline without stalling
 /// `tokio::io::copy_bidirectional` indefinitely on unresponsive peers.
 struct TunTcpStream {
-    inner: netstack_smoltcp::TcpStream,
+    inner: TunNetstackTcpStream,
     flushed_for_shutdown: bool,
     shutdown_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl TunTcpStream {
-    fn new(inner: netstack_smoltcp::TcpStream) -> Self {
+    fn new(inner: TunNetstackTcpStream) -> Self {
         Self {
             inner,
             flushed_for_shutdown: false,
@@ -462,20 +462,6 @@ pub async fn run_tun_pipeline_with_route_watch(
     mut route_rx: Option<watch::Receiver<u64>>,
 ) -> Result<()> {
     let clamped_mtu = mtu.clamp(MIN_MTU, MAX_MTU);
-    let (stack, runner, _udp_socket, tcp_listener) = StackBuilder::default()
-        .enable_tcp(true)
-        .enable_udp(false)
-        .enable_icmp(false)
-        .mtu(clamped_mtu)
-        .stack_buffer_size(profile.stack_buffer_size)
-        .tcp_buffer_size(profile.tcp_buffer_size)
-        .tcp_recv_buffer_size(profile.tcp_recv_buffer_size)
-        .tcp_send_buffer_size(profile.tcp_send_buffer_size)
-        .build()
-        .context("failed to build smoltcp netstack")?;
-
-    let runner = runner.ok_or_else(|| anyhow!("netstack runner missing"))?;
-    let mut tcp_listener = tcp_listener.ok_or_else(|| anyhow!("netstack TCP listener missing"))?;
 
     // Internal stop signal fires whenever either the caller requests shutdown OR any core
     // pipeline task exits unexpectedly, preventing silent zombie tunnels.
@@ -487,15 +473,25 @@ pub async fn run_tun_pipeline_with_route_watch(
         let _ = bridge_stop_tx.send(true);
     });
 
+    // Dedicated bounded TCP ingress queue so smoltcp TCP backpressure never stalls
+    // zero-lag UDP / DNS ingress while preserving lossless async backpressure for TCP.
+    let (tcp_in_tx, tcp_in_rx) = mpsc::channel::<Vec<u8>>(profile.channel_capacity.max(256));
+
+    let (mut tcp_stream_rx, netstack_handle) = spawn_tcp_netstack(
+        tcp_in_rx,
+        outbound_tx.clone(),
+        clamped_mtu,
+        profile.tcp_recv_buffer_size as usize,
+        profile.tcp_send_buffer_size as usize,
+        internal_stop_rx.clone(),
+    )
+    .context("failed to build smoltcp netstack")?;
+
     let runner_stop_tx = internal_stop_tx.clone();
     let runner_handle = tokio::spawn(async move {
-        if let Err(e) = runner.await {
-            debug!(error = %e, "netstack runner exited");
-        }
+        let _ = netstack_handle.await;
         let _ = runner_stop_tx.send(true);
     });
-
-    let (mut stack_sink, mut stack_stream) = stack.split();
 
     let reverse_dns = Arc::new(ReverseDnsCache::new(profile.max_reverse_dns_entries));
     let tcp_slots = Arc::new(Semaphore::new(profile.max_tcp_sessions));
@@ -504,34 +500,9 @@ pub async fn run_tun_pipeline_with_route_watch(
     let udp_lru_seq = Arc::new(AtomicU64::new(0));
     let observed_stage = Arc::new(AtomicU8::new(ctx.preferred_stage() as u8));
 
-    // Dedicated bounded TCP ingress queue so smoltcp TCP backpressure never stalls
-    // zero-lag UDP / DNS ingress in `tun_to_stack`.
-    let (tcp_in_tx, mut tcp_in_rx) = mpsc::channel::<Vec<u8>>(profile.stack_buffer_size.max(16));
-    let mut stop_tcp_in = internal_stop_rx.clone();
-    let tcp_in_stop_tx = internal_stop_tx.clone();
-    let tcp_to_stack = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                biased;
-                _ = wait_shutdown(&mut stop_tcp_in) => break,
-                pkt = tcp_in_rx.recv() => {
-                    let Some(pkt) = pkt else { break; };
-                    if let Err(e) = stack_sink.send(pkt).await {
-                        if e.kind() == ErrorKind::InvalidInput {
-                            debug!(error = %e, "dropped invalid inbound IP packet");
-                            continue;
-                        }
-                        let _ = tcp_in_stop_tx.send(true);
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
     // Task 1: Zero-lag TUN ingress demux — inspect UDP ONCE and bypass smoltcp completely
-    // for DNS/53, QUIC/443 (with STUN/TURN pass-through), and Cone-NAT UDP; hand non-UDP
-    // packets to `tcp_to_stack` without blocking UDP/DNS ingress.
+    // for DNS/53, QUIC/443 (with STUN/TURN pass-through), and Cone-NAT UDP; hand TCP
+    // packets directly to the in-tree smoltcp runner with lossless backpressure.
     let in_ctx = ctx.clone();
     let in_rdns = Arc::clone(&reverse_dns);
     let in_stats = Arc::clone(&tun_stats);
@@ -586,7 +557,7 @@ pub async fn run_tun_pipeline_with_route_watch(
                                                         rdns.insert(ip, domain.clone());
                                                     }
                                                 }
-                                                let max_udp = max_udp_payload_for_mtu(clamped_mtu, dst_addr.is_ipv4());
+                                                let max_udp = max_dns_udp_payload_for_mtu(clamped_mtu, dst_addr.is_ipv4());
                                                 let wire = if resp.len() > max_udp {
                                                     build_truncated_dns_reply(&query, &resp)
                                                 } else {
@@ -647,11 +618,23 @@ pub async fn run_tun_pipeline_with_route_watch(
                         continue;
                     }
 
-                    if !is_valid_inbound_tun_packet(&pkt) {
+                    if !matches!(pkt.first().map(|b| b >> 4), Some(4 | 6)) {
                         continue;
                     }
                     match tcp_in_tx.try_send(pkt) {
-                        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(pkt)) => {
+                            tokio::select! {
+                                biased;
+                                _ = wait_shutdown(&mut stop_in) => break,
+                                res = tcp_in_tx.send(pkt) => {
+                                    if res.is_err() {
+                                        let _ = in_stop_tx.send(true);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             let _ = in_stop_tx.send(true);
                             break;
@@ -662,38 +645,7 @@ pub async fn run_tun_pipeline_with_route_watch(
         }
     });
 
-    // Task 2: Forward smoltcp TCP stack -> outbound TUN packets
-    let mut stop_out = internal_stop_rx.clone();
-    let out_stop_tx = internal_stop_tx.clone();
-    let stack_to_tun = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                biased;
-                _ = wait_shutdown(&mut stop_out) => break,
-                item = stack_stream.next() => {
-                    match item {
-                        Some(Ok(pkt)) => {
-                            if outbound_tx.send(pkt).await.is_err() {
-                                let _ = out_stop_tx.send(true);
-                                break;
-                            }
-                        }
-                        Some(Err(e)) => {
-                            debug!(error = %e, "stack outbound stream error");
-                            let _ = out_stop_tx.send(true);
-                            break;
-                        }
-                        None => {
-                            let _ = out_stop_tx.send(true);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    });
-
-    // Task 3: Accept TCP streams from TUN with clean pre-accept semaphore backpressure
+    // Task 2: Accept TCP streams from TUN with clean pre-accept semaphore backpressure
     // (intercept TCP/53 DNS + relay all others via vdpi)
     let tcp_ctx = ctx.clone();
     let tcp_rdns = Arc::clone(&reverse_dns);
@@ -718,13 +670,15 @@ pub async fn run_tun_pipeline_with_route_watch(
             let maybe_stream = tokio::select! {
                 biased;
                 _ = wait_shutdown(&mut stop_tcp) => break,
-                maybe_stream = tcp_listener.next() => maybe_stream,
+                maybe_stream = tcp_stream_rx.recv() => maybe_stream,
             };
 
-            let Some((stream, _src, dst)) = maybe_stream else {
+            let Some(stream) = maybe_stream else {
                 let _ = tcp_stop_tx.send(true);
                 break;
             };
+            let _src = stream.local_addr();
+            let dst = stream.remote_addr();
 
             let conn_ctx = tcp_ctx.clone();
             let rdns = Arc::clone(&tcp_rdns);
@@ -839,9 +793,7 @@ pub async fn run_tun_pipeline_with_route_watch(
     let _abort_guard = PipelineAbortGuard {
         handles: vec![
             stop_bridge.abort_handle(),
-            tcp_to_stack.abort_handle(),
             tun_to_stack.abort_handle(),
-            stack_to_tun.abort_handle(),
             tcp_accept_task.abort_handle(),
             udp_reaper_task.abort_handle(),
             runner_handle.abort_handle(),
@@ -876,9 +828,7 @@ pub async fn run_tun_pipeline_with_route_watch(
     }
 
     stop_bridge.abort();
-    tcp_to_stack.abort();
     tun_to_stack.abort();
-    stack_to_tun.abort();
     tcp_accept_task.abort();
     udp_reaper_task.abort();
     runner_handle.abort();

@@ -1190,10 +1190,14 @@ mod desktop_tun {
     use vdpi::platform::vpn_guard::{GuardAction, VpnGuard};
     use vdpi::service::{clear_runtime_state, write_runtime_state_with_meta};
     #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-    use vdpi_tun::config::{TunProfile, DESKTOP_MTU};
+    use vdpi_tun::config::TunProfile;
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    use vdpi_tun::config::DESKTOP_MTU;
     use vdpi_tun::events::EventRing;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    use vdpi_tun::fd::{register_tun_fd, run_registered_tun_fd};
+    use vdpi_tun::fd::register_tun_fd;
+    #[cfg(target_os = "linux")]
+    use vdpi_tun::fd::run_registered_tun_fd;
     #[cfg(target_os = "windows")]
     use vdpi_tun::pipeline::run_tun_pipeline_with_route_watch;
     use vdpi_tun::pipeline::TunStats;
@@ -1213,6 +1217,7 @@ mod desktop_tun {
             || lower.contains("error 5")
             || lower.contains("permission denied")
             || lower.contains("operation not permitted")
+            || lower.contains("requires root privileges")
             || lower.contains("not supported on")
             || (lower.contains("wintun.dll")
                 && (lower.contains("not found")
@@ -1359,17 +1364,20 @@ mod desktop_tun {
                     }
                 };
 
+                let tun_mtu = usize::from(session.mtu());
                 let route_rx = session.route_change_rx();
                 let (stop_tx, stop_rx) = watch::channel(false);
-                let pipeline_task = tokio::spawn(run_registered_tun_fd(
-                    async_fd,
-                    ctx.clone(),
-                    Arc::clone(tun_stats),
-                    Arc::clone(events),
-                    DESKTOP_MTU,
-                    TunProfile::DESKTOP,
-                    stop_rx,
-                ));
+                let pipeline_task =
+                    tokio::spawn(vdpi_tun::fd::run_registered_tun_fd_with_route_watch(
+                        async_fd,
+                        ctx.clone(),
+                        Arc::clone(tun_stats),
+                        Arc::clone(events),
+                        tun_mtu,
+                        TunProfile::DESKTOP,
+                        stop_rx,
+                        Some(route_rx.clone()),
+                    ));
 
                 self.session = Some(PlatformTunHandle::Macos(session));
                 self.pipeline_stop_tx = Some(stop_tx);
@@ -1753,6 +1761,34 @@ mod desktop_tun {
                 slot.start(&binder, cfg.tun_ipv6, &ctx, &tun_stats, &events)
                     .await?;
             }
+        }
+
+        if slot.is_running() {
+            let probe_ctx = ctx.clone();
+            tokio::spawn(async move {
+                match tokio::time::timeout(
+                    Duration::from_secs(4),
+                    probe_ctx.dns.resolve("cloudflare.com"),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {
+                        debug!("TUN outbound bound DNS probe succeeded");
+                    }
+                    Ok(Err(err)) => {
+                        warn!(
+                            error = %err,
+                            "TUN outbound bound DNS probe failed - check physical uplink / firewall"
+                        );
+                    }
+                    Err(_) => {
+                        warn!(
+                            error = "timed out after 4s",
+                            "TUN outbound bound DNS probe failed - check physical uplink / firewall"
+                        );
+                    }
+                }
+            });
         }
 
         let health_listener = match bind_loopback_health_listener(DEFAULT_TUN_HEALTH_PORT) {

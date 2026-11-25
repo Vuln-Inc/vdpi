@@ -2,7 +2,7 @@
 
 use crate::config::{TunProfile, MAX_MTU, MIN_MTU};
 use crate::events::EventRing;
-use crate::pipeline::{run_tun_pipeline, wait_shutdown, TunStats};
+use crate::pipeline::{run_tun_pipeline_with_route_watch, wait_shutdown, TunStats};
 use anyhow::{anyhow, Context, Result};
 use std::io::ErrorKind;
 use std::os::unix::io::{AsRawFd, OwnedFd};
@@ -17,9 +17,6 @@ use vdpi_core::desync::EngineContext;
 const TUN_PI_LEN: usize = 4;
 #[cfg(not(target_os = "macos"))]
 const TUN_PI_LEN: usize = 0;
-
-/// Maximum packets drained per `AsyncFd` readiness wakeup before yielding back to Tokio.
-const IO_BATCH_LIMIT: usize = 32;
 
 struct AbortOnDrop(Vec<AbortHandle>);
 
@@ -53,7 +50,35 @@ pub async fn run_registered_tun_fd(
     profile: TunProfile,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
+    run_registered_tun_fd_with_route_watch(
+        async_fd,
+        ctx,
+        tun_stats,
+        events,
+        mtu,
+        profile,
+        shutdown_rx,
+        None,
+    )
+    .await
+}
+
+/// Runs the TUN engine attached to a registered Unix/Android `AsyncFd<OwnedFd>` with an
+/// optional route-change watch receiver that drains and rebinds active UDP Cone-NAT flows
+/// on uplink switches. Closes the TUN fd automatically when the tunnel stops or exits.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_registered_tun_fd_with_route_watch(
+    async_fd: Arc<AsyncFd<OwnedFd>>,
+    ctx: EngineContext,
+    tun_stats: Arc<TunStats>,
+    events: Arc<EventRing>,
+    mtu: usize,
+    profile: TunProfile,
+    shutdown_rx: watch::Receiver<bool>,
+    route_rx: Option<watch::Receiver<u64>>,
+) -> Result<()> {
     let clamped_mtu = mtu.clamp(MIN_MTU, MAX_MTU);
+    let io_batch_limit = profile.batch_size.clamp(16, 256);
     let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>(profile.channel_capacity);
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(profile.channel_capacity);
     let (fd_stop_tx, fd_stop_rx) = watch::channel(false);
@@ -86,7 +111,7 @@ pub async fn run_registered_tun_fd(
             };
 
             let mut drained = 0usize;
-            while drained < IO_BATCH_LIMIT {
+            while drained < io_batch_limit {
                 match guard.try_io(|inner| read_raw_fd(inner.as_raw_fd(), &mut buf)) {
                     Ok(Ok(0)) => {
                         let _ = read_stop_tx.send(true);
@@ -100,7 +125,21 @@ pub async fn run_registered_tun_fd(
                         };
                         match inbound_tx.try_send(ip_pkt.to_vec()) {
                             Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(_)) => {}
+                            Err(mpsc::error::TrySendError::Full(pkt)) => {
+                                // Drop readiness guard before awaiting channel space so backpressure
+                                // stays in the kernel TUN queue instead of silently dropping TCP frames.
+                                drop(guard);
+                                tokio::select! {
+                                    biased;
+                                    _ = wait_shutdown(&mut stop_read) => break 'outer,
+                                    res = inbound_tx.send(pkt) => {
+                                        if res.is_err() {
+                                            break 'outer;
+                                        }
+                                    }
+                                }
+                                break;
+                            }
                             Err(mpsc::error::TrySendError::Closed(_)) => break 'outer,
                         }
                     }
@@ -148,7 +187,7 @@ pub async fn run_registered_tun_fd(
             };
 
             let mut written = 0usize;
-            while written < IO_BATCH_LIMIT {
+            while written < io_batch_limit {
                 let pkt = match pending.take() {
                     Some(p) => p,
                     None => match outbound_rx.try_recv() {
@@ -189,7 +228,7 @@ pub async fn run_registered_tun_fd(
         writer_task.abort_handle(),
     ]);
 
-    let pipeline_res = run_tun_pipeline(
+    let pipeline_res = run_tun_pipeline_with_route_watch(
         inbound_rx,
         outbound_tx,
         ctx,
@@ -198,6 +237,7 @@ pub async fn run_registered_tun_fd(
         clamped_mtu,
         profile,
         fd_stop_rx,
+        route_rx,
     )
     .await;
 

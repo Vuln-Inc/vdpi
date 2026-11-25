@@ -17,6 +17,7 @@ use tracing::debug;
 
 const QTYPE_A: u16 = 1;
 const QTYPE_CNAME: u16 = 5;
+const QTYPE_SOA: u16 = 6;
 const QTYPE_AAAA: u16 = 28;
 const QTYPE_SVCB: u16 = 64;
 const QTYPE_HTTPS: u16 = 65;
@@ -140,7 +141,7 @@ impl DnsResolver {
 
         let dns_addr = dns_addr.as_ref();
         let udp_dns_servers = build_udp_dns_servers(dns_addr, dns_port);
-        let doh_endpoints = build_doh_endpoints(dns_addr);
+        let doh_endpoints = build_doh_endpoints(dns_addr, outbound_binder.is_some());
 
         Ok(Self {
             enable_doh,
@@ -1079,20 +1080,9 @@ impl DnsResolver {
             normalized_query[1] = 0;
         }
         let start = self.preferred_doh_idx.load(Ordering::Relaxed) % count;
-        if let Ok(bytes) = send_doh_wire(
-            &self.http,
-            self.outbound_binder.as_deref(),
-            self.bound_tls_connector.as_ref(),
-            &self.doh_endpoints[start],
-            &normalized_query,
-        )
-        .await
-        {
-            return Ok(bytes);
-        }
-        for offset in 1..count.min(3) {
+        for offset in 0..count.min(3) {
             let idx = (start + offset) % count;
-            if let Ok(bytes) = send_doh_wire(
+            let Ok(bytes) = send_doh_wire(
                 &self.http,
                 self.outbound_binder.as_deref(),
                 self.bound_tls_connector.as_ref(),
@@ -1100,8 +1090,13 @@ impl DnsResolver {
                 &normalized_query,
             )
             .await
-            {
-                self.preferred_doh_idx.store(idx, Ordering::Relaxed);
+            else {
+                continue;
+            };
+            if is_valid_raw_dns_reply(&bytes, false) {
+                if offset > 0 {
+                    self.preferred_doh_idx.store(idx, Ordering::Relaxed);
+                }
                 return Ok(bytes);
             }
         }
@@ -1114,27 +1109,37 @@ impl DnsResolver {
             bail!("no UDP DNS servers configured");
         }
         let start = self.preferred_udp_idx.load(Ordering::Relaxed) % count;
-        for offset in 0..count.min(3) {
+        for offset in 0..count {
             let idx = (start + offset) % count;
-            if let Ok(bytes) = send_udp_dns_raw(
+            let Ok(bytes) = send_udp_dns_raw(
                 self.udp_dns_servers[idx],
                 wire_query,
                 self.outbound_binder.as_deref(),
             )
             .await
-            {
-                let is_tc =
-                    bytes.len() >= 4 && (u16::from_be_bytes([bytes[2], bytes[3]]) & 0x0200) != 0;
-                if !is_tc {
-                    if offset > 0 {
-                        self.preferred_udp_idx.store(idx, Ordering::Relaxed);
-                    }
-                    return Ok(bytes);
+            else {
+                continue;
+            };
+            if is_valid_raw_dns_reply(&bytes, true) {
+                if offset > 0 {
+                    self.preferred_udp_idx.store(idx, Ordering::Relaxed);
                 }
+                return Ok(bytes);
             }
         }
         bail!("raw UDP DNS query failed")
     }
+}
+
+fn is_valid_raw_dns_reply(bytes: &[u8], reject_truncated: bool) -> bool {
+    if bytes.len() < 12 {
+        return false;
+    }
+    let flags = u16::from_be_bytes([bytes[2], bytes[3]]);
+    let is_response = (flags & 0x8000) != 0;
+    let is_tc = (flags & 0x0200) != 0;
+    let rcode = flags & 0x000f;
+    is_response && !(reject_truncated && is_tc) && !matches!(rcode, 2 | 5)
 }
 
 async fn send_udp_dns_raw(
@@ -1181,22 +1186,28 @@ async fn send_udp_dns_raw(
     };
     sock.connect(server).await?;
     sock.send(&outbound_query).await?;
-    let mut buf = [0u8; 2048];
-    let n = tokio::time::timeout(Duration::from_millis(1000), sock.recv(&mut buf))
-        .await
-        .map_err(|_| anyhow!("UDP DNS timeout from {server}"))??;
-    let resp = &buf[..n];
-    if resp.len() < 12 {
-        bail!("UDP DNS response shorter than 12-byte header from {server}");
+    let mut buf = [0u8; 4096];
+    let deadline = Instant::now() + Duration::from_millis(1000);
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            bail!("UDP DNS timeout from {server}");
+        };
+        if remaining.is_zero() {
+            bail!("UDP DNS timeout from {server}");
+        }
+        let n = tokio::time::timeout(remaining, sock.recv(&mut buf))
+            .await
+            .map_err(|_| anyhow!("UDP DNS timeout from {server}"))??;
+        let resp = &buf[..n];
+        if resp.len() < 12 || resp[0..2] != tx_bytes {
+            continue;
+        }
+        let flags = u16::from_be_bytes([resp[2], resp[3]]);
+        if (flags & 0x8000) == 0 {
+            continue;
+        }
+        return Ok(resp.to_vec());
     }
-    if resp[0..2] != tx_bytes {
-        bail!("UDP DNS response TXID mismatch from {server}");
-    }
-    let flags = u16::from_be_bytes([resp[2], resp[3]]);
-    if (flags & 0x8000) == 0 {
-        bail!("UDP DNS response missing QR=1 bit from {server}");
-    }
-    Ok(resp.to_vec())
 }
 
 struct ParsedDnsQuestion {
@@ -1285,13 +1296,20 @@ fn build_dns_wire_response(
     // QR=1 (0x8000), RA=1 (0x0080), preserve RD, set RCODE
     let resp_flags = 0x8080 | rd | u16::from(rcode & 0x0f);
     let ancount = u16::try_from(answers.len()).unwrap_or(u16::MAX);
+    let include_negative_soa = answers.is_empty() && ttl_secs > 0 && matches!(rcode, 0 | 3);
+    let nscount = u16::from(include_negative_soa);
 
-    let mut out = Vec::with_capacity(12 + question_slice.len() + answers.len() * 28);
+    let extra_cap = if include_negative_soa {
+        35
+    } else {
+        answers.len() * 28
+    };
+    let mut out = Vec::with_capacity(12 + question_slice.len() + extra_cap);
     out.extend_from_slice(&tx_id.to_be_bytes());
     out.extend_from_slice(&resp_flags.to_be_bytes());
     out.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT = 1
     out.extend_from_slice(&ancount.to_be_bytes());
-    out.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT = 0
+    out.extend_from_slice(&nscount.to_be_bytes()); // NSCOUNT
     out.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT = 0
     out.extend_from_slice(question_slice);
 
@@ -1314,6 +1332,23 @@ fn build_dns_wire_response(
                 out.extend_from_slice(&v6.octets());
             }
         }
+    }
+
+    if include_negative_soa {
+        // Minimal RFC 2308 Authority SOA RR so OS stub resolvers (mDNSResponder, dnscache)
+        // negatively cache HTTPS/SVCB/AAAA NODATA and NXDOMAIN replies.
+        out.extend_from_slice(&[0xc0, 0x0c]); // NAME: pointer to QNAME at offset 12
+        out.extend_from_slice(&QTYPE_SOA.to_be_bytes()); // TYPE = SOA (6)
+        out.extend_from_slice(&QCLASS_IN.to_be_bytes()); // CLASS = IN (1)
+        out.extend_from_slice(&ttl_secs.to_be_bytes()); // TTL
+        out.extend_from_slice(&23u16.to_be_bytes()); // RDLENGTH = 2 + 1 + 5*4 = 23
+        out.extend_from_slice(&[0xc0, 0x0c]); // MNAME: pointer to QNAME at offset 12
+        out.push(0x00); // RNAME: root (.)
+        out.extend_from_slice(&1u32.to_be_bytes()); // SERIAL = 1
+        out.extend_from_slice(&3600u32.to_be_bytes()); // REFRESH = 3600
+        out.extend_from_slice(&600u32.to_be_bytes()); // RETRY = 600
+        out.extend_from_slice(&86400u32.to_be_bytes()); // EXPIRE = 86400
+        out.extend_from_slice(&ttl_secs.to_be_bytes()); // MINIMUM = ttl_secs
     }
     out
 }
@@ -1490,6 +1525,9 @@ fn parse_http_doh_head(raw: &[u8], endpoint: &str) -> Result<Option<HttpDohHead>
         }
         return Ok(None);
     };
+    if pos > MAX_BOUND_DOH_HEADER_BYTES {
+        bail!("DoH HTTP headers exceeded {MAX_BOUND_DOH_HEADER_BYTES} bytes from {endpoint}");
+    }
     let head_str = std::str::from_utf8(&raw[..pos])
         .with_context(|| format!("non-UTF8 DoH HTTP response headers from {endpoint}"))?;
     let mut lines = head_str.split("\r\n");
@@ -1497,9 +1535,12 @@ fn parse_http_doh_head(raw: &[u8], endpoint: &str) -> Result<Option<HttpDohHead>
         .next()
         .ok_or_else(|| anyhow!("empty DoH HTTP response from {endpoint}"))?;
     let mut parts = status_line.split_ascii_whitespace();
-    let _version = parts
+    let version = parts
         .next()
         .ok_or_else(|| anyhow!("malformed DoH HTTP status line from {endpoint}"))?;
+    if !version.starts_with("HTTP/") {
+        bail!("malformed DoH HTTP status line from {endpoint}");
+    }
     let status_code = parts
         .next()
         .ok_or_else(|| anyhow!("missing DoH HTTP status code from {endpoint}"))?;
@@ -1520,9 +1561,14 @@ fn parse_http_doh_head(raw: &[u8], endpoint: &str) -> Result<Option<HttpDohHead>
                 if cl > MAX_DNS_MESSAGE_BYTES {
                     bail!("DoH response exceeded {MAX_DNS_MESSAGE_BYTES} bytes");
                 }
+                if content_length.is_some_and(|prev| prev != cl) {
+                    bail!("conflicting DoH Content-Length headers from {endpoint}");
+                }
                 content_length = Some(cl);
             } else if name.eq_ignore_ascii_case("transfer-encoding")
-                && val.to_ascii_lowercase().contains("chunked")
+                && val
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("chunked"))
             {
                 chunked = true;
             }
@@ -1536,7 +1582,7 @@ fn parse_http_doh_head(raw: &[u8], endpoint: &str) -> Result<Option<HttpDohHead>
     }))
 }
 
-fn decode_chunked_body(input: &[u8], max_bytes: usize) -> Result<Option<Vec<u8>>> {
+fn decode_http_chunked_body(input: &[u8], max_bytes: usize) -> Result<Option<Vec<u8>>> {
     let mut out = Vec::new();
     let mut pos = 0usize;
     loop {
@@ -1545,14 +1591,19 @@ fn decode_chunked_body(input: &[u8], max_bytes: usize) -> Result<Option<Vec<u8>>
         };
         let size_line =
             std::str::from_utf8(&input[pos..pos + rel_crlf]).context("non-UTF8 HTTP chunk size")?;
-        let size_hex = size_line.split(';').next().unwrap_or(size_line).trim();
+        let size_hex = size_line
+            .split_once(';')
+            .map_or(size_line, |(size, _)| size)
+            .trim();
+        if size_hex.is_empty() || !size_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!("invalid HTTP chunk size '{size_hex}'");
+        }
         let chunk_len = usize::from_str_radix(size_hex, 16)
             .with_context(|| format!("invalid HTTP chunk size '{size_hex}'"))?;
         pos += rel_crlf + 2;
         if chunk_len == 0 {
-            if input[pos..].starts_with(b"\r\n")
-                || input[pos..].windows(4).any(|w| w == b"\r\n\r\n")
-            {
+            let rest = &input[pos..];
+            if rest.starts_with(b"\r\n") || rest.windows(4).any(|w| w == b"\r\n\r\n") {
                 return Ok(Some(out));
             }
             return Ok(None);
@@ -1560,15 +1611,63 @@ fn decode_chunked_body(input: &[u8], max_bytes: usize) -> Result<Option<Vec<u8>>
         if chunk_len > max_bytes.saturating_sub(out.len()) {
             bail!("DoH response exceeded {max_bytes} bytes");
         }
-        if pos + chunk_len + 2 > input.len() {
+        let Some(chunk_end) = pos.checked_add(chunk_len) else {
+            bail!("DoH response exceeded {max_bytes} bytes");
+        };
+        let Some(next_pos) = chunk_end.checked_add(2) else {
+            bail!("DoH response exceeded {max_bytes} bytes");
+        };
+        if next_pos > input.len() {
             return Ok(None);
         }
-        out.extend_from_slice(&input[pos..pos + chunk_len]);
-        pos += chunk_len;
-        if &input[pos..pos + 2] != b"\r\n" {
+        out.extend_from_slice(&input[pos..chunk_end]);
+        if &input[chunk_end..next_pos] != b"\r\n" {
             bail!("malformed HTTP chunk terminator");
         }
-        pos += 2;
+        pos = next_pos;
+    }
+}
+
+fn parse_http_doh_response(
+    raw: &[u8],
+    parsed_head: &mut Option<HttpDohHead>,
+    endpoint: &str,
+    eof: bool,
+) -> Result<Option<Vec<u8>>> {
+    if parsed_head.is_none() {
+        *parsed_head = parse_http_doh_head(raw, endpoint)?;
+    }
+    let Some(head) = parsed_head.as_ref() else {
+        if eof {
+            bail!("incomplete DoH HTTP response headers from {endpoint}");
+        }
+        return Ok(None);
+    };
+
+    let body = &raw[head.body_offset..];
+    if head.chunked {
+        match decode_http_chunked_body(body, MAX_DNS_MESSAGE_BYTES)? {
+            Some(decoded) => Ok(Some(decoded)),
+            None if eof => bail!("truncated chunked DoH response from {endpoint}"),
+            None => Ok(None),
+        }
+    } else if let Some(cl) = head.content_length {
+        if body.len() >= cl {
+            Ok(Some(body[..cl].to_vec()))
+        } else if eof {
+            bail!(
+                "truncated DoH response from {endpoint} (got {} of {cl} bytes)",
+                body.len()
+            );
+        } else {
+            Ok(None)
+        }
+    } else if body.len() > MAX_DNS_MESSAGE_BYTES {
+        bail!("DoH response exceeded {MAX_DNS_MESSAGE_BYTES} bytes");
+    } else if eof {
+        Ok(Some(body.to_vec()))
+    } else {
+        Ok(None)
     }
 }
 
@@ -1620,24 +1719,10 @@ async fn send_doh_bound_tls(
                     }
                     raw.extend_from_slice(&buf[..n]);
 
-                    if parsed_head.is_none() {
-                        parsed_head = parse_http_doh_head(&raw, endpoint)?;
-                    }
-                    if let Some(ref head) = parsed_head {
-                        let body = &raw[head.body_offset..];
-                        if head.chunked {
-                            if let Some(decoded) =
-                                decode_chunked_body(body, MAX_DNS_MESSAGE_BYTES)?
-                            {
-                                return Ok(decoded);
-                            }
-                        } else if let Some(cl) = head.content_length {
-                            if body.len() >= cl {
-                                return Ok(body[..cl].to_vec());
-                            }
-                        } else if body.len() > MAX_DNS_MESSAGE_BYTES {
-                            bail!("DoH response exceeded {MAX_DNS_MESSAGE_BYTES} bytes");
-                        }
+                    if let Some(body) =
+                        parse_http_doh_response(&raw, &mut parsed_head, endpoint, false)?
+                    {
+                        return Ok(body);
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -1648,29 +1733,8 @@ async fn send_doh_bound_tls(
             }
         }
 
-        let head = match parsed_head {
-            Some(h) => h,
-            None => parse_http_doh_head(&raw, endpoint)?
-                .ok_or_else(|| anyhow!("incomplete DoH HTTP response headers from {endpoint}"))?,
-        };
-        let body = &raw[head.body_offset..];
-        if head.chunked {
-            decode_chunked_body(body, MAX_DNS_MESSAGE_BYTES)?
-                .ok_or_else(|| anyhow!("truncated chunked DoH response from {endpoint}"))
-        } else if let Some(cl) = head.content_length {
-            if body.len() < cl {
-                bail!(
-                    "truncated DoH response from {endpoint} (got {} of {cl} bytes)",
-                    body.len()
-                );
-            }
-            Ok(body[..cl].to_vec())
-        } else {
-            if body.len() > MAX_DNS_MESSAGE_BYTES {
-                bail!("DoH response exceeded {MAX_DNS_MESSAGE_BYTES} bytes");
-            }
-            Ok(body.to_vec())
-        }
+        parse_http_doh_response(&raw, &mut parsed_head, endpoint, true)?
+            .ok_or_else(|| anyhow!("incomplete DoH HTTP response from {endpoint}"))
     })
     .await
     .map_err(|_| anyhow!("bound DoH exchange timeout to {endpoint}"))?
@@ -1749,7 +1813,22 @@ async fn send_doh_request(
     }
 }
 
-fn build_doh_endpoints(dns_addr: &str) -> Vec<String> {
+fn is_http2_only_doh_endpoint(endpoint: &str) -> bool {
+    let Ok(target) = parse_bound_doh_endpoint(endpoint) else {
+        return false;
+    };
+    match target.addr.ip() {
+        IpAddr::V4(ip) => {
+            ip == Ipv4Addr::new(9, 9, 9, 9) || ip == Ipv4Addr::new(149, 112, 112, 112)
+        }
+        IpAddr::V6(ip) => {
+            ip == Ipv6Addr::new(0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x00fe)
+                || ip == Ipv6Addr::new(0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x0009)
+        }
+    }
+}
+
+fn build_doh_endpoints(dns_addr: &str, bound_http1: bool) -> Vec<String> {
     let mut list = Vec::new();
     let trimmed = dns_addr.trim();
     if trimmed.starts_with("https://") {
@@ -1782,6 +1861,11 @@ fn build_doh_endpoints(dns_addr: &str) -> Vec<String> {
         if !list.iter().any(|x| x == fallback) {
             list.push(fallback.to_string());
         }
+    }
+
+    if bound_http1 {
+        // Bound TLS DoH speaks HTTP/1.1 ALPN; Quad9 rejects HTTP/1.1 with HTTP 505.
+        list.retain(|ep| !is_http2_only_doh_endpoint(ep));
     }
     list
 }
@@ -2224,7 +2308,7 @@ mod tests {
         assert!(parse_dns_question(&nx_resp).is_err());
 
         // IPv6 literals must be bracketed in DoH URLs
-        let endpoints = build_doh_endpoints("2606:4700:4700::1111");
+        let endpoints = build_doh_endpoints("2606:4700:4700::1111", false);
         assert_eq!(endpoints[0], "https://[2606:4700:4700::1111]/dns-query");
     }
 
@@ -2479,10 +2563,200 @@ mod tests {
         )
         .is_err());
 
-        let decoded = decode_chunked_body(b"4\r\nabcd\r\n2\r\nef\r\n0\r\n\r\n", 64)
+        let decoded = decode_http_chunked_body(b"4\r\nabcd\r\n2\r\nef\r\n0\r\n\r\n", 64)
             .unwrap()
             .unwrap();
         assert_eq!(decoded, b"abcdef");
+    }
+
+    #[test]
+    fn decode_http_chunked_body_handles_chunks_extensions_trailers_and_errors() {
+        let multi =
+            decode_http_chunked_body(b"4;ext=1\r\nabcd\r\nA\r\n0123456789\r\n0\r\n\r\n", 64)
+                .unwrap()
+                .unwrap();
+        assert_eq!(multi, b"abcd0123456789");
+
+        let with_trailers = decode_http_chunked_body(b"3\r\ndns\r\n0\r\nX-Trailer: ok\r\n\r\n", 64)
+            .unwrap()
+            .unwrap();
+        assert_eq!(with_trailers, b"dns");
+
+        let empty = decode_http_chunked_body(b"0\r\n\r\n", 64).unwrap().unwrap();
+        assert!(empty.is_empty());
+
+        assert!(decode_http_chunked_body(b"4\r\nab", 64).unwrap().is_none());
+        assert!(decode_http_chunked_body(b"4\r\nabcd\r\n0\r\n", 64)
+            .unwrap()
+            .is_none());
+        assert!(decode_http_chunked_body(b"0\r\nX-Trailer: ok\r\n", 64)
+            .unwrap()
+            .is_none());
+
+        assert!(decode_http_chunked_body(b"z\r\n\r\n", 64).is_err());
+        assert!(decode_http_chunked_body(b"+4\r\nabcd\r\n0\r\n\r\n", 64).is_err());
+        assert!(decode_http_chunked_body(b"\r\n", 64).is_err());
+        assert!(decode_http_chunked_body(b"4\r\nabcdXX0\r\n\r\n", 64).is_err());
+        assert!(decode_http_chunked_body(b"5\r\nhello\r\n0\r\n\r\n", 4).is_err());
+    }
+
+    #[test]
+    fn parse_http_doh_response_handles_content_length_chunked_and_eof() {
+        let endpoint = "https://1.1.1.1/dns-query";
+
+        // Content-Length (case-insensitive): incremental arrival and fast return before EOF.
+        let mut head = None;
+        let mut raw = b"HTTP/1.1 200 OK\r\ncOnTeNt-LeNgTh: 6\r\n".to_vec();
+        assert!(parse_http_doh_response(&raw, &mut head, endpoint, false)
+            .unwrap()
+            .is_none());
+        raw.extend_from_slice(b"\r\nab");
+        assert!(parse_http_doh_response(&raw, &mut head, endpoint, false)
+            .unwrap()
+            .is_none());
+        assert!(parse_http_doh_response(&raw, &mut head, endpoint, true).is_err());
+        raw.extend_from_slice(b"cdefEXTRA");
+        let body = parse_http_doh_response(&raw, &mut head, endpoint, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(body, b"abcdef");
+
+        // Transfer-Encoding: chunked (case-insensitive): incremental decode and fast return before EOF.
+        let mut chunked_head = None;
+        let mut chunked_raw =
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: gzip, CHUNKED\r\n\r\n4\r\nabcd\r\n".to_vec();
+        assert!(
+            parse_http_doh_response(&chunked_raw, &mut chunked_head, endpoint, false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(parse_http_doh_response(&chunked_raw, &mut chunked_head, endpoint, true).is_err());
+        chunked_raw.extend_from_slice(b"2\r\nef\r\n0\r\n\r\n");
+        let chunked_body =
+            parse_http_doh_response(&chunked_raw, &mut chunked_head, endpoint, false)
+                .unwrap()
+                .unwrap();
+        assert_eq!(chunked_body, b"abcdef");
+
+        // Fallback to EOF when neither Content-Length nor Transfer-Encoding: chunked is present.
+        let mut eof_head = None;
+        let eof_raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\n\r\nraw-dns";
+        assert!(
+            parse_http_doh_response(eof_raw, &mut eof_head, endpoint, false)
+                .unwrap()
+                .is_none()
+        );
+        let eof_body = parse_http_doh_response(eof_raw, &mut eof_head, endpoint, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(eof_body, b"raw-dns");
+
+        // Conflicting Content-Length and malformed status line are rejected.
+        let mut bad_head = None;
+        assert!(parse_http_doh_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Length: 5\r\n\r\nabcd",
+            &mut bad_head,
+            endpoint,
+            true,
+        )
+        .is_err());
+        let mut bad_status_head = None;
+        assert!(parse_http_doh_response(
+            b"BAD 200 OK\r\nContent-Length: 0\r\n\r\n",
+            &mut bad_status_head,
+            endpoint,
+            true,
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn send_doh_bound_tls_fast_returns_on_content_length_and_decodes_chunked() {
+        let (server_cfg, connector) = make_local_doh_tls_pair();
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_cfg);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (cl_release_tx, cl_release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (chunked_release_tx, chunked_release_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server_task = tokio::spawn(async move {
+            // 1. Content-Length response held open (no FIN/close_notify until released).
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+            let query = read_doh_test_request(&mut tls).await;
+            let parsed = parse_dns_question(&query).unwrap();
+            let wire_resp = build_dns_wire_response(
+                parsed.tx_id,
+                parsed.flags,
+                &query[12..parsed.question_end],
+                0,
+                &[IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+                120,
+            );
+            let http_resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\n\r\n",
+                wire_resp.len()
+            );
+            tls.write_all(http_resp.as_bytes()).await.unwrap();
+            tls.write_all(&wire_resp).await.unwrap();
+            tls.flush().await.unwrap();
+            let _ = cl_release_rx.await;
+            drop(tls);
+
+            // 2. Chunked HTTP/1.1 response split across two flushes and held open.
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+            let query = read_doh_test_request(&mut tls).await;
+            let parsed = parse_dns_question(&query).unwrap();
+            let wire_resp = build_dns_wire_response(
+                parsed.tx_id,
+                parsed.flags,
+                &query[12..parsed.question_end],
+                0,
+                &[IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+                60,
+            );
+            let mid = wire_resp.len() / 2;
+            let chunk1_head = format!("{mid:x}\r\n");
+            let chunk2_head = format!("{:x}\r\n", wire_resp.len() - mid);
+            tls.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nTransfer-Encoding: chunked\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            tls.write_all(chunk1_head.as_bytes()).await.unwrap();
+            tls.write_all(&wire_resp[..mid]).await.unwrap();
+            tls.write_all(b"\r\n").await.unwrap();
+            tls.flush().await.unwrap();
+            tls.write_all(chunk2_head.as_bytes()).await.unwrap();
+            tls.write_all(&wire_resp[mid..]).await.unwrap();
+            tls.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+            tls.flush().await.unwrap();
+            let _ = chunked_release_rx.await;
+            drop(tls);
+        });
+
+        let binder = NoopBinder;
+        let endpoint = format!("https://127.0.0.1:{}/dns-query", addr.port());
+
+        let q1 = encode_dns_query("fast-cl.example", QTYPE_A).unwrap();
+        let raw_cl = send_doh_bound_tls(&binder, &connector, &endpoint, &q1)
+            .await
+            .unwrap();
+        let _ = cl_release_tx.send(());
+        let (ips_cl, _) = decode_dns_response(&raw_cl, QTYPE_A).unwrap();
+        assert_eq!(ips_cl, vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
+
+        let q2 = encode_dns_query("chunked-doh.example", QTYPE_A).unwrap();
+        let raw_chunked = send_doh_bound_tls(&binder, &connector, &endpoint, &q2)
+            .await
+            .unwrap();
+        let _ = chunked_release_tx.send(());
+        let (ips_chunked, _) = decode_dns_response(&raw_chunked, QTYPE_A).unwrap();
+        assert_eq!(ips_chunked, vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))]);
+
+        server_task.await.unwrap();
     }
 
     #[tokio::test]
@@ -2923,5 +3197,265 @@ mod tests {
             !entry.has_aaaa_lookup,
             "timed-out AAAA lookup must not be cached as completed"
         );
+    }
+
+    #[test]
+    fn bound_doh_skips_quad9_http2_only_endpoints() {
+        let bound_q9 = build_doh_endpoints("9.9.9.9", true);
+        assert!(!bound_q9.is_empty());
+        assert!(!bound_q9.iter().any(|ep| ep.contains("9.9.9.9")));
+        assert!(!bound_q9.iter().any(|ep| ep.contains("149.112.112.112")));
+        assert!(bound_q9.iter().any(|ep| ep == "https://1.1.1.1/dns-query"));
+
+        let bound_q9_alt = build_doh_endpoints("149.112.112.112", true);
+        assert!(!bound_q9_alt.iter().any(|ep| ep.contains("9.9.9.9")));
+        assert!(!bound_q9_alt.iter().any(|ep| ep.contains("149.112.112.112")));
+
+        let unbound_q9 = build_doh_endpoints("9.9.9.9", false);
+        assert_eq!(unbound_q9[0], "https://9.9.9.9/dns-query");
+        assert!(unbound_q9
+            .iter()
+            .any(|ep| ep == "https://149.112.112.112/dns-query"));
+
+        let binder: Arc<dyn OutboundBinder> = Arc::new(NoopBinder);
+        let resolver =
+            DnsResolver::new_with_binder("9.9.9.9", 53, true, false, Some(binder)).unwrap();
+        assert!(!resolver
+            .doh_endpoints
+            .iter()
+            .any(|ep| ep.contains("9.9.9.9") || ep.contains("149.112.112.112")));
+    }
+
+    #[test]
+    fn build_dns_wire_response_appends_rfc2308_soa_for_negative_replies() {
+        let q = encode_dns_query("nodata.example", QTYPE_HTTPS).unwrap();
+        let question_slice = &q[12..];
+
+        for (rcode, ttl_secs) in [(0u8, 60u32), (3u8, 30u32)] {
+            let resp =
+                build_dns_wire_response(0x1234, 0x0100, question_slice, rcode, &[], ttl_secs);
+            assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0);
+            assert_eq!(u16::from_be_bytes([resp[8], resp[9]]), 1);
+            let auth = &resp[12 + question_slice.len()..];
+            assert_eq!(auth.len(), 35);
+            assert_eq!(&auth[0..2], &[0xc0, 0x0c]);
+            assert_eq!(u16::from_be_bytes([auth[2], auth[3]]), QTYPE_SOA);
+            assert_eq!(u16::from_be_bytes([auth[4], auth[5]]), QCLASS_IN);
+            assert_eq!(
+                u32::from_be_bytes([auth[6], auth[7], auth[8], auth[9]]),
+                ttl_secs
+            );
+            assert_eq!(u16::from_be_bytes([auth[10], auth[11]]), 23);
+            assert_eq!(&auth[12..14], &[0xc0, 0x0c]);
+            assert_eq!(auth[14], 0x00);
+            assert_eq!(
+                u32::from_be_bytes([auth[15], auth[16], auth[17], auth[18]]),
+                1
+            );
+            assert_eq!(
+                u32::from_be_bytes([auth[19], auth[20], auth[21], auth[22]]),
+                3600
+            );
+            assert_eq!(
+                u32::from_be_bytes([auth[23], auth[24], auth[25], auth[26]]),
+                600
+            );
+            assert_eq!(
+                u32::from_be_bytes([auth[27], auth[28], auth[29], auth[30]]),
+                86400
+            );
+            assert_eq!(
+                u32::from_be_bytes([auth[31], auth[32], auth[33], auth[34]]),
+                ttl_secs
+            );
+        }
+
+        let positive = build_dns_wire_response(
+            0x1234,
+            0x0100,
+            question_slice,
+            0,
+            &[IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+            60,
+        );
+        assert_eq!(u16::from_be_bytes([positive[8], positive[9]]), 0);
+
+        let servfail = build_dns_wire_response(0x1234, 0x0100, question_slice, 2, &[], 60);
+        assert_eq!(u16::from_be_bytes([servfail[8], servfail[9]]), 0);
+
+        let zero_ttl = build_dns_wire_response(0x1234, 0x0100, question_slice, 0, &[], 0);
+        assert_eq!(u16::from_be_bytes([zero_ttl[8], zero_ttl[9]]), 0);
+    }
+
+    #[tokio::test]
+    async fn send_udp_dns_raw_skips_stray_packets_and_raw_queries_fail_over() {
+        // Unit checks for raw DNS reply validation helper.
+        assert!(!is_valid_raw_dns_reply(&[0u8; 11], false));
+        let mut hdr = [0u8; 12];
+        hdr[2..4].copy_from_slice(&0x0100u16.to_be_bytes()); // QR=0
+        assert!(!is_valid_raw_dns_reply(&hdr, false));
+        hdr[2..4].copy_from_slice(&0x8182u16.to_be_bytes()); // SERVFAIL
+        assert!(!is_valid_raw_dns_reply(&hdr, false));
+        hdr[2..4].copy_from_slice(&0x8185u16.to_be_bytes()); // REFUSED
+        assert!(!is_valid_raw_dns_reply(&hdr, false));
+        hdr[2..4].copy_from_slice(&0x8380u16.to_be_bytes()); // TC=1
+        assert!(!is_valid_raw_dns_reply(&hdr, true));
+        assert!(is_valid_raw_dns_reply(&hdr, false));
+        hdr[2..4].copy_from_slice(&0x8180u16.to_be_bytes()); // NOERROR
+        assert!(is_valid_raw_dns_reply(&hdr, true));
+        hdr[2..4].copy_from_slice(&0x8183u16.to_be_bytes()); // NXDOMAIN
+        assert!(is_valid_raw_dns_reply(&hdr, true));
+
+        // 1. send_udp_dns_raw skips short, mismatched-TXID, and QR=0 datagrams.
+        let stray_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stray_addr = stray_server.local_addr().unwrap();
+        let stray_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = stray_server.recv_from(&mut buf).await.unwrap();
+            let parsed = parse_dns_question(&buf[..n]).unwrap();
+            let qslice = &buf[12..parsed.question_end];
+            // Short packet
+            stray_server.send_to(&[0u8; 4], peer).await.unwrap();
+            // Wrong TXID
+            let wrong_tx = build_dns_wire_response(
+                parsed.tx_id ^ 0xffff,
+                parsed.flags,
+                qslice,
+                0,
+                &[IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))],
+                60,
+            );
+            stray_server.send_to(&wrong_tx, peer).await.unwrap();
+            // Matching TXID but QR=0
+            let mut qr0 = buf[..n].to_vec();
+            qr0[2] &= 0x7f;
+            stray_server.send_to(&qr0, peer).await.unwrap();
+            // Valid response
+            let good = build_dns_wire_response(
+                parsed.tx_id,
+                parsed.flags,
+                qslice,
+                0,
+                &[IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+                60,
+            );
+            stray_server.send_to(&good, peer).await.unwrap();
+        });
+
+        let q = encode_dns_query("stray-udp.example", QTYPE_A).unwrap();
+        let stray_resp = send_udp_dns_raw(stray_addr, &q, None).await.unwrap();
+        stray_task.await.unwrap();
+        let (ips, _) = decode_dns_response(&stray_resp, QTYPE_A).unwrap();
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
+
+        // 2. query_udp_raw fails over SERVFAIL, REFUSED, TC=1 past index 3 (beyond old .min(3) cap).
+        let s0 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a0 = s0.local_addr().unwrap();
+        let s1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a1 = s1.local_addr().unwrap();
+        let s2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a2 = s2.local_addr().unwrap();
+        let s3 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let a3 = s3.local_addr().unwrap();
+
+        let t0 = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = s0.recv_from(&mut buf).await.unwrap();
+            let p = parse_dns_question(&buf[..n]).unwrap();
+            let resp =
+                build_dns_wire_response(p.tx_id, p.flags, &buf[12..p.question_end], 2, &[], 0);
+            s0.send_to(&resp, peer).await.unwrap();
+        });
+        let t1 = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = s1.recv_from(&mut buf).await.unwrap();
+            let p = parse_dns_question(&buf[..n]).unwrap();
+            let resp =
+                build_dns_wire_response(p.tx_id, p.flags, &buf[12..p.question_end], 5, &[], 0);
+            s1.send_to(&resp, peer).await.unwrap();
+        });
+        let t2 = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = s2.recv_from(&mut buf).await.unwrap();
+            let p = parse_dns_question(&buf[..n]).unwrap();
+            let mut resp =
+                build_dns_wire_response(p.tx_id, p.flags, &buf[12..p.question_end], 0, &[], 0);
+            resp[2] |= 0x02; // TC=1
+            s2.send_to(&resp, peer).await.unwrap();
+        });
+        let t3 = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = s3.recv_from(&mut buf).await.unwrap();
+            let p = parse_dns_question(&buf[..n]).unwrap();
+            let resp = build_dns_wire_response(
+                p.tx_id,
+                p.flags,
+                &buf[12..p.question_end],
+                0,
+                &[IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+                60,
+            );
+            s3.send_to(&resp, peer).await.unwrap();
+        });
+
+        let mut resolver = DnsResolver::new("127.0.0.1", 53, false, true).unwrap();
+        resolver.udp_dns_servers = vec![a0, a1, a2, a3];
+        let raw_udp = resolver.query_udp_raw(&q).await.unwrap();
+        t0.await.unwrap();
+        t1.await.unwrap();
+        t2.await.unwrap();
+        t3.await.unwrap();
+        let (udp_ips, _) = decode_dns_response(&raw_udp, QTYPE_A).unwrap();
+        assert_eq!(udp_ips, vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
+        assert_eq!(resolver.preferred_udp_idx.load(Ordering::Relaxed), 3);
+
+        // 3. query_doh_raw rejects REFUSED (RCODE=5) and fails over to the next DoH endpoint.
+        let (server_cfg, connector) = make_local_doh_tls_pair();
+        let refused_acceptor = tokio_rustls::TlsAcceptor::from(Arc::clone(&server_cfg));
+        let ok_acceptor = tokio_rustls::TlsAcceptor::from(server_cfg);
+        let refused_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refused_addr = refused_listener.local_addr().unwrap();
+        let ok_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ok_addr = ok_listener.local_addr().unwrap();
+
+        let refused_task = tokio::spawn(async move {
+            let (tcp, _) = refused_listener.accept().await.unwrap();
+            let mut tls = refused_acceptor.accept(tcp).await.unwrap();
+            let query = read_doh_test_request(&mut tls).await;
+            let p = parse_dns_question(&query).unwrap();
+            let wire_resp =
+                build_dns_wire_response(p.tx_id, p.flags, &query[12..p.question_end], 5, &[], 0);
+            write_doh_test_response(&mut tls, &wire_resp).await;
+        });
+        let ok_task = tokio::spawn(async move {
+            let (tcp, _) = ok_listener.accept().await.unwrap();
+            let mut tls = ok_acceptor.accept(tcp).await.unwrap();
+            let query = read_doh_test_request(&mut tls).await;
+            let p = parse_dns_question(&query).unwrap();
+            let wire_resp = build_dns_wire_response(
+                p.tx_id,
+                p.flags,
+                &query[12..p.question_end],
+                0,
+                &[IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))],
+                60,
+            );
+            write_doh_test_response(&mut tls, &wire_resp).await;
+        });
+
+        let binder: Arc<dyn OutboundBinder> = Arc::new(NoopBinder);
+        let mut doh_resolver =
+            DnsResolver::new_with_binder("127.0.0.1", 53, true, true, Some(binder)).unwrap();
+        doh_resolver.bound_tls_connector = Some(connector);
+        doh_resolver.doh_endpoints = vec![
+            format!("https://127.0.0.1:{}/dns-query", refused_addr.port()),
+            format!("https://127.0.0.1:{}/dns-query", ok_addr.port()),
+        ];
+        let raw_doh = doh_resolver.query_doh_raw(&q).await.unwrap();
+        refused_task.await.unwrap();
+        ok_task.await.unwrap();
+        let (doh_ips, _) = decode_dns_response(&raw_doh, QTYPE_A).unwrap();
+        assert_eq!(doh_ips, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
+        assert_eq!(doh_resolver.preferred_doh_idx.load(Ordering::Relaxed), 1);
     }
 }

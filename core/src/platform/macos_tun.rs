@@ -1,6 +1,7 @@
 //! macOS desktop `utun` backend (`PF_SYSTEM` / `SYSPROTO_CONTROL`), physical uplink
-//! detection for `IP_BOUND_IF` / `IPV6_BOUND_IF`, split-route + LAN exclusion management,
-//! `networksetup` DNS snapshots, and a detached `setsid()` crash-cleanup guard.
+//! detection for `IP_BOUND_IF` / `IPV6_BOUND_IF`, split-route + `-ifscope` + LAN exclusion
+//! management, native `SCDynamicStore` session-scoped DNS on `utunN`, and a detached
+//! `setsid()` crash-cleanup guard.
 //!
 //! Pure parsing helpers and the crash-guard serde schema live outside `#[cfg(target_os = "macos")]`
 //! so they compile and unit-test cleanly on Windows, Linux, and macOS alike.
@@ -25,7 +26,10 @@ pub const MACOS_TUN_NETMASK_V4: &str = "255.255.255.252";
 /// Virtual IPv6 address assigned to `utun` when `--tun-ipv6` is enabled.
 pub const MACOS_TUN_IPV6: &str = "fd00:7664:7069::1";
 
-/// Default MTU configured on the macOS `utun` interface.
+/// Virtual DNS IPv6 address published via `SCDynamicStore` when `--tun-ipv6` is enabled.
+pub const MACOS_TUN_DNS_V6: &str = "fd00:7664:7069::2";
+
+/// Fallback MTU configured on the macOS `utun` interface when Jumbo MTUs are rejected.
 pub const MACOS_TUN_MTU: u16 = 1500;
 
 /// Hidden CLI flag used to invoke the detached macOS TUN crash-cleanup guard process.
@@ -87,8 +91,12 @@ pub fn parse_route_get_default(stdout: &str) -> Option<(String, Option<String>)>
         if key.eq_ignore_ascii_case("interface") {
             interface = Some(val.to_string());
         } else if key.eq_ignore_ascii_case("gateway")
-            && !val.starts_with("link#")
-            && !val.eq_ignore_ascii_case("default")
+            && val
+                .split('%')
+                .next()
+                .unwrap_or("")
+                .parse::<IpAddr>()
+                .is_ok()
         {
             gateway = Some(val.to_string());
         } else if key.eq_ignore_ascii_case("flags") {
@@ -188,7 +196,7 @@ pub fn is_relevant_pf_route_msg(buf: &[u8]) -> bool {
 /// during normal `Drop` or crash-guard recovery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManagedRoute {
-    /// Destination CIDR prefix (e.g. `"0.0.0.0/1"`, `"10.0.0.0/8"`, `"2000::/3"`).
+    /// Destination CIDR prefix or `"default"` (e.g. `"1.0.0.0/8"`, `"10.0.0.0/8"`, `"2000::/3"`, `"default"`).
     pub destination: String,
     /// `true` for `-inet6` routes, `false` for IPv4 `-inet` routes.
     #[serde(default)]
@@ -196,9 +204,12 @@ pub struct ManagedRoute {
     /// Interface name for `-interface <name>` routes.
     #[serde(default)]
     pub interface: Option<String>,
-    /// Gateway IP address for physical-gateway LAN exclusion routes.
+    /// Gateway IP address for physical-gateway LAN exclusion or `-ifscope` default routes.
     #[serde(default)]
     pub gateway: Option<String>,
+    /// Optional Darwin interface scope (`-ifscope <iface>`) for `IP_BOUND_IF` default routes.
+    #[serde(default)]
+    pub ifscope: Option<String>,
 }
 
 /// Snapshot of a macOS network service's DNS configuration prior to TUN activation.
@@ -335,36 +346,392 @@ pub fn build_macos_tun_cleanup_payload(state: &MacosTunGuardState) -> Result<Str
 mod imp {
     use super::{
         build_macos_tun_cleanup_payload, is_relevant_pf_route_msg, is_vdpi_owned_dns_servers,
-        parse_dns_servers_output, parse_route_get_default, sanitize_original_dns_servers,
-        DnsServiceSnapshot, MacosTunGuardState, ManagedRoute, MACOS_TUN_DNS_V4,
-        MACOS_TUN_GUARD_ARG, MACOS_TUN_IPV4, MACOS_TUN_IPV6, MACOS_TUN_MTU, MACOS_TUN_NETMASK_V4,
-        MACOS_TUN_STATE_PATH,
+        parse_dns_servers_output, parse_route_get_default, MacosTunGuardState, ManagedRoute,
+        MACOS_TUN_DNS_V4, MACOS_TUN_DNS_V6, MACOS_TUN_GUARD_ARG, MACOS_TUN_IPV4, MACOS_TUN_IPV6,
+        MACOS_TUN_MTU, MACOS_TUN_NETMASK_V4, MACOS_TUN_STATE_PATH,
     };
     use crate::binder::{DynamicOutboundBinder, OutboundTarget};
     use crate::platform::macos::list_configurable_network_services;
     use anyhow::{bail, Context, Result};
-    use std::ffi::CString;
+    use std::ffi::{c_void, CStr, CString};
     use std::fs;
     use std::io::{self, BufRead, BufReader, Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::process::CommandExt;
     use std::path::Path;
     use std::process::{Child, Command, Stdio};
+    use std::ptr;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
     use tokio::sync::watch;
     use tracing::{debug, info, warn};
 
-    const UTUN_CONTROL_NAME: &[u8] = b"com.apple.net.utun_control\0";
+    const UTUN_CONTROL_NAME: &CStr = c"com.apple.net.utun_control";
     const GUARD_READY: &str = "ready";
 
     const RFC1918_EXCLUSIONS: &[&str] = &["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"];
     const LINK_LOCAL_EXCLUSIONS: &[&str] = &["169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4"];
 
+    /// Non-zero-anchor IPv4 split routes covering `1.0.0.0..=255.255.255.255` while leaving
+    /// `0.0.0.0/8` untouched so `IP_BOUND_IF` on Ventura/Sonoma/Sequoia/Tahoe never hits
+    /// `ENETUNREACH`.
+    const IPV4_SPLIT_ROUTES: &[&str] = &[
+        "1.0.0.0/8",
+        "2.0.0.0/7",
+        "4.0.0.0/6",
+        "8.0.0.0/5",
+        "16.0.0.0/4",
+        "32.0.0.0/3",
+        "64.0.0.0/2",
+        "128.0.0.0/1",
+    ];
+
     const ROUTE_DEBOUNCE_WINDOW: Duration = Duration::from_millis(350);
     const ROUTE_DEBOUNCE_MAX_WAIT: Duration = Duration::from_millis(1500);
+
+    const SC_STORE_NAME: &str = "com.vdpi.tun";
+    const SC_KEY_SERVICE: &str = "State:/Network/Service/com.vdpi.tun/Service";
+    const SC_KEY_IPV4: &str = "State:/Network/Service/com.vdpi.tun/IPv4";
+    const SC_KEY_IPV6: &str = "State:/Network/Service/com.vdpi.tun/IPv6";
+    const SC_KEY_DNS: &str = "State:/Network/Service/com.vdpi.tun/DNS";
+
+    type CFTypeRef = *const c_void;
+    type CFAllocatorRef = *const c_void;
+    type CFStringRef = *const c_void;
+    type CFBooleanRef = *const c_void;
+    type CFNumberRef = *const c_void;
+    type CFArrayRef = *const c_void;
+    type CFDictionaryRef = *const c_void;
+    type SCDynamicStoreRef = *const c_void;
+    type CFIndex = isize;
+    type CFStringEncoding = u32;
+    type CFNumberType = CFIndex;
+    type Boolean = u8;
+
+    const K_CF_STRING_ENCODING_UTF8: CFStringEncoding = 0x0800_0100;
+    const K_CF_NUMBER_SINT32_TYPE: CFNumberType = 3;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        static kCFBooleanTrue: CFBooleanRef;
+        static kCFTypeArrayCallBacks: usize;
+        static kCFTypeDictionaryKeyCallBacks: usize;
+        static kCFTypeDictionaryValueCallBacks: usize;
+
+        fn CFRelease(cf: CFTypeRef);
+        fn CFStringCreateWithBytes(
+            alloc: CFAllocatorRef,
+            bytes: *const u8,
+            num_bytes: CFIndex,
+            encoding: CFStringEncoding,
+            is_external_representation: Boolean,
+        ) -> CFStringRef;
+        fn CFNumberCreate(
+            allocator: CFAllocatorRef,
+            the_type: CFNumberType,
+            value_ptr: *const c_void,
+        ) -> CFNumberRef;
+        fn CFArrayCreate(
+            allocator: CFAllocatorRef,
+            values: *const CFTypeRef,
+            num_values: CFIndex,
+            callbacks: *const c_void,
+        ) -> CFArrayRef;
+        fn CFDictionaryCreate(
+            allocator: CFAllocatorRef,
+            keys: *const CFTypeRef,
+            values: *const CFTypeRef,
+            num_values: CFIndex,
+            key_callbacks: *const c_void,
+            value_callbacks: *const c_void,
+        ) -> CFDictionaryRef;
+    }
+
+    #[link(name = "SystemConfiguration", kind = "framework")]
+    extern "C" {
+        static kSCDynamicStoreUseSessionKeys: CFStringRef;
+
+        fn SCDynamicStoreCreateWithOptions(
+            allocator: CFAllocatorRef,
+            name: CFStringRef,
+            store_options: CFDictionaryRef,
+            callout: *const c_void,
+            context: *mut c_void,
+        ) -> SCDynamicStoreRef;
+        fn SCDynamicStoreSetValue(
+            store: SCDynamicStoreRef,
+            key: CFStringRef,
+            value: CFTypeRef,
+        ) -> Boolean;
+        fn SCDynamicStoreRemoveValue(store: SCDynamicStoreRef, key: CFStringRef) -> Boolean;
+        fn SCError() -> libc::c_int;
+        fn SCErrorString(status: libc::c_int) -> *const libc::c_char;
+    }
+
+    struct CfOwned(CFTypeRef);
+
+    impl CfOwned {
+        fn from_raw(raw: CFTypeRef, label: &str) -> Result<Self> {
+            if raw.is_null() {
+                bail!("CoreFoundation failed to allocate {label}");
+            }
+            Ok(Self(raw))
+        }
+
+        fn as_ptr(&self) -> CFTypeRef {
+            self.0
+        }
+    }
+
+    impl Drop for CfOwned {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` is a valid non-null +1 retained CoreFoundation object owned by `Self`.
+                unsafe { CFRelease(self.0) };
+            }
+        }
+    }
+
+    fn cf_string(s: &str) -> Result<CfOwned> {
+        let len = CFIndex::try_from(s.len()).context("CFString length overflow")?;
+        // SAFETY: `s.as_ptr()` is valid for `len` UTF-8 bytes; `CFStringCreateWithBytes`
+        // copies the bytes into a newly allocated +1 retained `CFString`.
+        let raw = unsafe {
+            CFStringCreateWithBytes(ptr::null(), s.as_ptr(), len, K_CF_STRING_ENCODING_UTF8, 0)
+        };
+        CfOwned::from_raw(raw, "CFString")
+    }
+
+    fn cf_number_i32(value: i32) -> Result<CfOwned> {
+        // SAFETY: `value` is a valid stack `i32` matching `K_CF_NUMBER_SINT32_TYPE` (3).
+        let raw = unsafe {
+            CFNumberCreate(
+                ptr::null(),
+                K_CF_NUMBER_SINT32_TYPE,
+                ptr::from_ref(&value).cast::<c_void>(),
+            )
+        };
+        CfOwned::from_raw(raw, "CFNumber(i32)")
+    }
+
+    fn cf_array(items: &[&CfOwned]) -> Result<CfOwned> {
+        let ptrs: Vec<CFTypeRef> = items.iter().map(|item| item.as_ptr()).collect();
+        let len = CFIndex::try_from(ptrs.len()).context("CFArray length overflow")?;
+        // SAFETY: `ptrs` holds `len` valid `CFTypeRef` pointers; `kCFTypeArrayCallBacks`
+        // retains each element so the returned `CFArray` independently owns its entries.
+        let raw = unsafe {
+            CFArrayCreate(
+                ptr::null(),
+                ptrs.as_ptr(),
+                len,
+                ptr::addr_of!(kCFTypeArrayCallBacks).cast::<c_void>(),
+            )
+        };
+        CfOwned::from_raw(raw, "CFArray")
+    }
+
+    fn cf_dict_raw(entries: &[(CFTypeRef, CFTypeRef)]) -> Result<CfOwned> {
+        let mut keys: Vec<CFTypeRef> = Vec::with_capacity(entries.len());
+        let mut vals: Vec<CFTypeRef> = Vec::with_capacity(entries.len());
+        for &(k, v) in entries {
+            keys.push(k);
+            vals.push(v);
+        }
+        let len = CFIndex::try_from(entries.len()).context("CFDictionary length overflow")?;
+        // SAFETY: `keys` and `vals` each contain `len` valid `CFTypeRef` pointers;
+        // `kCFTypeDictionaryKeyCallBacks` and `kCFTypeDictionaryValueCallBacks` retain
+        // every key and value inside the newly allocated `CFDictionary`.
+        let raw = unsafe {
+            CFDictionaryCreate(
+                ptr::null(),
+                keys.as_ptr(),
+                vals.as_ptr(),
+                len,
+                ptr::addr_of!(kCFTypeDictionaryKeyCallBacks).cast::<c_void>(),
+                ptr::addr_of!(kCFTypeDictionaryValueCallBacks).cast::<c_void>(),
+            )
+        };
+        CfOwned::from_raw(raw, "CFDictionary")
+    }
+
+    fn sc_last_error() -> String {
+        // SAFETY: `SCError` and `SCErrorString` are thread-safe SystemConfiguration getters;
+        // `SCErrorString` returns a static NUL-terminated C string (or null).
+        unsafe {
+            let code = SCError();
+            let msg = SCErrorString(code);
+            if msg.is_null() {
+                format!("SCError({code})")
+            } else {
+                let desc = CStr::from_ptr(msg).to_string_lossy();
+                format!("{desc} (SCError {code})")
+            }
+        }
+    }
+
+    /// Session-scoped `SCDynamicStore` handle (`kSCDynamicStoreUseSessionKeys = true`) publishing
+    /// transient `com.vdpi.tun` service/IP/DNS state bound to `utunN`.
+    ///
+    /// Because all keys are session-scoped, macOS `configd` automatically removes them within
+    /// 1-3 seconds even on `SIGKILL` or process crash without ever touching `preferences.plist`.
+    struct ScDynamicStoreDnsSession {
+        store: SCDynamicStoreRef,
+        published_keys: Vec<&'static str>,
+    }
+
+    // SAFETY: `SCDynamicStoreRef` may be transferred sequentially between threads;
+    // `ScDynamicStoreDnsSession` exclusively owns the handle, never shares it concurrently,
+    // and only mutates or releases it via `&mut self` (setup / `Drop`).
+    unsafe impl Send for ScDynamicStoreDnsSession {}
+
+    impl ScDynamicStoreDnsSession {
+        fn install(iface_name: &str, ipv6_active: bool) -> Result<Self> {
+            let store_name = cf_string(SC_STORE_NAME)?;
+            // SAFETY: `kSCDynamicStoreUseSessionKeys` and `kCFBooleanTrue` are immutable
+            // framework-exported `CFStringRef` / `CFBooleanRef` constants.
+            let (use_session_keys, cf_true) =
+                unsafe { (kSCDynamicStoreUseSessionKeys, kCFBooleanTrue) };
+            if use_session_keys.is_null() || cf_true.is_null() {
+                bail!(
+                    "macOS CoreFoundation/SystemConfiguration session-key symbols resolved to null"
+                );
+            }
+            let options = cf_dict_raw(&[(use_session_keys, cf_true)])?;
+
+            // SAFETY: `store_name` and `options` are valid CoreFoundation objects; callout and
+            // context pointers are null.
+            let store = unsafe {
+                SCDynamicStoreCreateWithOptions(
+                    ptr::null(),
+                    store_name.as_ptr(),
+                    options.as_ptr(),
+                    ptr::null(),
+                    ptr::null_mut(),
+                )
+            };
+            if store.is_null() {
+                bail!(
+                    "SCDynamicStoreCreateWithOptions failed: {}",
+                    sc_last_error()
+                );
+            }
+
+            let mut session = Self {
+                store,
+                published_keys: Vec::with_capacity(4),
+            };
+
+            // 1. Service rank (added FIRST, removed LAST so configd never promotes utun as primary).
+            let k_primary_rank = cf_string("PrimaryRank")?;
+            let v_never = cf_string("Never")?;
+            let service_dict = cf_dict_raw(&[(k_primary_rank.as_ptr(), v_never.as_ptr())])?;
+            session.set_value(SC_KEY_SERVICE, &service_dict)?;
+
+            // 2. IPv4 binding to utunN.
+            let k_addresses = cf_string("Addresses")?;
+            let k_router = cf_string("Router")?;
+            let k_interface_name = cf_string("InterfaceName")?;
+            let v_iface = cf_string(iface_name)?;
+
+            let v_ipv4_addr = cf_string(MACOS_TUN_IPV4)?;
+            let v_ipv4_addrs = cf_array(&[&v_ipv4_addr])?;
+            let ipv4_dict = cf_dict_raw(&[
+                (k_addresses.as_ptr(), v_ipv4_addrs.as_ptr()),
+                (k_router.as_ptr(), v_ipv4_addr.as_ptr()),
+                (k_interface_name.as_ptr(), v_iface.as_ptr()),
+            ])?;
+            session.set_value(SC_KEY_IPV4, &ipv4_dict)?;
+
+            // 3. Optional IPv6 binding to utunN.
+            if ipv6_active {
+                let v_ipv6_addr = cf_string(MACOS_TUN_IPV6)?;
+                let v_ipv6_addrs = cf_array(&[&v_ipv6_addr])?;
+                let ipv6_dict = cf_dict_raw(&[
+                    (k_addresses.as_ptr(), v_ipv6_addrs.as_ptr()),
+                    (k_router.as_ptr(), v_ipv6_addr.as_ptr()),
+                    (k_interface_name.as_ptr(), v_iface.as_ptr()),
+                ])?;
+                session.set_value(SC_KEY_IPV6, &ipv6_dict)?;
+            }
+
+            // 4. Supplemental match-all DNS resolver scoped to com.vdpi.tun.
+            let k_server_addresses = cf_string("ServerAddresses")?;
+            let k_match_domains = cf_string("SupplementalMatchDomains")?;
+            let k_match_orders = cf_string("SupplementalMatchOrders")?;
+            let k_match_no_search = cf_string("SupplementalMatchDomainsNoSearch")?;
+
+            let v_dns_v4 = cf_string(MACOS_TUN_DNS_V4)?;
+            let v_dns_v6 = if ipv6_active {
+                Some(cf_string(MACOS_TUN_DNS_V6)?)
+            } else {
+                None
+            };
+            let mut dns_servers: Vec<&CfOwned> = vec![&v_dns_v4];
+            if let Some(ref v6) = v_dns_v6 {
+                dns_servers.push(v6);
+            }
+            let v_server_addresses = cf_array(&dns_servers)?;
+
+            let v_empty_domain = cf_string("")?;
+            let v_match_domains = cf_array(&[&v_empty_domain])?;
+
+            let v_order_one = cf_number_i32(1)?;
+            let v_match_orders = cf_array(&[&v_order_one])?;
+
+            let v_no_search_one = cf_number_i32(1)?;
+
+            let dns_dict = cf_dict_raw(&[
+                (k_server_addresses.as_ptr(), v_server_addresses.as_ptr()),
+                (k_match_domains.as_ptr(), v_match_domains.as_ptr()),
+                (k_match_orders.as_ptr(), v_match_orders.as_ptr()),
+                (k_match_no_search.as_ptr(), v_no_search_one.as_ptr()),
+            ])?;
+            session.set_value(SC_KEY_DNS, &dns_dict)?;
+
+            flush_macos_dns_cache();
+            Ok(session)
+        }
+
+        fn set_value(&mut self, key: &'static str, value: &CfOwned) -> Result<()> {
+            let cf_key = cf_string(key)?;
+            // SAFETY: `self.store`, `cf_key`, and `value` are valid non-null CoreFoundation refs.
+            let ok = unsafe { SCDynamicStoreSetValue(self.store, cf_key.as_ptr(), value.as_ptr()) };
+            if ok == 0 {
+                bail!("SCDynamicStoreSetValue({key}) failed: {}", sc_last_error());
+            }
+            self.published_keys.push(key);
+            Ok(())
+        }
+    }
+
+    impl Drop for ScDynamicStoreDnsSession {
+        fn drop(&mut self) {
+            let had_keys = !self.published_keys.is_empty();
+            for key in self.published_keys.iter().rev() {
+                if let Ok(cf_key) = cf_string(key) {
+                    // SAFETY: `self.store` and `cf_key` are valid non-null CoreFoundation refs.
+                    let ok = unsafe { SCDynamicStoreRemoveValue(self.store, cf_key.as_ptr()) };
+                    if ok == 0 {
+                        debug!(
+                            key = *key,
+                            error = %sc_last_error(),
+                            "SCDynamicStoreRemoveValue returned false during cleanup"
+                        );
+                    }
+                }
+            }
+            if !self.store.is_null() {
+                // SAFETY: `self.store` is exclusively owned (+1 retain count) by `Self`.
+                unsafe { CFRelease(self.store) };
+                self.store = ptr::null();
+            }
+            if had_keys {
+                flush_macos_dns_cache();
+            }
+        }
+    }
 
     /// Opens a dynamically assigned macOS `utunN` kernel control socket, configures
     /// `FD_CLOEXEC` and `O_NONBLOCK`, and returns `(OwnedFd, iface_name)`.
@@ -386,19 +753,20 @@ mod imp {
 
         // SAFETY: `ctl_info` is a POD C struct zero-initialized before populating `ctl_name`.
         let mut info: libc::ctl_info = unsafe { std::mem::zeroed() };
-        debug_assert!(UTUN_CONTROL_NAME.len() <= info.ctl_name.len());
-        // SAFETY: `UTUN_CONTROL_NAME` (27 bytes including NUL) fits inside `ctl_name` (96 bytes)
+        let ctl_name_bytes = UTUN_CONTROL_NAME.to_bytes_with_nul();
+        debug_assert!(ctl_name_bytes.len() <= info.ctl_name.len());
+        // SAFETY: `ctl_name_bytes` (27 bytes including NUL) fits inside `ctl_name` (96 bytes)
         // and the buffers do not overlap.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                UTUN_CONTROL_NAME.as_ptr().cast::<libc::c_char>(),
+            ptr::copy_nonoverlapping(
+                ctl_name_bytes.as_ptr().cast::<libc::c_char>(),
                 info.ctl_name.as_mut_ptr(),
-                UTUN_CONTROL_NAME.len(),
+                ctl_name_bytes.len(),
             );
         }
 
         // SAFETY: `fd` is a valid PF_SYSTEM socket and `info` matches CTLIOCGINFO.
-        if unsafe { libc::ioctl(fd, libc::CTLIOCGINFO, std::ptr::from_mut(&mut info)) } < 0 {
+        if unsafe { libc::ioctl(fd, libc::CTLIOCGINFO, ptr::from_mut(&mut info)) } < 0 {
             return Err(io::Error::last_os_error()).context(
                 "ioctl(CTLIOCGINFO, com.apple.net.utun_control) failed (root/sudo required)",
             );
@@ -416,7 +784,7 @@ mod imp {
         if unsafe {
             libc::connect(
                 fd,
-                std::ptr::from_ref(&addr).cast::<libc::sockaddr>(),
+                ptr::from_ref(&addr).cast::<libc::sockaddr>(),
                 std::mem::size_of::<libc::sockaddr_ctl>() as libc::socklen_t,
             )
         } < 0
@@ -468,6 +836,9 @@ mod imp {
         fn start(
             binder: Arc<DynamicOutboundBinder>,
             route_tx: Arc<watch::Sender<u64>>,
+            managed_ifscope_v4: Arc<Mutex<Option<ManagedRoute>>>,
+            managed_ifscope_v6: Arc<Mutex<Option<ManagedRoute>>>,
+            ipv6_active: bool,
         ) -> Result<Self> {
             let route_fd = open_pf_route_socket()?;
             let (stop_read_fd, stop_write_fd) = create_stop_pipe()?;
@@ -483,6 +854,9 @@ mod imp {
                         thread_stop_flag,
                         binder,
                         route_tx,
+                        managed_ifscope_v4,
+                        managed_ifscope_v6,
+                        ipv6_active,
                     );
                 })
                 .context("failed to spawn macOS PF_ROUTE monitoring thread")?;
@@ -503,7 +877,7 @@ mod imp {
             let _ = unsafe {
                 libc::write(
                     self.stop_write_fd.as_raw_fd(),
-                    std::ptr::from_ref(&byte).cast::<libc::c_void>(),
+                    ptr::from_ref(&byte).cast::<c_void>(),
                     1,
                 )
             };
@@ -513,26 +887,32 @@ mod imp {
         }
     }
 
-    /// Active macOS desktop `utun` session owning split routes, LAN exclusions, DNS
-    /// configuration, outbound binder state, a `PF_ROUTE` monitor, and a detached
-    /// crash-recovery guard.
+    /// Active macOS desktop `utun` session owning `-ifscope` default routes, split routes,
+    /// LAN exclusions, native `SCDynamicStore` session DNS, outbound binder state, a
+    /// `PF_ROUTE` monitor, and a detached crash-recovery guard.
     pub struct MacosTunSession {
         binder: Arc<DynamicOutboundBinder>,
         physical_nic: String,
+        mtu: u16,
         guard_state: MacosTunGuardState,
         guard_child: Option<Child>,
+        dns_session: Option<ScDynamicStoreDnsSession>,
+        managed_ifscope_v4: Arc<Mutex<Option<ManagedRoute>>>,
+        managed_ifscope_v6: Arc<Mutex<Option<ManagedRoute>>>,
         route_tx: Arc<watch::Sender<u64>>,
         route_monitor: Option<RouteMonitor>,
     }
 
     impl MacosTunSession {
         /// Starts a macOS desktop `utun` session:
-        /// 1. Verifies root privileges and recovers any stale crash-recovery state on disk.
+        /// 1. Verifies root privileges, recovers any stale crash-recovery state on disk, and
+        ///    heals any legacy v0.5.x `networksetup` DNS stuck on `198.18.0.2`.
         /// 2. Detects the physical default uplink and binds `DynamicOutboundBinder` via `IP_BOUND_IF`.
-        /// 3. Opens `utunN` and configures `198.18.0.1 <-> 198.18.0.2` (MTU 1500, optional IPv6).
-        /// 4. Atomically persists crash-recovery state before mutating routes or DNS.
-        /// 5. Installs LAN/special exclusion routes and split default routes (`0.0.0.0/1`, `128.0.0.0/1`, optional `2000::/3`).
-        /// 6. Snapshots and redirects active macOS network service DNS to `198.18.0.2`.
+        /// 3. Opens `utunN` and configures `198.18.0.1 <-> 198.18.0.2` (Jumbo MTU fallback, optional IPv6).
+        /// 4. Atomically persists crash-recovery state before mutating routes.
+        /// 5. Installs explicit `-ifscope` default route(s), LAN/special exclusion routes, and
+        ///    8 non-zero-anchor IPv4 split routes (`1.0.0.0/8`..`128.0.0.0/1`, optional `2000::/3`).
+        /// 6. Publishes transient `SCDynamicStore` session keys bound to `utunN` and flushes DNS cache.
         /// 7. Starts the `PF_ROUTE` live route/uplink monitor and arms the detached `setsid()` crash guard.
         pub fn start(
             binder: Arc<DynamicOutboundBinder>,
@@ -544,17 +924,19 @@ mod imp {
             }
 
             recover_stale_macos_tun_state();
+            heal_legacy_networksetup_dns();
 
             let (phys_iface, phys_gw) = detect_physical_default_v4()?;
             let if_index_v4 = if_name_to_index(&phys_iface)?;
-            let if_index_v6 = detect_physical_default_v6()
-                .and_then(|(iface6, _)| if_name_to_index(&iface6).ok())
-                .unwrap_or(if_index_v4);
+            let phys_v6 = detect_physical_default_v6();
+            let if_index_v6 = phys_v6
+                .as_ref()
+                .and_then(|(iface6, _)| if_name_to_index(iface6).ok());
 
             binder.update(OutboundTarget {
                 nic_name: Some(phys_iface.clone()),
                 if_index_v4: Some(if_index_v4),
-                if_index_v6: Some(if_index_v6),
+                if_index_v6,
                 fwmark: None,
                 fail_closed: true,
             });
@@ -569,11 +951,69 @@ mod imp {
             let (tun_fd, iface_name) = open_utun()?;
             rollback.state.iface_name = iface_name.clone();
 
-            let ipv6_active = configure_utun_interface(&iface_name, tun_ipv6)?;
+            let (mtu, ipv6_active) = configure_utun_interface(&iface_name, tun_ipv6)?;
 
-            // Persist initial crash-recovery state atomically (0600) BEFORE mutating routes or DNS.
+            // Persist initial crash-recovery state atomically (0600) BEFORE mutating routes.
             save_macos_tun_state(&rollback.state)?;
             rollback.state_persisted = true;
+
+            // Install explicit `-ifscope <phys_iface>` default routes BEFORE split routes so
+            // `IP_BOUND_IF` / `IPV6_BOUND_IF` outbound sockets always resolve a scoped default.
+            let mut initial_ifscope_v4: Option<ManagedRoute> = None;
+            if let Some(ref gw) = phys_gw {
+                let route = ManagedRoute {
+                    destination: "default".to_string(),
+                    is_ipv6: false,
+                    interface: None,
+                    gateway: Some(gw.clone()),
+                    ifscope: Some(phys_iface.clone()),
+                };
+                match add_managed_route(&route, true) {
+                    Ok(true) => {
+                        initial_ifscope_v4 = Some(route.clone());
+                        rollback.state.routes.push(route);
+                        save_macos_tun_state(&rollback.state)?;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        warn!(
+                            iface = %phys_iface,
+                            gateway = %gw,
+                            error = %e,
+                            "failed to install -ifscope IPv4 default route for IP_BOUND_IF"
+                        );
+                    }
+                }
+            }
+
+            let mut initial_ifscope_v6: Option<ManagedRoute> = None;
+            if ipv6_active {
+                if let Some((ref iface6, Some(ref gw6))) = phys_v6 {
+                    let route = ManagedRoute {
+                        destination: "default".to_string(),
+                        is_ipv6: true,
+                        interface: None,
+                        gateway: Some(gw6.clone()),
+                        ifscope: Some(iface6.clone()),
+                    };
+                    match add_managed_route(&route, true) {
+                        Ok(true) => {
+                            initial_ifscope_v6 = Some(route.clone());
+                            rollback.state.routes.push(route);
+                            save_macos_tun_state(&rollback.state)?;
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            warn!(
+                                iface = %iface6,
+                                gateway = %gw6,
+                                error = %e,
+                                "failed to install -ifscope IPv6 default route for IPV6_BOUND_IF"
+                            );
+                        }
+                    }
+                }
+            }
 
             // Install LAN exclusions before split routes so local networks stay reachable
             // directly on the physical NIC.
@@ -583,6 +1023,7 @@ mod imp {
                     is_ipv6: false,
                     interface: phys_gw.is_none().then(|| phys_iface.clone()),
                     gateway: phys_gw.clone(),
+                    ifscope: None,
                 };
                 match add_managed_route(&route, true) {
                     Ok(true) => {
@@ -602,6 +1043,7 @@ mod imp {
                     is_ipv6: false,
                     interface: Some(phys_iface.clone()),
                     gateway: None,
+                    ifscope: None,
                 };
                 match add_managed_route(&route, true) {
                     Ok(true) => {
@@ -619,15 +1061,16 @@ mod imp {
                 }
             }
 
-            // Install IPv4 split default routes on utunX (more specific than 0.0.0.0/0,
-            // leaving the physical default route intact for IP_BOUND_IF sockets).
+            // Install 8 non-zero-anchor IPv4 split routes on utunN (leaving 0.0.0.0/8 untouched
+            // so `IP_BOUND_IF` never hits ENETUNREACH on macOS Ventura/Sonoma/Sequoia/Tahoe).
             // `allow_existing = false` ensures pre-existing conflicting routes fail startup cleanly.
-            for prefix in ["0.0.0.0/1", "128.0.0.0/1"] {
+            for prefix in IPV4_SPLIT_ROUTES {
                 let route = ManagedRoute {
-                    destination: prefix.to_string(),
+                    destination: (*prefix).to_string(),
                     is_ipv6: false,
                     interface: Some(iface_name.clone()),
                     gateway: None,
+                    ifscope: None,
                 };
                 rollback.state.routes.push(route.clone());
                 save_macos_tun_state(&rollback.state)?;
@@ -646,6 +1089,7 @@ mod imp {
                     is_ipv6: true,
                     interface: Some(iface_name.clone()),
                     gateway: None,
+                    ifscope: None,
                 };
                 rollback.state.routes.push(route.clone());
                 save_macos_tun_state(&rollback.state)?;
@@ -658,17 +1102,25 @@ mod imp {
                 }
             }
 
-            // Snapshot & redirect DNS on all active physical network services to MACOS_TUN_DNS_V4.
-            configure_macos_tun_dns(&mut rollback.state)?;
-            flush_macos_dns_cache();
+            // Publish transient session-scoped SCDynamicStore DNS keys bound to utunN.
+            // If any later startup step fails, dropping `dns_session` automatically cleans them up.
+            let dns_session = ScDynamicStoreDnsSession::install(&iface_name, ipv6_active)?;
 
             // Start the PF_ROUTE monitoring thread after initial route setup so our own
             // startup mutations do not trigger spurious notifications.
+            let managed_ifscope_v4 = Arc::new(Mutex::new(initial_ifscope_v4));
+            let managed_ifscope_v6 = Arc::new(Mutex::new(initial_ifscope_v6));
             let (route_tx, _) = watch::channel::<u64>(0);
             let route_tx = Arc::new(route_tx);
-            let route_monitor = RouteMonitor::start(Arc::clone(&binder), Arc::clone(&route_tx))?;
+            let route_monitor = RouteMonitor::start(
+                Arc::clone(&binder),
+                Arc::clone(&route_tx),
+                Arc::clone(&managed_ifscope_v4),
+                Arc::clone(&managed_ifscope_v6),
+                ipv6_active,
+            )?;
 
-            // Arm the detached crash guard so SIGKILL still restores DNS & routes immediately.
+            // Arm the detached crash guard so SIGKILL still restores managed routes immediately.
             let guard_child = spawn_detached_guard(&rollback.state)?;
 
             let guard_state = std::mem::take(&mut rollback.state);
@@ -678,10 +1130,10 @@ mod imp {
             info!(
                 iface = %guard_state.iface_name,
                 physical_nic = %phys_iface,
+                mtu,
                 if_index_v4,
-                if_index_v6,
+                ?if_index_v6,
                 routes = guard_state.routes.len(),
-                dns_services = guard_state.dns_snapshots.len(),
                 tun_ipv6,
                 ipv6_active,
                 "macOS desktop utun session active"
@@ -691,8 +1143,12 @@ mod imp {
                 Self {
                     binder,
                     physical_nic: phys_iface,
+                    mtu,
                     guard_state,
                     guard_child: Some(guard_child),
+                    dns_session: Some(dns_session),
+                    managed_ifscope_v4,
+                    managed_ifscope_v6,
                     route_tx,
                     route_monitor: Some(route_monitor),
                 },
@@ -710,6 +1166,11 @@ mod imp {
             &self.physical_nic
         }
 
+        /// Returns the active MTU configured on the `utun` interface (e.g. `16384`, `9000`, or `1500`).
+        pub fn mtu(&self) -> u16 {
+            self.mtu
+        }
+
         /// Returns a live watch receiver signaled immediately on macOS `PF_ROUTE` changes.
         pub fn route_change_rx(&self) -> watch::Receiver<u64> {
             self.route_tx.subscribe()
@@ -722,10 +1183,32 @@ mod imp {
             // deletions do not trigger spurious notifications or uplink rebind probes.
             drop(self.route_monitor.take());
 
+            // Remove session-scoped SCDynamicStore DNS keys and flush mDNSResponder first so
+            // macOS immediately stops targeting `198.18.0.2`.
+            drop(self.dns_session.take());
+
+            // Clean up any dynamically swapped `-ifscope` default route added by `RouteMonitor`.
+            if let Some(route) = self
+                .managed_ifscope_v4
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                delete_managed_route(&route);
+            }
+            if let Some(route) = self
+                .managed_ifscope_v6
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                delete_managed_route(&route);
+            }
+
             let mut restored_by_guard = false;
             if let Some(mut child) = self.guard_child.take() {
                 // Closing the stdin pipe delivers EOF to the detached crash guard, which
-                // immediately removes managed routes, restores DNS, and flushes mDNSResponder.
+                // immediately removes managed routes and flushes mDNSResponder.
                 drop(child.stdin.take());
                 match child.wait() {
                     Ok(status) if status.success() => {
@@ -890,12 +1373,16 @@ mod imp {
         Ok((read_fd, write_fd))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_pf_route_monitor_loop(
         route_fd: OwnedFd,
         stop_read_fd: OwnedFd,
         stop_flag: Arc<AtomicBool>,
         binder: Arc<DynamicOutboundBinder>,
         route_tx: Arc<watch::Sender<u64>>,
+        managed_ifscope_v4: Arc<Mutex<Option<ManagedRoute>>>,
+        managed_ifscope_v6: Arc<Mutex<Option<ManagedRoute>>>,
+        ipv6_active: bool,
     ) {
         let mut pending_rebind: Option<(Instant, Instant)> = None;
         let mut buf = [0u8; 4096];
@@ -958,7 +1445,7 @@ mod imp {
                     let n = unsafe {
                         libc::read(
                             route_fd.as_raw_fd(),
-                            buf.as_mut_ptr().cast::<libc::c_void>(),
+                            buf.as_mut_ptr().cast::<c_void>(),
                             buf.len(),
                         )
                     };
@@ -1003,14 +1490,66 @@ mod imp {
                     || now.saturating_duration_since(burst_start) >= ROUTE_DEBOUNCE_MAX_WAIT
                 {
                     pending_rebind = None;
-                    rebind_physical_uplink(&binder);
+                    rebind_physical_uplink(
+                        &binder,
+                        &managed_ifscope_v4,
+                        &managed_ifscope_v6,
+                        ipv6_active,
+                    );
                 }
             }
         }
     }
 
-    fn rebind_physical_uplink(binder: &DynamicOutboundBinder) {
-        let (phys_iface, _phys_gw) = match detect_physical_default_v4() {
+    fn sync_managed_ifscope_route(
+        slot: &Mutex<Option<ManagedRoute>>,
+        is_ipv6: bool,
+        new_iface: &str,
+        new_gw: Option<&str>,
+    ) {
+        let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+        let desired = new_gw.map(|gw| ManagedRoute {
+            destination: "default".to_string(),
+            is_ipv6,
+            interface: None,
+            gateway: Some(gw.to_string()),
+            ifscope: Some(new_iface.to_string()),
+        });
+
+        if *guard == desired {
+            return;
+        }
+
+        if let Some(old) = guard.take() {
+            delete_managed_route(&old);
+        }
+
+        if let Some(route) = desired {
+            match add_managed_route(&route, true) {
+                Ok(true) => {
+                    *guard = Some(route);
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(
+                        iface = %new_iface,
+                        gateway = ?new_gw,
+                        is_ipv6,
+                        error = %e,
+                        "failed to install -ifscope default route on new macOS uplink"
+                    );
+                }
+            }
+        }
+    }
+
+    fn rebind_physical_uplink(
+        binder: &DynamicOutboundBinder,
+        managed_ifscope_v4: &Mutex<Option<ManagedRoute>>,
+        managed_ifscope_v6: &Mutex<Option<ManagedRoute>>,
+        ipv6_active: bool,
+    ) {
+        let (phys_iface, phys_gw) = match detect_physical_default_v4() {
             Ok(found) => found,
             Err(e) => {
                 debug!(
@@ -1033,19 +1572,52 @@ mod imp {
             }
         };
 
-        let if_index_v6 = detect_physical_default_v6()
-            .and_then(|(iface6, _)| if_name_to_index(&iface6).ok())
-            .unwrap_or(if_index_v4);
+        let phys_v6 = detect_physical_default_v6();
+        let if_index_v6 = phys_v6
+            .as_ref()
+            .and_then(|(iface6, _)| if_name_to_index(iface6).ok());
 
         let next = OutboundTarget {
-            nic_name: Some(phys_iface),
+            nic_name: Some(phys_iface.clone()),
             if_index_v4: Some(if_index_v4),
-            if_index_v6: Some(if_index_v6),
+            if_index_v6,
             fwmark: None,
             fail_closed: true,
         };
 
-        if binder.snapshot() != next {
+        let target_changed = binder.snapshot() != next;
+        let v4_gw_changed = {
+            let guard = managed_ifscope_v4.lock().unwrap_or_else(|e| e.into_inner());
+            guard.as_ref().is_some_and(|old| {
+                old.ifscope.as_deref() != Some(phys_iface.as_str())
+                    || old.gateway.as_deref() != phys_gw.as_deref()
+            })
+        };
+        let v6_gw_changed = ipv6_active && {
+            let guard = managed_ifscope_v6.lock().unwrap_or_else(|e| e.into_inner());
+            let desired_iface = phys_v6.as_ref().map(|(iface, _)| iface.as_str());
+            let desired_gw = phys_v6.as_ref().and_then(|(_, gw)| gw.as_deref());
+            guard.as_ref().is_some_and(|old| {
+                old.ifscope.as_deref() != desired_iface || old.gateway.as_deref() != desired_gw
+            })
+        };
+
+        if target_changed || v4_gw_changed || v6_gw_changed {
+            sync_managed_ifscope_route(managed_ifscope_v4, false, &phys_iface, phys_gw.as_deref());
+            if ipv6_active {
+                if let Some((ref iface6, ref gw6)) = phys_v6 {
+                    sync_managed_ifscope_route(managed_ifscope_v6, true, iface6, gw6.as_deref());
+                } else if let Some(old6) = managed_ifscope_v6
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                {
+                    delete_managed_route(&old6);
+                }
+            }
+        }
+
+        if target_changed {
             info!(
                 nic = ?next.nic_name,
                 if_index_v4 = ?next.if_index_v4,
@@ -1128,101 +1700,166 @@ mod imp {
         parse_route_get_default(&stdout)
     }
 
-    fn configure_utun_interface(iface_name: &str, tun_ipv6: bool) -> Result<bool> {
-        let mtu_str = MACOS_TUN_MTU.to_string();
-        run_cmd(
-            "/sbin/ifconfig",
-            &[
-                iface_name,
-                "inet",
-                MACOS_TUN_IPV4,
-                MACOS_TUN_DNS_V4,
-                "netmask",
-                MACOS_TUN_NETMASK_V4,
-                "mtu",
-                &mtu_str,
-                "up",
-            ],
-        )
-        .with_context(|| format!("failed to configure IPv4 on {iface_name}"))?;
+    fn configure_utun_interface(iface_name: &str, tun_ipv6: bool) -> Result<(u16, bool)> {
+        let preferred_mtu = u16::try_from(vdpi_tun::config::DESKTOP_MTU).unwrap_or(MACOS_TUN_MTU);
+        let mut mtu_candidates: Vec<u16> = Vec::with_capacity(3);
+        for candidate in [preferred_mtu, 9000, MACOS_TUN_MTU] {
+            if !mtu_candidates.contains(&candidate) {
+                mtu_candidates.push(candidate);
+            }
+        }
+
+        let mut configured_mtu: Option<u16> = None;
+        let mut last_err: Option<anyhow::Error> = None;
+        for candidate in mtu_candidates {
+            let mtu_str = candidate.to_string();
+            match run_cmd(
+                "/sbin/ifconfig",
+                &[
+                    iface_name,
+                    "inet",
+                    MACOS_TUN_IPV4,
+                    MACOS_TUN_DNS_V4,
+                    "netmask",
+                    MACOS_TUN_NETMASK_V4,
+                    "mtu",
+                    &mtu_str,
+                    "up",
+                ],
+            ) {
+                Ok(()) => {
+                    configured_mtu = Some(candidate);
+                    break;
+                }
+                Err(e) => {
+                    warn!(
+                        iface = %iface_name,
+                        mtu = candidate,
+                        error = %e,
+                        "ifconfig rejected utun MTU; trying lower fallback"
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        let mtu = match configured_mtu {
+            Some(m) => m,
+            None => {
+                return Err(last_err
+                    .unwrap_or_else(|| anyhow::anyhow!("no candidate MTU succeeded"))
+                    .context(format!("failed to configure IPv4 on {iface_name}")));
+            }
+        };
 
         if !tun_ipv6 {
-            return Ok(false);
+            return Ok((mtu, false));
         }
         match run_cmd(
             "/sbin/ifconfig",
             &[iface_name, "inet6", MACOS_TUN_IPV6, "prefixlen", "64", "up"],
         ) {
-            Ok(()) => Ok(true),
+            Ok(()) => Ok((mtu, true)),
             Err(e) => {
                 warn!(
                     iface = %iface_name,
                     error = %e,
                     "failed to configure IPv6 on utun interface; skipping IPv6 route"
                 );
-                Ok(false)
+                Ok((mtu, false))
             }
         }
     }
 
-    fn add_managed_route(route: &ManagedRoute, allow_existing: bool) -> Result<bool> {
+    fn managed_route_args<'a>(action: &'a str, route: &'a ManagedRoute) -> Option<Vec<&'a str>> {
         let family = if route.is_ipv6 { "-inet6" } else { "-inet" };
-        let mut args: Vec<&str> = vec!["-n", "add", family, "-net", &route.destination];
+        let mut args: Vec<&'a str> = Vec::with_capacity(10);
+        args.push("-n");
+        args.push(action);
+        args.push(family);
+        if route.destination == "default" {
+            args.push("default");
+        } else {
+            args.push("-net");
+            args.push(&route.destination);
+        }
+
         if let Some(ref gw) = route.gateway {
             args.push(gw);
         } else if let Some(ref iface) = route.interface {
             args.push("-interface");
             args.push(iface);
         } else {
+            return None;
+        }
+
+        if let Some(ref scope) = route.ifscope {
+            args.push("-ifscope");
+            args.push(scope);
+        }
+
+        Some(args)
+    }
+
+    fn add_managed_route(route: &ManagedRoute, allow_existing: bool) -> Result<bool> {
+        let Some(args) = managed_route_args("add", route) else {
             bail!(
                 "managed route {} specifies neither gateway nor interface",
                 route.destination
             );
-        }
+        };
 
         let out = Command::new("/sbin/route")
             .args(&args)
             .output()
             .with_context(|| format!("failed to execute /sbin/route {args:?}"))?;
 
-        if out.status.success() {
-            return Ok(true);
-        }
-
+        // On macOS, `/sbin/route -n add` can exit 0 even when printing "File exists" or
+        // "writing to routing socket:". Inspect stdout/stderr BEFORE trusting exit status!
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
-        if allow_existing && (stderr.contains("File exists") || stdout.contains("File exists")) {
-            debug!(
-                destination = %route.destination,
-                "route already exists in macOS table; skipping so existing route is preserved"
+        let has_file_exists = stderr.contains("File exists") || stdout.contains("File exists");
+        let has_routing_socket_err = stderr.contains("writing to routing socket:")
+            || stdout.contains("writing to routing socket:");
+
+        if has_file_exists {
+            if allow_existing {
+                debug!(
+                    destination = %route.destination,
+                    "route already exists in macOS table; skipping so existing route is preserved"
+                );
+                return Ok(false);
+            }
+            bail!(
+                "/sbin/route {:?} failed (File exists, status {}): {} {}",
+                args,
+                out.status,
+                stdout.trim(),
+                stderr.trim()
             );
-            return Ok(false);
         }
 
-        bail!(
-            "/sbin/route {:?} exited {}: {} {}",
-            args,
-            out.status,
-            stdout.trim(),
-            stderr.trim()
-        );
+        if !out.status.success() || has_routing_socket_err {
+            bail!(
+                "/sbin/route {:?} exited {}: {} {}",
+                args,
+                out.status,
+                stdout.trim(),
+                stderr.trim()
+            );
+        }
+
+        Ok(true)
     }
 
     fn delete_managed_route(route: &ManagedRoute) {
-        let family = if route.is_ipv6 { "-inet6" } else { "-inet" };
-        let mut args: Vec<&str> = vec!["-n", "delete", family, "-net", &route.destination];
-        if let Some(ref gw) = route.gateway {
-            args.push(gw);
-        } else if let Some(ref iface) = route.interface {
-            args.push("-interface");
-            args.push(iface);
-        } else {
+        let Some(args) = managed_route_args("delete", route) else {
             debug!(
                 destination = %route.destination,
                 "skipping managed route delete without explicit gateway or interface"
             );
             return;
-        }
+        };
 
         let _ = Command::new("/sbin/route").args(args).output();
     }
@@ -1247,56 +1884,61 @@ mod imp {
         )))
     }
 
-    fn configure_macos_tun_dns(state: &mut MacosTunGuardState) -> Result<()> {
-        let services = list_configurable_network_services()
-            .context("failed to enumerate macOS network services for DNS setup")?;
+    /// One-time migration cleanup for upgrades from v0.5.0/v0.5.1: if any physical macOS network
+    /// service still has persistent `networksetup` DNS stuck on `[198.18.0.2]`, reset it to
+    /// `Empty` (DHCP) so Wi-Fi/Ethernet DNS heals automatically.
+    fn heal_legacy_networksetup_dns() {
+        let services = match list_configurable_network_services() {
+            Ok(svcs) => svcs,
+            Err(e) => {
+                debug!(
+                    error = %e,
+                    "failed to list macOS network services for legacy v0.5.x DNS migration check"
+                );
+                return;
+            }
+        };
 
-        let mut configured = 0usize;
+        let mut healed = false;
         for service in services {
             let current = match get_service_dns_servers(&service) {
-                Ok(servers) => sanitize_original_dns_servers(servers),
+                Ok(servers) => servers,
                 Err(e) => {
-                    warn!(
+                    debug!(
                         service = %service,
                         error = %e,
-                        "failed to query current macOS DNS servers; skipping service"
+                        "failed to inspect macOS network service DNS during migration check"
                     );
                     continue;
                 }
             };
 
-            // Persist the original DNS snapshot BEFORE mutating the service's DNS servers.
-            state.dns_snapshots.push(DnsServiceSnapshot {
-                service: service.clone(),
-                original_servers: current,
-            });
-            if let Err(e) = save_macos_tun_state(state) {
-                state.dns_snapshots.pop();
-                return Err(e);
-            }
-
-            match run_cmd(
-                "/usr/sbin/networksetup",
-                &["-setdnsservers", &service, MACOS_TUN_DNS_V4],
-            ) {
-                Ok(()) => {
-                    configured += 1;
-                }
-                Err(e) => {
-                    state.dns_snapshots.pop();
-                    let _ = save_macos_tun_state(state);
-                    warn!(service = %service, error = %e, "failed to set macOS TUN DNS server");
+            if is_vdpi_owned_dns_servers(&current) {
+                warn!(
+                    service = %service,
+                    "found leftover v0.5.x networksetup DNS (198.18.0.2); resetting service to Empty (DHCP)"
+                );
+                match run_cmd(
+                    "/usr/sbin/networksetup",
+                    &["-setdnsservers", &service, "Empty"],
+                ) {
+                    Ok(()) => {
+                        healed = true;
+                    }
+                    Err(e) => {
+                        warn!(
+                            service = %service,
+                            error = %e,
+                            "failed to reset legacy v0.5.x networksetup DNS to Empty"
+                        );
+                    }
                 }
             }
         }
 
-        if configured == 0 {
-            bail!(
-                "failed to configure macOS TUN DNS on any active network service (0 services configured)"
-            );
+        if healed {
+            flush_macos_dns_cache();
         }
-
-        Ok(())
     }
 
     fn restore_macos_tun_state(state: &MacosTunGuardState) {
@@ -1634,45 +2276,125 @@ destination: default
     }
 
     #[test]
+    fn rejects_link_layer_and_non_ip_gateways_in_route_get_default() {
+        let link14_sample = "\
+   route to: default
+destination: default
+       mask: default
+    gateway: link#14
+  interface: en0
+      flags: <UP,CLONING,UCS,STATIC,GLOBAL>
+";
+        assert_eq!(
+            parse_route_get_default(link14_sample),
+            Some(("en0".to_string(), None))
+        );
+
+        let upper_link_sample = "\
+   route to: default
+destination: default
+    gateway: LINK#14
+  interface: en0
+      flags: <UP,STATIC>
+";
+        assert_eq!(
+            parse_route_get_default(upper_link_sample),
+            Some(("en0".to_string(), None))
+        );
+
+        let mac_gateway_sample = "\
+   route to: default
+destination: default
+    gateway: aa:bb:cc:dd:ee:ff
+  interface: en0
+      flags: <UP,STATIC>
+";
+        assert_eq!(
+            parse_route_get_default(mac_gateway_sample),
+            Some(("en0".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn managed_route_ifscope_serde_defaults_and_roundtrips() {
+        let legacy_json = r#"{"destination":"10.0.0.0/8","is_ipv6":false,"interface":null,"gateway":"192.168.1.1"}"#;
+        let decoded: ManagedRoute = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(
+            decoded,
+            ManagedRoute {
+                destination: "10.0.0.0/8".to_string(),
+                is_ipv6: false,
+                interface: None,
+                gateway: Some("192.168.1.1".to_string()),
+                ifscope: None,
+            }
+        );
+
+        let scoped = ManagedRoute {
+            destination: "default".to_string(),
+            is_ipv6: false,
+            interface: None,
+            gateway: Some("192.168.1.1".to_string()),
+            ifscope: Some("en0".to_string()),
+        };
+        let encoded = serde_json::to_string(&scoped).unwrap();
+        let roundtripped: ManagedRoute = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(roundtripped, scoped);
+    }
+
+    #[test]
     fn macos_tun_guard_state_serde_and_atomic_file_roundtrip() {
         let state = MacosTunGuardState {
             iface_name: "utun4".to_string(),
             routes: vec![
                 ManagedRoute {
+                    destination: "default".to_string(),
+                    is_ipv6: false,
+                    interface: None,
+                    gateway: Some("192.168.1.1".to_string()),
+                    ifscope: Some("en0".to_string()),
+                },
+                ManagedRoute {
                     destination: "10.0.0.0/8".to_string(),
                     is_ipv6: false,
                     interface: None,
                     gateway: Some("192.168.1.1".to_string()),
+                    ifscope: None,
                 },
                 ManagedRoute {
                     destination: "169.254.0.0/16".to_string(),
                     is_ipv6: false,
                     interface: Some("en0".to_string()),
                     gateway: None,
+                    ifscope: None,
                 },
                 ManagedRoute {
                     destination: "240.0.0.0/4".to_string(),
                     is_ipv6: false,
                     interface: Some("en0".to_string()),
                     gateway: None,
+                    ifscope: None,
                 },
                 ManagedRoute {
-                    destination: "0.0.0.0/1".to_string(),
+                    destination: "1.0.0.0/8".to_string(),
                     is_ipv6: false,
                     interface: Some("utun4".to_string()),
                     gateway: None,
+                    ifscope: None,
                 },
                 ManagedRoute {
                     destination: "128.0.0.0/1".to_string(),
                     is_ipv6: false,
                     interface: Some("utun4".to_string()),
                     gateway: None,
+                    ifscope: None,
                 },
                 ManagedRoute {
                     destination: "2000::/3".to_string(),
                     is_ipv6: true,
                     interface: Some("utun4".to_string()),
                     gateway: None,
+                    ifscope: None,
                 },
             ],
             dns_snapshots: vec![

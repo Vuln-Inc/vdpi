@@ -9,7 +9,7 @@ Runs as a transparent system-wide TUN adapter or a lightweight local proxy with 
 [![License: MIT](https://img.shields.io/badge/License-MIT-34d399?style=for-the-badge)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/Platforms-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Android%20%7C%20iOS-818cf8?style=for-the-badge)](#quick-install)
 
-[Quick Install](#quick-install) · [Engines](#choosing-an-engine-proxy-vs-tun) · [Getting Started](#getting-started) · [Docs](#documentation) · [Releases](https://github.com/Vuln-Inc/vdpi/releases/latest) · [Changelog](./CHANGELOG.md) · [Security](./SECURITY.md)
+[Quick Install](#quick-install) · [Engines](#engine-modes-proxy-vs-tun) · [Getting Started](#getting-started) · [Docs](#documentation) · [Releases](https://github.com/Vuln-Inc/vdpi/releases/latest) · [Changelog](./CHANGELOG.md) · [Security](./SECURITY.md)
 
 </div>
 
@@ -45,7 +45,7 @@ Runs as a transparent system-wide TUN adapter or a lightweight local proxy with 
     </td>
     <td valign="top" width="50%">
       <strong>Local-only &amp; verifiable</strong><br>
-      All traffic stays on-device with no remote relay servers or analytics. Every release asset is verified against <code>SHA256SUMS.txt</code> (see <a href="./SECURITY.md#binary-verification">SECURITY.md</a>).
+      All traffic stays on-device with no remote relay servers or analytics. Every release asset is verified against <code>SHA256SUMS.txt</code> (see <a href="https://github.com/Vuln-Inc/vdpi/blob/main/SECURITY.md#binary-verification">SECURITY.md</a>).
     </td>
   </tr>
 </table>
@@ -69,6 +69,8 @@ winget install Vuln-Inc.vdpi
 # Cargo (https://crates.io/crates/vdpi)
 cargo install vdpi
 ```
+
+> **Note:** On Windows, `cargo install vdpi` installs `vdpi.exe` (Proxy mode works immediately; for TUN mode, place `wintun.dll` beside `vdpi.exe` or install via Scoop, WinGet, or `install.ps1`).
 
 Direct download: [`vdpi-windows-x86_64.zip`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-windows-x86_64.zip) (bundles pinned WHQL-signed `wintun.dll`) or [crates.io/crates/vdpi](https://crates.io/crates/vdpi).
 
@@ -100,28 +102,32 @@ Direct downloads: [`vdpi-macos-universal.tar.gz`](https://github.com/Vuln-Inc/vd
 
 ---
 
-## Choosing an Engine (Proxy vs TUN)
+## Engine Modes (Proxy vs TUN)
 
-**Proxy mode is the default** for zero-hassle stability (no virtual network adapter, no routing table edits, and no elevated privileges required on macOS/Linux). Switch to **TUN mode** whenever you want transparent system-wide coverage for games, Discord voice, Roblox, or apps that ignore OS proxy settings.
+- **Proxy mode (default):** Zero admin privileges required, zero virtual adapter, routing table, or DNS changes, and most stable out of the box for browsers, Discord, Telegram, and apps that honor system proxy.
+- **TUN mode (system-wide):** Captures all TCP & UDP traffic including games (Roblox, Valorant, etc.) and apps that ignore system proxy.
+- **How to switch:** Open the `vdpi` Control Center (`vdpi` with no args) and select **Switch to TUN** / **Switch to Proxy** (automatically prompts for UAC on Windows or `sudo` / Touch ID password on macOS & Linux - no need to pre-run as root), or run `vdpi install --tun` / `vdpi --tun`.
 
 | Dimension | Proxy Mode (`--proxy`, **Default**) | TUN Mode (`--tun`) |
 | :--- | :--- | :--- |
 | **Traffic capture** | Local `127.0.0.1:8080` (HTTP/HTTPS/SOCKS5/4a) + `:1080` (SOCKS5 TCP/UDP) | Layer 3 virtual NIC (`Wintun` / `utun` / `/dev/net/tun`) + userspace stack |
-| **App coverage** | Browsers & apps honoring OS proxy settings or `HTTP_PROXY` / `HTTPS_PROXY` | System-wide: browsers, Discord, Roblox, games, CLI, `libcurl`, all apps |
-| **OS integration** | Sets OS proxy & env vars; restart already-open browsers once on first run | Zero proxy env edits; no browser restart required |
-| **Privileges & memory** | Unprivileged foreground (and macOS/Linux service); ~8-14 MB RAM | Prompts for UAC (Windows) or `sudo` / Touch ID (macOS & Linux); ~16-22 MB RAM |
+| **App coverage** | Browsers, Discord, Telegram & apps honoring system proxy or `HTTP_PROXY` / `HTTPS_PROXY` | System-wide TCP & UDP: games (Roblox, Valorant, etc.), Discord voice, CLI, all apps |
+| **OS integration** | Sets OS proxy & env vars; no virtual adapter, route, or DNS changes | Zero proxy env edits; no browser restart required |
+| **Privileges & memory** | Zero admin privileges required; ~8-14 MB RAM | Prompts for UAC (Windows) or `sudo` / Touch ID (macOS & Linux); ~16-22 MB RAM |
 | **VPN & anticheat** | Pure loopback proxy; no virtual adapter; `VpnGuard` auto-yield | `VpnGuard` 0ms auto-yield; WHQL-signed Wintun (anticheat safe) |
 
 ### Switching Modes
 
 Your current mode (`Proxy` or `TUN`) is always shown in the `Engine` row of the `vdpi` Control Center and in the Live Dashboard status bar.
 
-- **Interactive TUI:** Run `vdpi` and pick **Switch to TUN mode** / **Switch to Proxy mode** - `vdpi` automatically prompts for elevation (UAC on Windows, `sudo` password or Touch ID on macOS/Linux) when toggling a system TUN service or launching foreground TUN.
+- **Interactive TUI:** Run `vdpi` with no args and select **Switch to TUN** / **Switch to Proxy** - `vdpi` automatically prompts for elevation (UAC on Windows, `sudo` / Touch ID password on macOS & Linux; no need to pre-run as root).
 - **CLI:**
   ```bash
   vdpi engine         # Show current engine mode (Proxy or TUN)
   vdpi engine tun     # Switch to transparent system-wide TUN mode
   vdpi engine proxy   # Switch back to default local HTTP/SOCKS5 proxy mode
+  vdpi install --tun  # Install background service directly in TUN mode
+  vdpi --tun          # Launch or run in TUN mode
   vdpi --tun start    # Run a one-off foreground TUN session
   vdpi --proxy start  # Run a one-off foreground Proxy session
   ```

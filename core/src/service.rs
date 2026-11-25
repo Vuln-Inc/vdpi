@@ -1325,7 +1325,7 @@ WantedBy=default.target\n"
 }
 
 /// Generates a root-owned Linux `systemd` system service unit for transparent
-/// `EngineMode::Tun` with `CAP_NET_ADMIN` and automatic `ExecStopPost` TUN cleanup.
+/// `EngineMode::Tun` with full root capabilities and automatic `ExecStopPost` TUN cleanup.
 pub fn generate_systemd_system_unit(bin_path: &Path, cfg: &RuntimeConfig) -> String {
     let mut tun_cfg = cfg.clone();
     tun_cfg.engine = EngineMode::Tun;
@@ -1342,15 +1342,15 @@ pub fn generate_systemd_system_unit(bin_path: &Path, cfg: &RuntimeConfig) -> Str
     format!(
         "[Unit]\n\
 Description=vdpi Anti-DPI Transparent TUN Engine\n\
-After=network-online.target\n\
+After=network-online.target systemd-resolved.service NetworkManager.service\n\
 Wants=network-online.target\n\
+StartLimitIntervalSec=60\n\
+StartLimitBurst=5\n\
 \n\
 [Service]\n\
 Type=simple\n\
 ExecStart={exec_start}\n\
 ExecStopPost={exec_stop_post}\n\
-AmbientCapabilities=CAP_NET_ADMIN\n\
-CapabilityBoundingSet=CAP_NET_ADMIN\n\
 KillMode=mixed\n\
 Restart=always\n\
 RestartSec=2\n\
@@ -2458,6 +2458,10 @@ fn install_linux_systemd_system_service(target_bin: &Path, cfg: &RuntimeConfig) 
     let unit_text = generate_systemd_system_unit(target_bin, cfg);
     fs::write(&unit_path, unit_text)
         .with_context(|| format!("failed to write {}", unit_path.display()))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&unit_path, fs::Permissions::from_mode(0o644));
+    }
 
     let _ = Command::new("systemctl")
         .args(["daemon-reload"])
@@ -3189,6 +3193,10 @@ fn switch_service_engine_impl(
                         &unit_path,
                         generate_systemd_system_unit(&target_bin, &target_cfg),
                     )?;
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = fs::set_permissions(&unit_path, fs::Permissions::from_mode(0o644));
+                    }
                     let _ = Command::new("systemctl")
                         .args(["daemon-reload"])
                         .stdin(Stdio::null())
@@ -5218,9 +5226,14 @@ mod tests {
         assert!(daemon_plist.contains("<key>AbandonProcessGroup</key>\n    <true/>"));
 
         let sys_unit = generate_systemd_system_unit(Path::new(UNIX_SYSTEM_BIN_PATH), &cfg);
+        assert!(sys_unit.contains(
+            "After=network-online.target systemd-resolved.service NetworkManager.service"
+        ));
+        assert!(sys_unit.contains("StartLimitIntervalSec=60"));
+        assert!(sys_unit.contains("StartLimitBurst=5"));
         assert!(sys_unit.contains("ExecStart=\"/usr/local/bin/vdpi\" \"--tun\""));
-        assert!(sys_unit.contains("AmbientCapabilities=CAP_NET_ADMIN"));
-        assert!(sys_unit.contains("CapabilityBoundingSet=CAP_NET_ADMIN"));
+        assert!(!sys_unit.contains("AmbientCapabilities="));
+        assert!(!sys_unit.contains("CapabilityBoundingSet="));
         assert!(
             sys_unit.contains("ExecStopPost=+\"/usr/local/bin/vdpi\" --internal-linux-tun-cleanup")
         );

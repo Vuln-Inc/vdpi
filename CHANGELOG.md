@@ -6,6 +6,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-11-25
+
+### Fixed
+
+- macOS TUN `ERR_NAME_NOT_RESOLVED`: replaced `networksetup -setdnsservers` (which scoped `198.18.0.2` onto physical `en0` and broke `mDNSResponder`) with native `SCDynamicStore` session keys bound to `utunN` (`State:/Network/Service/com.vdpi.tun/*`, automatically cleaned by `configd` on exit or crash), added explicit `-ifscope` default routes plus 8 non-zero-anchor split routes (`1.0.0.0/8`..`128.0.0.0/1`) so `IP_BOUND_IF` never hits `ENETUNREACH`, fixed `/sbin/route add` exit-0 `"File exists"` handling and `link#` gateway rejection, wired `route_rx` into macOS TUN pipeline, and added automatic startup cleanup for any stale v0.5.x `198.18.0.2` Wi-Fi DNS entry.
+- Desktop TUN Gigabit throughput & low latency across Windows, macOS, and Linux: replaced `netstack-smoltcp` with an in-tree `smoltcp` 0.14 TCP runner (`ack_delay = None`, `nagle = false`, `Checksum::Tx`, poll-to-quiescence, zero silent TCP drops), raised desktop TUN MTU to `16384` (with `9000`/`1500` fallback on macOS and RFC 9715 1232-byte DNS cap), upgraded desktop TCP buffers to `512 KiB` (activating RFC 7323 window scaling), raised Wintun rings to 16 MiB/direction with batched RX/TX and 1ms Windows timer resolution, raised desktop relay buffers to `128 KiB`, and bumped Linux TUN `txqueuelen` to `4096`.
+- Windows service TUN mode now passes `route_rx` into the TUN pipeline so uplink switches immediately drain and rebind UDP Cone-NAT flows, and statically links the MSVC CRT (`+crt-static`) in release builds so `vdpi.exe` runs with zero `VCRUNTIME140.dll` dependency on clean Windows machines and WinGet validation VMs.
+- Linux TUN & `systemd` reliability: guarded `--internal-linux-tun-cleanup` (`ExecStopPost`) with non-blocking `flock` on `/run/vdpi/tun.lock`, fixed non-stub `/run/systemd/resolve/resolv.conf` detection and `nmcli general reload`, removed `CapabilityBoundingSet=CAP_NET_ADMIN` from the root `systemd` unit, ordered `After=systemd-resolved.service NetworkManager.service`, and added fast-fail detection for non-root Linux TUN errors.
+- Bound DoH & UDP DNS hardening: skipped HTTP/2-only Quad9 endpoints in HTTP/1.1 bound DoH, added `Content-Length` fast-return and chunked decoding, appended RFC 2308 Authority SOA records on negative/NODATA replies, widened raw UDP DNS buffers to 4096 bytes with stray-packet skipping, and expanded raw UDP failover across all configured servers.
+
+### Docs
+
+- Documented Proxy (default) vs TUN engine modes and switching workflows in `README.md`, and fixed relative links for crates.io rendering.
+
 ## [0.5.1] - 2026-11-25
 
 ### Fixed
@@ -104,7 +118,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Configured `CODE_SIGN_ENTITLEMENTS` in iOS `project.yml` so XcodeGen preserves `.entitlements` files.
 - Fixed release workflow entitlement verification and restricted automatic release runs to version tags and manual dispatch.
 
-[Unreleased]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/Vuln-Inc/vdpi/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/Vuln-Inc/vdpi/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/Vuln-Inc/vdpi/compare/v0.4.0...v0.4.1

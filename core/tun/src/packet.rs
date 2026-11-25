@@ -635,9 +635,23 @@ pub fn build_icmpv6_no_route(invoking_pkt: &[u8]) -> Option<Vec<u8>> {
     build_icmpv6_dest_unreachable(body, orig_src, orig_dst, ICMPV6_CODE_NO_ROUTE)
 }
 
+/// RFC 9715 / DNS Flag Day 2020 maximum safe internet UDP DNS payload size (1232 bytes),
+/// ensuring oversized local TUN MTUs (such as `DESKTOP_MTU = 16384`) never synthesize
+/// UDP/53 replies larger than 1232 bytes.
+pub(crate) const MAX_DNS_UDP_PAYLOAD: usize = 1232;
+
 pub(crate) fn max_udp_payload_for_mtu(mtu: usize, is_ipv4: bool) -> usize {
     let overhead = if is_ipv4 { 20 + 8 } else { 40 + 8 };
-    mtu.saturating_sub(overhead)
+    let ip_limit = if is_ipv4 {
+        usize::from(u16::MAX) - 20 - 8
+    } else {
+        usize::from(u16::MAX) - 8
+    };
+    mtu.saturating_sub(overhead).min(ip_limit)
+}
+
+pub(crate) fn max_dns_udp_payload_for_mtu(mtu: usize, is_ipv4: bool) -> usize {
+    max_udp_payload_for_mtu(mtu, is_ipv4).min(MAX_DNS_UDP_PAYLOAD)
 }
 
 #[cfg(test)]
@@ -1375,5 +1389,44 @@ mod tests {
         pkt8_icmp.extend_from_slice(&ext8_icmp);
         pkt8_icmp.extend_from_slice(&[ICMPV6_TYPE_DEST_UNREACHABLE, 0, 0, 0, 0, 0, 0, 0]);
         assert!(build_icmpv6_no_route(&pkt8_icmp).is_none());
+    }
+
+    #[test]
+    fn max_udp_payload_caps_dns_at_1232_and_build_udp_handles_65507() {
+        assert_eq!(max_dns_udp_payload_for_mtu(16384, true), 1232);
+        assert_eq!(max_dns_udp_payload_for_mtu(16384, false), 1232);
+        assert_eq!(max_dns_udp_payload_for_mtu(65535, true), 1232);
+        assert_eq!(max_dns_udp_payload_for_mtu(65535, false), 1232);
+        assert_eq!(max_dns_udp_payload_for_mtu(1280, false), 1232);
+        assert_eq!(max_dns_udp_payload_for_mtu(1000, true), 972);
+
+        assert_eq!(max_udp_payload_for_mtu(16384, true), 16384 - 28);
+        assert_eq!(max_udp_payload_for_mtu(16384, false), 16384 - 48);
+        assert_eq!(max_udp_payload_for_mtu(65535, true), 65507);
+        assert_eq!(max_udp_payload_for_mtu(65535, false), 65535 - 48);
+
+        let mut max_payload = vec![0xffu8; 65507];
+
+        let v4_src = Ipv4Addr::new(1, 1, 1, 1);
+        let v4_dst = Ipv4Addr::new(198, 18, 0, 1);
+        let src_v4 = SocketAddr::new(IpAddr::V4(v4_src), 443);
+        let dst_v4 = SocketAddr::new(IpAddr::V4(v4_dst), 51000);
+        let pkt_v4 = build_udp_packet(src_v4, dst_v4, &max_payload).expect("max IPv4 UDP packet");
+        assert_eq!(pkt_v4.len(), 65535);
+        assert_eq!(internet_checksum(&pkt_v4[..20]), 0);
+        let parsed_v4 = inspect_inbound_udp(&pkt_v4).expect("inspect max IPv4 UDP");
+        assert_eq!(parsed_v4.payload.len(), 65507);
+
+        let v6_src = Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111);
+        let v6_dst = Ipv6Addr::new(0xfd00, 0x7664, 0x7069, 0, 0, 0, 0, 1);
+        let src_v6 = SocketAddr::new(IpAddr::V6(v6_src), 443);
+        let dst_v6 = SocketAddr::new(IpAddr::V6(v6_dst), 51001);
+        let pkt_v6 = build_udp_packet(src_v6, dst_v6, &max_payload).expect("max IPv6 UDP packet");
+        assert_eq!(pkt_v6.len(), 40 + 8 + 65507);
+        let parsed_v6 = inspect_inbound_udp(&pkt_v6).expect("inspect max IPv6 UDP");
+        assert_eq!(parsed_v6.payload.len(), 65507);
+
+        max_payload.push(0);
+        assert!(build_udp_packet(src_v4, dst_v4, &max_payload).is_none());
     }
 }

@@ -22,10 +22,15 @@ pub const LINUX_TUN_DNS_V4: &str = "198.18.0.2";
 pub const LINUX_TUN_IPV6_CIDR: &str = "fd00:7664:7069::1/126";
 /// Virtual IPv6 DNS server routed into `vdpi0` when `tun_ipv6` is enabled.
 pub const LINUX_TUN_DNS_V6: &str = "fd00:7664:7069::2";
+/// Default MTU configured on `vdpi0` (matches `vdpi_tun::config::DESKTOP_MTU`; Linux
+/// `/dev/net/tun` supports up to 65,535 bytes).
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub const LINUX_TUN_MTU: u16 = vdpi_tun::config::DESKTOP_MTU as u16;
 /// Default MTU configured on `vdpi0`.
-pub const LINUX_TUN_MTU: u16 = 1500;
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub const LINUX_TUN_MTU: u16 = 16_384;
 /// Default transmit queue length configured on `vdpi0`.
-pub const LINUX_TUN_TXQUEUELEN: u32 = 1000;
+pub const LINUX_TUN_TXQUEUELEN: u32 = 4096;
 /// Linux `SO_MARK` fwmark (`"VD"`) applied to `vdpi`'s own outbound sockets.
 pub const VDPI_SO_MARK: u32 = 0x5644;
 /// Bitmask applied to `fwmark` policy rules so upper mark bits (e.g. Tailscale/WireGuard)
@@ -280,18 +285,19 @@ pub fn is_valid_resolv_symlink_target(target: &str) -> bool {
         && (target.starts_with('/') || target.starts_with("../"))
 }
 
-/// Returns `true` when `/etc/resolv.conf` indicates `systemd-resolved` actually owns host DNS
-/// (either via symlink into `/run/systemd/resolve/` or pointing at stub listeners
+/// Returns `true` when `/etc/resolv.conf` indicates `systemd-resolved`'s stub listener actually
+/// owns host DNS (either via a symlink targeting `stub-resolv.conf` or pointing at stub listeners
 /// `127.0.0.53` / `127.0.0.54`).
+///
+/// Non-stub `/run/systemd/resolve/resolv.conf` lists upstream nameservers directly and bypasses
+/// `systemd-resolved`'s stub listener, so it must return `false`.
 pub fn resolv_conf_uses_systemd_resolved(
     symlink_target: Option<&str>,
     contents: Option<&str>,
 ) -> bool {
     if let Some(target) = symlink_target {
         let normalized = target.trim();
-        if normalized.starts_with("/run/systemd/resolve/")
-            || normalized.starts_with("../run/systemd/resolve/")
-        {
+        if normalized.contains("stub-resolv.conf") {
             return true;
         }
     }
@@ -794,6 +800,32 @@ mod imp {
         Ok(lock_file)
     }
 
+    fn try_acquire_cleanup_lock() -> Result<Option<File>> {
+        fs::create_dir_all(LINUX_TUN_STATE_DIR)
+            .with_context(|| format!("failed to create {LINUX_TUN_STATE_DIR}"))?;
+        let lock_file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(LINUX_TUN_LOCK_PATH)
+            .with_context(|| format!("failed to open Linux TUN lock file {LINUX_TUN_LOCK_PATH}"))?;
+
+        // SAFETY: `lock_file` is an open file descriptor exclusively owned here.
+        let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(err).with_context(|| {
+                format!("failed to acquire exclusive lock on {LINUX_TUN_LOCK_PATH}")
+            });
+        }
+        Ok(Some(lock_file))
+    }
+
     /// Active Linux desktop TUN session managing interface config, `SO_MARK` policy routing,
     /// and 3-backend DNS configuration with automatic rollback on `Drop`.
     #[derive(Debug)]
@@ -822,7 +854,7 @@ mod imp {
 
             let lock_file = acquire_tun_lock()?;
 
-            if let Err(err) = cleanup_linux_tun_state() {
+            if let Err(err) = cleanup_linux_tun_state_locked() {
                 warn!(error = %err, "stale Linux TUN state recovery reported an issue");
             }
 
@@ -847,7 +879,7 @@ mod imp {
             let setup_res = Self::configure_network(&iface, &binder, tun_ipv6, &mut state);
             if let Err(err) = setup_res {
                 binder.update(OutboundTarget::default());
-                let _ = cleanup_linux_tun_state();
+                let _ = cleanup_linux_tun_state_locked();
                 return Err(err);
             }
 
@@ -888,7 +920,7 @@ mod imp {
 
             run_ip(&["-4", "addr", "replace", LINUX_TUN_IPV4_CIDR, "dev", iface])
                 .context("failed to assign IPv4 address to TUN interface")?;
-            run_ip(&[
+            if let Err(err) = run_ip(&[
                 "link",
                 "set",
                 "dev",
@@ -898,8 +930,16 @@ mod imp {
                 "txqueuelen",
                 &qlen_str,
                 "up",
-            ])
-            .context("failed to bring up Linux TUN interface")?;
+            ]) {
+                warn!(
+                    iface = %iface,
+                    txqueuelen = LINUX_TUN_TXQUEUELEN,
+                    error = %err,
+                    "ip link set with txqueuelen failed; retrying without txqueuelen"
+                );
+                run_ip(&["link", "set", "dev", iface, "mtu", &mtu_str, "up"])
+                    .context("failed to bring up Linux TUN interface")?;
+            }
 
             configure_loose_rp_filter(iface, state);
 
@@ -947,7 +987,7 @@ mod imp {
             if !self.cleaned {
                 self.cleaned = true;
                 self.binder.update(OutboundTarget::default());
-                if let Err(err) = cleanup_linux_tun_state() {
+                if let Err(err) = cleanup_linux_tun_state_locked() {
                     warn!(
                         iface = %self.iface,
                         error = %err,
@@ -962,9 +1002,21 @@ mod imp {
     /// `rp_filter` override, DNS configuration (including persistent `/var/lib/vdpi` backups),
     /// and `/run/vdpi/tun-state.json`.
     ///
-    /// Safe to invoke on `Drop`, during startup stale-state recovery, and from systemd
-    /// `ExecStopPost=+/usr/local/bin/vdpi --internal-linux-tun-cleanup`.
+    /// Acquires a non-blocking exclusive `flock` on [`LINUX_TUN_LOCK_PATH`] first; if another
+    /// live `vdpi` instance holds the lock, returns `Ok(())` immediately without touching the
+    /// active TUN session (safe for systemd `ExecStopPost=+/usr/local/bin/vdpi --internal-linux-tun-cleanup`).
     pub fn cleanup_linux_tun_state() -> Result<()> {
+        let Some(_lock_file) = try_acquire_cleanup_lock()? else {
+            info!(
+                lock = LINUX_TUN_LOCK_PATH,
+                "another vdpi Linux TUN instance is active; skipping cleanup"
+            );
+            return Ok(());
+        };
+        cleanup_linux_tun_state_locked()
+    }
+
+    fn cleanup_linux_tun_state_locked() -> Result<()> {
         let mut cleanup_errors: Vec<String> = Vec::new();
         let state_path = Path::new(LINUX_TUN_STATE_PATH);
         let state = match LinuxTunState::load_from_path(state_path) {
@@ -1405,7 +1457,7 @@ mod imp {
     fn reload_network_manager_dns() -> Result<()> {
         if let Some(nmcli) = resolve_trusted_bin("nmcli") {
             let ok = Command::new(nmcli)
-                .args(["general", "reload", "conf"])
+                .args(["general", "reload"])
                 .output()
                 .is_ok_and(|out| out.status.success());
             if ok {
@@ -1856,11 +1908,24 @@ default via 192.168.1.1 dev wlan0 proto dhcp src 192.168.1.42 metric 600
 
     #[test]
     fn detects_systemd_resolved_and_nm_dns_disable_configs() {
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        assert_eq!(LINUX_TUN_MTU, vdpi_tun::config::DESKTOP_MTU as u16);
+        assert_eq!(LINUX_TUN_TXQUEUELEN, 4096);
+
         assert!(resolv_conf_uses_systemd_resolved(
             Some("/run/systemd/resolve/stub-resolv.conf"),
             None
         ));
         assert!(resolv_conf_uses_systemd_resolved(
+            Some("../run/systemd/resolve/stub-resolv.conf"),
+            None
+        ));
+        // Non-stub `/run/systemd/resolve/resolv.conf` bypasses systemd-resolved's stub listener.
+        assert!(!resolv_conf_uses_systemd_resolved(
+            Some("/run/systemd/resolve/resolv.conf"),
+            None
+        ));
+        assert!(!resolv_conf_uses_systemd_resolved(
             Some("../run/systemd/resolve/resolv.conf"),
             None
         ));
