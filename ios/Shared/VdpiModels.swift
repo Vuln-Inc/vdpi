@@ -159,6 +159,9 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
     /// JSON-encoded `VdpiSettings` directly to `PacketTunnelProvider` even when App Group
     /// `UserDefaults` sharing is broken by third-party re-signers.
     public static let providerConfigSettingsKey = "vdpiSettingsJSON"
+    public static let currentSchemaVersion = 2
+    public static let legacyDefaultMtu = 1400
+    public static let defaultMtu = 4064
 
     public var desyncMode: DesyncMode
     public var chunkSize: Int
@@ -170,6 +173,7 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
     public var bypassDomains: [String]
     public var onDemandEnabled: Bool
     public var theme: ThemePreference
+    public var schemaVersion: Int?
 
     enum CodingKeys: String, CodingKey {
         case desyncMode
@@ -182,6 +186,8 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
         case bypassDomains
         case onDemandEnabled
         case theme
+        case schemaVersion
+        case settingsSchemaVersion
     }
 
     public init(
@@ -191,10 +197,11 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
         enableDoh: Bool = true,
         ipv4Only: Bool = false,
         blockQuic: Bool = true,
-        mtu: Int = 4064,
+        mtu: Int = VdpiSettings.defaultMtu,
         bypassDomains: [String] = [],
         onDemandEnabled: Bool = false,
-        theme: ThemePreference = .system
+        theme: ThemePreference = .system,
+        schemaVersion: Int? = VdpiSettings.currentSchemaVersion
     ) {
         self.desyncMode = desyncMode
         self.chunkSize = max(1, min(64, chunkSize))
@@ -206,6 +213,7 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
         self.bypassDomains = bypassDomains
         self.onDemandEnabled = onDemandEnabled
         self.theme = theme
+        self.schemaVersion = schemaVersion
     }
 
     public init(from decoder: Decoder) throws {
@@ -217,11 +225,36 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
         self.enableDoh = try c.decodeIfPresent(Bool.self, forKey: .enableDoh) ?? true
         self.ipv4Only = try c.decodeIfPresent(Bool.self, forKey: .ipv4Only) ?? false
         self.blockQuic = try c.decodeIfPresent(Bool.self, forKey: .blockQuic) ?? true
-        let rawMtu = try c.decodeIfPresent(Int.self, forKey: .mtu) ?? 4064
-        self.mtu = max(1280, min(4064, rawMtu))
+
+        let decodedSchemaVersion = try c.decodeIfPresent(Int.self, forKey: .schemaVersion)
+            ?? c.decodeIfPresent(Int.self, forKey: .settingsSchemaVersion)
+        let rawMtu = try c.decodeIfPresent(Int.self, forKey: .mtu) ?? Self.defaultMtu
+        let migratedMtu: Int
+        if rawMtu == Self.legacyDefaultMtu && (decodedSchemaVersion ?? 0) < Self.currentSchemaVersion {
+            migratedMtu = Self.defaultMtu
+        } else {
+            migratedMtu = rawMtu
+        }
+        self.mtu = max(1280, min(4064, migratedMtu))
         self.bypassDomains = try c.decodeIfPresent([String].self, forKey: .bypassDomains) ?? []
         self.onDemandEnabled = try c.decodeIfPresent(Bool.self, forKey: .onDemandEnabled) ?? false
         self.theme = try c.decodeIfPresent(ThemePreference.self, forKey: .theme) ?? .system
+        self.schemaVersion = max(decodedSchemaVersion ?? 0, Self.currentSchemaVersion)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(desyncMode, forKey: .desyncMode)
+        try c.encode(chunkSize, forKey: .chunkSize)
+        try c.encode(dnsAddr, forKey: .dnsAddr)
+        try c.encode(enableDoh, forKey: .enableDoh)
+        try c.encode(ipv4Only, forKey: .ipv4Only)
+        try c.encode(blockQuic, forKey: .blockQuic)
+        try c.encode(mtu, forKey: .mtu)
+        try c.encode(bypassDomains, forKey: .bypassDomains)
+        try c.encode(onDemandEnabled, forKey: .onDemandEnabled)
+        try c.encode(theme, forKey: .theme)
+        try c.encode(schemaVersion ?? Self.currentSchemaVersion, forKey: .schemaVersion)
     }
 
     public var clampedChunkSize: Int {

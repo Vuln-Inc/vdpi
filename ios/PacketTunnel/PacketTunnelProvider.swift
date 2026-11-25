@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import NetworkExtension
+import os
 import VdpiCore
 
 private let ipv4ProtocolNumber = NSNumber(value: AF_INET)
@@ -36,6 +37,7 @@ private func vdpiOutboundBatchCallback(
 
 final class PacketTunnelProvider: NEPacketTunnelProvider {
     private static let tunnelErrorDomain = "com.vulninc.vdpi.tunnel"
+    private static let logger = Logger(subsystem: tunnelErrorDomain, category: "PacketTunnelProvider")
     private static let maxUtunScanFd: Int32 = 1024
     private static let maxInboundBatchChunkSize = 64
     private static let maxInboundBackpressureRetries = 8
@@ -190,6 +192,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     )
                     let startOutcome = self.startNativeEngine(configJSON: configJSON)
                     if let errMsg = startOutcome.error {
+                        Self.logger.error(
+                            "startTunnel failed to start native engine: \(errMsg, privacy: .public)"
+                        )
                         completionHandler(NSError(
                             domain: Self.tunnelErrorDomain,
                             code: 1001,
@@ -220,6 +225,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     if !startOutcome.usedDirectFd {
                         self.ensureInboundPumpRunning()
                     }
+                    let ioMode = startOutcome.usedDirectFd
+                        ? "direct-utun (\(startOutcome.utunIfName ?? "utun"))"
+                        : "packetFlow-fallback"
+                    let ipv6Enabled = !effectiveIpv4Only
+                    let ifaceName = primaryIface ?? "unknown"
+                    Self.logger.notice(
+                        "startTunnel active: mode=\(ioMode, privacy: .public) mtu=\(effectiveMtu, privacy: .public) ipv6Enabled=\(ipv6Enabled, privacy: .public) primaryIface=\(ifaceName, privacy: .public)"
+                    )
                     VdpiAppGroup.saveAppliedConfig(settings.toNativeConfig())
                     completionHandler(nil)
                 }
@@ -282,6 +295,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         case .reloadEngine:
             reloadTunnelEngine(overrideJSON: nil, completionHandler: completionHandler)
+
+        case .reloadEngineWithSettings(let settingsJson):
+            reloadTunnelEngine(overrideJSON: settingsJson, completionHandler: completionHandler)
         }
     }
 
@@ -396,6 +412,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     if !startOutcome.usedDirectFd {
                         self.ensureInboundPumpRunning()
                     }
+                    let ioMode = startOutcome.usedDirectFd
+                        ? "direct-utun (\(startOutcome.utunIfName ?? "utun"))"
+                        : "packetFlow-fallback"
+                    let ipv6Enabled = !effectiveIpv4Only
+                    let ifaceName = primaryIface ?? "unknown"
+                    Self.logger.notice(
+                        "reloadTunnelEngine active: mode=\(ioMode, privacy: .public) mtu=\(effectiveMtu, privacy: .public) ipv6Enabled=\(ipv6Enabled, privacy: .public) primaryIface=\(ifaceName, privacy: .public)"
+                    )
                     VdpiAppGroup.saveAppliedConfig(settings.toNativeConfig())
                     finish(ProviderCommandResponse(ok: true))
                 }
@@ -406,21 +430,34 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// Starts or restarts the native Rust engine, preferring direct `dup(utun_fd)` attachment
     /// and automatically falling back to batched `NEPacketTunnelFlow` I/O if no `utun` fd is
     /// available or direct-FD startup fails.
-    private func startNativeEngine(configJSON: String) -> (error: String?, usedDirectFd: Bool) {
+    private func startNativeEngine(
+        configJSON: String
+    ) -> (error: String?, usedDirectFd: Bool, utunIfName: String?) {
         stateLock.lock()
         let alreadyUsingPacketFlow = hasArmedPacketFlowRead
         stateLock.unlock()
 
         // Never race with an already-armed `packetFlow.readPackets` callback on reload.
         if !alreadyUsingPacketFlow {
-            if let dupFd = Self.duplicateTunnelFileDescriptor() {
-                // Ownership of `dupFd >= 0` transfers immediately to `vdpi_ios_start_fd`
+            if let candidate = Self.duplicateTunnelFileDescriptor() {
+                // Ownership of `candidate.fd >= 0` transfers immediately to `vdpi_ios_start_fd`
                 // (`OwnedFd::from_raw_fd`), which closes it on stop or startup error.
-                // Swift must never close `dupFd` once handed to `startWithFd`.
-                if VdpiNativeBridge.startWithFd(tunFd: dupFd, configJSON: configJSON) == nil {
+                // Swift must never close `candidate.fd` once handed to `startWithFd`.
+                if let fdError = VdpiNativeBridge.startWithFd(tunFd: candidate.fd, configJSON: configJSON) {
+                    let ifName = candidate.ifName
+                    let dupFd = candidate.fd
+                    Self.logger.warning(
+                        "Direct utun startup failed on \(ifName, privacy: .public) (dupFd=\(dupFd, privacy: .public)): \(fdError, privacy: .public); falling back to packetFlow"
+                    )
+                } else {
                     setDirectUtunMode(true)
-                    return (nil, true)
+                    return (nil, true, candidate.ifName)
                 }
+            } else {
+                let scanLimit = Self.maxUtunScanFd
+                Self.logger.info(
+                    "No active utun fd found in 0..<\(scanLimit, privacy: .public); using packetFlow fallback"
+                )
             }
         }
 
@@ -430,11 +467,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             writeBatchCallback: vdpiOutboundBatchCallback,
             userCtx: ctxPtr
         ) {
-            return (errMsg, false)
+            return (errMsg, false, nil)
         }
 
         setDirectUtunMode(false)
-        return (nil, false)
+        return (nil, false, nil)
     }
 
     // MARK: - Batched NEPacketTunnelFlow Fallback Pump
@@ -535,13 +572,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     // MARK: - Direct utun File Descriptor Discovery
 
-    /// Scans POSIX fds `0...1024` for the `NEPacketTunnelFlow` `utun` kernel control socket,
+    /// Scans POSIX fds `0..<1024` for the `NEPacketTunnelFlow` `utun` kernel control socket,
     /// prefers the interface holding `TunnelNetworkSettingsBuilder.tunnelIpv4Address` (`198.18.0.2`),
-    /// duplicates the fd via `dup()` (never closing `NEPacketTunnelFlow`'s fd), and re-verifies
-    /// the duplicated fd to guard against TOCTOU fd reuse.
-    private static func duplicateTunnelFileDescriptor() -> Int32? {
+    /// picks the highest-numbered matching `utun*` fd (matching WireGuard/sing-box reconnect
+    /// safety so stale/closing lower fds are never selected), duplicates it via `dup()`, and
+    /// re-verifies the duplicated fd to guard against TOCTOU fd reuse.
+    private static func duplicateTunnelFileDescriptor() -> (fd: Int32, ifName: String)? {
         var candidates: [(fd: Int32, ifName: String)] = []
-        for fd in Int32(0)...maxUtunScanFd {
+        for fd in Int32(0)..<maxUtunScanFd {
             if let ifName = inspectUtunFd(fd) {
                 candidates.append((fd: fd, ifName: ifName))
             }
@@ -561,7 +599,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             guard dupFd >= 0 else { continue }
             // TOCTOU guard: verify the duplicated descriptor still refers to the same utun interface.
             if inspectUtunFd(dupFd) == candidate.ifName {
-                return dupFd
+                return (fd: dupFd, ifName: candidate.ifName)
             }
             Darwin.close(dupFd)
         }
@@ -753,7 +791,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 || !TunnelNetworkSettingsBuilder.hasGlobalIpv6(onInterface: primaryIface)
 
             if let previousIpv4Only, previousIpv4Only != newEffectiveIpv4Only {
-                self.reloadTunnelEngine(overrideJSON: nil, completionHandler: nil)
+                let preservedJSON = activeSettings.flatMap { try? JSONEncoder().encode($0) }
+                    .flatMap { String(data: $0, encoding: .utf8) }
+                self.reloadTunnelEngine(overrideJSON: preservedJSON, completionHandler: nil)
             }
         }
         pathUpdateWorkItem = workItem
@@ -767,8 +807,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         guard let path else { return "none" }
         let snapshot = activePhysicalInterfacesSnapshot()
         let primaryIface = selectPrimaryInterface(from: snapshot, path: path)
-        let primaryIps = primaryIface.flatMap { snapshot.addressesByName[$0]?.sorted().joined(separator: "|") } ?? ""
-        return "\(path.status.rawValue):exp=\(path.isExpensive):con=\(path.isConstrained):if=\(primaryIface ?? "none"):ip=\(primaryIps)"
+        // Exclude volatile IPv6 temporary privacy addresses (RFC 4941) from the path signature
+        // so routine IPv6 address churn does not tear down active UDP Cone-NAT flows.
+        let primaryIpv4s = primaryIface
+            .flatMap { snapshot.addressesByName[$0] }
+            .map { $0.filter { !$0.contains(":") }.sorted().joined(separator: "|") }
+            ?? ""
+        let hasV6 = TunnelNetworkSettingsBuilder.hasGlobalIpv6(onInterface: primaryIface)
+        return "\(path.status.rawValue):exp=\(path.isExpensive):con=\(path.isConstrained):if=\(primaryIface ?? "none"):v4=\(primaryIpv4s):v6=\(hasV6)"
     }
 
     private static func resolvePrimaryPhysicalInterface(for path: NWPath?) -> String? {
@@ -787,13 +833,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         from snapshot: PhysicalInterfacesSnapshot,
         path: NWPath?
     ) -> String? {
-        if path?.isExpensive == true {
-            return snapshot.cellularInterfaces.first
-                ?? snapshot.enInterfaces.first
-                ?? snapshot.otherInterfaces.first
+        // Note: Personal Hotspot Wi-Fi sets `path.isExpensive == true` on `en0`! Only prefer
+        // cellular when `enInterfaces` has no active IPv4/UP interface (or Wi-Fi is off).
+        if let wifi = snapshot.enInterfaces.first {
+            return wifi
         }
-        return snapshot.enInterfaces.first
-            ?? snapshot.cellularInterfaces.first
+        return snapshot.cellularInterfaces.first
             ?? snapshot.otherInterfaces.first
     }
 

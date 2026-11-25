@@ -86,7 +86,7 @@ public final class TunnelManager: ObservableObject {
                 return trimmed
             }
         }
-        return "0.5.2"
+        return "0.5.3"
     }
 
     private static let providerConfigSettingsKey = "vdpiSettingsJSON"
@@ -128,6 +128,7 @@ public final class TunnelManager: ObservableObject {
     private var isSceneActive: Bool = true
     private var userInitiatedDisconnect: Bool = false
     private var engineUnhealthyWhileConnected: Bool = false
+    private var consecutiveUnhealthySamples: Int = 0
 
     public init() {
         let loaded = VdpiAppGroup.loadSettings()
@@ -493,7 +494,16 @@ public final class TunnelManager: ObservableObject {
 
                 let replyData: Data?
                 if let session = self.vpnManager?.connection as? NETunnelProviderSession {
-                    replyData = await self.sendMessage(.reloadEngine, via: session)
+                    if let settingsData = try? JSONEncoder().encode(target),
+                       let settingsJson = String(data: settingsData, encoding: .utf8)
+                    {
+                        replyData = await self.sendMessage(
+                            .reloadEngineWithSettings(settingsJson: settingsJson),
+                            via: session
+                        )
+                    } else {
+                        replyData = await self.sendMessage(.reloadEngine, via: session)
+                    }
                 } else {
                     replyData = nil
                 }
@@ -503,12 +513,9 @@ public final class TunnelManager: ObservableObject {
                    let response = ProviderCommandResponse.decodeData(replyData),
                    response.ok
                 {
-                    let persisted = VdpiAppGroup.loadAppliedConfig()?.canonicalized()
-                    let applied = persisted ?? target.toNativeConfig()
+                    let applied = target.toNativeConfig().canonicalized()
                     self.appliedConfig = applied
-                    if persisted == nil {
-                        VdpiAppGroup.saveAppliedConfig(applied)
-                    }
+                    VdpiAppGroup.saveAppliedConfig(applied)
                     self.clearPendingReconnect()
                     // Re-check in case another runtime setting changed while reload was in flight.
                     if self.settings.requiresTunnelReload(comparedToApplied: applied) {
@@ -1231,7 +1238,14 @@ public final class TunnelManager: ObservableObject {
             if telemetry != decoded {
                 telemetry = decoded
             }
-            guard !isReloading, vpnManager?.connection.status == .connected else { return }
+            guard !isReloading, vpnManager?.connection.status == .connected else {
+                consecutiveUnhealthySamples = 0
+                return
+            }
+            // Require 2 consecutive `running == false` samples (~2s) so brief extension-initiated
+            // route-change reloads never falsely lock the UI into `.error`.
+            consecutiveUnhealthySamples += 1
+            guard consecutiveUnhealthySamples >= 2 else { return }
             engineUnhealthyWhileConnected = true
             telemetryTask?.cancel()
             telemetryTask = nil
@@ -1241,6 +1255,7 @@ public final class TunnelManager: ObservableObject {
             triggerNotificationHaptic(.error)
             return
         }
+        consecutiveUnhealthySamples = 0
         engineUnhealthyWhileConnected = false
         recordThroughputSample(from: decoded)
         if telemetry != decoded {
@@ -1347,7 +1362,7 @@ public final class TunnelManager: ObservableObject {
         switch message {
         case .snapshot, .clearCache:
             return 5
-        case .reloadEngine:
+        case .reloadEngine, .reloadEngineWithSettings:
             return 15
         case .runDoctor:
             return 35

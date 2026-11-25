@@ -175,6 +175,7 @@ public enum ProviderMessage: Codable, Equatable, Sendable {
     case clearCache
     case runDoctor(configJson: String)
     case reloadEngine
+    case reloadEngineWithSettings(settingsJson: String)
 
     public func encodeData() -> Data? {
         try? JSONEncoder().encode(self)

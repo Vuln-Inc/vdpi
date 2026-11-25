@@ -48,6 +48,11 @@ const RELAY_BUF_SIZE: usize = 16 * 1024;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 const RELAY_BUF_SIZE: usize = 128 * 1024;
 
+#[cfg(any(target_os = "android", target_os = "ios"))]
+const IDLE_RELAY_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+const IDLE_RELAY_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Single learned hostname entry persisted in the adaptive stage cache file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersistedHostEntry {
@@ -122,6 +127,49 @@ fn is_valid_cache_host(host: &str) -> bool {
         && !host
             .bytes()
             .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+}
+
+/// Derives a wildcard parent-domain hint key (e.g. `t0.rbxcdn.com` -> `*.rbxcdn.com`)
+/// so sibling CDN shards inherit a learned non-Primary strategy without cold timeouts.
+fn parent_domain_cache_key(host: &str) -> Option<String> {
+    let trimmed = host.trim().trim_end_matches('.');
+    if trimmed.is_empty()
+        || trimmed.starts_with("*.")
+        || !is_valid_cache_host(trimmed)
+        || trimmed.parse::<IpAddr>().is_ok()
+    {
+        return None;
+    }
+    let labels: Vec<&str> = trimmed.split('.').collect();
+    if labels.len() < 3 || labels.iter().any(|l| l.is_empty()) {
+        return None;
+    }
+    let last = labels[labels.len() - 1];
+    let second_last = labels[labels.len() - 2];
+    let is_two_part_tld = last.len() == 2
+        && matches!(
+            second_last,
+            "co" | "com"
+                | "net"
+                | "org"
+                | "gov"
+                | "edu"
+                | "ac"
+                | "mil"
+                | "gen"
+                | "web"
+                | "biz"
+                | "nom"
+        );
+    let parent = if is_two_part_tld {
+        if labels.len() < 4 {
+            return None;
+        }
+        format!("*.{}.{}.{}", labels[labels.len() - 3], second_last, last)
+    } else {
+        format!("*.{second_last}.{last}")
+    };
+    is_valid_cache_host(&parent).then_some(parent)
 }
 
 fn read_bounded_cache_file(path: &Path) -> std::io::Result<Vec<u8>> {
@@ -243,29 +291,32 @@ fn atomic_write_file(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Strategy learned per-hostname (and globally per ISP network) by the 7-Stage Adaptive
 /// Auto-Heal TLS Engine.
+///
+/// Enum `u8` discriminants are kept stable for backward compatibility with persisted
+/// `adaptive-cache.json` files; probing order is defined by `ALL_STAGES`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum LearnedStrategy {
-    /// Stage 1: Configured primary mode (default `Combo`: 4 wire-paced RFC-compliant TLS records
+    /// Configured primary mode (default `Combo`: 4 wire-paced RFC-compliant TLS records
     /// split across the handshake header and SNI midpoint).
     Primary = 0,
-    /// Stage 2: TCP Out-of-Band (`MSG_OOB`) urgent decoy byte injected right at the SNI midpoint.
+    /// TCP Out-of-Band (`MSG_OOB`) urgent decoy byte injected right at the SNI midpoint.
     /// Real server TCP stacks (`SO_OOBINLINE=0`) strip the urgent byte seamlessly while stateful
     /// full-stream-reassembling ISP DPI boxes corrupt/miss the SNI completely.
     OobSniDesync = 1,
-    /// Stage 3: Combined 4-record TLS split + `MSG_OOB` decoy byte injected right at the TLS
+    /// Combined 4-record TLS split + `MSG_OOB` decoy byte injected right at the TLS
     /// record boundary inside SNI, shifting subsequent TLS record framing for DPI state machines.
     MultiRecordOob = 2,
-    /// Stage 4: Single intact outer TLS record split across 4 wire-paced TCP segments (compatible
+    /// Single intact outer TLS record split across 4 wire-paced TCP segments (compatible
     /// with strict servers that reject multi-record ClientHellos while defeating active DPI).
     FineFragment = 3,
-    /// Stage 5: Deep 12+ RFC-compliant TLS record storm (up to 10 tiny 2-byte lead records
+    /// Deep 12+ RFC-compliant TLS record storm (up to 10 tiny 2-byte lead records
     /// exhausting hardware DPI per-flow packet caps before SNI hits the wire + SNI splits).
     DeepRecordStorm = 4,
-    /// Stage 6: Single intact outer TLS record with slow 2-byte SNI-only pacing (for strict
+    /// Single intact outer TLS record with slow 2-byte SNI-only pacing (for strict
     /// servers behind stateful burst-reassembling DPI).
     SlowSniSlice = 5,
-    /// Stage 7: Unmodified single-write passthrough (for unblocked strict WAFs/CDNs).
+    /// Unmodified single-write passthrough (for unblocked strict WAFs/CDNs).
     DirectPassthrough = 6,
 }
 
@@ -349,8 +400,12 @@ impl PromotionVoteTracker {
             !host_map.is_empty()
         });
 
+        let vote_key = parent_domain_cache_key(host)
+            .and_then(|p| p.strip_prefix("*.").map(str::to_string))
+            .unwrap_or_else(|| host.to_string());
+
         let host_map = self.votes.entry(candidate as u8).or_default();
-        if !host_map.contains_key(host) && host_map.len() >= MAX_PROMOTION_VOTE_HOSTS {
+        if !host_map.contains_key(&vote_key) && host_map.len() >= MAX_PROMOTION_VOTE_HOSTS {
             let oldest = host_map
                 .iter()
                 .min_by(|(ka, ta), (kb, tb)| ta.cmp(tb).then_with(|| ka.cmp(kb)))
@@ -359,7 +414,7 @@ impl PromotionVoteTracker {
                 host_map.remove(&oldest);
             }
         }
-        host_map.insert(host.to_string(), now);
+        host_map.insert(vote_key, now);
 
         if host_map.len() >= required_quorum {
             self.votes.clear();
@@ -454,16 +509,34 @@ pub struct EngineTelemetrySnapshot {
     pub dns_queries: u64,
 }
 
-/// Wraps an upstream `TcpStream` to update `bytes_tx` / `bytes_rx` live on every I/O completion
-/// (rather than only after clean EOF), so active downloads/streams and reset sockets are counted.
+/// Wraps an upstream stream to update `bytes_tx` / `bytes_rx` live on every I/O completion
+/// (rather than only after clean EOF) and tracks monotonic activity timestamps so truly
+/// idle connections can be reaped without cutting active unidirectional streams.
 struct CountingStream<S> {
     inner: S,
     telemetry: Arc<EngineTelemetry>,
+    started: Instant,
+    last_activity_ms: Arc<AtomicU64>,
 }
 
 impl<S> CountingStream<S> {
-    fn new(inner: S, telemetry: Arc<EngineTelemetry>) -> Self {
-        Self { inner, telemetry }
+    fn new(
+        inner: S,
+        telemetry: Arc<EngineTelemetry>,
+        started: Instant,
+        last_activity_ms: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            inner,
+            telemetry,
+            started,
+            last_activity_ms,
+        }
+    }
+
+    fn touch_activity(&self) {
+        let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_activity_ms.store(elapsed, Ordering::Relaxed);
     }
 }
 
@@ -478,6 +551,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for CountingStream<S> {
         if let Poll::Ready(Ok(())) = &poll {
             let n = buf.filled().len().saturating_sub(before);
             if n > 0 {
+                self.touch_activity();
                 self.telemetry
                     .bytes_rx
                     .fetch_add(n as u64, Ordering::Relaxed);
@@ -496,6 +570,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<S> {
         let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
         if let Poll::Ready(Ok(n)) = &poll {
             if *n > 0 {
+                self.touch_activity();
                 self.telemetry
                     .bytes_tx
                     .fetch_add(*n as u64, Ordering::Relaxed);
@@ -534,13 +609,48 @@ impl Drop for ActiveConnGuard {
 
 const ALL_STAGES: [LearnedStrategy; 7] = [
     LearnedStrategy::Primary,
-    LearnedStrategy::OobSniDesync,
-    LearnedStrategy::MultiRecordOob,
     LearnedStrategy::FineFragment,
     LearnedStrategy::DeepRecordStorm,
     LearnedStrategy::SlowSniSlice,
+    LearnedStrategy::OobSniDesync,
+    LearnedStrategy::MultiRecordOob,
     LearnedStrategy::DirectPassthrough,
 ];
+
+/// RFC 8446 Section 4.1.3 SHA-256("HelloRetryRequest") random sentinel embedded at bytes
+/// 11..43 of a TLS 1.3 HelloRetryRequest ServerHello record.
+const TLS13_HELLO_RETRY_REQUEST_RANDOM: [u8; 32] = [
+    0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
+    0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
+];
+
+fn is_tls_hello_retry_request(record: &[u8]) -> bool {
+    record.len() >= 43
+        && record[0] == 0x16
+        && record[1] == 0x03
+        && record[5] == 0x02
+        && record[11..43] == TLS13_HELLO_RETRY_REQUEST_RANDOM
+}
+
+/// Returns `true` iff `trailing` consists exclusively of complete TLS records (5-byte header +
+/// full body). If a coalesced TLS 1.3 0-RTT ApplicationData record was split across TCP segments,
+/// returning `false` lets `establish_initial_flight` forward once and enter `relay_bidirectional`
+/// immediately instead of deadlocking waiting for `ServerHello` while the rest of the record sits
+/// unread on the client socket.
+fn are_trailing_tls_records_complete(mut trailing: &[u8]) -> bool {
+    while !trailing.is_empty() {
+        if trailing.len() < 5 {
+            return false;
+        }
+        let rec_len = u16::from_be_bytes([trailing[3], trailing[4]]) as usize;
+        let total = 5 + rec_len;
+        if trailing.len() < total {
+            return false;
+        }
+        trailing = &trailing[total..];
+    }
+    true
+}
 
 #[derive(Clone)]
 pub struct EngineContext {
@@ -1353,11 +1463,29 @@ impl EngineContext {
                 .map(|h| h.trim().to_ascii_lowercase())
                 .filter(|k| is_valid_cache_host(k));
             let cached_stage = match cache_key.as_ref() {
-                Some(key) => self.adaptive_cache.read().await.get(key).copied(),
+                Some(key) => self.lookup_cached_host_stage(key).await,
                 None => None,
             };
 
             let current_global_stage = self.preferred_stage();
+
+            // Coalesced TLS 1.3 0-RTT early data (`payload.len() > ch_info.record_total_len`):
+            // If a trailing 0-RTT AppData record spans beyond `first_buf` (incomplete TLS record),
+            // blocking for `ServerHello` before forwarding the remainder deadlocks the handshake.
+            // Apply the cached/preferred desync strategy ONCE to the leading ClientHello, forward
+            // the trailing bytes, and enter `relay_bidirectional` immediately.
+            if payload.len() > ch_info.record_total_len
+                && !are_trailing_tls_records_complete(&payload[ch_info.record_total_len..])
+            {
+                let stage = cached_stage.unwrap_or(current_global_stage);
+                self.write_tls_flight(&mut remote, payload, &ch_info, stage)
+                    .await?;
+                self.telemetry
+                    .bytes_tx
+                    .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                return Ok(remote);
+            }
+
             let stages = self.build_stage_order(cached_stage);
             let mut retry_addrs: Option<Vec<SocketAddr>> = None;
 
@@ -1553,6 +1681,8 @@ impl EngineContext {
                             self.evict_cached_host_stage(key).await;
                         }
 
+                        let is_hrr = is_valid_tls_server_hello
+                            && is_tls_hello_retry_request(&probe_buf[..n]);
                         self.telemetry
                             .bytes_tx
                             .fetch_add(payload.len() as u64, Ordering::Relaxed);
@@ -1562,6 +1692,69 @@ impl EngineContext {
                         client.write_all(&probe_buf[..n]).await?;
                         client.flush().await?;
                         drop(probe_buf);
+
+                        // TLS 1.3 HelloRetryRequest (e.g. server declines iOS X25519MLKEM768
+                        // key_share and requests secp256r1/x25519): read ClientHello #2 and
+                        // apply the exact winning desync strategy so DPI cannot drop CH #2.
+                        if is_hrr {
+                            let mut ch2_buf = vec![0u8; 16384 + 512];
+                            if let Ok(Ok(mut filled2)) = tokio::time::timeout(
+                                Duration::from_secs(4),
+                                client.read(&mut ch2_buf),
+                            )
+                            .await
+                            {
+                                if filled2 > 0 {
+                                    // Skip optional leading 6-byte ChangeCipherSpec record (0x14 0x03 0x03 0x00 0x01 0x01)
+                                    let ccs_prefix =
+                                        if filled2 >= 6 && ch2_buf[0] == 0x14 && ch2_buf[1] == 0x03
+                                        {
+                                            6usize
+                                        } else {
+                                            0usize
+                                        };
+                                    if let Some(expected2) =
+                                        expected_tls_record_len(&ch2_buf[ccs_prefix..filled2])
+                                    {
+                                        let target_len =
+                                            (ccs_prefix + expected2).min(ch2_buf.len());
+                                        if filled2 < target_len {
+                                            let _ = tokio::time::timeout(
+                                                Duration::from_millis(600),
+                                                async {
+                                                    while filled2 < target_len {
+                                                        let m = client
+                                                            .read(&mut ch2_buf[filled2..target_len])
+                                                            .await?;
+                                                        if m == 0 {
+                                                            break;
+                                                        }
+                                                        filled2 += m;
+                                                    }
+                                                    Ok::<(), std::io::Error>(())
+                                                },
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                    let ch2_slice = &ch2_buf[..filled2];
+                                    if ccs_prefix > 0 {
+                                        stream.write_all(&ch2_slice[..ccs_prefix]).await?;
+                                    }
+                                    let tail = &ch2_slice[ccs_prefix..];
+                                    if let Some(ch2_info) = parse_client_hello(tail) {
+                                        self.write_tls_flight(&mut stream, tail, &ch2_info, stage)
+                                            .await?;
+                                    } else if !tail.is_empty() {
+                                        stream.write_all(tail).await?;
+                                    }
+                                    self.telemetry
+                                        .bytes_tx
+                                        .fetch_add(filled2 as u64, Ordering::Relaxed);
+                                }
+                            }
+                        }
+
                         return Ok(stream);
                     }
                     Ok(Err(err)) => {
@@ -1693,8 +1886,19 @@ impl EngineContext {
                     ts_guard.remove(&key);
                     cache_changed = true;
                 }
-            } else if upsert_adaptive_entry(&mut guard, &mut ts_guard, key, stage, now) {
-                cache_changed = true;
+            } else {
+                let parent_key = if stage != LearnedStrategy::Primary {
+                    parent_domain_cache_key(&key)
+                } else {
+                    None
+                };
+                if upsert_adaptive_entry(&mut guard, &mut ts_guard, key, stage, now) {
+                    cache_changed = true;
+                }
+                if let Some(parent_key) = parent_key {
+                    cache_changed |=
+                        upsert_adaptive_entry(&mut guard, &mut ts_guard, parent_key, stage, now);
+                }
             }
 
             self.telemetry
@@ -1707,12 +1911,37 @@ impl EngineContext {
         }
     }
 
+    async fn lookup_cached_host_stage(&self, key: &str) -> Option<LearnedStrategy> {
+        let guard = self.adaptive_cache.read().await;
+        if let Some(&stage) = guard.get(key) {
+            return Some(stage);
+        }
+        if let Some(parent_key) = parent_domain_cache_key(key) {
+            if let Some(&stage) = guard.get(&parent_key) {
+                return Some(stage);
+            }
+            if let Some(apex) = parent_key.strip_prefix("*.") {
+                if let Some(&stage) = guard.get(apex) {
+                    return Some(stage);
+                }
+            }
+        }
+        None
+    }
+
     async fn evict_cached_host_stage(&self, key: &str) {
         let removed = {
             let mut guard = self.adaptive_cache.write().await;
             let mut ts_guard = self.adaptive_timestamps.write().await;
-            ts_guard.remove(key);
-            let removed = guard.remove(key).is_some();
+            let removed = if guard.remove(key).is_some() {
+                ts_guard.remove(key);
+                true
+            } else if let Some(parent_key) = parent_domain_cache_key(key) {
+                ts_guard.remove(&parent_key);
+                guard.remove(&parent_key).is_some()
+            } else {
+                false
+            };
             self.telemetry
                 .learned_hosts
                 .store(guard.len(), Ordering::Relaxed);
@@ -1990,8 +2219,33 @@ async fn relay_bidirectional<C>(
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut counted = CountingStream::new(remote, Arc::clone(telemetry));
-    copy_bidirectional_with_sizes(client, &mut counted, RELAY_BUF_SIZE, RELAY_BUF_SIZE).await
+    let started = Instant::now();
+    let last_activity_ms = Arc::new(AtomicU64::new(0));
+    let mut counted = CountingStream::new(
+        remote,
+        Arc::clone(telemetry),
+        started,
+        Arc::clone(&last_activity_ms),
+    );
+    let idle_watcher = async {
+        let timeout_ms = u64::try_from(IDLE_RELAY_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
+        let mut check_interval = tokio::time::interval(Duration::from_secs(15));
+        check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        check_interval.tick().await;
+        loop {
+            check_interval.tick().await;
+            let now_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let last_ms = last_activity_ms.load(Ordering::Relaxed);
+            if now_ms.saturating_sub(last_ms) >= timeout_ms {
+                break;
+            }
+        }
+    };
+    tokio::select! {
+        biased;
+        res = copy_bidirectional_with_sizes(client, &mut counted, RELAY_BUF_SIZE, RELAY_BUF_SIZE) => res,
+        _ = idle_watcher => Ok((0, 0)),
+    }
 }
 
 // A wildcard listener has no concrete interface address. On a matching port,
@@ -2555,7 +2809,7 @@ mod tests {
                 .await
                 .get("cdn.strict-images.example")
                 .copied(),
-            Some(LearnedStrategy::OobSniDesync)
+            Some(LearnedStrategy::FineFragment)
         );
         assert_eq!(ctx.preferred_stage(), LearnedStrategy::Primary);
     }
@@ -2565,17 +2819,17 @@ mod tests {
         let config = RuntimeConfig {
             system_proxy: false,
             chunk_size: 10,
-            patterns: vec!["blocked\\.example$".to_string()],
+            patterns: vec!["blocked[0-9]\\.example$".to_string()],
             ..RuntimeConfig::default()
         };
         let ctx = EngineContext::new(config).unwrap();
 
         let hosts = [
-            "host1.blocked.example",
-            "host2.blocked.example",
-            "host3.blocked.example",
-            "host4.blocked.example",
-            "host5.blocked.example",
+            "host.blocked1.example",
+            "host.blocked2.example",
+            "host.blocked3.example",
+            "host.blocked4.example",
+            "host.blocked5.example",
         ];
         let expected_payload_len = build_synthetic_client_hello(hosts[0], 256).len() - 5;
 
@@ -3315,15 +3569,15 @@ mod tests {
         let config = RuntimeConfig {
             system_proxy: false,
             chunk_size: 10,
-            patterns: vec!["superonline\\.example$".to_string()],
+            patterns: vec!["superonline-[a-z]\\.example$".to_string()],
             ..RuntimeConfig::default()
         };
         let ctx = EngineContext::new(config).unwrap();
 
         let hosts = [
-            "a.superonline.example",
-            "b.superonline.example",
-            "c.superonline.example",
+            "www.superonline-a.example",
+            "www.superonline-b.example",
+            "www.superonline-c.example",
         ];
 
         let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3331,17 +3585,19 @@ mod tests {
         let attempt_counter = Arc::new(AtomicUsize::new(0));
         let attempt_srv = Arc::clone(&attempt_counter);
 
-        // Simulate Superonline/middlebox behavior per host:
-        // - Attempt 0 (Stage 1 Primary): hard-blocked via fake HTTP 302 block page
-        // - Attempt 1 (Stage 2 OobSniDesync): server returns TLS Alert 0x15 (decode_error)
-        // - Attempt 2 (Stage 3 MultiRecordOob): server returns TLS Alert 0x15 (decode_error)
-        // - Attempt 3 (Stage 4 FineFragment): succeeds with valid TLS ServerHello (0x16 0x03)
+        // Simulate Superonline/middlebox behavior per host with clean non-OOB stage order:
+        // - Attempt 0 (Primary): hard-blocked via fake HTTP 302 block page
+        // - Attempt 1 (FineFragment): succeeds with valid TLS ServerHello (0x16 0x03)
+        // Wait — to test intermediate TLS Alert 0x15 before a fast-quorum stage, verify
+        // Attempt 0 (Primary) -> HTTP 302, Attempt 1 (FineFragment) -> TLS Alert,
+        // Attempt 2 (DeepRecordStorm) -> TLS Alert, Attempt 3 (SlowSniSlice) -> TLS Alert,
+        // Attempt 4 (OobSniDesync, fast quorum = 3) -> ServerHello!
         tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = upstream.accept().await else {
                     break;
                 };
-                let step = attempt_srv.fetch_add(1, Ordering::SeqCst) % 4;
+                let step = attempt_srv.fetch_add(1, Ordering::SeqCst) % 5;
                 tokio::spawn(async move {
                     let mut hdr = [0u8; 5];
                     if sock.read_exact(&mut hdr).await.is_err() {
@@ -3359,7 +3615,7 @@ mod tests {
                                 )
                                 .await;
                         }
-                        1 | 2 => {
+                        1..=3 => {
                             let _ = sock
                                 .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x32])
                                 .await;
@@ -3412,15 +3668,15 @@ mod tests {
                 assert_eq!(ctx.preferred_stage(), LearnedStrategy::Primary);
                 assert_eq!(
                     ctx.adaptive_cache.read().await.get(host).copied(),
-                    Some(LearnedStrategy::FineFragment)
+                    Some(LearnedStrategy::OobSniDesync)
                 );
             }
         }
 
-        // Intermediate OOB TLS Alerts (0x15) must not block Stage 4 global promotion.
-        assert_eq!(ctx.preferred_stage(), LearnedStrategy::FineFragment);
+        // Intermediate TLS Alerts (0x15) on non-Primary stages must not block global promotion.
+        assert_eq!(ctx.preferred_stage(), LearnedStrategy::OobSniDesync);
         assert_eq!(ctx.learned_host_count().await, 0);
-        assert_eq!(attempt_counter.load(Ordering::SeqCst), 12);
+        assert_eq!(attempt_counter.load(Ordering::SeqCst), 15);
     }
 
     #[test]
@@ -3609,8 +3865,50 @@ mod tests {
                 .await
                 .get("api.zero-rtt.example")
                 .copied(),
-            Some(LearnedStrategy::OobSniDesync)
+            Some(LearnedStrategy::FineFragment)
         );
+    }
+
+    #[test]
+    fn hrr_detection_trailing_record_completeness_and_parent_domain_hints() {
+        let mut hrr = vec![
+            0x16, 0x03, 0x03, 0x00, 0x30, 0x02, 0x00, 0x00, 0x2c, 0x03, 0x03,
+        ];
+        hrr.extend_from_slice(&TLS13_HELLO_RETRY_REQUEST_RANDOM);
+        assert!(is_tls_hello_retry_request(&hrr));
+        let mut normal_sh = hrr.clone();
+        normal_sh[11] ^= 0xFF;
+        assert!(!is_tls_hello_retry_request(&normal_sh));
+
+        // Complete CCS + 8-byte 0-RTT record vs truncated 0-RTT record
+        let complete = [
+            0x14, 0x03, 0x03, 0x00, 0x01, 0x01, 0x17, 0x03, 0x03, 0x00, 0x04, 1, 2, 3, 4,
+        ];
+        assert!(are_trailing_tls_records_complete(&complete));
+        assert!(!are_trailing_tls_records_complete(
+            &complete[..complete.len() - 1]
+        ));
+
+        assert_eq!(
+            parent_domain_cache_key("tr.rbxcdn.com").as_deref(),
+            Some("*.rbxcdn.com")
+        );
+        assert_eq!(
+            parent_domain_cache_key("a.b.co.uk").as_deref(),
+            Some("*.b.co.uk")
+        );
+        assert_eq!(parent_domain_cache_key("roblox.com"), None);
+        assert_eq!(parent_domain_cache_key("1.1.1.1"), None);
+        // Clean non-OOB strategies always precede MSG_OOB stages
+        let fine_pos = ALL_STAGES
+            .iter()
+            .position(|&s| s == LearnedStrategy::FineFragment)
+            .unwrap();
+        let oob_pos = ALL_STAGES
+            .iter()
+            .position(|&s| s == LearnedStrategy::OobSniDesync)
+            .unwrap();
+        assert!(fine_pos < oob_pos);
     }
 
     #[tokio::test]

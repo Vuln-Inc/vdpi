@@ -29,6 +29,8 @@ const MAX_DNS_MESSAGE_BYTES: usize = u16::MAX as usize;
 const MAX_BOUND_DOH_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BOUND_DOH_RAW_BYTES: usize = MAX_DNS_MESSAGE_BYTES + MAX_BOUND_DOH_HEADER_BYTES;
 const MAX_DOH_FAILOVER_CONCURRENCY: usize = 2;
+const DOH_FAILURE_THRESHOLD: usize = 3;
+const DOH_BACKOFF_SECS: u64 = 5;
 const FIREFOX_CANARY_DOMAIN: &str = "use-application-dns.net";
 
 static PROCESS_EPOCH: OnceLock<Instant> = OnceLock::new();
@@ -94,6 +96,26 @@ enum DohError {
 
 type DohAttemptResult = (usize, String, std::result::Result<DnsOutcome, DohError>);
 
+fn build_doh_http_client() -> Result<Client> {
+    // `.no_proxy()` prevents vdpi from routing its own DoH traffic through itself
+    // when HTTP_PROXY / HTTPS_PROXY environment variables are active.
+    // HTTP/2 + TCP keepalives detect half-open mobile/NAT sockets promptly instead of
+    // hanging multiplexed DoH streams for repeated 2s timeouts.
+    Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_millis(2000))
+        .connect_timeout(Duration::from_millis(1200))
+        .pool_idle_timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(2)
+        .tcp_nodelay(true)
+        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .http2_keep_alive_interval(Some(Duration::from_secs(20)))
+        .http2_keep_alive_timeout(Duration::from_secs(5))
+        .http2_keep_alive_while_idle(true)
+        .build()
+        .context("failed to build DoH HTTP client")
+}
+
 #[derive(Clone)]
 pub struct DnsResolver {
     enable_doh: bool,
@@ -104,8 +126,9 @@ pub struct DnsResolver {
     preferred_doh_idx: Arc<AtomicUsize>,
     preferred_udp_idx: Arc<AtomicUsize>,
     doh_backoff_until_ms: Arc<AtomicU64>,
+    doh_consecutive_failures: Arc<AtomicUsize>,
     query_count: Arc<AtomicU64>,
-    http: Client,
+    http: Arc<std::sync::RwLock<Client>>,
     outbound_binder: Option<Arc<dyn OutboundBinder>>,
     bound_tls_connector: Option<TlsConnector>,
     cache: Arc<RwLock<HashMap<String, CacheEntry>>>,
@@ -143,17 +166,7 @@ impl DnsResolver {
     ) -> Result<Self> {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        // `.no_proxy()` prevents vdpi from routing its own DoH traffic through itself
-        // when HTTP_PROXY / HTTPS_PROXY environment variables are active.
-        let http = Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_millis(2000))
-            .connect_timeout(Duration::from_millis(1200))
-            .pool_idle_timeout(Duration::from_secs(30))
-            .pool_max_idle_per_host(2)
-            .tcp_nodelay(true)
-            .build()
-            .context("failed to build DoH HTTP client")?;
+        let http = build_doh_http_client()?;
 
         let bound_tls_connector = if outbound_binder.is_some() {
             Some(build_bound_tls_connector()?)
@@ -180,8 +193,9 @@ impl DnsResolver {
             preferred_doh_idx: Arc::new(AtomicUsize::new(0)),
             preferred_udp_idx: Arc::new(AtomicUsize::new(0)),
             doh_backoff_until_ms: Arc::new(AtomicU64::new(0)),
+            doh_consecutive_failures: Arc::new(AtomicUsize::new(0)),
             query_count: Arc::new(AtomicU64::new(0)),
-            http,
+            http: Arc::new(std::sync::RwLock::new(http)),
             outbound_binder,
             bound_tls_connector,
             cache: Arc::new(RwLock::new(HashMap::new())),
@@ -209,11 +223,45 @@ impl DnsResolver {
 
     fn clear_doh_backoff(&self) {
         self.doh_backoff_until_ms.store(0, Ordering::Relaxed);
+        self.doh_consecutive_failures.store(0, Ordering::Relaxed);
+    }
+
+    fn record_doh_success(&self) {
+        self.doh_consecutive_failures.store(0, Ordering::Relaxed);
+    }
+
+    fn record_doh_transport_failure(&self) -> bool {
+        let failures = self
+            .doh_consecutive_failures
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        if failures >= DOH_FAILURE_THRESHOLD {
+            self.doh_consecutive_failures.store(0, Ordering::Relaxed);
+            self.set_doh_backoff(Duration::from_secs(DOH_BACKOFF_SECS));
+            true
+        } else {
+            false
+        }
+    }
+
+    fn http_client(&self) -> Client {
+        self.http
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub async fn clear_cache(&self) {
         self.cache.write().await.clear();
         self.clear_doh_backoff();
+        // Rebuild the pooled HTTP/2 client on route change / wake so dead half-open
+        // connections from the previous network path are evicted immediately.
+        if let Ok(fresh) = build_doh_http_client() {
+            *self
+                .http
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = fresh;
+        }
     }
 
     /// Resolves `host` into an ordered list of IP addresses (IPv4 preferred before IPv6).
@@ -300,22 +348,34 @@ impl DnsResolver {
         }
 
         // 5. Multi-tier unpoisoned resolution:
-        //    Tier A: RFC 8484 DNS-over-HTTPS (only transport failures trip the 30s circuit-breaker;
-        //            protocol NXDOMAIN/NODATA/SERVFAIL replies never trip DoH backoff!)
+        //    Tier A: RFC 8484 DNS-over-HTTPS (only consecutive full-ring transport failures trip
+        //            the short 5s circuit-breaker; single-provider failover and protocol
+        //            NXDOMAIN/NODATA/SERVFAIL replies never trip DoH backoff!)
         //    Tier B: Non-standard port 1253 / 443 / 5353 + backup UDP DNS
         //    Tier C: System resolver fallback (with sinkhole IP filtering; skipped in TUN mode)
         let resolved = if self.enable_doh && !self.is_doh_in_backoff() {
             match self.resolve_via_doh(&normalized).await {
-                Ok(resolved) => resolved,
+                Ok(resolved) => {
+                    self.record_doh_success();
+                    resolved
+                }
                 Err(err) => {
                     match &err {
                         DohError::Transport(cause) => {
-                            debug!(
-                                domain = %normalized,
-                                error = %cause,
-                                "DoH transport failed; tripping 30s backoff"
-                            );
-                            self.set_doh_backoff(Duration::from_secs(30));
+                            if self.record_doh_transport_failure() {
+                                debug!(
+                                    domain = %normalized,
+                                    error = %cause,
+                                    backoff_secs = DOH_BACKOFF_SECS,
+                                    "all DoH endpoints failed transport consecutively; tripping short backoff"
+                                );
+                            } else {
+                                debug!(
+                                    domain = %normalized,
+                                    error = %cause,
+                                    "transient DoH transport failure; keeping DoH active"
+                                );
+                            }
                         }
                         DohError::ProtocolError { endpoint, rcode } => {
                             debug!(
@@ -465,17 +525,29 @@ impl DnsResolver {
         // 5. Query ONLY the requested qtype so `QTYPE_A` never stalls waiting on `QTYPE_AAAA`.
         let outcome = if self.enable_doh && !self.is_doh_in_backoff() {
             match self.query_doh_type(&normalized, qtype).await {
-                Ok(outcome) => outcome,
+                Ok(outcome) => {
+                    self.record_doh_success();
+                    outcome
+                }
                 Err(err) => {
                     match &err {
                         DohError::Transport(cause) => {
-                            debug!(
-                                domain = %normalized,
-                                qtype = qtype,
-                                error = %cause,
-                                "DoH transport failed; tripping 30s backoff"
-                            );
-                            self.set_doh_backoff(Duration::from_secs(30));
+                            if self.record_doh_transport_failure() {
+                                debug!(
+                                    domain = %normalized,
+                                    qtype = qtype,
+                                    error = %cause,
+                                    backoff_secs = DOH_BACKOFF_SECS,
+                                    "all DoH endpoints failed transport consecutively; tripping short backoff"
+                                );
+                            } else {
+                                debug!(
+                                    domain = %normalized,
+                                    qtype = qtype,
+                                    error = %cause,
+                                    "transient DoH transport failure; keeping DoH active"
+                                );
+                            }
                         }
                         DohError::ProtocolError { endpoint, rcode } => {
                             debug!(
@@ -724,7 +796,7 @@ impl DnsResolver {
         wire_query: &[u8],
         qtype: u16,
     ) {
-        let http = self.http.clone();
+        let http = self.http_client();
         let outbound_binder = self.outbound_binder.clone();
         let bound_tls = self.bound_tls_connector.clone();
         let endpoint = self.doh_endpoints[idx].clone();
@@ -762,8 +834,9 @@ impl DnsResolver {
 
         // Fast-path: try the currently sticky healthy DoH endpoint first.
         let start = self.preferred_doh_idx.load(Ordering::Relaxed) % count;
+        let http = self.http_client();
         match send_doh_request(
-            &self.http,
+            &http,
             self.outbound_binder.as_deref(),
             self.bound_tls_connector.as_ref(),
             &self.doh_endpoints[start],
@@ -1102,6 +1175,7 @@ impl DnsResolver {
         self.query_count.fetch_add(1, Ordering::Relaxed);
         if self.enable_doh && !self.is_doh_in_backoff() {
             if let Ok(mut raw) = self.query_doh_raw(query).await {
+                self.record_doh_success();
                 if raw.len() >= 12 {
                     raw[0..2].copy_from_slice(&parsed.tx_id.to_be_bytes());
                     return Ok((raw, None));
@@ -1134,10 +1208,11 @@ impl DnsResolver {
         }
         let start = self.preferred_doh_idx.load(Ordering::Relaxed) % count;
         let require_ip_literal = self.is_system_dns_disabled();
+        let http = self.http_client();
         for offset in 0..count.min(3) {
             let idx = (start + offset) % count;
             let Ok(bytes) = send_doh_wire(
-                &self.http,
+                &http,
                 self.outbound_binder.as_deref(),
                 self.bound_tls_connector.as_ref(),
                 &self.doh_endpoints[idx],
@@ -1872,9 +1947,13 @@ async fn send_doh_request(
             let had_ips = !ips.is_empty();
             let clean = filter_poisoned_ips(ips);
             if had_ips && clean.is_empty() {
-                Err(DohError::Transport(anyhow!(
-                    "DoH endpoint {endpoint} returned only poisoned/sinkhole IPs"
-                )))
+                // Treat sinkholed/filtered answers (e.g. ad/telemetry hosts returning 0.0.0.0)
+                // as a DNS-level error rather than a transport outage so a single sinkholed
+                // domain can NEVER trip the global DoH backoff and drop all DNS onto UDP/53.
+                Err(DohError::ProtocolError {
+                    endpoint: endpoint.to_string(),
+                    rcode: 0,
+                })
             } else {
                 Ok(DnsOutcome::Records(clean, ttl))
             }
@@ -3637,11 +3716,14 @@ mod tests {
         assert!(resolver.doh_endpoints.iter().any(|ep| ep == v6_google));
 
         let q = encode_dns_query("example.com", QTYPE_A).unwrap();
-        assert!(
-            send_doh_request_raw(&resolver.http, "https://dns.google/dns-query", &q, true)
-                .await
-                .is_err()
-        );
+        assert!(send_doh_request_raw(
+            &resolver.http_client(),
+            "https://dns.google/dns-query",
+            &q,
+            true
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]

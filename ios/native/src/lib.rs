@@ -304,16 +304,17 @@ fn start_packet_flow_tunnel(cfg: IosConfig, callback: PacketWriterCallback) -> R
     let mgr = manager()?;
     let _lifecycle = mgr.lifecycle_lock.lock().unwrap_or_else(|e| e.into_inner());
 
-    // Validate configuration and build EngineContext BEFORE stopping any active tunnel
-    // so invalid config never tears down a healthy session.
     let profile = TunProfile::LOW_MEMORY;
     let mtu = cfg.clamped_mtu().min(IOS_MAX_MTU);
     let mode_label = format!("{:?}", cfg.mode);
     let dns_label = cfg.dns_addr.clone();
     let doh_enabled = cfg.enable_doh;
-    let ctx = mgr.runtime.block_on(vdpi_tun::build_engine_context(cfg))?;
 
+    // Tear down any previous tunnel BEFORE loading `adaptive-cache.json` so the old session
+    // flushes newly learned strategies and never overwrites the new session's cache.
     stop_active_locked(mgr);
+
+    let ctx = mgr.runtime.block_on(vdpi_tun::build_engine_context(cfg))?;
 
     let tun_stats = Arc::new(TunStats::default());
     let chan_cap = profile.channel_capacity.max(PACKET_FLOW_MIN_CHANNEL_CAP);
@@ -400,22 +401,23 @@ pub fn start_tunnel_fd(owned_fd: std::os::unix::io::OwnedFd, cfg: IosConfig) -> 
     let mgr = manager()?;
     let _lifecycle = mgr.lifecycle_lock.lock().unwrap_or_else(|e| e.into_inner());
 
-    // Validate configuration and build EngineContext BEFORE stopping any active tunnel
-    // so invalid config never tears down a healthy session.
     let profile = TunProfile::LOW_MEMORY;
     let mtu = cfg.clamped_mtu().min(IOS_MAX_MTU);
     let mode_label = format!("{:?}", cfg.mode);
     let dns_label = cfg.dns_addr.clone();
     let doh_enabled = cfg.enable_doh;
+
+    // Stop any previous direct-FD session BEFORE registering the new dup(utun) fd and
+    // loading `adaptive-cache.json` so two kqueue registrations never race on the same
+    // utun socket and the old cache flushes cleanly first.
+    stop_active_locked(mgr);
+
     let ctx = mgr.runtime.block_on(vdpi_tun::build_engine_context(cfg))?;
 
-    // Set O_NONBLOCK and register with Tokio before tearing down an existing healthy tunnel.
     let async_fd = {
         let _enter = mgr.runtime.enter();
         vdpi_tun::fd::register_tun_fd(owned_fd).context("failed to register iOS utun fd")?
     };
-
-    stop_active_locked(mgr);
 
     let tun_stats = Arc::new(TunStats::default());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

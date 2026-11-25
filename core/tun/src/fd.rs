@@ -100,6 +100,7 @@ pub async fn run_registered_tun_fd_with_route_watch(
     });
 
     let rx_pi_len = detect_rx_pi_len(async_fd.as_raw_fd());
+    let tx_pi_len = rx_pi_len;
     let read_fd = Arc::clone(&async_fd);
     let mut stop_read = fd_stop_rx.clone();
     let read_stop_tx = fd_stop_tx.clone();
@@ -154,6 +155,16 @@ pub async fn run_registered_tun_fd_with_route_watch(
                         }
                     }
                     Ok(Err(e)) if e.kind() == ErrorKind::Interrupted => continue,
+                    Ok(Err(e)) if is_congestion_tun_errno(&e) => {
+                        debug!(error = %e, "transient TUN read congestion; backing off");
+                        drop(guard);
+                        tokio::select! {
+                            biased;
+                            _ = wait_shutdown(&mut stop_read) => break 'outer,
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(2)) => {}
+                        }
+                        break;
+                    }
                     Ok(Err(e)) => {
                         warn!(error = %e, "TUN read error");
                         let _ = read_stop_tx.send(true);
@@ -161,6 +172,9 @@ pub async fn run_registered_tun_fd_with_route_watch(
                     }
                     Err(_would_block) => break,
                 }
+            }
+            if drained >= io_batch_limit {
+                tokio::task::yield_now().await;
             }
         }
     });
@@ -170,6 +184,7 @@ pub async fn run_registered_tun_fd_with_route_watch(
     let write_stop_tx = fd_stop_tx.clone();
     let writer_task = tokio::spawn(async move {
         let mut pending: Option<Vec<u8>> = None;
+        let mut congestion_retries: u8 = 0;
         'outer: loop {
             if pending.is_none() {
                 let pkt = tokio::select! {
@@ -181,6 +196,7 @@ pub async fn run_registered_tun_fd_with_route_watch(
                     }
                 };
                 pending = Some(pkt);
+                congestion_retries = 0;
             }
 
             let mut guard = tokio::select! {
@@ -201,18 +217,42 @@ pub async fn run_registered_tun_fd_with_route_watch(
                 let pkt = match pending.take() {
                     Some(p) => p,
                     None => match outbound_rx.try_recv() {
-                        Ok(p) => p,
+                        Ok(p) => {
+                            congestion_retries = 0;
+                            p
+                        }
                         Err(mpsc::error::TryRecvError::Empty) => break,
                         Err(mpsc::error::TryRecvError::Disconnected) => break 'outer,
                     },
                 };
 
-                match guard.try_io(|inner| write_raw_fd(inner.as_raw_fd(), &pkt)) {
+                match guard.try_io(|inner| write_raw_fd(inner.as_raw_fd(), &pkt, tx_pi_len)) {
                     Ok(Ok(_)) => {
                         written += 1;
+                        congestion_retries = 0;
                     }
                     Ok(Err(e)) if e.kind() == ErrorKind::Interrupted => {
                         pending = Some(pkt);
+                    }
+                    Ok(Err(e)) if is_congestion_tun_errno(&e) => {
+                        // On iOS/macOS Skywalk utun, XNU returns ENOSPC/ENOBUFS (not EAGAIN)
+                        // when the pending input chain exceeds 512 packets. Back off briefly
+                        // instead of dropping segments or hammering XNU.
+                        if congestion_retries < 8 {
+                            congestion_retries += 1;
+                            pending = Some(pkt);
+                            drop(guard);
+                            let backoff_ms = u64::from(congestion_retries).min(4);
+                            tokio::select! {
+                                biased;
+                                _ = wait_shutdown(&mut stop_write) => break 'outer,
+                                _ = tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)) => {}
+                            }
+                            continue 'outer;
+                        }
+                        debug!(error = %e, "dropping TUN packet after sustained ENOSPC/ENOBUFS");
+                        congestion_retries = 0;
+                        written += 1;
                     }
                     Ok(Err(e)) => {
                         if is_fatal_tun_errno(&e) {
@@ -228,6 +268,9 @@ pub async fn run_registered_tun_fd_with_route_watch(
                         break;
                     }
                 }
+            }
+            if written >= io_batch_limit {
+                tokio::task::yield_now().await;
             }
         }
     });
@@ -374,13 +417,22 @@ fn read_raw_fd(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
     }
 }
 
+fn is_congestion_tun_errno(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::ENOSPC | libc::ENOBUFS))
+}
+
 #[cfg(target_vendor = "apple")]
-fn write_raw_fd(fd: i32, buf: &[u8]) -> std::io::Result<usize> {
-    let header = tun_pi_header(buf)?;
+fn write_raw_fd(fd: i32, buf: &[u8], tx_pi_len: usize) -> std::io::Result<usize> {
+    let pi4 = tun_pi_header(buf)?;
+    // XNU `UTUN_HEADER_SIZE(pcb)` is 4 bytes (AF) or 20 bytes (AF + 16-byte proc UUID)
+    // in BOTH RX and TX directions when `UTUN_FLAGS_ENABLE_PROC_UUID` is active.
+    let mut header = [0u8; 20];
+    header[..4].copy_from_slice(&pi4);
+    let hdr_len = if tx_pi_len >= 20 { 20 } else { 4 };
     let iov = [
         libc::iovec {
             iov_base: header.as_ptr().cast_mut().cast(),
-            iov_len: header.len(),
+            iov_len: hdr_len,
         },
         libc::iovec {
             iov_base: buf.as_ptr().cast_mut().cast(),
@@ -398,7 +450,7 @@ fn write_raw_fd(fd: i32, buf: &[u8]) -> std::io::Result<usize> {
 }
 
 #[cfg(not(target_vendor = "apple"))]
-fn write_raw_fd(fd: i32, buf: &[u8]) -> std::io::Result<usize> {
+fn write_raw_fd(fd: i32, buf: &[u8], _tx_pi_len: usize) -> std::io::Result<usize> {
     let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
     if n < 0 {
         Err(std::io::Error::last_os_error())
@@ -423,7 +475,7 @@ mod tests {
         assert_eq!(rx_pi_len, TUN_PI_LEN);
 
         let ipv4 = [0x45u8, 0x00, 0x00, 0x14, 1, 2, 3, 4];
-        let written = write_raw_fd(tx.as_raw_fd(), &ipv4).unwrap();
+        let written = write_raw_fd(tx.as_raw_fd(), &ipv4, rx_pi_len).unwrap();
         assert_eq!(written, TUN_PI_LEN + ipv4.len());
 
         let mut buf = [0u8; 64];
@@ -437,7 +489,7 @@ mod tests {
         assert_eq!(strip_tun_pi(&buf[..read], rx_pi_len), Some(ipv4.as_slice()));
 
         let ipv6 = [0x60u8, 0x00, 0x00, 0x00, 5, 6, 7, 8];
-        let written6 = write_raw_fd(tx.as_raw_fd(), &ipv6).unwrap();
+        let written6 = write_raw_fd(tx.as_raw_fd(), &ipv6, rx_pi_len).unwrap();
         assert_eq!(written6, TUN_PI_LEN + ipv6.len());
 
         let read6 = read_raw_fd(rx.as_raw_fd(), &mut buf).unwrap();

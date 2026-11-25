@@ -6,6 +6,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-11-25
+
+### Fixed
+- **iOS / TUN TCP netstack `SynReceived` + `RST` -> `Listen` deadlock & session starvation (`core/tun/src/netstack.rs`, `core/tun/src/config.rs`)**:
+  - Tracked `saw_non_listen` so `smoltcp` 0.14 sockets reverted from `SynReceived` back to `Listen` on client `RST` are aborted immediately instead of poisoning `listening_dsts` for 30s and wedging subsequent SYNs.
+  - Replaced the single `pending_frame` halt with a bounded `deferred_syns` queue + 3s orphan `Listen` reaper so `tcp_in_rx` never stops draining ACKs, FINs, RSTs, or other destinations.
+  - Counted only active non-closing sockets (`Listen`, `SynReceived`, `Established`) against `max_tcp_sessions`, added fast `TimeWait` (2s) & closing-state (5s) reapers with oldest-reclaimable eviction at `2 * max_tcp_sessions`, emitted RFC-valid IPv4/IPv6 TCP `RST+ACK` on hard capacity overflow, removed the `VirtualDevice::receive()` ACK gate, and doubled `LOW_MEMORY` `max_tcp_sessions` from `64` -> `128` (48 UDP flows, safely under iOS 256 `RLIMIT_NOFILE`).
+- **iOS `utun` direct-FD congestion & proc-UUID TX framing (`core/tun/src/fd.rs`)**:
+  - Matched TX `writev` prefix length (`4B` or `20B`) to `UTUN_FLAGS_ENABLE_PROC_UUID`, added bounded `ENOSPC`/`ENOBUFS` backoff retries instead of silent drops/mbuf leaks on XNU Skywalk `utun`, added transient `ENOBUFS` read recovery, and added cooperative yields on full I/O batches.
+- **TUN pipeline L3 demux isolation (`core/tun/src/pipeline.rs`)**:
+  - Switched `tun_to_stack` TCP forwarding to non-blocking `try_send`, moved UDP Cone-NAT slow paths off the demux loop onto bounded spawned tasks, bounded UDP/53 DNS queries to 5s, bypassed `tcp_slots` for TCP/53 DNS fallback, and bounded normal `tcp_slots` acquisition to 250ms.
+- **TLS 1.3 HRR, 0-RTT, Akamai `MSG_OOB`, idle keep-alives & DoH hardening (`core/engine/src/desync.rs`, `core/engine/src/dns.rs`)**:
+  - Reordered `ALL_STAGES` so clean non-OOB strategies (`Primary`, `FineFragment`, `DeepRecordStorm`, `SlowSniSlice`) precede `OobSniDesync`/`MultiRecordOob` (eliminating Akamai 2s `MSG_OOB` blackholes on `tr.rbxcdn.com`/`fts.rbxcdn.com`), normalized promotion votes by parent domain, and added sibling-CDN `*.<parent>` cache hint sharing.
+  - Detected TLS 1.3 `HelloRetryRequest` and applied desync to ClientHello #2; avoided deadlocking on split/incomplete coalesced 0-RTT records; added idle-aware bidirectional relay timeout (`120s` mobile / `300s` desktop).
+  - Treated sinkholed DoH responses (`0.0.0.0`/`127.0.0.1`) as DNS protocol errors instead of transport outages, required 3 consecutive full-ring DoH failures for a short 5s backoff (never 30s on one ad domain), and added HTTP/2 + TCP keepalives with `reqwest::Client` pool reset on route change.
+- **iOS Sideloadly live-reload, kqueue ordering, Personal Hotspot IPv6 & MTU migration (`ios/`)**:
+  - Passed settings JSON in `ProviderMessage.reloadEngineWithSettings` so live setting changes apply cleanly even without App Group sharing (fixing the infinite Reconnect banner loop).
+  - Stopped previous native tunnel before registering the new `utun` fd or loading `adaptive-cache.json`, required 2 consecutive unhealthy telemetry samples before locking UI into `.error`, fixed Personal Hotspot Wi-Fi (`isExpensive == true`) IPv6 interface selection, excluded volatile IPv6 privacy addresses from path signatures, and migrated legacy `mtu = 1400` saved settings to `4064`.
+
 ## [0.5.2] - 2026-11-25
 
 ### Fixed
@@ -119,7 +138,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Configured `CODE_SIGN_ENTITLEMENTS` in iOS `project.yml` so XcodeGen preserves `.entitlements` files.
 - Fixed release workflow entitlement verification and restricted automatic release runs to version tags and manual dispatch.
 
-[Unreleased]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/Vuln-Inc/vdpi/compare/v0.4.2...v0.5.0
