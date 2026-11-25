@@ -1,11 +1,14 @@
 use super::HANDSHAKE_TIMEOUT;
 use crate::desync::EngineContext;
+use crate::health::{handle_health_http_request, HealthRuntimeMeta};
 use crate::tls::expected_tls_record_len;
 use anyhow::{bail, Result};
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::debug;
+use vdpi_core::config::EngineMode;
 
 const MAX_HTTP_HEADER_BYTES: usize = 32 * 1024;
 
@@ -42,6 +45,12 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
 
     let header_bytes = &buf[..header_end];
     let leftover = &buf[header_end..];
+    if has_bare_lf(header_bytes) {
+        let _ = client
+            .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+            .await;
+        bail!("bare LF in HTTP request header");
+    }
     let header_str = match std::str::from_utf8(header_bytes) {
         Ok(s) => s,
         Err(_) => {
@@ -71,52 +80,17 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
 
     // Built-in local health endpoint for `vdpi status` / `vdpi doctor` / Control Center TUI
     if target == "/vdpi-health" {
-        let is_loopback_peer = client
-            .peer_addr()
-            .is_ok_and(|p| p.ip().to_canonical().is_loopback());
-        if !is_loopback_peer || !is_local_health_host(header_str) {
-            let _ = write_health_response(
-                &mut client,
-                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            )
-            .await;
-            return Ok(());
-        }
-
-        if !method.eq_ignore_ascii_case("GET") {
-            let _ = write_health_response(
-                &mut client,
-                b"HTTP/1.1 405 Method Not Allowed\r\nAllow: GET\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            )
-            .await;
-            return Ok(());
-        }
-
-        let snap = ctx.telemetry_snapshot();
-        let payload = serde_json::json!({
-            "status": "ok",
-            "service": "vdpi",
-            "version": env!("CARGO_PKG_VERSION"),
-            "mode": ctx.config.mode,
-            "doh": ctx.config.enable_doh,
-            "block_quic": ctx.config.block_quic,
-            "active_connections": snap.active_connections,
-            "total_connections": snap.total_connections,
-            "bytes_tx": snap.bytes_tx,
-            "bytes_rx": snap.bytes_rx,
-            "tls_handshakes": snap.tls_handshakes,
-            "auto_heal_escalations": snap.auto_heal_escalations,
-            "learned_hosts": snap.learned_hosts,
-            "isp_stage": ctx.preferred_stage().label(),
-        });
-        let body = format!("{payload}\n");
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        write_health_response(&mut client, resp.as_bytes()).await?;
-        return Ok(());
+        let meta = HealthRuntimeMeta {
+            engine: EngineMode::Proxy,
+            ..Default::default()
+        };
+        return handle_health_http_request(&mut client, method, header_str, &ctx, &meta).await;
     }
+
+    let is_loopback_peer = client
+        .peer_addr()
+        .is_ok_and(|p| p.ip().to_canonical().is_loopback());
+    let local_addr = client.local_addr().ok();
 
     if method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = match parse_authority(target, 443) {
@@ -128,10 +102,33 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
                 return Err(e);
             }
         };
+        if is_forbidden_proxy_host(is_loopback_peer, &host, port, local_addr) {
+            let status = if is_loopback_peer {
+                b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .as_slice()
+            } else {
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .as_slice()
+            };
+            let _ = client.write_all(status).await;
+            bail!("forbidden HTTP CONNECT target '{host}:{port}'");
+        }
 
         debug!(host = %host, port = port, "HTTP CONNECT request");
         match ctx.connect_target(&host, port).await {
             Ok((remote, remote_addr)) => {
+                if is_forbidden_remote_addr(is_loopback_peer, remote_addr, local_addr) {
+                    drop(remote);
+                    let status = if is_loopback_peer {
+                        b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .as_slice()
+                    } else {
+                        b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .as_slice()
+                    };
+                    let _ = client.write_all(status).await;
+                    bail!("forbidden resolved HTTP CONNECT target '{remote_addr}'");
+                }
                 client
                     .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                     .await?;
@@ -189,11 +186,32 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
             return Err(e);
         }
     };
+    if is_forbidden_proxy_host(is_loopback_peer, &host, port, local_addr) {
+        let status = if is_loopback_peer {
+            b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice()
+        } else {
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice()
+        };
+        let _ = client.write_all(status).await;
+        bail!("forbidden HTTP proxy target '{host}:{port}'");
+    }
 
     let rewritten = rewrite_http_request(method, &origin_path, version, header_str, leftover);
     drop(buf);
     match ctx.connect_target(&host, port).await {
         Ok((remote, remote_addr)) => {
+            if is_forbidden_remote_addr(is_loopback_peer, remote_addr, local_addr) {
+                drop(remote);
+                let status = if is_loopback_peer {
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .as_slice()
+                } else {
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .as_slice()
+                };
+                let _ = client.write_all(status).await;
+                bail!("forbidden resolved HTTP proxy target '{remote_addr}'");
+            }
             ctx.establish_and_relay(client, remote, &rewritten, Some(&host), remote_addr)
                 .await
         }
@@ -208,36 +226,58 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
     }
 }
 
-async fn write_health_response(client: &mut TcpStream, bytes: &[u8]) -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(3), async {
-        client.write_all(bytes).await?;
-        client.flush().await
-    })
-    .await??;
-    Ok(())
-}
-
-fn is_local_health_host(header_str: &str) -> bool {
-    for line in header_str.lines().skip(1) {
-        let line = line.trim_end_matches('\r');
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        if !name.trim().eq_ignore_ascii_case("host") {
-            continue;
-        }
-        let Ok((host, _)) = parse_authority(value, 80) else {
-            return false;
-        };
-        if !host.eq_ignore_ascii_case("localhost") && host != "127.0.0.1" && host != "::1" {
-            return false;
-        }
-    }
-    true
-}
-
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+}
+
+fn has_bare_lf(header_bytes: &[u8]) -> bool {
+    header_bytes
+        .iter()
+        .enumerate()
+        .any(|(i, &b)| b == b'\n' && (i == 0 || header_bytes[i - 1] != b'\r'))
+}
+
+fn is_loopback_or_unspecified_host(host: &str) -> bool {
+    let h = host.trim().trim_end_matches('.');
+    if h.eq_ignore_ascii_case("localhost") || h.to_ascii_lowercase().ends_with(".localhost") {
+        return true;
+    }
+    h.parse::<IpAddr>().is_ok_and(|ip| {
+        let canonical = ip.to_canonical();
+        canonical.is_loopback() || canonical.is_unspecified()
+    })
+}
+
+fn is_forbidden_proxy_host(
+    is_loopback_peer: bool,
+    host: &str,
+    port: u16,
+    local_addr: Option<SocketAddr>,
+) -> bool {
+    if !is_loopback_peer && is_loopback_or_unspecified_host(host) {
+        return true;
+    }
+    local_addr.is_some_and(|local| {
+        local.port() == port
+            && host
+                .trim()
+                .parse::<IpAddr>()
+                .is_ok_and(|ip| ip.to_canonical() == local.ip().to_canonical())
+    })
+}
+
+fn is_forbidden_remote_addr(
+    is_loopback_peer: bool,
+    remote_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
+) -> bool {
+    let remote_ip = remote_addr.ip().to_canonical();
+    if !is_loopback_peer && (remote_ip.is_loopback() || remote_ip.is_unspecified()) {
+        return true;
+    }
+    local_addr.is_some_and(|local| {
+        local.port() == remote_addr.port() && local.ip().to_canonical() == remote_ip
+    })
 }
 
 fn is_valid_http_method(method: &str) -> bool {
@@ -275,19 +315,25 @@ pub fn parse_authority(authority: &str, default_port: u16) -> Result<(String, u1
         let (v6, after) = rest
             .split_once(']')
             .ok_or_else(|| anyhow::anyhow!("unclosed IPv6 bracket in '{trimmed}'"))?;
-        let port = if let Some(p_str) = after.strip_prefix(':') {
+        if v6.trim().is_empty() {
+            bail!("empty IPv6 host in '{trimmed}'");
+        }
+        let port = if after.is_empty() {
+            default_port
+        } else if let Some(p_str) = after.strip_prefix(':') {
             p_str.parse::<u16>()?
         } else {
-            default_port
+            bail!("unexpected trailing characters after IPv6 bracket in '{trimmed}'");
         };
         return Ok((v6.to_string(), port));
     }
 
-    if let Some((h, p_str)) = trimmed.rsplit_once(':') {
-        if !h.contains(':') {
-            let port = p_str.parse::<u16>()?;
-            return Ok((h.to_string(), port));
+    if let Some((h, p_str)) = trimmed.rsplit_once(':').filter(|(h, _)| !h.contains(':')) {
+        if h.trim().is_empty() {
+            bail!("empty host in '{trimmed}'");
         }
+        let port = p_str.parse::<u16>()?;
+        return Ok((h.to_string(), port));
     }
 
     Ok((trimmed.to_string(), default_port))
@@ -341,19 +387,20 @@ fn rewrite_http_request(
     body_prefix: &[u8],
 ) -> Vec<u8> {
     let has_upgrade = header_str.split("\r\n").skip(1).any(|line| {
-        line.split_once(':')
-            .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("upgrade"))
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.trim().eq_ignore_ascii_case("upgrade") && !value.trim().is_empty()
+        })
     });
 
     let mut out = Vec::with_capacity(header_str.len() + body_prefix.len() + 24);
     out.extend_from_slice(format!("{method} {origin_path} {version}\r\n").as_bytes());
 
-    let mut saw_connection = false;
+    let mut saw_upgrade_connection = false;
     for line in header_str.split("\r\n").skip(1) {
         if line.is_empty() {
             continue;
         }
-        if let Some((name, _)) = line.split_once(':') {
+        if let Some((name, value)) = line.split_once(':') {
             let name = name.trim();
             if name.eq_ignore_ascii_case("proxy-connection")
                 || name.eq_ignore_ascii_case("proxy-authorization")
@@ -362,9 +409,28 @@ fn rewrite_http_request(
                 continue;
             }
             if name.eq_ignore_ascii_case("connection") {
-                if has_upgrade {
-                    saw_connection = true;
-                } else {
+                if !has_upgrade {
+                    continue;
+                }
+                let tokens: Vec<&str> = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .collect();
+                let has_upgrade_tok = tokens.iter().any(|t| t.eq_ignore_ascii_case("upgrade"));
+                if !has_upgrade_tok {
+                    continue;
+                }
+                let has_close_tok = tokens.iter().any(|t| t.eq_ignore_ascii_case("close"));
+                saw_upgrade_connection = true;
+                if has_close_tok {
+                    let kept: Vec<&str> = tokens
+                        .into_iter()
+                        .filter(|t| !t.eq_ignore_ascii_case("close"))
+                        .collect();
+                    out.extend_from_slice(
+                        format!("Connection: {}\r\n", kept.join(", ")).as_bytes(),
+                    );
                     continue;
                 }
             }
@@ -374,7 +440,7 @@ fn rewrite_http_request(
     }
 
     if has_upgrade {
-        if !saw_connection {
+        if !saw_upgrade_connection {
             out.extend_from_slice(b"Connection: Upgrade\r\n");
         }
         out.extend_from_slice(b"\r\n");
@@ -405,6 +471,19 @@ mod tests {
             parse_authority("[2606:4700::6810:85e8]:8443", 443).unwrap(),
             ("2606:4700::6810:85e8".to_string(), 8443)
         );
+        assert_eq!(
+            parse_authority("[::1]", 443).unwrap(),
+            ("::1".to_string(), 443)
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_authorities_and_empty_hosts() {
+        assert!(parse_authority("[::1]junk", 443).is_err());
+        assert!(parse_authority("[::1]:443junk", 443).is_err());
+        assert!(parse_authority(":443", 443).is_err());
+        assert!(parse_authority("[]:443", 443).is_err());
+        assert!(parse_authority("[]", 443).is_err());
     }
 
     #[test]
@@ -457,6 +536,119 @@ mod tests {
         let no_conn_s = String::from_utf8(no_conn_rewritten).unwrap();
         assert!(no_conn_s.contains("Upgrade: websocket\r\n"));
         assert!(no_conn_s.ends_with("Connection: Upgrade\r\n\r\n"));
+
+        // `Connection: keep-alive` with `Upgrade: websocket` lacks an `upgrade` token and is rewritten.
+        let keep_alive_ws = "GET http://example.com/ws HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\nUpgrade: websocket\r\n\r\n";
+        let ka_rewritten = rewrite_http_request("GET", "/ws", "HTTP/1.1", keep_alive_ws, b"");
+        let ka_s = String::from_utf8(ka_rewritten).unwrap();
+        assert!(ka_s.contains("Upgrade: websocket\r\n"));
+        assert!(ka_s.ends_with("Connection: Upgrade\r\n\r\n"));
+        assert!(!ka_s.to_ascii_lowercase().contains("connection: keep-alive"));
+        assert!(!ka_s.to_ascii_lowercase().contains("connection: close"));
+
+        // `Connection: close` with `Upgrade: websocket` is dropped and replaced with `Connection: Upgrade`.
+        let close_ws = "GET http://example.com/ws HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\nUpgrade: websocket\r\n\r\n";
+        let close_rewritten = rewrite_http_request("GET", "/ws", "HTTP/1.1", close_ws, b"");
+        let close_s = String::from_utf8(close_rewritten).unwrap();
+        assert!(close_s.contains("Upgrade: websocket\r\n"));
+        assert!(close_s.ends_with("Connection: Upgrade\r\n\r\n"));
+        assert!(!close_s.to_ascii_lowercase().contains("connection: close"));
+
+        // `Connection: close, Upgrade` strips `close` while preserving `Upgrade`.
+        let mixed_close_ws = "GET http://example.com/ws HTTP/1.1\r\nHost: example.com\r\nConnection: close, Upgrade\r\nUpgrade: websocket\r\n\r\n";
+        let mixed_close_rewritten =
+            rewrite_http_request("GET", "/ws", "HTTP/1.1", mixed_close_ws, b"");
+        let mixed_close_s = String::from_utf8(mixed_close_rewritten).unwrap();
+        assert!(mixed_close_s.contains("Connection: Upgrade\r\n"));
+        assert!(!mixed_close_s.to_ascii_lowercase().contains("close"));
+
+        // Empty `Upgrade:` value must NOT trigger upgrade mode.
+        let empty_upgrade =
+            "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nUpgrade:   \r\nConnection: keep-alive\r\n\r\n";
+        let empty_rewritten = rewrite_http_request("GET", "/", "HTTP/1.1", empty_upgrade, b"");
+        let empty_s = String::from_utf8(empty_rewritten).unwrap();
+        assert!(empty_s.ends_with("Connection: close\r\n\r\n"));
+    }
+
+    #[test]
+    fn rejects_non_loopback_proxy_targets_to_loopback_and_self_listener() {
+        let local: SocketAddr = "192.168.1.50:8080".parse().unwrap();
+        assert!(is_forbidden_proxy_host(
+            false,
+            "127.0.0.1",
+            8080,
+            Some(local)
+        ));
+        assert!(is_forbidden_proxy_host(
+            false,
+            "localhost",
+            18089,
+            Some(local)
+        ));
+        assert!(is_forbidden_proxy_host(false, "::1", 8080, Some(local)));
+        assert!(is_forbidden_proxy_host(false, "0.0.0.0", 8080, Some(local)));
+        assert!(is_forbidden_proxy_host(
+            false,
+            "192.168.1.50",
+            8080,
+            Some(local)
+        ));
+        assert!(!is_forbidden_proxy_host(
+            false,
+            "example.com",
+            443,
+            Some(local)
+        ));
+        assert!(!is_forbidden_proxy_host(
+            true,
+            "127.0.0.1",
+            19000,
+            Some(local)
+        ));
+
+        let loopback_target: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        assert!(is_forbidden_remote_addr(
+            false,
+            loopback_target,
+            Some(local)
+        ));
+        assert!(is_forbidden_remote_addr(false, local, Some(local)));
+        assert!(is_forbidden_remote_addr(true, local, Some(local)));
+        assert!(!is_forbidden_remote_addr(
+            true,
+            loopback_target,
+            Some(local)
+        ));
+    }
+
+    #[tokio::test]
+    async fn bare_lf_in_http_headers_returns_400() {
+        let cli = CliArgs::parse_from_iter(["vdpi", "--no-system-proxy"]).unwrap();
+        let ctx = EngineContext::new(cli.into_runtime_config()).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            handle_http_client(sock, ctx).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\nX-Smuggled: 1\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        assert_eq!(
+            resp,
+            b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"
+        );
+        assert!(server.await.unwrap().is_err());
     }
 
     #[test]

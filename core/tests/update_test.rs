@@ -2,6 +2,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use vdpi::platform::windows_tun::{WINTUN_DLL_AMD64_SHA256, WINTUN_VERSION, WINTUN_ZIP_SHA256};
 use vdpi::service::parse_version_from_cli_output;
 use vdpi::update::{
     compare_versions, parse_semver, parse_sha256sum_for_asset, platform_asset_name, sha256_hex,
@@ -310,5 +311,87 @@ fn strips_windows_non_unc_verbatim_path_prefix_safely() {
     assert_eq!(
         strip_windows_verbatim_prefix(Path::new("/usr/local/bin/vdpi")),
         PathBuf::from("/usr/local/bin/vdpi")
+    );
+}
+
+#[test]
+fn v050_semver_and_pinned_wintun_checksum_contract() {
+    assert_eq!(compare_versions("0.5.0", "0.4.2"), VersionRelation::Newer);
+    assert_eq!(
+        compare_versions("v0.5.0", "vdpi 0.5.0"),
+        VersionRelation::Same
+    );
+    assert_eq!(parse_semver("vdpi 0.5.0\r\n"), Some((0, 5, 0)));
+    assert_eq!(
+        parse_version_from_cli_output("vdpi 0.5.0\r\n"),
+        Some("0.5.0".to_string())
+    );
+
+    // Pinned Wintun release & DLL digests must be strict 64-char lowercase hex.
+    assert_eq!(WINTUN_VERSION, "0.14.1");
+    for digest in [WINTUN_ZIP_SHA256, WINTUN_DLL_AMD64_SHA256] {
+        assert_eq!(digest.len(), 64);
+        assert!(digest
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+    }
+
+    let sums = format!(
+        "{WINTUN_ZIP_SHA256}  wintun-{WINTUN_VERSION}.zip\n\
+         {WINTUN_DLL_AMD64_SHA256} *wintun.dll\n"
+    );
+    assert_eq!(
+        parse_sha256sum_for_asset(&sums, "wintun.dll").as_deref(),
+        Some(WINTUN_DLL_AMD64_SHA256)
+    );
+}
+
+#[test]
+fn release_workflow_wintun_sha256_matches_windows_tun_constants() {
+    let workflow_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("core crate should live inside workspace root")
+        .join(".github")
+        .join("workflows")
+        .join("release.yml");
+    let workflow = fs::read_to_string(&workflow_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", workflow_path.display()));
+
+    let extract_pwsh_var = |var_name: &str| -> String {
+        workflow
+            .lines()
+            .find_map(|line| {
+                let trimmed = line.trim();
+                let rest = trimmed.strip_prefix(var_name)?;
+                let rhs = rest.trim_start().strip_prefix('=')?.trim();
+                let unquoted = rhs
+                    .strip_prefix('\'')
+                    .and_then(|s| s.strip_suffix('\''))
+                    .or_else(|| rhs.strip_prefix('"').and_then(|s| s.strip_suffix('"')))?;
+                Some(unquoted.to_string())
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected {var_name} assignment in {}",
+                    workflow_path.display()
+                )
+            })
+    };
+
+    let wintun_url = extract_pwsh_var("$wintunUrl");
+    let expected_zip = extract_pwsh_var("$expectedZipSha256");
+    let expected_dll = extract_pwsh_var("$expectedDllSha256");
+
+    assert!(
+        wintun_url.ends_with(&format!("wintun-{WINTUN_VERSION}.zip")),
+        "release.yml $wintunUrl ({wintun_url}) must reference wintun-{WINTUN_VERSION}.zip"
+    );
+    assert_eq!(
+        expected_zip, WINTUN_ZIP_SHA256,
+        "release.yml $expectedZipSha256 must match windows_tun::WINTUN_ZIP_SHA256 verbatim"
+    );
+    assert_eq!(
+        expected_dll, WINTUN_DLL_AMD64_SHA256,
+        "release.yml $expectedDllSha256 must match windows_tun::WINTUN_DLL_AMD64_SHA256 verbatim"
     );
 }

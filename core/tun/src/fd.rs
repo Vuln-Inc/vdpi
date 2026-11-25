@@ -11,7 +11,15 @@ use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
 use tracing::{debug, warn};
-use vdpi::desync::EngineContext;
+use vdpi_core::desync::EngineContext;
+
+#[cfg(target_os = "macos")]
+const TUN_PI_LEN: usize = 4;
+#[cfg(not(target_os = "macos"))]
+const TUN_PI_LEN: usize = 0;
+
+/// Maximum packets drained per `AsyncFd` readiness wakeup before yielding back to Tokio.
+const IO_BATCH_LIMIT: usize = 32;
 
 struct AbortOnDrop(Vec<AbortHandle>);
 
@@ -60,10 +68,10 @@ pub async fn run_registered_tun_fd(
     let read_fd = Arc::clone(&async_fd);
     let mut stop_read = fd_stop_rx.clone();
     let read_stop_tx = fd_stop_tx.clone();
-    let read_buf_size = clamped_mtu + 128;
+    let read_buf_size = clamped_mtu + TUN_PI_LEN + 128;
     let reader_task = tokio::spawn(async move {
         let mut buf = vec![0u8; read_buf_size];
-        loop {
+        'outer: loop {
             let mut guard = tokio::select! {
                 biased;
                 _ = wait_shutdown(&mut stop_read) => break,
@@ -77,23 +85,33 @@ pub async fn run_registered_tun_fd(
                 }
             };
 
-            match guard.try_io(|inner| read_raw_fd(inner.as_raw_fd(), &mut buf)) {
-                Ok(Ok(0)) => {
-                    let _ = read_stop_tx.send(true);
-                    break;
+            let mut drained = 0usize;
+            while drained < IO_BATCH_LIMIT {
+                match guard.try_io(|inner| read_raw_fd(inner.as_raw_fd(), &mut buf)) {
+                    Ok(Ok(0)) => {
+                        let _ = read_stop_tx.send(true);
+                        break 'outer;
+                    }
+                    Ok(Ok(n)) => {
+                        drained += 1;
+                        let Some(ip_pkt) = strip_tun_pi(&buf[..n]) else {
+                            debug!(bytes = n, "dropping malformed or non-IP TUN frame");
+                            continue;
+                        };
+                        match inbound_tx.try_send(ip_pkt.to_vec()) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {}
+                            Err(mpsc::error::TrySendError::Closed(_)) => break 'outer,
+                        }
+                    }
+                    Ok(Err(e)) if e.kind() == ErrorKind::Interrupted => continue,
+                    Ok(Err(e)) => {
+                        warn!(error = %e, "TUN read error");
+                        let _ = read_stop_tx.send(true);
+                        break 'outer;
+                    }
+                    Err(_would_block) => break,
                 }
-                Ok(Ok(n)) => match inbound_tx.try_send(buf[..n].to_vec()) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {}
-                    Err(mpsc::error::TrySendError::Closed(_)) => break,
-                },
-                Ok(Err(e)) if e.kind() == ErrorKind::Interrupted => continue,
-                Ok(Err(e)) => {
-                    warn!(error = %e, "TUN read error");
-                    let _ = read_stop_tx.send(true);
-                    break;
-                }
-                Err(_would_block) => continue,
             }
         }
     });
@@ -102,33 +120,51 @@ pub async fn run_registered_tun_fd(
     let mut stop_write = fd_stop_rx.clone();
     let write_stop_tx = fd_stop_tx.clone();
     let writer_task = tokio::spawn(async move {
+        let mut pending: Option<Vec<u8>> = None;
         'outer: loop {
-            let pkt = tokio::select! {
+            if pending.is_none() {
+                let pkt = tokio::select! {
+                    biased;
+                    _ = wait_shutdown(&mut stop_write) => break,
+                    maybe_pkt = outbound_rx.recv() => match maybe_pkt {
+                        Some(p) => p,
+                        None => break,
+                    }
+                };
+                pending = Some(pkt);
+            }
+
+            let mut guard = tokio::select! {
                 biased;
                 _ = wait_shutdown(&mut stop_write) => break,
-                maybe_pkt = outbound_rx.recv() => match maybe_pkt {
-                    Some(p) => p,
-                    None => break,
+                res = write_fd.writable() => match res {
+                    Ok(g) => g,
+                    Err(e) => {
+                        warn!(error = %e, "TUN writable wait failed");
+                        let _ = write_stop_tx.send(true);
+                        break;
+                    }
                 }
             };
 
-            loop {
-                let mut guard = tokio::select! {
-                    biased;
-                    _ = wait_shutdown(&mut stop_write) => break 'outer,
-                    res = write_fd.writable() => match res {
-                        Ok(g) => g,
-                        Err(e) => {
-                            warn!(error = %e, "TUN writable wait failed");
-                            let _ = write_stop_tx.send(true);
-                            break 'outer;
-                        }
-                    }
+            let mut written = 0usize;
+            while written < IO_BATCH_LIMIT {
+                let pkt = match pending.take() {
+                    Some(p) => p,
+                    None => match outbound_rx.try_recv() {
+                        Ok(p) => p,
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => break 'outer,
+                    },
                 };
 
                 match guard.try_io(|inner| write_raw_fd(inner.as_raw_fd(), &pkt)) {
-                    Ok(Ok(_)) => break,
-                    Ok(Err(e)) if e.kind() == ErrorKind::Interrupted => continue,
+                    Ok(Ok(_)) => {
+                        written += 1;
+                    }
+                    Ok(Err(e)) if e.kind() == ErrorKind::Interrupted => {
+                        pending = Some(pkt);
+                    }
                     Ok(Err(e)) => {
                         if is_fatal_tun_errno(&e) {
                             warn!(error = %e, "fatal TUN write error");
@@ -136,9 +172,12 @@ pub async fn run_registered_tun_fd(
                             break 'outer;
                         }
                         debug!(error = %e, "transient TUN write drop");
+                        written += 1;
+                    }
+                    Err(_would_block) => {
+                        pending = Some(pkt);
                         break;
                     }
-                    Err(_would_block) => continue,
                 }
             }
         }
@@ -199,6 +238,48 @@ fn set_nonblocking(fd: i32) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn strip_tun_pi(frame: &[u8]) -> Option<&[u8]> {
+    if frame.len() <= TUN_PI_LEN {
+        return None;
+    }
+    let family = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]);
+    if family != libc::AF_INET as u32 && family != libc::AF_INET6 as u32 {
+        return None;
+    }
+    Some(&frame[TUN_PI_LEN..])
+}
+
+#[cfg(not(target_os = "macos"))]
+fn strip_tun_pi(frame: &[u8]) -> Option<&[u8]> {
+    if frame.is_empty() {
+        None
+    } else {
+        Some(frame)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn tun_pi_header(pkt: &[u8]) -> std::io::Result<[u8; TUN_PI_LEN]> {
+    let Some(&first) = pkt.first() else {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "empty TUN packet",
+        ));
+    };
+    let family = match first >> 4 {
+        4 => libc::AF_INET as u32,
+        6 => libc::AF_INET6 as u32,
+        _ => {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "unsupported IP version for macOS utun frame",
+            ));
+        }
+    };
+    Ok(family.to_be_bytes())
+}
+
 fn read_raw_fd(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
     let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
     if n < 0 {
@@ -208,11 +289,101 @@ fn read_raw_fd(fd: i32, buf: &mut [u8]) -> std::io::Result<usize> {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn write_raw_fd(fd: i32, buf: &[u8]) -> std::io::Result<usize> {
+    let header = tun_pi_header(buf)?;
+    let iov = [
+        libc::iovec {
+            iov_base: header.as_ptr().cast_mut().cast(),
+            iov_len: header.len(),
+        },
+        libc::iovec {
+            iov_base: buf.as_ptr().cast_mut().cast(),
+            iov_len: buf.len(),
+        },
+    ];
+    // SAFETY: Both `header` and `buf` are valid byte slices that remain alive for the
+    // entire synchronous `writev` syscall, and `writev` only reads from the iovecs.
+    let n = unsafe { libc::writev(fd, iov.as_ptr(), 2) };
+    if n < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(n as usize)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
 fn write_raw_fd(fd: i32, buf: &[u8]) -> std::io::Result<usize> {
     let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
     if n < 0 {
         Err(std::io::Error::last_os_error())
     } else {
         Ok(n as usize)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::io::FromRawFd;
+
+    #[test]
+    fn raw_fd_write_and_read_roundtrip_framing() {
+        let mut fds = [-1i32; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0);
+        let tx = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let rx = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+
+        let ipv4 = [0x45u8, 0x00, 0x00, 0x14, 1, 2, 3, 4];
+        let written = write_raw_fd(tx.as_raw_fd(), &ipv4).unwrap();
+        assert_eq!(written, TUN_PI_LEN + ipv4.len());
+
+        let mut buf = [0u8; 64];
+        let read = read_raw_fd(rx.as_raw_fd(), &mut buf).unwrap();
+        assert_eq!(read, TUN_PI_LEN + ipv4.len());
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            &buf[..TUN_PI_LEN],
+            (libc::AF_INET as u32).to_be_bytes().as_slice()
+        );
+        assert_eq!(strip_tun_pi(&buf[..read]), Some(ipv4.as_slice()));
+
+        let ipv6 = [0x60u8, 0x00, 0x00, 0x00, 5, 6, 7, 8];
+        let written6 = write_raw_fd(tx.as_raw_fd(), &ipv6).unwrap();
+        assert_eq!(written6, TUN_PI_LEN + ipv6.len());
+
+        let read6 = read_raw_fd(rx.as_raw_fd(), &mut buf).unwrap();
+        assert_eq!(read6, TUN_PI_LEN + ipv6.len());
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            &buf[..TUN_PI_LEN],
+            (libc::AF_INET6 as u32).to_be_bytes().as_slice()
+        );
+        assert_eq!(strip_tun_pi(&buf[..read6]), Some(ipv6.as_slice()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_pi_validation_rejects_bad_frames_and_versions() {
+        assert_eq!(strip_tun_pi(&[]), None);
+        assert_eq!(strip_tun_pi(&[0, 0, 0, 2]), None);
+        assert_eq!(strip_tun_pi(&[0, 0, 0, 99, 0x45, 0x00]), None);
+        assert_eq!(
+            tun_pi_header(&[]).unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            tun_pi_header(&[0x30, 0x00]).unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn non_macos_strip_pi_passthrough() {
+        assert_eq!(strip_tun_pi(&[]), None);
+        let pkt = [0x45u8, 0x00, 0x00, 0x14];
+        assert_eq!(strip_tun_pi(&pkt), Some(pkt.as_slice()));
     }
 }

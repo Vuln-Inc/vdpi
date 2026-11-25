@@ -9,13 +9,14 @@ plugins {
 
 fun readWorkspaceVersion(): String {
     val override = providers.gradleProperty("vdpiVersionName").orNull?.trim()
-    if (!override.isNullOrEmpty()) return override.removePrefix("v")
+    val stripped = override?.trimStart { it == 'v' || it == 'V' }
+    if (!stripped.isNullOrEmpty()) return stripped
     val cargoToml = rootProject.projectDir.parentFile?.resolve("Cargo.toml")
     if (cargoToml != null && cargoToml.isFile) {
         val match = Regex("""(?m)^version\s*=\s*"([^"]+)"""").find(cargoToml.readText())
         if (match != null) return match.groupValues[1]
     }
-    return "0.4.2"
+    return "0.5.0"
 }
 
 fun computeVersionCode(semver: String): Int {

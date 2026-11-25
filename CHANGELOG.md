@@ -6,6 +6,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-25
+
+### Added
+
+- Desktop Transparent TUN Mode across Windows (Wintun), macOS (`utun`), and Linux (`/dev/net/tun`) for system-wide DPI bypass without per-app proxy configuration.
+- `VpnGuard` desktop VPN coexistence with 0ms yield when a third-party VPN connects and 3s automatic recovery after the VPN disconnects.
+- Persistent `config.toml` configuration along with `vdpi engine` and `vdpi config` CLI subcommands.
+- Control Center v2 and Foreground Dashboard v2 with engine mode switching, live TUN/Proxy status telemetry, and updated diagnostics.
+- Pinned Wintun `0.14.1` packaging in `vdpi-windows-x86_64.zip` (`wintun.dll` and `WINTUN-LICENSE.txt` beside `vdpi.exe`) verified by archive SHA-256, DLL SHA-256, and `WireGuard LLC` Authenticode signature in CI.
+- Automated `cargo tree` mobile and cross-OS crate isolation gate in release CI verifying `vdpi-android` and `vdpi-ios` never pull `vdpi`, `ratatui`, `crossterm`, `clap`, or `windows-sys`.
+
+### Changed
+
+- Preserved Desktop Proxy Mode continuity with zero-disruption `vdpi update` in-place upgrades.
+- Split the workspace into acyclic `vdpi-core` and `vdpi-tun` crates shared across desktop, Android, and iOS.
+- Streamlined `README.md` and reorganized platform and architecture guides into `docs/`.
+
+### Fixed
+
+- Added zero-lag UDP fast-path with Windows `SIO_UDP_CONNRESET` handling and clean ICMP-backed QUIC fallback.
+- Improved `isp_stage` promotion hygiene so isolated host anomalies no longer over-promote global ISP desync stages.
+
 ## [0.4.2] - 2026-11-24
 
 ### Added
@@ -73,7 +95,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Configured `CODE_SIGN_ENTITLEMENTS` in iOS `project.yml` so XcodeGen preserves `.entitlements` files.
 - Fixed release workflow entitlement verification and restricted automatic release runs to version tags and manual dispatch.
 
-[Unreleased]: https://github.com/Vuln-Inc/vdpi/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Vuln-Inc/vdpi/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/Vuln-Inc/vdpi/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/Vuln-Inc/vdpi/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Vuln-Inc/vdpi/compare/v0.3.4...v0.4.0

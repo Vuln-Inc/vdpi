@@ -1,20 +1,25 @@
 [workspace]
 resolver = "2"
 members = [
-    "core",
+    "core/engine",
     "core/tun",
+    "core",
     "android/native",
     "ios/native",
 ]
 default-members = ["core"]
 
 [workspace.package]
-version = "0.4.2"
+version = "0.5.0"
 edition = "2021"
 authors = ["Vuln-Inc"]
 license = "MIT"
 repository = "https://github.com/Vuln-Inc/vdpi"
 homepage = "https://github.com/Vuln-Inc/vdpi"
+
+[workspace.dependencies]
+vdpi-core = { version = "0.5.0", path = "core/engine" }
+vdpi-tun = { version = "0.5.0", path = "core/tun" }
 
 [profile.release]
 opt-level = 3

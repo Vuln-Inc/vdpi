@@ -1,6 +1,7 @@
 use super::HANDSHAKE_TIMEOUT;
 use crate::desync::EngineContext;
 use anyhow::{bail, Result};
+use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -155,14 +156,67 @@ fn normalize_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
+#[cfg(windows)]
+fn disable_udp_connreset(sock: &UdpSocket) {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawSocket;
+
+    const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
+
+    #[link(name = "ws2_32")]
+    extern "system" {
+        fn WSAIoctl(
+            s: usize,
+            dw_io_control_code: u32,
+            lpv_in_buffer: *const c_void,
+            cb_in_buffer: u32,
+            lpv_out_buffer: *mut c_void,
+            cb_out_buffer: u32,
+            lpcb_bytes_returned: *mut u32,
+            lp_overlapped: *mut c_void,
+            lp_completion_routine: *const c_void,
+        ) -> i32;
+    }
+
+    let enable: i32 = 0; // BOOL FALSE
+    let mut bytes_returned: u32 = 0;
+    unsafe {
+        let _ = WSAIoctl(
+            sock.as_raw_socket() as usize,
+            SIO_UDP_CONNRESET,
+            (&enable as *const i32).cast::<c_void>(),
+            std::mem::size_of::<i32>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        );
+    }
+}
+
+fn is_self_udp_target(
+    target_ip: IpAddr,
+    dst_port: u16,
+    own_ports: &[u16],
+    own_local_ips: &[IpAddr],
+) -> bool {
+    target_ip.is_unspecified()
+        || ((target_ip.is_loopback() || own_local_ips.contains(&target_ip))
+            && own_ports.contains(&dst_port))
+}
+
 async fn run_udp_associate_session(
     mut tcp_control: TcpStream,
     client_udp: Arc<UdpSocket>,
     ctx: EngineContext,
 ) -> Result<()> {
+    #[cfg(windows)]
+    disable_udp_connreset(&client_udp);
+
     let expected_client_ip = tcp_control.peer_addr().ok().map(|a| normalize_ip(a.ip()));
-    let outbound_v4 = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
-    let outbound_v6 = UdpSocket::bind("[::]:0").await.ok().map(Arc::new);
+    let outbound_v4 = Arc::new(ctx.bind_outbound_udp(true, 0)?);
+    let outbound_v6 = ctx.bind_outbound_udp(false, 0).ok().map(Arc::new);
     let own_ports: Vec<u16> = [
         client_udp.local_addr().ok().map(|a| a.port()),
         outbound_v4.local_addr().ok().map(|a| a.port()),
@@ -173,6 +227,21 @@ async fn run_udp_associate_session(
     .into_iter()
     .flatten()
     .collect();
+    let mut own_local_ips: Vec<IpAddr> = [
+        tcp_control.local_addr().ok().map(|a| normalize_ip(a.ip())),
+        client_udp.local_addr().ok().map(|a| normalize_ip(a.ip())),
+        outbound_v4.local_addr().ok().map(|a| normalize_ip(a.ip())),
+        outbound_v6
+            .as_ref()
+            .and_then(|s| s.local_addr().ok().map(|a| normalize_ip(a.ip()))),
+        Some(normalize_ip(ctx.config.addr)),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|ip| !ip.is_unspecified())
+    .collect();
+    own_local_ips.sort_unstable();
+    own_local_ips.dedup();
 
     let last_client_peer: Arc<tokio::sync::RwLock<Option<SocketAddr>>> =
         Arc::new(tokio::sync::RwLock::new(None));
@@ -186,15 +255,22 @@ async fn run_udp_associate_session(
     let client_to_remote = async move {
         let mut buf = vec![0u8; 65535];
         loop {
-            let (n, src_peer) = c2r_client_udp.recv_from(&mut buf).await?;
-            if let Some(expected_ip) = expected_client_ip {
-                if normalize_ip(src_peer.ip()) != expected_ip {
+            let (n, src_peer) = match c2r_client_udp.recv_from(&mut buf).await {
+                Ok(pair) => pair,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        ErrorKind::ConnectionReset | ErrorKind::WouldBlock | ErrorKind::Interrupted
+                    ) =>
+                {
                     continue;
                 }
-            }
+                Err(e) => break Err::<(), std::io::Error>(e),
+            };
+            if expected_client_ip
+                .is_some_and(|expected_ip| normalize_ip(src_peer.ip()) != expected_ip)
             {
-                let mut guard = c2r_peer.write().await;
-                *guard = Some(src_peer);
+                continue;
             }
 
             let Some((dst_host, is_domain, dst_port, payload)) = parse_socks5_udp_packet(&buf[..n])
@@ -203,6 +279,10 @@ async fn run_udp_associate_session(
             };
             if dst_port == 0 {
                 continue;
+            }
+            {
+                let mut guard = c2r_peer.write().await;
+                *guard = Some(src_peer);
             }
 
             // If QUIC blocking is enabled, drop all UDP/443 datagrams (including RFC 9287
@@ -236,9 +316,7 @@ async fn run_udp_associate_session(
                 continue;
             };
             // Reject unspecified targets and self-reflection back into our own UDP relay sockets.
-            if target_ip.is_unspecified()
-                || (target_ip.is_loopback() && own_ports.contains(&dst_port))
-            {
+            if is_self_udp_target(target_ip, dst_port, &own_ports, &own_local_ips) {
                 continue;
             }
             let dst_sa = SocketAddr::new(target_ip, dst_port);
@@ -254,8 +332,6 @@ async fn run_udp_associate_session(
                 }
             }
         }
-        #[allow(unreachable_code)]
-        Ok::<(), std::io::Error>(())
     };
 
     let r2c_client_udp = Arc::clone(&client_udp);
@@ -265,14 +341,23 @@ async fn run_udp_associate_session(
     let remote_v4_to_client = async move {
         let mut buf = vec![0u8; 65535];
         loop {
-            let (n, remote_src) = r2c_out_v4.recv_from(&mut buf).await?;
+            let (n, remote_src) = match r2c_out_v4.recv_from(&mut buf).await {
+                Ok(pair) => pair,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        ErrorKind::ConnectionReset | ErrorKind::WouldBlock | ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue;
+                }
+                Err(e) => break Err::<(), std::io::Error>(e),
+            };
             if let Some(client_peer) = *r2c_peer.read().await {
                 let pkt = encode_socks5_udp_packet(remote_src, &buf[..n]);
                 let _ = r2c_client_udp.send_to(&pkt, client_peer).await;
             }
         }
-        #[allow(unreachable_code)]
-        Ok::<(), std::io::Error>(())
     };
 
     let r2c6_client_udp = Arc::clone(&client_udp);
@@ -281,7 +366,20 @@ async fn run_udp_associate_session(
         if let Some(v6_sock) = outbound_v6 {
             let mut buf = vec![0u8; 65535];
             loop {
-                let (n, remote_src) = v6_sock.recv_from(&mut buf).await?;
+                let (n, remote_src) = match v6_sock.recv_from(&mut buf).await {
+                    Ok(pair) => pair,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            ErrorKind::ConnectionReset
+                                | ErrorKind::WouldBlock
+                                | ErrorKind::Interrupted
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(e) => break Err(e),
+                };
                 if let Some(client_peer) = *r2c6_peer.read().await {
                     let pkt = encode_socks5_udp_packet(remote_src, &buf[..n]);
                     let _ = r2c6_client_udp.send_to(&pkt, client_peer).await;
@@ -469,5 +567,51 @@ mod tests {
         assert!(d_is_dom);
         assert_eq!(dport, 55123);
         assert_eq!(ddata, b"raknet-ping");
+    }
+
+    #[test]
+    fn rejects_self_udp_targets_including_non_loopback_bind_ips() {
+        let own_ports = [50000u16, 50001u16];
+        let own_local_ips = [
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
+            IpAddr::V6("fd00::50".parse().unwrap()),
+        ];
+
+        assert!(is_self_udp_target(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            53,
+            &own_ports,
+            &own_local_ips
+        ));
+        assert!(is_self_udp_target(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            50000,
+            &own_ports,
+            &own_local_ips
+        ));
+        assert!(is_self_udp_target(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
+            50001,
+            &own_ports,
+            &own_local_ips
+        ));
+        assert!(is_self_udp_target(
+            IpAddr::V6("fd00::50".parse().unwrap()),
+            50000,
+            &own_ports,
+            &own_local_ips
+        ));
+        assert!(!is_self_udp_target(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)),
+            53,
+            &own_ports,
+            &own_local_ips
+        ));
+        assert!(!is_self_udp_target(
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            50000,
+            &own_ports,
+            &own_local_ips
+        ));
     }
 }

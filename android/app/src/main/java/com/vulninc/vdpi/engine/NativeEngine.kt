@@ -1,5 +1,6 @@
 package com.vulninc.vdpi.engine
 
+import android.os.ParcelFileDescriptor
 import com.vulninc.vdpi.BuildConfig
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
@@ -102,7 +103,7 @@ object NativeEngine {
     }
 
     @JvmStatic
-    private external fun nativeStart(tunFd: Int, configJson: String): String
+    private external fun nativeStart(tunFd: Int, configJson: String): String?
 
     @JvmStatic
     private external fun nativeStop()
@@ -130,6 +131,12 @@ object NativeEngine {
         runCatching { json.decodeFromString(DoctorReport.serializer(), raw) }
             .getOrDefault(DoctorReport())
 
+    private fun closeUnownedFd(tunFd: Int) {
+        if (tunFd > 2) {
+            runCatching { ParcelFileDescriptor.adoptFd(tunFd).close() }
+        }
+    }
+
     fun prepareStart(config: NativeEngineConfig): Result<String> {
         return runCatching {
             ensureLoaded()
@@ -138,22 +145,35 @@ object NativeEngine {
     }
 
     fun startWithEncoded(tunFd: Int, encodedConfig: String): Result<Unit> {
-        return runCatching {
+        val err = try {
             ensureLoaded()
-            val err = nativeStart(tunFd, encodedConfig)
-            if (err.isNotEmpty()) {
-                error(err)
-            }
+            nativeStart(tunFd, encodedConfig)
+        } catch (t: Throwable) {
+            // Native never took ownership of tunFd if library load or JNI symbol binding threw.
+            closeUnownedFd(tunFd)
+            return Result.failure(t)
+        }
+        return when {
+            err == null -> Result.failure(IllegalStateException("Native engine failed to allocate status message"))
+            err.isNotEmpty() -> Result.failure(IllegalStateException(err))
+            else -> Result.success(Unit)
         }
     }
 
     fun start(tunFd: Int, config: NativeEngineConfig): Result<Unit> {
-        return runCatching {
+        val err = try {
             ensureLoaded()
-            val err = nativeStart(tunFd, encodeConfig(config))
-            if (err.isNotEmpty()) {
-                error(err)
-            }
+            val encoded = encodeConfig(config)
+            nativeStart(tunFd, encoded)
+        } catch (t: Throwable) {
+            // Native never took ownership of tunFd if load, encoding, or JNI symbol binding threw.
+            closeUnownedFd(tunFd)
+            return Result.failure(t)
+        }
+        return when {
+            err == null -> Result.failure(IllegalStateException("Native engine failed to allocate status message"))
+            err.isNotEmpty() -> Result.failure(IllegalStateException(err))
+            else -> Result.success(Unit)
         }
     }
 

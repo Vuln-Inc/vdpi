@@ -1,23 +1,39 @@
-use crate::config::RuntimeConfig;
+use crate::binder::{DynamicOutboundBinder, OutboundBinder, OutboundTarget};
+use crate::config::{EngineMode, RuntimeConfig, VpnCoexistence};
 use crate::desync::EngineContext;
-use crate::platform::windows::set_running_as_service;
+use crate::health::{
+    bind_loopback_health_listener, serve_health_until_shutdown, HealthMetaFn, HealthRuntimeMeta,
+    DEFAULT_TUN_HEALTH_PORT,
+};
+use crate::platform::vpn::{detect_active_vpn, VpnScope};
+use crate::platform::vpn_guard::{GuardAction, VpnGuard};
+use crate::platform::windows::{clear_all_windows_proxies, set_running_as_service};
+use crate::platform::windows_tun::{find_verified_wintun_dll, WindowsTunSession, VDPI_TUN_NAME};
 use crate::platform::SystemProxySession;
 use crate::server::{bind_listeners, serve_until_shutdown};
-use crate::service::{clear_runtime_state, write_runtime_state};
+use crate::service::{clear_runtime_state, write_runtime_state_with_meta};
 use anyhow::{bail, Context, Result};
 use std::ffi::c_void;
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
-use tracing::{error, info};
+use tracing::{error, info, warn};
+use vdpi_tun::config::{TunProfile, DESKTOP_MTU};
+use vdpi_tun::events::EventRing;
+use vdpi_tun::pipeline::{run_tun_pipeline, TunStats};
 
 pub const SERVICE_NAME: &str = "vdpi";
 pub const SERVICE_DISPLAY_NAME: &str = "vdpi Anti-DPI Service";
 pub const SERVICE_DESCRIPTION: &str =
     "Zero-hassle, high-performance anti-DPI local proxy engine (HTTP/HTTPS/SOCKS5 + DoH).";
+pub const SERVICE_CONTROL_UPGRADE_STOP: u32 = 128;
+
+const SERVICE_DEPENDENCIES: &str = "Tcpip\0Nsi\0Dnscache\0\0";
 
 type ScHandle = *mut c_void;
 type ServiceStatusHandle = *mut c_void;
@@ -31,6 +47,7 @@ const SERVICE_QUERY_CONFIG: Dword = 0x0001;
 const SERVICE_QUERY_STATUS: Dword = 0x0004;
 const SERVICE_START: Dword = 0x0010;
 const SERVICE_STOP: Dword = 0x0020;
+const SERVICE_USER_DEFINED_CONTROL: Dword = 0x0100;
 const DELETE: Dword = 0x0001_0000;
 const SERVICE_ALL_ACCESS: Dword = 0x000F_01FF;
 
@@ -50,12 +67,21 @@ const SERVICE_PAUSED: Dword = 0x0000_0007;
 
 const SERVICE_ACCEPT_STOP: Dword = 0x0000_0001;
 const SERVICE_ACCEPT_SHUTDOWN: Dword = 0x0000_0004;
+const SERVICE_ACCEPT_POWEREVENT: Dword = 0x0000_0040;
 const SERVICE_ACCEPT_SESSIONCHANGE: Dword = 0x0000_0080;
+const SERVICE_ACCEPTED_CONTROLS: Dword = SERVICE_ACCEPT_STOP
+    | SERVICE_ACCEPT_SHUTDOWN
+    | SERVICE_ACCEPT_POWEREVENT
+    | SERVICE_ACCEPT_SESSIONCHANGE;
 
 const SERVICE_CONTROL_STOP: Dword = 0x0000_0001;
 const SERVICE_CONTROL_INTERROGATE: Dword = 0x0000_0004;
 const SERVICE_CONTROL_SHUTDOWN: Dword = 0x0000_0005;
+const SERVICE_CONTROL_POWEREVENT: Dword = 0x0000_000D;
 const SERVICE_CONTROL_SESSIONCHANGE: Dword = 0x0000_000E;
+
+const PBT_APMRESUMESUSPEND: Dword = 0x0000_0007;
+const PBT_APMRESUMEAUTOMATIC: Dword = 0x0000_0012;
 
 const WTS_SESSION_LOGON: Dword = 0x0000_0005;
 const WTS_SESSION_UNLOCK: Dword = 0x0000_0008;
@@ -69,6 +95,7 @@ const SC_STATUS_PROCESS_INFO: Dword = 0;
 const NO_ERROR: Dword = 0;
 const ERROR_ACCESS_DENIED: Dword = 5;
 const ERROR_CALL_NOT_IMPLEMENTED: Dword = 120;
+const ERROR_INVALID_SERVICE_CONTROL: Dword = 1052;
 const ERROR_SERVICE_ALREADY_RUNNING: Dword = 1056;
 const ERROR_SERVICE_DOES_NOT_EXIST: Dword = 1060;
 const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: Dword = 1061;
@@ -282,6 +309,15 @@ impl Drop for ScmHandle {
 enum StopReason {
     Stop,
     Shutdown,
+    Upgrade,
+}
+
+fn should_deactivate_proxy_on_stop(reason: StopReason) -> bool {
+    matches!(reason, StopReason::Stop)
+}
+
+fn should_fallback_upgrade_control(win32_err: Dword) -> bool {
+    win32_err == ERROR_INVALID_SERVICE_CONTROL || win32_err == ERROR_CALL_NOT_IMPLEMENTED
 }
 
 struct ControlChannels {
@@ -490,9 +526,235 @@ unsafe extern "system" fn service_main(_argc: Dword, _argv: *mut *mut u16) {
     }
 }
 
+enum TunRunOutcome {
+    Stopped,
+    FallbackToProxy(anyhow::Error),
+}
+
+struct TunSlot {
+    session: Option<WindowsTunSession>,
+    pipeline_stop_tx: Option<watch::Sender<bool>>,
+    pipeline_task: Option<tokio::task::JoinHandle<Result<()>>>,
+    route_rx: Option<watch::Receiver<u64>>,
+}
+
+impl TunSlot {
+    fn empty() -> Self {
+        Self {
+            session: None,
+            pipeline_stop_tx: None,
+            pipeline_task: None,
+            route_rx: None,
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        self.session.is_some()
+    }
+
+    fn iface_name(&self) -> Option<String> {
+        self.session.as_ref().map(|s| s.iface_name().to_string())
+    }
+
+    fn physical_nic_name(&self) -> Option<String> {
+        self.session.as_ref().and_then(|s| s.physical_nic_name())
+    }
+
+    async fn start(
+        &mut self,
+        binder: &Arc<DynamicOutboundBinder>,
+        tun_ipv6: bool,
+        ctx: &EngineContext,
+        tun_stats: &Arc<TunStats>,
+        events: &Arc<EventRing>,
+    ) -> Result<()> {
+        if self.session.is_some() {
+            return Ok(());
+        }
+        let start_binder = Arc::clone(binder);
+        let (session, inbound_rx, outbound_tx, route_rx) =
+            tokio::task::spawn_blocking(move || WindowsTunSession::start(start_binder, tun_ipv6))
+                .await
+                .context("Windows TUN startup task panicked")??;
+
+        let (pipeline_stop_tx, pipeline_stop_rx) = watch::channel(false);
+        let pipeline_task = tokio::spawn(run_tun_pipeline(
+            inbound_rx,
+            outbound_tx,
+            ctx.clone(),
+            Arc::clone(tun_stats),
+            Arc::clone(events),
+            DESKTOP_MTU,
+            TunProfile::DESKTOP,
+            pipeline_stop_rx,
+        ));
+
+        self.session = Some(session);
+        self.pipeline_stop_tx = Some(pipeline_stop_tx);
+        self.pipeline_task = Some(pipeline_task);
+        self.route_rx = Some(route_rx);
+        Ok(())
+    }
+
+    async fn stop(&mut self) {
+        self.route_rx = None;
+        if let Some(tx) = self.pipeline_stop_tx.take() {
+            let _ = tx.send(true);
+        }
+        if let Some(mut task) = self.pipeline_task.take() {
+            if tokio::time::timeout(Duration::from_secs(2), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+            }
+        }
+        if let Some(session) = self.session.take() {
+            let _ = tokio::task::spawn_blocking(move || drop(session)).await;
+        }
+    }
+}
+
+fn windows_service_cache_path() -> PathBuf {
+    let base = std::env::var_os("ProgramData")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    base.join("vdpi").join("adaptive-cache.json")
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn sync_tun_telemetry(ctx: &EngineContext, tun_stats: &TunStats) {
+    ctx.set_udp_flows_active(tun_stats.udp_flows_active.load(Ordering::Relaxed));
+    let quic = tun_stats.quic_blocked.load(Ordering::Relaxed);
+    ctx.telemetry
+        .quic_blocked
+        .fetch_max(quic, Ordering::Relaxed);
+}
+
+struct TunSupervisor {
+    binder: Arc<DynamicOutboundBinder>,
+    ctx: EngineContext,
+    tun_stats: Arc<TunStats>,
+    events: Arc<EventRing>,
+    tun_ipv6: bool,
+    health_addr: SocketAddr,
+    vpn_guard: VpnGuard,
+    health_meta: Arc<Mutex<HealthRuntimeMeta>>,
+    last_scope: VpnScope,
+    last_start_attempt: Option<Instant>,
+    last_warned_provider: Option<String>,
+}
+
+impl TunSupervisor {
+    async fn reconcile(&mut self, slot: &mut TunSlot) {
+        sync_tun_telemetry(&self.ctx, &self.tun_stats);
+        let scope = if self.vpn_guard.policy() == VpnCoexistence::Off {
+            VpnScope::None
+        } else {
+            tokio::task::spawn_blocking(|| detect_active_vpn(Some(VDPI_TUN_NAME)))
+                .await
+                .unwrap_or(VpnScope::None)
+        };
+        let now = Instant::now();
+        let action = self.vpn_guard.evaluate(&scope, now);
+        self.last_scope = scope;
+
+        match action {
+            GuardAction::YieldTun { provider } => {
+                self.last_warned_provider = None;
+                warn!(
+                    provider = %provider,
+                    "full-tunnel VPN detected; yielding Windows TUN session"
+                );
+                slot.stop().await;
+                self.sync_runtime_state(slot);
+            }
+            GuardAction::ResumeTun => {
+                self.last_warned_provider = None;
+                info!("full-tunnel VPN cleared after cooldown; resuming Windows TUN session");
+                self.try_start_slot(slot, now).await;
+            }
+            GuardAction::WarnOnly { provider } => {
+                if self.last_warned_provider.as_deref() != Some(provider.as_str()) {
+                    warn!(
+                        provider = %provider,
+                        "full-tunnel VPN detected (vpn_coexistence=warn); keeping Windows TUN active"
+                    );
+                    self.last_warned_provider = Some(provider);
+                }
+            }
+            GuardAction::None => {
+                if !self.last_scope.is_full_tunnel() {
+                    self.last_warned_provider = None;
+                }
+                if !self.vpn_guard.is_yielded() && !slot.is_running() {
+                    let retry_due = self.last_start_attempt.is_none_or(|prev| {
+                        now.saturating_duration_since(prev) >= Duration::from_secs(5)
+                    });
+                    if retry_due {
+                        self.try_start_slot(slot, now).await;
+                    }
+                }
+            }
+        }
+
+        self.sync_health_meta(slot);
+    }
+
+    async fn try_start_slot(&mut self, slot: &mut TunSlot, now: Instant) {
+        self.last_start_attempt = Some(now);
+        match slot
+            .start(
+                &self.binder,
+                self.tun_ipv6,
+                &self.ctx,
+                &self.tun_stats,
+                &self.events,
+            )
+            .await
+        {
+            Ok(()) => {
+                self.sync_runtime_state(slot);
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "failed to start or resume Windows TUN session; will retry"
+                );
+            }
+        }
+    }
+
+    fn sync_runtime_state(&self, slot: &TunSlot) {
+        write_runtime_state_with_meta(
+            self.health_addr,
+            None,
+            EngineMode::Tun,
+            slot.iface_name(),
+            None,
+        );
+    }
+
+    fn sync_health_meta(&self, slot: &TunSlot) {
+        if let Ok(mut meta) = self.health_meta.lock() {
+            meta.engine = EngineMode::Tun;
+            meta.tun_interface = slot.iface_name();
+            meta.physical_nic = slot.physical_nic_name();
+            meta.vpn_conflict = self.vpn_guard.active_conflict_label(&self.last_scope);
+        }
+    }
+}
+
 fn run_service_runtime(handle: ServiceStatusHandle, cfg: RuntimeConfig) -> Result<()> {
-    let (stop_tx, mut stop_rx) = watch::channel::<Option<StopReason>>(None);
-    let (reconcile_tx, mut reconcile_rx) = watch::channel::<u64>(0);
+    let (stop_tx, stop_rx) = watch::channel::<Option<StopReason>>(None);
+    let (reconcile_tx, reconcile_rx) = watch::channel::<u64>(0);
 
     {
         let lock = CONTROL_CHANNELS.get_or_init(|| Mutex::new(None));
@@ -508,101 +770,445 @@ fn run_service_runtime(handle: ServiceStatusHandle, cfg: RuntimeConfig) -> Resul
         .context("failed to initialize Tokio runtime for Windows service")?;
 
     rt.block_on(async move {
-        let ctx = EngineContext::new(cfg.clone())?;
-        let bound = bind_listeners(&ctx)?;
+        if cfg.engine == EngineMode::Tun {
+            match find_verified_wintun_dll() {
+                Ok(_) => {
+                    match run_tun_service_runtime(
+                        handle,
+                        cfg.clone(),
+                        stop_rx.clone(),
+                        reconcile_rx.clone(),
+                    )
+                    .await?
+                    {
+                        TunRunOutcome::Stopped => return Ok(()),
+                        TunRunOutcome::FallbackToProxy(err) => {
+                            error!(
+                                error = %err,
+                                "Windows TUN session failed to initialize; falling back to proxy engine mode"
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    error!(
+                        error = %err,
+                        "wintun.dll is missing or invalid; falling back to proxy engine mode"
+                    );
+                }
+            }
 
-        let primary_addr = bound.primary_addr;
-        let socks_addr = bound.socks_addr;
-        write_runtime_state(primary_addr, socks_addr);
+            let mut fallback_cfg = cfg;
+            fallback_cfg.engine = EngineMode::Proxy;
+            return run_proxy_service_runtime(handle, fallback_cfg, stop_rx, reconcile_rx).await;
+        }
 
-        let proxy_session = if cfg.system_proxy {
-            Some(SystemProxySession::activate(
+        run_proxy_service_runtime(handle, cfg, stop_rx, reconcile_rx).await
+    })
+}
+
+async fn run_tun_service_runtime(
+    handle: ServiceStatusHandle,
+    cfg: RuntimeConfig,
+    mut stop_rx: watch::Receiver<Option<StopReason>>,
+    mut reconcile_rx: watch::Receiver<u64>,
+) -> Result<TunRunOutcome> {
+    let binder = DynamicOutboundBinder::new(OutboundTarget {
+        fail_closed: true,
+        ..OutboundTarget::default()
+    });
+    let binder_trait: Arc<dyn OutboundBinder> = binder.clone();
+    let ctx = EngineContext::new_with_binder(cfg.clone(), Some(binder_trait))?;
+    ctx.attach_cache_file(windows_service_cache_path()).await;
+    let tun_stats = Arc::new(TunStats::default());
+    let events = Arc::new(EventRing::new());
+
+    let mut vpn_guard = VpnGuard::new(cfg.vpn_coexistence);
+    let initial_scope = if vpn_guard.policy() == VpnCoexistence::Off {
+        VpnScope::None
+    } else {
+        tokio::task::spawn_blocking(|| detect_active_vpn(Some(VDPI_TUN_NAME)))
+            .await
+            .unwrap_or(VpnScope::None)
+    };
+    let initial_action = vpn_guard.evaluate(&initial_scope, Instant::now());
+    let mut last_warned_provider = None;
+    match initial_action {
+        GuardAction::YieldTun { ref provider } => {
+            warn!(
+                provider = %provider,
+                "full-tunnel VPN active at startup; holding Windows TUN in standby"
+            );
+        }
+        GuardAction::WarnOnly { ref provider } => {
+            warn!(
+                provider = %provider,
+                "full-tunnel VPN active at startup (vpn_coexistence=warn); keeping Windows TUN active"
+            );
+            last_warned_provider = Some(provider.clone());
+        }
+        GuardAction::ResumeTun | GuardAction::None => {}
+    }
+
+    let mut slot = TunSlot::empty();
+    let mut last_start_attempt = None;
+    if !vpn_guard.is_yielded() {
+        last_start_attempt = Some(Instant::now());
+        if let Err(err) = slot
+            .start(&binder, cfg.tun_ipv6, &ctx, &tun_stats, &events)
+            .await
+        {
+            slot.stop().await;
+            return Ok(TunRunOutcome::FallbackToProxy(err));
+        }
+    }
+
+    // Clear any leftover WinINET/WinHTTP/user-env proxy settings once when running in TUN mode.
+    let _ = tokio::task::spawn_blocking(clear_all_windows_proxies).await;
+
+    let health_meta = Arc::new(Mutex::new(HealthRuntimeMeta {
+        engine: EngineMode::Tun,
+        tun_interface: slot.iface_name(),
+        physical_nic: slot.physical_nic_name(),
+        vpn_conflict: vpn_guard.active_conflict_label(&initial_scope),
+    }));
+
+    let health_listener = match bind_loopback_health_listener(DEFAULT_TUN_HEALTH_PORT) {
+        Ok(listener) => listener,
+        Err(err) => {
+            slot.stop().await;
+            return Err(err);
+        }
+    };
+    let health_addr = match health_listener.local_addr() {
+        Ok(addr) => addr,
+        Err(err) => {
+            slot.stop().await;
+            return Err(err).context("failed to determine loopback TUN health listener address");
+        }
+    };
+    write_runtime_state_with_meta(health_addr, None, EngineMode::Tun, slot.iface_name(), None);
+
+    let (health_shutdown_tx, health_shutdown_rx) = watch::channel(false);
+    let meta_state = Arc::clone(&health_meta);
+    let meta_binder = Arc::clone(&binder);
+    let meta_fn: HealthMetaFn = Arc::new(move || {
+        let mut meta = meta_state
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|e| e.into_inner().clone());
+        if meta.tun_interface.is_some() {
+            meta.physical_nic = meta_binder.physical_nic_name().or(meta.physical_nic);
+        }
+        meta
+    });
+    let health_task = tokio::spawn(serve_health_until_shutdown(
+        health_listener,
+        ctx.clone(),
+        meta_fn,
+        health_shutdown_rx,
+    ));
+
+    report_service_status(
+        handle,
+        SERVICE_RUNNING,
+        SERVICE_ACCEPTED_CONTROLS,
+        NO_ERROR,
+        0,
+        0,
+    );
+
+    info!(
+        health = %health_addr,
+        tun_active = slot.is_running(),
+        vpn_coexistence = cfg.vpn_coexistence.as_str(),
+        "vdpi Windows service is running in TUN mode"
+    );
+
+    let mut supervisor = TunSupervisor {
+        binder,
+        ctx,
+        tun_stats,
+        events,
+        tun_ipv6: cfg.tun_ipv6,
+        health_addr,
+        vpn_guard,
+        health_meta,
+        last_scope: initial_scope,
+        last_start_attempt,
+        last_warned_provider,
+    };
+
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await;
+    let mut reconcile_open = true;
+
+    let reason = loop {
+        if let Some(r) = *stop_rx.borrow() {
+            break r;
+        }
+        tokio::select! {
+            biased;
+            changed = stop_rx.changed() => {
+                if changed.is_err() {
+                    break StopReason::Stop;
+                }
+                if let Some(r) = *stop_rx.borrow() {
+                    break r;
+                }
+            }
+            pipeline_res = async {
+                match slot.pipeline_task.as_mut() {
+                    Some(task) => task.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                slot.pipeline_task = None;
+                warn!(
+                    result = ?pipeline_res,
+                    "Windows TUN pipeline exited unexpectedly; tearing down adapter for recovery"
+                );
+                slot.stop().await;
+                supervisor.last_start_attempt = Some(Instant::now());
+                supervisor.sync_runtime_state(&slot);
+                supervisor.sync_health_meta(&slot);
+            }
+            changed = async {
+                match slot.route_rx.as_mut() {
+                    Some(rx) => rx.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if changed.is_ok() {
+                    supervisor.reconcile(&mut slot).await;
+                } else {
+                    slot.route_rx = None;
+                }
+            }
+            changed = async {
+                if reconcile_open {
+                    reconcile_rx.changed().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                if changed.is_ok() {
+                    supervisor.reconcile(&mut slot).await;
+                } else {
+                    reconcile_open = false;
+                }
+            }
+            _ = ticker.tick() => {
+                supervisor.reconcile(&mut slot).await;
+            }
+        }
+    };
+
+    info!(
+        ?reason,
+        "stopping Windows TUN service and tearing down adapter"
+    );
+    report_service_status(handle, SERVICE_STOP_PENDING, 0, NO_ERROR, 2, 5000);
+    let _ = health_shutdown_tx.send(true);
+    clear_runtime_state(std::process::id());
+    // Always tear down WindowsTunSession cleanly on Stop, Shutdown, and Upgrade.
+    slot.stop().await;
+    sync_tun_telemetry(&supervisor.ctx, &supervisor.tun_stats);
+    if let Err(err) = supervisor.ctx.flush_persisted_cache().await {
+        warn!(error = %err, "failed to flush adaptive cache on Windows TUN service shutdown");
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(2), health_task).await;
+
+    Ok(TunRunOutcome::Stopped)
+}
+
+async fn run_proxy_service_runtime(
+    handle: ServiceStatusHandle,
+    cfg: RuntimeConfig,
+    mut stop_rx: watch::Receiver<Option<StopReason>>,
+    mut reconcile_rx: watch::Receiver<u64>,
+) -> Result<()> {
+    let ctx = EngineContext::new(cfg.clone())?;
+    ctx.attach_cache_file(windows_service_cache_path()).await;
+    let bound = bind_listeners(&ctx)?;
+
+    let primary_addr = bound.primary_addr;
+    let socks_addr = bound.socks_addr;
+
+    let proxy_session = if cfg.system_proxy {
+        Some(
+            SystemProxySession::activate(
                 primary_addr.ip(),
                 primary_addr.port(),
                 socks_addr.map(|a| a.port()),
                 cfg.socks_system_proxy,
                 cfg.env_proxy,
                 &cfg.bypass_domains,
-            )?)
-        } else {
-            None
-        };
+            )?
+            .with_vpn_coexistence(cfg.vpn_coexistence),
+        )
+    } else {
+        None
+    };
 
-        report_service_status(
-            handle,
-            SERVICE_RUNNING,
-            SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_SESSIONCHANGE,
-            NO_ERROR,
-            0,
-            0,
-        );
+    let env_activated_at = (cfg.system_proxy && cfg.env_proxy).then(unix_now_secs);
+    write_runtime_state_with_meta(
+        primary_addr,
+        socks_addr,
+        EngineMode::Proxy,
+        None,
+        env_activated_at,
+    );
 
-        info!(
-            primary = %primary_addr,
-            socks = ?socks_addr,
-            "vdpi Windows service is running"
-        );
+    report_service_status(
+        handle,
+        SERVICE_RUNNING,
+        SERVICE_ACCEPTED_CONTROLS,
+        NO_ERROR,
+        0,
+        0,
+    );
 
-        let (server_shutdown_tx, server_shutdown_rx) = watch::channel(false);
+    info!(
+        primary = %primary_addr,
+        socks = ?socks_addr,
+        "vdpi Windows service is running"
+    );
 
-        let watchdog = if let Some(ref session) = proxy_session {
-            let watchdog_session = session.clone();
-            let mut watchdog_shutdown = server_shutdown_rx.clone();
-            Some(tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(Duration::from_secs(15));
-                ticker.tick().await;
-                loop {
-                    tokio::select! {
-                        _ = watchdog_shutdown.changed() => {
-                            if *watchdog_shutdown.borrow() {
-                                break;
-                            }
+    let (server_shutdown_tx, server_shutdown_rx) = watch::channel(false);
+
+    let watchdog = if let Some(ref session) = proxy_session {
+        let watchdog_session = session.clone();
+        let mut watchdog_shutdown = server_shutdown_rx.clone();
+        let vpn_policy = cfg.vpn_coexistence;
+        Some(tokio::spawn(async move {
+            let mut vpn_guard = VpnGuard::new(vpn_policy);
+            let mut last_warned_provider: Option<String> = None;
+            let mut reconcile_open = true;
+            loop {
+                let poll_interval = if vpn_guard.is_yielded() {
+                    Duration::from_secs(2)
+                } else {
+                    Duration::from_secs(15)
+                };
+                tokio::select! {
+                    _ = watchdog_shutdown.changed() => {
+                        if *watchdog_shutdown.borrow() {
+                            break;
                         }
-                        changed = reconcile_rx.changed() => {
-                            if changed.is_err() {
-                                break;
-                            }
-                            let s = watchdog_session.clone();
-                            let _ = tokio::task::spawn_blocking(move || s.reconcile()).await;
+                        continue;
+                    }
+                    changed = async {
+                        if reconcile_open {
+                            reconcile_rx.changed().await
+                        } else {
+                            std::future::pending().await
                         }
-                        _ = ticker.tick() => {
+                    } => {
+                        if changed.is_err() {
+                            reconcile_open = false;
+                            continue;
+                        }
+                    }
+                    _ = tokio::time::sleep(poll_interval) => {}
+                }
+
+                if vpn_guard.policy() == VpnCoexistence::Off {
+                    let s = watchdog_session.clone();
+                    let _ = tokio::task::spawn_blocking(move || s.reconcile()).await;
+                    continue;
+                }
+
+                let scope = tokio::task::spawn_blocking(|| detect_active_vpn(None))
+                    .await
+                    .unwrap_or(VpnScope::None);
+                match vpn_guard.evaluate(&scope, Instant::now()) {
+                    GuardAction::YieldTun { provider } => {
+                        last_warned_provider = None;
+                        warn!(
+                            provider = %provider,
+                            "full-tunnel VPN detected; yielding Windows system proxy"
+                        );
+                        let s = watchdog_session.clone();
+                        let _ = tokio::task::spawn_blocking(move || s.deactivate()).await;
+                    }
+                    GuardAction::ResumeTun => {
+                        last_warned_provider = None;
+                        info!(
+                            "full-tunnel VPN cleared after cooldown; restoring Windows system proxy"
+                        );
+                        let s = watchdog_session.clone();
+                        let _ = tokio::task::spawn_blocking(move || s.reconcile()).await;
+                    }
+                    GuardAction::WarnOnly { provider } => {
+                        if last_warned_provider.as_deref() != Some(provider.as_str()) {
+                            warn!(
+                                provider = %provider,
+                                "full-tunnel VPN detected (vpn_coexistence=warn); keeping Windows system proxy active"
+                            );
+                            last_warned_provider = Some(provider);
+                        }
+                    }
+                    GuardAction::None => {
+                        if !scope.is_full_tunnel() {
+                            last_warned_provider = None;
+                        }
+                        if !vpn_guard.is_yielded() {
                             let s = watchdog_session.clone();
                             let _ = tokio::task::spawn_blocking(move || s.reconcile()).await;
                         }
                     }
                 }
-            }))
-        } else {
-            None
-        };
-
-        let server_task = tokio::spawn(serve_until_shutdown(bound, ctx, server_shutdown_rx));
-
-        let reason = loop {
-            if let Some(r) = *stop_rx.borrow() {
-                break r;
             }
-            if stop_rx.changed().await.is_err() {
-                break StopReason::Stop;
-            }
-        };
+        }))
+    } else {
+        None
+    };
 
-        report_service_status(handle, SERVICE_STOP_PENDING, 0, NO_ERROR, 2, 5000);
-        let _ = server_shutdown_tx.send(true);
-        if let Some(watchdog) = watchdog {
-            let _ = watchdog.await;
+    let shutdown_ctx = ctx.clone();
+    let server_task = tokio::spawn(serve_until_shutdown(bound, ctx, server_shutdown_rx));
+
+    let reason = loop {
+        if let Some(r) = *stop_rx.borrow() {
+            break r;
         }
-        clear_runtime_state(std::process::id());
-
-        if reason == StopReason::Stop {
-            if let Some(session) = proxy_session {
-                let _ = tokio::task::spawn_blocking(move || session.deactivate()).await;
-            }
+        if stop_rx.changed().await.is_err() {
+            break StopReason::Stop;
         }
+    };
 
-        let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
-        Ok(())
-    })
+    report_service_status(handle, SERVICE_STOP_PENDING, 0, NO_ERROR, 2, 5000);
+    let _ = server_shutdown_tx.send(true);
+    if let Some(watchdog) = watchdog {
+        let _ = watchdog.await;
+    }
+    clear_runtime_state(std::process::id());
+
+    if should_deactivate_proxy_on_stop(reason) {
+        if let Some(session) = proxy_session {
+            let _ = tokio::task::spawn_blocking(move || session.deactivate()).await;
+        }
+    } else {
+        info!(
+            ?reason,
+            "preserving Windows proxy settings across stop/upgrade"
+        );
+    }
+
+    let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
+    if let Err(err) = shutdown_ctx.flush_persisted_cache().await {
+        warn!(error = %err, "failed to flush adaptive cache on Windows proxy service shutdown");
+    }
+    Ok(())
+}
+
+fn trigger_reconcile() {
+    if let Some(lock) = CONTROL_CHANNELS.get() {
+        if let Some(ref ch) = *lock.lock().unwrap_or_else(|e| e.into_inner()) {
+            ch.reconcile_tx.send_modify(|n| *n = n.wrapping_add(1));
+        }
+    }
 }
 
 unsafe extern "system" fn service_control_handler(
@@ -612,15 +1218,15 @@ unsafe extern "system" fn service_control_handler(
     _context: *mut c_void,
 ) -> Dword {
     match control {
-        SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
+        SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN | SERVICE_CONTROL_UPGRADE_STOP => {
             let handle = SERVICE_STATUS_HANDLE.load(Ordering::SeqCst);
             if !handle.is_null() {
                 report_service_status(handle, SERVICE_STOP_PENDING, 0, NO_ERROR, 1, 5000);
             }
-            let reason = if control == SERVICE_CONTROL_SHUTDOWN {
-                StopReason::Shutdown
-            } else {
-                StopReason::Stop
+            let reason = match control {
+                SERVICE_CONTROL_SHUTDOWN => StopReason::Shutdown,
+                SERVICE_CONTROL_UPGRADE_STOP => StopReason::Upgrade,
+                _ => StopReason::Stop,
             };
             if let Some(lock) = CONTROL_CHANNELS.get() {
                 if let Some(ref ch) = *lock.lock().unwrap_or_else(|e| e.into_inner()) {
@@ -631,11 +1237,13 @@ unsafe extern "system" fn service_control_handler(
         }
         SERVICE_CONTROL_SESSIONCHANGE => {
             if event_type == WTS_SESSION_LOGON || event_type == WTS_SESSION_UNLOCK {
-                if let Some(lock) = CONTROL_CHANNELS.get() {
-                    if let Some(ref ch) = *lock.lock().unwrap_or_else(|e| e.into_inner()) {
-                        ch.reconcile_tx.send_modify(|n| *n = n.wrapping_add(1));
-                    }
-                }
+                trigger_reconcile();
+            }
+            NO_ERROR
+        }
+        SERVICE_CONTROL_POWEREVENT => {
+            if event_type == PBT_APMRESUMEAUTOMATIC || event_type == PBT_APMRESUMESUSPEND {
+                trigger_reconcile();
             }
             NO_ERROR
         }
@@ -693,6 +1301,41 @@ pub fn stop_windows_service_if_running() -> Result<bool> {
     }
     let svc = ScmHandle(raw);
     stop_service_handle(svc.0)?;
+    thread::sleep(Duration::from_millis(150));
+    Ok(true)
+}
+
+/// Stops the `vdpi` Windows service for an in-place upgrade using custom control code
+/// `SERVICE_CONTROL_UPGRADE_STOP (128)` so proxy-mode user environment variables stay
+/// intact across `vdpi update`, falling back to `SERVICE_CONTROL_STOP` if an older
+/// v0.4.x service rejects custom control 128 (`ERROR_INVALID_SERVICE_CONTROL` /
+/// `ERROR_CALL_NOT_IMPLEMENTED`).
+/// Returns `Ok(true)` if the service existed, `Ok(false)` if not installed.
+pub fn stop_windows_service_for_upgrade() -> Result<bool> {
+    let scm = open_scm(SC_MANAGER_CONNECT)?;
+    let name_wide = to_wide_null(SERVICE_NAME);
+    let raw = unsafe {
+        OpenServiceW(
+            scm.0,
+            name_wide.as_ptr(),
+            SERVICE_STOP | SERVICE_USER_DEFINED_CONTROL | SERVICE_QUERY_STATUS,
+        )
+    };
+    if raw.is_null() {
+        let err = unsafe { GetLastError() };
+        if err == ERROR_SERVICE_DOES_NOT_EXIST {
+            return Ok(false);
+        }
+        if err == ERROR_ACCESS_DENIED {
+            bail!(
+                "Administrator privileges are required to stop the '{SERVICE_NAME}' Windows service. \
+                 Please accept the UAC prompt or run from an elevated Administrator terminal."
+            );
+        }
+        bail!("OpenServiceW('{SERVICE_NAME}') failed with Win32 error {err}");
+    }
+    let svc = ScmHandle(raw);
+    stop_service_handle_with_mode(svc.0, true)?;
     thread::sleep(Duration::from_millis(150));
     Ok(true)
 }
@@ -763,13 +1406,23 @@ pub fn start_windows_service() -> Result<bool> {
 }
 
 /// Installs or updates the `vdpi` Windows service with `AUTO_START` (non-delayed),
-/// `Tcpip` dependency, automatic crash recovery, and starts it immediately.
+/// `Tcpip`/`Nsi`/`Dnscache` dependencies, automatic crash recovery, and starts it immediately.
 pub fn install_or_update_windows_service(bin_path_cmd: &str) -> Result<()> {
+    install_or_update_windows_service_with_start(bin_path_cmd, true)
+}
+
+/// Installs or updates the `vdpi` Windows service with `AUTO_START` (non-delayed),
+/// `Tcpip`/`Nsi`/`Dnscache` dependencies, and automatic crash recovery, starting it
+/// only when `start_service` is `true`.
+pub(crate) fn install_or_update_windows_service_with_start(
+    bin_path_cmd: &str,
+    start_service: bool,
+) -> Result<()> {
     let scm = open_scm(SC_MANAGER_ALL_ACCESS)?;
     let name_wide = to_wide_null(SERVICE_NAME);
     let display_wide = to_wide_null(SERVICE_DISPLAY_NAME);
     let bin_wide = to_wide_null(bin_path_cmd);
-    let deps_wide: Vec<u16> = "Tcpip\0\0".encode_utf16().collect();
+    let deps_wide: Vec<u16> = SERVICE_DEPENDENCIES.encode_utf16().collect();
 
     let svc = {
         let existing = unsafe { OpenServiceW(scm.0, name_wide.as_ptr(), SERVICE_ALL_ACCESS) };
@@ -819,15 +1472,17 @@ pub fn install_or_update_windows_service(bin_path_cmd: &str) -> Result<()> {
 
     configure_service_metadata(svc.0);
 
-    let started = unsafe { StartServiceW(svc.0, 0, ptr::null()) };
-    if started == 0 {
-        let err = unsafe { GetLastError() };
-        if err != ERROR_SERVICE_ALREADY_RUNNING {
-            bail!("StartServiceW('{SERVICE_NAME}') failed with Win32 error {err}");
+    if start_service {
+        let started = unsafe { StartServiceW(svc.0, 0, ptr::null()) };
+        if started == 0 {
+            let err = unsafe { GetLastError() };
+            if err != ERROR_SERVICE_ALREADY_RUNNING {
+                bail!("StartServiceW('{SERVICE_NAME}') failed with Win32 error {err}");
+            }
         }
-    }
 
-    wait_for_service_running(svc.0, Duration::from_secs(10))?;
+        wait_for_service_running(svc.0, Duration::from_secs(10))?;
+    }
     Ok(())
 }
 
@@ -1051,9 +1706,26 @@ fn configure_service_metadata(svc: ScHandle) {
     }
 }
 
+fn zero_service_status() -> ServiceStatus {
+    ServiceStatus {
+        dw_service_type: 0,
+        dw_current_state: 0,
+        dw_controls_accepted: 0,
+        dw_win32_exit_code: 0,
+        dw_service_specific_exit_code: 0,
+        dw_check_point: 0,
+        dw_wait_hint: 0,
+    }
+}
+
 fn stop_service_handle(svc: ScHandle) -> Result<()> {
+    stop_service_handle_with_mode(svc, false)
+}
+
+fn stop_service_handle_with_mode(svc: ScHandle, prefer_upgrade_control: bool) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut stop_sent = false;
+    let mut use_upgrade_control = prefer_upgrade_control;
 
     loop {
         let ssp = query_service_status_process(svc)?;
@@ -1065,28 +1737,43 @@ fn stop_service_handle(svc: ScHandle) -> Result<()> {
             && ssp.dw_current_state != SERVICE_START_PENDING
             && ssp.dw_current_state != SERVICE_STOP_PENDING
         {
-            let mut status = ServiceStatus {
-                dw_service_type: 0,
-                dw_current_state: 0,
-                dw_controls_accepted: 0,
-                dw_win32_exit_code: 0,
-                dw_service_specific_exit_code: 0,
-                dw_check_point: 0,
-                dw_wait_hint: 0,
-            };
-            let ok = unsafe { ControlService(svc, SERVICE_CONTROL_STOP, &mut status) };
-            if ok != 0 {
-                if status.dw_current_state == SERVICE_STOPPED {
-                    return Ok(());
+            if use_upgrade_control {
+                let mut status = zero_service_status();
+                let ok = unsafe { ControlService(svc, SERVICE_CONTROL_UPGRADE_STOP, &mut status) };
+                if ok != 0 {
+                    if status.dw_current_state == SERVICE_STOPPED {
+                        return Ok(());
+                    }
+                    stop_sent = true;
+                } else {
+                    let err = unsafe { GetLastError() };
+                    if err == ERROR_SERVICE_NOT_ACTIVE {
+                        return Ok(());
+                    }
+                    if should_fallback_upgrade_control(err) {
+                        use_upgrade_control = false;
+                    } else if err != ERROR_SERVICE_CANNOT_ACCEPT_CTRL {
+                        bail!("ControlService(UPGRADE_STOP) failed with Win32 error {err}");
+                    }
                 }
-                stop_sent = true;
-            } else {
-                let err = unsafe { GetLastError() };
-                if err == ERROR_SERVICE_NOT_ACTIVE {
-                    return Ok(());
-                }
-                if err != ERROR_SERVICE_CANNOT_ACCEPT_CTRL {
-                    bail!("ControlService(STOP) failed with Win32 error {err}");
+            }
+
+            if !stop_sent && !use_upgrade_control {
+                let mut status = zero_service_status();
+                let ok = unsafe { ControlService(svc, SERVICE_CONTROL_STOP, &mut status) };
+                if ok != 0 {
+                    if status.dw_current_state == SERVICE_STOPPED {
+                        return Ok(());
+                    }
+                    stop_sent = true;
+                } else {
+                    let err = unsafe { GetLastError() };
+                    if err == ERROR_SERVICE_NOT_ACTIVE {
+                        return Ok(());
+                    }
+                    if err != ERROR_SERVICE_CANNOT_ACCEPT_CTRL {
+                        bail!("ControlService(STOP) failed with Win32 error {err}");
+                    }
                 }
             }
         }
@@ -1213,4 +1900,57 @@ unsafe fn wide_ptr_to_string(ptr: *const u16) -> Option<String> {
     }
     let slice = std::slice::from_raw_parts(ptr, len);
     Some(String::from_utf16_lossy(slice))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_control_constants_and_dependencies_match_win32_spec() {
+        assert_eq!(SERVICE_CONTROL_UPGRADE_STOP, 128);
+        assert_eq!(SERVICE_CONTROL_POWEREVENT, 0x0000_000D);
+        assert_eq!(SERVICE_ACCEPT_POWEREVENT, 0x0000_0040);
+        assert_eq!(PBT_APMRESUMESUSPEND, 0x0007);
+        assert_eq!(PBT_APMRESUMEAUTOMATIC, 0x0012);
+        assert_ne!(SERVICE_ACCEPTED_CONTROLS & SERVICE_ACCEPT_STOP, 0);
+        assert_ne!(SERVICE_ACCEPTED_CONTROLS & SERVICE_ACCEPT_SHUTDOWN, 0);
+        assert_ne!(SERVICE_ACCEPTED_CONTROLS & SERVICE_ACCEPT_SESSIONCHANGE, 0);
+        assert_ne!(SERVICE_ACCEPTED_CONTROLS & SERVICE_ACCEPT_POWEREVENT, 0);
+
+        assert_eq!(SERVICE_DEPENDENCIES, "Tcpip\0Nsi\0Dnscache\0\0");
+        let deps_wide: Vec<u16> = SERVICE_DEPENDENCIES.encode_utf16().collect();
+        assert!(deps_wide.ends_with(&[0, 0]));
+    }
+
+    #[test]
+    fn proxy_stop_deactivation_and_upgrade_fallback_rules() {
+        assert!(should_deactivate_proxy_on_stop(StopReason::Stop));
+        assert!(!should_deactivate_proxy_on_stop(StopReason::Shutdown));
+        assert!(!should_deactivate_proxy_on_stop(StopReason::Upgrade));
+
+        assert!(should_fallback_upgrade_control(
+            ERROR_INVALID_SERVICE_CONTROL
+        ));
+        assert!(should_fallback_upgrade_control(ERROR_CALL_NOT_IMPLEMENTED));
+        assert!(!should_fallback_upgrade_control(ERROR_ACCESS_DENIED));
+        assert!(!should_fallback_upgrade_control(
+            ERROR_SERVICE_CANNOT_ACCEPT_CTRL
+        ));
+    }
+
+    #[test]
+    fn windows_service_cache_path_lives_under_vdpi_adaptive_cache_json() {
+        let path = windows_service_cache_path();
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("adaptive-cache.json")
+        );
+        assert_eq!(
+            path.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str()),
+            Some("vdpi")
+        );
+    }
 }

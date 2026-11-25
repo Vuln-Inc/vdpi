@@ -30,6 +30,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var pathMonitor: NWPathMonitor?
     private var pathUpdateWorkItem: DispatchWorkItem?
     private var pathUpdateGeneration: UInt64 = 0
+    private var reloadGeneration: UInt64 = 0
 
     private let lifecycleQueue = DispatchQueue(label: "com.vulninc.vdpi.tunnel.lifecycle", qos: .userInitiated)
     private let doctorQueue = DispatchQueue(label: "com.vulninc.vdpi.tunnel.doctor", qos: .utility)
@@ -59,6 +60,19 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             stopping = newValue
             stateLock.unlock()
         }
+    }
+
+    private func nextReloadGeneration() -> UInt64 {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        reloadGeneration &+= 1
+        return reloadGeneration
+    }
+
+    private func isCurrentReloadGeneration(_ generation: UInt64) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return reloadGeneration == generation
     }
 
     override func startTunnel(
@@ -185,8 +199,20 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
 
         case .reloadEngine:
+            let generation = nextReloadGeneration()
             lifecycleQueue.async { [weak self] in
-                guard let self, self.isRunning else {
+                guard let self else {
+                    completionHandler?(ProviderCommandResponse(ok: false, error: "Provider deallocated").encodeData())
+                    return
+                }
+                guard self.isCurrentReloadGeneration(generation) else {
+                    completionHandler?(ProviderCommandResponse(ok: false, error: "Reload superseded").encodeData())
+                    return
+                }
+                guard self.isRunning else {
+                    if self.isCurrentReloadGeneration(generation) {
+                        self.reasserting = false
+                    }
                     completionHandler?(ProviderCommandResponse(ok: false, error: "Tunnel is not running").encodeData())
                     return
                 }
@@ -204,7 +230,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     }
                     self.lifecycleQueue.async {
                         defer {
-                            self.reasserting = false
+                            if self.isCurrentReloadGeneration(generation) {
+                                self.reasserting = false
+                            }
+                        }
+                        guard self.isCurrentReloadGeneration(generation) else {
+                            completionHandler?(ProviderCommandResponse(ok: false, error: "Reload superseded").encodeData())
+                            return
                         }
                         guard self.isRunning else {
                             completionHandler?(ProviderCommandResponse(ok: false, error: "Tunnel stopped during reload").encodeData())
@@ -230,6 +262,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                                 VdpiNativeBridge.stop()
                             }
                             completionHandler?(ProviderCommandResponse(ok: false, error: "Tunnel stopped during reload").encodeData())
+                        } else if !self.isCurrentReloadGeneration(generation) {
+                            completionHandler?(ProviderCommandResponse(ok: false, error: "Reload superseded").encodeData())
                         } else {
                             VdpiAppGroup.saveAppliedConfig(settings.toNativeConfig())
                             completionHandler?(ProviderCommandResponse(ok: true).encodeData())

@@ -15,7 +15,7 @@ use std::future::Future;
 use std::io::{self, IsTerminal, Stdout};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
@@ -27,6 +27,7 @@ use vdpi::config::{DesyncMode, RuntimeConfig};
 use vdpi::desync::{EngineContext, EngineTelemetrySnapshot};
 
 pub const MAX_LOG_ENTRIES: usize = 150;
+pub const MAX_LOG_MESSAGE_CHARS: usize = 512;
 pub const THROUGHPUT_WINDOW_SECS: usize = 60;
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
 const NOTICE_TTL: Duration = Duration::from_secs(3);
@@ -46,7 +47,12 @@ pub fn new_log_ring() -> SharedLogRing {
     Arc::new(Mutex::new(VecDeque::with_capacity(MAX_LOG_ENTRIES)))
 }
 
-pub fn push_log_entry(ring: &SharedLogRing, entry: LogEntry) {
+pub fn push_log_entry(ring: &SharedLogRing, mut entry: LogEntry) {
+    if entry.message.len() > MAX_LOG_MESSAGE_CHARS
+        && entry.message.chars().count() > MAX_LOG_MESSAGE_CHARS
+    {
+        entry.message = truncate_chars(&entry.message, MAX_LOG_MESSAGE_CHARS);
+    }
     let mut guard = ring.lock().unwrap_or_else(|e| e.into_inner());
     while guard.len() >= MAX_LOG_ENTRIES {
         guard.pop_front();
@@ -223,13 +229,37 @@ impl ThroughputRing {
 }
 
 #[derive(Debug, Clone)]
+pub enum DashboardEngine {
+    Proxy {
+        primary_addr: SocketAddr,
+        socks_addr: Option<SocketAddr>,
+        system_proxy: bool,
+    },
+    Tun {
+        interface: String,
+        physical_nic: Option<String>,
+        vpn_conflict: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone)]
 pub struct DashboardInfo {
-    pub primary_addr: SocketAddr,
-    pub socks_addr: Option<SocketAddr>,
+    pub engine: DashboardEngine,
     pub mode: DesyncMode,
     pub enable_doh: bool,
-    pub system_proxy: bool,
 }
+
+/// Live TUN metadata snapshot polled alongside engine telemetry so interface transitions,
+/// uplink switches, and VPN conflicts refresh in real time.
+#[derive(Debug, Clone, Default)]
+pub struct TunLiveMeta {
+    pub interface: Option<String>,
+    pub physical_nic: Option<String>,
+    pub vpn_conflict: Option<String>,
+}
+
+/// Optional live probe returning [`TunLiveMeta`] for TUN mode.
+pub type TunMetaProbe = Arc<dyn Fn() -> TunLiveMeta + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProbeStatus {
@@ -402,6 +432,21 @@ impl DashboardState {
         }
     }
 
+    fn refresh_tun_meta(&mut self, meta: TunLiveMeta) {
+        if let DashboardEngine::Tun {
+            interface: ref mut iface_slot,
+            physical_nic: ref mut nic_slot,
+            vpn_conflict: ref mut vpn_slot,
+        } = self.info.engine
+        {
+            if let Some(iface) = meta.interface {
+                *iface_slot = iface;
+            }
+            *nic_slot = meta.physical_nic;
+            *vpn_slot = meta.vpn_conflict;
+        }
+    }
+
     fn set_notice(&mut self, message: impl Into<String>, now: Instant) {
         self.notice = Some((message.into(), now + NOTICE_TTL));
     }
@@ -559,6 +604,33 @@ fn handle_key_event(state: &mut DashboardState, key: KeyEvent) -> KeyAction {
     }
 }
 
+static TUI_PANIC_HOOK_ONCE: Once = Once::new();
+static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Installs a process-wide panic hook wrapper once that restores raw mode and
+/// leaves the alternate screen before invoking the previous hook, so panic
+/// messages are never erased by unwinding `Drop` guards.
+pub(crate) fn install_tui_panic_hook() {
+    TUI_PANIC_HOOK_ONCE.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if TUI_ACTIVE.swap(false, Ordering::AcqRel) {
+                let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+                let _ = terminal::disable_raw_mode();
+            }
+            prev(info);
+        }));
+    });
+}
+
+pub(crate) fn mark_tui_active(active: bool) {
+    TUI_ACTIVE.store(active, Ordering::Release);
+}
+
+pub(crate) fn take_tui_active() -> bool {
+    TUI_ACTIVE.swap(false, Ordering::AcqRel)
+}
+
 /// RAII guard that enters raw mode + alternate screen and guarantees clean terminal
 /// restoration on normal exit, error return, or panic unwind.
 struct DashboardGuard {
@@ -567,11 +639,15 @@ struct DashboardGuard {
 
 impl DashboardGuard {
     fn enter() -> io::Result<Self> {
+        install_tui_panic_hook();
         terminal::enable_raw_mode()?;
+        mark_tui_active(true);
         let mut stdout = io::stdout();
         if let Err(err) = execute!(stdout, EnterAlternateScreen, Hide) {
-            let _ = execute!(stdout, Show, LeaveAlternateScreen);
-            let _ = terminal::disable_raw_mode();
+            if take_tui_active() {
+                let _ = execute!(stdout, LeaveAlternateScreen, Show);
+                let _ = terminal::disable_raw_mode();
+            }
             return Err(err);
         }
         let backend = CrosstermBackend::new(stdout);
@@ -581,9 +657,11 @@ impl DashboardGuard {
                 Ok(Self { terminal })
             }
             Err(err) => {
-                let mut out = io::stdout();
-                let _ = execute!(out, Show, LeaveAlternateScreen);
-                let _ = terminal::disable_raw_mode();
+                if take_tui_active() {
+                    let mut out = io::stdout();
+                    let _ = execute!(out, LeaveAlternateScreen, Show);
+                    let _ = terminal::disable_raw_mode();
+                }
                 Err(err)
             }
         }
@@ -592,8 +670,10 @@ impl DashboardGuard {
 
 impl Drop for DashboardGuard {
     fn drop(&mut self) {
-        let _ = execute!(self.terminal.backend_mut(), Show, LeaveAlternateScreen);
-        let _ = terminal::disable_raw_mode();
+        if take_tui_active() {
+            let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen, Show);
+            let _ = terminal::disable_raw_mode();
+        }
     }
 }
 
@@ -710,12 +790,31 @@ pub async fn run_dashboard<F>(
 where
     F: Future<Output = ()>,
 {
+    run_dashboard_with_tun_meta(info, ctx, logs, shutdown_tx, external_shutdown, None).await
+}
+
+/// Variant of [`run_dashboard`] that also polls an optional [`TunMetaProbe`] on each tick
+/// to keep TUN physical NIC and VPN conflict badges updated live.
+pub async fn run_dashboard_with_tun_meta<F>(
+    info: DashboardInfo,
+    ctx: EngineContext,
+    logs: SharedLogRing,
+    shutdown_tx: watch::Sender<bool>,
+    external_shutdown: F,
+    tun_meta_probe: Option<TunMetaProbe>,
+) -> Result<()>
+where
+    F: Future<Output = ()>,
+{
     let color = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
     let mut guard = DashboardGuard::enter()?;
 
     let now = Instant::now();
     let mut state = DashboardState::new(info, logs, color, now);
     state.update_telemetry(ctx.telemetry_snapshot(), now);
+    if let Some(ref probe) = tun_meta_probe {
+        state.refresh_tun_meta(probe());
+    }
 
     let mut reader_guard = EventReaderGuard::spawn();
 
@@ -725,8 +824,12 @@ where
     tokio::pin!(external_shutdown);
 
     let loop_result: io::Result<()> = loop {
+        while state.diag_tasks.try_join_next().is_some() {}
         let now = Instant::now();
         state.update_telemetry(ctx.telemetry_snapshot(), now);
+        if let Some(ref probe) = tun_meta_probe {
+            state.refresh_tun_meta(probe());
+        }
         if let Err(err) = guard
             .terminal
             .draw(|frame| render_dashboard(frame, &mut state))
@@ -856,8 +959,6 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
     }
 
     let version = env!("CARGO_PKG_VERSION");
-    let primary = state.info.primary_addr.to_string();
-    let socks = state.info.socks_addr.map(|sa| sa.to_string());
     let mode = format_desync_mode(state.info.mode);
     let dns = if state.info.enable_doh { "DoH" } else { "UDP" };
     let uptime = format_uptime(state.started_at.elapsed());
@@ -867,42 +968,6 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
 
     // "● vdpi v{version}" = 8 chars + version length.
     let head_len = 8 + version.len();
-    let full_len = head_len
-        + 3
-        + "HTTP/SOCKS ".len()
-        + primary.len()
-        + socks
-            .as_ref()
-            .map_or(0, |s| 3 + "SOCKS/UDP ".len() + s.len())
-        + 3
-        + mode.len()
-        + 3
-        + dns.len()
-        + 3
-        + "Uptime ".len()
-        + uptime.len();
-    let med_len = head_len
-        + 3
-        + "HTTP ".len()
-        + primary.len()
-        + socks.as_ref().map_or(0, |s| 3 + "SOCKS ".len() + s.len())
-        + 3
-        + mode.len()
-        + 3
-        + dns.len()
-        + 3
-        + "Uptime ".len()
-        + uptime.len();
-    let compact_len = head_len
-        + 3
-        + primary.len()
-        + socks.as_ref().map_or(0, |s| 3 + "SOCKS ".len() + s.len())
-        + 3
-        + mode.len()
-        + 1
-        + dns.len()
-        + 3
-        + uptime.len();
 
     let mut spans = vec![
         Span::styled("●", p.emerald),
@@ -912,51 +977,224 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
         Span::styled(format!("v{version}"), p.label),
     ];
 
-    if w >= full_len {
-        spans.push(sep.clone());
-        spans.push(Span::styled("HTTP/SOCKS ", p.label));
-        spans.push(Span::styled(primary, p.text));
-        if let Some(sa) = socks {
-            spans.push(sep.clone());
-            spans.push(Span::styled("SOCKS/UDP ", p.label));
-            spans.push(Span::styled(sa, p.text));
+    match &state.info.engine {
+        DashboardEngine::Proxy {
+            primary_addr,
+            socks_addr,
+            ..
+        } => {
+            let primary = primary_addr.to_string();
+            let socks = socks_addr.map(|sa| sa.to_string());
+
+            let full_len = head_len
+                + 3
+                + "HTTP/SOCKS ".len()
+                + primary.len()
+                + socks
+                    .as_ref()
+                    .map_or(0, |s| 3 + "SOCKS/UDP ".len() + s.len())
+                + 3
+                + mode.len()
+                + 3
+                + dns.len()
+                + 3
+                + "Uptime ".len()
+                + uptime.len();
+            let med_len = head_len
+                + 3
+                + "HTTP ".len()
+                + primary.len()
+                + socks.as_ref().map_or(0, |s| 3 + "SOCKS ".len() + s.len())
+                + 3
+                + mode.len()
+                + 3
+                + dns.len()
+                + 3
+                + "Uptime ".len()
+                + uptime.len();
+            let compact_len = head_len
+                + 3
+                + primary.len()
+                + socks.as_ref().map_or(0, |s| 3 + "SOCKS ".len() + s.len())
+                + 3
+                + mode.len()
+                + 1
+                + dns.len()
+                + 3
+                + uptime.len();
+
+            if w >= full_len {
+                spans.push(sep.clone());
+                spans.push(Span::styled("HTTP/SOCKS ", p.label));
+                spans.push(Span::styled(primary, p.text));
+                if let Some(sa) = socks {
+                    spans.push(sep.clone());
+                    spans.push(Span::styled("SOCKS/UDP ", p.label));
+                    spans.push(Span::styled(sa, p.text));
+                }
+                spans.push(sep.clone());
+                spans.push(Span::styled(format!("{mode} · {dns}"), p.text));
+                spans.push(sep);
+                spans.push(Span::styled("Uptime ", p.label));
+                spans.push(Span::styled(uptime, p.text));
+            } else if w >= med_len {
+                spans.push(sep.clone());
+                spans.push(Span::styled("HTTP ", p.label));
+                spans.push(Span::styled(primary, p.text));
+                if let Some(sa) = socks {
+                    spans.push(sep.clone());
+                    spans.push(Span::styled("SOCKS ", p.label));
+                    spans.push(Span::styled(sa, p.text));
+                }
+                spans.push(sep.clone());
+                spans.push(Span::styled(format!("{mode} · {dns}"), p.text));
+                spans.push(sep);
+                spans.push(Span::styled("Uptime ", p.label));
+                spans.push(Span::styled(uptime, p.text));
+            } else if w >= compact_len {
+                spans.push(sep.clone());
+                spans.push(Span::styled(primary, p.text));
+                if let Some(sa) = socks {
+                    spans.push(sep.clone());
+                    spans.push(Span::styled("SOCKS ", p.label));
+                    spans.push(Span::styled(sa, p.text));
+                }
+                spans.push(sep.clone());
+                spans.push(Span::styled(format!("{mode}/{dns}"), p.label));
+                spans.push(sep);
+                spans.push(Span::styled(uptime, p.text));
+            } else {
+                spans.push(sep.clone());
+                spans.push(Span::styled(primary, p.text));
+                spans.push(sep);
+                spans.push(Span::styled(uptime, p.text));
+            }
         }
-        spans.push(sep.clone());
-        spans.push(Span::styled(format!("{mode} · {dns}"), p.text));
-        spans.push(sep);
-        spans.push(Span::styled("Uptime ", p.label));
-        spans.push(Span::styled(uptime, p.text));
-    } else if w >= med_len {
-        spans.push(sep.clone());
-        spans.push(Span::styled("HTTP ", p.label));
-        spans.push(Span::styled(primary, p.text));
-        if let Some(sa) = socks {
-            spans.push(sep.clone());
-            spans.push(Span::styled("SOCKS ", p.label));
-            spans.push(Span::styled(sa, p.text));
+        DashboardEngine::Tun {
+            interface,
+            physical_nic,
+            vpn_conflict,
+        } => {
+            let iface = interface.as_str();
+            let nic = physical_nic
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let vpn_badge = vpn_conflict
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|provider| format!("[VPN: {provider}]"));
+
+            let iface_chars = iface.chars().count();
+            let nic_suffix = nic.map(|n| format!(" ({n})"));
+            let nic_chars = nic_suffix.as_ref().map_or(0, |s| s.chars().count());
+            let vpn_extra = vpn_badge.as_ref().map_or(0, |b| 3 + b.chars().count());
+
+            let full_len = head_len
+                + 3
+                + "TUN ".len()
+                + iface_chars
+                + nic_chars
+                + vpn_extra
+                + 3
+                + mode.len()
+                + 3
+                + dns.len()
+                + 3
+                + "Uptime ".len()
+                + uptime.len();
+            let med_len = head_len
+                + 3
+                + "TUN ".len()
+                + iface_chars
+                + nic_chars
+                + vpn_extra
+                + 3
+                + mode.len()
+                + 1
+                + dns.len()
+                + 3
+                + uptime.len();
+            let compact_len = head_len
+                + 3
+                + "TUN ".len()
+                + iface_chars
+                + vpn_extra
+                + 3
+                + mode.len()
+                + 1
+                + dns.len()
+                + 3
+                + uptime.len();
+
+            if w >= full_len {
+                spans.push(sep.clone());
+                spans.push(Span::styled("TUN ", p.label));
+                spans.push(Span::styled(iface.to_string(), p.text));
+                if let Some(suffix) = nic_suffix {
+                    spans.push(Span::styled(suffix, p.label));
+                }
+                if let Some(badge) = vpn_badge {
+                    spans.push(sep.clone());
+                    spans.push(Span::styled(badge, p.amber));
+                }
+                spans.push(sep.clone());
+                spans.push(Span::styled(format!("{mode} · {dns}"), p.text));
+                spans.push(sep);
+                spans.push(Span::styled("Uptime ", p.label));
+                spans.push(Span::styled(uptime, p.text));
+            } else if w >= med_len {
+                spans.push(sep.clone());
+                spans.push(Span::styled("TUN ", p.label));
+                spans.push(Span::styled(iface.to_string(), p.text));
+                if let Some(suffix) = nic_suffix {
+                    spans.push(Span::styled(suffix, p.label));
+                }
+                if let Some(badge) = vpn_badge {
+                    spans.push(sep.clone());
+                    spans.push(Span::styled(badge, p.amber));
+                }
+                spans.push(sep.clone());
+                spans.push(Span::styled(format!("{mode}/{dns}"), p.label));
+                spans.push(sep);
+                spans.push(Span::styled(uptime, p.text));
+            } else if w >= compact_len {
+                spans.push(sep.clone());
+                spans.push(Span::styled("TUN ", p.label));
+                spans.push(Span::styled(iface.to_string(), p.text));
+                if let Some(badge) = vpn_badge {
+                    spans.push(sep.clone());
+                    spans.push(Span::styled(badge, p.amber));
+                }
+                spans.push(sep.clone());
+                spans.push(Span::styled(format!("{mode}/{dns}"), p.label));
+                spans.push(sep);
+                spans.push(Span::styled(uptime, p.text));
+            } else {
+                spans.push(sep.clone());
+                spans.push(Span::styled("TUN ", p.label));
+                spans.push(Span::styled(iface.to_string(), p.text));
+                if let Some(full_badge) = vpn_badge {
+                    let base_len = head_len + 3 + "TUN ".len() + iface_chars + 3 + uptime.len();
+                    let full_with_badge = base_len + 3 + full_badge.chars().count();
+                    let compact_with_badge = base_len + 3 + "[VPN]".len();
+                    let chosen_badge = if w >= full_with_badge {
+                        Some(full_badge)
+                    } else if w >= compact_with_badge {
+                        Some("[VPN]".to_string())
+                    } else {
+                        None
+                    };
+                    if let Some(badge_text) = chosen_badge {
+                        spans.push(sep.clone());
+                        spans.push(Span::styled(badge_text, p.amber));
+                    }
+                }
+                spans.push(sep);
+                spans.push(Span::styled(uptime, p.text));
+            }
         }
-        spans.push(sep.clone());
-        spans.push(Span::styled(format!("{mode} · {dns}"), p.text));
-        spans.push(sep);
-        spans.push(Span::styled("Uptime ", p.label));
-        spans.push(Span::styled(uptime, p.text));
-    } else if w >= compact_len {
-        spans.push(sep.clone());
-        spans.push(Span::styled(primary, p.text));
-        if let Some(sa) = socks {
-            spans.push(sep.clone());
-            spans.push(Span::styled("SOCKS ", p.label));
-            spans.push(Span::styled(sa, p.text));
-        }
-        spans.push(sep.clone());
-        spans.push(Span::styled(format!("{mode}/{dns}"), p.label));
-        spans.push(sep);
-        spans.push(Span::styled(uptime, p.text));
-    } else {
-        spans.push(sep.clone());
-        spans.push(Span::styled(primary, p.text));
-        spans.push(sep);
-        spans.push(Span::styled(uptime, p.text));
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), inner);
@@ -981,55 +1219,96 @@ fn render_stats_panel(frame: &mut Frame<'_>, area: Rect, state: &DashboardState)
     }
 
     let snap = state.telemetry;
-    let proxy_val = if state.info.system_proxy {
-        "Active"
-    } else {
-        "Disabled"
-    };
-    let proxy_style = if state.info.system_proxy {
-        p.emerald
-    } else {
-        p.label
-    };
     let heal_style = if snap.auto_heal_escalations > 0 {
         p.amber
     } else {
         p.text
     };
+    let download_val = format!(
+        "{} ({})",
+        format_bytes(snap.bytes_rx),
+        format_rate(state.rx_rate)
+    );
+    let upload_val = format!(
+        "{} ({})",
+        format_bytes(snap.bytes_tx),
+        format_rate(state.tx_rate)
+    );
 
-    let rows = [
-        (
-            "Download",
-            format!(
-                "{} ({})",
-                format_bytes(snap.bytes_rx),
-                format_rate(state.rx_rate)
-            ),
-            p.text,
-        ),
-        (
-            "Upload",
-            format!(
-                "{} ({})",
-                format_bytes(snap.bytes_tx),
-                format_rate(state.tx_rate)
-            ),
-            p.text,
-        ),
-        (
-            "Connections",
-            format!("{} / {}", snap.active_connections, snap.total_connections),
-            p.text,
-        ),
-        ("TLS Handshakes", snap.tls_handshakes.to_string(), p.text),
-        (
-            "Auto-Heal",
-            snap.auto_heal_escalations.to_string(),
-            heal_style,
-        ),
-        ("Cached Hosts", snap.learned_hosts.to_string(), p.text),
-        ("Proxy", proxy_val.to_string(), proxy_style),
-    ];
+    let rows: [(&str, String, Style); 7] = match &state.info.engine {
+        DashboardEngine::Proxy { system_proxy, .. } => {
+            let proxy_val = if *system_proxy { "Active" } else { "Disabled" };
+            let proxy_style = if *system_proxy { p.emerald } else { p.label };
+            [
+                ("Download", download_val, p.text),
+                ("Upload", upload_val, p.text),
+                (
+                    "Connections",
+                    format!("{} / {}", snap.active_connections, snap.total_connections),
+                    p.text,
+                ),
+                ("TLS Handshakes", snap.tls_handshakes.to_string(), p.text),
+                (
+                    "Auto-Heal",
+                    snap.auto_heal_escalations.to_string(),
+                    heal_style,
+                ),
+                ("Cached Hosts", snap.learned_hosts.to_string(), p.text),
+                ("Proxy", proxy_val.to_string(), proxy_style),
+            ]
+        }
+        DashboardEngine::Tun {
+            interface,
+            physical_nic,
+            vpn_conflict,
+        } => {
+            let iface_val = match physical_nic
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(nic) => format!("{interface} ({nic})"),
+                None => interface.clone(),
+            };
+            let iface_style = if vpn_conflict
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty())
+            {
+                p.amber
+            } else {
+                p.emerald
+            };
+            [
+                ("Download", download_val, p.text),
+                ("Upload", upload_val, p.text),
+                (
+                    "TCP / UDP",
+                    format!(
+                        "{} active · {} UDP",
+                        snap.active_connections, snap.udp_flows_active
+                    ),
+                    p.text,
+                ),
+                ("QUIC Blocked", snap.quic_blocked.to_string(), p.text),
+                (
+                    if state.info.enable_doh {
+                        "DoH Queries"
+                    } else {
+                        "DNS Queries"
+                    },
+                    snap.dns_queries.to_string(),
+                    p.text,
+                ),
+                (
+                    "TLS / Heal",
+                    format!("{} / {}", snap.tls_handshakes, snap.auto_heal_escalations),
+                    heal_style,
+                ),
+                ("Interface", iface_val, iface_style),
+            ]
+        }
+    };
 
     let width = inner.width as usize;
     let lines: Vec<Line<'_>> = rows
@@ -1045,18 +1324,44 @@ fn render_sparkline_panel(frame: &mut Frame<'_>, area: Rect, state: &DashboardSt
     let p = state.palette;
     let cur = format_rate(state.throughput.latest());
     let peak = state.throughput.peak();
-    let metrics_title = format!(" {cur} · peak {} ", format_rate(peak));
+    let peak_str = format_rate(peak);
+    let avail = area.width.saturating_sub(2) as usize;
 
-    let block = Block::bordered()
+    let left_title = if avail >= 50 {
+        Some(" Throughput · 60s ")
+    } else if avail >= " Throughput ".len() {
+        Some(" Throughput ")
+    } else {
+        None
+    };
+    let left_len = left_title.map_or(0, |t| t.chars().count());
+    let min_gap = usize::from(left_len > 0);
+
+    let right_title = {
+        let full = format!(" {cur} · peak {peak_str} ");
+        if left_len + min_gap + full.chars().count() <= avail {
+            Some(full)
+        } else {
+            let short = format!(" {cur} · pk {peak_str} ");
+            if left_len + min_gap + short.chars().count() <= avail {
+                Some(short)
+            } else {
+                let cur_only = format!(" {cur} ");
+                (left_len + min_gap + cur_only.chars().count() <= avail).then_some(cur_only)
+            }
+        }
+    };
+
+    let mut block = Block::bordered()
         .border_type(p.border_type)
         .border_style(p.border)
-        .padding(Padding::horizontal(1))
-        .title_top(
-            Line::from(" Throughput · 60s ")
-                .style(p.title)
-                .left_aligned(),
-        )
-        .title_top(Line::from(metrics_title).style(p.label).right_aligned());
+        .padding(Padding::horizontal(1));
+    if let Some(left) = left_title {
+        block = block.title_top(Line::from(left).style(p.title).left_aligned());
+    }
+    if let Some(right) = right_title {
+        block = block.title_top(Line::from(right).style(p.label).right_aligned());
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1266,8 +1571,13 @@ fn render_diagnostics_modal(frame: &mut Frame<'_>, area: Rect, state: &Dashboard
         .clone();
 
     let mut lines = Vec::with_capacity(7);
-    let show_detail = inner.width >= 52;
-    let target_w = if inner.width >= 44 { 24 } else { 18 };
+    let show_detail = inner.width >= 58;
+    let fixed = 2 + 10 + 2 + 7;
+    let target_w = if inner.width >= 58 {
+        24
+    } else {
+        (inner.width as usize).saturating_sub(fixed).clamp(8, 18)
+    };
 
     if inner.height >= 6 {
         let header = if show_detail {
@@ -1357,7 +1667,10 @@ fn render_diagnostics_modal(frame: &mut Frame<'_>, area: Rect, state: &Dashboard
         } else {
             p.amber
         };
-        lines.push(Line::from(Span::styled(summary, summary_style)));
+        lines.push(Line::from(Span::styled(
+            truncate_chars(&summary, inner.width as usize),
+            summary_style,
+        )));
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
@@ -1462,11 +1775,25 @@ mod tests {
 
     fn sample_info() -> DashboardInfo {
         DashboardInfo {
-            primary_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
-            socks_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1080)),
+            engine: DashboardEngine::Proxy {
+                primary_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
+                socks_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1080)),
+                system_proxy: true,
+            },
             mode: DesyncMode::Combo,
             enable_doh: true,
-            system_proxy: true,
+        }
+    }
+
+    fn sample_tun_info(vpn_conflict: Option<&str>) -> DashboardInfo {
+        DashboardInfo {
+            engine: DashboardEngine::Tun {
+                interface: "vdpi0".to_string(),
+                physical_nic: Some("Ethernet".to_string()),
+                vpn_conflict: vpn_conflict.map(str::to_string),
+            },
+            mode: DesyncMode::Combo,
+            enable_doh: true,
         }
     }
 
@@ -1499,7 +1826,46 @@ mod tests {
             tls_handshakes: 28,
             auto_heal_escalations: 2,
             learned_hosts: 7,
+            udp_flows_active: 0,
+            quic_blocked: 0,
+            dns_queries: 0,
         };
+        state.rx_rate = 128 * 1024;
+        state.tx_rate = 16 * 1024;
+        for v in [10_000, 45_000, 120_000, 90_000, 144_000] {
+            state.throughput.push(v);
+        }
+        state
+    }
+
+    fn sample_tun_state(color: bool, vpn_conflict: Option<&str>) -> DashboardState {
+        let logs = new_log_ring();
+        push_log_entry(
+            &logs,
+            LogEntry {
+                timestamp: "12:00:01".to_string(),
+                level: Level::INFO,
+                message: "desktop TUN engine active interface=vdpi0".to_string(),
+            },
+        );
+
+        let now = Instant::now();
+        let mut state = DashboardState::new(sample_tun_info(vpn_conflict), logs, color, now);
+        state.update_telemetry(
+            EngineTelemetrySnapshot {
+                active_connections: 4,
+                total_connections: 42,
+                bytes_tx: 2 * 1024 * 1024,
+                bytes_rx: 15 * 1024 * 1024,
+                tls_handshakes: 28,
+                auto_heal_escalations: 2,
+                learned_hosts: 7,
+                udp_flows_active: 12,
+                quic_blocked: 7,
+                dns_queries: 34,
+            },
+            now,
+        );
         state.rx_rate = 128 * 1024;
         state.tx_rate = 16 * 1024;
         for v in [10_000, 45_000, 120_000, 90_000, 144_000] {
@@ -1850,7 +2216,13 @@ mod tests {
     #[test]
     fn stats_panel_shows_disabled_when_system_proxy_off() {
         let mut state = sample_state(true);
-        state.info.system_proxy = false;
+        if let DashboardEngine::Proxy {
+            ref mut system_proxy,
+            ..
+        } = state.info.engine
+        {
+            *system_proxy = false;
+        }
 
         let backend = TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1861,6 +2233,156 @@ mod tests {
         let screen = buffer_to_string(terminal.backend());
         assert!(screen.contains("Disabled"));
         assert!(!screen.contains("--no-proxy"));
+    }
+
+    #[test]
+    fn renders_tun_dashboard_at_100x30_wide_layout() {
+        let mut state = sample_tun_state(true, Some("WireGuard"));
+        state.set_notice("Cache cleared", Instant::now());
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_dashboard(frame, &mut state))
+            .unwrap();
+
+        let screen = buffer_to_string(terminal.backend());
+        assert!(screen.contains('╭'));
+        assert!(screen.contains(&format!("vdpi v{}", env!("CARGO_PKG_VERSION"))));
+        assert!(screen.contains("TUN vdpi0 (Ethernet)"));
+        assert!(screen.contains("[VPN: WireGuard]"));
+        assert!(screen.contains("Combo · DoH"));
+        assert!(screen.contains("Uptime"));
+        assert!(screen.contains("Traffic & Engine"));
+        assert!(screen.contains("Throughput · 60s"));
+        assert!(screen.contains("Download"));
+        assert!(screen.contains("Upload"));
+        assert!(screen.contains("TCP / UDP"));
+        assert!(screen.contains("4 active · 12 UDP"));
+        assert!(screen.contains("QUIC Blocked"));
+        assert!(screen.contains("DoH Queries"));
+        assert!(screen.contains("34"));
+        assert!(screen.contains("TLS / Heal"));
+        assert!(screen.contains("28 / 2"));
+        assert!(screen.contains("Interface"));
+        assert!(screen.contains("vdpi0 (Ethernet)"));
+        assert!(screen.contains("desktop TUN engine active"));
+        assert!(screen.contains("Cache cleared"));
+
+        // Verify amber VPN conflict badge color in status bar.
+        let buf = terminal.backend().buffer();
+        let status_row = 1u16;
+        let vpn_x = (0..buf.area.width.saturating_sub(4))
+            .find(|&x| {
+                buf[(x, status_row)].symbol() == "["
+                    && buf[(x + 1, status_row)].symbol() == "V"
+                    && buf[(x + 2, status_row)].symbol() == "P"
+                    && buf[(x + 3, status_row)].symbol() == "N"
+            })
+            .expect("amber VPN badge in TUN status bar");
+        assert_eq!(buf[(vpn_x, status_row)].fg, AMBER_WARN);
+
+        let same_row = screen
+            .lines()
+            .any(|line| line.contains("Traffic & Engine") && line.contains("Throughput · 60s"));
+        assert!(same_row, "expected side-by-side middle panels at 100x30");
+    }
+
+    #[test]
+    fn renders_tun_dashboard_at_80x24_layout() {
+        // Without VPN conflict: full NIC label fits at 80x24.
+        let mut clean_state = sample_tun_state(true, None);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_dashboard(frame, &mut clean_state))
+            .unwrap();
+        let clean_screen = buffer_to_string(terminal.backend());
+        assert!(clean_screen.contains("TUN vdpi0 (Ethernet)"));
+        assert!(clean_screen.contains("Combo · DoH"));
+        assert!(!clean_screen.contains("[VPN"));
+        assert!(clean_screen.contains("TCP / UDP"));
+        assert!(clean_screen.contains("4 active · 12 UDP"));
+        assert!(clean_screen.contains("QUIC Blocked"));
+        assert!(clean_screen.contains("DoH Queries"));
+        assert!(clean_screen.contains("TLS / Heal"));
+        assert!(clean_screen.contains("Interface"));
+
+        // With VPN conflict: compact tier keeps interface, amber VPN badge, and mode/DNS visible.
+        let mut vpn_state = sample_tun_state(true, Some("WireGuard"));
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_dashboard(frame, &mut vpn_state))
+            .unwrap();
+        let vpn_screen = buffer_to_string(terminal.backend());
+        assert!(vpn_screen.contains("TUN vdpi0"));
+        assert!(vpn_screen.contains("[VPN: WireGuard]"));
+        assert!(vpn_screen.contains("Combo/DoH"));
+    }
+
+    #[test]
+    fn renders_tun_dashboard_at_60x22_narrow_stacked_layout() {
+        let mut state = sample_tun_state(true, Some("WireGuard"));
+        let backend = TestBackend::new(60, 22);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_dashboard(frame, &mut state))
+            .unwrap();
+
+        let screen = buffer_to_string(terminal.backend());
+        assert!(screen.contains("TUN vdpi0"));
+        assert!(screen.contains("[VPN: WireGuard]"));
+        assert!(screen.contains("Traffic & Engine"));
+        assert!(screen.contains("Throughput · 60s"));
+        assert!(screen.contains("TCP / UDP"));
+        assert!(screen.contains("4 active · 12 UDP"));
+        assert!(screen.contains("QUIC Blocked"));
+        assert!(screen.contains("DoH Queries"));
+        assert!(screen.contains("Activity Log"));
+        assert!(screen.contains("q quit"));
+
+        let traffic_row = screen
+            .lines()
+            .position(|line| line.contains("Traffic & Engine"))
+            .unwrap();
+        let spark_row = screen
+            .lines()
+            .position(|line| line.contains("Throughput · 60s"))
+            .unwrap();
+        assert!(
+            spark_row > traffic_row,
+            "expected stacked middle panels when width < 72"
+        );
+    }
+
+    #[test]
+    fn renders_tun_dashboard_no_color_monochrome() {
+        let mut state = sample_tun_state(false, Some("WireGuard"));
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_dashboard(frame, &mut state))
+            .unwrap();
+
+        let screen = buffer_to_string(terminal.backend());
+        assert!(screen.contains('┌'));
+        assert!(screen.contains('└'));
+        assert!(screen.contains('●'));
+        assert!(!screen.contains('╭'));
+        assert!(!screen.contains('╰'));
+        assert!(screen.contains("TUN vdpi0 (Ethernet)"));
+        assert!(screen.contains("[VPN: WireGuard]"));
+        assert!(screen.contains("4 active · 12 UDP"));
+
+        let buf = terminal.backend().buffer();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                assert_eq!(cell.fg, Color::Reset, "unexpected fg color at ({x},{y})");
+                assert_eq!(cell.bg, Color::Reset, "unexpected bg color at ({x},{y})");
+            }
+        }
     }
 
     #[test]
@@ -1929,5 +2451,217 @@ mod tests {
         assert!(!state.diagnostics_open);
         while state.diag_tasks.join_next().await.is_some() {}
         assert!(aborted_close.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn renders_tun_status_bar_at_46x18_without_clipping_uptime() {
+        let mut state = sample_tun_state(true, Some("WireGuard"));
+        let before = format_uptime(state.started_at.elapsed());
+
+        let backend = TestBackend::new(46, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_dashboard(frame, &mut state))
+            .unwrap();
+        let after = format_uptime(state.started_at.elapsed());
+        let screen = buffer_to_string(terminal.backend());
+        let status_line = screen.lines().nth(1).expect("status bar row");
+
+        assert!(
+            status_line.contains("TUN vdpi0"),
+            "missing TUN interface in 46x18 status bar: {status_line}"
+        );
+        assert!(
+            status_line.contains(&before) || status_line.contains(&after),
+            "46x18 TUN status bar clipped uptime: {status_line}"
+        );
+        assert!(
+            !status_line.contains("[VPN"),
+            "46x18 TUN status bar must omit VPN badge rather than overflowing: {status_line}"
+        );
+        assert_eq!(terminal.backend().buffer()[(45, 1)].symbol(), "│");
+
+        // At 50x18 (inner 46 cols), compact [VPN] fits alongside uptime without full badge overflow.
+        let before_mid = format_uptime(state.started_at.elapsed());
+        let mid_backend = TestBackend::new(50, 18);
+        let mut mid_terminal = Terminal::new(mid_backend).unwrap();
+        mid_terminal
+            .draw(|frame| render_dashboard(frame, &mut state))
+            .unwrap();
+        let after_mid = format_uptime(state.started_at.elapsed());
+        let mid_screen = buffer_to_string(mid_terminal.backend());
+        let mid_status = mid_screen.lines().nth(1).expect("50x18 status bar row");
+        assert!(mid_status.contains("TUN vdpi0"));
+        assert!(mid_status.contains("[VPN]"));
+        assert!(!mid_status.contains("[VPN: WireGuard]"));
+        assert!(mid_status.contains(&before_mid) || mid_status.contains(&after_mid));
+
+        // When DoH is disabled, TUN stats panel labels the DNS row "DNS Queries".
+        state.info.enable_doh = false;
+        let wide_backend = TestBackend::new(100, 30);
+        let mut wide_terminal = Terminal::new(wide_backend).unwrap();
+        wide_terminal
+            .draw(|frame| render_dashboard(frame, &mut state))
+            .unwrap();
+        let wide_screen = buffer_to_string(wide_terminal.backend());
+        assert!(wide_screen.contains("DNS Queries"));
+        assert!(!wide_screen.contains("DoH Queries"));
+    }
+
+    #[test]
+    fn renders_sparkline_without_title_collision_at_80x24_and_46x18() {
+        let mut state = sample_state(true);
+
+        // 80x24 with non-zero throughput (140.6 KB/s): shortens left & right titles with border gap.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_dashboard(frame, &mut state))
+            .unwrap();
+        let screen = buffer_to_string(terminal.backend());
+        let header_row = screen
+            .lines()
+            .find(|line| line.contains("Traffic & Engine"))
+            .expect("80x24 middle panel border row");
+        assert!(
+            header_row.contains(" Throughput ─"),
+            "80x24 sparkline left title must not collide with right title: {header_row}"
+        );
+        assert!(
+            header_row.contains(" 140.6 KB/s · pk 140.6 KB/s "),
+            "80x24 sparkline should use compact pk right title: {header_row}"
+        );
+        assert!(!header_row.contains("Throughput · 60s"));
+
+        // Wider rate (1023.9 KB/s) degrades further to cur-only at 80x24 and pk at 46x18 without colliding.
+        state.throughput.push(1_048_473);
+        let wide_backend = TestBackend::new(80, 24);
+        let mut wide_terminal = Terminal::new(wide_backend).unwrap();
+        wide_terminal
+            .draw(|frame| render_dashboard(frame, &mut state))
+            .unwrap();
+        let wide_screen = buffer_to_string(wide_terminal.backend());
+        let wide_row = wide_screen
+            .lines()
+            .find(|line| line.contains("Traffic & Engine"))
+            .expect("80x24 high-rate border row");
+        assert!(
+            wide_row.contains(" Throughput ─"),
+            "80x24 high-rate sparkline left title collided: {wide_row}"
+        );
+        assert!(
+            wide_row.contains(" 1023.9 KB/s "),
+            "80x24 high-rate sparkline should fall back to cur-only title: {wide_row}"
+        );
+        assert!(!wide_row.contains("pk "));
+
+        let narrow_backend = TestBackend::new(46, 18);
+        let mut narrow_terminal = Terminal::new(narrow_backend).unwrap();
+        narrow_terminal
+            .draw(|frame| render_dashboard(frame, &mut state))
+            .unwrap();
+        let narrow_screen = buffer_to_string(narrow_terminal.backend());
+        let narrow_row = narrow_screen
+            .lines()
+            .find(|line| line.contains(" Throughput "))
+            .expect("46x18 sparkline border row");
+        assert!(
+            narrow_row.contains(" Throughput ─"),
+            "46x18 sparkline left title collided: {narrow_row}"
+        );
+        assert!(
+            narrow_row.contains(" 1023.9 KB/s · pk 1023.9 KB/s "),
+            "46x18 sparkline should render compact pk title cleanly: {narrow_row}"
+        );
+    }
+
+    #[test]
+    fn renders_diagnostics_modal_cleanly_at_46x18_and_60x22() {
+        let mut state = sample_state(true);
+        state.diagnostics_open = true;
+        {
+            let mut diag = state.diagnostics.lock().unwrap();
+            diag.run_id = 1;
+            diag.rows[0].status = ProbeStatus::Pass {
+                latency_ms: 19,
+                detail: "1.1.1.1".to_string(),
+            };
+            diag.rows[1].status = ProbeStatus::Pass {
+                latency_ms: 27,
+                detail: "162.159.135.232".to_string(),
+            };
+            diag.rows[2].status = ProbeStatus::Running;
+            diag.rows[3].status = ProbeStatus::Fail {
+                latency_ms: 4000,
+                reason: "timed out".to_string(),
+            };
+        }
+
+        // 46x18: latencies remain unclipped and Detail column is hidden.
+        let backend_46 = TestBackend::new(46, 18);
+        let mut term_46 = Terminal::new(backend_46).unwrap();
+        term_46
+            .draw(|frame| render_dashboard(frame, &mut state))
+            .unwrap();
+        let screen_46 = buffer_to_string(term_46.backend());
+        assert!(screen_46.contains("Diagnostics"));
+        assert!(screen_46.contains("r re-run · esc close"));
+        assert!(screen_46.contains("Target"));
+        assert!(screen_46.contains("Status"));
+        assert!(screen_46.contains("Latency"));
+        assert!(!screen_46.contains("Detai"));
+        assert!(screen_46.contains("19 ms"));
+        assert!(screen_46.contains("27 ms"));
+        assert!(screen_46.contains("4000 ms"));
+        assert!(screen_46.contains("PASS"));
+        assert!(screen_46.contains("FAIL"));
+        assert!(screen_46.contains("Running..."));
+
+        // 60x22: Detail column stays gated off so its header is never truncated to "Detai…".
+        let backend_60 = TestBackend::new(60, 22);
+        let mut term_60 = Terminal::new(backend_60).unwrap();
+        term_60
+            .draw(|frame| render_dashboard(frame, &mut state))
+            .unwrap();
+        let screen_60 = buffer_to_string(term_60.backend());
+        assert!(screen_60.contains("Target"));
+        assert!(screen_60.contains("Status"));
+        assert!(screen_60.contains("Latency"));
+        assert!(
+            !screen_60.contains("Detai"),
+            "60x22 modal must not render truncated Detail header:\n{screen_60}"
+        );
+        assert!(screen_60.contains("discord.com"));
+        assert!(screen_60.contains("gateway.discord.gg"));
+        assert!(screen_60.contains("www.roblox.com"));
+        assert!(screen_60.contains("19 ms"));
+        assert!(screen_60.contains("4000 ms"));
+
+        // 100x30: Detail column appears untruncated with IP detail.
+        let backend_100 = TestBackend::new(100, 30);
+        let mut term_100 = Terminal::new(backend_100).unwrap();
+        term_100
+            .draw(|frame| render_dashboard(frame, &mut state))
+            .unwrap();
+        let screen_100 = buffer_to_string(term_100.backend());
+        assert!(screen_100.contains("Detail"));
+        assert!(screen_100.contains("162.159.135.232"));
+    }
+
+    #[test]
+    fn log_ring_caps_entry_message_at_512_chars() {
+        let ring = new_log_ring();
+        push_log_entry(
+            &ring,
+            LogEntry {
+                timestamp: "12:00:00".to_string(),
+                level: Level::INFO,
+                message: "x".repeat(1_000),
+            },
+        );
+        let guard = ring.lock().unwrap();
+        let stored = &guard.back().unwrap().message;
+        assert_eq!(stored.chars().count(), MAX_LOG_MESSAGE_CHARS);
+        assert!(stored.ends_with('…'));
     }
 }

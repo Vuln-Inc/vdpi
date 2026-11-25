@@ -92,15 +92,48 @@ public enum VdpiFormatters {
         return false
     }
 
-    /// Normalizes a user-entered bypass domain or wildcard (e.g. `*.example.com`).
+    /// Normalizes a user-entered bypass domain, wildcard (e.g. `*.example.com`),
+    /// or IPv4/IPv6 CIDR range (e.g. `203.0.113.0/24`, `2001:db8::/32`).
     /// Returns `nil` for empty or malformed inputs.
     public static func normalizeBypassDomain(_ raw: String) -> String? {
         var value = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let hasScheme: Bool
         if value.hasPrefix("https://") {
             value = String(value.dropFirst("https://".count))
+            hasScheme = true
         } else if value.hasPrefix("http://") {
             value = String(value.dropFirst("http://".count))
+            hasScheme = true
+        } else {
+            hasScheme = false
         }
+
+        // Detect and preserve valid IPv4/IPv6 CIDR inputs (e.g. `203.0.113.0/24`, `2001:db8::/32`)
+        // before URL path `/` stripping.
+        if !hasScheme, value.contains("/") {
+            let parts = value.split(separator: "/", omittingEmptySubsequences: false)
+            let addrPart = String(parts[0])
+            var v4 = in_addr()
+            let isIpv4 = !addrPart.isEmpty && inet_pton(AF_INET, addrPart, &v4) == 1
+            var v6 = in6_addr()
+            let isIpv6 = !isIpv4 && !addrPart.isEmpty && inet_pton(AF_INET6, addrPart, &v6) == 1
+            if isIpv4 || isIpv6 {
+                guard parts.count == 2 else { return nil }
+                let prefixPart = parts[1]
+                guard !prefixPart.isEmpty,
+                      prefixPart.allSatisfy({ $0.isASCII && $0.isNumber }),
+                      let prefix = Int(prefixPart)
+                else {
+                    return nil
+                }
+                let maxPrefix = isIpv4 ? 32 : 128
+                guard (0...maxPrefix).contains(prefix) else {
+                    return nil
+                }
+                return "\(addrPart)/\(prefix)"
+            }
+        }
+
         if let cut = value.firstIndex(where: { $0 == "/" || $0 == "?" || $0 == "#" }) {
             value = String(value[..<cut])
         }

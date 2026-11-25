@@ -85,7 +85,7 @@ public final class TunnelManager: ObservableObject {
                 return trimmed
             }
         }
-        return "0.4.2"
+        return "0.5.0"
     }
 
     private static let maxThroughputSamples = 24
@@ -399,8 +399,7 @@ public final class TunnelManager: ObservableObject {
                     guard self.phase != .disconnecting else { return }
                     if self.phase != .disconnected {
                         self.vpnManager?.connection.stopVPNTunnel()
-                        try? await Task.sleep(nanoseconds: 350_000_000)
-                        guard !Task.isCancelled, self.reloadGeneration == generation else { return }
+                        guard await self.waitForDisconnect(generation: generation) else { return }
                     }
                     self.connect()
                 }
@@ -425,14 +424,28 @@ public final class TunnelManager: ObservableObject {
                     }
                 }
                 manager.connection.stopVPNTunnel()
-                try? await Task.sleep(nanoseconds: 350_000_000)
-                guard !Task.isCancelled, self.reloadGeneration == generation else { return }
+                guard await self.waitForDisconnect(generation: generation) else { return }
                 self.connect()
             }
             return
         }
 
         connect()
+    }
+
+    private func waitForDisconnect(generation: UInt64) async -> Bool {
+        let maxAttempts = 50 // 50 * 50ms = 2.5s
+        for _ in 0..<maxAttempts {
+            guard !Task.isCancelled, self.reloadGeneration == generation else {
+                return false
+            }
+            let status = self.vpnManager?.connection.status ?? .disconnected
+            if status == .disconnected || status == .invalid {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return !Task.isCancelled && self.reloadGeneration == generation
     }
 
     @discardableResult
@@ -600,6 +613,7 @@ public final class TunnelManager: ObservableObject {
             UserDefaults.standard.set(version, forKey: Self.dismissedUpdateVersionKey)
         }
         availableUpdate = nil
+        updateStatusMessage = nil
     }
 
     public func exportSettingsJSON() -> String? {

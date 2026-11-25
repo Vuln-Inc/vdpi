@@ -353,6 +353,12 @@ class VdpiVpnService : VpnService() {
                 }
 
                 val initialSnap = NativeEngine.snapshot()
+                if (!initialSnap.running) {
+                    val lastErr = initialSnap.events.lastOrNull { it.level == "error" }?.message
+                        ?: "Engine exited immediately after start"
+                    failAndStop(lastErr, startId, gen)
+                    return@withLock
+                }
                 val connectedAt = System.currentTimeMillis()
                 val initialSubtitle = formatConnectedSubtitle(initialSnap)
                 val connectedNotif = buildNotification(
@@ -723,16 +729,32 @@ class VdpiVpnService : VpnService() {
         unregisterNetworkMonitor()
         transitionJob?.cancel()
         pollJob?.cancel()
-        NativeEngine.stop()
         getSystemService(NotificationManager::class.java)?.cancel(NOTIFICATION_ID)
         if (TunnelRuntimeState.state.value.phase != TunnelPhase.ERROR) {
             TunnelRuntimeState.update {
-                it.copy(phase = TunnelPhase.DISCONNECTED, telemetry = NativeEngine.snapshot())
+                it.copy(phase = TunnelPhase.DISCONNECTED)
             }
         }
         TunnelRuntimeState.setAppliedSettings(null)
         requestTileSync()
         scope.cancel()
+
+        val appContext = applicationContext
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            if (!serviceActive.get()) {
+                NativeEngine.stop()
+                if (!serviceActive.get()) {
+                    val finalSnap = NativeEngine.snapshot()
+                    if (TunnelRuntimeState.state.value.phase != TunnelPhase.ERROR) {
+                        TunnelRuntimeState.update {
+                            it.copy(phase = TunnelPhase.DISCONNECTED, telemetry = finalSnap)
+                        }
+                    }
+                    TunnelRuntimeState.setAppliedSettings(null)
+                    requestTileAndWidgetSync(appContext)
+                }
+            }
+        }
         super.onDestroy()
     }
 
@@ -859,13 +881,7 @@ class VdpiVpnService : VpnService() {
     }
 
     private fun requestTileSync() {
-        runCatching {
-            TileService.requestListeningState(
-                applicationContext,
-                ComponentName(applicationContext, VdpiTileService::class.java),
-            )
-        }
-        requestWidgetSync(applicationContext)
+        requestTileAndWidgetSync(applicationContext)
     }
 
     companion object {
@@ -890,6 +906,17 @@ class VdpiVpnService : VpnService() {
         private const val TUN_IPV6_DNS = "fd00:7664:7069::2"
 
         private val serviceActive = AtomicBoolean(false)
+
+        private fun requestTileAndWidgetSync(context: Context) {
+            val appContext = context.applicationContext
+            runCatching {
+                TileService.requestListeningState(
+                    appContext,
+                    ComponentName(appContext, VdpiTileService::class.java),
+                )
+            }
+            requestWidgetSync(appContext)
+        }
 
         private fun requestWidgetSync(context: Context) {
             runCatching {

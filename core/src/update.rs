@@ -20,6 +20,8 @@ const MAX_SUMS_BODY_BYTES: usize = 256 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 const SHA256_READ_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_EXTRACT_SEARCH_DEPTH: usize = 3;
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_OPTIONAL_ARCHIVE_MEMBERS: &[&str] = &["wintun.dll", "WINTUN-LICENSE.txt"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VersionRelation {
@@ -437,13 +439,24 @@ pub fn platform_asset_name() -> Option<&'static str> {
     }
 }
 
-/// Best-effort cleanup of leftover `vdpi.old*.exe` binaries created during Windows updates.
+#[cfg(any(target_os = "windows", test))]
+fn is_stale_old_binary_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    (lower.starts_with("vdpi.old") && lower.ends_with(".exe"))
+        || (lower.starts_with("wintun.old") && lower.ends_with(".dll"))
+}
+
+/// Best-effort cleanup of leftover `vdpi.old*.exe` and `wintun.old*.dll` files
+/// created during Windows updates.
 pub fn cleanup_stale_old_binary() {
     #[cfg(target_os = "windows")]
     {
-        let Ok(exe) = std::env::current_exe() else {
+        let Ok(exe_raw) = std::env::current_exe() else {
             return;
         };
+        let exe = fs::canonicalize(&exe_raw)
+            .map(|p| strip_windows_verbatim_prefix(&p))
+            .unwrap_or_else(|_| strip_windows_verbatim_prefix(&exe_raw));
         let Some(dir) = exe.parent() else {
             return;
         };
@@ -455,8 +468,7 @@ pub fn cleanup_stale_old_binary() {
             let Some(name_str) = name.to_str() else {
                 continue;
             };
-            let lower = name_str.to_ascii_lowercase();
-            if lower.starts_with("vdpi.old") && lower.ends_with(".exe") {
+            if is_stale_old_binary_name(name_str) {
                 let _ = fs::remove_file(entry.path());
             }
         }
@@ -609,6 +621,22 @@ fn resolve_tar_command() -> PathBuf {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn resolve_tar_command() -> PathBuf {
+    PathBuf::from("/usr/bin/tar")
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_tar_command() -> PathBuf {
+    for candidate in ["/usr/bin/tar", "/bin/tar"] {
+        let path = Path::new(candidate);
+        if path.is_file() {
+            return path.to_path_buf();
+        }
+    }
+    PathBuf::from("tar")
+}
+
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
 fn validate_archive_entry(entry: &str) -> Result<()> {
     if entry.is_empty() {
@@ -626,12 +654,41 @@ fn validate_archive_entry(entry: &str) -> Result<()> {
     if entry.contains("..") {
         bail!("archive entry contains parent directory traversal: {entry}");
     }
+    if entry.contains(['*', '?', '[', ']']) {
+        bail!("archive entry contains forbidden glob metacharacter: {entry}");
+    }
     Ok(())
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
-fn select_archive_binary_member(listing: &str, bin_name: &str) -> Result<String> {
-    let mut matched: Option<String> = None;
+fn archive_name_matches_required(candidate: &str, required_name: &str) -> bool {
+    if cfg!(any(target_os = "windows", target_os = "macos")) {
+        candidate.eq_ignore_ascii_case(required_name)
+    } else {
+        candidate == required_name
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
+fn same_normalized_parent(a: &[&str], b: &[&str]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b.iter()).all(|(lhs, rhs)| {
+            if cfg!(any(target_os = "windows", target_os = "macos")) {
+                lhs.eq_ignore_ascii_case(rhs)
+            } else {
+                lhs == rhs
+            }
+        })
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
+fn select_archive_members(
+    listing: &str,
+    required_name: &str,
+    optional_names: &[&str],
+) -> Result<Vec<String>> {
+    let mut required_match: Option<(&str, Vec<&str>)> = None;
+    let mut optional_matches: Vec<Option<(&str, Vec<&str>)>> = vec![None; optional_names.len()];
 
     for entry in listing.lines() {
         if entry.is_empty() {
@@ -648,49 +705,143 @@ fn select_archive_binary_member(listing: &str, bin_name: &str) -> Result<String>
             .filter(|seg| !seg.is_empty() && *seg != ".")
             .collect();
 
-        let Some(&last) = segments.last() else {
+        let Some((&last, parent)) = segments.split_last() else {
             continue;
         };
 
-        if last == bin_name {
+        if archive_name_matches_required(last, required_name) {
             if segments.len() > MAX_EXTRACT_SEARCH_DEPTH + 1 {
                 bail!("archive binary entry '{entry}' exceeds maximum nesting depth");
             }
-            if let Some(prev) = &matched {
-                bail!("archive contains multiple '{bin_name}' entries ('{prev}' and '{entry}')");
+            if let Some((prev, _)) = &required_match {
+                bail!(
+                    "archive contains multiple '{required_name}' entries ('{prev}' and '{entry}')"
+                );
             }
-            matched = Some(entry.to_string());
+            required_match = Some((entry, parent.to_vec()));
+            continue;
+        }
+
+        for (idx, &opt_name) in optional_names.iter().enumerate() {
+            if last.eq_ignore_ascii_case(opt_name) {
+                if segments.len() > MAX_EXTRACT_SEARCH_DEPTH + 1 {
+                    bail!("archive companion entry '{entry}' exceeds maximum nesting depth");
+                }
+                if let Some((prev, _)) = &optional_matches[idx] {
+                    bail!(
+                        "archive contains multiple '{opt_name}' entries ('{prev}' and '{entry}')"
+                    );
+                }
+                optional_matches[idx] = Some((entry, parent.to_vec()));
+                break;
+            }
         }
     }
 
-    matched.ok_or_else(|| anyhow!("archive does not contain '{bin_name}'"))
+    let (required, required_parent) =
+        required_match.ok_or_else(|| anyhow!("archive does not contain '{required_name}'"))?;
+    let mut selected = Vec::with_capacity(1 + optional_names.len());
+    selected.push(required.to_string());
+    for (opt_entry, opt_parent) in optional_matches.into_iter().flatten() {
+        if !same_normalized_parent(&required_parent, &opt_parent) {
+            bail!(
+                "archive companion entry '{opt_entry}' is not in the same directory as '{required}'"
+            );
+        }
+        selected.push(opt_entry.to_string());
+    }
+    Ok(selected)
 }
 
-fn extract_archive(archive_path: &Path, extract_dir: &Path, bin_name: &str) -> Result<()> {
-    #[cfg(target_os = "windows")]
-    let tar_cmd = resolve_tar_command();
-    #[cfg(target_os = "macos")]
-    let tar_cmd = PathBuf::from("/usr/bin/tar");
-    #[cfg(target_os = "linux")]
-    let tar_cmd = PathBuf::from("tar");
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn select_archive_binary_member(listing: &str, bin_name: &str) -> Result<String> {
+    let mut members = select_archive_members(listing, bin_name, &[])?;
+    Ok(members.swap_remove(0))
+}
 
+#[cfg(any(target_os = "windows", test))]
+fn verify_extracted_windows_companions(
+    extract_dir: &Path,
+    companion_members: &[String],
+    sums_text: Option<&str>,
+) -> Result<()> {
+    if companion_members.is_empty() {
+        return Ok(());
+    }
+    let canonical_root = fs::canonicalize(extract_dir).with_context(|| {
+        format!(
+            "failed to canonicalize extraction directory {}",
+            extract_dir.display()
+        )
+    })?;
+    let expected_wintun_sha = sums_text.and_then(|s| parse_sha256sum_for_asset(s, "wintun.dll"));
+
+    for member in companion_members {
+        let extracted_path = extract_dir.join(member);
+        let verified_path = verify_contained_regular_file(&extracted_path, &canonical_root)?
+            .ok_or_else(|| {
+                anyhow!(
+                    "expected companion file '{member}' was not found inside extracted archive {}",
+                    extract_dir.display()
+                )
+            })?;
+
+        let is_wintun = member
+            .rsplit(['/', '\\'])
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case("wintun.dll"));
+
+        if is_wintun {
+            let meta = fs::symlink_metadata(&verified_path).with_context(|| {
+                format!(
+                    "failed to inspect extracted wintun.dll {}",
+                    verified_path.display()
+                )
+            })?;
+            if meta.len() == 0 {
+                let _ = fs::remove_file(&verified_path);
+                bail!("extracted wintun.dll is empty: {}", verified_path.display());
+            }
+            if let Some(expected_sha) = expected_wintun_sha.as_deref() {
+                let actual_sha = sha256_file(&verified_path)?;
+                if !actual_sha.eq_ignore_ascii_case(expected_sha) {
+                    let _ = fs::remove_file(&verified_path);
+                    bail!(
+                        "extracted wintun.dll SHA-256 mismatch: expected {expected_sha}, got {actual_sha}"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn extract_archive(
+    archive_path: &Path,
+    extract_dir: &Path,
+    bin_name: &str,
+    sums_text: Option<&str>,
+) -> Result<()> {
     #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     {
+        let tar_cmd = resolve_tar_command();
         let list_flag = if cfg!(target_os = "windows") {
             "-tf"
         } else {
             "-tzf"
         };
-        let list_output = Command::new(&tar_cmd)
-            .arg(list_flag)
-            .arg(archive_path)
-            .output()
-            .with_context(|| {
-                format!(
-                    "failed to run {} to inspect update archive",
-                    tar_cmd.display()
-                )
-            })?;
+        let mut list_cmd = Command::new(&tar_cmd);
+        #[cfg(target_os = "linux")]
+        list_cmd.arg("--force-local");
+        list_cmd.arg(list_flag).arg(archive_path);
+
+        let list_output = list_cmd.output().with_context(|| {
+            format!(
+                "failed to run {} to inspect update archive",
+                tar_cmd.display()
+            )
+        })?;
         if !list_output.status.success() {
             bail!(
                 "archive inspection failed (exit {:?}): {}",
@@ -701,6 +852,9 @@ fn extract_archive(archive_path: &Path, extract_dir: &Path, bin_name: &str) -> R
 
         let listing = std::str::from_utf8(&list_output.stdout)
             .context("archive entry listing contains invalid UTF-8")?;
+        #[cfg(target_os = "windows")]
+        let members = select_archive_members(listing, bin_name, WINDOWS_OPTIONAL_ARCHIVE_MEMBERS)?;
+        #[cfg(not(target_os = "windows"))]
         let member = select_archive_binary_member(listing, bin_name)?;
 
         let mut extract_cmd = Command::new(&tar_cmd);
@@ -710,12 +864,19 @@ fn extract_archive(archive_path: &Path, extract_dir: &Path, bin_name: &str) -> R
             extract_cmd.arg("-xzf");
         }
         extract_cmd.arg(archive_path).arg("-C").arg(extract_dir);
+        #[cfg(target_os = "linux")]
+        {
+            extract_cmd.arg("--force-local").arg("--no-wildcards");
+        }
         #[cfg(unix)]
         {
             extract_cmd
                 .arg("--no-same-owner")
                 .arg("--no-same-permissions");
         }
+        #[cfg(target_os = "windows")]
+        extract_cmd.arg("--").args(&members);
+        #[cfg(not(target_os = "windows"))]
         extract_cmd.arg("--").arg(member);
 
         let output = extract_cmd.output().with_context(|| {
@@ -731,16 +892,32 @@ fn extract_archive(archive_path: &Path, extract_dir: &Path, bin_name: &str) -> R
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
+
+        #[cfg(target_os = "windows")]
+        verify_extracted_windows_companions(extract_dir, &members[1..], sums_text)?;
+        #[cfg(not(target_os = "windows"))]
+        let _ = sums_text;
+
         Ok(())
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
-        let _ = (archive_path, extract_dir, bin_name);
+        let _ = (archive_path, extract_dir, bin_name, sums_text);
         bail!(
             "archive extraction is not supported on {}",
             std::env::consts::OS
         );
+    }
+}
+
+fn file_name_matches_target(file_name: &OsStr, target_name: &str) -> bool {
+    if cfg!(any(target_os = "windows", target_os = "macos")) {
+        file_name
+            .to_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(target_name))
+    } else {
+        file_name == OsStr::new(target_name)
     }
 }
 
@@ -760,7 +937,7 @@ fn find_extracted_binary(extract_dir: &Path, bin_name: &str) -> Result<PathBuf> 
     find_binary_recursive(
         extract_dir,
         &canonical_root,
-        OsStr::new(bin_name),
+        bin_name,
         MAX_EXTRACT_SEARCH_DEPTH,
     )?
     .ok_or_else(|| {
@@ -774,13 +951,9 @@ fn find_extracted_binary(extract_dir: &Path, bin_name: &str) -> Result<PathBuf> 
 fn find_binary_recursive(
     dir: &Path,
     canonical_root: &Path,
-    target_name: &OsStr,
+    target_name: &str,
     depth_remaining: usize,
 ) -> Result<Option<PathBuf>> {
-    if depth_remaining == 0 {
-        return Ok(None);
-    }
-
     for entry in fs::read_dir(dir)
         .with_context(|| format!("failed to read extracted directory {}", dir.display()))?
     {
@@ -790,11 +963,11 @@ fn find_binary_recursive(
         if meta.file_type().is_symlink() {
             continue;
         }
-        if meta.file_type().is_file() && entry.file_name() == target_name {
+        if meta.file_type().is_file() && file_name_matches_target(&entry.file_name(), target_name) {
             if let Some(verified) = verify_contained_regular_file(&path, canonical_root)? {
                 return Ok(Some(verified));
             }
-        } else if meta.file_type().is_dir() {
+        } else if meta.file_type().is_dir() && depth_remaining > 0 {
             let canonical_dir = fs::canonicalize(&path)?;
             if !canonical_dir.starts_with(canonical_root) {
                 bail!(
@@ -849,7 +1022,43 @@ fn verify_contained_regular_file(path: &Path, canonical_root: &Path) -> Result<O
     Ok(Some(normalized))
 }
 
-fn run_service_install(extracted_bin: &Path, cfg: &RuntimeConfig) -> Result<()> {
+#[cfg(target_os = "macos")]
+fn ad_hoc_codesign_macos(binary_path: &Path) -> Result<()> {
+    let output = Command::new("/usr/bin/codesign")
+        .args(["-fs", "-"])
+        .arg(binary_path)
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to run /usr/bin/codesign for {}",
+                binary_path.display()
+            )
+        })?;
+    if !output.status.success() {
+        bail!(
+            "codesign failed for {} (exit {:?}): {}",
+            binary_path.display(),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_macos_codesigned(binary_path: &Path) -> Result<()> {
+    let already_valid = Command::new("/usr/bin/codesign")
+        .args(["--verify", "--strict"])
+        .arg(binary_path)
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if already_valid {
+        return Ok(());
+    }
+    ad_hoc_codesign_macos(binary_path)
+}
+
+fn run_service_install(extracted_bin: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -857,11 +1066,11 @@ fn run_service_install(extracted_bin: &Path, cfg: &RuntimeConfig) -> Result<()> 
             .with_context(|| format!("failed to chmod 0755 {}", extracted_bin.display()))?;
     }
 
-    let mut args = vec!["install".to_string()];
-    args.extend(crate::service::build_service_cli_args(cfg));
+    #[cfg(target_os = "macos")]
+    ensure_macos_codesigned(extracted_bin)?;
 
     let status = Command::new(extracted_bin)
-        .args(args)
+        .args(["install", "--upgrade"])
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -875,12 +1084,373 @@ fn run_service_install(extracted_bin: &Path, cfg: &RuntimeConfig) -> Result<()> 
 
     if !status.success() {
         bail!(
-            "updated binary 'install' command failed with exit status {:?}",
+            "updated binary 'install --upgrade' command failed with exit status {:?}",
             status.code()
         );
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn stage_windows_file_unique(
+    src: &Path,
+    dir: &Path,
+    prefix: &str,
+    suffix: &str,
+) -> Result<PathBuf> {
+    let mut src_file = fs::File::open(src)
+        .with_context(|| format!("failed to open source file {}", src.display()))?;
+
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+
+    let mut created: Option<(PathBuf, fs::File)> = None;
+    for attempt in 0u32..32 {
+        let candidate = dir.join(format!("{prefix}.{pid}-{nanos}-{attempt}{suffix}"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                created = Some((candidate, file));
+                break;
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("failed to create staged file {}", candidate.display())
+                });
+            }
+        }
+    }
+
+    let (staged_path, mut dst_file) = created.ok_or_else(|| {
+        anyhow!(
+            "failed to allocate unique staged file ({prefix}.*{suffix}) under {}",
+            dir.display()
+        )
+    })?;
+
+    let copy_sync_res = (|| -> Result<()> {
+        io::copy(&mut src_file, &mut dst_file)
+            .with_context(|| format!("failed to stage file to {}", staged_path.display()))?;
+        dst_file
+            .sync_all()
+            .with_context(|| format!("failed to sync staged file {}", staged_path.display()))?;
+        Ok(())
+    })();
+
+    drop(dst_file);
+    if let Err(err) = copy_sync_res {
+        let _ = fs::remove_file(&staged_path);
+        return Err(err);
+    }
+
+    Ok(staged_path)
+}
+
+#[cfg(target_os = "windows")]
+fn unique_windows_backup_path(dir: &Path, prefix: &str, suffix: &str) -> Result<PathBuf> {
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+
+    for attempt in 0u32..32 {
+        let candidate = dir.join(format!("{prefix}.{pid}-{nanos}-{attempt}{suffix}"));
+        match fs::symlink_metadata(&candidate) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(candidate),
+            Ok(_) => continue,
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "failed to inspect backup path candidate {}",
+                        candidate.display()
+                    )
+                });
+            }
+        }
+    }
+
+    bail!(
+        "failed to allocate unique backup path ({prefix}.*{suffix}) under {}",
+        dir.display()
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn rollback_windows_file(backup: Option<&Path>, target: &Path) -> Result<()> {
+    if let Some(backup_path) = backup {
+        fs::rename(backup_path, target).with_context(|| {
+            format!(
+                "failed to restore backup {} to {}",
+                backup_path.display(),
+                target.display()
+            )
+        })
+    } else {
+        match fs::remove_file(target) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| {
+                format!("failed to remove newly placed file {}", target.display())
+            }),
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn swap_staged_windows_wintun(staged_new: &Path, exe_dir: &Path) -> Result<Option<PathBuf>> {
+    let target_wintun = exe_dir.join("wintun.dll");
+
+    let target_exists = match fs::symlink_metadata(&target_wintun) {
+        Ok(_) => true,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "failed to inspect existing wintun.dll {}",
+                    target_wintun.display()
+                )
+            });
+        }
+    };
+
+    let backup_path = if target_exists {
+        let backup = unique_windows_backup_path(exe_dir, "wintun.old", ".dll")?;
+        if let Err(err) = fs::rename(&target_wintun, &backup) {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to move current wintun.dll {} to {}",
+                    target_wintun.display(),
+                    backup.display()
+                )
+            });
+        }
+        Some(backup)
+    } else {
+        None
+    };
+
+    if let Err(err) = fs::rename(staged_new, &target_wintun) {
+        let _ = fs::remove_file(staged_new);
+        let rollback_note = match &backup_path {
+            Some(backup) => match rollback_windows_file(Some(backup), &target_wintun) {
+                Ok(()) => "restored previous wintun.dll".to_string(),
+                Err(rb_err) => format!("rollback of previous wintun.dll FAILED: {rb_err:#}"),
+            },
+            None => "no previous wintun.dll to restore".to_string(),
+        };
+        return Err(err).with_context(|| {
+            format!(
+                "failed to place new wintun.dll at {} ({rollback_note})",
+                target_wintun.display()
+            )
+        });
+    }
+
+    Ok(backup_path)
+}
+
+#[cfg(all(target_os = "windows", test))]
+fn atomic_swap_windows_wintun(src_wintun: &Path, exe_dir: &Path) -> Result<()> {
+    let staged_new = stage_windows_file_unique(src_wintun, exe_dir, "wintun.new", ".dll")?;
+    let backup = match swap_staged_windows_wintun(&staged_new, exe_dir) {
+        Ok(backup) => backup,
+        Err(err) => {
+            let _ = fs::remove_file(&staged_new);
+            return Err(err);
+        }
+    };
+    if let Some(backup_path) = backup {
+        let _ = fs::remove_file(backup_path);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn replace_portable_binary_in_dir(
+    extracted_bin: &Path,
+    current_exe: &Path,
+    exe_dir: &Path,
+) -> Result<()> {
+    let staged_wintun_src = extracted_bin
+        .parent()
+        .map(|dir| dir.join("wintun.dll"))
+        .filter(|path| fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file()));
+
+    // Stage both vdpi.exe and (if present) wintun.dll with sync_all() before mutating live files.
+    let staged_new_exe = stage_windows_file_unique(extracted_bin, exe_dir, "vdpi.new", ".exe")?;
+    let staged_new_wintun = match staged_wintun_src.as_deref() {
+        Some(src_wintun) => {
+            match stage_windows_file_unique(src_wintun, exe_dir, "wintun.new", ".dll") {
+                Ok(path) => Some(path),
+                Err(err) => {
+                    let _ = fs::remove_file(&staged_new_exe);
+                    return Err(err);
+                }
+            }
+        }
+        None => None,
+    };
+
+    // Swap wintun.dll first (retaining wintun_backup until vdpi.exe succeeds) so a locked DLL
+    // fails cleanly before vdpi.exe is ever moved.
+    let target_wintun = exe_dir.join("wintun.dll");
+    let (wintun_swapped, wintun_backup) = if let Some(staged_wintun) = staged_new_wintun.as_deref()
+    {
+        match swap_staged_windows_wintun(staged_wintun, exe_dir) {
+            Ok(backup) => (true, backup),
+            Err(err) => {
+                let _ = fs::remove_file(staged_wintun);
+                let _ = fs::remove_file(&staged_new_exe);
+                return Err(err);
+            }
+        }
+    } else {
+        (false, None)
+    };
+
+    let exe_backup = match unique_windows_backup_path(exe_dir, "vdpi.old", ".exe") {
+        Ok(path) => path,
+        Err(err) => {
+            let _ = fs::remove_file(&staged_new_exe);
+            if wintun_swapped {
+                if let Err(rb_err) = rollback_windows_file(wintun_backup.as_deref(), &target_wintun)
+                {
+                    return Err(err).with_context(|| {
+                        format!("also failed to roll back wintun.dll: {rb_err:#}")
+                    });
+                }
+            }
+            return Err(err);
+        }
+    };
+
+    if let Err(err) = fs::rename(current_exe, &exe_backup) {
+        let _ = fs::remove_file(&staged_new_exe);
+        let rollback_note = if wintun_swapped {
+            match rollback_windows_file(wintun_backup.as_deref(), &target_wintun) {
+                Ok(()) => " (rolled back wintun.dll)".to_string(),
+                Err(rb_err) => format!(" (wintun.dll rollback FAILED: {rb_err:#})"),
+            }
+        } else {
+            String::new()
+        };
+        return Err(err).with_context(|| {
+            format!(
+                "failed to move current binary {} to {}{rollback_note}",
+                current_exe.display(),
+                exe_backup.display()
+            )
+        });
+    }
+
+    if let Err(err) = fs::rename(&staged_new_exe, current_exe) {
+        let _ = fs::remove_file(&staged_new_exe);
+        let mut rollback_notes = Vec::new();
+        match rollback_windows_file(Some(&exe_backup), current_exe) {
+            Ok(()) => rollback_notes.push("restored previous binary".to_string()),
+            Err(rb_err) => {
+                rollback_notes.push(format!("previous binary rollback FAILED: {rb_err:#}"));
+            }
+        }
+        if wintun_swapped {
+            match rollback_windows_file(wintun_backup.as_deref(), &target_wintun) {
+                Ok(()) => rollback_notes.push("restored previous wintun.dll".to_string()),
+                Err(rb_err) => {
+                    rollback_notes.push(format!("wintun.dll rollback FAILED: {rb_err:#}"));
+                }
+            }
+        }
+        return Err(err).with_context(|| {
+            format!(
+                "failed to place new binary at {} ({})",
+                current_exe.display(),
+                rollback_notes.join("; ")
+            )
+        });
+    }
+
+    if let Some(backup) = wintun_backup {
+        let _ = fs::remove_file(backup);
+    }
+
+    if let Some(src_license) = extracted_bin
+        .parent()
+        .map(|dir| dir.join("WINTUN-LICENSE.txt"))
+        .filter(|path| fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file()))
+    {
+        let _ = fs::copy(src_license, exe_dir.join("WINTUN-LICENSE.txt"));
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn stage_unix_executable_unique(src: &Path, dir: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut src_file = fs::File::open(src)
+        .with_context(|| format!("failed to open updated binary {}", src.display()))?;
+
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+
+    let mut created: Option<(PathBuf, fs::File)> = None;
+    for attempt in 0u32..32 {
+        let candidate = dir.join(format!(".vdpi.update.{pid}-{nanos}-{attempt}.tmp"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o755)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                created = Some((candidate, file));
+                break;
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("failed to create staged binary {}", candidate.display())
+                });
+            }
+        }
+    }
+
+    let (tmp_path, mut dst_file) = created.ok_or_else(|| {
+        anyhow!(
+            "failed to allocate unique staged binary under {}",
+            dir.display()
+        )
+    })?;
+
+    let copy_sync_res = (|| -> Result<()> {
+        io::copy(&mut src_file, &mut dst_file)
+            .with_context(|| format!("failed to copy updated binary to {}", tmp_path.display()))?;
+        dst_file
+            .set_permissions(fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("failed to chmod 0755 {}", tmp_path.display()))?;
+        dst_file
+            .sync_all()
+            .with_context(|| format!("failed to sync staged binary {}", tmp_path.display()))?;
+        Ok(())
+    })();
+
+    drop(dst_file);
+    if let Err(err) = copy_sync_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    Ok(tmp_path)
 }
 
 fn replace_portable_binary(extracted_bin: &Path) -> Result<PathBuf> {
@@ -893,8 +1463,18 @@ fn replace_portable_binary(extracted_bin: &Path) -> Result<PathBuf> {
             current_exe_raw.display()
         )
     })?;
-    #[cfg(not(unix))]
-    let current_exe = strip_windows_verbatim_prefix(&current_exe_raw);
+    #[cfg(target_os = "windows")]
+    let current_exe = {
+        let canonical = fs::canonicalize(&current_exe_raw).with_context(|| {
+            format!(
+                "failed to canonicalize current executable {}",
+                current_exe_raw.display()
+            )
+        })?;
+        strip_windows_verbatim_prefix(&canonical)
+    };
+    #[cfg(not(any(unix, target_os = "windows")))]
+    let current_exe = current_exe_raw;
 
     let exe_dir = current_exe.parent().ok_or_else(|| {
         anyhow!(
@@ -905,71 +1485,18 @@ fn replace_portable_binary(extracted_bin: &Path) -> Result<PathBuf> {
 
     #[cfg(target_os = "windows")]
     {
-        let staged_new = exe_dir.join(format!("vdpi.new.{}.exe", std::process::id()));
-        if let Err(err) = fs::copy(extracted_bin, &staged_new)
-            .with_context(|| format!("failed to stage updated binary to {}", staged_new.display()))
-        {
-            let _ = fs::remove_file(&staged_new);
-            return Err(err);
-        }
-
-        let preferred_backup = exe_dir.join("vdpi.old.exe");
-        let backup_path =
-            if preferred_backup.exists() && fs::remove_file(&preferred_backup).is_err() {
-                exe_dir.join(format!("vdpi.old.{}.exe", std::process::id()))
-            } else {
-                preferred_backup
-            };
-
-        if let Err(err) = fs::rename(&current_exe, &backup_path) {
-            let _ = fs::remove_file(&staged_new);
-            return Err(err).with_context(|| {
-                format!(
-                    "failed to move current binary {} to {}",
-                    current_exe.display(),
-                    backup_path.display()
-                )
-            });
-        }
-
-        if let Err(err) = fs::rename(&staged_new, &current_exe) {
-            let _ = fs::remove_file(staged_new);
-            let _ = fs::rename(backup_path, &current_exe);
-            return Err(err).with_context(|| {
-                format!(
-                    "failed to place new binary at {} (restored previous binary)",
-                    current_exe.display()
-                )
-            });
-        }
-
+        replace_portable_binary_in_dir(extracted_bin, &current_exe, exe_dir)?;
         Ok(current_exe)
     }
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-
-        let tmp_path = exe_dir.join(format!(".vdpi.update.{}.tmp", std::process::id()));
-        let copy_res = fs::copy(extracted_bin, &tmp_path)
-            .with_context(|| format!("failed to copy updated binary to {}", tmp_path.display()));
-        if let Err(err) = copy_res {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(err);
-        }
-
-        if let Err(err) = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o755)) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(err)
-                .with_context(|| format!("failed to chmod 0755 {}", tmp_path.display()));
-        }
+        let tmp_path = stage_unix_executable_unique(extracted_bin, exe_dir)?;
 
         #[cfg(target_os = "macos")]
-        {
-            let _ = Command::new("/usr/bin/codesign")
-                .args(["-fs", "-"])
-                .arg(&tmp_path)
-                .output();
+        if let Err(err) = ad_hoc_codesign_macos(&tmp_path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err);
         }
 
         if let Err(err) = fs::rename(&tmp_path, &current_exe) {
@@ -998,7 +1525,7 @@ fn replace_portable_binary(extracted_bin: &Path) -> Result<PathBuf> {
 
 /// Checks GitHub Releases for the latest `vdpi` release and optionally downloads,
 /// verifies (SHA-256), and installs it for either service or portable deployments.
-pub async fn run_update(check_only: bool, force: bool, cfg: &RuntimeConfig) -> Result<()> {
+pub async fn run_update(check_only: bool, force: bool, _cfg: &RuntimeConfig) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let user_agent = format!("vdpi/{}", env!("CARGO_PKG_VERSION"));
@@ -1069,6 +1596,19 @@ pub async fn run_update(check_only: bool, force: bool, cfg: &RuntimeConfig) -> R
     if matches!(relation, VersionRelation::Same | VersionRelation::Older) && !force {
         println!("vdpi is already up to date (v{baseline}).");
         return Ok(());
+    }
+    if relation == VersionRelation::Unknown && !force {
+        if check_only {
+            println!(
+                "Cannot compare current version (v{baseline}) with latest release '{}'. Re-run with '--force' to install anyway.",
+                release.tag_name
+            );
+            return Ok(());
+        }
+        bail!(
+            "cannot compare current version (v{baseline}) with latest release '{}'; re-run with '--force' to install anyway",
+            release.tag_name
+        );
     }
 
     if check_only {
@@ -1163,7 +1703,7 @@ pub async fn run_update(check_only: bool, force: bool, cfg: &RuntimeConfig) -> R
     fs::create_dir(&extract_dir)
         .with_context(|| format!("failed to create {}", extract_dir.display()))?;
     let bin_name = if cfg!(windows) { "vdpi.exe" } else { "vdpi" };
-    extract_archive(&archive_path, &extract_dir, bin_name)?;
+    extract_archive(&archive_path, &extract_dir, bin_name, Some(&sums_text))?;
 
     let extracted_bin = find_extracted_binary(&extract_dir, bin_name)?;
 
@@ -1172,7 +1712,7 @@ pub async fn run_update(check_only: bool, force: bool, cfg: &RuntimeConfig) -> R
             "Updating installed vdpi service ({})...",
             info.binary_path.display()
         );
-        run_service_install(&extracted_bin, cfg)?;
+        run_service_install(&extracted_bin)?;
         println!("Successfully updated vdpi service to {}.", release.tag_name);
     } else {
         let updated_path = replace_portable_binary(&extracted_bin)?;
@@ -1379,5 +1919,343 @@ short_invalid_hash  broken.tar.gz
         assert!(select_archive_binary_member("vdpi\x00evil\n", "vdpi").is_err());
         assert!(select_archive_binary_member("a/vdpi\nb/vdpi\n", "vdpi").is_err());
         assert!(select_archive_binary_member("vdpi/\n", "vdpi").is_err());
+    }
+
+    #[test]
+    fn windows_multi_member_archive_selection_validates_companions() {
+        let nested_listing = "\
+vdpi-windows-x86_64/
+vdpi-windows-x86_64/README.md
+vdpi-windows-x86_64/vdpi.exe
+vdpi-windows-x86_64/wintun.dll
+vdpi-windows-x86_64/WINTUN-LICENSE.txt
+";
+        assert_eq!(
+            select_archive_members(nested_listing, "vdpi.exe", WINDOWS_OPTIONAL_ARCHIVE_MEMBERS)
+                .expect("valid nested windows archive"),
+            vec![
+                "vdpi-windows-x86_64/vdpi.exe".to_string(),
+                "vdpi-windows-x86_64/wintun.dll".to_string(),
+                "vdpi-windows-x86_64/WINTUN-LICENSE.txt".to_string(),
+            ]
+        );
+
+        assert_eq!(
+            select_archive_members(
+                "vdpi.exe\r\nwintun.dll\r\n",
+                "vdpi.exe",
+                WINDOWS_OPTIONAL_ARCHIVE_MEMBERS
+            )
+            .expect("valid flat windows archive"),
+            vec!["vdpi.exe".to_string(), "wintun.dll".to_string()]
+        );
+
+        // Older / proxy-only archives without wintun.dll remain valid.
+        assert_eq!(
+            select_archive_members(
+                "vdpi-pkg/vdpi.exe\nvdpi-pkg/wintun.dll/\n",
+                "vdpi.exe",
+                WINDOWS_OPTIONAL_ARCHIVE_MEMBERS
+            )
+            .expect("archive without wintun.dll"),
+            vec!["vdpi-pkg/vdpi.exe".to_string()]
+        );
+
+        // Depth == 3 allowed; depth > 3 rejected.
+        assert_eq!(
+            select_archive_members(
+                "a/b/c/vdpi.exe\na/b/c/wintun.dll\n",
+                "vdpi.exe",
+                WINDOWS_OPTIONAL_ARCHIVE_MEMBERS
+            )
+            .expect("depth 3 allowed"),
+            vec!["a/b/c/vdpi.exe".to_string(), "a/b/c/wintun.dll".to_string(),]
+        );
+        assert!(select_archive_members(
+            "vdpi.exe\na/b/c/d/wintun.dll\n",
+            "vdpi.exe",
+            WINDOWS_OPTIONAL_ARCHIVE_MEMBERS
+        )
+        .is_err());
+
+        // Duplicates (including case variants), traversal, and missing vdpi.exe rejected.
+        assert!(select_archive_members(
+            "vdpi.exe\na/wintun.dll\nb/wintun.dll\n",
+            "vdpi.exe",
+            WINDOWS_OPTIONAL_ARCHIVE_MEMBERS
+        )
+        .is_err());
+        assert!(select_archive_members(
+            "vdpi.exe\nwintun.dll\nWINTUN.DLL\n",
+            "vdpi.exe",
+            WINDOWS_OPTIONAL_ARCHIVE_MEMBERS
+        )
+        .is_err());
+        assert!(select_archive_members(
+            "vdpi.exe\na/WINTUN-LICENSE.txt\nb/wintun-license.txt\n",
+            "vdpi.exe",
+            WINDOWS_OPTIONAL_ARCHIVE_MEMBERS
+        )
+        .is_err());
+        assert!(select_archive_members(
+            "../evil\nvdpi.exe\nwintun.dll\n",
+            "vdpi.exe",
+            WINDOWS_OPTIONAL_ARCHIVE_MEMBERS
+        )
+        .is_err());
+        assert!(select_archive_members(
+            "vdpi.exe\nsub/../wintun.dll\n",
+            "vdpi.exe",
+            WINDOWS_OPTIONAL_ARCHIVE_MEMBERS
+        )
+        .is_err());
+        assert!(select_archive_members(
+            "vdpi.exe\nC:\\wintun.dll\n",
+            "vdpi.exe",
+            WINDOWS_OPTIONAL_ARCHIVE_MEMBERS
+        )
+        .is_err());
+        assert!(select_archive_members(
+            "wintun.dll\nWINTUN-LICENSE.txt\n",
+            "vdpi.exe",
+            WINDOWS_OPTIONAL_ARCHIVE_MEMBERS
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn stale_old_binary_cleanup_matches_exe_and_wintun_dll() {
+        assert!(is_stale_old_binary_name("vdpi.old.exe"));
+        assert!(is_stale_old_binary_name("vdpi.old.1234.exe"));
+        assert!(is_stale_old_binary_name("vdpi.old.1234-999999999-0.exe"));
+        assert!(is_stale_old_binary_name("VDPI.OLD.EXE"));
+        assert!(is_stale_old_binary_name("wintun.old.dll"));
+        assert!(is_stale_old_binary_name("wintun.old.5678.dll"));
+        assert!(is_stale_old_binary_name("wintun.old.5678-999999999-1.dll"));
+        assert!(is_stale_old_binary_name("WINTUN.OLD.99.DLL"));
+
+        assert!(!is_stale_old_binary_name("vdpi.exe"));
+        assert!(!is_stale_old_binary_name("wintun.dll"));
+        assert!(!is_stale_old_binary_name("wintun.new.1234.dll"));
+        assert!(!is_stale_old_binary_name("vdpi.new.1234-999999999-0.exe"));
+        assert!(!is_stale_old_binary_name("vdpi.old.dll"));
+        assert!(!is_stale_old_binary_name("wintun.old.exe"));
+    }
+
+    #[test]
+    fn finds_extracted_binary_at_max_depth_three_and_rejects_depth_four() {
+        let staging = StagingDir::new().expect("staging dir");
+        let extract_dir = staging.path().join("extract");
+        let depth3 = extract_dir.join("a").join("b").join("c");
+        fs::create_dir_all(&depth3).expect("create depth-3 dir");
+
+        let bin_depth3 = depth3.join("vdpi");
+        fs::write(&bin_depth3, b"depth3-binary").expect("write depth-3 binary");
+
+        let found =
+            find_extracted_binary(&extract_dir, "vdpi").expect("depth-3 binary must be discovered");
+        let expected = strip_windows_verbatim_prefix(
+            &fs::canonicalize(&bin_depth3).expect("canonicalize depth-3 binary"),
+        );
+        assert_eq!(found, expected);
+
+        // Depth 4 must not be traversed.
+        fs::remove_file(&bin_depth3).expect("remove depth-3 binary");
+        let depth4 = depth3.join("d");
+        fs::create_dir(&depth4).expect("create depth-4 dir");
+        fs::write(depth4.join("vdpi"), b"depth4-binary").expect("write depth-4 binary");
+        assert!(find_extracted_binary(&extract_dir, "vdpi").is_err());
+    }
+
+    #[test]
+    fn archive_selection_blocks_globs_mismatched_companion_dirs_and_case_dups() {
+        // Glob metacharacters must be rejected to prevent bsdtar fnmatch expansion.
+        assert!(select_archive_binary_member("vdpi*\n", "vdpi").is_err());
+        assert!(select_archive_binary_member("vdpi?\n", "vdpi").is_err());
+        assert!(select_archive_binary_member("vdpi[1]\n", "vdpi").is_err());
+        assert!(select_archive_binary_member("pkg/foo*bar\npkg/vdpi\n", "vdpi").is_err());
+
+        // Normalized equivalent parent directories succeed.
+        assert_eq!(
+            select_archive_members(
+                "./pkg/vdpi.exe\npkg\\wintun.dll\n./pkg/WINTUN-LICENSE.txt\n",
+                "vdpi.exe",
+                WINDOWS_OPTIONAL_ARCHIVE_MEMBERS
+            )
+            .expect("normalized same-parent companions allowed"),
+            vec![
+                "./pkg/vdpi.exe".to_string(),
+                "pkg\\wintun.dll".to_string(),
+                "./pkg/WINTUN-LICENSE.txt".to_string(),
+            ]
+        );
+
+        // Optional companions in a different parent directory than required binary must be rejected.
+        assert!(select_archive_members(
+            "vdpi.exe\nsub/wintun.dll\n",
+            "vdpi.exe",
+            WINDOWS_OPTIONAL_ARCHIVE_MEMBERS
+        )
+        .is_err());
+        assert!(select_archive_members(
+            "sub/vdpi.exe\nwintun.dll\n",
+            "vdpi.exe",
+            WINDOWS_OPTIONAL_ARCHIVE_MEMBERS
+        )
+        .is_err());
+        assert!(select_archive_members(
+            "a/vdpi.exe\nb/WINTUN-LICENSE.txt\n",
+            "vdpi.exe",
+            WINDOWS_OPTIONAL_ARCHIVE_MEMBERS
+        )
+        .is_err());
+
+        // Case-insensitive duplicate binary names are caught on Windows and macOS.
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        {
+            assert!(select_archive_members(
+                "vdpi.exe\nVDPI.EXE\n",
+                "vdpi.exe",
+                WINDOWS_OPTIONAL_ARCHIVE_MEMBERS
+            )
+            .is_err());
+            assert!(select_archive_binary_member("vdpi\nVDPI\n", "vdpi").is_err());
+        }
+    }
+
+    #[test]
+    fn windows_companion_verification_future_proofs_wintun_bumps_and_honors_sums() {
+        let staging = StagingDir::new().expect("staging dir");
+        let extract_dir = staging.path().join("extract");
+        fs::create_dir(&extract_dir).expect("create extract dir");
+
+        let wintun_path = extract_dir.join("wintun.dll");
+        let future_bytes = b"future-wintun-0.15.0-payload";
+        fs::write(&wintun_path, future_bytes).expect("write future wintun");
+
+        let members = vec!["wintun.dll".to_string()];
+
+        // When SHA256SUMS.txt has no standalone wintun.dll entry, any non-empty regular file passes.
+        let archive_only_sums = format!(
+            "{}  vdpi-windows-x86_64.zip\n",
+            sha256_hex(b"archive-bytes")
+        );
+        verify_extracted_windows_companions(&extract_dir, &members, Some(&archive_only_sums))
+            .expect("future wintun.dll must not fail when not explicitly pinned in SHA256SUMS.txt");
+
+        // When SHA256SUMS.txt explicitly includes wintun.dll, matching digest passes.
+        let matching_sums = format!("{} *wintun.dll\n", sha256_hex(future_bytes));
+        verify_extracted_windows_companions(&extract_dir, &members, Some(&matching_sums))
+            .expect("explicit matching wintun.dll hash in SHA256SUMS.txt must pass");
+
+        // Mismatched explicit wintun.dll hash must fail and remove the extracted file.
+        let bad_sums = format!("{} *wintun.dll\n", sha256_hex(b"different-wintun"));
+        assert!(
+            verify_extracted_windows_companions(&extract_dir, &members, Some(&bad_sums)).is_err()
+        );
+        assert!(
+            !wintun_path.exists(),
+            "mismatched wintun.dll must be removed on verification failure"
+        );
+
+        // Empty (0-byte) wintun.dll must fail and be removed even without a SHA256SUMS entry.
+        fs::write(&wintun_path, b"").expect("write empty wintun");
+        assert!(verify_extracted_windows_companions(&extract_dir, &members, None).is_err());
+        assert!(
+            !wintun_path.exists(),
+            "empty wintun.dll must be removed on verification failure"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_wintun_atomic_swap_creates_and_replaces() {
+        let staging = StagingDir::new().expect("staging dir");
+        let src_dir = staging.path().join("src");
+        let exe_dir = staging.path().join("exe");
+        fs::create_dir(&src_dir).expect("create src dir");
+        fs::create_dir(&exe_dir).expect("create exe dir");
+
+        let src_wintun = src_dir.join("wintun.dll");
+        fs::write(&src_wintun, b"wintun-v1").expect("write v1 wintun");
+        atomic_swap_windows_wintun(&src_wintun, &exe_dir).expect("fresh wintun swap");
+        assert_eq!(
+            fs::read(exe_dir.join("wintun.dll")).expect("read fresh wintun"),
+            b"wintun-v1"
+        );
+
+        fs::write(&src_wintun, b"wintun-v2").expect("write v2 wintun");
+        atomic_swap_windows_wintun(&src_wintun, &exe_dir).expect("replace wintun swap");
+        assert_eq!(
+            fs::read(exe_dir.join("wintun.dll")).expect("read replaced wintun"),
+            b"wintun-v2"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_portable_multi_member_swap_commits_and_rolls_back_cleanly() {
+        let staging = StagingDir::new().expect("staging dir");
+        let src_dir = staging.path().join("src");
+        let exe_dir = staging.path().join("exe");
+        fs::create_dir(&src_dir).expect("create src dir");
+        fs::create_dir(&exe_dir).expect("create exe dir");
+
+        let src_exe = src_dir.join("vdpi.exe");
+        let src_wintun = src_dir.join("wintun.dll");
+        let src_license = src_dir.join("WINTUN-LICENSE.txt");
+        fs::write(&src_exe, b"vdpi-v2").expect("write new exe");
+        fs::write(&src_wintun, b"wintun-v2").expect("write new wintun");
+        fs::write(&src_license, b"license-v2").expect("write new license");
+
+        let live_exe = exe_dir.join("vdpi.exe");
+        let live_wintun = exe_dir.join("wintun.dll");
+        fs::write(&live_exe, b"vdpi-v1").expect("write old exe");
+        fs::write(&live_wintun, b"wintun-v1").expect("write old wintun");
+
+        replace_portable_binary_in_dir(&src_exe, &live_exe, &exe_dir)
+            .expect("multi-member portable swap must succeed");
+        assert_eq!(fs::read(&live_exe).expect("read new live exe"), b"vdpi-v2");
+        assert_eq!(
+            fs::read(&live_wintun).expect("read new live wintun"),
+            b"wintun-v2"
+        );
+        assert_eq!(
+            fs::read(exe_dir.join("WINTUN-LICENSE.txt")).expect("read license"),
+            b"license-v2"
+        );
+
+        // Rollback check: when vdpi.exe move fails (missing current_exe), wintun.dll is rolled back.
+        fs::write(&src_wintun, b"wintun-v3").expect("write v3 wintun");
+        let missing_exe = exe_dir.join("missing-vdpi.exe");
+        assert!(replace_portable_binary_in_dir(&src_exe, &missing_exe, &exe_dir).is_err());
+        assert_eq!(
+            fs::read(&live_wintun).expect("wintun must be restored after exe rename failure"),
+            b"wintun-v2"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_staging_creates_unique_0755_file_with_o_excl() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let staging = StagingDir::new().expect("staging dir");
+        let src_bin = staging.path().join("vdpi-src");
+        fs::write(&src_bin, b"unix-binary-bytes").expect("write src bin");
+
+        let staged_a = stage_unix_executable_unique(&src_bin, staging.path()).expect("stage a");
+        let staged_b = stage_unix_executable_unique(&src_bin, staging.path()).expect("stage b");
+        assert_ne!(staged_a, staged_b);
+        assert_eq!(
+            fs::read(&staged_a).expect("read staged a"),
+            b"unix-binary-bytes"
+        );
+        let mode = fs::metadata(&staged_a)
+            .expect("stat staged a")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755);
     }
 }

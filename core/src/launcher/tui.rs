@@ -22,7 +22,8 @@ const KEY_BADGES: [&str; 9] = [
     "[1]", "[2]", "[3]", "[4]", "[5]", "[6]", "[7]", "[8]", "[9]",
 ];
 const RANGE_LABELS: [&str; 9] = ["1", "1-2", "1-3", "1-4", "1-5", "1-6", "1-7", "1-8", "1-9"];
-const UNINSTALL_CONFIRM_BODY: &str = "This stops the background service, removes installed files and PATH entries, and restores system proxies.";
+const COMPACT_VPN_BADGE: &str = "[VPN]";
+const UNINSTALL_CONFIRM_BODY: &str = "This stops the background service, removes installed files and PATH entries, and restores routes & proxies.";
 
 // Restrained cool slate / white / emerald / ice-blue / semantic amber & red palette.
 const BORDER_SLATE: Color = Color::Rgb(58, 66, 78);
@@ -49,6 +50,7 @@ struct Palette {
     status_accent: Style,
     status_warn: Style,
     status_neutral: Style,
+    status_warn_dot: &'static str,
     danger_bold: Style,
     active_row: Style,
     active_marker: Style,
@@ -76,6 +78,7 @@ impl Palette {
                 status_accent: Style::new().fg(ICE_BLUE),
                 status_warn: Style::new().fg(AMBER_WARN),
                 status_neutral: Style::new().fg(STEEL_MUTED),
+                status_warn_dot: "● ",
                 danger_bold: Style::new().fg(RED_DANGER).add_modifier(Modifier::BOLD),
                 active_row: Style::new().bg(ACTIVE_BG),
                 active_marker: Style::new().fg(ICE_BLUE).add_modifier(Modifier::BOLD),
@@ -103,6 +106,7 @@ impl Palette {
                 status_accent: bold,
                 status_warn: bold,
                 status_neutral: plain,
+                status_warn_dot: "! ",
                 danger_bold: bold,
                 active_row: Style::new().add_modifier(Modifier::REVERSED),
                 active_marker: bold,
@@ -124,6 +128,13 @@ impl Palette {
             StatusTone::Accent => self.status_accent,
             StatusTone::Warning => self.status_warn,
             StatusTone::Neutral => self.status_neutral,
+        }
+    }
+
+    const fn status_dot(self, tone: StatusTone) -> &'static str {
+        match tone {
+            StatusTone::Warning => self.status_warn_dot,
+            StatusTone::Active | StatusTone::Accent | StatusTone::Neutral => "● ",
         }
     }
 }
@@ -461,19 +472,25 @@ struct TerminalGuard {
 
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
+        crate::tui_dashboard::install_tui_panic_hook();
         terminal::enable_raw_mode()?;
+        crate::tui_dashboard::mark_tui_active(true);
         let mut stdout = io::stdout();
         if let Err(err) = execute!(stdout, EnterAlternateScreen, Hide) {
-            let _ = execute!(stdout, Show, LeaveAlternateScreen);
-            let _ = terminal::disable_raw_mode();
+            if crate::tui_dashboard::take_tui_active() {
+                let _ = execute!(stdout, LeaveAlternateScreen, Show);
+                let _ = terminal::disable_raw_mode();
+            }
             return Err(err);
         }
         let backend = CrosstermBackend::new(stdout);
         let terminal = match Terminal::new(backend) {
             Ok(terminal) => terminal,
             Err(err) => {
-                let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
-                let _ = terminal::disable_raw_mode();
+                if crate::tui_dashboard::take_tui_active() {
+                    let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+                    let _ = terminal::disable_raw_mode();
+                }
                 return Err(err);
             }
         };
@@ -485,8 +502,10 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(self.terminal.backend_mut(), Show, LeaveAlternateScreen);
-        let _ = terminal::disable_raw_mode();
+        if crate::tui_dashboard::take_tui_active() {
+            let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen, Show);
+            let _ = terminal::disable_raw_mode();
+        }
     }
 }
 
@@ -595,6 +614,19 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Action {
         KeyCode::End => state.selected = count - 1,
         _ if key.kind != KeyEventKind::Press => return Action::Ignore,
         KeyCode::Char('r' | 'R') => return Action::Refresh,
+        KeyCode::Char('m' | 'M') => {
+            if let Some((index, item)) = state
+                .menu
+                .items
+                .iter()
+                .enumerate()
+                .find(|(_, item)| matches!(item.choice, Choice::SwitchEngine(_)))
+            {
+                state.selected = index;
+                return Action::Finish(item.choice);
+            }
+            return Action::Ignore;
+        }
         KeyCode::Enter => {
             let choice = state.menu.items[state.selected].choice;
             if choice == Choice::Uninstall {
@@ -936,11 +968,33 @@ fn render_divider(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx) {
     frame.render_widget(line, area);
 }
 
+fn format_full_badge(raw: &str) -> Cow<'_, str> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+        Cow::Borrowed(trimmed)
+    } else {
+        Cow::Owned(format!("[{trimmed}]"))
+    }
+}
+
+fn truncate_badge(full_badge: Cow<'_, str>, max_chars: usize) -> Cow<'_, str> {
+    if full_badge.chars().count() <= max_chars {
+        return full_badge;
+    }
+    let inner = full_badge
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(&full_badge);
+    let inner_budget = max_chars.saturating_sub(2);
+    Cow::Owned(format!("[{}]", truncate_text(inner, inner_budget)))
+}
+
 fn render_status_row(frame: &mut Frame<'_>, area: Rect, row: &StatusRow, ctx: RenderCtx) {
     if area.is_empty() {
         return;
     }
     let pad = if ctx.inset { " " } else { "" };
+    let dot = ctx.palette.status_dot(row.tone);
     let tone_style = ctx.palette.status(row.tone);
     let label_width = 8usize;
     let prefix_cols = pad.len() + 2 + label_width + 2;
@@ -953,7 +1007,7 @@ fn render_status_row(frame: &mut Frame<'_>, area: Rect, row: &StatusRow, ctx: Re
         let text = truncate_text(&compact, budget);
         let line = Line::from(vec![
             Span::raw(pad),
-            Span::styled("● ", tone_style),
+            Span::styled(dot, tone_style),
             Span::styled(text, tone_style),
         ]);
         frame.render_widget(line, area);
@@ -962,14 +1016,69 @@ fn render_status_row(frame: &mut Frame<'_>, area: Rect, row: &StatusRow, ctx: Re
 
     let label = format!("{:<width$}", row.label, width = label_width);
     let budget = width.saturating_sub(prefix_cols + right_margin);
-    let value = truncate_text(&row.value, budget);
-    let line = Line::from(vec![
-        Span::raw(pad),
-        Span::styled("● ", tone_style),
-        Span::styled(label, ctx.palette.status_label),
-        Span::raw("  "),
-        Span::styled(value, tone_style),
-    ]);
+    let badge = row
+        .badge
+        .as_ref()
+        .map(|(text, tone)| (text.trim(), *tone))
+        .filter(|(b, _)| !b.is_empty());
+
+    let badge_layout: Option<(Cow<'_, str>, Cow<'_, str>, StatusTone)> =
+        badge.and_then(|(raw_badge, badge_tone)| {
+            let full_badge = format_full_badge(raw_badge);
+            let value_width = row.value.chars().count();
+            let full_badge_width = full_badge.chars().count();
+
+            if value_width
+                .saturating_add(2)
+                .saturating_add(full_badge_width)
+                <= budget
+            {
+                Some((Cow::Borrowed(row.value.as_str()), full_badge, badge_tone))
+            } else if budget >= 34 {
+                let max_badge_w = budget
+                    .saturating_sub(2 + value_width.min(budget.saturating_sub(16)))
+                    .max(12);
+                let badge_text = truncate_badge(full_badge, max_badge_w);
+                let value_budget = budget.saturating_sub(2 + badge_text.chars().count());
+                Some((
+                    truncate_text(&row.value, value_budget),
+                    badge_text,
+                    badge_tone,
+                ))
+            } else if budget >= 18 {
+                Some((
+                    truncate_text(&row.value, budget - 7),
+                    Cow::Borrowed(COMPACT_VPN_BADGE),
+                    badge_tone,
+                ))
+            } else {
+                None
+            }
+        });
+
+    let line = if let Some((value, badge_text, badge_tone)) = badge_layout {
+        let value_len = value.chars().count();
+        let badge_len = badge_text.chars().count();
+        let gap = budget.saturating_sub(value_len.saturating_add(badge_len));
+        Line::from(vec![
+            Span::raw(pad),
+            Span::styled(dot, tone_style),
+            Span::styled(label, ctx.palette.status_label),
+            Span::raw("  "),
+            Span::styled(value, tone_style),
+            Span::raw(" ".repeat(gap)),
+            Span::styled(badge_text, ctx.palette.status(badge_tone)),
+        ])
+    } else {
+        let value = truncate_text(&row.value, budget);
+        Line::from(vec![
+            Span::raw(pad),
+            Span::styled(dot, tone_style),
+            Span::styled(label, ctx.palette.status_label),
+            Span::raw("  "),
+            Span::styled(value, tone_style),
+        ])
+    };
     frame.render_widget(line, area);
 }
 
@@ -1402,6 +1511,7 @@ mod tests {
     use std::path::PathBuf;
     use vdpi::service::{InstalledInfo, LiveEngineStatus, ServiceState};
     use vdpi::update::VersionRelation;
+    use vdpi_core::config::EngineMode;
 
     fn sample_info(
         installed_version: Option<&str>,
@@ -1422,7 +1532,7 @@ mod tests {
             addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: 8080,
             socks_port: Some(1080),
-            version: Some("0.4.1".to_string()),
+            version: Some("0.5.0".to_string()),
             mode: Some("combo".to_string()),
             doh: Some(true),
             block_quic: Some(true),
@@ -1430,22 +1540,34 @@ mod tests {
             total_connections: Some(90),
             learned_hosts: Some(12),
             isp_stage: Some("balanced".to_string()),
+            engine: EngineMode::Proxy,
+            tun_interface: None,
+            physical_nic: None,
+            vpn_conflict: None,
+            udp_flows_active: None,
+            quic_blocked: None,
+            dns_queries: None,
+            rss_kb: None,
         }
     }
 
     fn status_running_live() -> ControlCenterStatus {
         ControlCenterStatus {
-            installed: Some(sample_info(Some("0.4.1"), "0.4.1", VersionRelation::Same)),
+            installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
             service_state: ServiceState::Running,
             live_engine: Some(sample_live_engine()),
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: None,
         }
     }
 
     fn status_paused() -> ControlCenterStatus {
         ControlCenterStatus {
-            installed: Some(sample_info(Some("0.4.1"), "0.4.1", VersionRelation::Same)),
+            installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
             service_state: ServiceState::Stopped,
             live_engine: None,
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: None,
         }
     }
 
@@ -1454,14 +1576,18 @@ mod tests {
             installed: None,
             service_state: ServiceState::NotInstalled,
             live_engine: None,
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: None,
         }
     }
 
     fn status_update_available() -> ControlCenterStatus {
         ControlCenterStatus {
-            installed: Some(sample_info(Some("0.3.0"), "0.4.1", VersionRelation::Newer)),
+            installed: Some(sample_info(Some("0.3.0"), "0.5.0", VersionRelation::Newer)),
             service_state: ServiceState::Running,
             live_engine: Some(sample_live_engine()),
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: None,
         }
     }
 
@@ -1495,11 +1621,11 @@ mod tests {
         assert!(text.contains("vdpi") && text.contains(VERSION_LABEL));
         assert!(text.contains(repo_display()));
         assert!(text.contains("Service"));
-        assert!(text.contains("Running · v0.4.1"));
+        assert!(text.contains("Running · v0.5.0"));
         assert!(text.contains("Anti-DPI"));
         assert!(text.contains("Active · Combo · DoH on · QUIC blocked"));
         assert!(text.contains("Engine"));
-        assert!(text.contains("127.0.0.1:8080 · 4 active · 12 cached hosts"));
+        assert!(text.contains("Proxy · 127.0.0.1:8080"));
 
         for (idx, item) in state.menu.items.iter().enumerate() {
             assert!(
@@ -1518,7 +1644,7 @@ mod tests {
             "missing selected item hint:\n{text}"
         );
         assert!(
-            text.contains("↑↓ move  ·  1-6 select  ·  r refresh  ·  enter confirm  ·  q quit"),
+            text.contains("↑↓ move  ·  1-7 select  ·  r refresh  ·  enter confirm  ·  q quit"),
             "missing full footer:\n{text}"
         );
         assert!(buf
@@ -1537,10 +1663,15 @@ mod tests {
         let buf = render_state(80, 24, &state, true);
         let text = buffer_text(&buf);
 
-        assert!(text.contains("Paused · v0.4.1 (temporarily stopped)"));
-        assert!(text.contains("Offline · system proxies restored"));
+        assert!(text.contains("Paused · v0.5.0 (temporarily stopped)"));
+        assert!(text.contains("Offline · routes & proxies restored"));
         assert!(text.contains("✓ Service paused - system proxies restored."));
-        assert_eq!(state.menu.items.len(), 7);
+        assert_eq!(state.menu.items.len(), 8);
+        assert!(state
+            .menu
+            .items
+            .iter()
+            .any(|item| matches!(item.choice, Choice::SwitchEngine(_))));
         for (idx, item) in state.menu.items.iter().enumerate() {
             assert!(
                 text.contains(&format!("[{}]", idx + 1)),
@@ -1555,8 +1686,8 @@ mod tests {
         }
         assert!(text.contains(&state.menu.items[0].hint));
         assert!(
-            text.contains("↑↓ move  ·  1-7 select  ·  r refresh  ·  enter confirm  ·  q quit"),
-            "missing full 1-7 footer:\n{text}"
+            text.contains("↑↓ move  ·  1-8 select  ·  r refresh  ·  enter confirm  ·  q quit"),
+            "missing full 1-8 footer:\n{text}"
         );
         assert!(buf
             .content()
@@ -1580,19 +1711,19 @@ mod tests {
         let fresh_buf = render_state(80, 24, &fresh, true);
         let fresh_text = buffer_text(&fresh_buf);
         assert!(fresh_text.contains("Not installed"));
-        assert!(fresh_text.contains("Offline · system proxies restored"));
+        assert!(fresh_text.contains("Offline · routes & proxies restored"));
         assert!(fresh_text.contains("Run directly"));
         assert!(fresh_text.contains("Install for automatic startup"));
         assert!(fresh_text.contains("Run diagnostics"));
         assert!(fresh_text.contains("Quit"));
         assert!(fresh_text
-            .contains("↑↓ move  ·  1-4 select  ·  r refresh  ·  enter confirm  ·  q quit"));
+            .contains("↑↓ move  ·  1-5 select  ·  r refresh  ·  enter confirm  ·  q quit"));
 
         let update = UiState::new(&status_update_available(), None);
         let update_buf = render_state(80, 24, &update, true);
         let update_text = buffer_text(&update_buf);
-        assert!(update_text.contains("Running · v0.3.0 -> v0.4.1 update ready"));
-        assert!(update_text.contains("Update installed vdpi (v0.3.0 -> v0.4.1)"));
+        assert!(update_text.contains("Running · v0.3.0 -> v0.5.0 update ready"));
+        assert!(update_text.contains("Update installed vdpi (v0.3.0 -> v0.5.0)"));
         assert!(update_text.contains("Pause background service"));
         assert!(update_text.contains("Uninstall vdpi"));
         assert!(update_buf
@@ -1604,10 +1735,11 @@ mod tests {
         let tall_buf = render_state(80, 32, &fresh, true);
         let tall_text = buffer_text(&tall_buf);
         for item in &fresh.menu.items {
+            let expected_hint = truncate_text(&item.hint, 60);
             assert!(
-                tall_text.contains(&item.hint),
+                tall_text.contains(expected_hint.as_ref()),
                 "tall 80x32 missing hint '{}':\n{tall_text}",
-                item.hint
+                expected_hint
             );
         }
     }
@@ -1617,12 +1749,24 @@ mod tests {
         let mut state = UiState::new(&status_running_live(), None);
         let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
 
-        // Select Uninstall via number key '5' -> enters confirmation instead of finishing.
+        // Select Uninstall via its number key -> enters confirmation instead of finishing.
+        let uninstall_idx = state
+            .menu
+            .items
+            .iter()
+            .position(|i| i.choice == Choice::Uninstall)
+            .expect("running menu includes Uninstall");
+        let uninstall_key = char::from_digit(
+            u32::try_from(uninstall_idx + 1).expect("uninstall badge fits u32"),
+            10,
+        )
+        .expect("uninstall shortcut is single digit");
         assert_eq!(
-            handle_key(&mut state, press(KeyCode::Char('5'))),
+            handle_key(&mut state, press(KeyCode::Char(uninstall_key))),
             Action::Redraw
         );
         assert!(state.confirming_uninstall);
+        assert_eq!(state.selected, uninstall_idx);
 
         let buf = render_state(80, 24, &state, true);
         let text = buffer_text(&buf);
@@ -1632,7 +1776,7 @@ mod tests {
         );
         assert!(
             text.contains("stops the background service")
-                && text.contains("restores system proxies."),
+                && text.contains("restores routes & proxies."),
             "missing confirm body:\n{text}"
         );
         assert!(
@@ -1741,9 +1885,9 @@ mod tests {
         let mut state = UiState::new(&status_paused(), None);
         let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
 
-        // Move to last item (index 6 of 7).
+        // Move to last item (index 7 of 8).
         assert_eq!(handle_key(&mut state, press(KeyCode::End)), Action::Redraw);
-        assert_eq!(state.selected, 6);
+        assert_eq!(state.selected, 7);
 
         // Pressing 'r' or 'R' requests refresh.
         assert_eq!(
@@ -1755,16 +1899,16 @@ mod tests {
             Action::Refresh
         );
 
-        // Apply refresh to NotInstalled (4 items): selection clamps cleanly to 3 and notice updates.
+        // Apply refresh to NotInstalled (5 items): selection clamps cleanly to 4 and notice updates.
         apply_refresh(&mut state, &status_not_installed());
-        assert_eq!(state.selected, 3);
+        assert_eq!(state.selected, 4);
         assert_eq!(state.menu.notice.as_deref(), Some("Status refreshed."));
         assert!(!state.confirming_uninstall);
 
         let buf = render_state(80, 24, &state, true);
         let text = buffer_text(&buf);
         assert!(text.contains("✓ Status refreshed."));
-        assert!(text.contains("▸ [4] Quit"));
+        assert!(text.contains("▸ [5] Quit"));
     }
 
     #[test]
@@ -1866,11 +2010,11 @@ mod tests {
         }
 
         // Verify scrolled selection on a very short framed terminal keeps selected item visible.
-        paused.selected = 6;
+        paused.selected = paused.menu.items.len() - 1;
         let buf = render_state(40, 6, &paused, true);
         let text = buffer_text(&buf);
         assert!(
-            text.contains("▸ [7] Quit"),
+            text.contains("▸ [8] Quit"),
             "expected scrolled item:\n{text}"
         );
     }
@@ -1881,12 +2025,12 @@ mod tests {
         let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
 
         assert_eq!(handle_key(&mut state, press(KeyCode::Up)), Action::Redraw);
-        assert_eq!(state.selected, 3);
+        assert_eq!(state.selected, 4);
         assert_eq!(
             handle_key(&mut state, press(KeyCode::Char('k'))),
             Action::Redraw
         );
-        assert_eq!(state.selected, 2);
+        assert_eq!(state.selected, 3);
         assert_eq!(
             handle_key(
                 &mut state,
@@ -1894,7 +2038,7 @@ mod tests {
             ),
             Action::Redraw
         );
-        assert_eq!(state.selected, 1);
+        assert_eq!(state.selected, 2);
         assert_eq!(handle_key(&mut state, press(KeyCode::Home)), Action::Redraw);
         assert_eq!(state.selected, 0);
         assert_eq!(handle_key(&mut state, press(KeyCode::Down)), Action::Redraw);
@@ -1906,6 +2050,8 @@ mod tests {
         assert_eq!(state.selected, 2);
         assert_eq!(handle_key(&mut state, press(KeyCode::Tab)), Action::Redraw);
         assert_eq!(state.selected, 3);
+        assert_eq!(handle_key(&mut state, press(KeyCode::Tab)), Action::Redraw);
+        assert_eq!(state.selected, 4);
         assert_eq!(handle_key(&mut state, press(KeyCode::Tab)), Action::Redraw);
         assert_eq!(state.selected, 0);
 
@@ -1932,7 +2078,7 @@ mod tests {
             Action::Finish(Choice::Run)
         );
         assert_eq!(
-            handle_key(&mut state, press(KeyCode::Char('3'))),
+            handle_key(&mut state, press(KeyCode::Char('4'))),
             Action::Finish(Choice::Doctor)
         );
         assert_eq!(
@@ -1965,5 +2111,448 @@ mod tests {
 
         assert_eq!(wrap_words("one two three", 7), vec!["one two", "three"]);
         assert!(wrap_words("hello", 0).is_empty());
+
+        assert!(matches!(
+            format_full_badge("[VPN: Mullvad]"),
+            Cow::Borrowed("[VPN: Mullvad]")
+        ));
+        assert_eq!(format_full_badge("VPN: Mullvad"), "[VPN: Mullvad]");
+    }
+
+    fn tun_vpn_state() -> UiState {
+        UiState {
+            menu: LauncherMenu {
+                status_rows: vec![
+                    StatusRow {
+                        label: "Service".to_string(),
+                        value: "Running · v0.5.0".to_string(),
+                        tone: StatusTone::Active,
+                        badge: None,
+                    },
+                    StatusRow {
+                        label: "Anti-DPI".to_string(),
+                        value: "Active · Combo · DoH on · QUIC blocked".to_string(),
+                        tone: StatusTone::Active,
+                        badge: None,
+                    },
+                    StatusRow {
+                        label: "Engine".to_string(),
+                        value: "TUN · 4 active · 12 cached hosts".to_string(),
+                        tone: StatusTone::Warning,
+                        badge: Some(("[VPN: Mullvad]".to_string(), StatusTone::Warning)),
+                    },
+                ],
+                notice: None,
+                items: vec![
+                    MenuItem {
+                        choice: Choice::PauseService,
+                        title: "Pause background service".to_string(),
+                        hint: "Temporarily stops vdpi and restores routing.".to_string(),
+                    },
+                    MenuItem {
+                        choice: Choice::SwitchEngine(EngineMode::Proxy),
+                        title: "Switch to Proxy mode".to_string(),
+                        hint: "Use classic local HTTP/SOCKS5 proxy instead of TUN.".to_string(),
+                    },
+                    MenuItem {
+                        choice: Choice::Update,
+                        title: "Check for updates online".to_string(),
+                        hint: "Checks GitHub Releases and updates automatically.".to_string(),
+                    },
+                    MenuItem {
+                        choice: Choice::Doctor,
+                        title: "Run diagnostics".to_string(),
+                        hint: "Tests DNS ring and anti-DPI bypass connectivity.".to_string(),
+                    },
+                    MenuItem {
+                        choice: Choice::Uninstall,
+                        title: "Uninstall vdpi".to_string(),
+                        hint: "Stops service, removes files & PATH, restores routing.".to_string(),
+                    },
+                    MenuItem {
+                        choice: Choice::Cancel,
+                        title: "Quit".to_string(),
+                        hint: "Exit without changing anything.".to_string(),
+                    },
+                ],
+            },
+            selected: 0,
+            confirming_uninstall: false,
+        }
+    }
+
+    fn rightmost_content_col(buf: &Buffer, y: u16) -> Option<u16> {
+        (0..buf.area.width)
+            .rev()
+            .find(|&x| !matches!(buf[(x, y)].symbol(), " " | "│"))
+    }
+
+    #[test]
+    fn renders_tun_with_vpn_badge_at_80x24() {
+        let state = tun_vpn_state();
+        let buf = render_state(80, 24, &state, true);
+        let text = buffer_text(&buf);
+
+        assert!(text.contains("TUN · 4 active · 12 cached hosts"));
+        assert!(text.contains("[VPN: Mullvad]"));
+        assert!(
+            text.contains("↑↓ move  ·  1-6 select  ·  r refresh  ·  enter confirm  ·  q quit"),
+            "footer must remain uncluttered:\n{text}"
+        );
+
+        let header_y = u16::try_from(
+            text.lines()
+                .position(|line| line.contains(repo_display()))
+                .expect("header row"),
+        )
+        .expect("header y fits u16");
+        let engine_y = u16::try_from(
+            text.lines()
+                .position(|line| {
+                    line.contains("Engine")
+                        && line.contains("TUN · 4 active · 12 cached hosts")
+                        && line.contains("[VPN: Mullvad]")
+                })
+                .expect("engine row with full VPN badge"),
+        )
+        .expect("engine y fits u16");
+
+        let header_right = rightmost_content_col(&buf, header_y).expect("header right col");
+        let badge_end = rightmost_content_col(&buf, engine_y).expect("badge right col");
+        assert_eq!(
+            badge_end, header_right,
+            "VPN badge must align flush with right edge:\n{text}"
+        );
+        assert_eq!(buf[(badge_end, engine_y)].symbol(), "]");
+
+        let badge_len = u16::try_from("[VPN: Mullvad]".len()).expect("badge len");
+        let badge_start = badge_end + 1 - badge_len;
+        assert_eq!(buf[(badge_start, engine_y)].symbol(), "[");
+        for x in badge_start..=badge_end {
+            assert_eq!(
+                buf[(x, engine_y)].fg,
+                AMBER_WARN,
+                "badge cell at x={x} must be AMBER_WARN"
+            );
+        }
+    }
+
+    #[test]
+    fn renders_tun_with_compact_vpn_badge_at_46x18_and_omits_when_too_narrow() {
+        let state = tun_vpn_state();
+        let buf = render_state(46, 18, &state, true);
+        let text = buffer_text(&buf);
+
+        assert!(
+            text.contains("TUN · 4 active · 12 …"),
+            "narrow 46x18 should truncate TUN value to budget - 7:\n{text}"
+        );
+        assert!(
+            text.contains("[VPN]"),
+            "narrow 46x18 should render compact [VPN] badge:\n{text}"
+        );
+        assert!(
+            !text.contains("[VPN: Mullvad]"),
+            "narrow 46x18 must not overflow with full badge:\n{text}"
+        );
+
+        let header_y = u16::try_from(
+            text.lines()
+                .position(|line| line.contains(repo_display()))
+                .expect("narrow header row"),
+        )
+        .expect("header y fits u16");
+        let engine_y = u16::try_from(
+            text.lines()
+                .position(|line| line.contains("Engine") && line.contains("[VPN]"))
+                .expect("narrow engine row with compact VPN badge"),
+        )
+        .expect("engine y fits u16");
+
+        assert_eq!(buf[(0, engine_y)].symbol(), "│");
+        assert_eq!(buf[(45, engine_y)].symbol(), "│");
+        let header_right = rightmost_content_col(&buf, header_y).expect("header right col");
+        let badge_end = rightmost_content_col(&buf, engine_y).expect("compact badge end");
+        assert_eq!(badge_end, header_right);
+
+        let badge_len = u16::try_from(COMPACT_VPN_BADGE.len()).expect("compact len");
+        let badge_start = badge_end + 1 - badge_len;
+        assert_eq!(buf[(badge_start, engine_y)].symbol(), "[");
+        assert_eq!(buf[(badge_end, engine_y)].symbol(), "]");
+        for x in badge_start..=badge_end {
+            assert_eq!(buf[(x, engine_y)].fg, AMBER_WARN);
+        }
+
+        // Below budget 18 (width 30 -> inner 26 -> budget 14): badge omits cleanly with intact border.
+        let tiny_buf = render_state(30, 18, &state, true);
+        let tiny_text = buffer_text(&tiny_buf);
+        assert!(tiny_text.contains("Engine"));
+        assert!(
+            !tiny_text.contains("[VPN"),
+            "budget < 18 must omit badge cleanly:\n{tiny_text}"
+        );
+        let tiny_engine_y = u16::try_from(
+            tiny_text
+                .lines()
+                .position(|line| line.contains("Engine"))
+                .expect("tiny engine row"),
+        )
+        .expect("tiny engine y fits u16");
+        assert_eq!(tiny_buf[(29, tiny_engine_y)].symbol(), "│");
+
+        // Degenerate sizes with VPN badge must never panic.
+        for (w, h) in [(28, 10), (20, 7), (14, 5), (12, 4), (8, 3), (4, 1), (0, 0)] {
+            for color in [true, false] {
+                let _ = render_state(w, h, &state, color);
+            }
+        }
+    }
+
+    #[test]
+    fn renders_tun_vpn_badge_and_warning_dot_under_no_color() {
+        let state = tun_vpn_state();
+
+        // 80x24 NO_COLOR: full badge bold, warning dot is "! ", Active rows remain "● ".
+        let buf = render_state(80, 24, &state, false);
+        let text = buffer_text(&buf);
+        assert!(text.contains('┌') && text.contains('└') && !text.contains('╭'));
+        assert!(buf
+            .content()
+            .iter()
+            .all(|c| c.fg == Color::Reset && c.bg == Color::Reset));
+        assert!(
+            text.contains("● Service"),
+            "Active row must keep bullet dot under NO_COLOR:\n{text}"
+        );
+        assert!(
+            text.contains("● Anti-DPI"),
+            "Active row must keep bullet dot under NO_COLOR:\n{text}"
+        );
+        assert!(
+            text.contains("! Engine") && !text.contains("● Engine"),
+            "Warning row must render '! ' indicator under NO_COLOR:\n{text}"
+        );
+        assert!(text.contains("[VPN: Mullvad]"));
+
+        let engine_y = u16::try_from(
+            text.lines()
+                .position(|line| line.contains("! Engine") && line.contains("[VPN: Mullvad]"))
+                .expect("NO_COLOR engine row"),
+        )
+        .expect("engine y fits u16");
+        let bang_col = (0..buf.area.width)
+            .find(|&x| buf[(x, engine_y)].symbol() == "!")
+            .expect("warning bang cell");
+        assert!(buf[(bang_col, engine_y)].modifier.contains(Modifier::BOLD));
+
+        let badge_end = rightmost_content_col(&buf, engine_y).expect("NO_COLOR badge end");
+        let badge_len = u16::try_from("[VPN: Mullvad]".len()).expect("badge len");
+        let badge_start = badge_end + 1 - badge_len;
+        for x in badge_start..=badge_end {
+            assert!(
+                buf[(x, engine_y)].modifier.contains(Modifier::BOLD),
+                "NO_COLOR badge cell at x={x} must be BOLD"
+            );
+        }
+
+        // 46x18 NO_COLOR: compact [VPN] badge bold and "! Engine" warning dot.
+        let narrow_buf = render_state(46, 18, &state, false);
+        let narrow_text = buffer_text(&narrow_buf);
+        assert!(narrow_buf
+            .content()
+            .iter()
+            .all(|c| c.fg == Color::Reset && c.bg == Color::Reset));
+        assert!(narrow_text.contains("! Engine"));
+        assert!(narrow_text.contains("[VPN]") && !narrow_text.contains("[VPN: Mullvad]"));
+        let narrow_engine_y = u16::try_from(
+            narrow_text
+                .lines()
+                .position(|line| line.contains("! Engine") && line.contains("[VPN]"))
+                .expect("narrow NO_COLOR engine row"),
+        )
+        .expect("narrow engine y fits u16");
+        let narrow_end = rightmost_content_col(&narrow_buf, narrow_engine_y).expect("end col");
+        let compact_len = u16::try_from(COMPACT_VPN_BADGE.len()).expect("compact len");
+        for x in (narrow_end + 1 - compact_len)..=narrow_end {
+            assert!(narrow_buf[(x, narrow_engine_y)]
+                .modifier
+                .contains(Modifier::BOLD));
+        }
+
+        // Verify all 4 tones under NO_COLOR: Warning -> "! ", Active/Accent/Neutral -> "● ".
+        let tones_state = UiState {
+            menu: LauncherMenu {
+                status_rows: vec![
+                    StatusRow {
+                        label: "Active".to_string(),
+                        value: "ok".to_string(),
+                        tone: StatusTone::Active,
+                        badge: None,
+                    },
+                    StatusRow {
+                        label: "Accent".to_string(),
+                        value: "update".to_string(),
+                        tone: StatusTone::Accent,
+                        badge: None,
+                    },
+                    StatusRow {
+                        label: "Warn".to_string(),
+                        value: "conflict".to_string(),
+                        tone: StatusTone::Warning,
+                        badge: None,
+                    },
+                    StatusRow {
+                        label: "Neutral".to_string(),
+                        value: "idle".to_string(),
+                        tone: StatusTone::Neutral,
+                        badge: None,
+                    },
+                ],
+                notice: None,
+                items: vec![MenuItem {
+                    choice: Choice::Cancel,
+                    title: "Quit".to_string(),
+                    hint: "Exit.".to_string(),
+                }],
+            },
+            selected: 0,
+            confirming_uninstall: false,
+        };
+        let tones_text = buffer_text(&render_state(80, 24, &tones_state, false));
+        assert!(tones_text.contains("● Active"));
+        assert!(tones_text.contains("● Accent"));
+        assert!(tones_text.contains("! Warn"));
+        assert!(tones_text.contains("● Neutral"));
+    }
+
+    #[test]
+    fn switch_engine_m_hotkey_triggers_only_when_available_and_not_confirming() {
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        let mut state = tun_vpn_state();
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('m'))),
+            Action::Finish(Choice::SwitchEngine(EngineMode::Proxy))
+        );
+        assert_eq!(state.selected, 1);
+
+        state.selected = 0;
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('M'))),
+            Action::Finish(Choice::SwitchEngine(EngineMode::Proxy))
+        );
+        assert_eq!(state.selected, 1);
+
+        // Repeat/Release and modified keys must be ignored.
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            for ch in ['m', 'M'] {
+                assert_eq!(
+                    handle_key(
+                        &mut state,
+                        KeyEvent::new_with_kind(KeyCode::Char(ch), KeyModifiers::NONE, kind)
+                    ),
+                    Action::Ignore
+                );
+            }
+        }
+        assert_eq!(
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL)
+            ),
+            Action::Ignore
+        );
+        assert_eq!(
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT)
+            ),
+            Action::Ignore
+        );
+
+        // Confirm mode must ignore 'm' and 'M'.
+        state.confirming_uninstall = true;
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('m'))),
+            Action::Ignore
+        );
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('M'))),
+            Action::Ignore
+        );
+
+        // Menus without SwitchEngine ignore 'm' and 'M'.
+        let mut no_switch = UiState {
+            menu: LauncherMenu {
+                status_rows: Vec::new(),
+                notice: None,
+                items: vec![
+                    MenuItem {
+                        choice: Choice::Run,
+                        title: "Run directly".to_string(),
+                        hint: "Active while this terminal is open.".to_string(),
+                    },
+                    MenuItem {
+                        choice: Choice::Cancel,
+                        title: "Quit".to_string(),
+                        hint: "Exit.".to_string(),
+                    },
+                ],
+            },
+            selected: 0,
+            confirming_uninstall: false,
+        };
+        assert_eq!(
+            handle_key(&mut no_switch, press(KeyCode::Char('m'))),
+            Action::Ignore
+        );
+        assert_eq!(
+            handle_key(&mut no_switch, press(KeyCode::Char('M'))),
+            Action::Ignore
+        );
+        assert_eq!(no_switch.selected, 0);
+    }
+
+    #[test]
+    fn status_row_uses_badge_tone_and_truncates_vpn_badge_when_budget_at_least_34() {
+        let mut state = tun_vpn_state();
+        // Long provider badge with budget >= 34 truncates to [VPN: <trunc>…] instead of collapsing to [VPN].
+        state.menu.status_rows[2].badge = Some((
+            "VPN: ProtonVPN WireGuard Enterprise".to_string(),
+            StatusTone::Warning,
+        ));
+        let buf = render_state(80, 24, &state, true);
+        let text = buffer_text(&buf);
+        let engine_row = text
+            .lines()
+            .find(|line| line.contains("Engine"))
+            .expect("engine row at 80x24");
+        assert!(
+            engine_row.contains("[VPN: Proton") && engine_row.contains("…]"),
+            "80x24 long VPN badge should truncate with ellipsis before collapsing to [VPN]:\n{text}"
+        );
+        assert!(!engine_row.contains("[VPN]"));
+
+        // Non-warning badge tone renders with palette.status(badge_tone) instead of hardcoded AMBER_WARN.
+        state.menu.status_rows[0].badge = Some(("Update".to_string(), StatusTone::Accent));
+        let accent_buf = render_state(80, 24, &state, true);
+        let accent_text = buffer_text(&accent_buf);
+        let service_y = u16::try_from(
+            accent_text
+                .lines()
+                .position(|line| line.contains("Service") && line.contains("[Update]"))
+                .expect("service row with Accent badge"),
+        )
+        .expect("service y fits u16");
+        let badge_end = rightmost_content_col(&accent_buf, service_y).expect("accent badge end");
+        let badge_len = u16::try_from("[Update]".len()).expect("accent badge len");
+        let badge_start = badge_end + 1 - badge_len;
+        for x in badge_start..=badge_end {
+            assert_eq!(
+                accent_buf[(x, service_y)].fg,
+                ICE_BLUE,
+                "Accent badge cell at x={x} must use ICE_BLUE"
+            );
+        }
     }
 }

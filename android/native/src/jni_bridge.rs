@@ -8,26 +8,43 @@ use jni::JNIEnv;
 use std::os::unix::io::{FromRawFd, OwnedFd};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+const MAX_CONFIG_JSON_BYTES: usize = 256 * 1024;
+
 fn safe_jstring(env: &mut JNIEnv, value: &str) -> jstring {
     if env.exception_check().unwrap_or(false) {
         let _ = env.exception_clear();
     }
-    env.new_string(value)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
-}
-
-fn read_jstring_safe(env: &mut JNIEnv, input: &JString) -> String {
-    if input.is_null() {
-        return String::new();
-    }
-    match env.get_string(input) {
-        Ok(s) => s.into(),
+    match env.new_string(value) {
+        Ok(s) => s.into_raw(),
         Err(_) => {
             if env.exception_check().unwrap_or(false) {
                 let _ = env.exception_clear();
             }
-            String::new()
+            std::ptr::null_mut()
+        }
+    }
+}
+
+fn read_jstring_safe(env: &mut JNIEnv, input: &JString) -> Result<String, &'static str> {
+    if input.is_null() {
+        return Err("config JSON string is null");
+    }
+    match env.get_string(input) {
+        Ok(s) => {
+            if s.to_bytes().len() > MAX_CONFIG_JSON_BYTES {
+                return Err("config JSON exceeds 256 KiB limit");
+            }
+            let owned: String = s.into();
+            if owned.len() > MAX_CONFIG_JSON_BYTES {
+                return Err("config JSON exceeds 256 KiB limit");
+            }
+            Ok(owned)
+        }
+        Err(_) => {
+            if env.exception_check().unwrap_or(false) {
+                let _ = env.exception_clear();
+            }
+            Err("failed to read JNI config JSON string")
         }
     }
 }
@@ -41,9 +58,9 @@ pub extern "system" fn Java_com_vulninc_vdpi_engine_NativeEngine_nativeStart(
 ) -> jstring {
     // Adopt TUN fd ownership immediately before any fallible JNI call so every
     // early error return or panic automatically closes the detached fd via Drop.
-    let owned_fd = if tun_fd >= 0 {
-        // SAFETY: `tun_fd` is non-negative and exclusively detached by Android's
-        // `ParcelFileDescriptor.detachFd()` for transfer into native ownership.
+    let owned_fd = if tun_fd > 2 {
+        // SAFETY: `tun_fd` is greater than stdio fds (0, 1, 2) and exclusively detached by
+        // Android's `ParcelFileDescriptor.detachFd()` for transfer into native ownership.
         Some(unsafe { OwnedFd::from_raw_fd(tun_fd) })
     } else {
         None
@@ -53,7 +70,10 @@ pub extern "system" fn Java_com_vulninc_vdpi_engine_NativeEngine_nativeStart(
         let Some(fd) = owned_fd else {
             return format!("invalid TUN file descriptor: {tun_fd}");
         };
-        let raw_cfg = read_jstring_safe(&mut env, &config_json);
+        let raw_cfg = match read_jstring_safe(&mut env, &config_json) {
+            Ok(s) => s,
+            Err(msg) => return msg.to_string(),
+        };
         let cfg = match AndroidConfig::from_json_str(&raw_cfg) {
             Ok(c) => c,
             Err(e) => return format!("invalid config JSON: {e}"),
@@ -96,7 +116,10 @@ pub extern "system" fn Java_com_vulninc_vdpi_engine_NativeEngine_nativeRunDoctor
     config_json: JString,
 ) -> jstring {
     let payload = catch_unwind(AssertUnwindSafe(|| {
-        let raw_cfg = read_jstring_safe(&mut env, &config_json);
+        let raw_cfg = match read_jstring_safe(&mut env, &config_json) {
+            Ok(s) => s,
+            Err(_) => return r#"{"ok":false,"checks":[]}"#.to_string(),
+        };
         run_doctor_json(&raw_cfg)
     }))
     .unwrap_or_else(|_| r#"{"ok":false,"checks":[]}"#.to_string());

@@ -1,9 +1,10 @@
 pub mod config;
+pub mod device;
 pub mod doctor;
 pub mod events;
 #[cfg(unix)]
 pub mod fd;
-mod packet;
+pub mod packet;
 pub mod pipeline;
 
 use crate::config::TunnelConfig;
@@ -13,20 +14,32 @@ use anyhow::Result;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Instant;
 use tracing::debug;
-use vdpi::desync::EngineContext;
+use vdpi_core::binder::OutboundBinder;
+use vdpi_core::desync::EngineContext;
 
 /// Builds an [`EngineContext`] from a mobile [`TunnelConfig`], attaching and pre-loading
 /// the persistent adaptive stage cache file whenever `config.cache_path` is provided.
 pub async fn build_engine_context(config: TunnelConfig) -> Result<EngineContext> {
+    build_engine_context_with_binder(config, None).await
+}
+
+/// Builds an [`EngineContext`] from a [`TunnelConfig`] with an optional outbound socket
+/// [`OutboundBinder`], attaching and pre-loading the persistent adaptive stage cache file
+/// whenever `config.cache_path` is provided.
+pub async fn build_engine_context_with_binder(
+    config: TunnelConfig,
+    binder: Option<Arc<dyn OutboundBinder>>,
+) -> Result<EngineContext> {
     let cache_path = config
         .cache_path
         .as_deref()
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .map(PathBuf::from);
-    let ctx = EngineContext::new(config.into_runtime_config())?;
+    let ctx = EngineContext::new_with_binder(config.into_runtime_config(), binder)?;
     if let Some(path) = cache_path {
         ctx.attach_cache_file(path).await;
     }
@@ -124,7 +137,20 @@ impl TelemetrySnapshot {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
-    use vdpi::desync::LearnedStrategy;
+    use vdpi_core::binder::NoopBinder;
+    use vdpi_core::desync::LearnedStrategy;
+
+    #[tokio::test]
+    async fn build_engine_context_with_binder_attaches_outbound_binder() {
+        let binder: Arc<dyn OutboundBinder> = Arc::new(NoopBinder);
+        let ctx_bound = build_engine_context_with_binder(TunnelConfig::default(), Some(binder))
+            .await
+            .unwrap();
+        assert!(ctx_bound.outbound_binder.is_some());
+
+        let ctx_default = build_engine_context(TunnelConfig::default()).await.unwrap();
+        assert!(ctx_default.outbound_binder.is_none());
+    }
 
     #[tokio::test]
     async fn build_engine_context_attaches_and_flushes_persisted_cache() {
@@ -146,7 +172,7 @@ mod tests {
         assert!(ctx1.has_cache_file().await);
         {
             let mut guard = ctx1.adaptive_cache.write().await;
-            guard.insert("discord.com".to_string(), LearnedStrategy::MultiRecordOob);
+            guard.insert("discord.com".to_string(), LearnedStrategy::FineFragment);
             ctx1.telemetry
                 .learned_hosts
                 .store(guard.len(), Ordering::Relaxed);
@@ -166,7 +192,7 @@ mod tests {
         assert_eq!(ctx2.preferred_stage(), LearnedStrategy::MultiRecordOob);
         assert_eq!(
             ctx2.adaptive_cache.read().await.get("discord.com").copied(),
-            Some(LearnedStrategy::MultiRecordOob)
+            Some(LearnedStrategy::FineFragment)
         );
 
         let _ = std::fs::remove_dir_all(&dir);

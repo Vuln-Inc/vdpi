@@ -4,6 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use vdpi::config::EngineMode;
 use vdpi::server::REPOSITORY_URL;
 use vdpi::service::{ControlCenterStatus, InstalledInfo, LiveEngineStatus, ServiceState};
 use vdpi::update::VersionRelation;
@@ -22,6 +23,7 @@ pub enum Choice {
     Update,
     PauseService,
     ResumeService,
+    SwitchEngine(EngineMode),
     Doctor,
     Uninstall,
     Cancel,
@@ -42,6 +44,7 @@ pub(super) struct StatusRow {
     pub value: String,
     #[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
     pub tone: StatusTone,
+    pub badge: Option<(String, StatusTone)>,
 }
 
 impl StatusRow {
@@ -50,7 +53,13 @@ impl StatusRow {
             label: label.into(),
             value: value.into(),
             tone,
+            badge: None,
         }
+    }
+
+    fn with_badge(mut self, badge: Option<(String, StatusTone)>) -> Self {
+        self.badge = badge;
+        self
     }
 }
 
@@ -186,6 +195,19 @@ fn build_service_status_row(status: &ControlCenterStatus) -> StatusRow {
     }
 }
 
+const fn engine_label(engine: EngineMode) -> &'static str {
+    match engine {
+        EngineMode::Tun => "TUN",
+        EngineMode::Proxy => "Proxy",
+    }
+}
+
+fn format_rss_mb(rss_kb: Option<u64>) -> Option<String> {
+    let kb = rss_kb.filter(|&kb| kb > 0)?;
+    let mb = (kb.saturating_add(512) / 1024).max(1);
+    Some(format!("{mb} MB"))
+}
+
 fn build_anti_dpi_row(live: &LiveEngineStatus) -> StatusRow {
     let mut parts: Vec<String> = Vec::new();
     if let Some(mode) = live
@@ -210,51 +232,104 @@ fn build_anti_dpi_row(live: &LiveEngineStatus) -> StatusRow {
     }
 
     let value = if parts.is_empty() {
-        format!("Active · {}", SocketAddr::new(live.addr, live.port))
+        if live.engine == EngineMode::Tun {
+            "Active".to_string()
+        } else {
+            format!("Active · {}", SocketAddr::new(live.addr, live.port))
+        }
     } else {
         format!("Active · {}", parts.join(" · "))
     };
     StatusRow::new("Anti-DPI", value, StatusTone::Active)
 }
 
-fn build_engine_row(live: &LiveEngineStatus) -> StatusRow {
-    let mut parts = vec![SocketAddr::new(live.addr, live.port).to_string()];
-    if let Some(active) = live.active_connections {
-        parts.push(format!("{active} active"));
-    }
-    if let Some(hosts) = live.learned_hosts {
-        let label = if hosts == 1 {
-            "cached host"
-        } else {
-            "cached hosts"
+fn build_engine_row(status: &ControlCenterStatus) -> StatusRow {
+    let badge = status
+        .live_engine
+        .as_ref()
+        .and_then(|l| l.vpn_conflict.as_deref())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            status
+                .vpn_conflict
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+        })
+        .map(|v| (format!("VPN: {v}"), StatusTone::Warning));
+
+    if let Some(live) = status.live_engine.as_ref() {
+        let value = match live.engine {
+            EngineMode::Tun => {
+                let mut parts = vec!["TUN".to_string()];
+                if let Some(iface) = live
+                    .tun_interface
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    parts.push(iface.to_string());
+                }
+                if let Some(nic) = live
+                    .physical_nic
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    parts.push(nic.to_string());
+                }
+                if let Some(rss) = format_rss_mb(live.rss_kb) {
+                    let current_len: usize = parts.iter().map(|p| p.chars().count()).sum::<usize>()
+                        + parts.len().saturating_sub(1) * 3;
+                    let max_len = if badge.is_some() { 38 } else { 48 };
+                    if current_len + 3 + rss.len() <= max_len {
+                        parts.push(rss);
+                    }
+                }
+                parts.join(" · ")
+            }
+            EngineMode::Proxy => format!("Proxy · {}", SocketAddr::new(live.addr, live.port)),
         };
-        parts.push(format!("{hosts} {label}"));
+
+        return StatusRow::new("Engine", value, StatusTone::Active).with_badge(badge);
     }
-    StatusRow::new("Engine", parts.join(" · "), StatusTone::Neutral)
+
+    let label = engine_label(status.configured_engine);
+    let state_suffix = match status.service_state {
+        ServiceState::Stopped => "paused",
+        ServiceState::Running | ServiceState::NotInstalled => "selected",
+    };
+    StatusRow::new(
+        "Engine",
+        format!("{label} ({state_suffix})"),
+        StatusTone::Neutral,
+    )
+    .with_badge(badge)
 }
 
 fn build_status_rows(status: &ControlCenterStatus) -> Vec<StatusRow> {
-    let mut rows = Vec::with_capacity(3);
-    rows.push(build_service_status_row(status));
-
-    if let Some(live) = status.live_engine.as_ref() {
-        rows.push(build_anti_dpi_row(live));
-        rows.push(build_engine_row(live));
+    let anti_dpi_row = if let Some(live) = status.live_engine.as_ref() {
+        build_anti_dpi_row(live)
     } else if status.service_state == ServiceState::Running {
-        rows.push(StatusRow::new(
+        StatusRow::new(
             "Anti-DPI",
             "Starting or listening on custom port",
             StatusTone::Warning,
-        ));
+        )
     } else {
-        rows.push(StatusRow::new(
+        StatusRow::new(
             "Anti-DPI",
-            "Offline · system proxies restored",
+            "Offline · routes & proxies restored",
             StatusTone::Neutral,
-        ));
-    }
+        )
+    };
 
-    rows
+    vec![
+        build_service_status_row(status),
+        build_engine_row(status),
+        anti_dpi_row,
+    ]
 }
 
 fn pause_or_resume_item(service_state: ServiceState) -> Option<MenuItem> {
@@ -262,12 +337,12 @@ fn pause_or_resume_item(service_state: ServiceState) -> Option<MenuItem> {
         ServiceState::Running => Some(MenuItem::new(
             Choice::PauseService,
             "Pause background service",
-            "Temporarily stops vdpi and restores system proxies.",
+            "Temporarily stops vdpi and restores routes & proxies.",
         )),
         ServiceState::Stopped => Some(MenuItem::new(
             Choice::ResumeService,
             "Resume background service",
-            "Starts the installed service and re-enables proxies.",
+            "Starts the service and re-enables routes & proxies.",
         )),
         ServiceState::NotInstalled => None,
     }
@@ -277,22 +352,48 @@ fn uninstall_item() -> MenuItem {
     MenuItem::new(
         Choice::Uninstall,
         "Uninstall vdpi",
-        "Stops service, removes files & PATH, restores proxies.",
+        "Stops service, removes files & PATH, restores routes & proxies.",
     )
+}
+
+fn active_or_configured_engine(status: &ControlCenterStatus) -> EngineMode {
+    status
+        .live_engine
+        .as_ref()
+        .map_or(status.configured_engine, |live| live.engine)
+}
+
+fn switch_engine_item(current: EngineMode) -> MenuItem {
+    match current {
+        EngineMode::Proxy => MenuItem::new(
+            Choice::SwitchEngine(EngineMode::Tun),
+            "Switch to TUN mode",
+            "Transparent system-wide anti-DPI via vdpi0 - no proxy setup or browser restarts.",
+        ),
+        EngineMode::Tun => MenuItem::new(
+            Choice::SwitchEngine(EngineMode::Proxy),
+            "Switch to Proxy mode",
+            "Classic local HTTP/SOCKS5 proxy - lightweight, no virtual adapter, VPN-friendly.",
+        ),
+    }
 }
 
 fn quit_item() -> MenuItem {
     MenuItem::new(Choice::Cancel, "Quit", "Exit without changing anything.")
 }
 
-fn build_same_version_items(service_state: ServiceState) -> Vec<MenuItem> {
+fn build_same_version_items(
+    service_state: ServiceState,
+    current_engine: EngineMode,
+) -> Vec<MenuItem> {
     match service_state {
         ServiceState::Running => vec![
             MenuItem::new(
                 Choice::PauseService,
                 "Pause background service",
-                "Temporarily stops vdpi and restores system proxies.",
+                "Temporarily stops vdpi and restores routes & proxies.",
             ),
+            switch_engine_item(current_engine),
             MenuItem::new(
                 Choice::Update,
                 "Check for updates online",
@@ -315,8 +416,9 @@ fn build_same_version_items(service_state: ServiceState) -> Vec<MenuItem> {
             MenuItem::new(
                 Choice::ResumeService,
                 "Resume background service",
-                "Starts the installed service and re-enables proxies.",
+                "Starts the service and re-enables routes & proxies.",
             ),
+            switch_engine_item(current_engine),
             MenuItem::new(
                 Choice::Run,
                 "Run directly (this session)",
@@ -346,6 +448,7 @@ fn build_same_version_items(service_state: ServiceState) -> Vec<MenuItem> {
                 "Reinstall / repair service",
                 "Rewrites the background service and restarts it.",
             ),
+            switch_engine_item(current_engine),
             MenuItem::new(
                 Choice::Run,
                 "Run directly (this session)",
@@ -373,6 +476,7 @@ pub(super) fn build_menu(status: &ControlCenterStatus, notice: Option<&str>) -> 
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    let current_engine = active_or_configured_engine(status);
 
     let items = match (status.installed.as_ref(), status.service_state) {
         (None, ServiceState::NotInstalled) => vec![
@@ -381,6 +485,7 @@ pub(super) fn build_menu(status: &ControlCenterStatus, notice: Option<&str>) -> 
                 "Run directly",
                 "Active while this terminal is open.",
             ),
+            switch_engine_item(current_engine),
             MenuItem::new(
                 Choice::Install,
                 "Install for automatic startup",
@@ -393,12 +498,12 @@ pub(super) fn build_menu(status: &ControlCenterStatus, notice: Option<&str>) -> 
             ),
             quit_item(),
         ],
-        (None, service_state) => build_same_version_items(service_state),
+        (None, service_state) => build_same_version_items(service_state, current_engine),
         (Some(info), service_state) => match info.relation {
             VersionRelation::Newer => {
                 let old = info.installed_version.as_deref().unwrap_or("unknown");
                 let new = info.current_version;
-                let mut items = Vec::with_capacity(5);
+                let mut items = Vec::with_capacity(6);
                 items.push(MenuItem::new(
                     Choice::Install,
                     format!("Update installed vdpi (v{old} -> v{new})"),
@@ -407,6 +512,7 @@ pub(super) fn build_menu(status: &ControlCenterStatus, notice: Option<&str>) -> 
                 if let Some(toggle) = pause_or_resume_item(service_state) {
                     items.push(toggle);
                 }
+                items.push(switch_engine_item(current_engine));
                 items.push(MenuItem::new(
                     Choice::Run,
                     "Run directly without updating",
@@ -416,11 +522,11 @@ pub(super) fn build_menu(status: &ControlCenterStatus, notice: Option<&str>) -> 
                 items.push(quit_item());
                 items
             }
-            VersionRelation::Same => build_same_version_items(service_state),
+            VersionRelation::Same => build_same_version_items(service_state, current_engine),
             VersionRelation::Older => {
                 let inst = info.installed_version.as_deref().unwrap_or("newer");
                 let cur = info.current_version;
-                let mut items = Vec::with_capacity(5);
+                let mut items = Vec::with_capacity(6);
                 items.push(MenuItem::new(
                     Choice::Run,
                     "Run directly",
@@ -429,6 +535,7 @@ pub(super) fn build_menu(status: &ControlCenterStatus, notice: Option<&str>) -> 
                 if let Some(toggle) = pause_or_resume_item(service_state) {
                     items.push(toggle);
                 }
+                items.push(switch_engine_item(current_engine));
                 items.push(MenuItem::new(
                     Choice::Install,
                     format!("Downgrade installed vdpi (v{inst} -> v{cur})"),
@@ -440,7 +547,7 @@ pub(super) fn build_menu(status: &ControlCenterStatus, notice: Option<&str>) -> 
             }
             VersionRelation::Unknown => {
                 let cur = info.current_version;
-                let mut items = Vec::with_capacity(5);
+                let mut items = Vec::with_capacity(6);
                 items.push(MenuItem::new(
                     Choice::Install,
                     format!("Update / repair installed vdpi (to v{cur})"),
@@ -449,6 +556,7 @@ pub(super) fn build_menu(status: &ControlCenterStatus, notice: Option<&str>) -> 
                 if let Some(toggle) = pause_or_resume_item(service_state) {
                     items.push(toggle);
                 }
+                items.push(switch_engine_item(current_engine));
                 items.push(MenuItem::new(
                     Choice::Run,
                     "Run directly",
@@ -495,7 +603,7 @@ where
 
     let mut latest_status = status.clone();
     let selected = if io::stdin().is_terminal() && io::stdout().is_terminal() {
-        let tracked_refresh = || {
+        let mut tracked_refresh = || {
             let refreshed = refresh();
             latest_status = refreshed.clone();
             refreshed
@@ -508,12 +616,21 @@ where
                     io::stderr().lock(),
                     status,
                     notice,
-                    tracked_refresh,
+                    &mut tracked_refresh,
                 )?
             } else {
                 let color = env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
-                tui::choose(color, status, notice, tracked_refresh)
-                    .context("running the terminal launcher")?
+                match tui::choose(color, status, notice, &mut tracked_refresh) {
+                    Ok(choice) => choice,
+                    Err(_) => read_choice(
+                        io::stdin().lock(),
+                        io::stderr().lock(),
+                        status,
+                        notice,
+                        &mut tracked_refresh,
+                    )
+                    .context("running the terminal launcher")?,
+                }
             }
         }
         #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -523,7 +640,7 @@ where
                 io::stderr().lock(),
                 status,
                 notice,
-                tracked_refresh,
+                &mut tracked_refresh,
             )?
         }
     } else if explicit {
@@ -608,7 +725,7 @@ pub fn uninstall_finished(result: &Result<()>) {
     if io::stdin().is_terminal() && has_own_console() {
         match result {
             Ok(()) => {
-                eprintln!("\n  vdpi has been uninstalled and system proxies restored.");
+                eprintln!("\n  vdpi has been uninstalled and routes & proxies restored.");
                 eprintln!("  GitHub: {REPOSITORY_URL}");
             }
             Err(error) => eprintln!("\n  Uninstall did not finish: {error:#}"),
@@ -664,7 +781,11 @@ fn print_console_menu(output: &mut impl Write, menu: &LauncherMenu) -> io::Resul
         env!("CARGO_PKG_VERSION")
     )?;
     for row in &menu.status_rows {
-        writeln!(output, "  {:<8}  {}", row.label, row.value)?;
+        if let Some((badge, _)) = &row.badge {
+            writeln!(output, "  {:<8}  {}  [{badge}]", row.label, row.value)?;
+        } else {
+            writeln!(output, "  {:<8}  {}", row.label, row.value)?;
+        }
     }
     if let Some(notice) = &menu.notice {
         writeln!(output, "  Notice    {notice}")?;
@@ -728,6 +849,15 @@ where
             print_console_menu(&mut output, &menu)?;
             continue;
         }
+        if trimmed.eq_ignore_ascii_case("m") {
+            if let Some(item) = menu
+                .items
+                .iter()
+                .find(|item| matches!(item.choice, Choice::SwitchEngine(_)))
+            {
+                return Ok(item.choice);
+            }
+        }
         if let Some(item) = trimmed
             .parse::<usize>()
             .ok()
@@ -737,7 +867,7 @@ where
             if item.choice == Choice::Uninstall {
                 write!(
                     output,
-                    "  Confirm uninstall? This stops the service, removes files & PATH, and restores proxies. [y/N]: "
+                    "  Confirm uninstall? This stops the service, removes files & PATH, and restores routes & proxies. [y/N]: "
                 )?;
                 output.flush()?;
                 answer.clear();
@@ -779,12 +909,12 @@ mod tests {
         }
     }
 
-    fn sample_live_engine() -> LiveEngineStatus {
+    fn sample_live_proxy_engine() -> LiveEngineStatus {
         LiveEngineStatus {
             addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: 8080,
             socks_port: Some(1080),
-            version: Some("0.4.1".to_string()),
+            version: Some("0.5.0".to_string()),
             mode: Some("combo".to_string()),
             doh: Some(true),
             block_quic: Some(true),
@@ -792,6 +922,38 @@ mod tests {
             total_connections: Some(42),
             learned_hosts: Some(7),
             isp_stage: Some("balanced".to_string()),
+            engine: EngineMode::Proxy,
+            tun_interface: None,
+            physical_nic: None,
+            vpn_conflict: None,
+            udp_flows_active: None,
+            quic_blocked: None,
+            dns_queries: None,
+            rss_kb: Some(14_336),
+        }
+    }
+
+    fn sample_live_tun_engine() -> LiveEngineStatus {
+        LiveEngineStatus {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 18089,
+            socks_port: None,
+            version: Some("0.5.0".to_string()),
+            mode: Some("combo".to_string()),
+            doh: Some(true),
+            block_quic: Some(true),
+            active_connections: Some(5),
+            total_connections: Some(120),
+            learned_hosts: Some(9),
+            isp_stage: Some("balanced".to_string()),
+            engine: EngineMode::Tun,
+            tun_interface: Some("vdpi0".to_string()),
+            physical_nic: Some("Ethernet".to_string()),
+            vpn_conflict: None,
+            udp_flows_active: Some(12),
+            quic_blocked: Some(42),
+            dns_queries: Some(89),
+            rss_kb: Some(16_384),
         }
     }
 
@@ -808,6 +970,14 @@ mod tests {
             total_connections: None,
             learned_hosts: None,
             isp_stage: None,
+            engine: EngineMode::Proxy,
+            tun_interface: None,
+            physical_nic: None,
+            vpn_conflict: None,
+            udp_flows_active: None,
+            quic_blocked: None,
+            dns_queries: None,
+            rss_kb: None,
         }
     }
 
@@ -816,6 +986,8 @@ mod tests {
             installed: None,
             service_state: ServiceState::NotInstalled,
             live_engine: None,
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: None,
         }
     }
 
@@ -823,36 +995,65 @@ mod tests {
     fn build_menu_fresh_install() {
         let menu = build_menu(&fresh_status(), None);
         assert_eq!(menu.notice, None);
-        assert_eq!(menu.status_rows.len(), 2);
+        assert_eq!(menu.status_rows.len(), 3);
         assert_eq!(
             menu.status_rows[0],
             StatusRow::new("Service", "Not installed", StatusTone::Neutral)
         );
         assert_eq!(
             menu.status_rows[1],
+            StatusRow::new("Engine", "Proxy (selected)", StatusTone::Neutral)
+        );
+        assert_eq!(
+            menu.status_rows[2],
             StatusRow::new(
                 "Anti-DPI",
-                "Offline · system proxies restored",
+                "Offline · routes & proxies restored",
                 StatusTone::Neutral
             )
         );
-        assert_eq!(menu.items.len(), 4);
+        assert_eq!(menu.items.len(), 5);
         assert_eq!(menu.items[0].choice, Choice::Run);
         assert_eq!(menu.items[0].title, "Run directly");
-        assert_eq!(menu.items[1].choice, Choice::Install);
-        assert_eq!(menu.items[1].title, "Install for automatic startup");
-        assert_eq!(menu.items[2].choice, Choice::Doctor);
-        assert_eq!(menu.items[2].title, "Run diagnostics");
-        assert_eq!(menu.items[3].choice, Choice::Cancel);
-        assert_eq!(menu.items[3].title, "Quit");
+        assert_eq!(menu.items[1].choice, Choice::SwitchEngine(EngineMode::Tun));
+        assert_eq!(menu.items[1].title, "Switch to TUN mode");
+        assert_eq!(
+            menu.items[1].hint,
+            "Transparent system-wide anti-DPI via vdpi0 - no proxy setup or browser restarts."
+        );
+        assert_eq!(menu.items[2].choice, Choice::Install);
+        assert_eq!(menu.items[2].title, "Install for automatic startup");
+        assert_eq!(menu.items[3].choice, Choice::Doctor);
+        assert_eq!(menu.items[3].title, "Run diagnostics");
+        assert_eq!(menu.items[4].choice, Choice::Cancel);
+        assert_eq!(menu.items[4].title, "Quit");
+
+        let mut fresh_tun = fresh_status();
+        fresh_tun.configured_engine = EngineMode::Tun;
+        let tun_menu = build_menu(&fresh_tun, None);
+        assert_eq!(
+            tun_menu.status_rows[1],
+            StatusRow::new("Engine", "TUN (selected)", StatusTone::Neutral)
+        );
+        assert_eq!(
+            tun_menu.items[1].choice,
+            Choice::SwitchEngine(EngineMode::Proxy)
+        );
+        assert_eq!(tun_menu.items[1].title, "Switch to Proxy mode");
+        assert_eq!(
+            tun_menu.items[1].hint,
+            "Classic local HTTP/SOCKS5 proxy - lightweight, no virtual adapter, VPN-friendly."
+        );
     }
 
     #[test]
-    fn build_menu_running_with_live_engine_and_minimal_fallback() {
+    fn build_menu_running_proxy_mode_and_minimal_fallback() {
         let status = ControlCenterStatus {
-            installed: Some(sample_info(Some("0.4.1"), "0.4.1", VersionRelation::Same)),
+            installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
             service_state: ServiceState::Running,
-            live_engine: Some(sample_live_engine()),
+            live_engine: Some(sample_live_proxy_engine()),
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: None,
         };
         let menu = build_menu(&status, Some("Service resumed - anti-DPI active."));
         assert_eq!(
@@ -862,10 +1063,14 @@ mod tests {
         assert_eq!(menu.status_rows.len(), 3);
         assert_eq!(
             menu.status_rows[0],
-            StatusRow::new("Service", "Running · v0.4.1", StatusTone::Active)
+            StatusRow::new("Service", "Running · v0.5.0", StatusTone::Active)
         );
         assert_eq!(
             menu.status_rows[1],
+            StatusRow::new("Engine", "Proxy · 127.0.0.1:8080", StatusTone::Active)
+        );
+        assert_eq!(
+            menu.status_rows[2],
             StatusRow::new(
                 "Anti-DPI",
                 "Active · Combo · DoH on · QUIC blocked",
@@ -873,17 +1078,10 @@ mod tests {
             )
         );
         assert_eq!(
-            menu.status_rows[2],
-            StatusRow::new(
-                "Engine",
-                "127.0.0.1:8080 · 3 active · 7 cached hosts",
-                StatusTone::Neutral
-            )
-        );
-        assert_eq!(
             menu.items.iter().map(|i| i.choice).collect::<Vec<_>>(),
             vec![
                 Choice::PauseService,
+                Choice::SwitchEngine(EngineMode::Tun),
                 Choice::Update,
                 Choice::Doctor,
                 Choice::Install,
@@ -892,30 +1090,54 @@ mod tests {
             ]
         );
 
+        let mut proxy_with_vpn = sample_live_proxy_engine();
+        proxy_with_vpn.vpn_conflict = Some("WireGuard".to_string());
+        let vpn_proxy_status = ControlCenterStatus {
+            installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
+            service_state: ServiceState::Running,
+            live_engine: Some(proxy_with_vpn),
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: None,
+        };
+        let vpn_proxy_menu = build_menu(&vpn_proxy_status, None);
+        assert_eq!(
+            vpn_proxy_menu.status_rows[1],
+            StatusRow::new("Engine", "Proxy · 127.0.0.1:8080", StatusTone::Active)
+                .with_badge(Some(("VPN: WireGuard".to_string(), StatusTone::Warning)))
+        );
+
         let minimal_status = ControlCenterStatus {
-            installed: Some(sample_info(Some("0.4.1"), "0.4.1", VersionRelation::Same)),
+            installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
             service_state: ServiceState::Running,
             live_engine: Some(sample_minimal_live_engine()),
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: None,
         };
         let minimal_menu = build_menu(&minimal_status, None);
         assert_eq!(
             minimal_menu.status_rows[1],
-            StatusRow::new("Anti-DPI", "Active · 127.0.0.1:8080", StatusTone::Active)
+            StatusRow::new("Engine", "Proxy · 127.0.0.1:8080", StatusTone::Active)
         );
         assert_eq!(
             minimal_menu.status_rows[2],
-            StatusRow::new("Engine", "127.0.0.1:8080", StatusTone::Neutral)
+            StatusRow::new("Anti-DPI", "Active · 127.0.0.1:8080", StatusTone::Active)
         );
 
         let custom_port_status = ControlCenterStatus {
-            installed: Some(sample_info(Some("0.4.1"), "0.4.1", VersionRelation::Same)),
+            installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
             service_state: ServiceState::Running,
             live_engine: None,
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: None,
         };
         let custom_menu = build_menu(&custom_port_status, None);
-        assert_eq!(custom_menu.status_rows.len(), 2);
+        assert_eq!(custom_menu.status_rows.len(), 3);
         assert_eq!(
             custom_menu.status_rows[1],
+            StatusRow::new("Engine", "Proxy (selected)", StatusTone::Neutral)
+        );
+        assert_eq!(
+            custom_menu.status_rows[2],
             StatusRow::new(
                 "Anti-DPI",
                 "Starting or listening on custom port",
@@ -925,27 +1147,129 @@ mod tests {
     }
 
     #[test]
+    fn build_menu_running_tun_mode_and_vpn_badge() {
+        let tun_status = ControlCenterStatus {
+            installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
+            service_state: ServiceState::Running,
+            live_engine: Some(sample_live_tun_engine()),
+            configured_engine: EngineMode::Tun,
+            vpn_conflict: None,
+        };
+        let tun_menu = build_menu(&tun_status, None);
+        assert_eq!(tun_menu.status_rows.len(), 3);
+        assert_eq!(
+            tun_menu.status_rows[0],
+            StatusRow::new("Service", "Running · v0.5.0", StatusTone::Active)
+        );
+        assert_eq!(
+            tun_menu.status_rows[1],
+            StatusRow::new(
+                "Engine",
+                "TUN · vdpi0 · Ethernet · 16 MB",
+                StatusTone::Active
+            )
+        );
+        assert_eq!(
+            tun_menu.status_rows[2],
+            StatusRow::new(
+                "Anti-DPI",
+                "Active · Combo · DoH on · QUIC blocked",
+                StatusTone::Active
+            )
+        );
+        assert_eq!(
+            tun_menu.items[1],
+            MenuItem::new(
+                Choice::SwitchEngine(EngineMode::Proxy),
+                "Switch to Proxy mode",
+                "Classic local HTTP/SOCKS5 proxy - lightweight, no virtual adapter, VPN-friendly.",
+            )
+        );
+
+        // TUN without RSS reports interface + uplink cleanly.
+        let mut no_rss_tun = sample_live_tun_engine();
+        no_rss_tun.rss_kb = None;
+        let no_rss_status = ControlCenterStatus {
+            installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
+            service_state: ServiceState::Running,
+            live_engine: Some(no_rss_tun),
+            configured_engine: EngineMode::Tun,
+            vpn_conflict: None,
+        };
+        assert_eq!(
+            build_menu(&no_rss_status, None).status_rows[1],
+            StatusRow::new("Engine", "TUN · vdpi0 · Ethernet", StatusTone::Active)
+        );
+
+        // TUN + VPN conflict attaches a warning badge.
+        let mut vpn_tun = sample_live_tun_engine();
+        vpn_tun.vpn_conflict = Some("Mullvad".to_string());
+        let vpn_status = ControlCenterStatus {
+            installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
+            service_state: ServiceState::Running,
+            live_engine: Some(vpn_tun),
+            configured_engine: EngineMode::Tun,
+            vpn_conflict: None,
+        };
+        let vpn_menu = build_menu(&vpn_status, None);
+        assert_eq!(
+            vpn_menu.status_rows[1],
+            StatusRow::new(
+                "Engine",
+                "TUN · vdpi0 · Ethernet · 16 MB",
+                StatusTone::Active
+            )
+            .with_badge(Some(("VPN: Mullvad".to_string(), StatusTone::Warning)))
+        );
+
+        // Very long physical NIC name omits RSS so the status row stays compact.
+        let mut long_nic_tun = sample_live_tun_engine();
+        long_nic_tun.physical_nic = Some("Realtek PCIe GbE Family Controller".to_string());
+        let long_nic_status = ControlCenterStatus {
+            installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
+            service_state: ServiceState::Running,
+            live_engine: Some(long_nic_tun),
+            configured_engine: EngineMode::Tun,
+            vpn_conflict: None,
+        };
+        assert_eq!(
+            build_menu(&long_nic_status, None).status_rows[1],
+            StatusRow::new(
+                "Engine",
+                "TUN · vdpi0 · Realtek PCIe GbE Family Controller",
+                StatusTone::Active
+            )
+        );
+    }
+
+    #[test]
     fn build_menu_paused_same_version() {
         let status = ControlCenterStatus {
-            installed: Some(sample_info(Some("0.4.1"), "0.4.1", VersionRelation::Same)),
+            installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
             service_state: ServiceState::Stopped,
             live_engine: None,
+            configured_engine: EngineMode::Tun,
+            vpn_conflict: None,
         };
         let menu = build_menu(&status, None);
-        assert_eq!(menu.status_rows.len(), 2);
+        assert_eq!(menu.status_rows.len(), 3);
         assert_eq!(
             menu.status_rows[0],
             StatusRow::new(
                 "Service",
-                "Paused · v0.4.1 (temporarily stopped)",
+                "Paused · v0.5.0 (temporarily stopped)",
                 StatusTone::Warning
             )
         );
         assert_eq!(
             menu.status_rows[1],
+            StatusRow::new("Engine", "TUN (paused)", StatusTone::Neutral)
+        );
+        assert_eq!(
+            menu.status_rows[2],
             StatusRow::new(
                 "Anti-DPI",
-                "Offline · system proxies restored",
+                "Offline · routes & proxies restored",
                 StatusTone::Neutral
             )
         );
@@ -953,6 +1277,7 @@ mod tests {
             menu.items.iter().map(|i| i.choice).collect::<Vec<_>>(),
             vec![
                 Choice::ResumeService,
+                Choice::SwitchEngine(EngineMode::Proxy),
                 Choice::Run,
                 Choice::Update,
                 Choice::Doctor,
@@ -961,21 +1286,38 @@ mod tests {
                 Choice::Cancel,
             ]
         );
+
+        let paused_proxy = ControlCenterStatus {
+            configured_engine: EngineMode::Proxy,
+            ..status
+        };
+        let proxy_menu = build_menu(&paused_proxy, None);
+        assert_eq!(
+            proxy_menu.status_rows[1],
+            StatusRow::new("Engine", "Proxy (paused)", StatusTone::Neutral)
+        );
+        assert_eq!(
+            proxy_menu.items[1].choice,
+            Choice::SwitchEngine(EngineMode::Tun)
+        );
     }
 
     #[test]
     fn build_menu_newer_older_unknown_and_unregistered_binary() {
         let newer_running = ControlCenterStatus {
-            installed: Some(sample_info(Some("0.3.0"), "0.4.1", VersionRelation::Newer)),
+            installed: Some(sample_info(Some("0.4.2"), "0.5.0", VersionRelation::Newer)),
             service_state: ServiceState::Running,
-            live_engine: Some(sample_live_engine()),
+            live_engine: Some(sample_live_proxy_engine()),
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: None,
         };
         let menu = build_menu(&newer_running, None);
+        assert_eq!(menu.status_rows.len(), 3);
         assert_eq!(
             menu.status_rows[0],
             StatusRow::new(
                 "Service",
-                "Running · v0.3.0 -> v0.4.1 update ready",
+                "Running · v0.4.2 -> v0.5.0 update ready",
                 StatusTone::Accent
             )
         );
@@ -984,6 +1326,7 @@ mod tests {
             vec![
                 Choice::Install,
                 Choice::PauseService,
+                Choice::SwitchEngine(EngineMode::Tun),
                 Choice::Run,
                 Choice::Uninstall,
                 Choice::Cancel,
@@ -991,25 +1334,33 @@ mod tests {
         );
 
         let newer_stopped = ControlCenterStatus {
-            installed: Some(sample_info(Some("0.3.0"), "0.4.1", VersionRelation::Newer)),
+            installed: Some(sample_info(Some("0.4.2"), "0.5.0", VersionRelation::Newer)),
             service_state: ServiceState::Stopped,
             live_engine: None,
+            configured_engine: EngineMode::Tun,
+            vpn_conflict: None,
         };
         let stopped_menu = build_menu(&newer_stopped, None);
         assert_eq!(
             stopped_menu.status_rows[0],
             StatusRow::new(
                 "Service",
-                "Paused · v0.3.0 -> v0.4.1 update ready",
+                "Paused · v0.4.2 -> v0.5.0 update ready",
                 StatusTone::Accent
             )
         );
         assert_eq!(stopped_menu.items[1].choice, Choice::ResumeService);
+        assert_eq!(
+            stopped_menu.items[2].choice,
+            Choice::SwitchEngine(EngineMode::Proxy)
+        );
 
         let older = ControlCenterStatus {
-            installed: Some(sample_info(Some("0.5.0"), "0.4.1", VersionRelation::Older)),
+            installed: Some(sample_info(Some("0.6.0"), "0.5.0", VersionRelation::Older)),
             service_state: ServiceState::Running,
             live_engine: None,
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: None,
         };
         let older_menu = build_menu(&older, None);
         assert_eq!(older_menu.status_rows[0].tone, StatusTone::Warning);
@@ -1022,6 +1373,7 @@ mod tests {
             vec![
                 Choice::Run,
                 Choice::PauseService,
+                Choice::SwitchEngine(EngineMode::Tun),
                 Choice::Install,
                 Choice::Uninstall,
                 Choice::Cancel,
@@ -1029,9 +1381,11 @@ mod tests {
         );
 
         let unknown = ControlCenterStatus {
-            installed: Some(sample_info(None, "0.4.1", VersionRelation::Unknown)),
+            installed: Some(sample_info(None, "0.5.0", VersionRelation::Unknown)),
             service_state: ServiceState::Stopped,
             live_engine: None,
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: None,
         };
         let unknown_menu = build_menu(&unknown, None);
         assert_eq!(unknown_menu.status_rows[0].tone, StatusTone::Warning);
@@ -1044,6 +1398,7 @@ mod tests {
             vec![
                 Choice::Install,
                 Choice::ResumeService,
+                Choice::SwitchEngine(EngineMode::Tun),
                 Choice::Run,
                 Choice::Uninstall,
                 Choice::Cancel,
@@ -1051,28 +1406,34 @@ mod tests {
         );
 
         let unregistered = ControlCenterStatus {
-            installed: Some(sample_info(Some("0.4.1"), "0.4.1", VersionRelation::Same)),
+            installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
             service_state: ServiceState::NotInstalled,
             live_engine: None,
+            configured_engine: EngineMode::Tun,
+            vpn_conflict: None,
         };
         let unreg_menu = build_menu(&unregistered, None);
         assert_eq!(
             unreg_menu.status_rows[0],
             StatusRow::new(
                 "Service",
-                "Installed v0.4.1 (service not registered)",
+                "Installed v0.5.0 (service not registered)",
                 StatusTone::Warning
             )
+        );
+        assert_eq!(
+            unreg_menu.items[1].choice,
+            Choice::SwitchEngine(EngineMode::Proxy)
         );
     }
 
     #[test]
-    fn console_handles_refresh_uninstall_confirm_and_reprompts() {
+    fn console_handles_refresh_badge_switch_engine_uninstall_confirm_and_reprompts() {
         let fresh = fresh_status();
         let mut output = Vec::new();
         assert_eq!(
             read_choice(
-                &b"\nno\n0\n9\n2\n"[..],
+                &b"\nno\n0\n9\n3\n"[..],
                 &mut output,
                 &fresh,
                 None,
@@ -1083,23 +1444,56 @@ mod tests {
         );
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("Run directly"));
+        assert!(output.contains("Switch to TUN mode"));
         assert!(output.contains("Install for automatic startup"));
         assert!(output.contains("Run diagnostics"));
-        assert!(output.contains("Enter a number from 1 to 4, r to refresh, or q to quit."));
-        assert!(output.contains("Choose [1 / 2 / 3 / 4 / r / q]: "));
+        assert!(output.contains("Enter a number from 1 to 5, r to refresh, or q to quit."));
+        assert!(output.contains("Choose [1 / 2 / 3 / 4 / 5 / r / q]: "));
         assert!(output.contains(REPOSITORY_URL));
         assert!(!output.contains('\x1b'));
 
+        // Console renders inline [VPN: Mullvad] badge and returns SwitchEngine on slot 2.
+        let mut tun_with_vpn = sample_live_tun_engine();
+        tun_with_vpn.vpn_conflict = Some("Mullvad".to_string());
+        let running_tun = ControlCenterStatus {
+            installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
+            service_state: ServiceState::Running,
+            live_engine: Some(tun_with_vpn),
+            configured_engine: EngineMode::Tun,
+            vpn_conflict: None,
+        };
+        let mut tun_out = Vec::new();
+        assert_eq!(
+            read_choice(&b"2\n"[..], &mut tun_out, &running_tun, None, || {
+                running_tun.clone()
+            })
+            .unwrap(),
+            Choice::SwitchEngine(EngineMode::Proxy)
+        );
+        let tun_out = String::from_utf8(tun_out).unwrap();
+        assert!(tun_out.contains("Engine    TUN · vdpi0 · Ethernet · 16 MB  [VPN: Mullvad]"));
+        assert!(tun_out.contains("Switch to Proxy mode"));
+
+        // Shortcut 'm' also triggers SwitchEngine in console fallback.
+        assert_eq!(
+            read_choice(&b"m\n"[..], Vec::new(), &fresh, None, fresh_status).unwrap(),
+            Choice::SwitchEngine(EngineMode::Tun)
+        );
+
         // Refresh transitions from Running -> Stopped and allows selecting ResumeService.
         let running = ControlCenterStatus {
-            installed: Some(sample_info(Some("0.4.1"), "0.4.1", VersionRelation::Same)),
+            installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
             service_state: ServiceState::Running,
-            live_engine: Some(sample_live_engine()),
+            live_engine: Some(sample_live_proxy_engine()),
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: None,
         };
         let paused = ControlCenterStatus {
-            installed: Some(sample_info(Some("0.4.1"), "0.4.1", VersionRelation::Same)),
+            installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
             service_state: ServiceState::Stopped,
             live_engine: None,
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: None,
         };
         let mut refresh_out = Vec::new();
         assert_eq!(
@@ -1117,7 +1511,7 @@ mod tests {
         let mut confirm_out = Vec::new();
         assert_eq!(
             read_choice(
-                &b"5\nn\n5\ny\n"[..],
+                &b"6\nn\n6\ny\n"[..],
                 &mut confirm_out,
                 &running,
                 None,
@@ -1148,24 +1542,32 @@ mod tests {
 
         let fresh = fresh_status();
         let installed_running = ControlCenterStatus {
-            installed: Some(sample_info(Some("0.4.1"), "0.4.1", VersionRelation::Same)),
+            installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
             service_state: ServiceState::Running,
             live_engine: None,
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: None,
         };
         let installed_stopped = ControlCenterStatus {
-            installed: Some(sample_info(Some("0.4.1"), "0.4.1", VersionRelation::Same)),
+            installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
             service_state: ServiceState::Stopped,
             live_engine: None,
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: None,
         };
         let service_without_bin = ControlCenterStatus {
             installed: None,
             service_state: ServiceState::Stopped,
             live_engine: None,
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: None,
         };
         let bin_without_service = ControlCenterStatus {
-            installed: Some(sample_info(Some("0.4.1"), "0.4.1", VersionRelation::Same)),
+            installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
             service_state: ServiceState::NotInstalled,
             live_engine: None,
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: None,
         };
 
         assert!(should_auto_run(false, Some(&marker), &fresh));
@@ -1181,14 +1583,14 @@ mod tests {
 
     #[test]
     fn install_success_message_distinguishes_update_from_fresh_install() {
-        let newer = sample_info(Some("0.3.0"), "0.4.1", VersionRelation::Newer);
-        let same = sample_info(Some("0.4.1"), "0.4.1", VersionRelation::Same);
-        let older = sample_info(Some("0.5.0"), "0.4.1", VersionRelation::Older);
-        let unknown = sample_info(None, "0.4.1", VersionRelation::Unknown);
+        let newer = sample_info(Some("0.4.2"), "0.5.0", VersionRelation::Newer);
+        let same = sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same);
+        let older = sample_info(Some("0.6.0"), "0.5.0", VersionRelation::Older);
+        let unknown = sample_info(None, "0.5.0", VersionRelation::Unknown);
 
         assert_eq!(
             install_success_message(Some(&newer)),
-            "vdpi updated to v0.4.1 and restarted."
+            "vdpi updated to v0.5.0 and restarted."
         );
         assert_eq!(
             install_success_message(None),
@@ -1241,18 +1643,86 @@ mod tests {
         live.addr = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
         live.port = 8080;
         let status = ControlCenterStatus {
-            installed: Some(sample_info(Some("0.4.1"), "0.4.1", VersionRelation::Same)),
+            installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
             service_state: ServiceState::Running,
             live_engine: Some(live),
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: None,
         };
         let menu = build_menu(&status, None);
         assert_eq!(
             menu.status_rows[1],
-            StatusRow::new("Anti-DPI", "Active · [::1]:8080", StatusTone::Active)
+            StatusRow::new("Engine", "Proxy · [::1]:8080", StatusTone::Active)
         );
         assert_eq!(
             menu.status_rows[2],
-            StatusRow::new("Engine", "[::1]:8080", StatusTone::Neutral)
+            StatusRow::new("Anti-DPI", "Active · [::1]:8080", StatusTone::Active)
+        );
+    }
+
+    #[test]
+    fn vpn_conflict_badge_visible_across_non_live_and_proxy_states_and_hints_mention_routes() {
+        // NotInstalled with top-level status.vpn_conflict shows badge.
+        let mut fresh_vpn = fresh_status();
+        fresh_vpn.vpn_conflict = Some("Mullvad".to_string());
+        let fresh_menu = build_menu(&fresh_vpn, None);
+        assert_eq!(
+            fresh_menu.status_rows[1],
+            StatusRow::new("Engine", "Proxy (selected)", StatusTone::Neutral)
+                .with_badge(Some(("VPN: Mullvad".to_string(), StatusTone::Warning)))
+        );
+
+        // Paused service with top-level status.vpn_conflict shows badge and updated hints.
+        let paused_vpn = ControlCenterStatus {
+            installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
+            service_state: ServiceState::Stopped,
+            live_engine: None,
+            configured_engine: EngineMode::Tun,
+            vpn_conflict: Some("WireGuard".to_string()),
+        };
+        let paused_menu = build_menu(&paused_vpn, None);
+        assert_eq!(
+            paused_menu.status_rows[1],
+            StatusRow::new("Engine", "TUN (paused)", StatusTone::Neutral)
+                .with_badge(Some(("VPN: WireGuard".to_string(), StatusTone::Warning)))
+        );
+        assert!(paused_menu.items[0].hint.contains("routes & proxies"));
+        let uninstall_item = paused_menu
+            .items
+            .iter()
+            .find(|item| item.choice == Choice::Uninstall)
+            .expect("uninstall item");
+        assert!(uninstall_item.hint.contains("routes & proxies"));
+
+        // Live proxy with live.vpn_conflict = None falls back to status.vpn_conflict.
+        let proxy_fallback = ControlCenterStatus {
+            installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
+            service_state: ServiceState::Running,
+            live_engine: Some(sample_live_proxy_engine()),
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: Some("ProtonVPN".to_string()),
+        };
+        let proxy_menu = build_menu(&proxy_fallback, None);
+        assert_eq!(
+            proxy_menu.status_rows[1],
+            StatusRow::new("Engine", "Proxy · 127.0.0.1:8080", StatusTone::Active)
+                .with_badge(Some(("VPN: ProtonVPN".to_string(), StatusTone::Warning)))
+        );
+        assert!(proxy_menu.items[0].hint.contains("routes & proxies"));
+
+        // Live vpn_conflict takes precedence over top-level status.vpn_conflict.
+        let mut live_override = sample_live_tun_engine();
+        live_override.vpn_conflict = Some("Tailscale".to_string());
+        let override_status = ControlCenterStatus {
+            installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
+            service_state: ServiceState::Running,
+            live_engine: Some(live_override),
+            configured_engine: EngineMode::Tun,
+            vpn_conflict: Some("Mullvad".to_string()),
+        };
+        assert_eq!(
+            build_menu(&override_status, None).status_rows[1].badge,
+            Some(("VPN: Tailscale".to_string(), StatusTone::Warning))
         );
     }
 }

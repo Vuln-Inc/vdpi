@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use vdpi::desync::EngineContext;
+use vdpi_core::desync::EngineContext;
 #[cfg(unix)]
 use vdpi_tun::config::TunProfile;
 use vdpi_tun::doctor::run_doctor;
@@ -63,7 +63,7 @@ pub fn engine_version() -> &'static str {
 }
 
 fn stop_active_locked(mgr: &TunnelManager) {
-    let active = mgr.active.lock().ok().and_then(|mut g| g.take());
+    let active = mgr.active.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(tunnel) = active {
         let _ = tunnel.shutdown_tx.send(true);
         let mut handle = tunnel.task;
@@ -75,10 +75,14 @@ fn stop_active_locked(mgr: &TunnelManager) {
         });
         if !finished {
             handle.abort();
-            let _ = mgr.runtime.block_on(tokio::time::timeout(
-                Duration::from_millis(500),
-                vdpi_tun::flush_engine_cache(&tunnel.ctx),
-            ));
+            mgr.runtime.block_on(async {
+                let _ = tokio::time::timeout(Duration::from_millis(500), &mut handle).await;
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(500),
+                    vdpi_tun::flush_engine_cache(&tunnel.ctx),
+                )
+                .await;
+            });
         }
         mgr.events.push("info", "tunnel", "disconnect completed");
     }
@@ -89,19 +93,18 @@ fn stop_active_locked(mgr: &TunnelManager) {
 #[cfg(unix)]
 pub fn start_tunnel(owned_fd: std::os::unix::io::OwnedFd, cfg: AndroidConfig) -> Result<()> {
     let mgr = manager()?;
-    let _lifecycle = mgr
-        .lifecycle_lock
-        .lock()
-        .map_err(|_| anyhow!("tunnel lifecycle lock poisoned"))?;
+    let _lifecycle = mgr.lifecycle_lock.lock().unwrap_or_else(|e| e.into_inner());
 
-    stop_active_locked(mgr);
-
+    // Validate config and build EngineContext BEFORE stopping any active tunnel
+    // so invalid config never tears down a healthy session.
     let mtu = cfg.clamped_mtu();
     let mode_label = format!("{:?}", cfg.mode);
     let dns_label = cfg.dns_addr.clone();
     let doh_enabled = cfg.enable_doh;
-
     let ctx = mgr.runtime.block_on(vdpi_tun::build_engine_context(cfg))?;
+
+    stop_active_locked(mgr);
+
     let async_fd = {
         let _enter = mgr.runtime.enter();
         vdpi_tun::fd::register_tun_fd(owned_fd).context("failed to register Android TUN fd")?
@@ -171,8 +174,9 @@ pub fn clear_engine_cache() {
     let ctx = mgr
         .active
         .lock()
-        .ok()
-        .and_then(|g| g.as_ref().map(|t| t.ctx.clone()));
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|t| t.ctx.clone());
     if let Some(ctx) = ctx {
         mgr.runtime.block_on(async move {
             ctx.clear_adaptive_cache().await;
@@ -189,8 +193,8 @@ pub fn snapshot_json() -> String {
     };
     let events = mgr.events.snapshot();
     let snapshot = {
-        let guard = mgr.active.lock().ok();
-        if let Some(Some(tunnel)) = guard.as_deref() {
+        let guard = mgr.active.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(tunnel) = guard.as_ref() {
             let running = !tunnel.task.is_finished();
             TelemetrySnapshot::from_live(
                 &tunnel.ctx,

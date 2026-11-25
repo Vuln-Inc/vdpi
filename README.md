@@ -2,469 +2,149 @@
 
 # `vdpi`
 
-**Zero-hassle, self-healing anti-DPI engine in Rust - native across Windows, macOS, Linux, Android, and iOS.**
+Self-healing anti-DPI engine in Rust, native across Windows, macOS, Linux, Android, and iOS.  
+Runs as a transparent system-wide TUN adapter or a lightweight local proxy with zero remote servers and zero telemetry.
 
-[![GitHub](https://img.shields.io/badge/GitHub-Vuln--Inc%2Fvdpi-0f172a?style=for-the-badge&logo=github)](https://github.com/Vuln-Inc/vdpi)
 [![Release](https://img.shields.io/github/v/release/Vuln-Inc/vdpi?style=for-the-badge&logo=github&color=38bdf8)](https://github.com/Vuln-Inc/vdpi/releases/latest)
-[![Platforms](https://img.shields.io/badge/Platforms-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Android%20%7C%20iOS-818cf8?style=for-the-badge)](#platforms)
-[![Rust](https://img.shields.io/badge/Rust-2021%20Edition-c084fc?style=for-the-badge&logo=rust)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-34d399?style=for-the-badge)](./LICENSE)
+[![Platforms](https://img.shields.io/badge/Platforms-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Android%20%7C%20iOS-818cf8?style=for-the-badge)](#quick-install)
 
-Single self-contained binary on desktop. Zero-root local VPN apps on Android and iOS. Zero kernel drivers.  
-Works across ISPs and mobile networks worldwide with instant startup, zero ping penalty, and full **Discord** & **Roblox** support.
-
-[GitHub](https://github.com/Vuln-Inc/vdpi) · [Platforms](#platforms) · [Android App](#android-app) · [iOS App](#ios--ipados-app) · [Desktop Installation](#desktop-installation) · [How It Works](#how-it-works) · [Diagnostics](#diagnostics) · [CLI Reference](#cli-reference) · [Building from Source](#building-from-source) · [Changelog](./CHANGELOG.md) · [Security](./SECURITY.md)
+[Quick Install](#quick-install) · [Engines](#choosing-an-engine-tun-vs-proxy) · [Getting Started](#getting-started) · [Docs](#documentation) · [Releases](https://github.com/Vuln-Inc/vdpi/releases/latest) · [Changelog](./CHANGELOG.md) · [Security](./SECURITY.md)
 
 </div>
 
 ---
 
-## Platforms
+## Highlights
 
-Download the latest build for your device from **[GitHub Releases](https://github.com/Vuln-Inc/vdpi/releases/latest)** (all assets verified in `SHA256SUMS.txt` — see [SECURITY.md](./SECURITY.md#binary-verification)):
-
-| Platform | Release Asset | Architecture / Requirements | Mode |
-| :--- | :--- | :--- | :--- |
-| **Android** | [`vdpi-android-universal.apk`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-android-universal.apk) | Android 8.0+ (API 26), `arm64-v8a` / `armeabi-v7a` / `x86_64` | Zero-root local `VpnService` + Rust userspace TUN |
-| **Windows** | [`vdpi-windows-x86_64.zip`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-windows-x86_64.zip) | Windows 10 & 11 (`x86_64`) | Native Windows Service + WinINET + `HTTP_PROXY`/`HTTPS_PROXY` + WinHTTP |
-| **macOS** | [`vdpi-macos-universal.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-macos-universal.tar.gz) | Apple Silicon & Intel (Universal) | `LaunchAgent` + `networksetup` proxy |
-| **Linux** | [`vdpi-linux-x86_64.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-linux-x86_64.tar.gz) / [`vdpi-linux-arm64.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-linux-arm64.tar.gz) | `x86_64` & `arm64` (static `musl`) | `systemd --user` + GNOME / KDE proxy |
-| **iOS / iPadOS** | [`vdpi-ios-unsigned.ipa`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-ios-unsigned.ipa) | iOS / iPadOS 16+ (`arm64`, unsigned — requires TrollStore or paid `NetworkExtension` signing) | `NEPacketTunnelProvider` + shared Rust TUN (`VdpiCore.xcframework`) |
-
-> **VPN coexistence note:** On desktop, `vdpi` runs as a pure userspace proxy (`127.0.0.1:8080` / `:1080`) with no kernel drivers, so it coexists alongside WireGuard, Cloudflare WARP, OpenVPN, Mullvad, and ProtonVPN. On **Android** (`VpnService`) and **iOS** (`NEPacketTunnelProvider`), `vdpi` uses the OS's zero-root local VPN API, which occupies the device's single active Personal VPN slot.
-
----
-
-## Android App
-
-`vdpi` for Android runs the exact same Rust 7-stage TLS desync engine and anti-poisoning DoH ring inside an on-device userspace TUN stack (`core/tun` + `android/native` + `netstack-smoltcp`) — no root access, no remote VPN servers, and no external traffic relay.
-
-### Android Capabilities
-
-- **Zero-Root Local TUN Engine:** Captures device traffic locally via `VpnService` (`198.18.0.2/30`, MTU `1400`, DNS `198.18.0.1`), desynchronizes TLS `ClientHello` handshakes in userspace, and relays UDP via a Cone-NAT table for voice and gaming traffic.
-- **Anti-Poisoning DNS, Automatic IPv6 Detection & Clean QUIC Fallback:** Intercepts both UDP/53 and RFC 1035 TCP/53 DNS queries through `vdpi`'s multi-provider RFC 8484 DoH ring, automatically detects whether the underlying Wi-Fi/Cellular interface actually has global unicast IPv6 (`2000::/3`) so IPv4-only networks never blackhole dual-stack sites, and drops all UDP/443 QUIC datagrams (including RFC 9287 greased and short-header frames) for desync-eligible hosts so Chrome and webviews fall back cleanly to HTTP/2 over desynchronized TCP/TLS instead of throwing `ERR_QUIC_PROTOCOL_ERROR`.
-- **Per-App Split Tunneling:** Choose between **Bypass selected** or **Only selected** apps (without requiring `QUERY_ALL_PACKAGES`).
-- **Always-On VPN, Top-Pinned Notification, Quick Settings Tile & Home Widget:** Supports Android's Always-On VPN setting, a live Quick Settings tile, a Home Screen toggle widget (`VdpiWidgetProvider`), and a top-pinned silent VPN status notification with live uptime and Android 14–16 auto-repin if dismissed while connected (note: do not enable *"Block connections without VPN"* lockdown mode if your device relies on bypass exclusions).
-- **Live Telemetry, Throughput Sparkline & Shareable Diagnostics:** Real-time 1 Hz counters (active TLS stage, connections, TX/RX bytes, DNS queries, blocked QUIC, active UDP flows) with an Activity throughput sparkline, built-in `rustls` TLS 1.3/1.2 connectivity probes, a 1-tap Share Diagnostics report, and copyable chronological engine logs.
-- **Persistent Stage Cache, Backup & Update Checker:** Persists learned per-host TLS stages across restarts in `adaptive-cache.json`, supports Settings JSON backup/restore, and includes a quiet GitHub Releases update checker.
-- **Adaptive Apple Liquid Glass UI:** Jetpack Compose interface featuring a floating Liquid Glass navigation bar, live tunnel mini-bar, two-pane landscape layout, cross-tab top **"Settings Changed"** reconnect popup, System-default theme (with Dark/Light overrides), WCAG AA contrast, 16 KB page-aligned native libraries, and explicit backup exclusion rules.
-
-### Installing on Android
-
-1. Download **[`vdpi-android-universal.apk`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-android-universal.apk)** directly from GitHub Releases, or track automatic updates with **[Obtainium](https://github.com/ImranR98/Obtainium)** using `https://github.com/Vuln-Inc/vdpi`.
-2. Open **vdpi**, tap **Connect**, and accept the Android VPN connection prompt.
-3. Tap **Diagnostics** to verify live DoH resolution and TLS bypass checks against your network.
-
-<details>
-<summary>Android notes (Private DNS, battery optimization &amp; APK signing)</summary>
-
-- **Private DNS:** If Android's system Private DNS is set to a custom hostname that your ISP blocks, switch Private DNS to *Automatic* or *Off* while using `vdpi` so DNS goes through `vdpi`'s built-in RFC 8484 DoH ring.
-- **Battery optimization:** Some OEMs (Xiaomi/MIUI/HyperOS, Samsung, Oppo, Huawei) aggressively kill background VPN services. Set **vdpi** to *Unrestricted* / *No restrictions* in battery settings if the tunnel stops when the screen turns off.
-- **APK signing:** Releases starting with `v0.4.1` are signed with the persistent repository release keystore (`VDPI_KEYSTORE_BASE64`) so future updates install in-place without clearing settings (upgrading from `v0.4.0` or earlier requires one clean reinstall when the signing key transitions).
-
-</details>
+<table>
+  <tr>
+    <td valign="top" width="50%">
+      <strong>Two desktop engines (TUN + Proxy)</strong><br>
+      Transparent system-wide TUN (<code>Wintun</code> / <code>utun</code> / <code>/dev/net/tun</code>, zero proxy env edits or browser restarts) or classic lightweight local HTTP/SOCKS5 proxy (no virtual adapter, portable) - 1-press switchable.
+    </td>
+    <td valign="top" width="50%">
+      <strong>Native across all 5 platforms</strong><br>
+      Single self-contained binary on Windows, macOS, and Linux, plus zero-root local VPN apps for Android (APK) and iOS/iPadOS (IPA) sharing the same Rust core.
+    </td>
+  </tr>
+  <tr>
+    <td valign="top" width="50%">
+      <strong>Zero-hassle &amp; lightweight</strong><br>
+      Self-healing 7-stage adaptive TLS desync engine, anti-poisoning RFC 8484 DoH ring, UDP/443 QUIC blocking, ~10-20 MB RAM, and crash-proof OS teardown.
+    </td>
+    <td valign="top" width="50%">
+      <strong>VPN &amp; gaming safe</strong><br>
+      Auto-yields to Mullvad, WireGuard, OpenVPN, ProtonVPN, and WARP and auto-resumes; coexists with Tailscale, Docker, and LAN; WHQL-signed Wintun (anticheat safe) and low-latency UDP NAT for Discord, Roblox, and games.
+    </td>
+  </tr>
+  <tr>
+    <td valign="top" width="50%">
+      <strong>Control Center TUI</strong><br>
+      Interactive <code>ratatui</code> launcher and live throughput sparkline dashboard (<code>vdpi</code>), SHA-256-verified self-updater (<code>vdpi update</code>), and <code>config.toml</code> persistence.
+    </td>
+    <td valign="top" width="50%">
+      <strong>Local-only &amp; verifiable</strong><br>
+      All traffic stays on-device with no remote relay servers or analytics. Every release asset is verified against <code>SHA256SUMS.txt</code> (see <a href="./SECURITY.md#binary-verification">SECURITY.md</a>).
+    </td>
+  </tr>
+</table>
 
 ---
 
-## iOS / iPadOS App
+## Quick Install
 
-`vdpi` for iOS and iPadOS pairs a native SwiftUI app (`VdpiApp`) with a Network Extension (`VdpiPacketTunnel`) powered by the exact same shared Rust TUN engine (`core/tun` + `ios/native` -> `VdpiCore.xcframework`), tuned with a dedicated **Low-Memory profile** to stay well below iOS's 50 MB `NEPacketTunnelProvider` Jetsam ceiling.
-
-### iOS Capabilities
-
-- **Shared Rust Userspace TUN Engine:** Uses `NEPacketTunnelFlow` packet bridging (100% public Apple APIs) into `vdpi`'s 7-stage adaptive TLS desync engine, anti-poisoning RFC 8484 DoH ring, clean UDP/443 QUIC fallback, and Cone-NAT UDP relay.
-- **50 MB Jetsam-Safe & `RLIMIT_NOFILE`-Safe Profile (`LowMemory`):** Runs with 2 Tokio workers, 16 KB `smoltcp` TCP buffers (vs. 64 KB on Android `Standard`), capped concurrent flows (48 TCP / 64 UDP / 24 DNS inflight), drained `autoreleasepool` outbound callbacks, and Darwin `SO_NOSIGPIPE` protection so background extensions stay rock-solid.
-- **Clean RFC 2544 Addressing, LAN Exclusion & Automatic IPv6 Gating:** Uses `198.18.0.2/24` with virtual DNS `198.18.0.1` and distinct remote endpoint `198.19.0.1` (MTU `1400`), excludes all RFC 1918 / loopback / broadcast / link-local / ULA LAN ranges, automatically disables IPv6 tunnel routes on IPv4-only networks via `getifaddrs`, and observes `NWPathMonitor` to flush caches on Wi-Fi/Cellular handoffs.
-- **On-Demand VPN, Siri Shortcuts & Domain Bypass:** Supports iOS VPN On-Demand (`NEOnDemandRuleConnect`), Siri Shortcuts & iOS Automations (`AppIntents`), and custom domain bypass rules. Note: consumer iOS restricts per-app VPN split-tunneling (`NEAppRule`) to supervised MDM devices, so consumer builds use domain bypass.
-- **Live Telemetry, Throughput Sparkline & Shareable Diagnostics:** App Group (`group.com.vulninc.vdpi`) shares settings while `NETunnelProviderSession.sendProviderMessage` IPC handles 1 Hz telemetry with an Activity throughput sparkline, live reloads, cache clears, in-tunnel `rustls` TLS 1.3/1.2 Diagnostics, and a 1-tap Share Diagnostics report (`ShareLink`).
-- **Persistent Stage Cache, Backup & Update Checker:** Persists learned per-host TLS stages in the shared App Group container, supports Settings JSON backup/restore, and includes a quiet GitHub Releases update checker.
-- **Adaptive Apple Liquid Glass SwiftUI Interface:** Native iOS/iPadOS UI featuring a floating Liquid Glass navigation bar, live tunnel mini-bar, two-pane landscape layout, cross-tab top **"Settings Changed"** reconnect popup, and System-default theme (with Dark and Light overrides).
-
-### Installing on iOS / iPadOS
-
-Download **[`vdpi-ios-unsigned.ipa`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-ios-unsigned.ipa)** from GitHub Releases (includes both `VdpiApp.app` and `PlugIns/VdpiPacketTunnel.appex` with ad-hoc embedded entitlements), or add the official AltStore / SideStore / Feather source URL for 1-tap updates:
-
-```text
-https://vuln-inc.github.io/vdpi/apps.json
-```
-
-- **TrollStore (iOS 16.0 – 16.6.1 / 17.0):** Install `vdpi-ios-unsigned.ipa` directly in TrollStore — CoreTrust preserves the `packet-tunnel-provider` and `group.com.vulninc.vdpi` entitlements without an Apple Developer account.
-- **Paid Apple Developer certificate / third-party signer (Feather, ESign, Sideloadly, etc.):** Re-sign `vdpi-ios-unsigned.ipa` with a paid certificate & provisioning profile that explicitly grants `com.apple.developer.networking.networkextension` (`packet-tunnel-provider`) and matching App Groups on **both** `VdpiApp` and `PlugIns/VdpiPacketTunnel.appex`.
-- **Xcode (recommended for paid Apple Developer Teams):** Build and sign directly from `ios/Vdpi.xcodeproj` using the steps in [Building from Source](#ios-app-xcode--xcframework).
-
-> **iOS signing & Simulator caveats:**
-> - **Free Apple ID sideloading does not work:** Apple blocks the `com.apple.developer.networking.networkextension` (`packet-tunnel-provider`) entitlement on free Apple IDs (AltStore / SideStore / free Sideloadly). Signing will fail or iOS will refuse to start the VPN tunnel.
-> - **CI & Simulator:** `VdpiCore.xcframework` builds, unit tests (`VdpiSharedTests`), and physical `arm64` Release packaging (`vdpi-ios-unsigned.ipa`) are verified in GitHub Actions on `macos-latest`. iOS Simulator does **not** execute `NEPacketTunnelProvider` packet routing — live on-device DPI bypass requires a physical iPhone/iPad. Prebuilt `VdpiCore.xcframework.zip` is also uploaded as the `ios-xcframework` GitHub Actions artifact.
-
----
-
-## Desktop Features & Control Center
-
-| Capability | Details |
-| :--- | :--- |
-| **Single-Binary Self-Installer & Updater** | `vdpi install`, `vdpi update`, and `vdpi uninstall` handle OS setup, SHA-256-verified self-updates, and cleanup natively — no external `.bat` or `.sh` scripts required. |
-| **Native OS Background Services** | Installs as a native **Windows Service (`AUTO_START`)**, **macOS `LaunchAgent`**, or **Linux `systemd --user`** unit. |
-| **7-Stage Adaptive Auto-Heal** | Automatically escalates across multi-record TLS splitting, TCP `MSG_OOB` SNI & TLS-framing desync, and 12+ record storms — learning the winning strategy per host and ISP network. |
-| **Full App, Voice & Game Support** | Protocol-autodetecting **HTTP/1.1 + HTTPS `CONNECT` + SOCKS5 (`CONNECT` & `UDP ASSOCIATE`) + SOCKS4a** proxy with native OS proxy and environment bridging. |
-| **Anti-Poisoning DNS Ring** | In-memory TTL-cached **RFC 8484 DoH** with sticky healthy failover across 4 independent networks (`1.1.1.1`, `8.8.8.8`, `94.140.14.140`, `9.9.9.9`), non-port-53 UDP fallback (`1253`, `443`, `5353`), and sinkhole IP filtering. |
-| **100% Desktop VPN Coexistence** | Pure userspace proxy (no WinDivert, kernel extensions, or fake-TTL injection) — coexists cleanly with WireGuard, Cloudflare WARP, OpenVPN, Mullvad, and ProtonVPN. |
-| **Smart Local & Portal Bypass** | Automatically bypasses LAN/private subnets (`localhost`, `10.0.0.0/8`, `192.168.0.0/16`, `*.local`), government/banking portals, and any custom `--bypass` rules. |
-| **`ratatui` Control Center & Live Dashboard** | Interactive `ratatui` Control Center with live Service and Anti-DPI telemetry, 1-press service pause/resume, live diagnostics, and inline-confirmed uninstall, plus a live foreground dashboard on `vdpi start` with a 60s `Sparkline`, traffic counters, scrollable log, and diagnostics overlay. |
-
-### Interactive Control Center & Live Dashboard
-
-Open `vdpi.exe` from File Explorer, or run `vdpi` with no arguments (or `vdpi launcher`) in an interactive terminal, to open the version-aware `ratatui` **Control Center**.
-
-- **Live Service & Anti-DPI Status Panel:** Shows current background service state alongside live Anti-DPI engine telemetry from the local daemon (desync mode, DoH status, QUIC blocking, active connections, and cached adaptive hosts). Press **`r`** at any time for a live refresh.
-- **Pause / Resume background service:** 1-press temporary toggle (`Pause` / `Resume`) that stops the background service and restores OS proxy settings without removing installed files or service registration, or restarts it cleanly.
-- **Run directly:** Start `vdpi` in the foreground. Closing it stops `vdpi` and releases its desktop proxy automatically. When `vdpi` is not installed, this also saves a `run-directly` preference next to the executable (`vdpi launcher` reopens the Control Center; `vdpi start` skips it).
-- **Install / Update / Repair:** Register automatic background startup, repair an existing service, apply a 1-press in-place update when opening a newly downloaded binary over an older installation, or **Check for updates online** directly against GitHub Releases.
-- **Run diagnostics:** Execute live end-to-end HTTP `CONNECT`, SOCKS5h, and DoH checks directly from the Control Center.
-- **Uninstall vdpi:** Stop the service, remove files and startup registration, and restore OS proxy settings behind an inline confirmation prompt.
-- **Quit:** Exit without changing service state or saved preferences.
-
-Use **Up/Down** (**j/k** or **Tab**) to move, **Enter** or number keys (**1–9**) to select, **`r`** to refresh live status, and **Esc** / **`q`** to quit (falls back to a numbered prompt when `TERM=dumb`).
-
-Running `vdpi start` (or choosing **Run directly**) in an interactive terminal launches a lightweight `ratatui` live foreground dashboard displaying a 60s throughput `Sparkline`, live traffic and connection counters, and a scrollable 150-line activity log. Press `d` to open the live diagnostics overlay, `c` to clear the adaptive stage cache, or `q` for a clean shutdown. Non-interactive runs (`--service`, `--quiet`, `--debug`, `TERM=dumb`, or non-TTY streams) automatically fall back to plain-text output.
-
-> **Windows desktop games & `libcurl` apps (e.g., Roblox):** Browsers (Chrome/Edge) and Discord use Windows WinINET proxy settings, whereas native game clients like `RobloxPlayerBeta.exe` use `libcurl` (which ignores WinINET and reads `HTTP_PROXY`/`HTTPS_PROXY`) or WinHTTP. `vdpi` leases **both** WinINET and `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` in Windows foreground mode (automatically restoring both when closed, even if the console is killed) and additionally configures WinHTTP in `vdpi install` service mode. If Chrome was **already open** before you started `vdpi` in foreground mode, restart Chrome once so games launched via `roblox-player://` inherit `HTTPS_PROXY` — or run `vdpi install` once so `HTTPS_PROXY` is present from login.
-
-<details>
-<summary>Cleaning up stale proxy settings from older Windows builds</summary>
-
-If an older Windows build left a dead proxy behind, open **Settings > Network & internet > Proxy** and disable the manual proxy only if it points to `vdpi`'s old local address. If `HTTP_PROXY` or `HTTPS_PROXY` still points there in your user environment, remove those values and reopen affected apps.
-
-</details>
-
----
-
-## Desktop Installation
-
-Download the release archive for your OS from **[Releases](https://github.com/Vuln-Inc/vdpi/releases/latest)**, install with `cargo install vdpi` from **[crates.io](https://crates.io/crates/vdpi)**, or use the one-line SHA-256-verified installers below.  
-Binary installation, `PATH` registration, background service setup, and OS proxy configuration are handled natively by `vdpi`.
-
-### Windows (Windows 10 & 11 `x86_64`)
-
-Install with the one-line SHA-256-verified PowerShell installer, **[Scoop](https://scoop.sh)**, or download **[`vdpi-windows-x86_64.zip`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-windows-x86_64.zip)**:
+### Windows (`x86_64`, Windows 10 & 11)
 
 ```powershell
-# One-line installer (verifies SHA-256 against SHA256SUMS.txt)
+# PowerShell one-liner (SHA-256 verified)
 irm https://vuln-inc.github.io/vdpi/install.ps1 | iex
 
-# Or Scoop (direct manifest, no extra bucket required)
+# Scoop (direct manifest, no extra bucket required)
 scoop install https://vuln-inc.github.io/vdpi/vdpi.json
 
-# Install as a native Windows Service (auto-prompts UAC, starts at boot, adds to System PATH)
-vdpi install
+# WinGet
+winget install Vuln-Inc.vdpi
 
-# Temporarily pause / resume the background service without uninstalling
-vdpi pause    # alias: vdpi stop
-vdpi resume
-
-# Or run for the current session only (no Admin required; Ctrl+C restores proxies)
-vdpi start
-
-# Stop & remove the Windows Service, clean files & PATH, and restore Windows proxies
-vdpi uninstall
+# Cargo (https://crates.io/crates/vdpi)
+cargo install vdpi
 ```
 
-### macOS (Apple Silicon & Intel)
+Direct download: [`vdpi-windows-x86_64.zip`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-windows-x86_64.zip) (bundles pinned WHQL-signed `wintun.dll`) or [crates.io/crates/vdpi](https://crates.io/crates/vdpi).
 
-Install with the one-line SHA-256-verified shell installer or download **[`vdpi-macos-universal.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-macos-universal.tar.gz)**:
+### macOS & Linux (`universal` / `x86_64` & `arm64`)
 
 ```bash
-# One-line installer (macOS & Linux, verifies SHA-256 against SHA256SUMS.txt)
+# Shell one-liner (macOS & Linux, SHA-256 verified)
 curl -fsSL https://vuln-inc.github.io/vdpi/install.sh | sh
 
-# Install to ~/.vdpi/bin/vdpi, codesign, register LaunchAgent, and configure proxies
-vdpi install
-
-# Temporarily pause / resume the LaunchAgent without uninstalling
-vdpi pause    # alias: vdpi stop
-vdpi resume
-
-# Or run for the current terminal session only (Ctrl+C restores proxies)
-vdpi start
-
-# Stop LaunchAgent, remove files, and restore macOS network settings
-vdpi uninstall
+# Cargo (https://crates.io/crates/vdpi)
+cargo install vdpi
 ```
 
-### Linux (`x86_64` & `arm64`)
+Direct downloads: [`vdpi-macos-universal.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-macos-universal.tar.gz) · [`vdpi-linux-x86_64.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-linux-x86_64.tar.gz) · [`vdpi-linux-arm64.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-linux-arm64.tar.gz) (static `musl`).
 
-Install with the one-line SHA-256-verified shell installer (`curl -fsSL https://vuln-inc.github.io/vdpi/install.sh | sh`) or download **[`vdpi-linux-x86_64.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-linux-x86_64.tar.gz)** / **[`vdpi-linux-arm64.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-linux-arm64.tar.gz)**:
+### Android (`8.0+`, `arm64-v8a` / `armeabi-v7a` / `x86_64`)
 
-```bash
-tar -xzf vdpi-linux-x86_64.tar.gz
+- Download the signed universal APK: [`vdpi-android-universal.apk`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-android-universal.apk)
+- Track automatic updates with [Obtainium](https://github.com/ImranR98/Obtainium) using `https://github.com/Vuln-Inc/vdpi`
+- Open **vdpi**, tap **Connect**, and run **Diagnostics** to verify DoH and TLS bypass.
 
-# Install static musl binary to ~/.vdpi/bin/vdpi, enable systemd --user service, and configure proxies
-./vdpi install
+### iOS / iPadOS (`16+`, `arm64`)
 
-# Temporarily pause / resume the systemd --user service without uninstalling
-vdpi pause    # alias: vdpi stop
-vdpi resume
-
-# Or run in the foreground for the current session (Ctrl+C restores proxies)
-./vdpi start
-
-# Disable systemd --user service, remove files, and restore GNOME / KDE proxies
-vdpi uninstall
-```
-
-### What `vdpi install` Configures
-
-| Platform | Binary Path | Startup Service | System Proxy Integration |
-| :--- | :--- | :--- | :--- |
-| **Windows** | `%ProgramFiles%\vdpi\bin\vdpi.exe` (added to System `PATH`) | Native Windows Service (`vdpi`, `AUTO_START`, `Tcpip` dependency, crash auto-restart) | Interactive `HKU` / `HKCU` WinINET Registry + `HTTP_PROXY`/`HTTPS_PROXY` User Env + WinHTTP (`netsh winhttp`) + `WTS_SESSION_LOGON` instant sync |
-| **macOS** | `~/.vdpi/bin/vdpi` (ad-hoc `codesign`, added to shell `PATH`) | `~/Library/LaunchAgents/com.vdpi.plist` (`RunAtLoad` + `KeepAlive`) | `networksetup` (Wi-Fi / Ethernet, VPN-safe) + `launchctl setenv` (`HTTP_PROXY`/`HTTPS_PROXY` unless `--no-env-proxy`) |
-| **Linux** | `~/.vdpi/bin/vdpi` (static `musl`, symlinked to `~/.local/bin/vdpi`) | `~/.config/systemd/user/vdpi.service` (`systemctl --user`) | GNOME `gsettings` + KDE `kioslaverc` + `systemctl --user set-environment` (unless `--no-env-proxy`) |
-
-### Updating
-
-`vdpi` updates itself natively from GitHub Releases, verifying every download against `SHA256SUMS.txt` and automatically upgrading any installed background service (Windows Service / `LaunchAgent` / `systemd --user`):
-
-```bash
-# Check, SHA-256 verify, and install the latest release (upgrades running service automatically)
-vdpi update
-
-# Check whether a newer release is available without modifying anything
-vdpi update --check
-
-# Reinstall the latest release even if already on the current version
-vdpi update --force
-```
-
-Opening a newly downloaded `vdpi` binary also detects an older installed version automatically and offers a 1-press in-place update.
+- **AltStore / SideStore / Feather source URL:**
+  ```text
+  https://vuln-inc.github.io/vdpi/apps.json
+  ```
+- **TrollStore / Sideloadly / paid signer:** download [`vdpi-ios-unsigned.ipa`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-ios-unsigned.ipa) (requires TrollStore or a paid Apple Developer certificate with `NetworkExtension` entitlements; free Apple IDs cannot sign `packet-tunnel-provider`).
 
 ---
 
-## How It Works
+## Choosing an Engine (TUN vs Proxy)
 
-### Adaptive 7-Stage TLS Engine
+| Dimension | TUN Mode (`--tun`) | Proxy Mode (`--proxy`) |
+| :--- | :--- | :--- |
+| **Traffic capture** | Layer 3 virtual NIC (`Wintun` / `utun` / `/dev/net/tun`) + userspace stack | Local `127.0.0.1:8080` (HTTP/HTTPS/SOCKS5/4a) + `:1080` (SOCKS5 TCP/UDP) |
+| **App coverage** | System-wide: browsers, Discord, Roblox, games, CLI, `libcurl`, all apps | Apps honoring OS proxy settings or `HTTP_PROXY` / `HTTPS_PROXY` |
+| **OS proxy & restarts** | Zero proxy env edits; no browser restart required | Sets OS proxy & env vars; restart already-open browsers once on first run |
+| **Privileges & memory** | Admin / root / `CAP_NET_ADMIN`; ~16-22 MB RAM | Unprivileged foreground (and macOS/Linux service); ~8-14 MB RAM |
+| **VPN & anticheat** | `VpnGuard` 0ms auto-yield; WHQL-signed Wintun (anticheat safe) | Pure loopback proxy; no virtual adapter |
 
-Shared across desktop, Android, and iOS, every outbound TLS handshake validates the upstream `ServerHello` (`0x16 0x03`) — rejecting TCP resets, TLS Alerts (`0x15`), and injected ISP block pages — and automatically escalates, caches, and self-heals across networks:
+Switch desktop engines at any time via CLI or by pressing `[2]` inside the `vdpi` Control Center:
 
-| Stage | Strategy | How It Works |
-| :---: | :--- | :--- |
-| **1** | `ComboMultiRecord` | Splits the TLS `ClientHello` into 4 wire-paced RFC-compliant `0x16` records across the handshake header and SNI midpoint (defeating OS TCP coalescing and shallow DPI). |
-| **2** | `OobSniDesync` | Injects 1 TCP Out-of-Band (`MSG_OOB`, `URG=1`) decoy byte right at the SNI midpoint. Server TCP stacks (`SO_OOBINLINE=0`) strip the urgent byte cleanly while stateful DPI boxes see a corrupted hostname and pass the flow through. |
-| **3** | `MultiRecordOob` | Combines 4-record TLS splitting with a `MSG_OOB` urgent decoy byte at the TLS record boundary inside SNI, shifting subsequent TLS record framing for stateful DPI state machines. |
-| **4** | `FineFragment` | Keeps a single intact outer TLS record split across 4 wire-paced TCP segments (for strict servers or firewalls that reject multi-record `ClientHello`s or strip `URG`). |
-| **5** | `DeepRecordStorm` | Emits 12+ wire-paced `0x16` records (10 tiny 2-byte lead records exhausting hardware DPI per-flow packet caps before the SNI hits the wire, followed by SNI-split records) and auto-promotes globally on strict stateful ISPs. |
-| **6** | `SlowSniSlice` | Single intact outer TLS record with 2-byte paced SNI slicing and a 20ms midpoint gap for strict servers behind stateful burst-reassembling DPI. |
-| **7** | `DirectPassthrough` | Falls back cleanly to an unmodified handshake for unblocked strict WAFs and caches the winning strategy per hostname. |
+```bash
+vdpi engine tun     # Switch to transparent system-wide TUN mode
+vdpi engine proxy   # Switch to classic local HTTP/SOCKS5 proxy mode
+```
 
-> **Persistent adaptive stage cache:** Learned per-host winning strategies are persisted via atomic writes to `adaptive-cache.json` (up to 256 hosts, 7-day TTL) across Windows, macOS, Linux, Android, and iOS. Subsequent startups reuse cached stages immediately without re-escalating.
+---
 
-### Network Compatibility
+## Getting Started
 
-`vdpi` works across ISPs, fiber, cable, and mobile carriers worldwide without region-specific configs or manual DNS changes:
+```bash
+vdpi              # Open the interactive Control Center TUI (install, switch engine, live telemetry)
+vdpi engine tun   # Switch desktop engine to TUN mode (or `vdpi engine proxy`)
+vdpi pause        # Temporarily pause the background service (`vdpi resume` to re-enable)
+vdpi doctor       # Run live end-to-end DPI bypass and DoH diagnostics
+vdpi update       # Check, SHA-256 verify, and upgrade in place
+```
 
-| DPI / Censorship Mechanism | Automatic `vdpi` Countermeasure |
+Run `vdpi install` to register automatic background startup (Windows Service, macOS `LaunchDaemon` / `LaunchAgent`, or Linux `systemd`), `vdpi start` for a foreground session with a live throughput sparkline dashboard, or `vdpi uninstall` to remove all files and restore OS network settings.
+
+---
+
+## Documentation
+
+| Guide | Contents |
 | :--- | :--- |
-| **Active Inline & Stateful Stream-Reassembling DPI** | 7-Stage wire-paced adaptive TLS engine (`ComboMultiRecord` -> `OobSniDesync` -> `MultiRecordOob` -> `FineFragment` -> `DeepRecordStorm` -> `SlowSniSlice`) with automatic ISP-wide promotion |
-| **Transparent Port-53 DNS Hijacking & Poisoning** | Sticky multi-ASN IP-literal RFC 8484 DoH ring with concurrent failover, negative caching, 30s circuit-breaker to non-port-53 UDP (`1253`, `443`, `5353`), and sinkhole IP rejection |
-| **SNI, HTTP `Host`, IPv6 CNAME & QUIC Filtering** | CNAME-safe IPv4/IPv6 resolution, automatic mobile IPv6-availability gating, 3-segment wire-paced HTTP `Host` splitting, and full UDP/443 QUIC blocking (RFC 9000 + RFC 9287 greased + short-header) for clean TCP TLS fallback |
-| **Strict CDNs, Banking & Government Portals** | Built-in LAN/government/banking bypass policy (`--bypass` / Android & iOS bypass lists) + Stage 7 Auto-Heal Passthrough |
-
----
-
-## Diagnostics
-
-On **Android** and **iOS**, tap **Diagnostics** from the main Tunnel screen to run live DoH and real `rustls` TLS 1.3/1.2 probes directly through the desync engine, or inspect/copy the live engine event log.
-
-On **Desktop**, run:
-
-```bash
-# Inspect live daemon health, Anti-DPI telemetry, service state, ports, and OS proxy settings
-vdpi status
-
-# Run live end-to-end HTTP CONNECT + SOCKS5h + DoH connectivity checks
-vdpi doctor
-```
-
-<details>
-<summary>Example <code>vdpi doctor</code> output</summary>
-
-```text
-Testing against running vdpi daemon at 127.0.0.1:8080 (SOCKS5: 127.0.0.1:1080)...
-
-=== HTTP/HTTPS CONNECT Tunnel Checks ===
-  [PASS] Discord Web              -> HTTP 200 (  38 ms)
-  [PASS] Discord Updater          -> HTTP 200 (  41 ms)
-  [PASS] Discord Gateway          -> HTTP 200 (  35 ms)
-  [PASS] Discord CDN              -> HTTP 200 (  29 ms)
-  [PASS] Discord Voice Latency    -> HTTP 204 (  44 ms)
-  [PASS] Roblox Web               -> HTTP 200 (  72 ms)
-  [PASS] Roblox ClientSettings    -> HTTP 200 (  51 ms)
-  [PASS] Roblox APIs              -> HTTP 404 (  68 ms)
-  [PASS] Roblox Auth              -> HTTP 200 (  69 ms)
-  [PASS] Roblox GameJoin          -> HTTP 404 (  64 ms)
-  [PASS] Roblox Telemetry         -> HTTP 200 (  63 ms)
-
-=== SOCKS5h (Remote DoH + TLS DPI Desync) Checks ===
-  [PASS] SOCKS5 Discord           -> HTTP 200 (  37 ms)
-  [PASS] SOCKS5 Discord Gateway   -> HTTP 200 (  34 ms)
-  [PASS] SOCKS5 Roblox Web        -> HTTP 200 (  70 ms)
-  [PASS] SOCKS5 Roblox APIs       -> HTTP 404 (  65 ms)
-
-All Discord & Roblox HTTP CONNECT and SOCKS5h checks passed.
-```
-
-</details>
-
----
-
-## CLI Reference
-
-```text
-Usage: vdpi [OPTIONS] [COMMAND]
-
-Commands:
-  start      Start the vdpi engine in the foreground without opening the Control Center [aliases: run]
-  launcher   Open the interactive Control Center TUI, even if a run-directly preference was saved
-  install    Install vdpi and enable automatic background startup (Windows Service / LaunchAgent / systemd)
-  pause      Temporarily stop the background service and restore proxies without uninstalling [aliases: stop]
-  resume     Start the paused background service and re-apply system proxy settings
-  uninstall  Stop vdpi, remove startup registration, and restore system proxy settings
-  update     Check for and install the latest vdpi release with SHA-256 verification and automatic service upgrade
-  status     Display live daemon health, Anti-DPI telemetry, service state, ports, and system proxy settings
-  doctor     Run live end-to-end DPI bypass diagnostics (HTTP CONNECT + SOCKS5h + DoH)
-  help       Print this message or the help of the given subcommand(s)
-```
-
-<details>
-<summary>All CLI options</summary>
-
-```text
-Options:
-  -b, --bind <BIND>              Local address to bind listeners on [default: 127.0.0.1]
-  -p, --port <PORT>              Primary proxy port (HTTP/1.1, HTTPS CONNECT, SOCKS5, SOCKS4a) [default: 8080]
-  -s, --socks-port <SOCKS_PORT>  Dedicated SOCKS5 (TCP + UDP) port; 0 to disable [default: 1080]
-  -m, --mode <MODE>              DPI desync mode [default: combo] [possible values: combo, tls-record, fragment, split]
-  -c, --chunk-size <CHUNK_SIZE>  Segment size (bytes) for fragmented TLS ClientHello packets [default: 10]
-      --dns <DNS_ADDR>           Primary upstream DNS / DoH server address or URL [default: 1.1.1.1]
-      --dns-port <DNS_PORT>      Port for plain UDP DNS queries when DoH is disabled [default: 53]
-  -4, --ipv4-only                Resolve IPv4 (A) records only
-      --no-doh                   Disable DNS-over-HTTPS and use plain UDP / OS DNS resolution
-      --include <REGEX>          Apply DPI desync only to hostnames matching this regex (repeatable)
-      --bypass <DOMAIN>          Additional domains or wildcards to bypass DPI fragmentation (repeatable)
-      --no-system-proxy          Do not modify OS system proxy settings
-      --no-socks-proxy           Do not configure OS SOCKS5 system proxy (keeps SOCKS5 listener running)
-      --no-env-proxy             Do not export proxy variables into the user session environment
-      --allow-quic               Allow QUIC (UDP/443) packets over SOCKS5 UDP relay
-  -t, --timeout <TIMEOUT_MS>     Outbound TCP connection timeout in ms (0 uses default 8000ms) [default: 0]
-  -d, --debug                    Enable verbose debug logging
-  -q, --quiet                    Suppress startup banner and informational output
-  -h, --help                     Print help
-  -V, --version                  Print version
-
-Update options (`vdpi update [OPTIONS]`):
-      --check                    Check for a newer release without downloading or installing
-      --force                    Reinstall the latest release even if already up to date
-```
-
-</details>
-
----
-
-## Building from Source
-
-### Desktop Binary
-
-Requires the current stable Rust toolchain:
-
-```bash
-git clone https://github.com/Vuln-Inc/vdpi.git
-cd vdpi
-cargo build --locked --release
-cargo test --workspace --locked
-./target/release/vdpi install
-```
-
-- The desktop proxy allows up to 256 concurrent client sessions across both listeners (with a 15-second negotiation timeout for incomplete HTTP/SOCKS handshakes).
-- The default test suite runs offline against local sockets. To run the optional live public DNS smoke test, execute `cargo test --locked resolves_discord_and_roblox_via_live_doh -- --ignored`.
-
-### Android APK
-
-Requires Rust Android targets (`aarch64-linux-android`, `armv7-linux-androideabi`, `x86_64-linux-android`), `cargo-ndk` (v4.1.2+), JDK 21, and Android SDK 35 + NDK 27:
-
-```bash
-# 1. Cross-compile libvdpi_android.so for arm64-v8a, armeabi-v7a, and x86_64
-./android/scripts/build-native.sh
-
-# 2. Run Android unit tests, release lint, and assemble the universal APK
-cd android
-./gradlew testDebugUnitTest lintRelease assembleRelease
-```
-
-The signed universal APK is written to `android/app/build/outputs/apk/release/app-release.apk`.
-
-### iOS App (Xcode + XCFramework)
-
-Requires macOS with Xcode 16+, `xcodegen` (`brew install xcodegen`), and Rust Apple iOS targets (`aarch64-apple-ios`, `aarch64-apple-ios-sim`, `x86_64-apple-ios`):
-
-```bash
-# 1. Cross-compile Rust static libs and package ios/Frameworks/VdpiCore.xcframework
-./ios/scripts/build-xcframework.sh
-
-# 2. Generate ios/Vdpi.xcodeproj and open in Xcode
-cd ios
-xcodegen generate
-open Vdpi.xcodeproj
-
-# Optional: run unsigned Simulator XCTests and verify generic arm64 Release build from CLI
-xcodebuild test -project Vdpi.xcodeproj -scheme VdpiApp -destination 'platform=iOS Simulator,name=iPhone 16' CODE_SIGN_IDENTITY='-' CODE_SIGNING_REQUIRED=NO DEVELOPMENT_TEAM=''
-xcodebuild build -project Vdpi.xcodeproj -scheme VdpiApp -configuration Release -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO
-```
-
-To sign and install on your own physical iPhone/iPad with your own paid Apple Developer Team, replace the bundle IDs (`com.vulninc.vdpi`, `com.vulninc.vdpi.packet-tunnel`) and App Group (`group.com.vulninc.vdpi`) with your own unique identifiers across these three files before running `xcodegen generate` (`ios/Shared/VdpiAppGroup.swift` auto-detects `suiteName` and `extensionBundleId` at runtime since `v0.4.1`):
-1. `ios/project.yml` (`bundleIdPrefix` and both `PRODUCT_BUNDLE_IDENTIFIER` values)
-2. `ios/VdpiApp/VdpiApp.entitlements` (`com.apple.security.application-groups`)
-3. `ios/PacketTunnel/PacketTunnel.entitlements` (`com.apple.security.application-groups`)
-
-<details>
-<summary>Repository layout</summary>
-
-```text
-vdpi/
-├── core/                       # Shared Rust anti-DPI engine, desktop CLI/service, and mobile TUN core
-│   ├── src/                    # main, tls, dns, desync, bypass, server, service, proxy/, platform/
-│   │   ├── launcher/           # ratatui Control Center TUI (live status, service pause/resume, diagnostics, uninstall)
-│   │   ├── tui_dashboard.rs    # Lightweight ratatui live foreground dashboard (Sparkline, log ring, overlays)
-│   │   └── update.rs           # GitHub Releases SHA-256-verified self-updater
-│   ├── tests/                  # End-to-end TLS desync, auto-heal, SOCKS5/4a, and UDP relay tests
-│   └── tun/                    # Shared pure-Rust userspace TUN stack (smoltcp, packet, pipeline, doctor)
-├── android/                    # Everything Android (Kotlin Jetpack Compose app + Rust JNI bridge)
-│   ├── app/                    # Compose UI (chrome/, components/, screens/, theme/), VpnService, DataStore
-│   │   └── src/main/java/com/vulninc/vdpi/widget/  # Home Screen toggle widget (VdpiWidgetProvider)
-│   ├── native/                 # Rust JNI + OwnedFd bridge over core/tun (vdpi-android)
-│   └── scripts/                # build-native.sh (cargo-ndk for arm64-v8a, armeabi-v7a, x86_64)
-├── ios/                        # Everything iOS (SwiftUI app, NEPacketTunnelProvider, Rust C-ABI bridge)
-│   ├── VdpiApp/                # SwiftUI views, FloatingChrome, Primitives, TunnelManager, Theme
-│   │   └── Intents/            # Siri Shortcuts & iOS Automations (AppIntents)
-│   ├── PacketTunnel/           # NEPacketTunnelProvider + NWPathMonitor + entitlements
-│   ├── Shared/                 # Models, App Group IPC, Formatters, NativeBridge, TunnelNetworkSettings
-│   │   └── UpdateChecker.swift # Quiet GitHub Releases update checker
-│   ├── VdpiAppTests/           # XCTest suite verifying wire JSON, IPC, routes, and live Rust FFI
-│   ├── native/                 # Rust C-ABI staticlib bridge + headers over core/tun (vdpi-ios)
-│   ├── scripts/                # build-xcframework.sh (iOS + Simulator XCFramework)
-│   └── project.yml             # XcodeGen project specification
-├── .github/
-│   ├── ISSUE_TEMPLATE/         # Bug report and feature request templates
-│   └── workflows/release.yml   # Desktop, Android APK, iOS XCFramework/XCTest, and Release CI
-├── Cargo.toml                  # Rust workspace root (core, core/tun, android/native, ios/native)
-├── Cargo.lock
-├── CHANGELOG.md                # Release history (Keep a Changelog)
-├── SECURITY.md                 # Vulnerability reporting, SHA256SUMS verification, and threat model
-├── LICENSE                     # MIT License
-└── README.md                   # Documentation and installation guide
-```
-
-</details>
+| [Engine Modes (TUN vs Proxy)](docs/engines.md) | Platform TUN architecture, Proxy OS integration, 7-stage adaptive TLS engine |
+| [VPN Coexistence & Custom Bypass](docs/vpn-and-bypass.md) | `VpnGuard` auto-yield, Tailscale/Docker/LAN safety, `--bypass` & `--include` rules |
+| [CLI & config.toml Reference](docs/cli.md) | All commands, global flags, precedence rules, and full `config.toml` schema |
+| [Diagnostics & Troubleshooting](docs/diagnostics.md) | `vdpi status`, `vdpi doctor`, Defender/antivirus notes, recovery steps |
+| [Building from Source](docs/building.md) | Workspace crate layout and build steps for Desktop, Android APK, and iOS IPA |
 
 ---
 
 ## License
 
-Released under the [MIT License](./LICENSE) · [Changelog](./CHANGELOG.md) · [Security](./SECURITY.md) · Official repository: [github.com/Vuln-Inc/vdpi](https://github.com/Vuln-Inc/vdpi) · Copyright © 2026 [Vuln-Inc](https://github.com/Vuln-Inc).
+Released under the [MIT License](./LICENSE) · [Changelog](./CHANGELOG.md) · [Security](./SECURITY.md) · Official repository: [github.com/Vuln-Inc/vdpi](https://github.com/Vuln-Inc/vdpi) · Copyright (c) 2026 [Vuln-Inc](https://github.com/Vuln-Inc).

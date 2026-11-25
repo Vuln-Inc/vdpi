@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
-use vdpi::desync::EngineContext;
+use vdpi_core::desync::EngineContext;
 use vdpi_tun::config::TunProfile;
 use vdpi_tun::doctor::run_doctor;
 use vdpi_tun::events::EventRing;
@@ -70,9 +70,11 @@ fn manager() -> Result<&'static IosTunnelManager> {
     ignore_sigpipe_once();
 
     let init = MANAGER.get_or_init(|| {
-        // 2 worker threads keep memory overhead minimal inside iOS's 50 MB Jetsam ceiling.
+        // 2 worker threads and capped blocking pool keep memory overhead minimal inside iOS's 50 MB Jetsam ceiling.
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
+            .max_blocking_threads(8)
+            .thread_keep_alive(Duration::from_secs(5))
             .thread_name("vdpi-ios")
             .enable_all()
             .build()
@@ -247,7 +249,11 @@ pub fn push_packet(packet: &[u8]) -> bool {
     let Some(tx) = sender else {
         return false;
     };
-    tx.try_send(packet.to_vec()).is_ok()
+    let Ok(permit) = tx.try_reserve() else {
+        return false;
+    };
+    permit.send(packet.to_vec());
+    true
 }
 
 pub fn stop_tunnel() {

@@ -1,26 +1,30 @@
 //! Keep the foreground proxy settings tied to a detached process lease. Closing a
 //! Windows console can terminate its processes without running any Rust cleanup.
-use super::{broadcast_environment_change, build_windows_proxy_override, notify_wininet_refresh};
+use super::{
+    broadcast_environment_change, build_windows_proxy_override, is_vdpi_owned_proxy_env,
+    is_vdpi_owned_wininet_server, normalize_client_proxy_ip, notify_wininet_refresh,
+};
 use crate::bypass::build_no_proxy_value;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::SocketAddr;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS};
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
-    HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_SZ,
+    HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_EXPAND_SZ, REG_SZ,
 };
 
 pub const GUARD_ARG: &str = "--internal-foreground-proxy-guard";
 const READY: &str = "ready";
-const DETACHED_PROCESS: u32 = 0x00000008;
+const DETACHED_PROCESS: u32 = 0x0000_0008;
+const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
 #[derive(Serialize, Deserialize)]
 struct Request {
@@ -36,18 +40,32 @@ fn default_env_proxy() -> bool {
 
 pub struct ForegroundProxy(Child);
 
+fn spawn_guard_process(exe: &Path) -> io::Result<Child> {
+    let primary = Command::new(exe)
+        .arg(GUARD_ARG)
+        .creation_flags(DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+    match primary {
+        Ok(child) => Ok(child),
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => Command::new(exe)
+            .arg(GUARD_ARG)
+            .creation_flags(DETACHED_PROCESS)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn(),
+        Err(err) => Err(err),
+    }
+}
+
 impl ForegroundProxy {
     pub fn activate(endpoint: SocketAddr, env_proxy: bool, bypass: &[String]) -> Result<Self> {
-        let mut guard = Self(
-            Command::new(std::env::current_exe()?)
-                .arg(GUARD_ARG)
-                .creation_flags(DETACHED_PROCESS)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .context("starting the Windows proxy cleanup process")?,
-        );
+        let exe = std::env::current_exe()?;
+        let mut guard =
+            Self(spawn_guard_process(&exe).context("starting the Windows proxy cleanup process")?);
         let pipe = guard.0.stdin.as_mut().expect("guard stdin was piped");
         serde_json::to_writer(
             &mut *pipe,
@@ -108,8 +126,13 @@ fn guard_inner() -> Result<()> {
         .open(dir.join("proxy-lease.lock"))
         .context("acquiring the Windows proxy lease (another vdpi may already be running)")?;
 
+    let endpoint = SocketAddr::new(
+        normalize_client_proxy_ip(request.endpoint.ip()),
+        request.endpoint.port(),
+    );
+    let endpoint_str = endpoint.to_string();
     let inet = Key::open(super::INTERNET_SETTINGS_SUBKEY)?;
-    let server = Value::string(&request.endpoint.to_string());
+    let server = Value::string(&endpoint_str);
     let mut proxy = Settings::prepare(
         &inet,
         [
@@ -120,15 +143,10 @@ fn guard_inner() -> Result<()> {
                     &request.bypass,
                 ))),
             ),
-            (
-                "ProxyEnable",
-                Some(Value {
-                    kind: REG_DWORD,
-                    data: 1u32.to_le_bytes().to_vec(),
-                }),
-            ),
+            ("ProxyEnable", Some(Value::dword(1))),
         ],
     )?;
+    normalize_stale_wininet_before(&mut proxy.changes, &endpoint_str);
 
     // Also lease HKCU\Environment HTTP_PROXY/HTTPS_PROXY/NO_PROXY so libcurl-based
     // Windows desktop apps (such as RobloxPlayerBeta.exe) route through vdpi even in
@@ -138,17 +156,21 @@ fn guard_inner() -> Result<()> {
     } else {
         None
     };
-    let proxy_url = format!("http://{}", request.endpoint);
+    let proxy_url = format!("http://{endpoint_str}");
     let no_proxy_csv = build_no_proxy_value(&request.bypass);
     let mut env_settings = match env_key.as_ref() {
-        Some(key) => Some(Settings::prepare(
-            key,
-            [
-                ("HTTP_PROXY", Some(Value::string(&proxy_url))),
-                ("HTTPS_PROXY", Some(Value::string(&proxy_url))),
-                ("NO_PROXY", Some(Value::string(&no_proxy_csv))),
-            ],
-        )?),
+        Some(key) => {
+            let mut settings = Settings::prepare(
+                key,
+                [
+                    ("HTTP_PROXY", Some(Value::string(&proxy_url))),
+                    ("HTTPS_PROXY", Some(Value::string(&proxy_url))),
+                    ("NO_PROXY", Some(Value::string(&no_proxy_csv))),
+                ],
+            )?;
+            normalize_stale_env_before(&mut settings.changes, &proxy_url, &no_proxy_csv);
+            Some(settings)
+        }
         None => None,
     };
 
@@ -162,11 +184,74 @@ fn guard_inner() -> Result<()> {
             writeln!(output, "{READY}")?;
             output.flush()?;
             drop(output);
-            // No further messages are necessary. Any return (EOF or broken pipe) restores the lease.
-            let _ = input.fill_buf();
+            // Wait until the parent closes stdin (true EOF or broken pipe) before restoring the lease.
+            let mut drain = [0u8; 64];
+            loop {
+                match input.read(&mut drain) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
             Ok(())
         },
     )
+}
+
+fn normalize_stale_wininet_before(changes: &mut [Change], endpoint: &str) {
+    let before_server = changes
+        .iter()
+        .find(|c| c.name == "ProxyServer")
+        .and_then(|c| c.before.as_ref())
+        .and_then(Value::as_string);
+    let before_enabled = changes
+        .iter()
+        .find(|c| c.name == "ProxyEnable")
+        .and_then(|c| c.before.as_ref())
+        .and_then(Value::as_dword)
+        == Some(1);
+
+    let is_stale_vdpi = before_server.as_deref().is_some_and(|s| {
+        s.trim().eq_ignore_ascii_case(endpoint)
+            || (before_enabled && is_vdpi_owned_wininet_server(s))
+    });
+    if !is_stale_vdpi {
+        return;
+    }
+    if let Some(enable) = changes.iter_mut().find(|c| c.name == "ProxyEnable") {
+        enable.before = Some(Value::dword(0));
+    }
+}
+
+fn normalize_stale_env_before(changes: &mut [Change], proxy_url: &str, no_proxy_csv: &str) {
+    let mut had_vdpi_proxy = false;
+    for change in changes.iter_mut() {
+        if matches!(change.name, "HTTP_PROXY" | "HTTPS_PROXY") {
+            let is_vdpi = change
+                .before
+                .as_ref()
+                .and_then(Value::as_string)
+                .as_deref()
+                .is_some_and(|s| {
+                    s.trim().eq_ignore_ascii_case(proxy_url) || is_vdpi_owned_proxy_env(s)
+                });
+            if is_vdpi {
+                change.before = None;
+                had_vdpi_proxy = true;
+            }
+        }
+    }
+    if let Some(no_proxy) = changes.iter_mut().find(|c| c.name == "NO_PROXY") {
+        let is_vdpi_no_proxy = had_vdpi_proxy
+            || no_proxy
+                .before
+                .as_ref()
+                .and_then(Value::as_string)
+                .as_deref()
+                .is_some_and(|s| s.trim() == no_proxy_csv);
+        if is_vdpi_no_proxy {
+            no_proxy.before = None;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -219,6 +304,34 @@ impl Value {
             kind: REG_SZ,
             data: wide(text).into_iter().flat_map(u16::to_le_bytes).collect(),
         }
+    }
+
+    fn dword(value: u32) -> Self {
+        Self {
+            kind: REG_DWORD,
+            data: value.to_le_bytes().to_vec(),
+        }
+    }
+
+    fn as_string(&self) -> Option<String> {
+        if self.kind != REG_SZ && self.kind != REG_EXPAND_SZ {
+            return None;
+        }
+        let chunks = self.data.chunks_exact(2);
+        if !chunks.remainder().is_empty() {
+            return None;
+        }
+        let units: Vec<u16> = chunks.map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+        Some(String::from_utf16_lossy(&units[..end]))
+    }
+
+    fn as_dword(&self) -> Option<u32> {
+        if self.kind != REG_DWORD {
+            return None;
+        }
+        let bytes: [u8; 4] = self.data.as_slice().try_into().ok()?;
+        Some(u32::from_le_bytes(bytes))
     }
 }
 
@@ -480,5 +593,101 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         true
+    }
+
+    #[test]
+    fn normalizes_stale_vdpi_before_state_without_clobbering_external_proxy() {
+        let mut stale_inet = vec![
+            Change {
+                name: "ProxyServer",
+                before: Some(Value::string("127.0.0.1:8080")),
+                after: Some(Value::string("127.0.0.1:8080")),
+            },
+            Change {
+                name: "ProxyEnable",
+                before: Some(Value::dword(1)),
+                after: Some(Value::dword(1)),
+            },
+        ];
+        normalize_stale_wininet_before(&mut stale_inet, "127.0.0.1:8080");
+        assert_eq!(stale_inet[1].before, Some(Value::dword(0)));
+
+        let mut stale_loopback_other_port = vec![
+            Change {
+                name: "ProxyServer",
+                before: Some(Value::string("[::1]:18080")),
+                after: Some(Value::string("127.0.0.1:8080")),
+            },
+            Change {
+                name: "ProxyEnable",
+                before: Some(Value::dword(1)),
+                after: Some(Value::dword(1)),
+            },
+        ];
+        normalize_stale_wininet_before(&mut stale_loopback_other_port, "127.0.0.1:8080");
+        assert_eq!(stale_loopback_other_port[1].before, Some(Value::dword(0)));
+
+        let mut external_inet = vec![
+            Change {
+                name: "ProxyServer",
+                before: Some(Value::string("proxy.corp.local:3128")),
+                after: Some(Value::string("127.0.0.1:8080")),
+            },
+            Change {
+                name: "ProxyEnable",
+                before: Some(Value::dword(1)),
+                after: Some(Value::dword(1)),
+            },
+        ];
+        normalize_stale_wininet_before(&mut external_inet, "127.0.0.1:8080");
+        assert_eq!(external_inet[1].before, Some(Value::dword(1)));
+
+        let mut stale_env = vec![
+            Change {
+                name: "HTTP_PROXY",
+                before: Some(Value::string("http://127.0.0.1:8080")),
+                after: Some(Value::string("http://127.0.0.1:8080")),
+            },
+            Change {
+                name: "HTTPS_PROXY",
+                before: Some(Value::string("http://[::1]:18080")),
+                after: Some(Value::string("http://127.0.0.1:8080")),
+            },
+            Change {
+                name: "NO_PROXY",
+                before: Some(Value::string("localhost,127.0.0.1")),
+                after: Some(Value::string("localhost,127.0.0.1")),
+            },
+        ];
+        normalize_stale_env_before(
+            &mut stale_env,
+            "http://127.0.0.1:8080",
+            "localhost,127.0.0.1",
+        );
+        assert!(stale_env.iter().all(|c| c.before.is_none()));
+
+        let mut external_env = vec![
+            Change {
+                name: "HTTP_PROXY",
+                before: Some(Value::string("http://proxy.corp.local:3128")),
+                after: Some(Value::string("http://127.0.0.1:8080")),
+            },
+            Change {
+                name: "HTTPS_PROXY",
+                before: Some(Value::string("http://proxy.corp.local:3128")),
+                after: Some(Value::string("http://127.0.0.1:8080")),
+            },
+            Change {
+                name: "NO_PROXY",
+                before: Some(Value::string("corp.internal")),
+                after: Some(Value::string("localhost,127.0.0.1")),
+            },
+        ];
+        normalize_stale_env_before(
+            &mut external_env,
+            "http://127.0.0.1:8080",
+            "localhost,127.0.0.1",
+        );
+        assert!(external_env.iter().all(|c| c.before.is_some()));
     }
 }

@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use vdpi::desync::EngineContext;
+use vdpi_core::desync::EngineContext;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DoctorCheck {
@@ -286,8 +286,9 @@ mod tests {
             let _ = acceptor.accept(sock).await;
         });
 
-        let cfg = TunnelConfig::default();
-        let ctx = EngineContext::new(cfg.into_runtime_config()).unwrap();
+        let mut runtime_cfg = TunnelConfig::default().into_runtime_config();
+        runtime_cfg.patterns = vec!["doctor\\.test$".into()];
+        let ctx = EngineContext::new(runtime_cfg).unwrap();
         let remote = ctx.connect_upstream_addr(addr).await.unwrap();
         let check = probe_connected_tls_target(
             &ctx,

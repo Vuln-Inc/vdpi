@@ -155,7 +155,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
-    use vdpi::dns::{decode_dns_response, encode_dns_query};
+    use vdpi_core::dns::{decode_dns_response, encode_dns_query};
 
     struct CaptureState {
         packets: Mutex<Vec<(u8, Vec<u8>)>>,

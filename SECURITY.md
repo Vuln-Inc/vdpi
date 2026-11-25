@@ -6,8 +6,8 @@ Only the current minor release line receives security fixes.
 
 | Version | Supported |
 | :--- | :--- |
-| `0.4.x` | Yes |
-| `< 0.4.0` | No |
+| `0.5.x` | Yes |
+| `< 0.5.0` | No |
 
 ## Reporting a Vulnerability
 
@@ -57,7 +57,7 @@ On desktop, `vdpi update` fetches both the target release archive and `SHA256SUM
 `vdpi` is a local-only anti-DPI engine:
 
 - **Zero telemetry:** `vdpi` collects no analytics, crash reports, usage metrics, or device identifiers.
-- **No remote proxy or VPN servers:** All traffic stays on-device. Desktop runs a local loopback proxy (`127.0.0.1`); Android (`VpnService`) and iOS (`NEPacketTunnelProvider`) run an on-device userspace TUN stack. Packets go directly from your device to their destination.
+- **No remote proxy or VPN servers:** All traffic stays on-device. Desktop runs either an on-device userspace TUN adapter (`Wintun` / `utun` / `/dev/net/tun`) or a local loopback proxy (`127.0.0.1`); Android (`VpnService`) and iOS (`NEPacketTunnelProvider`) run the same on-device userspace TUN stack. Packets go directly from your device to their destination.
 - **No IP masking:** `vdpi` does not hide your IP address or encrypt traffic beyond the protocols your applications already use (such as TLS). It modifies initial transport framing locally to bypass passive/active ISP DPI inspection.
 - **External requests:** Outside of your own application traffic, `vdpi` only contacts:
   - Configured RFC 8484 DNS-over-HTTPS (DoH) resolvers for anti-poisoning DNS resolution

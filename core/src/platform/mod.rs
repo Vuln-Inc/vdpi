@@ -1,16 +1,22 @@
 use anyhow::Result;
 use std::net::IpAddr;
+use vdpi_core::config::VpnCoexistence;
 
 #[cfg(target_os = "linux")]
 pub mod linux;
+pub mod linux_tun;
 #[cfg(target_os = "macos")]
 pub mod macos;
+pub mod macos_tun;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod unix_foreground;
+pub mod vpn;
+pub mod vpn_guard;
 #[cfg(target_os = "windows")]
 pub mod windows;
 #[cfg(target_os = "windows")]
 pub mod windows_service;
+pub mod windows_tun;
 
 /// Cross-platform system proxy session handle that configures OS-level HTTP/HTTPS/SOCKS5
 /// settings on startup, reconciles across network changes, and cleanly restores state on exit.
@@ -83,6 +89,20 @@ impl SystemProxySession {
                 extra_bypass,
             );
             Ok(Self {})
+        }
+    }
+
+    pub fn with_vpn_coexistence(self, mode: VpnCoexistence) -> Self {
+        #[cfg(target_os = "windows")]
+        {
+            Self {
+                inner: self.inner.with_vpn_coexistence(mode),
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = mode;
+            self
         }
     }
 

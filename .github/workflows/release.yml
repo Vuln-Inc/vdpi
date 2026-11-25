@@ -29,6 +29,33 @@ jobs:
           components: clippy
       - name: Run Clippy
         run: cargo clippy --workspace --locked --all-targets -- -D warnings
+      - name: Verify Mobile & Cross-OS Crate Isolation
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          FORBIDDEN='^(vdpi|ratatui|crossterm|clap|windows-sys) '
+          check_isolation() {
+            local pkg="$1"
+            local target="$2"
+            echo "Checking crate isolation: ${pkg} (${target})"
+            local tree
+            tree="$(cargo tree --locked -p "${pkg}" --target "${target}" -e normal --prefix none)"
+            if [ -z "${tree}" ]; then
+              echo "ERROR: cargo tree returned empty output for ${pkg} (${target})" >&2
+              exit 1
+            fi
+            if printf '%s\n' "${tree}" | grep -E "${FORBIDDEN}"; then
+              echo "ERROR: ${pkg} (${target}) pulled forbidden crate(s)" >&2
+              exit 1
+            fi
+          }
+          for target in aarch64-linux-android armv7-linux-androideabi x86_64-linux-android x86_64-unknown-linux-gnu; do
+            check_isolation vdpi-android "${target}"
+          done
+          for target in aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios aarch64-apple-darwin; do
+            check_isolation vdpi-ios "${target}"
+          done
       - name: Run Unit & Integration Tests
         run: cargo test --workspace --locked
 
@@ -58,11 +85,29 @@ jobs:
         run: ./android/scripts/build-native.sh
       - name: Decode Optional Release Keystore
         env:
+          IS_TAG_RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') }}
           VDPI_KEYSTORE_BASE64: ${{ secrets.VDPI_KEYSTORE_BASE64 }}
+          VDPI_KEYSTORE_PASSWORD: ${{ secrets.VDPI_KEYSTORE_PASSWORD }}
+          VDPI_KEY_ALIAS: ${{ secrets.VDPI_KEY_ALIAS }}
+          VDPI_KEY_PASSWORD: ${{ secrets.VDPI_KEY_PASSWORD }}
         run: |
-          if [ -n "$VDPI_KEYSTORE_BASE64" ]; then
+          set -euo pipefail
+          if [ "$IS_TAG_RELEASE" = "true" ]; then
+            missing=()
+            [ -n "$VDPI_KEYSTORE_BASE64" ] || missing+=(VDPI_KEYSTORE_BASE64)
+            [ -n "$VDPI_KEYSTORE_PASSWORD" ] || missing+=(VDPI_KEYSTORE_PASSWORD)
+            [ -n "$VDPI_KEY_ALIAS" ] || missing+=(VDPI_KEY_ALIAS)
+            [ -n "$VDPI_KEY_PASSWORD" ] || missing+=(VDPI_KEY_PASSWORD)
+            if [ "${#missing[@]}" -gt 0 ]; then
+              echo "ERROR: Tagged release requires all 4 Android keystore secrets; missing: ${missing[*]}" >&2
+              exit 1
+            fi
+          fi
+          if [ -n "$VDPI_KEYSTORE_BASE64" ] && [ -n "$VDPI_KEYSTORE_PASSWORD" ] && [ -n "$VDPI_KEY_ALIAS" ] && [ -n "$VDPI_KEY_PASSWORD" ]; then
             echo "$VDPI_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/vdpi-release.jks"
             echo "VDPI_KEYSTORE_PATH=$RUNNER_TEMP/vdpi-release.jks" >> "$GITHUB_ENV"
+          elif [ -n "$VDPI_KEYSTORE_BASE64" ]; then
+            echo "WARNING: Partial Android keystore secrets on non-tag dispatch; falling back to debug keystore" >&2
           fi
       - name: Run Android Unit Tests, Lint & Assemble Release APK
         working-directory: android
@@ -90,7 +135,7 @@ jobs:
   build-ios:
     name: Build & Test iOS App (XCFramework + Simulator)
     needs: test
-    if: ${{ always() && (needs.test.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.ios_only)) }}
+    if: ${{ !cancelled() && (needs.test.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.ios_only)) }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -192,11 +237,76 @@ jobs:
           targets: x86_64-pc-windows-msvc
       - name: Build Windows Release Binary
         run: cargo build --locked --release --target x86_64-pc-windows-msvc
+      - name: Download & Verify Wintun 0.14.1
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $wintunUrl = 'https://www.wintun.net/builds/wintun-0.14.1.zip'
+          $expectedZipSha256 = '07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51'
+          $expectedDllSha256 = 'e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce'
+          $stageDir = Join-Path $env:RUNNER_TEMP 'wintun-0.14.1'
+          $zipPath = Join-Path $stageDir 'wintun-0.14.1.zip'
+          $extractDir = Join-Path $stageDir 'extracted'
+
+          Remove-Item -LiteralPath $stageDir -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+
+          $maxAttempts = 3
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            try {
+              Invoke-WebRequest -Uri $wintunUrl -OutFile $zipPath -TimeoutSec 60
+              break
+            } catch {
+              if ($attempt -eq $maxAttempts) {
+                throw "Failed to download $wintunUrl after $maxAttempts attempts: $($_.Exception.Message)"
+              }
+              Write-Warning "Attempt $attempt/$maxAttempts failed downloading Wintun ($($_.Exception.Message)); retrying..."
+              Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds ($attempt * 3)
+            }
+          }
+
+          $actualZipSha256 = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualZipSha256 -ne $expectedZipSha256) {
+            throw "Wintun archive SHA-256 mismatch: expected $expectedZipSha256, got $actualZipSha256"
+          }
+
+          Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir -Force
+
+          $dllPath = Join-Path $extractDir 'wintun/bin/amd64/wintun.dll'
+          $licensePath = Join-Path $extractDir 'wintun/LICENSE.txt'
+          if (-not (Test-Path -LiteralPath $dllPath)) {
+            throw "Missing extracted Wintun DLL at $dllPath"
+          }
+          if (-not (Test-Path -LiteralPath $licensePath)) {
+            throw "Missing extracted Wintun LICENSE at $licensePath"
+          }
+
+          $actualDllSha256 = (Get-FileHash -LiteralPath $dllPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualDllSha256 -ne $expectedDllSha256) {
+            throw "wintun.dll SHA-256 mismatch: expected $expectedDllSha256, got $actualDllSha256"
+          }
+
+          $sig = Get-AuthenticodeSignature -FilePath $dllPath
+          if ($sig.Status -ne 'Valid') {
+            throw "wintun.dll Authenticode signature invalid: Status=$($sig.Status), Message=$($sig.StatusMessage)"
+          }
+          $subject = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { '' }
+          if ($subject -notmatch 'WireGuard LLC') {
+            throw "wintun.dll Authenticode signer mismatch: expected WireGuard LLC, got '$subject'"
+          }
+
+          Write-Host "Verified wintun.dll SHA-256 ($actualDllSha256) and Authenticode signer ($subject)"
       - name: Package Windows Zip
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          $extractDir = Join-Path $env:RUNNER_TEMP 'wintun-0.14.1/extracted'
+          Remove-Item -LiteralPath dist/win -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path dist/win | Out-Null
           Copy-Item target/x86_64-pc-windows-msvc/release/vdpi.exe dist/win/vdpi.exe
+          Copy-Item (Join-Path $extractDir 'wintun/bin/amd64/wintun.dll') dist/win/wintun.dll
+          Copy-Item (Join-Path $extractDir 'wintun/LICENSE.txt') dist/win/WINTUN-LICENSE.txt
           Copy-Item README.md dist/win/README.md
           Copy-Item LICENSE dist/win/LICENSE
           Compress-Archive -Path dist/win/* -DestinationPath dist/vdpi-windows-x86_64.zip -Force
@@ -294,14 +404,16 @@ jobs:
         run: |
           git fetch origin "refs/tags/${TAG}:refs/tags/${TAG}" --force
           TAG_TYPE="$(git cat-file -t "refs/tags/${TAG}" 2>/dev/null || true)"
-          TAG_NOTES=""
+          RAW_TAG_NOTES=""
+          TRIMMED_TAG_NOTES=""
           if [ "$TAG_TYPE" = "tag" ]; then
-            TAG_NOTES="$(git for-each-ref --format='%(contents)' "refs/tags/${TAG}" | sed '/^[[:space:]]*$/d')"
+            RAW_TAG_NOTES="$(git for-each-ref --format='%(contents)' "refs/tags/${TAG}")"
+            TRIMMED_TAG_NOTES="$(printf '%s\n' "$RAW_TAG_NOTES" | sed '/^[[:space:]]*$/d' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
           fi
-          if [ -n "$TAG_NOTES" ] && [ "$TAG_NOTES" != "vdpi $TAG" ] && [ "$TAG_NOTES" != "$TAG" ]; then
-            printf '%s\n' "$TAG_NOTES" > release-notes.md
+          if [ -n "$TRIMMED_TAG_NOTES" ] && [ "$TRIMMED_TAG_NOTES" != "vdpi $TAG" ] && [ "$TRIMMED_TAG_NOTES" != "$TAG" ]; then
+            printf '%s\n' "$RAW_TAG_NOTES" > release-notes.md
           else
-            PREV_TAG="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+            PREV_TAG="$(git describe --tags --abbrev=0 --match 'v*' "${TAG}^" 2>/dev/null || true)"
             if [ -n "$PREV_TAG" ]; then
               git log --no-merges --pretty=tformat:'- %s' "${PREV_TAG}..${TAG}" > release-notes.md
             else

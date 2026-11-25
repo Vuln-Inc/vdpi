@@ -1,16 +1,18 @@
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
-use vdpi::config::{DesyncMode, RuntimeConfig};
+use vdpi_core::config::{DesyncMode, RuntimeConfig};
 
 pub const MIN_MTU: usize = 1280;
-pub const MAX_MTU: usize = 9000;
+pub const DEFAULT_MTU: usize = 1400;
+pub const DESKTOP_MTU: usize = 1500;
+pub const MAX_MTU: usize = 1500;
 
 /// Resource-budget tuning profile for the userspace TUN stack.
 ///
-/// Android runs inside a normal app process with generous heap headroom (`Standard`),
-/// while iOS `NEPacketTunnelProvider` extensions are terminated by Jetsam above ~50 MB RSS
-/// (`LowMemory`).
+/// Desktop hosts run with high-throughput buffers (`DESKTOP`), Android runs inside a normal app
+/// process with moderate heap headroom (`STANDARD`), while iOS `NEPacketTunnelProvider`
+/// extensions are terminated by Jetsam above ~50 MB RSS (`LOW_MEMORY`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TunProfile {
     pub stack_buffer_size: usize,
@@ -24,21 +26,52 @@ pub struct TunProfile {
     pub max_reverse_dns_entries: usize,
     pub channel_capacity: usize,
     pub udp_reply_capacity: usize,
+    pub tcp_relay_buf_size: usize,
+    pub packet_pool_size: usize,
+    pub batch_size: usize,
+    pub udp_socket_buf_bytes: usize,
+    pub emit_quic_icmp_reject: bool,
 }
 
 impl TunProfile {
+    /// Tuned for desktop virtual TUN adapters (Wintun / utun / `/dev/net/tun`),
+    /// bounded to keep desktop TUN memory footprint around ~18-22 MB RAM.
+    pub const DESKTOP: Self = Self {
+        stack_buffer_size: 1024,
+        tcp_buffer_size: 512,
+        udp_buffer_size: 512,
+        tcp_recv_buffer_size: 32 * 1024,
+        tcp_send_buffer_size: 32 * 1024,
+        max_tcp_sessions: 128,
+        max_udp_flows: 256,
+        max_dns_inflight: 128,
+        max_reverse_dns_entries: 4096,
+        channel_capacity: 1024,
+        udp_reply_capacity: 1024,
+        tcp_relay_buf_size: 16 * 1024,
+        packet_pool_size: 512,
+        batch_size: 32,
+        udp_socket_buf_bytes: 128 * 1024,
+        emit_quic_icmp_reject: true,
+    };
+
     pub const STANDARD: Self = Self {
         stack_buffer_size: 512,
         tcp_buffer_size: 256,
         udp_buffer_size: 256,
         tcp_recv_buffer_size: 64 * 1024,
         tcp_send_buffer_size: 64 * 1024,
-        max_tcp_sessions: 192,
-        max_udp_flows: 256,
+        max_tcp_sessions: 128,
+        max_udp_flows: 128,
         max_dns_inflight: 96,
         max_reverse_dns_entries: 2048,
         channel_capacity: 512,
         udp_reply_capacity: 512,
+        tcp_relay_buf_size: 32 * 1024,
+        packet_pool_size: 256,
+        batch_size: 32,
+        udp_socket_buf_bytes: 128 * 1024,
+        emit_quic_icmp_reject: false,
     };
 
     /// Tuned for iOS `NEPacketTunnelProvider` (~50 MB hard Jetsam memory ceiling and 256 RLIMIT_NOFILE).
@@ -54,6 +87,11 @@ impl TunProfile {
         max_reverse_dns_entries: 512,
         channel_capacity: 96,
         udp_reply_capacity: 96,
+        tcp_relay_buf_size: 16 * 1024,
+        packet_pool_size: 128,
+        batch_size: 16,
+        udp_socket_buf_bytes: 0,
+        emit_quic_icmp_reject: false,
     };
 }
 
@@ -63,7 +101,7 @@ impl Default for TunProfile {
     }
 }
 
-/// JSON-serializable runtime settings passed from Android or iOS apps into the Rust TUN engine.
+/// JSON-serializable runtime settings passed from desktop, Android, or iOS apps into the Rust TUN engine.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct TunnelConfig {
@@ -90,7 +128,7 @@ impl Default for TunnelConfig {
             ipv4_only: false,
             block_quic: true,
             timeout_ms: 8000,
-            mtu: 1400,
+            mtu: DEFAULT_MTU,
             bypass_domains: Vec::new(),
             cache_path: None,
         }
@@ -140,6 +178,7 @@ impl TunnelConfig {
             debug: false,
             quiet: true,
             windows_service: false,
+            ..RuntimeConfig::default()
         }
     }
 }
@@ -162,7 +201,7 @@ mod tests {
         assert_eq!(partial.dns_addr, "9.9.9.9");
         assert!(!partial.block_quic);
         assert!(partial.enable_doh);
-        assert_eq!(partial.mtu, 1400);
+        assert_eq!(partial.mtu, DEFAULT_MTU);
     }
 
     #[test]
@@ -175,6 +214,12 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(raw.clamped_mtu(), MAX_MTU);
+        assert_eq!(MAX_MTU, 1500);
+        let desktop = TunnelConfig {
+            mtu: DESKTOP_MTU,
+            ..Default::default()
+        };
+        assert_eq!(desktop.clamped_mtu(), DESKTOP_MTU);
         let low = TunnelConfig {
             mtu: 64,
             ..Default::default()
@@ -187,6 +232,7 @@ mod tests {
         assert_eq!(cfg.connect_timeout, Duration::from_millis(1500));
         assert_eq!(cfg.dns_addr, "1.1.1.1");
         assert!(!cfg.system_proxy);
+        assert!(!cfg.tun_ipv6);
     }
 
     #[test]
@@ -214,9 +260,55 @@ mod tests {
         assert!(low.tcp_recv_buffer_size < std.tcp_recv_buffer_size);
         assert!(low.max_tcp_sessions < std.max_tcp_sessions);
         assert!(low.max_udp_flows < std.max_udp_flows);
-        // Worst-case concurrent smoltcp TCP buffer footprint stays well below 10 MB.
+        assert!(low.tcp_relay_buf_size < std.tcp_relay_buf_size);
+        assert!(low.packet_pool_size < std.packet_pool_size);
+        assert!(low.batch_size < std.batch_size);
+        assert_eq!(low.udp_socket_buf_bytes, 0);
+        assert!(!low.emit_quic_icmp_reject);
+        assert!(!std.emit_quic_icmp_reject);
+        // Worst-case concurrent smoltcp TCP buffer footprint stays <= 6 MiB for iOS Jetsam.
         let max_tcp_mem = low.max_tcp_sessions
             * (low.tcp_recv_buffer_size as usize + low.tcp_send_buffer_size as usize);
         assert!(max_tcp_mem <= 6 * 1024 * 1024);
+    }
+
+    #[test]
+    fn desktop_profile_scales_above_standard_with_valid_bounds() {
+        let desk = TunProfile::DESKTOP;
+        let std = TunProfile::STANDARD;
+
+        assert!(desk.stack_buffer_size > std.stack_buffer_size);
+        assert!(desk.tcp_buffer_size > std.tcp_buffer_size);
+        assert!(desk.udp_buffer_size > std.udp_buffer_size);
+        assert_eq!(desk.tcp_recv_buffer_size, 32 * 1024);
+        assert_eq!(desk.tcp_send_buffer_size, 32 * 1024);
+        assert_eq!(desk.max_tcp_sessions, 128);
+        assert_eq!(std.max_tcp_sessions, 128);
+        assert_eq!(desk.max_udp_flows, 256);
+        assert_eq!(std.max_udp_flows, 128);
+        assert!(desk.max_udp_flows > std.max_udp_flows);
+        assert!(desk.max_dns_inflight > std.max_dns_inflight);
+        assert!(desk.max_reverse_dns_entries > std.max_reverse_dns_entries);
+        assert!(desk.channel_capacity > std.channel_capacity);
+        assert!(desk.udp_reply_capacity > std.udp_reply_capacity);
+        assert_eq!(desk.tcp_relay_buf_size, 16 * 1024);
+        assert!(desk.packet_pool_size > std.packet_pool_size);
+        assert!(desk.batch_size >= std.batch_size);
+        assert!(desk.batch_size > 0);
+        assert_eq!(desk.udp_socket_buf_bytes, 128 * 1024);
+        assert_eq!(std.udp_socket_buf_bytes, 128 * 1024);
+        assert!(desk.emit_quic_icmp_reject);
+
+        // Worst-case desktop smoltcp TCP buffer footprint stays bounded (8 MiB, ~18-22 MB total TUN RAM).
+        let max_tcp_mem = desk.max_tcp_sessions
+            * (desk.tcp_recv_buffer_size as usize + desk.tcp_send_buffer_size as usize);
+        assert_eq!(max_tcp_mem, 8 * 1024 * 1024);
+        assert!(max_tcp_mem <= 16 * 1024 * 1024);
+        // Android STANDARD FD budget stays well under the 1024 FD ceiling.
+        assert!(std.max_tcp_sessions + std.max_udp_flows <= 256);
+
+        assert_eq!(DEFAULT_MTU, 1400);
+        assert_eq!(DESKTOP_MTU, 1500);
+        assert_eq!(MAX_MTU, 1500);
     }
 }
