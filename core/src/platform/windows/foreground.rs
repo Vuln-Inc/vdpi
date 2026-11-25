@@ -317,11 +317,11 @@ impl Value {
         if self.kind != REG_SZ && self.kind != REG_EXPAND_SZ {
             return None;
         }
-        let chunks = self.data.chunks_exact(2);
-        if !chunks.remainder().is_empty() {
+        let (chunks, remainder) = self.data.as_chunks::<2>();
+        if !remainder.is_empty() {
             return None;
         }
-        let units: Vec<u16> = chunks.map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let units: Vec<u16> = chunks.iter().map(|&c| u16::from_le_bytes(c)).collect();
         let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
         Some(String::from_utf16_lossy(&units[..end]))
     }
