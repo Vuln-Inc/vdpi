@@ -37,6 +37,12 @@ pub enum Command {
         #[arg(id = "engine_mode", value_name = "ENGINE", value_enum)]
         mode: Option<EngineMode>,
     },
+    /// Display or change the upstream DNS server address (e.g. `1.1.1.1`, `94.140.14.14`)
+    Dns {
+        /// Target DNS server IP or DoH URL; omit to print the configured DNS server
+        #[arg(value_name = "SERVER")]
+        addr: Option<String>,
+    },
     /// Inspect, validate, or modify persisted `config.toml` settings
     Config {
         #[command(subcommand)]

@@ -582,6 +582,65 @@ fn load_configured_engine(fallback: EngineMode) -> EngineMode {
     fallback
 }
 
+/// Loads the currently configured upstream DNS server address from the active
+/// `config.toml` (system config when a system service is installed, otherwise
+/// user config with fallback to system config and runtime default).
+pub fn load_configured_dns(fallback: &str) -> String {
+    #[cfg(target_os = "macos")]
+    if launch_daemon_plist_path().exists() {
+        let sys_path = config_file::system_config_path();
+        if let Some(dns) = config_file::load_file_config(Some(&sys_path), true)
+            .ok()
+            .and_then(|(_, file_cfg)| file_cfg.dns_addr)
+            .filter(|s| !s.trim().is_empty())
+        {
+            return dns;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    if systemd_system_unit_path().exists() {
+        let sys_path = config_file::system_config_path();
+        if let Some(dns) = config_file::load_file_config(Some(&sys_path), true)
+            .ok()
+            .and_then(|(_, file_cfg)| file_cfg.dns_addr)
+            .filter(|s| !s.trim().is_empty())
+        {
+            return dns;
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    if crate::platform::windows_service::query_windows_service_status().installed {
+        let sys_path = config_file::system_config_path();
+        if let Some(dns) = config_file::load_file_config(Some(&sys_path), true)
+            .ok()
+            .and_then(|(_, file_cfg)| file_cfg.dns_addr)
+            .filter(|s| !s.trim().is_empty())
+        {
+            return dns;
+        }
+    }
+
+    let user_path = resolved_user_config_path();
+    if let Some(dns) = config_file::load_file_config(Some(&user_path), false)
+        .ok()
+        .and_then(|(_, file_cfg)| file_cfg.dns_addr)
+        .filter(|s| !s.trim().is_empty())
+    {
+        return dns;
+    }
+    let sys_path = config_file::system_config_path();
+    if let Some(dns) = config_file::load_file_config(Some(&sys_path), true)
+        .ok()
+        .and_then(|(_, file_cfg)| file_cfg.dns_addr)
+        .filter(|s| !s.trim().is_empty())
+    {
+        return dns;
+    }
+    fallback.to_string()
+}
+
 fn format_vpn_scope_conflict(scope: &VpnScope) -> Option<String> {
     match scope {
         VpnScope::FullTunnel {
@@ -3290,6 +3349,277 @@ fn switch_service_engine_impl(
     {
         let _ = (target, cfg, verbose);
         bail!("engine switching is not supported on {}", platform_name());
+    }
+}
+
+/// Updates the configured upstream DNS server in `config.toml` and restarts any
+/// running background service so the new resolver takes effect immediately.
+pub fn set_service_dns(dns_addr: &str, cfg: &RuntimeConfig) -> Result<()> {
+    set_service_dns_impl(dns_addr, cfg, true)
+}
+
+/// Silent variant of [`set_service_dns`] for the interactive Control Center TUI.
+pub fn set_service_dns_quiet(dns_addr: &str, cfg: &RuntimeConfig) -> Result<()> {
+    set_service_dns_impl(dns_addr, cfg, false)
+}
+
+fn set_service_dns_impl(dns_addr: &str, cfg: &RuntimeConfig, verbose: bool) -> Result<()> {
+    let trimmed = dns_addr.trim();
+    let mut validator = config_file::FileConfig::default();
+    config_file::set_config_key(&mut validator, "dns_addr", trimmed)?;
+    let validated = validator.dns_addr.unwrap_or_else(|| trimmed.to_string());
+
+    #[cfg(target_os = "windows")]
+    {
+        use crate::platform::windows_service::{
+            install_or_update_windows_service_with_start, is_elevated,
+            query_windows_service_status, relaunch_elevated_and_wait,
+        };
+
+        let svc = query_windows_service_status();
+        if svc.installed && !is_elevated() {
+            if verbose {
+                println!(
+                    "Requesting Administrator privileges to update the vdpi Windows service DNS server to {validated}..."
+                );
+            }
+            relaunch_elevated_and_wait(&["dns".to_string(), validated.clone()])?;
+            if verbose {
+                println!("Updated vdpi Windows service DNS server to {validated}.");
+            }
+            return Ok(());
+        }
+
+        let config_path = if svc.installed || is_elevated() {
+            config_file::system_config_path()
+        } else {
+            config_file::user_config_path()
+        };
+        let mut file_cfg = config_file::load_file_config(Some(&config_path), svc.installed)
+            .ok()
+            .and_then(|(found, fc)| found.map(|_| fc))
+            .unwrap_or_else(|| file_config_from_runtime(cfg));
+        file_cfg.schema_version = Some(CONFIG_SCHEMA_VERSION);
+        file_cfg.dns_addr = Some(validated.clone());
+        config_file::save_file_config_atomic(&config_path, &file_cfg)?;
+
+        if svc.installed {
+            let was_running = matches!(svc.state, "RUNNING" | "START_PENDING");
+            let target_bin = installed_binary_path()
+                .ok()
+                .filter(|p| p.is_file())
+                .or_else(|| std::env::current_exe().ok())
+                .context("failed to determine vdpi binary path for DNS update")?;
+            let target_cfg = apply_file_config_to_runtime(cfg, &file_cfg);
+            let bin_path_cmd = build_windows_service_bin_path(&target_bin, &target_cfg);
+            install_or_update_windows_service_with_start(&bin_path_cmd, was_running)?;
+        }
+
+        if verbose {
+            println!(
+                "Updated vdpi DNS server to {validated} (saved {}).",
+                config_path.display()
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let daemon_exists = launch_daemon_plist_path().exists();
+        let agent_exists = launch_agent_plist_path().ok().is_some_and(|p| p.exists());
+        let was_running = detect_service_state() == ServiceState::Running;
+
+        if daemon_exists && !is_unix_root() {
+            let args = vec!["dns".to_string(), validated.clone()];
+            let action = format!("update the macOS background service DNS server to {validated}");
+            relaunch_unix_sudo_and_wait(&args, &action)?;
+            return Ok(());
+        }
+
+        let config_path = if daemon_exists {
+            config_file::system_config_path()
+        } else {
+            resolved_user_config_path()
+        };
+        let mut file_cfg = config_file::load_file_config(Some(&config_path), daemon_exists)
+            .ok()
+            .and_then(|(found, fc)| found.map(|_| fc))
+            .unwrap_or_else(|| file_config_from_runtime(cfg));
+        file_cfg.schema_version = Some(CONFIG_SCHEMA_VERSION);
+        file_cfg.dns_addr = Some(validated.clone());
+        config_file::save_file_config_atomic(&config_path, &file_cfg)?;
+        if !daemon_exists {
+            if let Some(parent) = config_path.parent() {
+                chown_to_sudo_user(parent);
+            }
+            chown_to_sudo_user(&config_path);
+        }
+
+        let target_cfg = apply_file_config_to_runtime(cfg, &file_cfg);
+        if daemon_exists {
+            let target_bin = PathBuf::from(UNIX_SYSTEM_BIN_PATH);
+            let plist_path = launch_daemon_plist_path();
+            let service_target = format!("system/{LAUNCH_DAEMON_LABEL}");
+            let plist_str = plist_path.display().to_string();
+            if was_running || launchctl_service_loaded(&service_target) {
+                let _ = Command::new("/bin/launchctl")
+                    .args(["bootout", &service_target])
+                    .stdin(Stdio::null())
+                    .output();
+                let _ = Command::new("/bin/launchctl")
+                    .args(["bootout", "system", &plist_str])
+                    .stdin(Stdio::null())
+                    .output();
+                wait_launchctl_unloaded(&service_target);
+            }
+            fs::write(
+                &plist_path,
+                generate_launch_daemon_plist(&target_bin, &target_cfg),
+            )?;
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&plist_path, fs::Permissions::from_mode(0o644));
+            }
+            if was_running {
+                start_macos_launch_daemon(&plist_path)?;
+            }
+        } else if agent_exists {
+            let target_bin = installed_binary_path()?;
+            let plist_path = launch_agent_plist_path()?;
+            let domain = launchctl_gui_domain();
+            let service_target = format!("{domain}/{LAUNCH_AGENT_LABEL}");
+            let plist_str = plist_path.display().to_string();
+            if was_running || launchctl_service_loaded(&service_target) {
+                let _ = Command::new("/bin/launchctl")
+                    .args(["bootout", &service_target])
+                    .stdin(Stdio::null())
+                    .output();
+                let _ = Command::new("/bin/launchctl")
+                    .args(["bootout", &domain, &plist_str])
+                    .stdin(Stdio::null())
+                    .output();
+                wait_launchctl_unloaded(&service_target);
+            }
+            fs::write(
+                &plist_path,
+                generate_launchd_plist(&target_bin, &target_cfg),
+            )?;
+            if was_running {
+                let boot = Command::new("/bin/launchctl")
+                    .args(["bootstrap", &domain, &plist_str])
+                    .stdin(Stdio::null())
+                    .output()
+                    .context("failed to execute '/bin/launchctl bootstrap'")?;
+                if !boot.status.success() && !launchctl_service_loaded(&service_target) {
+                    let detail = String::from_utf8_lossy(&boot.stderr).trim().to_string();
+                    bail!("failed to start LaunchAgent '{LAUNCH_AGENT_LABEL}': {detail}");
+                }
+                let _ = Command::new("/bin/launchctl")
+                    .args(["kickstart", "-k", &service_target])
+                    .stdin(Stdio::null())
+                    .output();
+            }
+        }
+
+        if verbose {
+            println!(
+                "Updated vdpi DNS server to {validated} (saved {}).",
+                config_path.display()
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let system_exists = systemd_system_unit_path().exists();
+        let user_exists = systemd_user_unit_path().ok().is_some_and(|p| p.exists());
+        let was_running = detect_service_state() == ServiceState::Running;
+
+        if system_exists && !is_unix_root() {
+            let args = vec!["dns".to_string(), validated.clone()];
+            let action = format!("update the Linux background service DNS server to {validated}");
+            relaunch_unix_sudo_and_wait(&args, &action)?;
+            return Ok(());
+        }
+
+        let config_path = if system_exists {
+            config_file::system_config_path()
+        } else {
+            resolved_user_config_path()
+        };
+        let mut file_cfg = config_file::load_file_config(Some(&config_path), system_exists)
+            .ok()
+            .and_then(|(found, fc)| found.map(|_| fc))
+            .unwrap_or_else(|| file_config_from_runtime(cfg));
+        file_cfg.schema_version = Some(CONFIG_SCHEMA_VERSION);
+        file_cfg.dns_addr = Some(validated.clone());
+        config_file::save_file_config_atomic(&config_path, &file_cfg)?;
+        if !system_exists {
+            if let Some(parent) = config_path.parent() {
+                chown_to_sudo_user(parent);
+            }
+            chown_to_sudo_user(&config_path);
+        }
+
+        let target_cfg = apply_file_config_to_runtime(cfg, &file_cfg);
+        if system_exists {
+            let target_bin = PathBuf::from(UNIX_SYSTEM_BIN_PATH);
+            let unit_path = systemd_system_unit_path();
+            fs::write(
+                &unit_path,
+                generate_systemd_system_unit(&target_bin, &target_cfg),
+            )?;
+            let _ = Command::new("systemctl")
+                .args(["daemon-reload"])
+                .stdin(Stdio::null())
+                .output();
+            if was_running {
+                let out = Command::new("systemctl")
+                    .args(["restart", SYSTEMD_UNIT_NAME])
+                    .stdin(Stdio::null())
+                    .output()
+                    .context("failed to execute 'systemctl restart'")?;
+                if !out.status.success() {
+                    let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    bail!("failed to restart systemd system unit '{SYSTEMD_UNIT_NAME}': {detail}");
+                }
+            }
+        } else if user_exists {
+            let target_bin = installed_binary_path()?;
+            let unit_path = systemd_user_unit_path()?;
+            fs::write(&unit_path, generate_systemd_unit(&target_bin, &target_cfg))?;
+            let _ = linux_user_systemctl_command()
+                .args(["daemon-reload"])
+                .stdin(Stdio::null())
+                .output();
+            if was_running {
+                let out = linux_user_systemctl_command()
+                    .args(["restart", SYSTEMD_UNIT_NAME])
+                    .stdin(Stdio::null())
+                    .output()
+                    .context("failed to execute 'systemctl --user restart'")?;
+                if !out.status.success() {
+                    let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    bail!("failed to restart systemd user unit '{SYSTEMD_UNIT_NAME}': {detail}");
+                }
+            }
+        }
+
+        if verbose {
+            println!(
+                "Updated vdpi DNS server to {validated} (saved {}).",
+                config_path.display()
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (validated, cfg, verbose);
+        bail!("DNS configuration is not supported on {}", platform_name());
     }
 }
 

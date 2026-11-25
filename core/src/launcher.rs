@@ -24,9 +24,81 @@ pub enum Choice {
     PauseService,
     ResumeService,
     SwitchEngine(EngineMode),
+    SelectDns,
+    SetDns(&'static str),
     Doctor,
     Uninstall,
     Cancel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DnsPreset {
+    pub name: &'static str,
+    pub addr: &'static str,
+    pub hint: &'static str,
+}
+
+pub const DNS_PRESETS: [DnsPreset; 6] = [
+    DnsPreset {
+        name: "Cloudflare",
+        addr: "1.1.1.1",
+        hint: "Fast, privacy-focused public DNS (default).",
+    },
+    DnsPreset {
+        name: "Google",
+        addr: "8.8.8.8",
+        hint: "Global low-latency public DNS.",
+    },
+    DnsPreset {
+        name: "AdGuard",
+        addr: "94.140.14.14",
+        hint: "Blocks ads, trackers, and phishing domains.",
+    },
+    DnsPreset {
+        name: "AdGuard Unfiltered",
+        addr: "94.140.14.140",
+        hint: "Privacy-focused DNS without ad filtering.",
+    },
+    DnsPreset {
+        name: "Quad9",
+        addr: "9.9.9.9",
+        hint: "Blocks known malware and phishing domains.",
+    },
+    DnsPreset {
+        name: "Cloudflare Family",
+        addr: "1.1.1.3",
+        hint: "Blocks malware and adult content.",
+    },
+];
+
+pub fn format_dns_label(addr: &str) -> String {
+    let trimmed = addr.trim();
+    if let Some(preset) = DNS_PRESETS
+        .iter()
+        .find(|p| p.addr.eq_ignore_ascii_case(trimmed))
+    {
+        format!("{} ({})", preset.name, preset.addr)
+    } else if trimmed.is_empty() {
+        format!("{} ({})", DNS_PRESETS[0].name, DNS_PRESETS[0].addr)
+    } else {
+        format!("Custom ({trimmed})")
+    }
+}
+
+pub(super) fn dns_preset_index(addr: &str) -> usize {
+    let trimmed = addr.trim();
+    DNS_PRESETS
+        .iter()
+        .position(|p| p.addr.eq_ignore_ascii_case(trimmed))
+        .unwrap_or(0)
+}
+
+fn dns_server_item(current_dns: &str) -> MenuItem {
+    MenuItem::new(
+        Choice::SelectDns,
+        format!("Choose DNS server · {}", format_dns_label(current_dns)),
+        "Pick Cloudflare, Google, AdGuard, Quad9, or Family DoH.",
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,6 +457,7 @@ fn quit_item() -> MenuItem {
 fn build_same_version_items(
     service_state: ServiceState,
     current_engine: EngineMode,
+    configured_dns: &str,
 ) -> Vec<MenuItem> {
     match service_state {
         ServiceState::Running => vec![
@@ -394,6 +467,7 @@ fn build_same_version_items(
                 "Temporarily stops vdpi and restores routes & proxies.",
             ),
             switch_engine_item(current_engine),
+            dns_server_item(configured_dns),
             MenuItem::new(
                 Choice::Update,
                 "Check for updates online",
@@ -419,6 +493,7 @@ fn build_same_version_items(
                 "Starts the service and re-enables routes & proxies.",
             ),
             switch_engine_item(current_engine),
+            dns_server_item(configured_dns),
             MenuItem::new(
                 Choice::Run,
                 "Run directly (this session)",
@@ -449,6 +524,7 @@ fn build_same_version_items(
                 "Rewrites the background service and restarts it.",
             ),
             switch_engine_item(current_engine),
+            dns_server_item(configured_dns),
             MenuItem::new(
                 Choice::Run,
                 "Run directly (this session)",
@@ -470,7 +546,16 @@ fn build_same_version_items(
     }
 }
 
+#[cfg(test)]
 pub(super) fn build_menu(status: &ControlCenterStatus, notice: Option<&str>) -> LauncherMenu {
+    build_menu_with_dns(status, notice, DNS_PRESETS[0].addr)
+}
+
+pub(super) fn build_menu_with_dns(
+    status: &ControlCenterStatus,
+    notice: Option<&str>,
+    configured_dns: &str,
+) -> LauncherMenu {
     let status_rows = build_status_rows(status);
     let notice = notice
         .map(str::trim)
@@ -491,6 +576,7 @@ pub(super) fn build_menu(status: &ControlCenterStatus, notice: Option<&str>) -> 
                 "Install for automatic startup",
                 "Runs in the background after you close it.",
             ),
+            dns_server_item(configured_dns),
             MenuItem::new(
                 Choice::Doctor,
                 "Run diagnostics",
@@ -498,12 +584,14 @@ pub(super) fn build_menu(status: &ControlCenterStatus, notice: Option<&str>) -> 
             ),
             quit_item(),
         ],
-        (None, service_state) => build_same_version_items(service_state, current_engine),
+        (None, service_state) => {
+            build_same_version_items(service_state, current_engine, configured_dns)
+        }
         (Some(info), service_state) => match info.relation {
             VersionRelation::Newer => {
                 let old = info.installed_version.as_deref().unwrap_or("unknown");
                 let new = info.current_version;
-                let mut items = Vec::with_capacity(6);
+                let mut items = Vec::with_capacity(7);
                 items.push(MenuItem::new(
                     Choice::Install,
                     format!("Update installed vdpi (v{old} -> v{new})"),
@@ -513,6 +601,7 @@ pub(super) fn build_menu(status: &ControlCenterStatus, notice: Option<&str>) -> 
                     items.push(toggle);
                 }
                 items.push(switch_engine_item(current_engine));
+                items.push(dns_server_item(configured_dns));
                 items.push(MenuItem::new(
                     Choice::Run,
                     "Run directly without updating",
@@ -522,11 +611,13 @@ pub(super) fn build_menu(status: &ControlCenterStatus, notice: Option<&str>) -> 
                 items.push(quit_item());
                 items
             }
-            VersionRelation::Same => build_same_version_items(service_state, current_engine),
+            VersionRelation::Same => {
+                build_same_version_items(service_state, current_engine, configured_dns)
+            }
             VersionRelation::Older => {
                 let inst = info.installed_version.as_deref().unwrap_or("newer");
                 let cur = info.current_version;
-                let mut items = Vec::with_capacity(6);
+                let mut items = Vec::with_capacity(7);
                 items.push(MenuItem::new(
                     Choice::Run,
                     "Run directly",
@@ -536,6 +627,7 @@ pub(super) fn build_menu(status: &ControlCenterStatus, notice: Option<&str>) -> 
                     items.push(toggle);
                 }
                 items.push(switch_engine_item(current_engine));
+                items.push(dns_server_item(configured_dns));
                 items.push(MenuItem::new(
                     Choice::Install,
                     format!("Downgrade installed vdpi (v{inst} -> v{cur})"),
@@ -547,7 +639,7 @@ pub(super) fn build_menu(status: &ControlCenterStatus, notice: Option<&str>) -> 
             }
             VersionRelation::Unknown => {
                 let cur = info.current_version;
-                let mut items = Vec::with_capacity(6);
+                let mut items = Vec::with_capacity(7);
                 items.push(MenuItem::new(
                     Choice::Install,
                     format!("Update / repair installed vdpi (to v{cur})"),
@@ -557,6 +649,7 @@ pub(super) fn build_menu(status: &ControlCenterStatus, notice: Option<&str>) -> 
                     items.push(toggle);
                 }
                 items.push(switch_engine_item(current_engine));
+                items.push(dns_server_item(configured_dns));
                 items.push(MenuItem::new(
                     Choice::Run,
                     "Run directly",
@@ -591,6 +684,7 @@ pub fn choose<F>(
     explicit: bool,
     status: &ControlCenterStatus,
     notice: Option<&str>,
+    configured_dns: &str,
     mut refresh: F,
 ) -> Result<Choice>
 where
@@ -611,22 +705,24 @@ where
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             if env::var("TERM").as_deref() == Ok("dumb") {
-                read_choice(
+                read_choice_with_dns(
                     io::stdin().lock(),
                     io::stderr().lock(),
                     status,
                     notice,
+                    configured_dns,
                     &mut tracked_refresh,
                 )?
             } else {
                 let color = env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
-                match tui::choose(color, status, notice, &mut tracked_refresh) {
+                match tui::choose(color, status, notice, configured_dns, &mut tracked_refresh) {
                     Ok(choice) => choice,
-                    Err(_) => read_choice(
+                    Err(_) => read_choice_with_dns(
                         io::stdin().lock(),
                         io::stderr().lock(),
                         status,
                         notice,
+                        configured_dns,
                         &mut tracked_refresh,
                     )
                     .context("running the terminal launcher")?,
@@ -635,11 +731,12 @@ where
         }
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {
-            read_choice(
+            read_choice_with_dns(
                 io::stdin().lock(),
                 io::stderr().lock(),
                 status,
                 notice,
+                configured_dns,
                 &mut tracked_refresh,
             )?
         }
@@ -804,17 +901,95 @@ fn print_console_menu(output: &mut impl Write, menu: &LauncherMenu) -> io::Resul
     Ok(())
 }
 
+#[cfg(test)]
 fn read_choice<F>(
+    input: impl BufRead,
+    output: impl Write,
+    initial_status: &ControlCenterStatus,
+    notice: Option<&str>,
+    refresh: F,
+) -> io::Result<Choice>
+where
+    F: FnMut() -> ControlCenterStatus,
+{
+    read_choice_with_dns(
+        input,
+        output,
+        initial_status,
+        notice,
+        DNS_PRESETS[0].addr,
+        refresh,
+    )
+}
+
+fn read_dns_choice(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    configured_dns: &str,
+) -> io::Result<Option<&'static str>> {
+    writeln!(
+        output,
+        "\n  Choose DNS server (current: {})",
+        format_dns_label(configured_dns)
+    )?;
+    for (idx, preset) in DNS_PRESETS.iter().enumerate() {
+        let active = if preset.addr.eq_ignore_ascii_case(configured_dns.trim()) {
+            " [active]"
+        } else {
+            ""
+        };
+        writeln!(
+            output,
+            "  {}  {:<18} {:<15} {}{active}",
+            idx + 1,
+            preset.name,
+            preset.addr,
+            preset.hint
+        )?;
+    }
+    let mut answer = String::new();
+    loop {
+        write!(output, "  Choose DNS [1-{} / b back]: ", DNS_PRESETS.len())?;
+        output.flush()?;
+        answer.clear();
+        if input.read_line(&mut answer)? == 0 {
+            return Ok(None);
+        }
+        let trimmed = answer.trim();
+        if trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("b")
+            || trimmed.eq_ignore_ascii_case("q")
+        {
+            return Ok(None);
+        }
+        if let Some(preset) = trimmed
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_sub(1))
+            .and_then(|i| DNS_PRESETS.get(i))
+        {
+            return Ok(Some(preset.addr));
+        }
+        writeln!(
+            output,
+            "  Enter a number from 1 to {}, or b to go back.",
+            DNS_PRESETS.len()
+        )?;
+    }
+}
+
+fn read_choice_with_dns<F>(
     mut input: impl BufRead,
     mut output: impl Write,
     initial_status: &ControlCenterStatus,
     notice: Option<&str>,
+    configured_dns: &str,
     mut refresh: F,
 ) -> io::Result<Choice>
 where
     F: FnMut() -> ControlCenterStatus,
 {
-    let mut menu = build_menu(initial_status, notice);
+    let mut menu = build_menu_with_dns(initial_status, notice, configured_dns);
     if menu.items.is_empty() {
         return Ok(Choice::Cancel);
     }
@@ -826,7 +1001,7 @@ where
         let count = menu.items.len();
         let choices: Vec<String> = (1..=count)
             .map(|n| n.to_string())
-            .chain(["r".to_string(), "q".to_string()])
+            .chain(["d".to_string(), "r".to_string(), "q".to_string()])
             .collect();
         let prompt_choices = choices.join(" / ");
 
@@ -842,7 +1017,7 @@ where
         }
         if trimmed.eq_ignore_ascii_case("r") {
             let latest = refresh();
-            menu = build_menu(&latest, Some("Status refreshed."));
+            menu = build_menu_with_dns(&latest, Some("Status refreshed."), configured_dns);
             if menu.items.is_empty() {
                 return Ok(Choice::Cancel);
             }
@@ -858,12 +1033,26 @@ where
                 return Ok(item.choice);
             }
         }
+        if trimmed.eq_ignore_ascii_case("d") {
+            if let Some(addr) = read_dns_choice(&mut input, &mut output, configured_dns)? {
+                return Ok(Choice::SetDns(addr));
+            }
+            print_console_menu(&mut output, &menu)?;
+            continue;
+        }
         if let Some(item) = trimmed
             .parse::<usize>()
             .ok()
             .and_then(|n| n.checked_sub(1))
             .and_then(|i| menu.items.get(i))
         {
+            if item.choice == Choice::SelectDns {
+                if let Some(addr) = read_dns_choice(&mut input, &mut output, configured_dns)? {
+                    return Ok(Choice::SetDns(addr));
+                }
+                print_console_menu(&mut output, &menu)?;
+                continue;
+            }
             if item.choice == Choice::Uninstall {
                 write!(
                     output,
@@ -1012,7 +1201,7 @@ mod tests {
                 StatusTone::Neutral
             )
         );
-        assert_eq!(menu.items.len(), 5);
+        assert_eq!(menu.items.len(), 6);
         assert_eq!(menu.items[0].choice, Choice::Run);
         assert_eq!(menu.items[0].title, "Run directly");
         assert_eq!(menu.items[1].choice, Choice::SwitchEngine(EngineMode::Tun));
@@ -1023,10 +1212,12 @@ mod tests {
         );
         assert_eq!(menu.items[2].choice, Choice::Install);
         assert_eq!(menu.items[2].title, "Install for automatic startup");
-        assert_eq!(menu.items[3].choice, Choice::Doctor);
-        assert_eq!(menu.items[3].title, "Run diagnostics");
-        assert_eq!(menu.items[4].choice, Choice::Cancel);
-        assert_eq!(menu.items[4].title, "Quit");
+        assert_eq!(menu.items[3].choice, Choice::SelectDns);
+        assert!(menu.items[3].title.contains("Cloudflare (1.1.1.1)"));
+        assert_eq!(menu.items[4].choice, Choice::Doctor);
+        assert_eq!(menu.items[4].title, "Run diagnostics");
+        assert_eq!(menu.items[5].choice, Choice::Cancel);
+        assert_eq!(menu.items[5].title, "Quit");
 
         let mut fresh_tun = fresh_status();
         fresh_tun.configured_engine = EngineMode::Tun;
@@ -1082,6 +1273,7 @@ mod tests {
             vec![
                 Choice::PauseService,
                 Choice::SwitchEngine(EngineMode::Tun),
+                Choice::SelectDns,
                 Choice::Update,
                 Choice::Doctor,
                 Choice::Install,
@@ -1278,6 +1470,7 @@ mod tests {
             vec![
                 Choice::ResumeService,
                 Choice::SwitchEngine(EngineMode::Proxy),
+                Choice::SelectDns,
                 Choice::Run,
                 Choice::Update,
                 Choice::Doctor,
@@ -1327,6 +1520,7 @@ mod tests {
                 Choice::Install,
                 Choice::PauseService,
                 Choice::SwitchEngine(EngineMode::Tun),
+                Choice::SelectDns,
                 Choice::Run,
                 Choice::Uninstall,
                 Choice::Cancel,
@@ -1374,6 +1568,7 @@ mod tests {
                 Choice::Run,
                 Choice::PauseService,
                 Choice::SwitchEngine(EngineMode::Tun),
+                Choice::SelectDns,
                 Choice::Install,
                 Choice::Uninstall,
                 Choice::Cancel,
@@ -1399,6 +1594,7 @@ mod tests {
                 Choice::Install,
                 Choice::ResumeService,
                 Choice::SwitchEngine(EngineMode::Tun),
+                Choice::SelectDns,
                 Choice::Run,
                 Choice::Uninstall,
                 Choice::Cancel,
@@ -1447,10 +1643,20 @@ mod tests {
         assert!(output.contains("Switch to TUN mode"));
         assert!(output.contains("Install for automatic startup"));
         assert!(output.contains("Run diagnostics"));
-        assert!(output.contains("Enter a number from 1 to 5, r to refresh, or q to quit."));
-        assert!(output.contains("Choose [1 / 2 / 3 / 4 / 5 / r / q]: "));
+        assert!(output.contains("Enter a number from 1 to 6, r to refresh, or q to quit."));
+        assert!(output.contains("Choose [1 / 2 / 3 / 4 / 5 / 6 / d / r / q]: "));
         assert!(output.contains(REPOSITORY_URL));
         assert!(!output.contains('\x1b'));
+
+        // Console 'd' shortcut opens DNS preset picker and selects AdGuard on '3'.
+        let mut dns_out = Vec::new();
+        assert_eq!(
+            read_choice(&b"d\n3\n"[..], &mut dns_out, &fresh, None, fresh_status).unwrap(),
+            Choice::SetDns("94.140.14.14")
+        );
+        let dns_out = String::from_utf8(dns_out).unwrap();
+        assert!(dns_out.contains("AdGuard"));
+        assert!(dns_out.contains("94.140.14.14"));
 
         // Console renders inline [VPN: Mullvad] badge and returns SwitchEngine on slot 2.
         let mut tun_with_vpn = sample_live_tun_engine();
@@ -1511,7 +1717,7 @@ mod tests {
         let mut confirm_out = Vec::new();
         assert_eq!(
             read_choice(
-                &b"6\nn\n6\ny\n"[..],
+                &b"7\nn\n7\ny\n"[..],
                 &mut confirm_out,
                 &running,
                 None,

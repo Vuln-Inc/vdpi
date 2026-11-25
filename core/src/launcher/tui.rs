@@ -1,4 +1,7 @@
-use super::{build_menu, Choice, LauncherMenu, MenuItem, StatusRow, StatusTone};
+use super::{
+    build_menu_with_dns, dns_preset_index, format_dns_label, Choice, LauncherMenu, MenuItem,
+    StatusRow, StatusTone, DNS_PRESETS,
+};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -150,14 +153,35 @@ struct UiState {
     menu: LauncherMenu,
     selected: usize,
     confirming_uninstall: bool,
+    selecting_dns: bool,
+    dns_selected: usize,
+    configured_dns: String,
 }
 
 impl UiState {
+    #[cfg(test)]
     fn new(status: &ControlCenterStatus, notice: Option<&str>) -> Self {
+        Self::new_with_dns(status, notice, DNS_PRESETS[0].addr)
+    }
+
+    fn new_with_dns(
+        status: &ControlCenterStatus,
+        notice: Option<&str>,
+        configured_dns: &str,
+    ) -> Self {
+        let dns = configured_dns.trim();
+        let dns = if dns.is_empty() {
+            DNS_PRESETS[0].addr
+        } else {
+            dns
+        };
         Self {
-            menu: build_menu(status, notice),
+            menu: build_menu_with_dns(status, notice, dns),
             selected: 0,
             confirming_uninstall: false,
+            selecting_dns: false,
+            dns_selected: dns_preset_index(dns),
+            configured_dns: dns.to_string(),
         }
     }
 }
@@ -521,12 +545,13 @@ pub(super) fn choose<F>(
     color: bool,
     initial_status: &ControlCenterStatus,
     notice: Option<&str>,
+    configured_dns: &str,
     mut refresh: F,
 ) -> io::Result<Choice>
 where
     F: FnMut() -> ControlCenterStatus,
 {
-    let mut state = UiState::new(initial_status, notice);
+    let mut state = UiState::new_with_dns(initial_status, notice, configured_dns);
     if state.menu.items.is_empty() {
         return Ok(Choice::Cancel);
     }
@@ -557,8 +582,9 @@ where
 }
 
 fn apply_refresh(state: &mut UiState, latest: &ControlCenterStatus) {
-    state.menu = build_menu(latest, Some("Status refreshed."));
+    state.menu = build_menu_with_dns(latest, Some("Status refreshed."), &state.configured_dns);
     state.confirming_uninstall = false;
+    state.selecting_dns = false;
     if state.menu.items.is_empty() {
         state.selected = 0;
     } else {
@@ -595,6 +621,48 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Action {
         };
     }
 
+    if state.selecting_dns {
+        let count = DNS_PRESETS.len();
+        if state.dns_selected >= count {
+            state.dns_selected = count.saturating_sub(1);
+        }
+        match key.code {
+            KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
+                state.dns_selected = (state.dns_selected + count - 1) % count;
+                return Action::Redraw;
+            }
+            KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
+                state.dns_selected = (state.dns_selected + 1) % count;
+                return Action::Redraw;
+            }
+            KeyCode::Home => {
+                state.dns_selected = 0;
+                return Action::Redraw;
+            }
+            KeyCode::End => {
+                state.dns_selected = count - 1;
+                return Action::Redraw;
+            }
+            _ if key.kind != KeyEventKind::Press => return Action::Ignore,
+            KeyCode::Enter => {
+                return Action::Finish(Choice::SetDns(DNS_PRESETS[state.dns_selected].addr));
+            }
+            KeyCode::Char(c @ '1'..='9') => {
+                let index = usize::from(c as u8 - b'1');
+                if let Some(preset) = DNS_PRESETS.get(index) {
+                    state.dns_selected = index;
+                    return Action::Finish(Choice::SetDns(preset.addr));
+                }
+                return Action::Ignore;
+            }
+            KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('q' | 'Q' | 'b' | 'B') => {
+                state.selecting_dns = false;
+                return Action::Redraw;
+            }
+            _ => return Action::Ignore,
+        }
+    }
+
     let count = state.menu.items.len();
     if count == 0 {
         return Action::Finish(Choice::Cancel);
@@ -614,6 +682,11 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Action {
         KeyCode::End => state.selected = count - 1,
         _ if key.kind != KeyEventKind::Press => return Action::Ignore,
         KeyCode::Char('r' | 'R') => return Action::Refresh,
+        KeyCode::Char('d' | 'D') => {
+            state.dns_selected = dns_preset_index(&state.configured_dns);
+            state.selecting_dns = true;
+            return Action::Redraw;
+        }
         KeyCode::Char('m' | 'M') => {
             if let Some((index, item)) = state
                 .menu
@@ -633,6 +706,11 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Action {
                 state.confirming_uninstall = true;
                 return Action::Redraw;
             }
+            if choice == Choice::SelectDns {
+                state.dns_selected = dns_preset_index(&state.configured_dns);
+                state.selecting_dns = true;
+                return Action::Redraw;
+            }
             return Action::Finish(choice);
         }
         KeyCode::Char(c @ '1'..='9') => {
@@ -641,6 +719,12 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Action {
                 if item.choice == Choice::Uninstall {
                     state.selected = index;
                     state.confirming_uninstall = true;
+                    return Action::Redraw;
+                }
+                if item.choice == Choice::SelectDns {
+                    state.selected = index;
+                    state.dns_selected = dns_preset_index(&state.configured_dns);
+                    state.selecting_dns = true;
                     return Action::Redraw;
                 }
                 return Action::Finish(item.choice);
@@ -842,6 +926,13 @@ fn render(frame: &mut Frame<'_>, state: &UiState, color: bool) {
             footer_y = footer_y.saturating_sub(1);
             render_divider(frame, row(footer_y), ctx);
         }
+        return;
+    }
+
+    if state.selecting_dns {
+        render_dns_picker_card(
+            frame, area, card_width, padding, inset, state, palette, color,
+        );
         return;
     }
 
@@ -1339,6 +1430,224 @@ fn render_item_hint(
     frame.render_widget(line, area);
 }
 
+#[allow(clippy::too_many_arguments)]
+fn render_dns_picker_card(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    card_width: u16,
+    padding: Padding,
+    inset: bool,
+    state: &UiState,
+    palette: Palette,
+    color: bool,
+) {
+    let preset_count = u16::try_from(DNS_PRESETS.len()).unwrap_or(6);
+    // borders(2) + header(1) + top_div(1) + title(1) + gap(1) + presets(6) + gap(1) + hint(1) + bot_div(1) + footer(1)
+    let ideal_height = 2 + 1 + 1 + 1 + 1 + preset_count + 1 + 1 + 1 + 1;
+    let card_height = ideal_height.min(area.height).max(5);
+    let card_area = centered_rect(area, card_width, card_height);
+    let block = Block::bordered()
+        .border_type(if color {
+            BorderType::Rounded
+        } else {
+            BorderType::Plain
+        })
+        .border_style(palette.border)
+        .padding(padding);
+    let inner = block.inner(card_area);
+    frame.render_widget(block, card_area);
+
+    if inner.is_empty() {
+        return;
+    }
+
+    let ctx = RenderCtx { palette, inset };
+    let mut y = inner.y;
+    let bottom = inner.y.saturating_add(inner.height);
+    let row = |row_y: u16| Rect::new(inner.x, row_y, inner.width, 1);
+
+    if y < bottom {
+        render_header(frame, row(y), ctx);
+        y = y.saturating_add(1);
+    }
+    if y + 2 < bottom {
+        render_divider(frame, row(y), ctx);
+        y = y.saturating_add(1);
+    }
+
+    let show_footer = inner.height >= 5;
+    let show_bot_divider = inner.height >= 11;
+    let footer_reserve = u16::from(show_footer) + u16::from(show_bot_divider);
+    let body_bottom = bottom.saturating_sub(footer_reserve).max(y);
+
+    let pad = if inset { " " } else { "" };
+    let width = usize::from(inner.width);
+    let right_margin = usize::from(inset);
+    let selected = state.dns_selected.min(DNS_PRESETS.len().saturating_sub(1));
+
+    if y < body_bottom {
+        let current_label = format_dns_label(&state.configured_dns);
+        let heading = format!("Choose DNS server · {current_label}");
+        let budget = width.saturating_sub(pad.len() + 2 + right_margin);
+        let title_line = Line::from(vec![
+            Span::raw(pad),
+            Span::styled("● ", palette.status_accent),
+            Span::styled(truncate_text(&heading, budget), palette.active_title),
+        ]);
+        frame.render_widget(title_line, row(y));
+        y = y.saturating_add(1);
+    }
+
+    let remaining_for_presets = body_bottom.saturating_sub(y);
+    if remaining_for_presets >= preset_count + 2 && y < body_bottom {
+        y = y.saturating_add(1);
+    }
+
+    let show_hint = body_bottom.saturating_sub(y) > preset_count;
+    let list_bottom = if show_hint {
+        body_bottom.saturating_sub(1)
+    } else {
+        body_bottom
+    };
+    let visible_slots = usize::from(list_bottom.saturating_sub(y)).max(1);
+    let start_index = if selected < visible_slots {
+        0
+    } else {
+        (selected + 1).saturating_sub(visible_slots)
+    };
+
+    for (index, preset) in DNS_PRESETS
+        .iter()
+        .enumerate()
+        .skip(start_index)
+        .take(visible_slots)
+    {
+        if y >= list_bottom {
+            break;
+        }
+        let is_selected = index == selected;
+        let is_active = preset
+            .addr
+            .eq_ignore_ascii_case(state.configured_dns.trim());
+        let prefix = if is_selected {
+            if inset {
+                " ▸ "
+            } else {
+                "▸ "
+            }
+        } else if inset {
+            "   "
+        } else {
+            "  "
+        };
+        let badge = key_badge(index);
+        let active_tag = if is_active { " [Active]" } else { "" };
+        let label = format!("{:<19} {}", preset.name, preset.addr);
+        let used = prefix.len() + badge.len() + 1 + active_tag.len() + right_margin;
+        let budget = width.saturating_sub(used);
+        let display_label = truncate_text(&label, budget);
+
+        let mut spans = vec![
+            Span::styled(
+                prefix,
+                if is_selected {
+                    palette.active_marker
+                } else {
+                    palette.inactive_title
+                },
+            ),
+            Span::styled(
+                badge,
+                if is_selected {
+                    palette.active_badge
+                } else {
+                    palette.inactive_badge
+                },
+            ),
+            Span::raw(" "),
+            Span::styled(
+                display_label,
+                if is_selected {
+                    palette.active_title
+                } else {
+                    palette.inactive_title
+                },
+            ),
+        ];
+        if is_active {
+            spans.push(Span::styled(active_tag, palette.status_active));
+        }
+        frame.render_widget(Line::from(spans), row(y));
+        y = y.saturating_add(1);
+    }
+
+    if show_hint && y < body_bottom {
+        let hint_y = body_bottom.saturating_sub(1);
+        let indent = if inset { "       " } else { "      " };
+        let budget = width.saturating_sub(indent.len() + right_margin);
+        let hint = truncate_text(DNS_PRESETS[selected].hint, budget);
+        let line = Line::from(vec![
+            Span::raw(indent),
+            Span::styled(hint, palette.active_hint),
+        ]);
+        frame.render_widget(line, row(hint_y));
+    }
+
+    let mut footer_y = bottom;
+    if show_footer && footer_y > y {
+        footer_y = footer_y.saturating_sub(1);
+        render_dns_footer(frame, row(footer_y), ctx);
+    }
+    if show_bot_divider && footer_y > y {
+        footer_y = footer_y.saturating_sub(1);
+        render_divider(frame, row(footer_y), ctx);
+    }
+}
+
+fn render_dns_footer(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx) {
+    if area.is_empty() {
+        return;
+    }
+    let pad = if ctx.inset { " " } else { "" };
+    let key = ctx.palette.footer_key;
+    let text = ctx.palette.footer_text;
+    let width = usize::from(area.width);
+    let range = range_label(DNS_PRESETS.len());
+
+    let line = if width >= pad.len() * 2 + 46 + range.len() {
+        Line::from(vec![
+            Span::raw(pad),
+            Span::styled("↑↓", key),
+            Span::styled(" move · ", text),
+            Span::styled(range, key),
+            Span::styled(" pick · ", text),
+            Span::styled("enter", key),
+            Span::styled(" apply · ", text),
+            Span::styled("esc", key),
+            Span::styled(" back", text),
+        ])
+    } else if width >= pad.len() * 2 + 24 + range.len() {
+        Line::from(vec![
+            Span::raw(pad),
+            Span::styled("↑↓", key),
+            Span::styled(" · ", text),
+            Span::styled(range, key),
+            Span::styled(" · ", text),
+            Span::styled("enter", key),
+            Span::styled(" · ", text),
+            Span::styled("esc", key),
+        ])
+    } else {
+        Line::from(vec![
+            Span::raw(pad),
+            Span::styled("enter", key),
+            Span::styled(" · ", text),
+            Span::styled("esc", key),
+        ])
+    };
+    frame.render_widget(line, area);
+}
+
 fn render_confirm_footer(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx) {
     if area.is_empty() {
         return;
@@ -1396,13 +1705,15 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, item_count: usize, ctx: Rend
         Line::from(vec![
             Span::raw(pad),
             Span::styled("↑↓", key),
-            Span::styled(" move  ·  ", text),
+            Span::styled(" move · ", text),
             Span::styled(range, key),
-            Span::styled(" select  ·  ", text),
+            Span::styled(" select · ", text),
+            Span::styled("d", key),
+            Span::styled(" dns · ", text),
             Span::styled("r", key),
-            Span::styled(" refresh  ·  ", text),
+            Span::styled(" refresh · ", text),
             Span::styled("enter", key),
-            Span::styled(" confirm  ·  ", text),
+            Span::styled(" ok · ", text),
             Span::styled("q", key),
             Span::styled(" quit", text),
         ])
@@ -1644,7 +1955,7 @@ mod tests {
             "missing selected item hint:\n{text}"
         );
         assert!(
-            text.contains("↑↓ move  ·  1-7 select  ·  r refresh  ·  enter confirm  ·  q quit"),
+            text.contains("↑↓ move · 1-8 select · d dns · r refresh · enter ok · q quit"),
             "missing full footer:\n{text}"
         );
         assert!(buf
@@ -1666,7 +1977,7 @@ mod tests {
         assert!(text.contains("Paused · v0.5.0 (temporarily stopped)"));
         assert!(text.contains("Offline · routes & proxies restored"));
         assert!(text.contains("✓ Service paused - system proxies restored."));
-        assert_eq!(state.menu.items.len(), 8);
+        assert_eq!(state.menu.items.len(), 9);
         assert!(state
             .menu
             .items
@@ -1686,8 +1997,8 @@ mod tests {
         }
         assert!(text.contains(&state.menu.items[0].hint));
         assert!(
-            text.contains("↑↓ move  ·  1-8 select  ·  r refresh  ·  enter confirm  ·  q quit"),
-            "missing full 1-8 footer:\n{text}"
+            text.contains("↑↓ move · 1-9 select · d dns · r refresh · enter ok · q quit"),
+            "missing full 1-9 footer:\n{text}"
         );
         assert!(buf
             .content()
@@ -1716,8 +2027,7 @@ mod tests {
         assert!(fresh_text.contains("Install for automatic startup"));
         assert!(fresh_text.contains("Run diagnostics"));
         assert!(fresh_text.contains("Quit"));
-        assert!(fresh_text
-            .contains("↑↓ move  ·  1-5 select  ·  r refresh  ·  enter confirm  ·  q quit"));
+        assert!(fresh_text.contains("↑↓ move · 1-6 select · d dns · r refresh · enter ok · q quit"));
 
         let update = UiState::new(&status_update_available(), None);
         let update_buf = render_state(80, 24, &update, true);
@@ -1885,9 +2195,9 @@ mod tests {
         let mut state = UiState::new(&status_paused(), None);
         let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
 
-        // Move to last item (index 7 of 8).
+        // Move to last item (index 8 of 9).
         assert_eq!(handle_key(&mut state, press(KeyCode::End)), Action::Redraw);
-        assert_eq!(state.selected, 7);
+        assert_eq!(state.selected, 8);
 
         // Pressing 'r' or 'R' requests refresh.
         assert_eq!(
@@ -1899,16 +2209,16 @@ mod tests {
             Action::Refresh
         );
 
-        // Apply refresh to NotInstalled (5 items): selection clamps cleanly to 4 and notice updates.
+        // Apply refresh to NotInstalled (6 items): selection clamps cleanly to 5 and notice updates.
         apply_refresh(&mut state, &status_not_installed());
-        assert_eq!(state.selected, 4);
+        assert_eq!(state.selected, 5);
         assert_eq!(state.menu.notice.as_deref(), Some("Status refreshed."));
         assert!(!state.confirming_uninstall);
 
         let buf = render_state(80, 24, &state, true);
         let text = buffer_text(&buf);
         assert!(text.contains("✓ Status refreshed."));
-        assert!(text.contains("▸ [5] Quit"));
+        assert!(text.contains("▸ [6] Quit"));
     }
 
     #[test]
@@ -1990,6 +2300,9 @@ mod tests {
             },
             selected: 0,
             confirming_uninstall: false,
+            selecting_dns: false,
+            dns_selected: 0,
+            configured_dns: DNS_PRESETS[0].addr.to_string(),
         };
 
         for state in [&paused, &confirm, &empty] {
@@ -2014,7 +2327,7 @@ mod tests {
         let buf = render_state(40, 6, &paused, true);
         let text = buffer_text(&buf);
         assert!(
-            text.contains("▸ [8] Quit"),
+            text.contains("▸ [9] Quit"),
             "expected scrolled item:\n{text}"
         );
     }
@@ -2025,12 +2338,12 @@ mod tests {
         let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
 
         assert_eq!(handle_key(&mut state, press(KeyCode::Up)), Action::Redraw);
-        assert_eq!(state.selected, 4);
+        assert_eq!(state.selected, 5);
         assert_eq!(
             handle_key(&mut state, press(KeyCode::Char('k'))),
             Action::Redraw
         );
-        assert_eq!(state.selected, 3);
+        assert_eq!(state.selected, 4);
         assert_eq!(
             handle_key(
                 &mut state,
@@ -2038,7 +2351,7 @@ mod tests {
             ),
             Action::Redraw
         );
-        assert_eq!(state.selected, 2);
+        assert_eq!(state.selected, 3);
         assert_eq!(handle_key(&mut state, press(KeyCode::Home)), Action::Redraw);
         assert_eq!(state.selected, 0);
         assert_eq!(handle_key(&mut state, press(KeyCode::Down)), Action::Redraw);
@@ -2052,6 +2365,8 @@ mod tests {
         assert_eq!(state.selected, 3);
         assert_eq!(handle_key(&mut state, press(KeyCode::Tab)), Action::Redraw);
         assert_eq!(state.selected, 4);
+        assert_eq!(handle_key(&mut state, press(KeyCode::Tab)), Action::Redraw);
+        assert_eq!(state.selected, 5);
         assert_eq!(handle_key(&mut state, press(KeyCode::Tab)), Action::Redraw);
         assert_eq!(state.selected, 0);
 
@@ -2078,7 +2393,7 @@ mod tests {
             Action::Finish(Choice::Run)
         );
         assert_eq!(
-            handle_key(&mut state, press(KeyCode::Char('4'))),
+            handle_key(&mut state, press(KeyCode::Char('5'))),
             Action::Finish(Choice::Doctor)
         );
         assert_eq!(
@@ -2178,6 +2493,9 @@ mod tests {
             },
             selected: 0,
             confirming_uninstall: false,
+            selecting_dns: false,
+            dns_selected: 0,
+            configured_dns: DNS_PRESETS[0].addr.to_string(),
         }
     }
 
@@ -2196,7 +2514,7 @@ mod tests {
         assert!(text.contains("TUN · 4 active · 12 cached hosts"));
         assert!(text.contains("[VPN: Mullvad]"));
         assert!(
-            text.contains("↑↓ move  ·  1-6 select  ·  r refresh  ·  enter confirm  ·  q quit"),
+            text.contains("↑↓ move · 1-6 select · d dns · r refresh · enter ok · q quit"),
             "footer must remain uncluttered:\n{text}"
         );
 
@@ -2417,6 +2735,9 @@ mod tests {
             },
             selected: 0,
             confirming_uninstall: false,
+            selecting_dns: false,
+            dns_selected: 0,
+            configured_dns: DNS_PRESETS[0].addr.to_string(),
         };
         let tones_text = buffer_text(&render_state(80, 24, &tones_state, false));
         assert!(tones_text.contains("● Active"));
@@ -2501,6 +2822,9 @@ mod tests {
             },
             selected: 0,
             confirming_uninstall: false,
+            selecting_dns: false,
+            dns_selected: 0,
+            configured_dns: DNS_PRESETS[0].addr.to_string(),
         };
         assert_eq!(
             handle_key(&mut no_switch, press(KeyCode::Char('m'))),
@@ -2553,6 +2877,57 @@ mod tests {
                 ICE_BLUE,
                 "Accent badge cell at x={x} must use ICE_BLUE"
             );
+        }
+    }
+
+    #[test]
+    fn dns_picker_opens_via_hotkey_navigates_renders_and_applies_choice() {
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut state = UiState::new_with_dns(&status_running_live(), None, "1.1.1.1");
+        assert!(!state.selecting_dns);
+
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('d'))),
+            Action::Redraw
+        );
+        assert!(state.selecting_dns);
+        assert_eq!(state.dns_selected, 0);
+
+        let buf = render_state(80, 24, &state, true);
+        let text = buffer_text(&buf);
+        assert!(
+            text.contains("Choose DNS server"),
+            "header missing:\n{text}"
+        );
+        assert!(text.contains("Cloudflare"), "Cloudflare missing:\n{text}");
+        assert!(text.contains("AdGuard"), "AdGuard missing:\n{text}");
+        assert!(text.contains("94.140.14.14"), "AdGuard IP missing:\n{text}");
+        assert!(text.contains("[Active]"), "Active tag missing:\n{text}");
+
+        // Move down twice (Cloudflare -> Google -> AdGuard) and press Enter.
+        assert_eq!(handle_key(&mut state, press(KeyCode::Down)), Action::Redraw);
+        assert_eq!(handle_key(&mut state, press(KeyCode::Down)), Action::Redraw);
+        assert_eq!(state.dns_selected, 2);
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Enter)),
+            Action::Finish(Choice::SetDns("94.140.14.14"))
+        );
+
+        // Digit '5' directly picks Quad9.
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('5'))),
+            Action::Finish(Choice::SetDns("9.9.9.9"))
+        );
+
+        // Esc closes DNS picker back to main menu without exiting.
+        assert_eq!(handle_key(&mut state, press(KeyCode::Esc)), Action::Redraw);
+        assert!(!state.selecting_dns);
+
+        // Rendering DNS picker at compact sizes (46x18, 24x12, 80x24) must never panic.
+        state.selecting_dns = true;
+        for (w, h) in [(80, 24), (46, 18), (24, 12)] {
+            let _ = render_state(w, h, &state, true);
+            let _ = render_state(w, h, &state, false);
         }
     }
 }

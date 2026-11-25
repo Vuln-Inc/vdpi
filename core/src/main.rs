@@ -109,6 +109,7 @@ fn main() -> Result<()> {
         let mut explicit_launcher = !bare;
         let mut cli_rt: Option<tokio::runtime::Runtime> = None;
         let mut session_engine_override: Option<EngineMode> = None;
+        let mut session_dns_override: Option<String> = None;
         loop {
             let probe_status =
                 |runtime_cfg: &RuntimeConfig, override_engine: Option<EngineMode>| {
@@ -124,11 +125,15 @@ fn main() -> Result<()> {
                     probed
                 };
             let initial_status = probe_status(&cfg, session_engine_override);
+            let configured_dns = session_dns_override
+                .clone()
+                .unwrap_or_else(|| vdpi::service::load_configured_dns(&cfg.dns_addr));
             let latest_status = RefCell::new(initial_status.clone());
             let choice = launcher::choose(
                 explicit_launcher,
                 &initial_status,
                 notice.as_deref(),
+                &configured_dns,
                 || {
                     let refreshed = probe_status(&cfg, session_engine_override);
                     *latest_status.borrow_mut() = refreshed.clone();
@@ -272,6 +277,31 @@ fn main() -> Result<()> {
                     }
                     explicit_launcher = true;
                 }
+                launcher::Choice::SelectDns => {
+                    explicit_launcher = true;
+                    continue;
+                }
+                launcher::Choice::SetDns(dns_addr) => {
+                    let was_installed = status.installed.is_some()
+                        || status.service_state != ServiceState::NotInstalled;
+                    match vdpi::service::set_service_dns_quiet(dns_addr, &cfg) {
+                        Ok(()) => {
+                            cfg.dns_addr = dns_addr.to_string();
+                            session_dns_override = Some(dns_addr.to_string());
+                            let label = launcher::format_dns_label(dns_addr);
+                            notice = Some(if was_installed {
+                                format!("DNS server set to {label}.")
+                            } else {
+                                format!("DNS server set to {label} (saved).")
+                            });
+                        }
+                        Err(err) => {
+                            notice = Some(sanitize_notice(&format!("DNS change failed: {err:#}")));
+                        }
+                    }
+                    explicit_launcher = true;
+                    continue;
+                }
                 launcher::Choice::Doctor => {
                     let result = get_or_init_cli_runtime(&mut cli_rt)
                         .and_then(|rt| rt.block_on(run_doctor(cfg.clone())));
@@ -330,6 +360,17 @@ fn main() -> Result<()> {
                     } else {
                         println!("Engine: {} (configured)", status.configured_engine.as_str());
                     }
+                    Ok(())
+                }
+            }
+        }
+        Some(Command::Dns { addr }) => {
+            init_tracing(&cfg);
+            match addr {
+                Some(target) => vdpi::service::set_service_dns(&target, &cfg),
+                None => {
+                    let current = vdpi::service::load_configured_dns(&cfg.dns_addr);
+                    println!("DNS: {}", launcher::format_dns_label(&current));
                     Ok(())
                 }
             }

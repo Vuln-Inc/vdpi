@@ -6,6 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-11-25
+
+### Added
+- **Desktop TUI DNS server picker & `vdpi dns` CLI command (`core/src/launcher.rs`, `core/src/launcher/tui.rs`, `core/src/service.rs`, `core/src/config.rs`, `core/src/main.rs`)**:
+  - Added an inline DNS server selector in the interactive Control Center TUI (`Choose DNS server` menu entry and `d` hotkey) with built-in DoH presets: Cloudflare (`1.1.1.1`), Google (`8.8.8.8`), AdGuard (`94.140.14.14`), AdGuard Unfiltered (`94.140.14.140`), Quad9 (`9.9.9.9`), and Cloudflare Family (`1.1.1.3`), plus `[Active]` indicator and fallback non-TUI console selection.
+  - Added `vdpi dns [SERVER]` CLI command and `set_service_dns` persistence/restart support across Windows, macOS, and Linux (auto-elevates cleanly when updating an installed system service and restarts the running service immediately).
+
 ## [0.5.3] - 2026-11-25
 
 ### Fixed
@@ -138,7 +145,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Configured `CODE_SIGN_ENTITLEMENTS` in iOS `project.yml` so XcodeGen preserves `.entitlements` files.
 - Fixed release workflow entitlement verification and restricted automatic release runs to version tags and manual dispatch.
 
-[Unreleased]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.3...HEAD
+[Unreleased]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.4...HEAD
+[0.5.4]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.0...v0.5.1
