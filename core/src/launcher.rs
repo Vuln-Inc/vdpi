@@ -881,6 +881,7 @@ pub fn print_run_notice() {
     eprintln!("  GitHub        |  {REPOSITORY_URL}");
 }
 
+#[allow(dead_code)]
 pub fn install_finished(result: &Result<()>, installed_before: Option<&InstalledInfo>) {
     if result.is_ok() {
         clear_preference();
@@ -902,6 +903,7 @@ pub fn install_finished(result: &Result<()>, installed_before: Option<&Installed
 }
 
 #[cfg(any(windows, test))]
+#[allow(dead_code)]
 fn install_success_message(installed_before: Option<&InstalledInfo>) -> String {
     match installed_before {
         Some(info) if info.relation == VersionRelation::Newer => {
@@ -911,6 +913,7 @@ fn install_success_message(installed_before: Option<&InstalledInfo>) -> String {
     }
 }
 
+#[allow(dead_code)]
 pub fn update_finished(result: &Result<()>) {
     if result.is_ok() {
         clear_preference();
@@ -929,6 +932,7 @@ pub fn update_finished(result: &Result<()>) {
     }
 }
 
+#[allow(dead_code)]
 pub fn uninstall_finished(result: &Result<()>) {
     if result.is_ok() {
         clear_preference();
@@ -947,6 +951,7 @@ pub fn uninstall_finished(result: &Result<()>) {
     }
 }
 
+#[allow(dead_code)]
 pub fn wait_for_continue_if_interactive() {
     if io::stdin().is_terminal() && io::stdout().is_terminal() {
         eprintln!("\n  Press Enter to return to vdpi Control Center...");
@@ -955,6 +960,7 @@ pub fn wait_for_continue_if_interactive() {
 }
 
 #[cfg(windows)]
+#[allow(dead_code)]
 fn has_own_console() -> bool {
     let mut processes = [0; 2];
     // The array is writable for two process IDs for the duration of the call.

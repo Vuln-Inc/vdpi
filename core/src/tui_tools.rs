@@ -193,9 +193,7 @@ struct Palette {
     label: Style,
     value: Style,
     value_muted: Style,
-    emerald: Style,
     emerald_bold: Style,
-    ice: Style,
     ice_bold: Style,
     amber: Style,
     amber_bold: Style,
@@ -225,9 +223,7 @@ impl Palette {
                 label: Style::new().fg(SLATE_DIM),
                 value: Style::new().fg(TEXT_WHITE),
                 value_muted: Style::new().fg(STEEL_MUTED),
-                emerald: Style::new().fg(EMERALD_ACTIVE),
                 emerald_bold: Style::new().fg(EMERALD_ACTIVE).add_modifier(Modifier::BOLD),
-                ice: Style::new().fg(ICE_BLUE),
                 ice_bold: Style::new().fg(ICE_BLUE).add_modifier(Modifier::BOLD),
                 amber: Style::new().fg(AMBER_WARN),
                 amber_bold: Style::new().fg(AMBER_WARN).add_modifier(Modifier::BOLD),
@@ -267,9 +263,7 @@ impl Palette {
                 label: dim,
                 value: plain,
                 value_muted: dim,
-                emerald: bold,
                 emerald_bold: bold,
-                ice: bold,
                 ice_bold: bold,
                 amber: bold,
                 amber_bold: bold,
@@ -590,11 +584,9 @@ fn render_scrollbar(
     let thumb_h = ((visible_rows * track_h) / total_rows).clamp(1, track_h);
     let max_scroll = total_rows.saturating_sub(visible_rows);
     let max_thumb_pos = track_h.saturating_sub(thumb_h);
-    let thumb_pos = if max_scroll == 0 {
-        0
-    } else {
-        (scroll.min(max_scroll) * max_thumb_pos + max_scroll / 2) / max_scroll
-    };
+    let thumb_pos = (scroll.min(max_scroll) * max_thumb_pos + max_scroll / 2)
+        .checked_div(max_scroll)
+        .unwrap_or(0);
 
     for row_idx in 0..track_h {
         let is_thumb = row_idx >= thumb_pos && row_idx < thumb_pos + thumb_h;
@@ -3245,7 +3237,7 @@ mod tests {
 
     #[test]
     fn diagnostics_key_handling_and_summary_strings() {
-        let mut state = sample_all_pass_diag();
+        let state = sample_all_pass_diag();
         assert_eq!(state.summary_string(), "Diagnostics passed (5/5)");
 
         let mut mixed = sample_mixed_diag();
