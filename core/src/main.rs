@@ -32,6 +32,8 @@ use vdpi::service::{
 mod launcher;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod tui_dashboard;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod tui_tools;
 
 fn main() -> Result<()> {
     #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
@@ -107,6 +109,7 @@ fn main() -> Result<()> {
         anyhow::bail!("--service is only supported on Windows");
     }
 
+    let mut unattended = false;
     if bare || matches!(command, Some(Command::Launcher)) {
         let mut notice: Option<String> = None;
         let mut explicit_launcher = !bare;
@@ -212,21 +215,67 @@ fn main() -> Result<()> {
                     break;
                 }
                 launcher::Choice::Unattended => {
+                    unattended = true;
                     command = Some(Command::Start);
                     break;
                 }
                 launcher::Choice::Install => {
-                    init_tracing(&cfg);
-                    let result = install_service(&cfg);
-                    launcher::install_finished(&result, installed_before.as_ref());
-                    return result;
+                    match install_service(&cfg) {
+                        Ok(()) => {
+                            launcher::clear_preference();
+                            session_engine_override = None;
+                            wait_for_live_engine(&cfg, cfg.engine);
+                            notice = Some(if installed_before.is_some() {
+                                format!(
+                                    "Updated vdpi background service to v{}.",
+                                    env!("CARGO_PKG_VERSION")
+                                )
+                            } else {
+                                "vdpi installed and running in background.".to_string()
+                            });
+                        }
+                        Err(err) => {
+                            notice = Some(sanitize_notice(&format!("Install failed: {err:#}")));
+                        }
+                    }
+                    explicit_launcher = true;
+                    continue;
                 }
                 launcher::Choice::Update => {
-                    init_tracing(&cfg);
-                    let result = get_or_init_cli_runtime(&mut cli_rt)
-                        .and_then(|rt| rt.block_on(vdpi::update::run_update(false, false, &cfg)));
-                    launcher::update_finished(&result);
-                    return result;
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                    {
+                        let result = get_or_init_cli_runtime(&mut cli_rt)
+                            .and_then(|rt| rt.block_on(tui_tools::run_update_tui(&cfg)));
+                        match result {
+                            Ok(Some(msg)) => {
+                                launcher::clear_preference();
+                                notice = Some(sanitize_notice(&msg));
+                            }
+                            Ok(None) => {
+                                notice = None;
+                            }
+                            Err(err) => {
+                                notice = Some(sanitize_notice(&format!("Update failed: {err:#}")));
+                            }
+                        }
+                    }
+                    #[cfg(any(target_os = "android", target_os = "ios"))]
+                    {
+                        let result = get_or_init_cli_runtime(&mut cli_rt).and_then(|rt| {
+                            rt.block_on(vdpi::update::run_update(false, false, &cfg))
+                        });
+                        match result {
+                            Ok(()) => {
+                                launcher::clear_preference();
+                                notice = Some("Update check complete.".to_string());
+                            }
+                            Err(err) => {
+                                notice = Some(sanitize_notice(&format!("Update failed: {err:#}")));
+                            }
+                        }
+                    }
+                    explicit_launcher = true;
+                    continue;
                 }
                 launcher::Choice::PauseService => {
                     match vdpi::service::pause_service_quiet() {
@@ -375,23 +424,51 @@ fn main() -> Result<()> {
                     continue;
                 }
                 launcher::Choice::Doctor => {
-                    let result = get_or_init_cli_runtime(&mut cli_rt)
-                        .and_then(|rt| rt.block_on(run_doctor(cfg.clone())));
-                    notice = Some(match result {
-                        Ok(()) => "Diagnostics complete.".to_string(),
-                        Err(err) => {
-                            eprintln!("\nDiagnostics error: {err:#}");
-                            sanitize_notice(&format!("Diagnostics finished with issues: {err:#}"))
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                    {
+                        let result = get_or_init_cli_runtime(&mut cli_rt).and_then(|rt| {
+                            rt.block_on(tui_tools::run_diagnostics_tui(cfg.clone()))
+                        });
+                        match result {
+                            Ok(summary) => {
+                                notice = Some(sanitize_notice(&summary));
+                            }
+                            Err(err) => {
+                                notice =
+                                    Some(sanitize_notice(&format!("Diagnostics failed: {err:#}")));
+                            }
                         }
-                    });
-                    launcher::wait_for_continue_if_interactive();
+                    }
+                    #[cfg(any(target_os = "android", target_os = "ios"))]
+                    {
+                        let result = get_or_init_cli_runtime(&mut cli_rt)
+                            .and_then(|rt| rt.block_on(run_doctor(cfg.clone())));
+                        match result {
+                            Ok(()) => {
+                                notice = Some("Diagnostics complete.".to_string());
+                            }
+                            Err(err) => {
+                                notice =
+                                    Some(sanitize_notice(&format!("Diagnostics failed: {err:#}")));
+                            }
+                        }
+                    }
                     explicit_launcher = true;
+                    continue;
                 }
                 launcher::Choice::Uninstall => {
-                    init_tracing(&cfg);
-                    let result = uninstall_service();
-                    launcher::uninstall_finished(&result);
-                    return result;
+                    match uninstall_service() {
+                        Ok(()) => {
+                            launcher::clear_preference();
+                            session_engine_override = None;
+                            notice = Some("vdpi background service uninstalled.".to_string());
+                        }
+                        Err(err) => {
+                            notice = Some(sanitize_notice(&format!("Uninstall failed: {err:#}")));
+                        }
+                    }
+                    explicit_launcher = true;
+                    continue;
                 }
                 launcher::Choice::Cancel => return Ok(()),
             }
@@ -464,6 +541,17 @@ fn main() -> Result<()> {
             })
         }
         Some(Command::Start) | None => {
+            #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+            if cfg.engine == EngineMode::Tun
+                && !is_process_elevated()
+                && !unattended
+                && !is_service_mode(&cfg)
+                && try_auto_elevate_current_cli("run vdpi in TUN mode")?
+            {
+                return Ok(());
+            }
+            #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+            let _ = unattended;
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             let dashboard_tracing =
                 if tui_dashboard::should_enable_dashboard(&cfg, is_service_mode(&cfg)) {
@@ -554,21 +642,57 @@ fn is_process_elevated() -> bool {
     }
 }
 
-fn resolve_writable_config_path(explicit: Option<&Path>, service_mode: bool) -> Result<PathBuf> {
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn try_auto_elevate_current_cli(action_description: &str) -> Result<bool> {
+    use std::io::IsTerminal;
+
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Ok(false);
+    }
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(target_os = "windows")]
+    {
+        let _ = action_description;
+        vdpi::platform::windows_service::relaunch_elevated_and_wait(&args)?;
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        vdpi::service::relaunch_unix_sudo_and_wait(&args, action_description)?;
+    }
+    Ok(true)
+}
+
+#[cfg_attr(
+    not(any(target_os = "windows", target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
+enum WritableConfigPath {
+    Ready(PathBuf),
+    ElevatedAndDone,
+}
+
+fn resolve_writable_config_path(
+    explicit: Option<&Path>,
+    service_mode: bool,
+) -> Result<WritableConfigPath> {
     if let Some(path) = explicit {
-        return Ok(path.to_path_buf());
+        return Ok(WritableConfigPath::Ready(path.to_path_buf()));
     }
     if service_mode {
-        return Ok(system_config_path());
+        return Ok(WritableConfigPath::Ready(system_config_path()));
     }
     let usr = user_config_path();
     if usr.is_file() {
-        return Ok(usr);
+        return Ok(WritableConfigPath::Ready(usr));
     }
     let sys = system_config_path();
     if sys.is_file() {
         if is_process_elevated() {
-            return Ok(sys);
+            return Ok(WritableConfigPath::Ready(sys));
+        }
+        #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+        if try_auto_elevate_current_cli("update system vdpi configuration")? {
+            return Ok(WritableConfigPath::ElevatedAndDone);
         }
         #[cfg(target_os = "windows")]
         let hint = "Run this command from an elevated Administrator terminal to update the system config, or pass `--config <path>` to edit a separate file.";
@@ -579,7 +703,7 @@ fn resolve_writable_config_path(explicit: Option<&Path>, service_mode: bool) -> 
             sys.display()
         );
     }
-    Ok(usr)
+    Ok(WritableConfigPath::Ready(usr))
 }
 
 fn runtime_to_file_config(cfg: &RuntimeConfig) -> FileConfig {
@@ -680,7 +804,11 @@ fn handle_config_command(
             Ok(())
         }
         ConfigCommand::Set { key, value } => {
-            let target = resolve_writable_config_path(explicit_path.as_deref(), service_mode)?;
+            let target = match resolve_writable_config_path(explicit_path.as_deref(), service_mode)?
+            {
+                WritableConfigPath::Ready(path) => path,
+                WritableConfigPath::ElevatedAndDone => return Ok(()),
+            };
             let (_, mut file_cfg) = load_file_config_or_default(Some(&target), service_mode)?;
             file_cfg.schema_version.get_or_insert(CONFIG_SCHEMA_VERSION);
             set_config_key(&mut file_cfg, &key, &value)?;
@@ -697,7 +825,11 @@ fn handle_config_command(
             Ok(())
         }
         ConfigCommand::Unset { key } => {
-            let target = resolve_writable_config_path(explicit_path.as_deref(), service_mode)?;
+            let target = match resolve_writable_config_path(explicit_path.as_deref(), service_mode)?
+            {
+                WritableConfigPath::Ready(path) => path,
+                WritableConfigPath::ElevatedAndDone => return Ok(()),
+            };
             let (loaded_path, mut file_cfg) =
                 load_file_config_or_default(Some(&target), service_mode)?;
             unset_config_key(&mut file_cfg, &key)?;
@@ -723,7 +855,11 @@ fn handle_config_command(
             Ok(())
         }
         ConfigCommand::Reset => {
-            let target = resolve_writable_config_path(explicit_path.as_deref(), service_mode)?;
+            let target = match resolve_writable_config_path(explicit_path.as_deref(), service_mode)?
+            {
+                WritableConfigPath::Ready(path) => path,
+                WritableConfigPath::ElevatedAndDone => return Ok(()),
+            };
             let fresh = FileConfig {
                 schema_version: Some(CONFIG_SCHEMA_VERSION),
                 ..Default::default()
@@ -1074,6 +1210,12 @@ fn handle_split_command(action: Option<SplitCommand>) -> Result<()> {
         Some(SplitCommand::Clear) => {
             let cleared = SplitTunnelConfig::default();
             let msg = vdpi::service::set_service_split_tunnel(&cleared)?;
+            println!("{msg}");
+            Ok(())
+        }
+        Some(SplitCommand::Apply { mode, apps }) => {
+            let new_cfg = SplitTunnelConfig { mode, apps };
+            let msg = vdpi::service::set_service_split_tunnel(&new_cfg)?;
             println!("{msg}");
             Ok(())
         }

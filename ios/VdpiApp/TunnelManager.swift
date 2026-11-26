@@ -86,7 +86,7 @@ public final class TunnelManager: ObservableObject {
                 return trimmed
             }
         }
-        return "0.5.5"
+        return "0.5.6"
     }
 
     private static let providerConfigSettingsKey = "vdpiSettingsJSON"

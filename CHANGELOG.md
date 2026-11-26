@@ -6,6 +6,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.5.6] - 2026-11-26
+
+### Added
+- **Interactive TUI screens for Software Update and Network Diagnostics**:
+  - Added full `ratatui` TUI views for **Software Update** (live GitHub release check spinner, word-wrapped release notes, one-key update) and **Network Diagnostics** (live per-check progress and latency).
+
+### Changed
+- **Persistent Control Center workflow**:
+  - Control Center now stays open with live status notices after Update, Diagnostics, Install, and Uninstall instead of abruptly closing the terminal.
+- **Seamless automatic elevation & clean approval prompt**:
+  - Added automatic `sudo` (macOS/Linux) and UAC (Windows) elevation across Update, LaunchDaemon/systemd upgrade, Split Tunneling save, `vdpi config`, and foreground TUN start, eliminating raw permission and LaunchDaemon errors.
+  - Added a clean rounded-card administrator approval prompt for `sudo` with proper alignment and clean screen transitions.
+
 ## [0.5.5] - 2026-11-26
 
 ### Added
@@ -157,7 +170,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Configured `CODE_SIGN_ENTITLEMENTS` in iOS `project.yml` so XcodeGen preserves `.entitlements` files.
 - Fixed release workflow entitlement verification and restricted automatic release runs to version tags and manual dispatch.
 
-[Unreleased]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.5...HEAD
+[Unreleased]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.6...HEAD
+[0.5.6]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.5...v0.5.6
 [0.5.5]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.2...v0.5.3

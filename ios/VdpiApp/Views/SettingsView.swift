@@ -854,7 +854,7 @@ struct SettingsView: View {
 
     private func formattedVersion(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "v0.5.5" }
+        guard !trimmed.isEmpty else { return "v0.5.6" }
         return trimmed.lowercased().hasPrefix("v") ? trimmed : "v\(trimmed)"
     }
 

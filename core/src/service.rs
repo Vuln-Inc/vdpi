@@ -1838,8 +1838,22 @@ pub fn install_service(cfg: &RuntimeConfig) -> Result<()> {
     install_service_with_options(cfg, false)
 }
 
+/// Quiet variant of [`install_service`] for interactive TUI callers that must not write
+/// status lines to stdout.
+pub fn install_service_quiet(cfg: &RuntimeConfig) -> Result<()> {
+    install_service_with_options_impl(cfg, false, false)
+}
+
+pub fn install_service_with_options(cfg: &RuntimeConfig, upgrade: bool) -> Result<()> {
+    install_service_with_options_impl(cfg, upgrade, true)
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-pub fn install_service_with_options(_cfg: &RuntimeConfig, _upgrade: bool) -> Result<()> {
+fn install_service_with_options_impl(
+    _cfg: &RuntimeConfig,
+    _upgrade: bool,
+    _verbose: bool,
+) -> Result<()> {
     bail!(
         "service installation is not supported on {}",
         platform_name()
@@ -2123,8 +2137,26 @@ fn print_windows_stale_browser_hint(cfg: &RuntimeConfig) {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn build_unix_install_sudo_args(effective_cfg: &RuntimeConfig, upgrade: bool) -> Vec<String> {
+    if upgrade {
+        let mut args = vec!["install".to_string(), "--upgrade".to_string()];
+        if effective_cfg.engine == EngineMode::Tun {
+            args.push("--tun".to_string());
+        }
+        return args;
+    }
+    let mut args = build_service_cli_args(effective_cfg);
+    args.push("install".to_string());
+    args
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-pub fn install_service_with_options(cfg: &RuntimeConfig, upgrade: bool) -> Result<()> {
+fn install_service_with_options_impl(
+    cfg: &RuntimeConfig,
+    upgrade: bool,
+    verbose: bool,
+) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         use crate::platform::windows::{broadcast_environment_change, notify_wininet_refresh};
@@ -2132,8 +2164,15 @@ pub fn install_service_with_options(cfg: &RuntimeConfig, upgrade: bool) -> Resul
             is_elevated, query_windows_service_status, relaunch_elevated_and_wait,
         };
 
+        let prev_svc = query_windows_service_status();
+        // Windows SCM installation/upgrades (TUN or Proxy, fresh or existing service)
+        // always require Administrator elevation.
         if !is_elevated() {
-            println!("Requesting Administrator privileges to install the vdpi Windows service...");
+            if verbose {
+                println!(
+                    "Requesting Administrator privileges to install the vdpi Windows service..."
+                );
+            }
             let mut args = vec!["install".to_string()];
             if upgrade {
                 args.push("--upgrade".to_string());
@@ -2145,14 +2184,17 @@ pub fn install_service_with_options(cfg: &RuntimeConfig, upgrade: bool) -> Resul
             relaunch_elevated_and_wait(&args)?;
             notify_wininet_refresh();
             broadcast_environment_change();
-            println!("Installed and started Windows service: {WINDOWS_SERVICE_NAME} (AUTO_START)");
-            if !upgrade {
-                print_windows_stale_browser_hint(cfg);
+            if verbose {
+                println!(
+                    "Installed and started Windows service: {WINDOWS_SERVICE_NAME} (AUTO_START)"
+                );
+                if !upgrade {
+                    print_windows_stale_browser_hint(cfg);
+                }
             }
             return Ok(());
         }
 
-        let prev_svc = query_windows_service_status();
         let config_path = config_file::system_config_path();
 
         // Stop existing Windows service and any legacy vdpi.exe processes before replacing the binary.
@@ -2212,7 +2254,7 @@ pub fn install_service_with_options(cfg: &RuntimeConfig, upgrade: bool) -> Resul
                 }
             };
 
-        if let Err(err) = install_windows_native_service(&target_bin, &effective_cfg) {
+        if let Err(err) = install_windows_native_service(&target_bin, &effective_cfg, verbose) {
             if let Some(backup) = wintun_backup {
                 backup.rollback();
             }
@@ -2229,14 +2271,16 @@ pub fn install_service_with_options(cfg: &RuntimeConfig, upgrade: bool) -> Resul
             backup.commit();
         }
 
-        if wintun_copied {
-            println!(
-                "Installed Wintun : {}",
-                bin_dir.join("wintun.dll").display()
-            );
-        }
-        if !upgrade {
-            print_windows_stale_browser_hint(&effective_cfg);
+        if verbose {
+            if wintun_copied {
+                println!(
+                    "Installed Wintun : {}",
+                    bin_dir.join("wintun.dll").display()
+                );
+            }
+            if !upgrade {
+                print_windows_stale_browser_hint(&effective_cfg);
+            }
         }
         Ok(())
     }
@@ -2246,11 +2290,14 @@ pub fn install_service_with_options(cfg: &RuntimeConfig, upgrade: bool) -> Resul
         let current_exe =
             std::env::current_exe().context("failed to determine current executable")?;
 
+        #[cfg(target_os = "macos")]
+        let has_system_daemon = launch_daemon_plist_path().exists()
+            || launchctl_service_loaded(&format!("system/{LAUNCH_DAEMON_LABEL}"));
+        #[cfg(target_os = "linux")]
+        let has_system_daemon = systemd_system_unit_path().exists();
+        let has_system_bin = Path::new(UNIX_SYSTEM_BIN_PATH).is_file();
+
         let effective_cfg = if upgrade {
-            #[cfg(target_os = "macos")]
-            let has_system_daemon = launch_daemon_plist_path().exists();
-            #[cfg(target_os = "linux")]
-            let has_system_daemon = systemd_system_unit_path().exists();
             let preferred_path = if has_system_daemon {
                 config_file::system_config_path()
             } else {
@@ -2258,21 +2305,36 @@ pub fn install_service_with_options(cfg: &RuntimeConfig, upgrade: bool) -> Resul
             };
             match config_file::load_file_config(Some(&preferred_path), has_system_daemon) {
                 Ok((Some(_), file_cfg)) => apply_file_config_to_runtime(cfg, &file_cfg),
-                _ => cfg.clone(),
+                _ => {
+                    if has_system_daemon {
+                        // A root system daemon is only installed for TUN mode; preserve
+                        // TUN intent if the system config is unreadable prior to sudo.
+                        let mut fallback = cfg.clone();
+                        fallback.engine = EngineMode::Tun;
+                        fallback
+                    } else {
+                        cfg.clone()
+                    }
+                }
             }
         } else {
             cfg.clone()
         };
 
+        let needs_root = effective_cfg.engine == EngineMode::Tun
+            || has_system_daemon
+            || (upgrade && has_system_bin);
+        if needs_root && !is_unix_root() {
+            let sudo_args = build_unix_install_sudo_args(&effective_cfg, upgrade);
+            let action = if upgrade {
+                "update the vdpi background service"
+            } else {
+                "install the vdpi background service"
+            };
+            return relaunch_unix_sudo_and_wait(&sudo_args, action);
+        }
+
         if effective_cfg.engine == EngineMode::Tun {
-            if !is_unix_root() {
-                let mut sudo_args = build_service_cli_args(&effective_cfg);
-                sudo_args.push("install".to_string());
-                if upgrade {
-                    sudo_args.push("--upgrade".to_string());
-                }
-                return relaunch_unix_sudo_and_wait(&sudo_args, "install vdpi in TUN mode");
-            }
             let sys_config_path = config_file::system_config_path();
             if !upgrade || !sys_config_path.is_file() {
                 let file_cfg = file_config_from_runtime(&effective_cfg);
@@ -2282,10 +2344,10 @@ pub fn install_service_with_options(cfg: &RuntimeConfig, upgrade: bool) -> Resul
             copy_binary_atomically(&current_exe, &target_bin)?;
 
             #[cfg(target_os = "macos")]
-            install_macos_launch_daemon(&target_bin, &effective_cfg)?;
+            install_macos_launch_daemon(&target_bin, &effective_cfg, verbose)?;
 
             #[cfg(target_os = "linux")]
-            install_linux_systemd_system_service(&target_bin, &effective_cfg)?;
+            install_linux_systemd_system_service(&target_bin, &effective_cfg, verbose)?;
 
             return Ok(());
         }
@@ -2315,11 +2377,15 @@ pub fn install_service_with_options(cfg: &RuntimeConfig, upgrade: bool) -> Resul
         chown_to_sudo_user(&log_dir);
         chown_to_sudo_user(&target_bin);
 
+        if upgrade && has_system_bin && is_unix_root() {
+            copy_binary_atomically(&current_exe, Path::new(UNIX_SYSTEM_BIN_PATH))?;
+        }
+
         #[cfg(target_os = "macos")]
-        install_macos_launch_agent(&target_bin, &effective_cfg)?;
+        install_macos_launch_agent(&target_bin, &effective_cfg, verbose)?;
 
         #[cfg(target_os = "linux")]
-        install_linux_systemd_service(&target_bin, &effective_cfg)?;
+        install_linux_systemd_service(&target_bin, &effective_cfg, verbose)?;
 
         Ok(())
     }
@@ -2443,7 +2509,11 @@ fn start_macos_launch_daemon(plist_path: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn install_macos_launch_daemon(target_bin: &Path, cfg: &RuntimeConfig) -> Result<()> {
+fn install_macos_launch_daemon(
+    target_bin: &Path,
+    cfg: &RuntimeConfig,
+    verbose: bool,
+) -> Result<()> {
     // Mutual exclusion: unload any user LaunchAgent and clear system proxies before starting TUN.
     remove_macos_launch_agent_if_present();
     let _ = clear_all_system_proxies();
@@ -2477,13 +2547,15 @@ fn install_macos_launch_daemon(target_bin: &Path, cfg: &RuntimeConfig) -> Result
 
     start_macos_launch_daemon(&plist_path)?;
 
-    println!("Installed binary : {}", target_bin.display());
-    println!("Loaded daemon    : {} (TUN)", plist_path.display());
+    if verbose {
+        println!("Installed binary : {}", target_bin.display());
+        println!("Loaded daemon    : {} (TUN)", plist_path.display());
+    }
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn install_macos_launch_agent(target_bin: &Path, cfg: &RuntimeConfig) -> Result<()> {
+fn install_macos_launch_agent(target_bin: &Path, cfg: &RuntimeConfig, verbose: bool) -> Result<()> {
     // Mutual exclusion: remove system LaunchDaemon if previously installed in TUN mode.
     let _ = remove_macos_launch_daemon_if_present()?;
 
@@ -2534,10 +2606,12 @@ fn install_macos_launch_agent(target_bin: &Path, cfg: &RuntimeConfig) -> Result<
 
     let path_updated = ensure_unix_shell_path();
 
-    println!("Installed binary : {}", target_bin.display());
-    println!("Loaded service   : {}", plist_path.display());
-    if path_updated {
-        println!("Shell PATH       : added ~/.vdpi/bin (restart shell or source profile)");
+    if verbose {
+        println!("Installed binary : {}", target_bin.display());
+        println!("Loaded service   : {}", plist_path.display());
+        if path_updated {
+            println!("Shell PATH       : added ~/.vdpi/bin (restart shell or source profile)");
+        }
     }
     Ok(())
 }
@@ -2603,7 +2677,11 @@ fn remove_linux_system_unit_if_present() -> Result<bool> {
 }
 
 #[cfg(target_os = "linux")]
-fn install_linux_systemd_system_service(target_bin: &Path, cfg: &RuntimeConfig) -> Result<()> {
+fn install_linux_systemd_system_service(
+    target_bin: &Path,
+    cfg: &RuntimeConfig,
+    verbose: bool,
+) -> Result<()> {
     // Mutual exclusion: stop/remove user Proxy unit and clear desktop proxies before starting TUN.
     remove_linux_user_unit_if_present();
     let _ = clear_all_system_proxies();
@@ -2645,20 +2723,26 @@ fn install_linux_systemd_system_service(target_bin: &Path, cfg: &RuntimeConfig) 
         }
     }
 
-    if let Some(reason) = systemd_note {
-        println!(
-            "Note: systemd system daemon not active ({reason}). Wrote unit file to {}",
-            unit_path.display()
-        );
-    }
+    if verbose {
+        if let Some(reason) = systemd_note {
+            println!(
+                "Note: systemd system daemon not active ({reason}). Wrote unit file to {}",
+                unit_path.display()
+            );
+        }
 
-    println!("Installed binary : {}", target_bin.display());
-    println!("Systemd unit     : {} (TUN)", unit_path.display());
+        println!("Installed binary : {}", target_bin.display());
+        println!("Systemd unit     : {} (TUN)", unit_path.display());
+    }
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn install_linux_systemd_service(target_bin: &Path, cfg: &RuntimeConfig) -> Result<()> {
+fn install_linux_systemd_service(
+    target_bin: &Path,
+    cfg: &RuntimeConfig,
+    verbose: bool,
+) -> Result<()> {
     // Mutual exclusion: remove root system TUN unit if previously installed.
     let _ = remove_linux_system_unit_if_present()?;
 
@@ -2703,19 +2787,21 @@ fn install_linux_systemd_service(target_bin: &Path, cfg: &RuntimeConfig) -> Resu
         }
     }
 
-    if let Some(reason) = systemd_note {
-        println!(
-            "Note: systemd user session not active ({reason}). Wrote unit file to {}",
-            unit_path.display()
-        );
-    }
-
     let path_updated = ensure_unix_shell_path();
 
-    println!("Installed binary : {}", target_bin.display());
-    println!("Systemd unit     : {}", unit_path.display());
-    if path_updated {
-        println!("Shell PATH       : added ~/.vdpi/bin (restart shell or source profile)");
+    if verbose {
+        if let Some(reason) = systemd_note {
+            println!(
+                "Note: systemd user session not active ({reason}). Wrote unit file to {}",
+                unit_path.display()
+            );
+        }
+
+        println!("Installed binary : {}", target_bin.display());
+        println!("Systemd unit     : {}", unit_path.display());
+        if path_updated {
+            println!("Shell PATH       : added ~/.vdpi/bin (restart shell or source profile)");
+        }
     }
     Ok(())
 }
@@ -2799,7 +2885,11 @@ fn remove_unix_shell_path() -> bool {
 }
 
 #[cfg(target_os = "windows")]
-fn install_windows_native_service(target_bin: &Path, cfg: &RuntimeConfig) -> Result<()> {
+fn install_windows_native_service(
+    target_bin: &Path,
+    cfg: &RuntimeConfig,
+    verbose: bool,
+) -> Result<()> {
     use crate::platform::windows::{
         add_dir_to_windows_system_path, broadcast_environment_change, notify_wininet_refresh,
     };
@@ -2818,11 +2908,13 @@ fn install_windows_native_service(target_bin: &Path, cfg: &RuntimeConfig) -> Res
     notify_wininet_refresh();
     broadcast_environment_change();
 
-    println!("Installed binary : {}", target_bin.display());
-    println!("Windows service  : {WINDOWS_SERVICE_NAME} (AUTO_START, RUNNING)");
-    if path_added {
-        if let Some(bin_dir) = target_bin.parent() {
-            println!("System PATH      : added {}", bin_dir.display());
+    if verbose {
+        println!("Installed binary : {}", target_bin.display());
+        println!("Windows service  : {WINDOWS_SERVICE_NAME} (AUTO_START, RUNNING)");
+        if path_added {
+            if let Some(bin_dir) = target_bin.parent() {
+                println!("System PATH      : added {}", bin_dir.display());
+            }
         }
     }
     Ok(())
@@ -3137,7 +3229,8 @@ fn switch_service_engine_impl(
 
     #[cfg(target_os = "macos")]
     {
-        let daemon_exists = launch_daemon_plist_path().exists();
+        let daemon_exists = launch_daemon_plist_path().exists()
+            || launchctl_service_loaded(&format!("system/{LAUNCH_DAEMON_LABEL}"));
         let agent_exists = launch_agent_plist_path().ok().is_some_and(|p| p.exists());
         let service_installed = daemon_exists || agent_exists;
         let was_running = detect_service_state() == ServiceState::Running;
@@ -3738,6 +3831,22 @@ fn save_split_tunnel_to_config_path(
     config_file::save_file_config_atomic(config_path, &file_cfg)
 }
 
+/// Builds the `vdpi split apply --mode <mode> [--app <app>]...` CLI arguments
+/// used when auto-elevating split-tunnel updates across `sudo` or Windows UAC.
+pub fn build_split_apply_args(cfg: &vdpi_core::config::SplitTunnelConfig) -> Vec<String> {
+    let mut args = vec![
+        "split".to_string(),
+        "apply".to_string(),
+        "--mode".to_string(),
+        cfg.mode.as_str().to_string(),
+    ];
+    for app in &cfg.apps {
+        args.push("--app".to_string());
+        args.push(app.clone());
+    }
+    args
+}
+
 /// Validates and saves per-application split-tunnel settings into the active
 /// `config.toml` (preserving all other keys) and restarts the background `vdpi`
 /// service when it is currently running.
@@ -3755,8 +3864,8 @@ pub fn set_service_split_tunnel(
     {
         use crate::platform::windows::{broadcast_environment_change, notify_wininet_refresh};
         use crate::platform::windows_service::{
-            is_elevated, query_windows_service_status, start_windows_service,
-            stop_windows_service_if_running,
+            is_elevated, query_windows_service_status, relaunch_elevated_and_wait,
+            start_windows_service, stop_windows_service_if_running,
         };
 
         let svc = query_windows_service_status();
@@ -3768,10 +3877,11 @@ pub fn set_service_split_tunnel(
         };
 
         if svc.installed && !is_elevated() {
-            bail!(
-                "updating split tunneling for the installed Windows service requires Administrator privileges (config: {})",
-                config_path.display()
-            );
+            let args = build_split_apply_args(&normalized);
+            relaunch_elevated_and_wait(&args)?;
+            notify_wininet_refresh();
+            broadcast_environment_change();
+            return Ok(format!("Split tunneling saved: {summary}"));
         }
 
         save_split_tunnel_to_config_path(&config_path, use_system, &normalized)?;
@@ -3805,10 +3915,9 @@ pub fn set_service_split_tunnel(
         };
 
         if daemon_exists && !is_unix_root() {
-            bail!(
-                "updating split tunneling for the macOS background service requires root privileges (config: {})",
-                config_path.display()
-            );
+            let args = build_split_apply_args(&normalized);
+            relaunch_unix_sudo_and_wait(&args, "update split tunneling settings")?;
+            return Ok(format!("Split tunneling saved: {summary}"));
         }
 
         save_split_tunnel_to_config_path(&config_path, daemon_exists, &normalized)?;
@@ -3891,10 +4000,9 @@ pub fn set_service_split_tunnel(
         };
 
         if system_exists && !is_unix_root() {
-            bail!(
-                "updating split tunneling for the Linux background service requires root privileges (config: {})",
-                config_path.display()
-            );
+            let args = build_split_apply_args(&normalized);
+            relaunch_unix_sudo_and_wait(&args, "update split tunneling settings")?;
+            return Ok(format!("Split tunneling saved: {summary}"));
         }
 
         save_split_tunnel_to_config_path(&config_path, system_exists, &normalized)?;
@@ -3972,15 +4080,26 @@ pub fn uninstall_service() -> Result<()> {
     uninstall_service_with_options(true)
 }
 
+/// Quiet variant of [`uninstall_service`] for interactive TUI callers that must not write
+/// status lines to stdout.
+pub fn uninstall_service_quiet() -> Result<()> {
+    uninstall_service_with_options_impl(true, false)
+}
+
 /// Stops the background service (both system TUN and user Proxy units if present), removes
 /// startup registration, cleans installed files, restores system proxy state, and removes
 /// `config.toml` when `purge` is `true`.
 pub fn uninstall_service_with_options(purge: bool) -> Result<()> {
+    uninstall_service_with_options_impl(purge, true)
+}
+
+fn uninstall_service_with_options_impl(purge: bool, verbose: bool) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         let daemon_present = launch_daemon_plist_path().exists()
             || launchctl_service_loaded(&format!("system/{LAUNCH_DAEMON_LABEL}"))
-            || fs::symlink_metadata(UNIX_SYSTEM_BIN_PATH).is_ok();
+            || fs::symlink_metadata(UNIX_SYSTEM_BIN_PATH).is_ok()
+            || (purge && config_file::system_config_path().exists());
         if daemon_present && !is_unix_root() {
             let mut args = vec!["uninstall".to_string()];
             if purge {
@@ -3988,7 +4107,7 @@ pub fn uninstall_service_with_options(purge: bool) -> Result<()> {
             }
             return relaunch_unix_sudo_and_wait(&args, "uninstall the vdpi TUN background service");
         }
-        if remove_macos_launch_daemon_if_present()? {
+        if remove_macos_launch_daemon_if_present()? && verbose {
             println!(
                 "Removed LaunchDaemon: {}",
                 launch_daemon_plist_path().display()
@@ -3997,11 +4116,19 @@ pub fn uninstall_service_with_options(purge: bool) -> Result<()> {
         let sys_bin = Path::new(UNIX_SYSTEM_BIN_PATH);
         if fs::symlink_metadata(sys_bin).is_ok() {
             match fs::remove_file(sys_bin) {
-                Ok(()) => println!("Removed system binary: {}", sys_bin.display()),
-                Err(err) => eprintln!(
-                    "Warning: could not remove {} ({err}); run with sudo if needed.",
-                    sys_bin.display()
-                ),
+                Ok(()) => {
+                    if verbose {
+                        println!("Removed system binary: {}", sys_bin.display());
+                    }
+                }
+                Err(err) => {
+                    if verbose {
+                        eprintln!(
+                            "Warning: could not remove {} ({err}); run with sudo if needed.",
+                            sys_bin.display()
+                        );
+                    }
+                }
             }
         }
 
@@ -4027,14 +4154,16 @@ pub fn uninstall_service_with_options(purge: bool) -> Result<()> {
                 .stdin(Stdio::null())
                 .output();
             fs::remove_file(&plist_path)?;
-            println!("Removed LaunchAgent: {}", plist_path.display());
-        } else {
+            if verbose {
+                println!("Removed LaunchAgent: {}", plist_path.display());
+            }
+        } else if verbose {
             println!("LaunchAgent {} is not installed", plist_path.display());
         }
 
         wait_launchctl_unloaded(&service_target);
 
-        if remove_unix_shell_path() {
+        if remove_unix_shell_path() && verbose {
             println!("Removed ~/.vdpi/bin from shell PATH profile.");
         }
         let _ = fs::remove_file("/Library/Application Support/vdpi/state.json");
@@ -4064,7 +4193,8 @@ pub fn uninstall_service_with_options(purge: bool) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         let system_present = systemd_system_unit_path().exists()
-            || fs::symlink_metadata(UNIX_SYSTEM_BIN_PATH).is_ok();
+            || fs::symlink_metadata(UNIX_SYSTEM_BIN_PATH).is_ok()
+            || (purge && config_file::system_config_path().exists());
         if system_present && !is_unix_root() {
             let mut args = vec!["uninstall".to_string()];
             if purge {
@@ -4072,7 +4202,7 @@ pub fn uninstall_service_with_options(purge: bool) -> Result<()> {
             }
             return relaunch_unix_sudo_and_wait(&args, "uninstall the vdpi TUN background service");
         }
-        if remove_linux_system_unit_if_present()? {
+        if remove_linux_system_unit_if_present()? && verbose {
             println!(
                 "Removed systemd system unit: {}",
                 systemd_system_unit_path().display()
@@ -4081,11 +4211,19 @@ pub fn uninstall_service_with_options(purge: bool) -> Result<()> {
         let sys_bin = Path::new(UNIX_SYSTEM_BIN_PATH);
         if fs::symlink_metadata(sys_bin).is_ok() {
             match fs::remove_file(sys_bin) {
-                Ok(()) => println!("Removed system binary: {}", sys_bin.display()),
-                Err(err) => eprintln!(
-                    "Warning: could not remove {} ({err}); run with sudo if needed.",
-                    sys_bin.display()
-                ),
+                Ok(()) => {
+                    if verbose {
+                        println!("Removed system binary: {}", sys_bin.display());
+                    }
+                }
+                Err(err) => {
+                    if verbose {
+                        eprintln!(
+                            "Warning: could not remove {} ({err}); run with sudo if needed.",
+                            sys_bin.display()
+                        );
+                    }
+                }
             }
         }
 
@@ -4100,8 +4238,10 @@ pub fn uninstall_service_with_options(purge: bool) -> Result<()> {
                 .args(["daemon-reload"])
                 .stdin(Stdio::null())
                 .output();
-            println!("Removed systemd user unit: {}", unit_path.display());
-        } else {
+            if verbose {
+                println!("Removed systemd user unit: {}", unit_path.display());
+            }
+        } else if verbose {
             println!("Systemd unit {} is not installed", unit_path.display());
         }
         if let Ok(home) = home_dir() {
@@ -4110,7 +4250,7 @@ pub fn uninstall_service_with_options(purge: bool) -> Result<()> {
                 let _ = fs::remove_file(&link_path);
             }
         }
-        if remove_unix_shell_path() {
+        if remove_unix_shell_path() && verbose {
             println!("Removed ~/.vdpi/bin from shell PATH profile.");
         }
         let _ = fs::remove_file("/run/vdpi/state.json");
@@ -4141,9 +4281,11 @@ pub fn uninstall_service_with_options(purge: bool) -> Result<()> {
         use crate::platform::windows_service::{is_elevated, relaunch_elevated_and_wait};
 
         if !is_elevated() {
-            println!(
-                "Requesting Administrator privileges to uninstall the vdpi Windows service..."
-            );
+            if verbose {
+                println!(
+                    "Requesting Administrator privileges to uninstall the vdpi Windows service..."
+                );
+            }
             let _ = std::env::set_current_dir(std::env::temp_dir());
             let mut args = vec!["uninstall".to_string()];
             if purge {
@@ -4151,20 +4293,24 @@ pub fn uninstall_service_with_options(purge: bool) -> Result<()> {
             }
             relaunch_elevated_and_wait(&args)?;
             clear_all_system_proxies()?;
-            println!(
-                "Removed Windows service '{WINDOWS_SERVICE_NAME}' and restored {} system proxy settings.",
-                platform_name()
-            );
+            if verbose {
+                println!(
+                    "Removed Windows service '{WINDOWS_SERVICE_NAME}' and restored {} system proxy settings.",
+                    platform_name()
+                );
+            }
             return Ok(());
         }
 
         let removed = crate::platform::windows_service::uninstall_windows_service()?;
         cleanup_legacy_windows_startup();
         stop_windows_foreground_daemons();
-        if removed {
-            println!("Stopped and removed Windows service: {WINDOWS_SERVICE_NAME}");
-        } else {
-            println!("Windows service '{WINDOWS_SERVICE_NAME}' is not installed.");
+        if verbose {
+            if removed {
+                println!("Stopped and removed Windows service: {WINDOWS_SERVICE_NAME}");
+            } else {
+                println!("Windows service '{WINDOWS_SERVICE_NAME}' is not installed.");
+            }
         }
     }
 
@@ -4176,7 +4322,9 @@ pub fn uninstall_service_with_options(purge: bool) -> Result<()> {
     #[cfg(target_os = "windows")]
     cleanup_windows_install_files(purge);
 
-    println!("Restored {} system proxy settings.", platform_name());
+    if verbose {
+        println!("Restored {} system proxy settings.", platform_name());
+    }
     Ok(())
 }
 
@@ -5527,6 +5675,147 @@ pub fn is_unix_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+const SUDO_CARD_INDENT: &str = "  ";
+const SUDO_CARD_INNER_WIDTH: usize = 60;
+const SUDO_CARD_ACTION_WRAP_WIDTH: usize = 46;
+const SUDO_CARD_TITLE: &str = "vdpi · Administrator Approval";
+
+fn capitalize_first_char(text: &str) -> String {
+    let trimmed = text.trim();
+    let mut chars = trimmed.chars();
+    match chars.next() {
+        Some(first) => {
+            let mut out = String::with_capacity(trimmed.len());
+            for ch in first.to_uppercase() {
+                out.push(ch);
+            }
+            out.push_str(chars.as_str());
+            out
+        }
+        None => String::new(),
+    }
+}
+
+fn wrap_sudo_action_lines(action_description: &str, max_width: usize) -> Vec<String> {
+    let normalized = capitalize_first_char(action_description);
+    let source = if normalized.is_empty() {
+        "Complete a privileged operation".to_string()
+    } else {
+        normalized
+    };
+
+    let limit = max_width.max(1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_len = 0usize;
+
+    for word in source.split_whitespace() {
+        let word_len = word.chars().count();
+        if word_len > limit {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+                current_len = 0;
+            }
+            let mut chunk = String::new();
+            let mut chunk_len = 0usize;
+            for ch in word.chars() {
+                if chunk_len == limit {
+                    lines.push(std::mem::take(&mut chunk));
+                    chunk_len = 0;
+                }
+                chunk.push(ch);
+                chunk_len += 1;
+            }
+            if !chunk.is_empty() {
+                current = chunk;
+                current_len = chunk_len;
+            }
+            continue;
+        }
+
+        if current.is_empty() {
+            current.push_str(word);
+            current_len = word_len;
+        } else if current_len + 1 + word_len <= limit {
+            current.push(' ');
+            current.push_str(word);
+            current_len += 1 + word_len;
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+            current_len = word_len;
+        }
+    }
+
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push("Complete a privileged operation".to_string());
+    }
+    lines
+}
+
+/// Formats a compact 62-column rounded-box Unix `sudo` approval card (64 columns
+/// including its 2-space left margin so it never wraps on 80x24 terminals).
+///
+/// When `no_color` is `true`, no ANSI escape sequences are emitted.
+pub fn format_unix_sudo_prompt_card(
+    action_description: &str,
+    is_macos: bool,
+    no_color: bool,
+) -> String {
+    const BORDER: &str = "\x1b[38;2;74;85;104m";
+    const TITLE: &str = "\x1b[1;38;2;241;245;249m";
+    const LABEL: &str = "\x1b[38;2;148;163;184m";
+    const VALUE: &str = "\x1b[38;2;226;232;240m";
+    const HINT: &str = "\x1b[38;2;148;163;184m";
+    const RESET: &str = "\x1b[0m";
+
+    let (c_border, c_title, c_label, c_value, c_hint, c_reset) = if no_color {
+        ("", "", "", "", "", "")
+    } else {
+        (BORDER, TITLE, LABEL, VALUE, HINT, RESET)
+    };
+
+    let hbar = "─".repeat(SUDO_CARD_INNER_WIDTH);
+    let title_len = SUDO_CARD_TITLE.chars().count();
+    let title_pad = " ".repeat(SUDO_CARD_INNER_WIDTH.saturating_sub(2 + title_len));
+
+    let prompt_hint = if is_macos {
+        "Enter your password (or Touch ID) below"
+    } else {
+        "Enter your sudo password below"
+    };
+
+    let action_lines = wrap_sudo_action_lines(action_description, SUDO_CARD_ACTION_WRAP_WIDTH);
+
+    let mut out = String::new();
+    out.push_str(&format!("{SUDO_CARD_INDENT}{c_border}╭{hbar}╮{c_reset}\n"));
+    out.push_str(&format!(
+        "{SUDO_CARD_INDENT}{c_border}│{c_reset}  {c_title}{SUDO_CARD_TITLE}{c_reset}{title_pad}{c_border}│{c_reset}\n"
+    ));
+    out.push_str(&format!("{SUDO_CARD_INDENT}{c_border}├{hbar}┤{c_reset}\n"));
+
+    for (idx, line) in action_lines.iter().enumerate() {
+        let label = if idx == 0 { "Action   " } else { "         " };
+        let used = 2 + label.chars().count() + line.chars().count();
+        let pad = " ".repeat(SUDO_CARD_INNER_WIDTH.saturating_sub(used));
+        out.push_str(&format!(
+            "{SUDO_CARD_INDENT}{c_border}│{c_reset}  {c_label}{label}{c_reset}{c_value}{line}{c_reset}{pad}{c_border}│{c_reset}\n"
+        ));
+    }
+
+    let prompt_label = "Prompt   ";
+    let prompt_used = 2 + prompt_label.chars().count() + prompt_hint.chars().count();
+    let prompt_pad = " ".repeat(SUDO_CARD_INNER_WIDTH.saturating_sub(prompt_used));
+    out.push_str(&format!(
+        "{SUDO_CARD_INDENT}{c_border}│{c_reset}  {c_label}{prompt_label}{c_reset}{c_hint}{prompt_hint}{c_reset}{prompt_pad}{c_border}│{c_reset}\n"
+    ));
+    out.push_str(&format!("{SUDO_CARD_INDENT}{c_border}╰{hbar}╯{c_reset}\n"));
+    out
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn relaunch_unix_sudo_and_wait(args: &[String], action_description: &str) -> Result<()> {
     use std::io::IsTerminal;
@@ -5542,11 +5831,14 @@ pub fn relaunch_unix_sudo_and_wait(args: &[String], action_description: &str) ->
         .find(|p| Path::new(p).is_file())
         .unwrap_or("sudo");
 
-    println!("\nAdministrator privileges required to {action_description}.");
-    println!("Enter your password (or Touch ID) if prompted by sudo...");
+    let no_color = std::env::var_os("NO_COLOR").is_some();
+    let card =
+        format_unix_sudo_prompt_card(action_description, cfg!(target_os = "macos"), no_color);
+    print!("\x1b[2J\x1b[H\n{card}\n");
+    let _ = std::io::stdout().flush();
 
     let status = Command::new(sudo_bin)
-        .arg("--")
+        .args(["-p", "  Password: ", "--"])
         .arg(exe)
         .args(args)
         .stdin(Stdio::inherit())
@@ -5561,6 +5853,9 @@ pub fn relaunch_unix_sudo_and_wait(args: &[String], action_description: &str) ->
             .map_or_else(|| "signal".to_string(), |c| c.to_string());
         bail!("sudo canceled or failed (exit {code}) - try: sudo vdpi {cmd_hint}");
     }
+
+    print!("\x1b[2J\x1b[H");
+    let _ = std::io::stdout().flush();
     Ok(())
 }
 
@@ -6443,5 +6738,146 @@ mod tests {
         assert!(err.to_string().contains("control characters"));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    fn strip_ansi_escapes(input: &str) -> String {
+        let mut out = String::with_capacity(input.len());
+        let mut chars = input.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' && chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn sudo_prompt_card_respects_width_wrapping_and_no_color() {
+        let long_action =
+            "switch the macOS background service to tun mode and refresh split tunneling rules";
+        let plain_macos = format_unix_sudo_prompt_card(long_action, true, true);
+        assert!(
+            !plain_macos.contains('\x1b'),
+            "NO_COLOR card must not emit ANSI escapes"
+        );
+        assert!(plain_macos.contains("vdpi · Administrator Approval"));
+        assert!(plain_macos.contains("Prompt   Enter your password (or Touch ID) below"));
+
+        let lines: Vec<&str> = plain_macos.lines().collect();
+        assert!(lines.len() >= 6, "long action should wrap across lines");
+        for line in &lines {
+            let width = line.chars().count();
+            assert!(
+                width <= 64,
+                "sudo card line exceeded 64 cols ({width}): {line:?}"
+            );
+            assert_eq!(
+                width, 64,
+                "sudo card lines should stay aligned at 64 cols: {line:?}"
+            );
+        }
+
+        // Verify word wrapping never breaks words mid-word and capitalizes the first letter.
+        let wrapped = wrap_sudo_action_lines(long_action, SUDO_CARD_ACTION_WRAP_WIDTH);
+        assert!(wrapped.len() >= 2);
+        assert!(wrapped[0].starts_with("Switch "));
+        for wline in &wrapped {
+            assert!(
+                wline.chars().count() <= SUDO_CARD_ACTION_WRAP_WIDTH,
+                "wrapped action line exceeded 46 chars: {wline:?}"
+            );
+        }
+        assert_eq!(
+            wrapped.join(" "),
+            "Switch the macOS background service to tun mode and refresh split tunneling rules"
+        );
+
+        // Verify colored macOS card uses the expected ANSI palette and strips identically to plain.
+        let colored_macos = format_unix_sudo_prompt_card(long_action, true, false);
+        assert!(colored_macos.contains("\x1b[38;2;74;85;104m"));
+        assert!(colored_macos.contains("\x1b[1;38;2;241;245;249m"));
+        assert!(colored_macos.contains("\x1b[38;2;148;163;184m"));
+        assert_eq!(strip_ansi_escapes(&colored_macos), plain_macos);
+
+        // Verify Linux prompt hint and empty action fallback.
+        let plain_linux = format_unix_sudo_prompt_card("   ", false, true);
+        assert!(!plain_linux.contains('\x1b'));
+        assert!(plain_linux.contains("Prompt   Enter your sudo password below"));
+        assert!(plain_linux.contains("Action   Complete a privileged operation"));
+        for line in plain_linux.lines() {
+            assert!(line.chars().count() <= 64);
+        }
+    }
+
+    #[test]
+    fn builds_split_apply_args_for_elevation() {
+        let all_cfg = vdpi_core::config::SplitTunnelConfig {
+            mode: vdpi_core::config::SplitTunnelMode::All,
+            apps: vec![],
+        };
+        assert_eq!(
+            build_split_apply_args(&all_cfg),
+            vec!["split", "apply", "--mode", "all"]
+        );
+
+        let exclude_cfg = vdpi_core::config::SplitTunnelConfig {
+            mode: vdpi_core::config::SplitTunnelMode::Exclude,
+            apps: vec!["discord".to_string(), "steam".to_string()],
+        };
+        assert_eq!(
+            build_split_apply_args(&exclude_cfg),
+            vec!["split", "apply", "--mode", "exclude", "--app", "discord", "--app", "steam"]
+        );
+
+        let include_cfg = vdpi_core::config::SplitTunnelConfig {
+            mode: vdpi_core::config::SplitTunnelMode::Include,
+            apps: vec!["Google Chrome".to_string()],
+        };
+        assert_eq!(
+            build_split_apply_args(&include_cfg),
+            vec![
+                "split",
+                "apply",
+                "--mode",
+                "include",
+                "--app",
+                "Google Chrome"
+            ]
+        );
+    }
+
+    #[test]
+    fn builds_unix_install_sudo_args_preserving_upgrade_and_engine() {
+        let mut cfg = CliArgs::parse_from_iter(["vdpi"])
+            .unwrap()
+            .into_runtime_config();
+
+        cfg.engine = EngineMode::Proxy;
+        assert_eq!(
+            build_unix_install_sudo_args(&cfg, true),
+            vec!["install", "--upgrade"]
+        );
+
+        cfg.engine = EngineMode::Tun;
+        assert_eq!(
+            build_unix_install_sudo_args(&cfg, true),
+            vec!["install", "--upgrade", "--tun"]
+        );
+
+        let fresh_tun = build_unix_install_sudo_args(&cfg, false);
+        assert!(fresh_tun.iter().any(|a| a == "--tun"));
+        assert_eq!(fresh_tun.last().map(String::as_str), Some("install"));
+
+        cfg.engine = EngineMode::Proxy;
+        let fresh_proxy = build_unix_install_sudo_args(&cfg, false);
+        assert!(fresh_proxy.iter().any(|a| a == "--proxy"));
+        assert_eq!(fresh_proxy.last().map(String::as_str), Some("install"));
     }
 }

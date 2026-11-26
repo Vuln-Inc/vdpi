@@ -31,6 +31,19 @@ pub enum VersionRelation {
     Unknown, // either side unparseable
 }
 
+#[derive(Debug, Clone)]
+pub struct ReleaseCheckResult {
+    pub current_version: String,
+    pub latest_version: String,
+    pub release_url: String,
+    pub release_notes: Vec<String>,
+    pub relation: VersionRelation,
+    pub asset_name: Option<String>,
+    pub asset_url: Option<String>,
+    pub sums_url: Option<String>,
+    pub installed_service_path: Option<PathBuf>,
+}
+
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
     tag_name: String,
@@ -492,8 +505,13 @@ impl StagingDir {
             let candidate = base.join(format!("vdpi-update-{pid}-{nanos}-{attempt}"));
             #[cfg(unix)]
             let create_res = {
-                use std::os::unix::fs::DirBuilderExt;
-                fs::DirBuilder::new().mode(0o700).create(&candidate)
+                use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+                fs::DirBuilder::new()
+                    .mode(0o755)
+                    .create(&candidate)
+                    .map(|()| {
+                        let _ = fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755));
+                    })
             };
             #[cfg(not(unix))]
             let create_res = fs::create_dir(&candidate);
@@ -1058,23 +1076,310 @@ fn ensure_macos_codesigned(binary_path: &Path) -> Result<()> {
     ad_hoc_codesign_macos(binary_path)
 }
 
-fn run_service_install(extracted_bin: &Path) -> Result<()> {
-    #[cfg(unix)]
+#[cfg(unix)]
+fn ensure_unix_executable_tree_permissions(
+    staging_root: &Path,
+    extracted_bin: &Path,
+) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = fs::Permissions::from_mode(0o755);
+    let canonical_root =
+        fs::canonicalize(staging_root).unwrap_or_else(|_| staging_root.to_path_buf());
+    let mut dirs_to_chmod = Vec::new();
+    let mut cursor = extracted_bin.parent();
+    while let Some(dir) = cursor {
+        dirs_to_chmod.push(dir.to_path_buf());
+        if dir == staging_root || dir == canonical_root {
+            break;
+        }
+        cursor = dir.parent();
+    }
+    if !dirs_to_chmod
+        .iter()
+        .any(|d| d == staging_root || d == &canonical_root)
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(extracted_bin, fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("failed to chmod 0755 {}", extracted_bin.display()))?;
+        dirs_to_chmod.push(staging_root.to_path_buf());
+    }
+
+    for dir in dirs_to_chmod.into_iter().rev() {
+        fs::set_permissions(&dir, mode.clone())
+            .with_context(|| format!("failed to chmod 0755 {}", dir.display()))?;
+    }
+    fs::set_permissions(extracted_bin, mode)
+        .with_context(|| format!("failed to chmod 0755 {}", extracted_bin.display()))?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn is_unix_system_bin_path(path: &Path) -> bool {
+    path == Path::new(crate::service::UNIX_SYSTEM_BIN_PATH) || path.starts_with("/usr/local/bin")
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn unix_service_upgrade_needs_sudo(installed_service_path: Option<&Path>) -> bool {
+    if crate::service::is_unix_root() {
+        return false;
     }
 
     #[cfg(target_os = "macos")]
-    ensure_macos_codesigned(extracted_bin)?;
+    let has_system_daemon = Path::new(crate::service::LAUNCH_DAEMON_PLIST_PATH).exists();
+    #[cfg(target_os = "linux")]
+    let has_system_daemon = Path::new(crate::service::SYSTEMD_SYSTEM_UNIT_PATH).exists();
 
-    let status = Command::new(extracted_bin)
-        .args(["install", "--upgrade"])
+    let under_system_bin = installed_service_path.is_some_and(is_unix_system_bin_path);
+    if has_system_daemon || under_system_bin {
+        return true;
+    }
+
+    crate::config_file::load_file_config(None, false)
+        .ok()
+        .and_then(|(_, file_cfg)| file_cfg.engine)
+        == Some(crate::config::EngineMode::Tun)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn run_unix_sudo_os_args(bin: &Path, args: &[&OsStr], action_description: &str) -> Result<()> {
+    use std::io::IsTerminal;
+
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        bail!("Root required to {action_description} - run: sudo vdpi update");
+    }
+
+    let sudo_bin = ["/usr/bin/sudo", "/bin/sudo", "/usr/local/bin/sudo"]
+        .into_iter()
+        .find(|p| Path::new(p).is_file())
+        .unwrap_or("sudo");
+
+    let status = Command::new(sudo_bin)
+        .args(["-p", "  Password: ", "--"])
+        .arg(bin)
+        .args(args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
+        .with_context(|| {
+            format!("Root required to {action_description} - run: sudo vdpi update")
+        })?;
+
+    if !status.success() {
+        let code = status
+            .code()
+            .map_or_else(|| "signal".to_string(), |c| c.to_string());
+        bail!("sudo canceled or failed (exit {code}) - try: sudo vdpi update");
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn run_unix_sudo_binary(bin: &Path, args: &[&str], action_description: &str) -> Result<()> {
+    let os_args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+    run_unix_sudo_os_args(bin, &os_args, action_description)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn error_is_permission_denied(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|io_err| io_err.kind() == io::ErrorKind::PermissionDenied)
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn run_windows_elevated_binary(bin: &Path, args: &[&str]) -> Result<()> {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+
+    type Bool = i32;
+    type Dword = u32;
+
+    const SEE_MASK_NOCLOSEPROCESS: Dword = 0x0000_0040;
+    const SW_HIDE: i32 = 0;
+    const INFINITE: Dword = 0xFFFF_FFFF;
+    const WAIT_OBJECT_0: Dword = 0;
+    const ERROR_CANCELLED: Dword = 1223;
+
+    #[repr(C)]
+    struct ShellExecuteInfoW {
+        cb_size: Dword,
+        f_mask: Dword,
+        hwnd: *mut c_void,
+        lp_verb: *const u16,
+        lp_file: *const u16,
+        lp_parameters: *const u16,
+        lp_directory: *const u16,
+        n_show: i32,
+        h_inst_app: *mut c_void,
+        lp_id_list: *mut c_void,
+        lp_class: *const u16,
+        hkey_class: *mut c_void,
+        dw_hot_key: Dword,
+        h_icon_or_monitor: *mut c_void,
+        h_process: *mut c_void,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLastError() -> Dword;
+        fn WaitForSingleObject(h_handle: *mut c_void, dw_milliseconds: Dword) -> Dword;
+        fn GetExitCodeProcess(h_process: *mut c_void, lp_exit_code: *mut Dword) -> Bool;
+        fn CloseHandle(h_object: *mut c_void) -> Bool;
+    }
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteExW(p_exec_info: *mut ShellExecuteInfoW) -> Bool;
+    }
+
+    fn to_wide_null(value: &OsStr) -> Vec<u16> {
+        value.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    let clean_bin = strip_windows_verbatim_prefix(bin);
+    let temp_dir = strip_windows_verbatim_prefix(&std::env::temp_dir());
+    let params: String = args
+        .iter()
+        .map(|arg| crate::service::quote_windows_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let verb_wide = to_wide_null(OsStr::new("runas"));
+    let file_wide = to_wide_null(clean_bin.as_os_str());
+    let params_wide = to_wide_null(OsStr::new(&params));
+    let dir_wide = to_wide_null(temp_dir.as_os_str());
+
+    let mut info = ShellExecuteInfoW {
+        cb_size: std::mem::size_of::<ShellExecuteInfoW>() as Dword,
+        f_mask: SEE_MASK_NOCLOSEPROCESS,
+        hwnd: ptr::null_mut(),
+        lp_verb: verb_wide.as_ptr(),
+        lp_file: file_wide.as_ptr(),
+        lp_parameters: if params.is_empty() {
+            ptr::null()
+        } else {
+            params_wide.as_ptr()
+        },
+        lp_directory: dir_wide.as_ptr(),
+        n_show: SW_HIDE,
+        h_inst_app: ptr::null_mut(),
+        lp_id_list: ptr::null_mut(),
+        lp_class: ptr::null(),
+        hkey_class: ptr::null_mut(),
+        dw_hot_key: 0,
+        h_icon_or_monitor: ptr::null_mut(),
+        h_process: ptr::null_mut(),
+    };
+
+    // SAFETY: `info` and all wide-string buffers live across the `ShellExecuteExW` call.
+    let ok = unsafe { ShellExecuteExW(&mut info) };
+    if ok == 0 {
+        let err = unsafe { GetLastError() };
+        if err == ERROR_CANCELLED {
+            bail!(
+                "UAC elevation was cancelled. Administrator privileges are required to update the vdpi Windows service."
+            );
+        }
+        bail!("ShellExecuteExW(runas) failed with Win32 error {err}");
+    }
+
+    if info.h_process.is_null() {
+        bail!("ShellExecuteExW(runas) succeeded without returning an elevated process handle");
+    }
+
+    let mut exit_code: Dword = 0;
+    let wait_res = unsafe { WaitForSingleObject(info.h_process, INFINITE) };
+    let wait_err = if wait_res != WAIT_OBJECT_0 {
+        Some(unsafe { GetLastError() })
+    } else {
+        None
+    };
+
+    let exit_code_err = if wait_err.is_none() {
+        let got_exit = unsafe { GetExitCodeProcess(info.h_process, &mut exit_code) };
+        if got_exit == 0 {
+            Some(unsafe { GetLastError() })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    unsafe {
+        let _ = CloseHandle(info.h_process);
+    }
+
+    if let Some(err) = wait_err {
+        bail!(
+            "WaitForSingleObject for elevated updater failed (result {wait_res}, Win32 error {err})"
+        );
+    }
+    if let Some(err) = exit_code_err {
+        bail!("GetExitCodeProcess for elevated updater failed with Win32 error {err}");
+    }
+    if exit_code != 0 {
+        bail!("elevated updater 'install --upgrade' exited with status code {exit_code}");
+    }
+
+    Ok(())
+}
+
+fn format_child_failure(label: &str, output: &std::process::Output) -> anyhow::Error {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = stderr
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .or_else(|| stdout.lines().rev().find(|line| !line.trim().is_empty()))
+        .map(str::trim);
+
+    match detail {
+        Some(msg) => anyhow!("{label} failed: {msg}"),
+        None => anyhow!("{label} failed with exit status {:?}", output.status.code()),
+    }
+}
+
+fn run_service_install(
+    extracted_bin: &Path,
+    staging_root: &Path,
+    installed_service_path: Option<&Path>,
+) -> Result<()> {
+    #[cfg(unix)]
+    ensure_unix_executable_tree_permissions(staging_root, extracted_bin)?;
+    #[cfg(not(unix))]
+    let _ = staging_root;
+
+    #[cfg(target_os = "macos")]
+    ensure_macos_codesigned(extracted_bin)?;
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if unix_service_upgrade_needs_sudo(installed_service_path) {
+        return run_unix_sudo_binary(
+            extracted_bin,
+            &["install", "--upgrade"],
+            "update the vdpi background service",
+        );
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let _ = installed_service_path;
+
+    #[cfg(target_os = "windows")]
+    if !crate::platform::windows_service::is_elevated() {
+        run_windows_elevated_binary(extracted_bin, &["install", "--upgrade"])?;
+        crate::platform::windows::notify_wininet_refresh();
+        crate::platform::windows::broadcast_environment_change();
+        return Ok(());
+    }
+
+    let output = Command::new(extracted_bin)
+        .args(["install", "--upgrade"])
+        .stdin(Stdio::null())
+        .output()
         .with_context(|| {
             format!(
                 "failed to launch extracted updater binary {}",
@@ -1082,11 +1387,17 @@ fn run_service_install(extracted_bin: &Path) -> Result<()> {
             )
         })?;
 
-    if !status.success() {
-        bail!(
-            "updated binary 'install --upgrade' command failed with exit status {:?}",
-            status.code()
-        );
+    if !output.status.success() {
+        return Err(format_child_failure(
+            "updated binary 'install --upgrade'",
+            &output,
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    if !crate::platform::windows::is_running_as_service() {
+        crate::platform::windows::notify_wininet_refresh();
+        crate::platform::windows::broadcast_environment_change();
     }
 
     Ok(())
@@ -1453,7 +1764,34 @@ fn stage_unix_executable_unique(src: &Path, dir: &Path) -> Result<PathBuf> {
     Ok(tmp_path)
 }
 
-fn replace_portable_binary(extracted_bin: &Path) -> Result<PathBuf> {
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn replace_portable_binary_with_sudo(
+    extracted_bin: &Path,
+    staging_root: &Path,
+    current_exe: &Path,
+) -> Result<PathBuf> {
+    ensure_unix_executable_tree_permissions(staging_root, extracted_bin)?;
+    #[cfg(target_os = "macos")]
+    ensure_macos_codesigned(extracted_bin)?;
+
+    let install_bin = ["/usr/bin/install", "/bin/install"]
+        .into_iter()
+        .find(|p| Path::new(p).is_file())
+        .unwrap_or("install");
+
+    let args = [
+        OsStr::new("-m"),
+        OsStr::new("0755"),
+        OsStr::new("--"),
+        extracted_bin.as_os_str(),
+        current_exe.as_os_str(),
+    ];
+    let action = format!("update {}", current_exe.display());
+    run_unix_sudo_os_args(Path::new(install_bin), &args, &action)?;
+    Ok(current_exe.to_path_buf())
+}
+
+fn replace_portable_binary(extracted_bin: &Path, staging_root: &Path) -> Result<PathBuf> {
     let current_exe_raw =
         std::env::current_exe().context("failed to determine current executable path")?;
     #[cfg(unix)]
@@ -1485,37 +1823,65 @@ fn replace_portable_binary(extracted_bin: &Path) -> Result<PathBuf> {
 
     #[cfg(target_os = "windows")]
     {
+        let _ = staging_root;
         replace_portable_binary_in_dir(extracted_bin, &current_exe, exe_dir)?;
         Ok(current_exe)
     }
 
     #[cfg(unix)]
     {
-        let tmp_path = stage_unix_executable_unique(extracted_bin, exe_dir)?;
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let _ = staging_root;
 
-        #[cfg(target_os = "macos")]
-        if let Err(err) = ad_hoc_codesign_macos(&tmp_path) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(err);
+        match stage_unix_executable_unique(extracted_bin, exe_dir) {
+            Ok(tmp_path) => {
+                #[cfg(target_os = "macos")]
+                if let Err(err) = ad_hoc_codesign_macos(&tmp_path) {
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(err);
+                }
+
+                match fs::rename(&tmp_path, &current_exe) {
+                    Ok(()) => Ok(current_exe),
+                    Err(err) => {
+                        let _ = fs::remove_file(&tmp_path);
+                        #[cfg(any(target_os = "macos", target_os = "linux"))]
+                        if err.kind() == io::ErrorKind::PermissionDenied
+                            && !crate::service::is_unix_root()
+                        {
+                            return replace_portable_binary_with_sudo(
+                                extracted_bin,
+                                staging_root,
+                                &current_exe,
+                            );
+                        }
+                        Err(err).with_context(|| {
+                            format!(
+                                "failed to atomically replace {} with {}",
+                                current_exe.display(),
+                                tmp_path.display()
+                            )
+                        })
+                    }
+                }
+            }
+            Err(err) => {
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                if error_is_permission_denied(&err) && !crate::service::is_unix_root() {
+                    return replace_portable_binary_with_sudo(
+                        extracted_bin,
+                        staging_root,
+                        &current_exe,
+                    );
+                }
+                Err(err)
+            }
         }
-
-        if let Err(err) = fs::rename(&tmp_path, &current_exe) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(err).with_context(|| {
-                format!(
-                    "failed to atomically replace {} with {}",
-                    current_exe.display(),
-                    tmp_path.display()
-                )
-            });
-        }
-
-        Ok(current_exe)
     }
 
     #[cfg(not(any(target_os = "windows", unix)))]
     {
-        let _ = (extracted_bin, exe_dir);
+        let _ = (extracted_bin, staging_root, exe_dir);
         bail!(
             "portable self-update is not supported on {}",
             std::env::consts::OS
@@ -1523,19 +1889,36 @@ fn replace_portable_binary(extracted_bin: &Path) -> Result<PathBuf> {
     }
 }
 
-/// Checks GitHub Releases for the latest `vdpi` release and optionally downloads,
-/// verifies (SHA-256), and installs it for either service or portable deployments.
-pub async fn run_update(check_only: bool, force: bool, _cfg: &RuntimeConfig) -> Result<()> {
+fn build_updater_client() -> Result<Client> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let user_agent = format!("vdpi/{}", env!("CARGO_PKG_VERSION"));
-    let client = Client::builder()
+    Client::builder()
         .user_agent(&user_agent)
         .https_only(true)
         .redirect(reqwest::redirect::Policy::limited(5))
         .timeout(API_TIMEOUT)
         .build()
-        .context("failed to build HTTP client for updater")?;
+        .context("failed to build HTTP client for updater")
+}
+
+fn extract_release_notes(body: Option<&str>) -> Vec<String> {
+    body.map(|notes| {
+        notes
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("- ") || line.starts_with("* "))
+            .take(8)
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Queries GitHub Releases for the latest `vdpi` release and compares it against
+/// the installed (or currently running) version without printing to stdout.
+pub async fn check_latest_release() -> Result<ReleaseCheckResult> {
+    let client = build_updater_client()?;
 
     debug!(
         url = GITHUB_LATEST_RELEASE_URL,
@@ -1571,55 +1954,68 @@ pub async fn run_update(check_only: bool, force: bool, _cfg: &RuntimeConfig) -> 
         .as_ref()
         .and_then(|info| info.installed_version.as_deref())
         .unwrap_or(env!("CARGO_PKG_VERSION"));
-    let baseline = format_display_version(baseline_raw);
-
-    println!("Current version : v{baseline}");
-    println!("Latest version  : {}", release.tag_name);
-    println!("Release URL     : {}", release.html_url);
-
-    if let Some(notes) = release.body.as_deref() {
-        let bullets: Vec<&str> = notes
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with("- ") || line.starts_with("* "))
-            .take(8)
-            .collect();
-        if !bullets.is_empty() {
-            println!("Release notes   :");
-            for bullet in bullets {
-                println!("  {bullet}");
-            }
-        }
-    }
-
+    let current_version = format_display_version(baseline_raw);
     let relation = compare_versions(&release.tag_name, baseline_raw);
-    if matches!(relation, VersionRelation::Same | VersionRelation::Older) && !force {
-        println!("vdpi is already up to date (v{baseline}).");
-        return Ok(());
+    let release_notes = extract_release_notes(release.body.as_deref());
+
+    let asset_name = platform_asset_name().map(str::to_string);
+    let asset_url = asset_name.as_deref().and_then(|name| {
+        release
+            .assets
+            .iter()
+            .find(|a| a.name == name)
+            .map(|a| a.browser_download_url.clone())
+    });
+    let sums_url = release
+        .assets
+        .iter()
+        .find(|a| a.name == "SHA256SUMS.txt")
+        .map(|a| a.browser_download_url.clone());
+
+    Ok(ReleaseCheckResult {
+        current_version,
+        latest_version: release.tag_name,
+        release_url: release.html_url,
+        release_notes,
+        relation,
+        asset_name,
+        asset_url,
+        sums_url,
+        installed_service_path: installed.map(|info| info.binary_path),
+    })
+}
+
+/// Downloads, SHA-256 verifies, extracts, and installs the release described by `check`.
+///
+/// Emits human-readable status lines exclusively via `on_progress` (zero `println!`),
+/// returning a final summary message on success.
+pub async fn apply_release_update<F>(
+    check: &ReleaseCheckResult,
+    force: bool,
+    mut on_progress: F,
+) -> Result<String>
+where
+    F: FnMut(&str),
+{
+    if matches!(
+        check.relation,
+        VersionRelation::Same | VersionRelation::Older
+    ) && !force
+    {
+        return Ok(format!(
+            "vdpi is already up to date (v{}).",
+            check.current_version
+        ));
     }
-    if relation == VersionRelation::Unknown && !force {
-        if check_only {
-            println!(
-                "Cannot compare current version (v{baseline}) with latest release '{}'. Re-run with '--force' to install anyway.",
-                release.tag_name
-            );
-            return Ok(());
-        }
+    if check.relation == VersionRelation::Unknown && !force {
         bail!(
-            "cannot compare current version (v{baseline}) with latest release '{}'; re-run with '--force' to install anyway",
-            release.tag_name
+            "cannot compare current version (v{}) with latest release '{}'; re-run with '--force' to install anyway",
+            check.current_version,
+            check.latest_version
         );
     }
 
-    if check_only {
-        println!(
-            "Update available: v{baseline} -> {}. Run 'vdpi update' to install.",
-            release.tag_name
-        );
-        return Ok(());
-    }
-
-    let asset_name = platform_asset_name().ok_or_else(|| {
+    let asset_name = check.asset_name.as_deref().ok_or_else(|| {
         anyhow!(
             "no prebuilt release asset is available for {}/{}",
             std::env::consts::OS,
@@ -1627,47 +2023,34 @@ pub async fn run_update(check_only: bool, force: bool, _cfg: &RuntimeConfig) -> 
         )
     })?;
 
-    let asset = release
-        .assets
-        .iter()
-        .find(|a| a.name == asset_name)
-        .ok_or_else(|| {
-            anyhow!(
-                "release {} does not contain asset '{asset_name}'",
-                release.tag_name
-            )
-        })?;
+    let asset_url = check.asset_url.as_deref().ok_or_else(|| {
+        anyhow!(
+            "release {} does not contain asset '{asset_name}'",
+            check.latest_version
+        )
+    })?;
 
-    let sums_asset = release
-        .assets
-        .iter()
-        .find(|a| a.name == "SHA256SUMS.txt")
-        .ok_or_else(|| {
-            anyhow!(
-                "release {} is missing SHA256SUMS.txt; refusing unverified update",
-                release.tag_name
-            )
-        })?;
+    let sums_url = check.sums_url.as_deref().ok_or_else(|| {
+        anyhow!(
+            "release {} is missing SHA256SUMS.txt; refusing unverified update",
+            check.latest_version
+        )
+    })?;
 
-    if !asset.browser_download_url.starts_with("https://") {
-        bail!(
-            "refusing non-HTTPS download URL for {}: {}",
-            asset.name,
-            asset.browser_download_url
-        );
+    if !asset_url.starts_with("https://") {
+        bail!("refusing non-HTTPS download URL for {asset_name}: {asset_url}");
     }
-    if !sums_asset.browser_download_url.starts_with("https://") {
-        bail!(
-            "refusing non-HTTPS download URL for SHA256SUMS.txt: {}",
-            sums_asset.browser_download_url
-        );
+    if !sums_url.starts_with("https://") {
+        bail!("refusing non-HTTPS download URL for SHA256SUMS.txt: {sums_url}");
     }
 
+    let client = build_updater_client()?;
     let staging = StagingDir::new()?;
     debug!(dir = %staging.path().display(), "created update staging directory");
 
+    on_progress("Downloading SHA256SUMS.txt...");
     let sums_resp = client
-        .get(&sums_asset.browser_download_url)
+        .get(sums_url)
         .send()
         .await
         .context("failed to download SHA256SUMS.txt")?;
@@ -1686,19 +2069,15 @@ pub async fn run_update(check_only: bool, force: bool, _cfg: &RuntimeConfig) -> 
     let sums_text =
         read_response_text_bounded(sums_resp, MAX_SUMS_BODY_BYTES, "SHA256SUMS.txt").await?;
 
-    println!("Downloading {asset_name}...");
+    on_progress(&format!("Downloading {asset_name}..."));
     let archive_path = staging.path().join(asset_name);
-    download_to_file(
-        &client,
-        &asset.browser_download_url,
-        &archive_path,
-        MAX_ARCHIVE_BYTES,
-    )
-    .await?;
+    download_to_file(&client, asset_url, &archive_path, MAX_ARCHIVE_BYTES).await?;
 
+    on_progress("Verifying SHA-256 checksum...");
     verify_archive_sha256(&archive_path, &sums_text, asset_name)?;
-    println!("SHA-256 verified.");
+    on_progress("SHA-256 verified.");
 
+    on_progress("Extracting update archive...");
     let extract_dir = staging.path().join("extract");
     fs::create_dir(&extract_dir)
         .with_context(|| format!("failed to create {}", extract_dir.display()))?;
@@ -1707,21 +2086,79 @@ pub async fn run_update(check_only: bool, force: bool, _cfg: &RuntimeConfig) -> 
 
     let extracted_bin = find_extracted_binary(&extract_dir, bin_name)?;
 
-    if let Some(info) = installed {
-        println!(
+    if let Some(service_path) = check.installed_service_path.as_deref() {
+        on_progress(&format!(
             "Updating installed vdpi service ({})...",
-            info.binary_path.display()
-        );
-        run_service_install(&extracted_bin)?;
-        println!("Successfully updated vdpi service to {}.", release.tag_name);
+            service_path.display()
+        ));
+        run_service_install(&extracted_bin, staging.path(), Some(service_path))?;
+        Ok(format!(
+            "Successfully updated vdpi service to {}.",
+            check.latest_version
+        ))
     } else {
-        let updated_path = replace_portable_binary(&extracted_bin)?;
-        println!(
+        on_progress("Replacing vdpi binary...");
+        let updated_path = replace_portable_binary(&extracted_bin, staging.path())?;
+        Ok(format!(
             "Successfully updated vdpi to {} at {}.",
-            release.tag_name,
+            check.latest_version,
             updated_path.display()
+        ))
+    }
+}
+
+/// Checks GitHub Releases for the latest `vdpi` release and optionally downloads,
+/// verifies (SHA-256), and installs it for either service or portable deployments.
+pub async fn run_update(check_only: bool, force: bool, _cfg: &RuntimeConfig) -> Result<()> {
+    let check = check_latest_release().await?;
+
+    println!("Current version : v{}", check.current_version);
+    println!("Latest version  : {}", check.latest_version);
+    println!("Release URL     : {}", check.release_url);
+
+    if !check.release_notes.is_empty() {
+        println!("Release notes   :");
+        for bullet in &check.release_notes {
+            println!("  {bullet}");
+        }
+    }
+
+    if matches!(
+        check.relation,
+        VersionRelation::Same | VersionRelation::Older
+    ) && !force
+    {
+        println!("vdpi is already up to date (v{}).", check.current_version);
+        return Ok(());
+    }
+    if check.relation == VersionRelation::Unknown && !force {
+        if check_only {
+            println!(
+                "Cannot compare current version (v{}) with latest release '{}'. Re-run with '--force' to install anyway.",
+                check.current_version, check.latest_version
+            );
+            return Ok(());
+        }
+        bail!(
+            "cannot compare current version (v{}) with latest release '{}'; re-run with '--force' to install anyway",
+            check.current_version,
+            check.latest_version
         );
     }
+
+    if check_only {
+        println!(
+            "Update available: v{} -> {}. Run 'vdpi update' to install.",
+            check.current_version, check.latest_version
+        );
+        return Ok(());
+    }
+
+    let summary = apply_release_update(&check, force, |step| {
+        println!("{step}");
+    })
+    .await?;
+    println!("{summary}");
 
     Ok(())
 }
@@ -2257,5 +2694,92 @@ vdpi-windows-x86_64/WINTUN-LICENSE.txt
             .mode()
             & 0o777;
         assert_eq!(mode, 0o755);
+
+        let staging_mode = fs::metadata(staging.path())
+            .expect("stat staging dir")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(staging_mode, 0o755);
+    }
+
+    #[test]
+    fn extracts_up_to_eight_release_note_bullets() {
+        let body = "\
+## Highlights
+- Item 1
+* Item 2
+  - Item 3
+Plain paragraph ignored
+- Item 4
+- Item 5
+- Item 6
+- Item 7
+- Item 8
+- Item 9
+";
+        let notes = extract_release_notes(Some(body));
+        assert_eq!(notes.len(), 8);
+        assert_eq!(notes[0], "- Item 1");
+        assert_eq!(notes[1], "* Item 2");
+        assert_eq!(notes[2], "- Item 3");
+        assert_eq!(notes[7], "- Item 8");
+        assert!(extract_release_notes(None).is_empty());
+    }
+
+    #[test]
+    fn detects_unix_system_bin_paths_and_permission_denied_errors() {
+        assert!(is_unix_system_bin_path(Path::new("/usr/local/bin/vdpi")));
+        assert!(is_unix_system_bin_path(Path::new(
+            "/usr/local/bin/sub/vdpi"
+        )));
+        assert!(!is_unix_system_bin_path(Path::new(
+            "/Users/alice/.vdpi/bin/vdpi"
+        )));
+
+        let perm_err =
+            anyhow::Error::new(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+                .context("failed to write binary");
+        assert!(error_is_permission_denied(&perm_err));
+
+        let other_err = anyhow::Error::new(io::Error::new(io::ErrorKind::NotFound, "missing"));
+        assert!(!error_is_permission_denied(&other_err));
+    }
+
+    #[tokio::test]
+    async fn apply_release_update_handles_up_to_date_and_invalid_urls_without_network() {
+        let base_check = ReleaseCheckResult {
+            current_version: "0.5.6".to_string(),
+            latest_version: "v0.5.6".to_string(),
+            release_url: "https://github.com/Vuln-Inc/vdpi/releases/tag/v0.5.6".to_string(),
+            release_notes: vec!["- Fix".to_string()],
+            relation: VersionRelation::Same,
+            asset_name: Some("vdpi-windows-x86_64.zip".to_string()),
+            asset_url: Some("https://example.com/vdpi.zip".to_string()),
+            sums_url: Some("https://example.com/SHA256SUMS.txt".to_string()),
+            installed_service_path: None,
+        };
+
+        let mut progress = Vec::new();
+        let msg = apply_release_update(&base_check, false, |s| progress.push(s.to_string()))
+            .await
+            .expect("already up to date should return Ok");
+        assert!(msg.contains("already up to date"));
+        assert!(progress.is_empty());
+
+        let mut unknown_check = base_check.clone();
+        unknown_check.relation = VersionRelation::Unknown;
+        let err = apply_release_update(&unknown_check, false, |_| {})
+            .await
+            .expect_err("unknown relation without force must fail");
+        assert!(err.to_string().contains("--force"));
+
+        let mut insecure_check = base_check;
+        insecure_check.relation = VersionRelation::Newer;
+        insecure_check.asset_url = Some("http://example.com/vdpi.zip".to_string());
+        let err = apply_release_update(&insecure_check, false, |_| {})
+            .await
+            .expect_err("non-HTTPS asset URL must fail");
+        assert!(err.to_string().contains("non-HTTPS"));
     }
 }

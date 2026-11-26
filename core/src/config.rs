@@ -137,6 +137,27 @@ pub enum SplitCommand {
     },
     /// Clear the configured application list and reset split-tunnel mode to `all`
     Clear,
+    /// Atomically apply split-tunnel mode and app list (used for elevated saves)
+    #[command(
+        hide = true,
+        arg = clap::Arg::new("mode")
+            .long("__vdpi-desync-mode-shadow")
+            .value_parser(clap::value_parser!(DesyncMode))
+            .hide(true)
+    )]
+    Apply {
+        /// Target split-tunneling mode (`all`, `exclude`, or `include`)
+        #[arg(
+            long = "mode",
+            id = "split_apply_mode",
+            value_name = "MODE",
+            value_enum
+        )]
+        mode: SplitTunnelMode,
+        /// Application executable names to set (repeatable)
+        #[arg(long = "app", value_name = "APP")]
+        apps: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -1540,6 +1561,45 @@ mod tests {
             clear.command,
             Some(Command::Split {
                 action: Some(SplitCommand::Clear)
+            })
+        );
+    }
+
+    #[test]
+    fn parses_split_apply_subcommand() {
+        <CliArgs as clap::CommandFactory>::command().debug_assert();
+
+        let apply = CliArgs::parse_from_iter([
+            "vdpi",
+            "split",
+            "apply",
+            "--mode",
+            "include",
+            "--app",
+            "discord.exe",
+            "--app",
+            "chrome.exe",
+        ])
+        .expect("valid split apply command");
+        assert_eq!(
+            apply.command,
+            Some(Command::Split {
+                action: Some(SplitCommand::Apply {
+                    mode: SplitTunnelMode::Include,
+                    apps: vec!["discord.exe".to_string(), "chrome.exe".to_string()],
+                })
+            })
+        );
+
+        let apply_empty = CliArgs::parse_from_iter(["vdpi", "split", "apply", "--mode", "all"])
+            .expect("valid split apply command with no apps");
+        assert_eq!(
+            apply_empty.command,
+            Some(Command::Split {
+                action: Some(SplitCommand::Apply {
+                    mode: SplitTunnelMode::All,
+                    apps: Vec::new(),
+                })
             })
         );
     }
