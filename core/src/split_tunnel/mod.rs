@@ -831,6 +831,24 @@ pub fn resolve_local_app(local_ip: IpAddr, local_port: u16, is_udp: bool) -> Opt
     global_resolver().resolve(local_ip, local_port, is_udp)
 }
 
+/// Builds an optional per-flow TUN bypass hook from `split` for desktop TUN
+/// sessions. Returns `None` when split tunneling is in `All` mode so the TUN
+/// hot path incurs zero overhead.
+pub fn build_tun_app_bypass_hook(
+    split: &vdpi_core::config::SplitTunnelConfig,
+) -> Option<vdpi_tun::config::AppBypassHook> {
+    if !split.is_active() {
+        return None;
+    }
+    let cfg = split.clone();
+    Some(vdpi_tun::config::AppBypassHook::new(
+        move |src_ip, src_port, is_udp| {
+            let app = resolve_local_app(src_ip, src_port, is_udp);
+            cfg.should_bypass_app(app.as_deref())
+        },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

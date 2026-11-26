@@ -1660,10 +1660,10 @@ mod desktop_tun {
     use vdpi_tun::events::EventRing;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use vdpi_tun::fd::register_tun_fd;
-    #[cfg(target_os = "linux")]
-    use vdpi_tun::fd::run_registered_tun_fd;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use vdpi_tun::fd::run_registered_tun_fd_with_app_bypass;
     #[cfg(target_os = "windows")]
-    use vdpi_tun::pipeline::run_tun_pipeline_with_route_watch;
+    use vdpi_tun::pipeline::run_tun_pipeline_with_app_bypass;
     use vdpi_tun::pipeline::TunStats;
 
     const MAX_CONSECUTIVE_PIPELINE_EXITS: u32 = 5;
@@ -1788,8 +1788,10 @@ mod desktop_tun {
                     .context("Windows TUN startup task panicked")?
                     .map_err(format_tun_start_error)?;
 
+                let app_bypass =
+                    vdpi::split_tunnel::build_tun_app_bypass_hook(&ctx.config.split_tunnel);
                 let (stop_tx, stop_rx) = watch::channel(false);
-                let pipeline_task = tokio::spawn(run_tun_pipeline_with_route_watch(
+                let pipeline_task = tokio::spawn(run_tun_pipeline_with_app_bypass(
                     inbound_rx,
                     outbound_tx,
                     ctx.clone(),
@@ -1799,6 +1801,7 @@ mod desktop_tun {
                     TunProfile::DESKTOP,
                     stop_rx,
                     Some(route_rx.clone()),
+                    app_bypass,
                 ));
 
                 self.session = Some(PlatformTunHandle::Windows(session));
@@ -1830,18 +1833,20 @@ mod desktop_tun {
 
                 let tun_mtu = usize::from(session.mtu());
                 let route_rx = session.route_change_rx();
+                let app_bypass =
+                    vdpi::split_tunnel::build_tun_app_bypass_hook(&ctx.config.split_tunnel);
                 let (stop_tx, stop_rx) = watch::channel(false);
-                let pipeline_task =
-                    tokio::spawn(vdpi_tun::fd::run_registered_tun_fd_with_route_watch(
-                        async_fd,
-                        ctx.clone(),
-                        Arc::clone(tun_stats),
-                        Arc::clone(events),
-                        tun_mtu,
-                        TunProfile::DESKTOP,
-                        stop_rx,
-                        Some(route_rx.clone()),
-                    ));
+                let pipeline_task = tokio::spawn(run_registered_tun_fd_with_app_bypass(
+                    async_fd,
+                    ctx.clone(),
+                    Arc::clone(tun_stats),
+                    Arc::clone(events),
+                    tun_mtu,
+                    TunProfile::DESKTOP,
+                    stop_rx,
+                    Some(route_rx.clone()),
+                    app_bypass,
+                ));
 
                 self.session = Some(PlatformTunHandle::Macos(session));
                 self.pipeline_stop_tx = Some(stop_tx);
@@ -1870,8 +1875,10 @@ mod desktop_tun {
                     }
                 };
 
+                let app_bypass =
+                    vdpi::split_tunnel::build_tun_app_bypass_hook(&ctx.config.split_tunnel);
                 let (stop_tx, stop_rx) = watch::channel(false);
-                let pipeline_task = tokio::spawn(run_registered_tun_fd(
+                let pipeline_task = tokio::spawn(run_registered_tun_fd_with_app_bypass(
                     async_fd,
                     ctx.clone(),
                     Arc::clone(tun_stats),
@@ -1879,6 +1886,8 @@ mod desktop_tun {
                     DESKTOP_MTU,
                     TunProfile::DESKTOP,
                     stop_rx,
+                    None,
+                    app_bypass,
                 ));
 
                 self.session = Some(PlatformTunHandle::Linux(session));

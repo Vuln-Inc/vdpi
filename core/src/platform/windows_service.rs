@@ -25,7 +25,7 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 use vdpi_tun::config::{TunProfile, DESKTOP_MTU};
 use vdpi_tun::events::EventRing;
-use vdpi_tun::pipeline::{run_tun_pipeline_with_route_watch, TunStats};
+use vdpi_tun::pipeline::{run_tun_pipeline_with_app_bypass, TunStats};
 
 pub const SERVICE_NAME: &str = "vdpi";
 pub const SERVICE_DISPLAY_NAME: &str = "vdpi Anti-DPI Service";
@@ -577,8 +577,9 @@ impl TunSlot {
                 .await
                 .context("Windows TUN startup task panicked")??;
 
+        let app_bypass = crate::split_tunnel::build_tun_app_bypass_hook(&ctx.config.split_tunnel);
         let (pipeline_stop_tx, pipeline_stop_rx) = watch::channel(false);
-        let pipeline_task = tokio::spawn(run_tun_pipeline_with_route_watch(
+        let pipeline_task = tokio::spawn(run_tun_pipeline_with_app_bypass(
             inbound_rx,
             outbound_tx,
             ctx.clone(),
@@ -588,6 +589,7 @@ impl TunSlot {
             TunProfile::DESKTOP,
             pipeline_stop_rx,
             Some(route_rx.clone()),
+            app_bypass,
         ));
 
         self.session = Some(session);
