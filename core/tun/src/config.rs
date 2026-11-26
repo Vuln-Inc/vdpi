@@ -1,7 +1,52 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Arc;
 use std::time::Duration;
 use vdpi_core::config::{DesyncMode, RuntimeConfig};
+
+/// Per-flow callback `(src_ip, src_port, is_udp) -> bool` for desktop TUN split tunneling.
+/// Returns `true` when the originating app should bypass TLS/HTTP DPI desync and UDP/443 QUIC blocking.
+pub type AppBypassFn = Arc<dyn Fn(IpAddr, u16, bool) -> bool + Send + Sync>;
+
+/// Cloneable, `Debug`-friendly wrapper around [`AppBypassFn`] so [`TunnelConfig`] retains
+/// `#[derive(Debug, Clone, PartialEq, Eq)]`.
+#[derive(Clone)]
+pub struct AppBypassHook(pub AppBypassFn);
+
+impl AppBypassHook {
+    pub fn new<F>(f: F) -> Self
+    where
+        F: Fn(IpAddr, u16, bool) -> bool + Send + Sync + 'static,
+    {
+        Self(Arc::new(f))
+    }
+
+    #[inline]
+    pub fn should_bypass(&self, src_ip: IpAddr, src_port: u16, is_udp: bool) -> bool {
+        (self.0)(src_ip, src_port, is_udp)
+    }
+}
+
+impl From<AppBypassFn> for AppBypassHook {
+    fn from(f: AppBypassFn) -> Self {
+        Self(f)
+    }
+}
+
+impl fmt::Debug for AppBypassHook {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AppBypassHook(..)")
+    }
+}
+
+impl PartialEq for AppBypassHook {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for AppBypassHook {}
 
 pub const MIN_MTU: usize = 1280;
 pub const DEFAULT_MTU: usize = 1400;
@@ -119,6 +164,8 @@ pub struct TunnelConfig {
     pub bypass_domains: Vec<String>,
     #[serde(default)]
     pub cache_path: Option<String>,
+    #[serde(skip)]
+    pub app_bypass_fn: Option<AppBypassHook>,
 }
 
 impl Default for TunnelConfig {
@@ -134,6 +181,7 @@ impl Default for TunnelConfig {
             mtu: DEFAULT_MTU,
             bypass_domains: Vec::new(),
             cache_path: None,
+            app_bypass_fn: None,
         }
     }
 }
@@ -334,5 +382,34 @@ mod tests {
         assert_eq!(DEFAULT_MTU, 1400);
         assert_eq!(DESKTOP_MTU, 16384);
         assert_eq!(MAX_MTU, 65535);
+    }
+
+    #[test]
+    fn app_bypass_hook_defaults_to_none_and_invokes_when_configured() {
+        let default_cfg = TunnelConfig::default();
+        assert!(default_cfg.app_bypass_fn.is_none());
+
+        let parsed = TunnelConfig::from_json_str(r#"{"block_quic":true}"#).unwrap();
+        assert!(parsed.app_bypass_fn.is_none());
+
+        let hook = AppBypassHook::new(|ip, port, is_udp| {
+            ip == IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)) && port == 4242 && is_udp
+        });
+        let cloned = hook.clone();
+        assert_eq!(hook, cloned);
+        assert_eq!(format!("{hook:?}"), "AppBypassHook(..)");
+
+        let cfg = TunnelConfig {
+            app_bypass_fn: Some(hook),
+            ..Default::default()
+        };
+        let active = cfg.app_bypass_fn.as_ref().expect("hook configured");
+        assert!(active.should_bypass(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 4242, true));
+        assert!(!active.should_bypass(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 4242, false));
+        assert!(!active.should_bypass(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 4243, true));
+
+        let serialized = serde_json::to_string(&cfg).unwrap();
+        let roundtrip = TunnelConfig::from_json_str(&serialized).unwrap();
+        assert!(roundtrip.app_bypass_fn.is_none());
     }
 }

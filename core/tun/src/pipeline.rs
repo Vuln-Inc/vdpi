@@ -20,8 +20,9 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::task::AbortHandle;
 use tracing::debug;
-use vdpi_core::desync::{EngineContext, LearnedStrategy};
+use vdpi_core::desync::{EngineContext, EngineTelemetry, LearnedStrategy};
 
+pub use crate::config::{AppBypassFn, AppBypassHook};
 pub use crate::packet::{
     build_udp_packet, inspect_inbound_udp, is_blocked_quic_udp, is_stun_packet,
     is_valid_inbound_tun_packet, InboundUdpPacket,
@@ -32,6 +33,7 @@ const UDP_REAPER_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_QUIC_ICMP_PER_SEC: u64 = 64;
 const TCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const TCP_SLOT_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(250);
+const PASSTHROUGH_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const STUN_FLOW_MAX_ENTRIES: usize = 256;
 const STUN_FLOW_TTL_SECS: u64 = 120;
 
@@ -363,9 +365,9 @@ fn is_transient_udp_recv_error(err: &std::io::Error) -> bool {
 }
 
 /// Evaluates whether an inbound UDP/443 datagram should be dropped as QUIC, exempting
-/// RFC 5389 STUN packets and subsequent TURN ChannelData / DTLS / SRTP packets on
-/// STUN-authenticated `(src_addr, dst_addr)` flows. Optionally emits a rate-limited
-/// ICMP Port Unreachable reply for sub-50ms browser TCP/TLS fallback.
+/// RFC 5389 STUN packets, subsequent TURN ChannelData / DTLS / SRTP packets on
+/// STUN-authenticated `(src_addr, dst_addr)` flows, and app-bypassed flows. Optionally emits
+/// a rate-limited ICMP Port Unreachable reply for sub-50ms browser TCP/TLS fallback.
 #[allow(clippy::too_many_arguments)]
 fn should_drop_inbound_quic(
     pkt: &[u8],
@@ -378,6 +380,7 @@ fn should_drop_inbound_quic(
     events: &EventRing,
     stun_flows: &mut StunFlowCache,
     icmp_reject: Option<(&IcmpRateLimiter, &mpsc::Sender<Vec<u8>>)>,
+    app_bypass: Option<&AppBypassHook>,
 ) -> bool {
     if udp.dst_port != 443 {
         return false;
@@ -399,6 +402,11 @@ fn should_drop_inbound_quic(
         .should_desync(known_host.as_deref(), Some(udp.dst_ip))
     {
         return false;
+    }
+    if let Some(hook) = app_bypass {
+        if hook.should_bypass(udp.src_ip, udp.src_port, true) {
+            return false;
+        }
     }
 
     let count = stats.quic_blocked.fetch_add(1, Ordering::Relaxed) + 1;
@@ -454,6 +462,37 @@ pub async fn run_tun_pipeline(
 /// sockets are drained and aborted so subsequent datagrams immediately rebind to the new uplink.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tun_pipeline_with_route_watch(
+    inbound_rx: mpsc::Receiver<Vec<u8>>,
+    outbound_tx: mpsc::Sender<Vec<u8>>,
+    ctx: EngineContext,
+    tun_stats: Arc<TunStats>,
+    events: Arc<EventRing>,
+    mtu: usize,
+    profile: TunProfile,
+    shutdown_rx: watch::Receiver<bool>,
+    route_rx: Option<watch::Receiver<u64>>,
+) -> Result<()> {
+    run_tun_pipeline_with_app_bypass(
+        inbound_rx,
+        outbound_tx,
+        ctx,
+        tun_stats,
+        events,
+        mtu,
+        profile,
+        shutdown_rx,
+        route_rx,
+        None,
+    )
+    .await
+}
+
+/// Runs the userspace TUN packet pipeline with optional route-change watching and an optional
+/// per-flow [`AppBypassHook`] callback for desktop per-app split tunneling.
+/// When `app_bypass` is `None`, behavior and hot-path overhead are identical to
+/// [`run_tun_pipeline_with_route_watch`].
+#[allow(clippy::too_many_arguments)]
+pub async fn run_tun_pipeline_with_app_bypass(
     mut inbound_rx: mpsc::Receiver<Vec<u8>>,
     outbound_tx: mpsc::Sender<Vec<u8>>,
     ctx: EngineContext,
@@ -463,6 +502,7 @@ pub async fn run_tun_pipeline_with_route_watch(
     profile: TunProfile,
     shutdown_rx: watch::Receiver<bool>,
     mut route_rx: Option<watch::Receiver<u64>>,
+    app_bypass: Option<AppBypassHook>,
 ) -> Result<()> {
     let clamped_mtu = mtu.clamp(MIN_MTU, MAX_MTU);
 
@@ -518,6 +558,7 @@ pub async fn run_tun_pipeline_with_route_watch(
     let in_udp_slow_slots = Arc::clone(&udp_slow_slots);
     let in_udp_nat = Arc::clone(&udp_nat);
     let in_udp_lru_seq = Arc::clone(&udp_lru_seq);
+    let in_app_bypass = app_bypass.clone();
     let in_stop_root = internal_stop_rx.clone();
     let emit_quic_icmp_reject = profile.emit_quic_icmp_reject;
     let max_udp_flows = profile.max_udp_flows;
@@ -608,6 +649,7 @@ pub async fn run_tun_pipeline_with_route_watch(
                             &in_events,
                             &mut stun_flows,
                             icmp_reject,
+                            in_app_bypass.as_ref(),
                         ) {
                             continue;
                         }
@@ -691,6 +733,8 @@ pub async fn run_tun_pipeline_with_route_watch(
     let tcp_dns_slots = Arc::clone(&dns_slots);
     let tcp_events = Arc::clone(&events);
     let tcp_stage_tracker = Arc::clone(&observed_stage);
+    let tcp_app_bypass = app_bypass;
+    let tcp_relay_buf_size = profile.tcp_relay_buf_size;
     let tcp_stop_root = internal_stop_rx.clone();
     let mut stop_tcp = internal_stop_rx.clone();
     let tcp_stop_tx = internal_stop_tx.clone();
@@ -706,7 +750,7 @@ pub async fn run_tun_pipeline_with_route_watch(
                 let _ = tcp_stop_tx.send(true);
                 break;
             };
-            let _src = stream.local_addr();
+            let src = stream.local_addr();
             let dst = stream.remote_addr();
 
             // Intercept TCP port 53 DNS fallback (RFC 1035 2-byte length framing) BEFORE
@@ -750,6 +794,7 @@ pub async fn run_tun_pipeline_with_route_watch(
             let rdns = Arc::clone(&tcp_rdns);
             let ev = Arc::clone(&tcp_events);
             let tracker = Arc::clone(&tcp_stage_tracker);
+            let conn_app_bypass = tcp_app_bypass.clone();
             let mut conn_stop = tcp_stop_root.clone();
             let active_tcp_guard = ActiveTcpGuard::enter(&tcp_stats);
 
@@ -761,6 +806,9 @@ pub async fn run_tun_pipeline_with_route_watch(
                     biased;
                     _ = wait_shutdown(&mut conn_stop) => {}
                     _ = async {
+                        let bypass_dpi = conn_app_bypass
+                            .as_ref()
+                            .is_some_and(|hook| hook.should_bypass(src.ip(), src.port(), false));
                         let known_host = rdns.lookup(dst.ip());
                         let upstream_res = match conn_ctx.connect_upstream_addr(dst).await {
                             Ok(remote) => Ok((remote, dst)),
@@ -784,25 +832,39 @@ pub async fn run_tun_pipeline_with_route_watch(
                         };
                         match upstream_res {
                             Ok((remote, effective_dst)) => {
-                                if let Err(e) = conn_ctx
-                                    .relay_stream(TunTcpStream::new(stream), remote, known_host.as_deref(), effective_dst)
+                                if bypass_dpi {
+                                    debug!(%src, %effective_dst, host = ?known_host, "TUN TCP passthrough (app bypassed)");
+                                    if let Err(e) = relay_tcp_passthrough(
+                                        TunTcpStream::new(stream),
+                                        remote,
+                                        &conn_ctx,
+                                        tcp_relay_buf_size,
+                                    )
                                     .await
-                                {
-                                    debug!(%effective_dst, host = ?known_host, error = %e, "TUN TCP relay ended");
-                                }
-                                let current = conn_ctx.preferred_stage() as u8;
-                                let prev = tracker.fetch_max(current, Ordering::Relaxed);
-                                if current > prev {
-                                    let stage = LearnedStrategy::from_u8(current);
-                                    ev.push(
-                                        "info",
-                                        "auto-heal",
-                                        format!(
-                                            "ISP stage promoted to Stage {} ({})",
-                                            stage.stage_number(),
-                                            stage.label()
-                                        ),
-                                    );
+                                    {
+                                        debug!(%effective_dst, host = ?known_host, error = %e, "TUN bypassed TCP relay ended");
+                                    }
+                                } else {
+                                    if let Err(e) = conn_ctx
+                                        .relay_stream(TunTcpStream::new(stream), remote, known_host.as_deref(), effective_dst)
+                                        .await
+                                    {
+                                        debug!(%effective_dst, host = ?known_host, error = %e, "TUN TCP relay ended");
+                                    }
+                                    let current = conn_ctx.preferred_stage() as u8;
+                                    let prev = tracker.fetch_max(current, Ordering::Relaxed);
+                                    if current > prev {
+                                        let stage = LearnedStrategy::from_u8(current);
+                                        ev.push(
+                                            "info",
+                                            "auto-heal",
+                                            format!(
+                                                "ISP stage promoted to Stage {} ({})",
+                                                stage.stage_number(),
+                                                stage.label()
+                                            ),
+                                        );
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -898,6 +960,125 @@ pub async fn run_tun_pipeline_with_route_watch(
         Ok(())
     } else {
         Err(anyhow!("TUN pipeline terminated unexpectedly"))
+    }
+}
+
+struct PassthroughCountingStream {
+    inner: tokio::net::TcpStream,
+    telemetry: Arc<EngineTelemetry>,
+    started: Instant,
+    last_activity_ms: Arc<AtomicU64>,
+}
+
+impl AsyncRead for PassthroughCountingStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &poll {
+            let read_bytes = buf.filled().len().saturating_sub(before);
+            if read_bytes > 0 {
+                this.telemetry
+                    .bytes_rx
+                    .fetch_add(read_bytes as u64, Ordering::Relaxed);
+                let elapsed_ms =
+                    u64::try_from(this.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                this.last_activity_ms.store(elapsed_ms, Ordering::Relaxed);
+            }
+        }
+        poll
+    }
+}
+
+impl AsyncWrite for PassthroughCountingStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &poll {
+            if *n > 0 {
+                this.telemetry
+                    .bytes_tx
+                    .fetch_add(*n as u64, Ordering::Relaxed);
+                let elapsed_ms =
+                    u64::try_from(this.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                this.last_activity_ms.store(elapsed_ms, Ordering::Relaxed);
+            }
+        }
+        poll
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// Straight-through bidirectional TCP relay for app-bypassed flows.
+/// Forwards the initial TLS/HTTP payload untouched without ClientHello inspection or splitting.
+async fn relay_tcp_passthrough(
+    mut client: TunTcpStream,
+    remote: tokio::net::TcpStream,
+    ctx: &EngineContext,
+    buf_size: usize,
+) -> std::io::Result<()> {
+    struct TelemetryConnGuard(Arc<EngineTelemetry>);
+    impl Drop for TelemetryConnGuard {
+        fn drop(&mut self) {
+            self.0.active_connections.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    let _ = remote.set_nodelay(true);
+    ctx.telemetry
+        .active_connections
+        .fetch_add(1, Ordering::Relaxed);
+    ctx.telemetry
+        .total_connections
+        .fetch_add(1, Ordering::Relaxed);
+    let _conn_guard = TelemetryConnGuard(Arc::clone(&ctx.telemetry));
+
+    let started = Instant::now();
+    let last_activity_ms = Arc::new(AtomicU64::new(0));
+    let mut counted_remote = PassthroughCountingStream {
+        inner: remote,
+        telemetry: Arc::clone(&ctx.telemetry),
+        started,
+        last_activity_ms: Arc::clone(&last_activity_ms),
+    };
+
+    let idle_watcher = async {
+        let timeout_ms = u64::try_from(PASSTHROUGH_IDLE_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let now_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let last_ms = last_activity_ms.load(Ordering::Relaxed);
+            if now_ms.saturating_sub(last_ms) >= timeout_ms {
+                break;
+            }
+        }
+    };
+
+    let copy_buf = buf_size.clamp(16 * 1024, 128 * 1024);
+    tokio::select! {
+        biased;
+        res = tokio::io::copy_bidirectional_with_sizes(&mut client, &mut counted_remote, copy_buf, copy_buf) => {
+            res.map(|_| ())
+        }
+        _ = idle_watcher => Ok(()),
     }
 }
 
@@ -1895,5 +2076,267 @@ mod tests {
         ));
         assert_eq!(stats.dropped_packets.load(Ordering::Relaxed), 0);
         assert_eq!(stats.tcp_sessions_dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn app_bypass_hook_bypasses_quic_blocking_for_matching_udp_flows() {
+        let cfg = TunnelConfig {
+            enable_doh: false,
+            block_quic: true,
+            ..Default::default()
+        };
+        let ctx = EngineContext::new(cfg.into_runtime_config()).unwrap();
+        let tun_stats = Arc::new(TunStats::default());
+        let events = Arc::new(EventRing::new());
+
+        let observed = Arc::new(std::sync::Mutex::new(Vec::<(IpAddr, u16, bool)>::new()));
+        let observed_hook = Arc::clone(&observed);
+        let hook = AppBypassHook::new(move |src_ip, src_port, is_udp| {
+            observed_hook
+                .lock()
+                .unwrap()
+                .push((src_ip, src_port, is_udp));
+            is_udp && src_port == 57000
+        });
+
+        let (in_tx, in_rx) = mpsc::channel(64);
+        let (out_tx, mut out_rx) = mpsc::channel(64);
+        let (stop_tx, stop_rx) = watch::channel(false);
+
+        let pipeline = tokio::spawn(run_tun_pipeline_with_app_bypass(
+            in_rx,
+            out_tx,
+            ctx.clone(),
+            Arc::clone(&tun_stats),
+            Arc::clone(&events),
+            1500,
+            TunProfile::DESKTOP,
+            stop_rx,
+            None,
+            Some(hook),
+        ));
+
+        let client_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let public_quic = Ipv4Addr::new(162, 159, 135, 232);
+
+        // Bypassed app source port 57000 -> QUIC UDP/443 must NOT be dropped.
+        in_tx
+            .send(build_ipv4_udp(
+                client_ip,
+                57000,
+                public_quic,
+                443,
+                &[0xc0u8; 1200],
+            ))
+            .await
+            .unwrap();
+        // Non-bypassed app source port 57001 -> QUIC UDP/443 MUST be dropped + ICMP rejected.
+        in_tx
+            .send(build_ipv4_udp(
+                client_ip,
+                57001,
+                public_quic,
+                443,
+                &[0xc0u8; 1200],
+            ))
+            .await
+            .unwrap();
+
+        let icmp_raw = tokio::time::timeout(Duration::from_secs(3), out_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(icmp_raw.len() >= 28);
+        assert_eq!(icmp_raw[0] >> 4, 4);
+        assert_eq!(icmp_raw[9], 1); // IPv4 ICMP
+        assert_eq!(icmp_raw[20], 3); // Destination Unreachable
+        assert_eq!(icmp_raw[21], 3); // Port Unreachable
+        assert_eq!(tun_stats.quic_blocked.load(Ordering::Relaxed), 1);
+        assert_eq!(ctx.telemetry.quic_blocked.load(Ordering::Relaxed), 1);
+
+        let calls = observed.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![
+                (IpAddr::V4(client_ip), 57000, true),
+                (IpAddr::V4(client_ip), 57001, true),
+            ]
+        );
+
+        stop_tx.send(true).unwrap();
+        pipeline.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn app_bypass_hook_bypasses_tcp_dpi_desync_for_matching_tcp_flows() {
+        let cfg = TunnelConfig {
+            enable_doh: false,
+            block_quic: true,
+            ..Default::default()
+        };
+        let ctx = EngineContext::new(cfg.into_runtime_config()).unwrap();
+        let tun_stats = Arc::new(TunStats::default());
+        let events = Arc::new(EventRing::new());
+
+        let observed = Arc::new(std::sync::Mutex::new(Vec::<(IpAddr, u16, bool)>::new()));
+        let observed_hook = Arc::clone(&observed);
+        let hook = AppBypassHook::new(move |src_ip, src_port, is_udp| {
+            observed_hook
+                .lock()
+                .unwrap()
+                .push((src_ip, src_port, is_udp));
+            !is_udp && src_port == 58000
+        });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_port = listener.local_addr().unwrap().port();
+        let client_hello = vdpi_core::tls::build_synthetic_client_hello("bypassed.example.com", 0);
+        let expected_hello_1 = client_hello.clone();
+        let expected_hello_2 = client_hello.clone();
+
+        let server_task = tokio::spawn(async move {
+            for expected in [expected_hello_1, expected_hello_2] {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; expected.len()];
+                sock.read_exact(&mut buf).await.unwrap();
+                assert_eq!(buf, expected);
+                sock.write_all(b"OK").await.unwrap();
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        let (in_tx, in_rx) = mpsc::channel(128);
+        let (out_tx, mut out_rx) = mpsc::channel(128);
+        let (stop_tx, stop_rx) = watch::channel(false);
+
+        let pipeline = tokio::spawn(run_tun_pipeline_with_app_bypass(
+            in_rx,
+            out_tx,
+            ctx.clone(),
+            Arc::clone(&tun_stats),
+            Arc::clone(&events),
+            1500,
+            TunProfile::STANDARD,
+            stop_rx,
+            None,
+            Some(hook),
+        ));
+
+        let client_ip = Ipv4Addr::new(10, 0, 0, 1);
+
+        // Helper performing a raw IPv4 TCP handshake + sending ClientHello + receiving "OK".
+        async fn run_raw_tcp_exchange(
+            in_tx: &mpsc::Sender<Vec<u8>>,
+            out_rx: &mut mpsc::Receiver<Vec<u8>>,
+            client_ip: Ipv4Addr,
+            client_port: u16,
+            server_port: u16,
+            payload: &[u8],
+        ) {
+            let client_isn: u32 = 1000;
+            let mut syn = Vec::new();
+            PacketBuilder::ipv4(client_ip.octets(), Ipv4Addr::LOCALHOST.octets(), 64)
+                .tcp(client_port, server_port, client_isn, 65535)
+                .syn()
+                .write(&mut syn, &[])
+                .unwrap();
+            in_tx.send(syn).await.unwrap();
+
+            let server_isn = loop {
+                let raw = tokio::time::timeout(Duration::from_secs(3), out_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let sliced = SlicedPacket::from_ip(&raw).unwrap();
+                if let Some(TransportSlice::Tcp(tcp)) = sliced.transport {
+                    if tcp.destination_port() == client_port && tcp.syn() && tcp.ack() {
+                        break tcp.sequence_number();
+                    }
+                }
+            };
+
+            let mut ack_and_data = Vec::new();
+            PacketBuilder::ipv4(client_ip.octets(), Ipv4Addr::LOCALHOST.octets(), 64)
+                .tcp(client_port, server_port, client_isn + 1, 65535)
+                .ack(server_isn.wrapping_add(1))
+                .psh()
+                .write(&mut ack_and_data, payload)
+                .unwrap();
+            in_tx.send(ack_and_data).await.unwrap();
+
+            let mut received = Vec::new();
+            let mut server_next_seq = server_isn.wrapping_add(1);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while received.len() < 2 {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let raw = tokio::time::timeout(remaining, out_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let sliced = SlicedPacket::from_ip(&raw).unwrap();
+                if let Some(TransportSlice::Tcp(tcp)) = sliced.transport {
+                    if tcp.destination_port() == client_port && !tcp.payload().is_empty() {
+                        received.extend_from_slice(tcp.payload());
+                        server_next_seq = server_next_seq.wrapping_add(tcp.payload().len() as u32);
+                    }
+                }
+            }
+            assert_eq!(received, b"OK");
+
+            let mut fin = Vec::new();
+            PacketBuilder::ipv4(client_ip.octets(), Ipv4Addr::LOCALHOST.octets(), 64)
+                .tcp(
+                    client_port,
+                    server_port,
+                    client_isn + 1 + payload.len() as u32,
+                    65535,
+                )
+                .ack(server_next_seq)
+                .fin()
+                .write(&mut fin, &[])
+                .unwrap();
+            let _ = in_tx.send(fin).await;
+        }
+
+        // 1. Bypassed port 58000 -> goes straight through passthrough; tls_handshakes stays 0.
+        run_raw_tcp_exchange(
+            &in_tx,
+            &mut out_rx,
+            client_ip,
+            58000,
+            server_port,
+            &client_hello,
+        )
+        .await;
+        assert_eq!(ctx.telemetry.tls_handshakes.load(Ordering::Relaxed), 0);
+        assert!(ctx.telemetry.bytes_tx.load(Ordering::Relaxed) >= client_hello.len() as u64);
+        assert!(ctx.telemetry.bytes_rx.load(Ordering::Relaxed) >= 2);
+
+        // 2. Non-bypassed port 58001 -> enters normal EngineContext::relay_stream; tls_handshakes becomes 1.
+        run_raw_tcp_exchange(
+            &in_tx,
+            &mut out_rx,
+            client_ip,
+            58001,
+            server_port,
+            &client_hello,
+        )
+        .await;
+        assert_eq!(ctx.telemetry.tls_handshakes.load(Ordering::Relaxed), 1);
+
+        server_task.await.unwrap();
+
+        let calls = observed.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![
+                (IpAddr::V4(client_ip), 58000, false),
+                (IpAddr::V4(client_ip), 58001, false),
+            ]
+        );
+
+        stop_tx.send(true).unwrap();
+        pipeline.await.unwrap().unwrap();
+        assert_eq!(ctx.telemetry.active_connections.load(Ordering::Relaxed), 0);
     }
 }

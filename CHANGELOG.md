@@ -6,6 +6,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-11-26
+
+### Added
+- **Live dashboard attach for running background service**:
+  - Added Control Center `[1] Open live dashboard` (hotkey `l`) to attach in real time to the running background TUN or Proxy service without restarting it.
+  - Added `vdpi dashboard` (alias `dash`) CLI command for direct live dashboard attach.
+  - Displays live RX/TX throughput sparkline, active/total connections, DoH queries, TLS/auto-heal telemetry, ISP stage, process RSS, inline diagnostics (`d`), and automatic reconnect on service restart.
+- **Desktop Per-App Split Tunneling**:
+  - Added cross-platform per-app split tunneling across Windows (`GetExtendedTcpTable`/`GetExtendedUdpTable`), macOS (`lsof` + `.app` bundle discovery), and Linux (pure `/proc` + `.desktop` discovery) in both TUN and Proxy modes.
+  - Added interactive TUI Split-Tunneling App Picker (`s` in Control Center or `vdpi split` / `vdpi apps`) with live instant fuzzy search (`/`), All / Include / Exclude mode switcher (`Tab`), running-app indicators, and custom executable entry (`a`).
+  - Added persistent `split_tunnel_mode` and `split_tunnel_apps` in `config.toml`, CLI flags (`--split-mode`, `--split-app`), and `vdpi split` subcommands.
+
 ## [0.5.4] - 2026-11-25
 
 ### Added
@@ -145,7 +157,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Configured `CODE_SIGN_ENTITLEMENTS` in iOS `project.yml` so XcodeGen preserves `.entitlements` files.
 - Fixed release workflow entitlement verification and restricted automatic release runs to version tags and manual dispatch.
 
-[Unreleased]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.4...HEAD
+[Unreleased]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.5...HEAD
+[0.5.5]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.1...v0.5.2

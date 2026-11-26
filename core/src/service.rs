@@ -523,6 +523,10 @@ pub struct LiveEngineStatus {
     pub quic_blocked: Option<u64>,
     pub dns_queries: Option<u64>,
     pub rss_kb: Option<u64>,
+    pub bytes_rx: Option<u64>,
+    pub bytes_tx: Option<u64>,
+    pub tls_handshakes: Option<u64>,
+    pub auto_heal_escalations: Option<u64>,
 }
 
 /// Combined local snapshot for the interactive Control Center.
@@ -639,6 +643,71 @@ pub fn load_configured_dns(fallback: &str) -> String {
         return dns;
     }
     fallback.to_string()
+}
+
+fn extract_split_tunnel_from_file_config(
+    file_cfg: &config_file::FileConfig,
+) -> Option<vdpi_core::config::SplitTunnelConfig> {
+    if file_cfg.split_tunnel_mode.is_none() && file_cfg.split_tunnel_apps.is_none() {
+        return None;
+    }
+    Some(vdpi_core::config::SplitTunnelConfig {
+        mode: file_cfg.split_tunnel_mode.unwrap_or_default(),
+        apps: file_cfg
+            .split_tunnel_apps
+            .as_deref()
+            .map(config_file::sanitize_split_tunnel_apps)
+            .unwrap_or_default(),
+    })
+}
+
+/// Loads the currently configured per-application split-tunnel settings from
+/// the active `config.toml` (system config when a system service is installed,
+/// otherwise user config with fallback to system config and
+/// [`vdpi_core::config::SplitTunnelConfig::default`]).
+pub fn load_configured_split_tunnel() -> vdpi_core::config::SplitTunnelConfig {
+    #[cfg(target_os = "macos")]
+    if launch_daemon_plist_path().exists() {
+        let sys_path = config_file::system_config_path();
+        return config_file::load_file_config(Some(&sys_path), true)
+            .ok()
+            .and_then(|(_, file_cfg)| extract_split_tunnel_from_file_config(&file_cfg))
+            .unwrap_or_default();
+    }
+
+    #[cfg(target_os = "linux")]
+    if systemd_system_unit_path().exists() {
+        let sys_path = config_file::system_config_path();
+        return config_file::load_file_config(Some(&sys_path), true)
+            .ok()
+            .and_then(|(_, file_cfg)| extract_split_tunnel_from_file_config(&file_cfg))
+            .unwrap_or_default();
+    }
+
+    #[cfg(target_os = "windows")]
+    if crate::platform::windows_service::query_windows_service_status().installed {
+        let sys_path = config_file::system_config_path();
+        return config_file::load_file_config(Some(&sys_path), true)
+            .ok()
+            .and_then(|(_, file_cfg)| extract_split_tunnel_from_file_config(&file_cfg))
+            .unwrap_or_default();
+    }
+
+    let user_path = resolved_user_config_path();
+    if let Some(split_tunnel) = config_file::load_file_config(Some(&user_path), false)
+        .ok()
+        .and_then(|(_, file_cfg)| extract_split_tunnel_from_file_config(&file_cfg))
+    {
+        return split_tunnel;
+    }
+    let sys_path = config_file::system_config_path();
+    if let Some(split_tunnel) = config_file::load_file_config(Some(&sys_path), true)
+        .ok()
+        .and_then(|(_, file_cfg)| extract_split_tunnel_from_file_config(&file_cfg))
+    {
+        return split_tunnel;
+    }
+    vdpi_core::config::SplitTunnelConfig::default()
 }
 
 fn format_vpn_scope_conflict(scope: &VpnScope) -> Option<String> {
@@ -803,6 +872,14 @@ pub fn parse_health_json(
         quic_blocked: obj.get("quic_blocked").and_then(serde_json::Value::as_u64),
         dns_queries: obj.get("dns_queries").and_then(serde_json::Value::as_u64),
         rss_kb: obj.get("rss_kb").and_then(serde_json::Value::as_u64),
+        bytes_rx: obj.get("bytes_rx").and_then(serde_json::Value::as_u64),
+        bytes_tx: obj.get("bytes_tx").and_then(serde_json::Value::as_u64),
+        tls_handshakes: obj
+            .get("tls_handshakes")
+            .and_then(serde_json::Value::as_u64),
+        auto_heal_escalations: obj
+            .get("auto_heal_escalations")
+            .and_then(serde_json::Value::as_u64),
     })
 }
 
@@ -935,6 +1012,16 @@ fn probe_local_health(
     let (_, body) = text.split_once("\r\n\r\n")?;
 
     parse_health_json(body, addr, port, socks_port)
+}
+
+/// Performs a fast, synchronous, local-only `/vdpi-health` probe against the given
+/// loopback bind address and port, returning parsed [`LiveEngineStatus`] telemetry.
+///
+/// A `socks_port` of `0` is treated as disabled (`None`).
+pub fn probe_live_engine(bind: IpAddr, port: u16, socks_port: u16) -> Option<LiveEngineStatus> {
+    let socks_port = (socks_port != 0).then_some(socks_port);
+    let deadline = Instant::now() + CONTROL_CENTER_PROBE_BUDGET;
+    probe_local_health(bind, port, socks_port, deadline)
 }
 
 /// Performs a fast, synchronous, local-only status probe of installation, background
@@ -1429,6 +1516,7 @@ fn xml_escape(s: &str) -> String {
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
 fn file_config_from_runtime(cfg: &RuntimeConfig) -> FileConfig {
+    let split_tunnel_apps = config_file::sanitize_split_tunnel_apps(&cfg.split_tunnel.apps);
     FileConfig {
         schema_version: Some(CONFIG_SCHEMA_VERSION),
         engine: Some(cfg.engine),
@@ -1438,6 +1526,11 @@ fn file_config_from_runtime(cfg: &RuntimeConfig) -> FileConfig {
         dns_addr: Some(cfg.dns_addr.clone()),
         bypass_domains: (!cfg.bypass_domains.is_empty()).then(|| cfg.bypass_domains.clone()),
         include_domains: (!cfg.patterns.is_empty()).then(|| cfg.patterns.clone()),
+        split_tunnel_mode: cfg
+            .split_tunnel
+            .is_active()
+            .then_some(cfg.split_tunnel.mode),
+        split_tunnel_apps: (!split_tunnel_apps.is_empty()).then_some(split_tunnel_apps),
         vpn_coexistence: Some(cfg.vpn_coexistence),
         tun_ipv6: Some(cfg.tun_ipv6),
         chunk_size: Some(cfg.chunk_size),
@@ -1476,6 +1569,12 @@ fn apply_file_config_to_runtime(base: &RuntimeConfig, file_cfg: &FileConfig) -> 
     }
     if let Some(ref include) = file_cfg.include_domains {
         out.patterns.clone_from(include);
+    }
+    if let Some(split_mode) = file_cfg.split_tunnel_mode {
+        out.split_tunnel.mode = split_mode;
+    }
+    if let Some(ref split_apps) = file_cfg.split_tunnel_apps {
+        out.split_tunnel.apps = config_file::sanitize_split_tunnel_apps(split_apps);
     }
     if let Some(vpn_coexistence) = file_cfg.vpn_coexistence {
         out.vpn_coexistence = vpn_coexistence;
@@ -3625,6 +3724,230 @@ fn set_service_dns_impl(dns_addr: &str, cfg: &RuntimeConfig, verbose: bool) -> R
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
+fn save_split_tunnel_to_config_path(
+    config_path: &Path,
+    service_mode: bool,
+    cfg: &vdpi_core::config::SplitTunnelConfig,
+) -> Result<()> {
+    let (_, mut file_cfg) =
+        config_file::load_file_config_or_default(Some(config_path), service_mode)?;
+    file_cfg.schema_version = Some(CONFIG_SCHEMA_VERSION);
+    file_cfg.split_tunnel_mode = Some(cfg.mode);
+    file_cfg.split_tunnel_apps = Some(cfg.apps.clone());
+    config_file::save_file_config_atomic(config_path, &file_cfg)
+}
+
+/// Validates and saves per-application split-tunnel settings into the active
+/// `config.toml` (preserving all other keys) and restarts the background `vdpi`
+/// service when it is currently running.
+pub fn set_service_split_tunnel(
+    cfg: &vdpi_core::config::SplitTunnelConfig,
+) -> anyhow::Result<String> {
+    let validated_apps = config_file::validate_split_tunnel_apps(&cfg.apps)?;
+    let normalized = vdpi_core::config::SplitTunnelConfig {
+        mode: cfg.mode,
+        apps: validated_apps,
+    };
+    let summary = normalized.summary_label();
+
+    #[cfg(target_os = "windows")]
+    {
+        use crate::platform::windows::{broadcast_environment_change, notify_wininet_refresh};
+        use crate::platform::windows_service::{
+            is_elevated, query_windows_service_status, start_windows_service,
+            stop_windows_service_if_running,
+        };
+
+        let svc = query_windows_service_status();
+        let use_system = svc.installed || is_elevated();
+        let config_path = if use_system {
+            config_file::system_config_path()
+        } else {
+            config_file::user_config_path()
+        };
+
+        if svc.installed && !is_elevated() {
+            bail!(
+                "updating split tunneling for the installed Windows service requires Administrator privileges (config: {})",
+                config_path.display()
+            );
+        }
+
+        save_split_tunnel_to_config_path(&config_path, use_system, &normalized)?;
+
+        let was_running = svc.installed && matches!(svc.state, "RUNNING" | "START_PENDING");
+        if was_running {
+            let _ = stop_windows_service_if_running()?;
+            if !start_windows_service()? {
+                bail!("failed to restart vdpi Windows service after updating split tunneling");
+            }
+            notify_wininet_refresh();
+            broadcast_environment_change();
+            return Ok(format!(
+                "Split tunneling saved: {summary} (service restarted)"
+            ));
+        }
+
+        Ok(format!("Split tunneling saved: {summary}"))
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let daemon_exists = launch_daemon_plist_path().exists();
+        let agent_exists = launch_agent_plist_path().ok().is_some_and(|p| p.exists());
+        let was_running = detect_service_state() == ServiceState::Running;
+
+        let config_path = if daemon_exists {
+            config_file::system_config_path()
+        } else {
+            resolved_user_config_path()
+        };
+
+        if daemon_exists && !is_unix_root() {
+            bail!(
+                "updating split tunneling for the macOS background service requires root privileges (config: {})",
+                config_path.display()
+            );
+        }
+
+        save_split_tunnel_to_config_path(&config_path, daemon_exists, &normalized)?;
+        if !daemon_exists {
+            if let Some(parent) = config_path.parent() {
+                chown_to_sudo_user(parent);
+            }
+            chown_to_sudo_user(&config_path);
+        }
+
+        if was_running {
+            if daemon_exists {
+                let plist_path = launch_daemon_plist_path();
+                let service_target = format!("system/{LAUNCH_DAEMON_LABEL}");
+                let plist_str = plist_path.display().to_string();
+                if launchctl_service_loaded(&service_target) {
+                    let _ = Command::new("/bin/launchctl")
+                        .args(["bootout", &service_target])
+                        .stdin(Stdio::null())
+                        .output();
+                    let _ = Command::new("/bin/launchctl")
+                        .args(["bootout", "system", &plist_str])
+                        .stdin(Stdio::null())
+                        .output();
+                    wait_launchctl_unloaded(&service_target);
+                }
+                start_macos_launch_daemon(&plist_path)?;
+                return Ok(format!(
+                    "Split tunneling saved: {summary} (service restarted)"
+                ));
+            } else if agent_exists {
+                let plist_path = launch_agent_plist_path()?;
+                let uid = current_uid();
+                let domain = format!("gui/{uid}");
+                let service_target = format!("{domain}/{LAUNCH_AGENT_LABEL}");
+                let plist_str = plist_path.display().to_string();
+                if launchctl_service_loaded(&service_target) {
+                    let _ = Command::new("/bin/launchctl")
+                        .args(["bootout", &service_target])
+                        .stdin(Stdio::null())
+                        .output();
+                    let _ = Command::new("/bin/launchctl")
+                        .args(["bootout", &domain, &plist_str])
+                        .stdin(Stdio::null())
+                        .output();
+                    wait_launchctl_unloaded(&service_target);
+                }
+                let boot = Command::new("/bin/launchctl")
+                    .args(["bootstrap", &domain, &plist_str])
+                    .stdin(Stdio::null())
+                    .output()
+                    .context("failed to execute '/bin/launchctl bootstrap'")?;
+                if !boot.status.success() && !launchctl_service_loaded(&service_target) {
+                    let detail = String::from_utf8_lossy(&boot.stderr).trim().to_string();
+                    bail!("failed to restart LaunchAgent '{LAUNCH_AGENT_LABEL}': {detail}");
+                }
+                let _ = Command::new("/bin/launchctl")
+                    .args(["kickstart", "-k", &service_target])
+                    .stdin(Stdio::null())
+                    .output();
+                return Ok(format!(
+                    "Split tunneling saved: {summary} (service restarted)"
+                ));
+            }
+        }
+
+        Ok(format!("Split tunneling saved: {summary}"))
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let system_exists = systemd_system_unit_path().exists();
+        let user_exists = systemd_user_unit_path().ok().is_some_and(|p| p.exists());
+        let was_running = detect_service_state() == ServiceState::Running;
+
+        let config_path = if system_exists {
+            config_file::system_config_path()
+        } else {
+            resolved_user_config_path()
+        };
+
+        if system_exists && !is_unix_root() {
+            bail!(
+                "updating split tunneling for the Linux background service requires root privileges (config: {})",
+                config_path.display()
+            );
+        }
+
+        save_split_tunnel_to_config_path(&config_path, system_exists, &normalized)?;
+        if !system_exists {
+            if let Some(parent) = config_path.parent() {
+                chown_to_sudo_user(parent);
+            }
+            chown_to_sudo_user(&config_path);
+        }
+
+        if was_running {
+            if system_exists {
+                let out = Command::new("systemctl")
+                    .args(["restart", SYSTEMD_UNIT_NAME])
+                    .stdin(Stdio::null())
+                    .output()
+                    .context("failed to execute 'systemctl restart'")?;
+                if !out.status.success() {
+                    let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    bail!("failed to restart systemd system unit '{SYSTEMD_UNIT_NAME}': {detail}");
+                }
+                return Ok(format!(
+                    "Split tunneling saved: {summary} (service restarted)"
+                ));
+            } else if user_exists {
+                let out = linux_user_systemctl_command()
+                    .args(["restart", SYSTEMD_UNIT_NAME])
+                    .stdin(Stdio::null())
+                    .output()
+                    .context("failed to execute 'systemctl --user restart'")?;
+                if !out.status.success() {
+                    let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    bail!("failed to restart systemd user unit '{SYSTEMD_UNIT_NAME}': {detail}");
+                }
+                return Ok(format!(
+                    "Split tunneling saved: {summary} (service restarted)"
+                ));
+            }
+        }
+
+        Ok(format!("Split tunneling saved: {summary}"))
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (normalized, summary);
+        bail!(
+            "split tunneling configuration is not supported on {}",
+            platform_name()
+        );
+    }
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn cleanup_unix_root_dir(root: &Path, user_cfg: &Path, purge: bool) {
     if !root.exists() {
@@ -5403,6 +5726,10 @@ mod tests {
                 quic_blocked: None,
                 dns_queries: None,
                 rss_kb: None,
+                bytes_rx: None,
+                bytes_tx: None,
+                tls_handshakes: None,
+                auto_heal_escalations: None,
             }
         );
     }
@@ -5436,6 +5763,10 @@ mod tests {
                 quic_blocked: None,
                 dns_queries: None,
                 rss_kb: None,
+                bytes_rx: None,
+                bytes_tx: None,
+                tls_handshakes: None,
+                auto_heal_escalations: None,
             }
         );
 
@@ -5495,6 +5826,10 @@ mod tests {
                 quic_blocked: Some(55),
                 dns_queries: Some(310),
                 rss_kb: Some(16384),
+                bytes_rx: None,
+                bytes_tx: None,
+                tls_handshakes: None,
+                auto_heal_escalations: None,
             }
         );
         assert_eq!(
@@ -5529,6 +5864,46 @@ mod tests {
         assert_eq!(parsed.quic_blocked, Some(3));
         assert_eq!(parsed.dns_queries, Some(44));
         assert_eq!(parsed.rss_kb, Some(9216));
+        assert_eq!(parsed.bytes_rx, None);
+        assert_eq!(parsed.bytes_tx, None);
+        assert_eq!(parsed.tls_handshakes, None);
+        assert_eq!(parsed.auto_heal_escalations, None);
+    }
+
+    #[test]
+    fn parses_live_traffic_and_auto_heal_telemetry_from_health_json() {
+        let body = r#"{
+            "status": "ok",
+            "service": "vdpi",
+            "version": "0.5.0",
+            "engine": "proxy",
+            "bytes_rx": 1048576,
+            "bytes_tx": 262144,
+            "tls_handshakes": 28,
+            "auto_heal_escalations": 2
+        }"#;
+        let addr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let parsed = parse_health_json(body, addr, 8080, Some(1080))
+            .expect("health payload with traffic and auto-heal telemetry should parse");
+        assert_eq!(parsed.bytes_rx, Some(1_048_576));
+        assert_eq!(parsed.bytes_tx, Some(262_144));
+        assert_eq!(parsed.tls_handshakes, Some(28));
+        assert_eq!(parsed.auto_heal_escalations, Some(2));
+
+        let zeros = r#"{
+            "status": "ok",
+            "service": "vdpi",
+            "bytes_rx": 0,
+            "bytes_tx": 0,
+            "tls_handshakes": 0,
+            "auto_heal_escalations": 0
+        }"#;
+        let parsed_zeros = parse_health_json(zeros, addr, 8080, None)
+            .expect("health payload with zeroed telemetry should parse");
+        assert_eq!(parsed_zeros.bytes_rx, Some(0));
+        assert_eq!(parsed_zeros.bytes_tx, Some(0));
+        assert_eq!(parsed_zeros.tls_handshakes, Some(0));
+        assert_eq!(parsed_zeros.auto_heal_escalations, Some(0));
     }
 
     #[test]
@@ -5846,6 +6221,57 @@ mod tests {
     }
 
     #[test]
+    fn probe_live_engine_fetches_health_and_maps_socks_port() {
+        use std::net::{Shutdown, TcpListener};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let port = listener.local_addr().expect("listener addr").port();
+
+        let body = r#"{"status":"ok","service":"vdpi","version":"0.5.0","engine":"proxy","bytes_rx":4096,"bytes_tx":1024,"tls_handshakes":11,"auto_heal_escalations":1}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}"
+        );
+
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept probe connection");
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut req_buf = [0u8; 512];
+                let _ = stream.read(&mut req_buf);
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write HTTP response");
+                let _ = stream.flush();
+                let _ = stream.shutdown(Shutdown::Write);
+            }
+        });
+
+        let with_socks = probe_live_engine(IpAddr::V4(Ipv4Addr::LOCALHOST), port, 1080)
+            .expect("probe_live_engine with socks_port should succeed");
+        assert_eq!(with_socks.socks_port, Some(1080));
+        assert_eq!(with_socks.bytes_rx, Some(4096));
+        assert_eq!(with_socks.bytes_tx, Some(1024));
+        assert_eq!(with_socks.tls_handshakes, Some(11));
+        assert_eq!(with_socks.auto_heal_escalations, Some(1));
+
+        let without_socks = probe_live_engine(IpAddr::V4(Ipv4Addr::LOCALHOST), port, 0)
+            .expect("probe_live_engine with socks_port=0 should succeed");
+        assert_eq!(without_socks.socks_port, None);
+        assert_eq!(without_socks.bytes_rx, Some(4096));
+
+        assert_eq!(
+            probe_live_engine(IpAddr::V4(Ipv4Addr::LOCALHOST), 0, 1080),
+            None
+        );
+        assert_eq!(
+            probe_live_engine(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), port, 1080),
+            None
+        );
+
+        server.join().expect("server thread should finish cleanly");
+    }
+
+    #[test]
     fn apply_file_config_to_runtime_enforces_invariants_unconditionally() {
         let base = CliArgs::parse_from_iter(["vdpi"])
             .unwrap()
@@ -5936,5 +6362,86 @@ mod tests {
             parse_nonzero_sudo_uid(Some(OsStr::new(" 1000 "))),
             Some(1000)
         );
+    }
+
+    #[test]
+    fn file_config_roundtrip_preserves_split_tunnel_settings() {
+        let mut base = CliArgs::parse_from_iter(["vdpi"])
+            .unwrap()
+            .into_runtime_config();
+        let default_fc = file_config_from_runtime(&base);
+        assert_eq!(default_fc.split_tunnel_mode, None);
+        assert_eq!(default_fc.split_tunnel_apps, None);
+
+        base.split_tunnel = vdpi_core::config::SplitTunnelConfig {
+            mode: vdpi_core::config::SplitTunnelMode::Include,
+            apps: vec!["Discord.exe".to_string(), "chrome".to_string()],
+        };
+        let fc = file_config_from_runtime(&base);
+        assert_eq!(
+            fc.split_tunnel_mode,
+            Some(vdpi_core::config::SplitTunnelMode::Include)
+        );
+        assert_eq!(
+            fc.split_tunnel_apps,
+            Some(vec!["Discord.exe".to_string(), "chrome".to_string()])
+        );
+
+        let fresh = CliArgs::parse_from_iter(["vdpi"])
+            .unwrap()
+            .into_runtime_config();
+        let applied = apply_file_config_to_runtime(&fresh, &fc);
+        assert_eq!(applied.split_tunnel, base.split_tunnel);
+    }
+
+    #[test]
+    fn save_split_tunnel_preserves_existing_keys_and_extracts_back() {
+        let unique = format!(
+            "vdpi-split-tunnel-test-{}-{}",
+            std::process::id(),
+            unix_now_secs()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let cfg_path = root.join("config.toml");
+
+        let initial = FileConfig {
+            schema_version: Some(CONFIG_SCHEMA_VERSION),
+            engine: Some(EngineMode::Tun),
+            dns_addr: Some("94.140.14.14".to_string()),
+            bypass_domains: Some(vec!["local.test".to_string()]),
+            port: Some(9090),
+            ..Default::default()
+        };
+        config_file::save_file_config_atomic(&cfg_path, &initial).expect("write initial config");
+
+        let target = vdpi_core::config::SplitTunnelConfig {
+            mode: vdpi_core::config::SplitTunnelMode::Exclude,
+            apps: vec!["steam".to_string(), "discord".to_string()],
+        };
+        save_split_tunnel_to_config_path(&cfg_path, false, &target)
+            .expect("save split tunnel config");
+
+        let (_, reloaded) =
+            config_file::load_file_config(Some(&cfg_path), false).expect("reload config");
+        assert_eq!(reloaded.engine, Some(EngineMode::Tun));
+        assert_eq!(reloaded.dns_addr.as_deref(), Some("94.140.14.14"));
+        assert_eq!(
+            reloaded.bypass_domains,
+            Some(vec!["local.test".to_string()])
+        );
+        assert_eq!(reloaded.port, Some(9090));
+        assert_eq!(
+            extract_split_tunnel_from_file_config(&reloaded),
+            Some(target)
+        );
+
+        let err = set_service_split_tunnel(&vdpi_core::config::SplitTunnelConfig {
+            mode: vdpi_core::config::SplitTunnelMode::Include,
+            apps: vec!["bad\napp".to_string()],
+        })
+        .expect_err("control characters in app list must fail validation");
+        assert!(err.to_string().contains("control characters"));
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -7,7 +7,10 @@ use tokio::sync::watch;
 use tracing::warn;
 use tracing::{debug, info};
 use vdpi::bypass::BypassPolicy;
-use vdpi::config::{CliArgs, Command, ConfigCommand, EngineMode, RuntimeConfig};
+use vdpi::config::{
+    CliArgs, Command, ConfigCommand, EngineMode, RuntimeConfig, SplitCommand, SplitTunnelConfig,
+    SplitTunnelMode,
+};
 use vdpi::config_file::{
     get_config_key, load_file_config, load_file_config_or_default, render_config_toml,
     save_file_config_atomic, set_config_key, system_config_path, unset_config_key,
@@ -110,6 +113,7 @@ fn main() -> Result<()> {
         let mut cli_rt: Option<tokio::runtime::Runtime> = None;
         let mut session_engine_override: Option<EngineMode> = None;
         let mut session_dns_override: Option<String> = None;
+        let mut session_split_override: Option<SplitTunnelConfig> = None;
         loop {
             let probe_status =
                 |runtime_cfg: &RuntimeConfig, override_engine: Option<EngineMode>| {
@@ -128,12 +132,16 @@ fn main() -> Result<()> {
             let configured_dns = session_dns_override
                 .clone()
                 .unwrap_or_else(|| vdpi::service::load_configured_dns(&cfg.dns_addr));
+            let configured_split = session_split_override
+                .clone()
+                .unwrap_or_else(vdpi::service::load_configured_split_tunnel);
             let latest_status = RefCell::new(initial_status.clone());
-            let choice = launcher::choose(
+            let choice = launcher::choose_with_options(
                 explicit_launcher,
                 &initial_status,
                 notice.as_deref(),
                 &configured_dns,
+                &configured_split,
                 || {
                     let refreshed = probe_status(&cfg, session_engine_override);
                     *latest_status.borrow_mut() = refreshed.clone();
@@ -302,6 +310,70 @@ fn main() -> Result<()> {
                     explicit_launcher = true;
                     continue;
                 }
+                launcher::Choice::SplitTunnel => {
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                    {
+                        match vdpi::split_tunnel::tui::run_split_tunnel_picker(configured_split) {
+                            Ok(Some(new_cfg)) => {
+                                match vdpi::service::set_service_split_tunnel(&new_cfg) {
+                                    Ok(msg) => {
+                                        cfg.split_tunnel = new_cfg.clone();
+                                        session_split_override = Some(new_cfg);
+                                        notice = Some(sanitize_notice(&msg));
+                                    }
+                                    Err(err) => {
+                                        notice = Some(sanitize_notice(&format!(
+                                            "Split tunnel save failed: {err:#}"
+                                        )));
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                notice = None;
+                            }
+                            Err(err) => {
+                                notice = Some(sanitize_notice(&format!(
+                                    "Split tunnel picker failed: {err:#}"
+                                )));
+                            }
+                        }
+                    }
+                    #[cfg(any(target_os = "android", target_os = "ios"))]
+                    {
+                        notice = Some(
+                            "Split tunnel picker is not supported on this platform.".to_string(),
+                        );
+                    }
+                    explicit_launcher = true;
+                    continue;
+                }
+                launcher::Choice::Dashboard => {
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                    {
+                        let result = get_or_init_cli_runtime(&mut cli_rt).and_then(|rt| {
+                            rt.block_on(run_attached_dashboard_for_status(&status, &cfg))
+                        });
+                        match result {
+                            Ok(true) => {
+                                notice = None;
+                            }
+                            Ok(false) => {
+                                notice = Some("No running vdpi service detected.".to_string());
+                            }
+                            Err(err) => {
+                                notice =
+                                    Some(sanitize_notice(&format!("Dashboard error: {err:#}")));
+                            }
+                        }
+                    }
+                    #[cfg(any(target_os = "android", target_os = "ios"))]
+                    {
+                        notice =
+                            Some("Live dashboard is not supported on this platform.".to_string());
+                    }
+                    explicit_launcher = true;
+                    continue;
+                }
                 launcher::Choice::Doctor => {
                     let result = get_or_init_cli_runtime(&mut cli_rt)
                         .and_then(|rt| rt.block_on(run_doctor(cfg.clone())));
@@ -375,6 +447,8 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Some(Command::Dashboard) => handle_dashboard_command(&cfg),
+        Some(Command::Split { action }) => handle_split_command(action),
         Some(Command::Status) | Some(Command::Doctor) | Some(Command::Update { .. }) => {
             init_tracing(&cfg);
             let rt = build_cli_runtime()?;
@@ -518,6 +592,8 @@ fn runtime_to_file_config(cfg: &RuntimeConfig) -> FileConfig {
         dns_addr: Some(cfg.dns_addr.clone()),
         bypass_domains: Some(cfg.bypass_domains.clone()),
         include_domains: Some(cfg.patterns.clone()),
+        split_tunnel_mode: Some(cfg.split_tunnel.mode),
+        split_tunnel_apps: Some(cfg.split_tunnel.apps.clone()),
         vpn_coexistence: Some(cfg.vpn_coexistence),
         tun_ipv6: Some(cfg.tun_ipv6),
         chunk_size: Some(cfg.chunk_size),
@@ -562,6 +638,8 @@ fn handle_config_command(
                     "timeout_ms": u64::try_from(cfg.connect_timeout.as_millis()).unwrap_or(u64::MAX),
                     "bypass_domains": cfg.bypass_domains,
                     "include_domains": cfg.patterns,
+                    "split_tunnel_mode": cfg.split_tunnel.mode.as_str(),
+                    "split_tunnel_apps": cfg.split_tunnel.apps,
                     "system_proxy": cfg.system_proxy,
                     "socks_system_proxy": cfg.socks_system_proxy,
                     "env_proxy": cfg.env_proxy,
@@ -652,6 +730,351 @@ fn handle_config_command(
             };
             save_file_config_atomic(&target, &fresh)?;
             println!("Reset configuration to defaults: {}", target.display());
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn parse_live_desync_mode(
+    raw: Option<&str>,
+    fallback: vdpi::config::DesyncMode,
+) -> vdpi::config::DesyncMode {
+    use vdpi::config::DesyncMode;
+    let Some(value) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return fallback;
+    };
+    if value.eq_ignore_ascii_case("combo") {
+        DesyncMode::Combo
+    } else if value.eq_ignore_ascii_case("tls-record")
+        || value.eq_ignore_ascii_case("tlsrec")
+        || value.eq_ignore_ascii_case("tls_record")
+    {
+        DesyncMode::TlsRecord
+    } else if value.eq_ignore_ascii_case("fragment") || value.eq_ignore_ascii_case("chunk") {
+        DesyncMode::Fragment
+    } else if value.eq_ignore_ascii_case("split") {
+        DesyncMode::Split
+    } else {
+        fallback
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn dashboard_engine_from_live(
+    live: &vdpi::service::LiveEngineStatus,
+    system_proxy_fallback: bool,
+) -> tui_dashboard::DashboardEngine {
+    match live.engine {
+        EngineMode::Tun => tui_dashboard::DashboardEngine::Tun {
+            interface: live
+                .tun_interface
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "vdpi0".to_string()),
+            physical_nic: live.physical_nic.clone(),
+            vpn_conflict: live.vpn_conflict.clone(),
+        },
+        EngineMode::Proxy => tui_dashboard::DashboardEngine::Proxy {
+            primary_addr: std::net::SocketAddr::new(live.addr, live.port),
+            socks_addr: live
+                .socks_port
+                .filter(|&p| p != 0)
+                .map(|p| std::net::SocketAddr::new(live.addr, p)),
+            system_proxy: system_proxy_fallback,
+        },
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn telemetry_snapshot_from_live(
+    live: &vdpi::service::LiveEngineStatus,
+) -> vdpi::desync::EngineTelemetrySnapshot {
+    vdpi::desync::EngineTelemetrySnapshot {
+        active_connections: live.active_connections.unwrap_or(0),
+        total_connections: live.total_connections.unwrap_or(0),
+        bytes_tx: live.bytes_tx.unwrap_or(0),
+        bytes_rx: live.bytes_rx.unwrap_or(0),
+        tls_handshakes: live.tls_handshakes.unwrap_or(0),
+        auto_heal_escalations: live.auto_heal_escalations.unwrap_or(0),
+        learned_hosts: live.learned_hosts.unwrap_or(0),
+        udp_flows_active: live.udp_flows_active.unwrap_or(0),
+        quic_blocked: live.quic_blocked.unwrap_or(0),
+        dns_queries: live.dns_queries.unwrap_or(0),
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn dashboard_info_from_live(
+    live: &vdpi::service::LiveEngineStatus,
+    fallback_cfg: &RuntimeConfig,
+) -> tui_dashboard::DashboardInfo {
+    tui_dashboard::DashboardInfo {
+        engine: dashboard_engine_from_live(live, fallback_cfg.system_proxy),
+        mode: parse_live_desync_mode(live.mode.as_deref(), fallback_cfg.mode),
+        enable_doh: live.doh.unwrap_or(fallback_cfg.enable_doh),
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn attached_telemetry_from_live(
+    live: &vdpi::service::LiveEngineStatus,
+    fallback_cfg: &RuntimeConfig,
+) -> tui_dashboard::AttachedTelemetry {
+    tui_dashboard::AttachedTelemetry {
+        snap: telemetry_snapshot_from_live(live),
+        engine: dashboard_engine_from_live(live, fallback_cfg.system_proxy),
+        mode: parse_live_desync_mode(live.mode.as_deref(), fallback_cfg.mode),
+        doh: live.doh.unwrap_or(fallback_cfg.enable_doh),
+        block_quic: live.block_quic.unwrap_or(fallback_cfg.block_quic),
+        rss_kb: live.rss_kb,
+        isp_stage: live.isp_stage.clone(),
+        version: live.version.clone(),
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn probe_live_engine_for_dashboard(cfg: &RuntimeConfig) -> Option<vdpi::service::LiveEngineStatus> {
+    vdpi::service::probe_control_center_status(cfg)
+        .live_engine
+        .or_else(|| {
+            vdpi::service::probe_live_engine(cfg.addr, cfg.port, cfg.socks_port.unwrap_or(0))
+        })
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+async fn wait_for_attached_shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, Signal, SignalKind};
+
+        async fn wait_signal(sig: &mut Option<Signal>) {
+            match sig.as_mut() {
+                Some(s) => {
+                    let _ = s.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        }
+
+        let mut sigterm = signal(SignalKind::terminate()).ok();
+        let mut sighup = signal(SignalKind::hangup()).ok();
+        tokio::select! {
+            _ = wait_signal(&mut sigterm) => {}
+            _ = wait_signal(&mut sighup) => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // `run_attached_dashboard` handles q, Esc, and Ctrl-C key events directly in raw mode.
+        std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+async fn run_attached_dashboard_for_live(
+    live: &vdpi::service::LiveEngineStatus,
+    cfg: &RuntimeConfig,
+) -> Result<()> {
+    let initial_info = dashboard_info_from_live(live, cfg);
+    let initial_snap = telemetry_snapshot_from_live(live);
+    let initial_rss_kb = live.rss_kb;
+    let initial_isp_stage = live.isp_stage.clone();
+
+    let live_addr = live.addr;
+    let live_port = live.port;
+    let live_socks_port = live.socks_port.unwrap_or(0);
+    let probe_cfg = cfg.clone();
+
+    let probe_fn = move || {
+        let sampled = vdpi::service::probe_live_engine(live_addr, live_port, live_socks_port)
+            .or_else(|| vdpi::service::probe_control_center_status(&probe_cfg).live_engine)?;
+        Some(attached_telemetry_from_live(&sampled, &probe_cfg))
+    };
+
+    tui_dashboard::run_attached_dashboard(
+        initial_info,
+        initial_snap,
+        initial_rss_kb,
+        initial_isp_stage,
+        probe_fn,
+        wait_for_attached_shutdown(),
+    )
+    .await
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+async fn run_attached_dashboard_for_status(
+    status: &vdpi::service::ControlCenterStatus,
+    cfg: &RuntimeConfig,
+) -> Result<bool> {
+    let Some(live) = status
+        .live_engine
+        .clone()
+        .or_else(|| probe_live_engine_for_dashboard(cfg))
+    else {
+        return Ok(false);
+    };
+    run_attached_dashboard_for_live(&live, cfg).await?;
+    Ok(true)
+}
+
+fn handle_dashboard_command(cfg: &RuntimeConfig) -> Result<()> {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let _ = cfg;
+        anyhow::bail!("live dashboard is not supported on {}", platform_name());
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let Some(live) = probe_live_engine_for_dashboard(cfg) else {
+            println!("No running vdpi service detected. Run 'vdpi' or 'vdpi start' first.");
+            return Ok(());
+        };
+        let rt = build_cli_runtime()?;
+        rt.block_on(run_attached_dashboard_for_live(&live, cfg))
+    }
+}
+
+fn merge_split_tunnel_apps(existing: &[String], to_add: &[String]) -> Result<Vec<String>> {
+    let validated_add = vdpi::config_file::validate_split_tunnel_apps(to_add)?;
+    if validated_add.is_empty() {
+        anyhow::bail!("no valid application names provided");
+    }
+    let mut combined = Vec::with_capacity(existing.len().saturating_add(validated_add.len()));
+    combined.extend(existing.iter().cloned());
+    combined.extend(validated_add);
+    vdpi::config_file::validate_split_tunnel_apps(&combined)
+}
+
+fn remove_split_tunnel_apps(existing: &[String], to_remove: &[String]) -> Vec<String> {
+    let remove_keys: std::collections::HashSet<String> = to_remove
+        .iter()
+        .map(|raw| vdpi_core::config::normalize_split_app_name(raw))
+        .filter(|key| !key.is_empty())
+        .collect();
+    existing
+        .iter()
+        .filter(|entry| !remove_keys.contains(&vdpi_core::config::normalize_split_app_name(entry)))
+        .cloned()
+        .collect()
+}
+
+fn handle_split_command(action: Option<SplitCommand>) -> Result<()> {
+    match action {
+        None => {
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            {
+                anyhow::bail!(
+                    "interactive split-tunnel picker is not supported on {}",
+                    platform_name()
+                );
+            }
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            {
+                let current = vdpi::service::load_configured_split_tunnel();
+                if let Some(new_cfg) = vdpi::split_tunnel::tui::run_split_tunnel_picker(current)? {
+                    let msg = vdpi::service::set_service_split_tunnel(&new_cfg)?;
+                    println!("{msg}");
+                }
+                Ok(())
+            }
+        }
+        Some(SplitCommand::Status) => {
+            let current = vdpi::service::load_configured_split_tunnel();
+            println!("Split tunneling: {}", current.summary_label());
+            println!("Mode: {}", current.mode.as_str());
+            if current.apps.is_empty() {
+                println!("Apps: (none)");
+            } else {
+                println!("Apps ({}):", current.apps.len());
+                for app in &current.apps {
+                    println!("  - {app}");
+                }
+            }
+            Ok(())
+        }
+        Some(SplitCommand::List { query }) => {
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            {
+                let _ = query;
+                anyhow::bail!(
+                    "application discovery is not supported on {}",
+                    platform_name()
+                );
+            }
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            {
+                let current = vdpi::service::load_configured_split_tunnel();
+                let discovered = vdpi::split_tunnel::discover_apps(&current.apps);
+                let query_str = query.as_deref().unwrap_or("");
+                let matched = vdpi::split_tunnel::filter_and_rank_apps(&discovered, query_str);
+                if matched.is_empty() {
+                    if query_str.trim().is_empty() {
+                        println!("No applications discovered.");
+                    } else {
+                        println!("No applications matching '{}'.", query_str.trim());
+                    }
+                    return Ok(());
+                }
+                let selected_norm: std::collections::HashSet<String> = current
+                    .apps
+                    .iter()
+                    .map(|a| vdpi::split_tunnel::normalize_exe(a))
+                    .filter(|n| !n.is_empty())
+                    .collect();
+                for app in matched {
+                    let checked =
+                        selected_norm.contains(&vdpi::split_tunnel::normalize_exe(&app.exe_name));
+                    let mark = if checked { "[x]" } else { "[ ]" };
+                    let tag = if app.is_running {
+                        "running"
+                    } else {
+                        match app.category {
+                            vdpi::split_tunnel::AppCategory::Running => "running",
+                            vdpi::split_tunnel::AppCategory::Popular => "popular",
+                            vdpi::split_tunnel::AppCategory::Installed => "installed",
+                            vdpi::split_tunnel::AppCategory::Custom => "custom",
+                        }
+                    };
+                    println!(
+                        "{mark} {:<28} {:<24} [{tag}]",
+                        app.display_name, app.exe_name
+                    );
+                }
+                Ok(())
+            }
+        }
+        Some(SplitCommand::Mode { mode }) => {
+            let mut current = vdpi::service::load_configured_split_tunnel();
+            current.mode = mode;
+            let msg = vdpi::service::set_service_split_tunnel(&current)?;
+            println!("{msg}");
+            Ok(())
+        }
+        Some(SplitCommand::Add { apps }) => {
+            let mut current = vdpi::service::load_configured_split_tunnel();
+            current.apps = merge_split_tunnel_apps(&current.apps, &apps)?;
+            let msg = vdpi::service::set_service_split_tunnel(&current)?;
+            println!("{msg}");
+            if current.mode == SplitTunnelMode::All {
+                println!(
+                    "Note: split tunneling mode is currently 'all'. Run 'vdpi split mode exclude' or 'vdpi split mode include' to activate."
+                );
+            }
+            Ok(())
+        }
+        Some(SplitCommand::Remove { apps }) => {
+            let mut current = vdpi::service::load_configured_split_tunnel();
+            current.apps = remove_split_tunnel_apps(&current.apps, &apps);
+            let msg = vdpi::service::set_service_split_tunnel(&current)?;
+            println!("{msg}");
+            Ok(())
+        }
+        Some(SplitCommand::Clear) => {
+            let cleared = SplitTunnelConfig::default();
+            let msg = vdpi::service::set_service_split_tunnel(&cleared)?;
+            println!("{msg}");
             Ok(())
         }
     }
@@ -2776,6 +3199,10 @@ mod tests {
             quic_blocked: None,
             dns_queries: None,
             rss_kb: None,
+            bytes_rx: None,
+            bytes_tx: None,
+            tls_handshakes: None,
+            auto_heal_escalations: None,
         };
         assert_eq!(
             format_live_engine_line(&base),
@@ -2816,5 +3243,110 @@ mod tests {
         assert_eq!(desktop_tun::retry_backoff(4), Duration::from_secs(24));
         assert_eq!(desktop_tun::retry_backoff(5), Duration::from_secs(30));
         assert_eq!(desktop_tun::retry_backoff(100), Duration::from_secs(30));
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[test]
+    fn live_engine_status_maps_to_attached_dashboard_telemetry() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use vdpi::config::DesyncMode;
+
+        let fallback_cfg = RuntimeConfig::default();
+        let tun_live = vdpi::service::LiveEngineStatus {
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 19847,
+            socks_port: None,
+            engine: EngineMode::Tun,
+            tun_interface: Some("vdpi0".to_string()),
+            physical_nic: Some("Ethernet".to_string()),
+            vpn_conflict: None,
+            version: Some("0.5.5".to_string()),
+            mode: Some("tls-record".to_string()),
+            doh: Some(false),
+            block_quic: Some(true),
+            active_connections: Some(7),
+            total_connections: Some(42),
+            learned_hosts: Some(5),
+            isp_stage: Some("Stage 2".to_string()),
+            udp_flows_active: Some(3),
+            quic_blocked: Some(19),
+            dns_queries: Some(88),
+            rss_kb: Some(12288),
+            bytes_rx: Some(65_536),
+            bytes_tx: Some(16_384),
+            tls_handshakes: Some(21),
+            auto_heal_escalations: Some(2),
+        };
+
+        let info = dashboard_info_from_live(&tun_live, &fallback_cfg);
+        assert_eq!(info.mode, DesyncMode::TlsRecord);
+        assert!(!info.enable_doh);
+        assert_eq!(
+            info.engine,
+            tui_dashboard::DashboardEngine::Tun {
+                interface: "vdpi0".to_string(),
+                physical_nic: Some("Ethernet".to_string()),
+                vpn_conflict: None,
+            }
+        );
+
+        let attached = attached_telemetry_from_live(&tun_live, &fallback_cfg);
+        assert_eq!(attached.snap.active_connections, 7);
+        assert_eq!(attached.snap.total_connections, 42);
+        assert_eq!(attached.snap.bytes_rx, 65_536);
+        assert_eq!(attached.snap.bytes_tx, 16_384);
+        assert_eq!(attached.snap.tls_handshakes, 21);
+        assert_eq!(attached.snap.auto_heal_escalations, 2);
+        assert_eq!(attached.snap.learned_hosts, 5);
+        assert_eq!(attached.snap.udp_flows_active, 3);
+        assert_eq!(attached.snap.quic_blocked, 19);
+        assert_eq!(attached.snap.dns_queries, 88);
+        assert_eq!(attached.rss_kb, Some(12288));
+        assert_eq!(attached.isp_stage.as_deref(), Some("Stage 2"));
+        assert_eq!(attached.version.as_deref(), Some("0.5.5"));
+
+        let mut proxy_live = tun_live;
+        proxy_live.engine = EngineMode::Proxy;
+        proxy_live.port = 8080;
+        proxy_live.socks_port = Some(1080);
+        proxy_live.mode = None;
+        let proxy_info = dashboard_info_from_live(&proxy_live, &fallback_cfg);
+        assert_eq!(proxy_info.mode, fallback_cfg.mode);
+        assert_eq!(
+            proxy_info.engine,
+            tui_dashboard::DashboardEngine::Proxy {
+                primary_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
+                socks_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1080)),
+                system_proxy: fallback_cfg.system_proxy,
+            }
+        );
+    }
+
+    #[test]
+    fn split_tunnel_app_merge_and_remove_normalize_and_deduplicate() {
+        let existing = vec!["Discord.exe".to_string(), "steam.exe".to_string()];
+        let merged = merge_split_tunnel_apps(
+            &existing,
+            &[
+                "discord".to_string(),
+                "  firefox.exe ".to_string(),
+                "FIREFOX".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            merged,
+            vec![
+                "Discord.exe".to_string(),
+                "steam.exe".to_string(),
+                "firefox.exe".to_string()
+            ]
+        );
+
+        assert!(merge_split_tunnel_apps(&existing, &["   ".to_string()]).is_err());
+
+        let remaining =
+            remove_split_tunnel_apps(&merged, &["discord".to_string(), "STEAM.EXE".to_string()]);
+        assert_eq!(remaining, vec!["firefox.exe".to_string()]);
     }
 }

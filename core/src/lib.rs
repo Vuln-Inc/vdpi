@@ -7,4 +7,6 @@ pub mod platform;
 pub mod proxy;
 pub mod server;
 pub mod service;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub mod split_tunnel;
 pub mod update;

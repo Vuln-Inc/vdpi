@@ -1,4 +1,4 @@
-use super::HANDSHAKE_TIMEOUT;
+use super::{check_split_tunnel_bypass_stream, relay_direct_tunnel, HANDSHAKE_TIMEOUT};
 use crate::desync::EngineContext;
 use anyhow::{bail, Result};
 use std::io::ErrorKind;
@@ -27,6 +27,7 @@ pub async fn handle_socks5_client(mut client: TcpStream, ctx: EngineContext) -> 
 
     match cmd {
         CMD_CONNECT => {
+            let split_bypass = check_split_tunnel_bypass_stream(&ctx, &client);
             debug!(host = %target_host, port = target_port, "SOCKS5 CONNECT");
             match ctx.connect_target(&target_host, target_port).await {
                 Ok((remote, remote_addr)) => {
@@ -36,6 +37,10 @@ pub async fn handle_socks5_client(mut client: TcpStream, ctx: EngineContext) -> 
                     );
                     client.write_all(&reply).await?;
                     client.flush().await?;
+                    if let Some(bypass) = split_bypass {
+                        bypass.log_bypass(&target_host);
+                        return relay_direct_tunnel(&ctx, client, remote).await;
+                    }
                     ctx.relay_tunnel(client, remote, known_domain.as_deref(), remote_addr)
                         .await
                 }
@@ -51,6 +56,7 @@ pub async fn handle_socks5_client(mut client: TcpStream, ctx: EngineContext) -> 
             }
         }
         CMD_UDP_ASSOCIATE => {
+            let split_bypass = check_split_tunnel_bypass_stream(&ctx, &client);
             let bind_ip = client
                 .local_addr()
                 .map(|a| normalize_ip(a.ip()))
@@ -63,7 +69,14 @@ pub async fn handle_socks5_client(mut client: TcpStream, ctx: EngineContext) -> 
             client.write_all(&reply).await?;
             client.flush().await?;
 
-            run_udp_associate_session(client, client_udp, ctx).await
+            let split_bypassed = if let Some(bypass) = split_bypass {
+                bypass.log_bypass("udp-associate");
+                true
+            } else {
+                false
+            };
+
+            run_udp_associate_session(client, client_udp, ctx, split_bypassed).await
         }
         other => {
             let reply =
@@ -106,11 +119,16 @@ pub async fn handle_socks4_client(mut client: TcpStream, ctx: EngineContext) -> 
     let (host, known_domain, port) =
         tokio::time::timeout(HANDSHAKE_TIMEOUT, read_socks4_request(&mut client)).await??;
 
+    let split_bypass = check_split_tunnel_bypass_stream(&ctx, &client);
     debug!(host = %host, port = port, "SOCKS4/4a CONNECT");
     match ctx.connect_target(&host, port).await {
         Ok((remote, remote_addr)) => {
             client.write_all(&[0x00, 0x5a, 0, 0, 0, 0, 0, 0]).await?;
             client.flush().await?;
+            if let Some(bypass) = split_bypass {
+                bypass.log_bypass(&host);
+                return relay_direct_tunnel(&ctx, client, remote).await;
+            }
             ctx.relay_tunnel(client, remote, known_domain.as_deref(), remote_addr)
                 .await
         }
@@ -210,6 +228,7 @@ async fn run_udp_associate_session(
     mut tcp_control: TcpStream,
     client_udp: Arc<UdpSocket>,
     ctx: EngineContext,
+    split_bypassed: bool,
 ) -> Result<()> {
     #[cfg(windows)]
     disable_udp_connreset(&client_udp);
@@ -288,7 +307,8 @@ async fn run_udp_associate_session(
             // If QUIC blocking is enabled, drop all UDP/443 datagrams (including RFC 9287
             // greased and short-header QUIC) for non-bypassed targets so applications cleanly
             // fall back to DPI-bypassed TCP/443 TLS.
-            if c2r_ctx.config.block_quic
+            if !split_bypassed
+                && c2r_ctx.config.block_quic
                 && dst_port == 443
                 && !payload.is_empty()
                 && c2r_ctx.bypass.should_desync(

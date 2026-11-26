@@ -1,8 +1,8 @@
 #![cfg(unix)]
 
-use crate::config::{TunProfile, MAX_MTU, MIN_MTU};
+use crate::config::{AppBypassHook, TunProfile, MAX_MTU, MIN_MTU};
 use crate::events::EventRing;
-use crate::pipeline::{run_tun_pipeline_with_route_watch, wait_shutdown, TunStats};
+use crate::pipeline::{run_tun_pipeline_with_app_bypass, wait_shutdown, TunStats};
 use anyhow::{anyhow, Context, Result};
 use std::io::ErrorKind;
 use std::os::unix::io::{AsRawFd, OwnedFd};
@@ -85,6 +85,36 @@ pub async fn run_registered_tun_fd_with_route_watch(
     profile: TunProfile,
     shutdown_rx: watch::Receiver<bool>,
     route_rx: Option<watch::Receiver<u64>>,
+) -> Result<()> {
+    run_registered_tun_fd_with_app_bypass(
+        async_fd,
+        ctx,
+        tun_stats,
+        events,
+        mtu,
+        profile,
+        shutdown_rx,
+        route_rx,
+        None,
+    )
+    .await
+}
+
+/// Runs the TUN engine attached to a registered Unix/Android `AsyncFd<OwnedFd>` with an
+/// optional route-change watch receiver and an optional per-flow [`AppBypassHook`] callback
+/// for desktop per-app split tunneling. Closes the TUN fd automatically when the tunnel stops
+/// or exits.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_registered_tun_fd_with_app_bypass(
+    async_fd: Arc<AsyncFd<OwnedFd>>,
+    ctx: EngineContext,
+    tun_stats: Arc<TunStats>,
+    events: Arc<EventRing>,
+    mtu: usize,
+    profile: TunProfile,
+    shutdown_rx: watch::Receiver<bool>,
+    route_rx: Option<watch::Receiver<u64>>,
+    app_bypass: Option<AppBypassHook>,
 ) -> Result<()> {
     let clamped_mtu = mtu.clamp(MIN_MTU, MAX_MTU);
     let io_batch_limit = profile.batch_size.clamp(16, 256);
@@ -281,7 +311,7 @@ pub async fn run_registered_tun_fd_with_route_watch(
         writer_task.abort_handle(),
     ]);
 
-    let pipeline_res = run_tun_pipeline_with_route_watch(
+    let pipeline_res = run_tun_pipeline_with_app_bypass(
         inbound_rx,
         outbound_tx,
         ctx,
@@ -291,6 +321,7 @@ pub async fn run_registered_tun_fd_with_route_watch(
         profile,
         fd_stop_rx,
         route_rx,
+        app_bypass,
     )
     .await;
 

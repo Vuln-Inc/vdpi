@@ -1,11 +1,13 @@
-use crate::config_file::FileConfig;
+use crate::config_file::{sanitize_split_tunnel_apps, FileConfig};
 use clap::{Parser, Subcommand};
 use std::ffi::OsString;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-pub use vdpi_core::config::{DesyncMode, EngineMode, RuntimeConfig, VpnCoexistence};
+pub use vdpi_core::config::{
+    DesyncMode, EngineMode, RuntimeConfig, SplitTunnelConfig, SplitTunnelMode, VpnCoexistence,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Command {
@@ -42,6 +44,15 @@ pub enum Command {
         /// Target DNS server IP or DoH URL; omit to print the configured DNS server
         #[arg(value_name = "SERVER")]
         addr: Option<String>,
+    },
+    /// Open the real-time live dashboard attached to the running vdpi service
+    #[command(visible_alias = "dash")]
+    Dashboard,
+    /// Configure per-app split tunneling (opens interactive app picker when no subcommand given)
+    #[command(visible_alias = "apps", alias = "split-tunnel")]
+    Split {
+        #[command(subcommand)]
+        action: Option<SplitCommand>,
     },
     /// Inspect, validate, or modify persisted `config.toml` settings
     Config {
@@ -94,6 +105,38 @@ pub enum ConfigCommand {
     Validate,
     /// Reset `config.toml` back to built-in defaults
     Reset,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum SplitCommand {
+    /// Print the current split-tunneling mode and configured applications
+    Status,
+    /// Discover and list installed and running applications, optionally filtered by query
+    List {
+        /// Optional fuzzy search filter query
+        #[arg(short = 'f', long, alias = "filter")]
+        query: Option<String>,
+    },
+    /// Set the split-tunneling mode (`all`, `exclude`, or `include`)
+    Mode {
+        /// Target split-tunneling mode (`all`, `exclude`, or `include`)
+        #[arg(id = "split_tunnel_mode", value_name = "MODE", value_enum)]
+        mode: SplitTunnelMode,
+    },
+    /// Add one or more applications to the split-tunnel list
+    Add {
+        /// Executable names or paths to add
+        #[arg(required = true, value_name = "APP")]
+        apps: Vec<String>,
+    },
+    /// Remove one or more applications from the split-tunnel list
+    Remove {
+        /// Executable names or paths to remove
+        #[arg(required = true, value_name = "APP")]
+        apps: Vec<String>,
+    },
+    /// Clear the configured application list and reset split-tunnel mode to `all`
+    Clear,
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -256,6 +299,14 @@ pub struct CliArgs {
     #[arg(long = "bypass", global = true)]
     pub bypass_domains: Vec<String>,
 
+    /// Per-application split-tunnel routing mode (`all`, `exclude`, or `include`)
+    #[arg(long, value_enum, global = true)]
+    pub split_mode: Option<vdpi_core::config::SplitTunnelMode>,
+
+    /// Application executable name or path for split-tunnel routing (repeatable)
+    #[arg(long = "split-app", value_name = "APP", global = true)]
+    pub split_apps: Vec<String>,
+
     /// Automatically configure OS system proxy settings while running
     #[arg(
         long = "system-proxy",
@@ -389,6 +440,7 @@ struct ExplicitFlags {
     no_doh: bool,
     include_patterns: bool,
     bypass_domains: bool,
+    split_apps: bool,
     system_proxy: bool,
     no_system_proxy: bool,
     socks_system_proxy: bool,
@@ -465,6 +517,10 @@ impl ExplicitFlags {
                         flags.bypass_domains = true;
                         skip_next = !has_eq;
                     }
+                    "split-app" => {
+                        flags.split_apps = true;
+                        skip_next = !has_eq;
+                    }
                     "system-proxy" => flags.system_proxy = true,
                     "no-system-proxy" => flags.no_system_proxy = true,
                     "socks-system-proxy" => flags.socks_system_proxy = true,
@@ -481,7 +537,7 @@ impl ExplicitFlags {
                     "proxy" => flags.proxy = true,
                     "tun-ipv6" => flags.tun_ipv6 = true,
                     "no-tun-ipv6" => flags.no_tun_ipv6 = true,
-                    "config" | "vpn-coexistence" => {
+                    "config" | "vpn-coexistence" | "split-mode" => {
                         skip_next = !has_eq;
                     }
                     _ => {}
@@ -716,6 +772,26 @@ impl CliArgs {
             file_cfg.bypass_domains.clone().unwrap_or_default()
         };
 
+        let split_tunnel_mode = self
+            .split_mode
+            .or(file_cfg.split_tunnel_mode)
+            .unwrap_or_default();
+
+        let split_tunnel_apps = if explicit.split_apps || !self.split_apps.is_empty() {
+            sanitize_split_tunnel_apps(&self.split_apps)
+        } else {
+            file_cfg
+                .split_tunnel_apps
+                .as_deref()
+                .map(sanitize_split_tunnel_apps)
+                .unwrap_or_default()
+        };
+
+        let split_tunnel = SplitTunnelConfig {
+            mode: split_tunnel_mode,
+            apps: split_tunnel_apps,
+        };
+
         let system_proxy = if self.no_system_proxy || explicit.no_system_proxy {
             false
         } else if explicit.system_proxy {
@@ -790,6 +866,7 @@ impl CliArgs {
             mode,
             patterns,
             bypass_domains,
+            split_tunnel,
             system_proxy,
             socks_system_proxy,
             env_proxy,
@@ -1116,6 +1193,8 @@ mod tests {
             dns_addr: Some("9.9.9.9".to_string()),
             bypass_domains: Some(vec!["*.corp.internal".to_string()]),
             include_domains: Some(vec!["^discord\\.com$".to_string()]),
+            split_tunnel_mode: Some(SplitTunnelMode::Exclude),
+            split_tunnel_apps: Some(vec!["discord.exe".to_string()]),
             vpn_coexistence: Some(VpnCoexistence::Warn),
             tun_ipv6: Some(true),
             chunk_size: Some(4),
@@ -1141,6 +1220,8 @@ mod tests {
         assert_eq!(cfg.dns_addr, "9.9.9.9");
         assert_eq!(cfg.bypass_domains, vec!["*.corp.internal".to_string()]);
         assert_eq!(cfg.patterns, vec!["^discord\\.com$".to_string()]);
+        assert_eq!(cfg.split_tunnel.mode, SplitTunnelMode::Exclude);
+        assert_eq!(cfg.split_tunnel.apps, vec!["discord.exe".to_string()]);
         assert_eq!(cfg.vpn_coexistence, VpnCoexistence::Warn);
         assert!(cfg.tun_ipv6);
         assert_eq!(cfg.chunk_size, 4);
@@ -1165,6 +1246,8 @@ mod tests {
             dns_addr: Some("9.9.9.9".to_string()),
             bypass_domains: Some(vec!["file.example.com".to_string()]),
             include_domains: Some(vec!["^file\\.example\\.com$".to_string()]),
+            split_tunnel_mode: Some(SplitTunnelMode::Exclude),
+            split_tunnel_apps: Some(vec!["discord.exe".to_string()]),
             vpn_coexistence: Some(VpnCoexistence::Warn),
             tun_ipv6: Some(false),
             chunk_size: Some(4),
@@ -1188,6 +1271,12 @@ mod tests {
             "cli.example.com",
             "--include",
             "^cli\\.example\\.com$",
+            "--split-mode",
+            "include",
+            "--split-app",
+            "chrome.exe",
+            "--split-app",
+            "firefox.exe",
             "--vpn-coexistence",
             "off",
             "--tun-ipv6",
@@ -1208,6 +1297,11 @@ mod tests {
         assert!(!cfg.block_quic);
         assert_eq!(cfg.bypass_domains, vec!["cli.example.com".to_string()]);
         assert_eq!(cfg.patterns, vec!["^cli\\.example\\.com$".to_string()]);
+        assert_eq!(cfg.split_tunnel.mode, SplitTunnelMode::Include);
+        assert_eq!(
+            cfg.split_tunnel.apps,
+            vec!["chrome.exe".to_string(), "firefox.exe".to_string()]
+        );
         assert_eq!(cfg.vpn_coexistence, VpnCoexistence::Off);
         assert!(cfg.tun_ipv6);
 
@@ -1234,6 +1328,7 @@ mod tests {
         assert_eq!(cfg.mode, DesyncMode::Combo);
         assert!(cfg.patterns.is_empty());
         assert!(cfg.bypass_domains.is_empty());
+        assert_eq!(cfg.split_tunnel, SplitTunnelConfig::default());
         assert!(cfg.system_proxy);
         assert!(cfg.socks_system_proxy);
         assert!(cfg.env_proxy);
@@ -1314,5 +1409,138 @@ mod tests {
                 "expected ArgumentConflict for {left} start {right}"
             );
         }
+    }
+
+    #[test]
+    fn resolve_runtime_config_overlays_split_tunnel_cli_flags() {
+        let file_cfg = FileConfig {
+            split_tunnel_mode: Some(SplitTunnelMode::Exclude),
+            split_tunnel_apps: Some(vec![
+                " Discord.exe ".to_string(),
+                "discord".to_string(),
+                "steam.exe".to_string(),
+            ]),
+            ..FileConfig::default()
+        };
+
+        // CLI --split-mode only overlays mode; file apps remain (sanitized).
+        let mode_only_argv: Vec<String> = ["vdpi", "start", "--split-mode=include"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let mode_only_cli =
+            CliArgs::parse_from_iter(&mode_only_argv).expect("valid --split-mode override");
+        let mode_only_cfg = mode_only_cli.resolve_runtime_config(&file_cfg, &mode_only_argv);
+        assert_eq!(mode_only_cfg.split_tunnel.mode, SplitTunnelMode::Include);
+        assert_eq!(
+            mode_only_cfg.split_tunnel.apps,
+            vec!["Discord.exe".to_string(), "steam.exe".to_string()]
+        );
+
+        // CLI --split-app only overlays apps (sanitized & deduped); file mode remains.
+        let apps_only_argv: Vec<String> = [
+            "vdpi",
+            "start",
+            "--split-app",
+            " Chrome.exe ",
+            "--split-app=chrome",
+            "--split-app",
+            "firefox.exe",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let apps_only_cli =
+            CliArgs::parse_from_iter(&apps_only_argv).expect("valid --split-app override");
+        let apps_only_cfg = apps_only_cli.resolve_runtime_config(&file_cfg, &apps_only_argv);
+        assert_eq!(apps_only_cfg.split_tunnel.mode, SplitTunnelMode::Exclude);
+        assert_eq!(
+            apps_only_cfg.split_tunnel.apps,
+            vec!["Chrome.exe".to_string(), "firefox.exe".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_dashboard_and_split_subcommands_and_aliases() {
+        let dash = CliArgs::parse_from_iter(["vdpi", "dashboard"]).unwrap();
+        assert_eq!(dash.command, Some(Command::Dashboard));
+        let dash_alias = CliArgs::parse_from_iter(["vdpi", "dash"]).unwrap();
+        assert_eq!(dash_alias.command, Some(Command::Dashboard));
+
+        let split_bare = CliArgs::parse_from_iter(["vdpi", "split"]).unwrap();
+        assert_eq!(split_bare.command, Some(Command::Split { action: None }));
+        let apps_alias = CliArgs::parse_from_iter(["vdpi", "apps"]).unwrap();
+        assert_eq!(apps_alias.command, Some(Command::Split { action: None }));
+        let split_tunnel_alias = CliArgs::parse_from_iter(["vdpi", "split-tunnel"]).unwrap();
+        assert_eq!(
+            split_tunnel_alias.command,
+            Some(Command::Split { action: None })
+        );
+
+        let status = CliArgs::parse_from_iter(["vdpi", "split", "status"]).unwrap();
+        assert_eq!(
+            status.command,
+            Some(Command::Split {
+                action: Some(SplitCommand::Status)
+            })
+        );
+
+        let list = CliArgs::parse_from_iter(["vdpi", "split", "list", "--query", "disc"]).unwrap();
+        assert_eq!(
+            list.command,
+            Some(Command::Split {
+                action: Some(SplitCommand::List {
+                    query: Some("disc".to_string())
+                })
+            })
+        );
+        let list_short = CliArgs::parse_from_iter(["vdpi", "split", "list", "-f", "disc"]).unwrap();
+        assert_eq!(
+            list_short.command,
+            Some(Command::Split {
+                action: Some(SplitCommand::List {
+                    query: Some("disc".to_string())
+                })
+            })
+        );
+
+        let mode = CliArgs::parse_from_iter(["vdpi", "split", "mode", "exclude"]).unwrap();
+        assert_eq!(
+            mode.command,
+            Some(Command::Split {
+                action: Some(SplitCommand::Mode {
+                    mode: SplitTunnelMode::Exclude
+                })
+            })
+        );
+
+        let add =
+            CliArgs::parse_from_iter(["vdpi", "apps", "add", "discord.exe", "steam.exe"]).unwrap();
+        assert_eq!(
+            add.command,
+            Some(Command::Split {
+                action: Some(SplitCommand::Add {
+                    apps: vec!["discord.exe".to_string(), "steam.exe".to_string()]
+                })
+            })
+        );
+
+        let remove = CliArgs::parse_from_iter(["vdpi", "split", "remove", "discord.exe"]).unwrap();
+        assert_eq!(
+            remove.command,
+            Some(Command::Split {
+                action: Some(SplitCommand::Remove {
+                    apps: vec!["discord.exe".to_string()]
+                })
+            })
+        );
+
+        let clear = CliArgs::parse_from_iter(["vdpi", "split", "clear"]).unwrap();
+        assert_eq!(
+            clear.command,
+            Some(Command::Split {
+                action: Some(SplitCommand::Clear)
+            })
+        );
     }
 }

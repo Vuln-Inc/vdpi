@@ -13,12 +13,14 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
 use std::io::{self, IsTerminal, Stdout};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::field::{Field, Visit};
 use tracing::{info, Level};
 use tracing_subscriber::layer::Context;
@@ -30,9 +32,13 @@ pub const MAX_LOG_ENTRIES: usize = 150;
 pub const MAX_LOG_MESSAGE_CHARS: usize = 512;
 pub const THROUGHPUT_WINDOW_SECS: usize = 60;
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
+const ATTACHED_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const NOTICE_TTL: Duration = Duration::from_secs(3);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 const SIDE_BY_SIDE_MIN_WIDTH: u16 = 72;
+const PROXY_CONNECT_MAX_HEADER_BYTES: usize = 2048;
+const AUTO_HEAL_LOG_COOLDOWN: Duration = Duration::from_secs(5);
+const LEARNED_HOSTS_LOG_COOLDOWN: Duration = Duration::from_secs(15);
 
 pub type SharedLogRing = Arc<Mutex<VecDeque<LogEntry>>>;
 
@@ -228,7 +234,7 @@ impl ThroughputRing {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DashboardEngine {
     Proxy {
         primary_addr: SocketAddr,
@@ -247,6 +253,21 @@ pub struct DashboardInfo {
     pub engine: DashboardEngine,
     pub mode: DesyncMode,
     pub enable_doh: bool,
+}
+
+/// Live telemetry snapshot returned by a remote-attach probe callback for
+/// [`run_attached_dashboard`]. Decoupled from `service.rs` so the dashboard
+/// module compiles independently of health-client types.
+#[derive(Debug, Clone)]
+pub struct AttachedTelemetry {
+    pub snap: EngineTelemetrySnapshot,
+    pub engine: DashboardEngine,
+    pub mode: DesyncMode,
+    pub doh: bool,
+    pub block_quic: bool,
+    pub rss_kb: Option<u64>,
+    pub isp_stage: Option<String>,
+    pub version: Option<String>,
 }
 
 /// Live TUN metadata snapshot polled alongside engine telemetry so interface transitions,
@@ -374,6 +395,7 @@ struct DashboardState {
     tx_rate: u64,
     prev_rx: u64,
     prev_tx: u64,
+    rate_initialized: bool,
     last_rate_sample: Instant,
     throughput: ThroughputRing,
     logs: SharedLogRing,
@@ -385,6 +407,11 @@ struct DashboardState {
     diagnostics: Arc<Mutex<DiagnosticsState>>,
     diag_tasks: JoinSet<()>,
     next_diag_run: u64,
+    is_attached: bool,
+    reconnecting: bool,
+    rss_kb: Option<u64>,
+    isp_stage: Option<String>,
+    remote_version: Option<String>,
 }
 
 impl DashboardState {
@@ -398,6 +425,7 @@ impl DashboardState {
             tx_rate: 0,
             prev_rx: 0,
             prev_tx: 0,
+            rate_initialized: false,
             last_rate_sample: now,
             throughput: ThroughputRing::new(),
             logs,
@@ -409,24 +437,107 @@ impl DashboardState {
             diagnostics: Arc::new(Mutex::new(DiagnosticsState::new_running(0))),
             diag_tasks: JoinSet::new(),
             next_diag_run: 0,
+            is_attached: false,
+            reconnecting: false,
+            rss_kb: None,
+            isp_stage: None,
+            remote_version: None,
         }
+    }
+
+    fn new_attached(
+        info: DashboardInfo,
+        initial_snap: EngineTelemetrySnapshot,
+        initial_rss_kb: Option<u64>,
+        initial_isp_stage: Option<String>,
+        logs: SharedLogRing,
+        color: bool,
+        now: Instant,
+    ) -> Self {
+        let mut state = Self::new(info, logs, color, now);
+        state.is_attached = true;
+        state.rss_kb = initial_rss_kb;
+        state.isp_stage = normalize_opt_string(initial_isp_stage);
+        state.update_telemetry(initial_snap, now);
+        state
     }
 
     fn update_telemetry(&mut self, snap: EngineTelemetrySnapshot, now: Instant) {
         self.telemetry = snap;
-        let elapsed = now.saturating_duration_since(self.last_rate_sample);
-        if elapsed >= Duration::from_secs(1) {
-            let elapsed_ms = elapsed.as_millis().max(1) as u64;
-            let drx = snap.bytes_rx.saturating_sub(self.prev_rx);
-            let dtx = snap.bytes_tx.saturating_sub(self.prev_tx);
-            self.rx_rate = drx.saturating_mul(1000) / elapsed_ms;
-            self.tx_rate = dtx.saturating_mul(1000) / elapsed_ms;
-            self.throughput
-                .push(self.rx_rate.saturating_add(self.tx_rate));
+        if !self.rate_initialized {
             self.prev_rx = snap.bytes_rx;
             self.prev_tx = snap.bytes_tx;
+            self.rx_rate = 0;
+            self.tx_rate = 0;
+            self.last_rate_sample = now;
+            self.rate_initialized = true;
+        } else if snap.bytes_rx < self.prev_rx || snap.bytes_tx < self.prev_tx {
+            // Daemon restarted and byte counters reset to a lower value:
+            // re-baseline cleanly without stalling or underflowing.
+            if now.saturating_duration_since(self.last_rate_sample) >= Duration::from_secs(1) {
+                self.throughput.push(0);
+            }
+            self.prev_rx = snap.bytes_rx;
+            self.prev_tx = snap.bytes_tx;
+            self.rx_rate = 0;
+            self.tx_rate = 0;
+            self.last_rate_sample = now;
+        } else {
+            let elapsed = now.saturating_duration_since(self.last_rate_sample);
+            if elapsed >= Duration::from_secs(1) {
+                let elapsed_ms = u128::from(elapsed.as_millis().max(1) as u64);
+                let drx = u128::from(snap.bytes_rx.saturating_sub(self.prev_rx));
+                let dtx = u128::from(snap.bytes_tx.saturating_sub(self.prev_tx));
+                self.rx_rate = ((drx * 1000) / elapsed_ms).min(u128::from(u64::MAX)) as u64;
+                self.tx_rate = ((dtx * 1000) / elapsed_ms).min(u128::from(u64::MAX)) as u64;
+                self.throughput
+                    .push(self.rx_rate.saturating_add(self.tx_rate));
+                self.prev_rx = snap.bytes_rx;
+                self.prev_tx = snap.bytes_tx;
+                self.last_rate_sample = now;
+            }
+        }
+        self.expire_notice(now);
+    }
+
+    fn apply_attached_sample(&mut self, sample: AttachedTelemetry, now: Instant) {
+        let was_reconnecting = self.reconnecting;
+        self.reconnecting = false;
+        if was_reconnecting {
+            // Re-baseline after an offline window so accumulated traffic during
+            // disconnect never shows up as a fake catch-up spike.
+            self.rate_initialized = false;
+        }
+        self.update_telemetry(sample.snap, now);
+        self.info.engine = sample.engine;
+        self.info.mode = sample.mode;
+        self.info.enable_doh = sample.doh;
+        self.rss_kb = sample.rss_kb;
+        self.isp_stage = normalize_opt_string(sample.isp_stage);
+        self.remote_version = normalize_opt_string(sample.version).and_then(|v| {
+            let trimmed = v.trim_start_matches('v').trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        });
+    }
+
+    fn mark_reconnecting(&mut self, now: Instant) {
+        self.reconnecting = true;
+        self.tick_reconnecting(now);
+    }
+
+    fn tick_reconnecting(&mut self, now: Instant) {
+        if self.reconnecting
+            && now.saturating_duration_since(self.last_rate_sample) >= Duration::from_secs(1)
+        {
+            self.rx_rate = 0;
+            self.tx_rate = 0;
+            self.throughput.push(0);
             self.last_rate_sample = now;
         }
+        self.expire_notice(now);
+    }
+
+    fn expire_notice(&mut self, now: Instant) {
         if self.notice.as_ref().is_some_and(|(_, exp)| now >= *exp) {
             self.notice = None;
         }
@@ -529,6 +640,7 @@ enum KeyAction {
     None,
     Redraw,
     ClearCache,
+    Refresh,
     RunDiagnostics,
     Quit,
 }
@@ -598,7 +710,8 @@ fn handle_key_event(state: &mut DashboardState, key: KeyEvent) -> KeyAction {
             state.diagnostics_open = true;
             KeyAction::RunDiagnostics
         }
-        KeyCode::Char('c' | 'C') => KeyAction::ClearCache,
+        KeyCode::Char('r' | 'R') if state.is_attached => KeyAction::Refresh,
+        KeyCode::Char('c' | 'C') if !state.is_attached => KeyAction::ClearCache,
         KeyCode::Char('q' | 'Q') | KeyCode::Esc => KeyAction::Quit,
         _ => KeyAction::None,
     }
@@ -735,6 +848,572 @@ impl Drop for EventReaderGuard {
     }
 }
 
+struct TaskAbortGuard<T> {
+    handle: Option<JoinHandle<T>>,
+}
+
+impl<T> TaskAbortGuard<T> {
+    fn new(handle: JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+}
+
+impl<T> Drop for TaskAbortGuard<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+fn normalize_opt_string(value: Option<String>) -> Option<String> {
+    value.and_then(|s| {
+        let trimmed = sanitize_single_line(&s);
+        (!trimmed.is_empty()).then_some(trimmed)
+    })
+}
+
+fn normalize_loopback_connect_addr(addr: SocketAddr) -> SocketAddr {
+    let ip = addr.ip().to_canonical();
+    let connect_ip = if ip.is_unspecified() {
+        match ip {
+            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        }
+    } else {
+        ip
+    };
+    SocketAddr::new(connect_ip, addr.port())
+}
+
+fn format_engine_summary(engine: &DashboardEngine) -> String {
+    match engine {
+        DashboardEngine::Proxy {
+            primary_addr,
+            socks_addr,
+            system_proxy,
+        } => {
+            let mut out = format!("proxy {primary_addr}");
+            if let Some(sa) = socks_addr {
+                out.push_str(&format!(" · socks {sa}"));
+            }
+            if !*system_proxy {
+                out.push_str(" · manual proxy");
+            }
+            out
+        }
+        DashboardEngine::Tun {
+            interface,
+            physical_nic,
+            ..
+        } => match physical_nic
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(nic) => format!("TUN {interface} ({nic})"),
+            None => format!("TUN {interface}"),
+        },
+    }
+}
+
+fn next_traffic_milestone_after(total_bytes: u64) -> u64 {
+    const MB: u64 = 1024 * 1024;
+    const GB: u64 = 1024 * MB;
+    const STEPS: [u64; 6] = [10 * MB, 50 * MB, 100 * MB, 250 * MB, 500 * MB, GB];
+    for step in STEPS {
+        if total_bytes < step {
+            return step;
+        }
+    }
+    (total_bytes / GB).saturating_add(1).saturating_mul(GB)
+}
+
+struct AttachedActivityTracker {
+    logs: SharedLogRing,
+    last_block_quic: Option<bool>,
+    last_auto_heal: u64,
+    last_auto_heal_log: Option<Instant>,
+    last_learned_hosts: usize,
+    last_learned_hosts_log: Option<Instant>,
+    next_traffic_milestone: u64,
+}
+
+impl AttachedActivityTracker {
+    fn new(
+        logs: SharedLogRing,
+        initial_info: &DashboardInfo,
+        initial_snap: EngineTelemetrySnapshot,
+        initial_isp_stage: Option<&str>,
+    ) -> Self {
+        let total_bytes = initial_snap.bytes_rx.saturating_add(initial_snap.bytes_tx);
+        let tracker = Self {
+            logs,
+            last_block_quic: None,
+            last_auto_heal: initial_snap.auto_heal_escalations,
+            last_auto_heal_log: None,
+            last_learned_hosts: initial_snap.learned_hosts,
+            last_learned_hosts_log: None,
+            next_traffic_milestone: next_traffic_milestone_after(total_bytes),
+        };
+
+        let engine_summary = format_engine_summary(&initial_info.engine);
+        let mode = format_desync_mode(initial_info.mode);
+        let dns = if initial_info.enable_doh {
+            "DoH"
+        } else {
+            "UDP"
+        };
+        let mut startup =
+            format!("attached to live vdpi daemon · {engine_summary} · {mode} · {dns}");
+        if let Some(stage) = initial_isp_stage.map(str::trim).filter(|s| !s.is_empty()) {
+            startup.push_str(&format!(" · stage {stage}"));
+        }
+        tracker.push(Level::INFO, startup);
+
+        if let DashboardEngine::Tun {
+            vpn_conflict: Some(vpn),
+            ..
+        } = &initial_info.engine
+        {
+            let vpn = sanitize_single_line(vpn);
+            if !vpn.is_empty() {
+                tracker.push(Level::WARN, format!("VPN conflict active: {vpn}"));
+            }
+        }
+
+        tracker
+    }
+
+    fn push(&self, level: Level, message: impl Into<String>) {
+        push_log_entry(
+            &self.logs,
+            LogEntry {
+                timestamp: format_wall_clock(SystemTime::now()),
+                level,
+                message: sanitize_single_line(&message.into()),
+            },
+        );
+    }
+
+    fn on_offline(&self, prev: &DashboardState) {
+        if !prev.reconnecting {
+            self.push(Level::WARN, "daemon unreachable; waiting to reconnect...");
+        }
+    }
+
+    fn on_sample(&mut self, prev: &DashboardState, sample: &AttachedTelemetry, now: Instant) {
+        let counters_reset = prev.rate_initialized
+            && (sample.snap.bytes_rx < prev.prev_rx || sample.snap.bytes_tx < prev.prev_tx);
+        let new_summary = format_engine_summary(&sample.engine);
+
+        if prev.reconnecting {
+            if counters_reset {
+                self.push(
+                    Level::INFO,
+                    format!("reconnected to live vdpi daemon (restarted · {new_summary})"),
+                );
+            } else {
+                self.push(
+                    Level::INFO,
+                    format!("reconnected to live vdpi daemon ({new_summary})"),
+                );
+            }
+        } else if counters_reset {
+            self.push(
+                Level::WARN,
+                "daemon telemetry counters reset (service restarted)",
+            );
+        }
+
+        if counters_reset {
+            self.last_auto_heal = sample.snap.auto_heal_escalations;
+            self.last_auto_heal_log = None;
+            self.last_learned_hosts = sample.snap.learned_hosts;
+            self.last_learned_hosts_log = None;
+            let total_bytes = sample.snap.bytes_rx.saturating_add(sample.snap.bytes_tx);
+            self.next_traffic_milestone = next_traffic_milestone_after(total_bytes);
+        }
+
+        match (&prev.info.engine, &sample.engine) {
+            (
+                DashboardEngine::Tun {
+                    interface: old_iface,
+                    physical_nic: old_nic,
+                    vpn_conflict: old_vpn,
+                },
+                DashboardEngine::Tun {
+                    interface: new_iface,
+                    physical_nic: new_nic,
+                    vpn_conflict: new_vpn,
+                },
+            ) => {
+                if old_iface != new_iface {
+                    self.push(
+                        Level::INFO,
+                        format!("TUN interface changed: {old_iface} -> {new_iface}"),
+                    );
+                }
+                let old_nic_norm = normalize_opt_string(old_nic.clone());
+                let new_nic_norm = normalize_opt_string(new_nic.clone());
+                if old_nic_norm != new_nic_norm {
+                    self.push(
+                        Level::INFO,
+                        format!(
+                            "TUN uplink changed: {} -> {}",
+                            old_nic_norm.as_deref().unwrap_or("none"),
+                            new_nic_norm.as_deref().unwrap_or("none")
+                        ),
+                    );
+                }
+                let old_vpn_norm = normalize_opt_string(old_vpn.clone());
+                let new_vpn_norm = normalize_opt_string(new_vpn.clone());
+                if old_vpn_norm != new_vpn_norm {
+                    match (old_vpn_norm, new_vpn_norm) {
+                        (None, Some(v)) => {
+                            self.push(Level::WARN, format!("VPN conflict detected: {v}"));
+                        }
+                        (Some(old), None) => {
+                            self.push(Level::INFO, format!("VPN conflict cleared (was {old})"));
+                        }
+                        (Some(old), Some(new)) => {
+                            self.push(Level::WARN, format!("VPN conflict changed: {old} -> {new}"));
+                        }
+                        (None, None) => {}
+                    }
+                }
+            }
+            (
+                DashboardEngine::Proxy {
+                    primary_addr: old_p,
+                    socks_addr: old_s,
+                    system_proxy: old_sys,
+                },
+                DashboardEngine::Proxy {
+                    primary_addr: new_p,
+                    socks_addr: new_s,
+                    system_proxy: new_sys,
+                },
+            ) => {
+                if old_p != new_p || old_s != new_s || old_sys != new_sys {
+                    self.push(
+                        Level::INFO,
+                        format!("proxy configuration updated: {new_summary}"),
+                    );
+                }
+            }
+            _ => {
+                self.push(Level::INFO, format!("engine switched to {new_summary}"));
+                if let DashboardEngine::Tun {
+                    vpn_conflict: Some(vpn),
+                    ..
+                } = &sample.engine
+                {
+                    let vpn = sanitize_single_line(vpn);
+                    if !vpn.is_empty() {
+                        self.push(Level::WARN, format!("VPN conflict active: {vpn}"));
+                    }
+                }
+            }
+        }
+
+        if prev.info.mode != sample.mode {
+            self.push(
+                Level::INFO,
+                format!(
+                    "desync mode changed: {} -> {}",
+                    format_desync_mode(prev.info.mode),
+                    format_desync_mode(sample.mode)
+                ),
+            );
+        }
+
+        if prev.info.enable_doh != sample.doh {
+            let old_dns = if prev.info.enable_doh { "DoH" } else { "UDP" };
+            let new_dns = if sample.doh { "DoH" } else { "UDP" };
+            self.push(
+                Level::INFO,
+                format!("DNS transport changed: {old_dns} -> {new_dns}"),
+            );
+        }
+
+        if let Some(prev_quic) = self.last_block_quic {
+            if prev_quic != sample.block_quic {
+                let state_str = if sample.block_quic {
+                    "enabled"
+                } else {
+                    "disabled"
+                };
+                self.push(Level::INFO, format!("QUIC blocking {state_str}"));
+            }
+        }
+        self.last_block_quic = Some(sample.block_quic);
+
+        let new_stage = normalize_opt_string(sample.isp_stage.clone());
+        if prev.isp_stage != new_stage {
+            match (&prev.isp_stage, &new_stage) {
+                (Some(old), Some(new)) => {
+                    self.push(Level::INFO, format!("ISP stage changed: {old} -> {new}"));
+                }
+                (None, Some(new)) => {
+                    self.push(Level::INFO, format!("ISP stage active: {new}"));
+                }
+                (Some(old), None) => {
+                    self.push(Level::INFO, format!("ISP stage cleared (was {old})"));
+                }
+                (None, None) => {}
+            }
+        }
+
+        if !counters_reset {
+            if sample.snap.auto_heal_escalations > self.last_auto_heal
+                && self
+                    .last_auto_heal_log
+                    .is_none_or(|t| now.saturating_duration_since(t) >= AUTO_HEAL_LOG_COOLDOWN)
+            {
+                let delta = sample.snap.auto_heal_escalations - self.last_auto_heal;
+                self.push(
+                    Level::WARN,
+                    format!(
+                        "auto-heal escalated (+{delta}, total {})",
+                        sample.snap.auto_heal_escalations
+                    ),
+                );
+                self.last_auto_heal = sample.snap.auto_heal_escalations;
+                self.last_auto_heal_log = Some(now);
+            }
+
+            if sample.snap.learned_hosts > self.last_learned_hosts {
+                let delta = sample.snap.learned_hosts - self.last_learned_hosts;
+                if delta >= 5
+                    || self.last_learned_hosts_log.is_none_or(|t| {
+                        now.saturating_duration_since(t) >= LEARNED_HOSTS_LOG_COOLDOWN
+                    })
+                {
+                    self.push(
+                        Level::INFO,
+                        format!(
+                            "adaptive strategy cache grew (+{delta}, total {} hosts)",
+                            sample.snap.learned_hosts
+                        ),
+                    );
+                    self.last_learned_hosts = sample.snap.learned_hosts;
+                    self.last_learned_hosts_log = Some(now);
+                }
+            }
+
+            let total_bytes = sample.snap.bytes_rx.saturating_add(sample.snap.bytes_tx);
+            if total_bytes >= self.next_traffic_milestone {
+                self.push(
+                    Level::INFO,
+                    format!(
+                        "traffic milestone: {} total ({} down / {} up, {} connections)",
+                        format_bytes(total_bytes),
+                        format_bytes(sample.snap.bytes_rx),
+                        format_bytes(sample.snap.bytes_tx),
+                        sample.snap.total_connections
+                    ),
+                );
+                self.next_traffic_milestone = next_traffic_milestone_after(total_bytes);
+            }
+        }
+    }
+}
+
+async fn probe_via_http_connect(proxy_addr: SocketAddr, host: &str) -> ProbeStatus {
+    let started = Instant::now();
+    let connect_addr = normalize_loopback_connect_addr(proxy_addr);
+    let result = tokio::time::timeout(PROBE_TIMEOUT, async {
+        let mut stream = TcpStream::connect(connect_addr).await?;
+        let req = format!(
+            "CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\nProxy-Connection: keep-alive\r\n\r\n"
+        );
+        stream.write_all(req.as_bytes()).await?;
+        stream.flush().await?;
+
+        let mut buf = Vec::with_capacity(256);
+        let mut chunk = [0u8; 256];
+        loop {
+            let n = stream.read(&mut chunk).await?;
+            if n == 0 {
+                break;
+            }
+            let remaining = PROXY_CONNECT_MAX_HEADER_BYTES.saturating_sub(buf.len());
+            let take = n.min(remaining);
+            buf.extend_from_slice(&chunk[..take]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n")
+                || buf.len() >= PROXY_CONNECT_MAX_HEADER_BYTES
+            {
+                break;
+            }
+        }
+        let header = String::from_utf8_lossy(&buf);
+        let status_line = header
+            .lines()
+            .next()
+            .map(sanitize_single_line)
+            .unwrap_or_default();
+        Ok::<String, io::Error>(status_line)
+    })
+    .await;
+
+    let latency_ms = started.elapsed().as_millis();
+    match result {
+        Ok(Ok(status_line)) => {
+            let code = status_line.split_whitespace().nth(1);
+            if status_line.starts_with("HTTP/1.") && code == Some("200") {
+                ProbeStatus::Pass {
+                    latency_ms,
+                    detail: "CONNECT 200".to_string(),
+                }
+            } else if status_line.is_empty() {
+                ProbeStatus::Fail {
+                    latency_ms,
+                    reason: "empty proxy response".to_string(),
+                }
+            } else {
+                ProbeStatus::Fail {
+                    latency_ms,
+                    reason: status_line,
+                }
+            }
+        }
+        Ok(Err(err)) => ProbeStatus::Fail {
+            latency_ms,
+            reason: sanitize_single_line(&err.to_string()),
+        },
+        Err(_) => ProbeStatus::Fail {
+            latency_ms,
+            reason: "timed out".to_string(),
+        },
+    }
+}
+
+async fn probe_via_tun_direct(
+    client: Option<Arc<reqwest::Client>>,
+    enable_doh: bool,
+    idx: usize,
+    host: &'static str,
+) -> ProbeStatus {
+    let started = Instant::now();
+    if idx == 0 && !enable_doh {
+        let result =
+            tokio::time::timeout(PROBE_TIMEOUT, tokio::net::lookup_host((host, 443))).await;
+        let latency_ms = started.elapsed().as_millis();
+        return match result {
+            Ok(Ok(mut addrs)) => {
+                let detail = addrs
+                    .next()
+                    .map(|sa| sa.ip().to_string())
+                    .unwrap_or_else(|| "ok".to_string());
+                ProbeStatus::Pass { latency_ms, detail }
+            }
+            Ok(Err(err)) => ProbeStatus::Fail {
+                latency_ms,
+                reason: sanitize_single_line(&err.to_string()),
+            },
+            Err(_) => ProbeStatus::Fail {
+                latency_ms,
+                reason: "timed out".to_string(),
+            },
+        };
+    }
+
+    let Some(client) = client else {
+        return ProbeStatus::Fail {
+            latency_ms: started.elapsed().as_millis(),
+            reason: "HTTP client unavailable".to_string(),
+        };
+    };
+
+    let result = tokio::time::timeout(PROBE_TIMEOUT, async move {
+        if idx == 0 {
+            let resp = client
+                .get("https://1.1.1.1/dns-query?name=one.one.one.one&type=A")
+                .header(reqwest::header::ACCEPT, "application/dns-json")
+                .send()
+                .await
+                .map_err(|e| sanitize_single_line(&e.to_string()))?;
+            let status = resp.status();
+            if status.is_success() {
+                Ok::<String, String>(format!("DoH HTTP {}", status.as_u16()))
+            } else {
+                Err(format!("DoH HTTP {}", status.as_u16()))
+            }
+        } else {
+            let url = format!("https://{host}/");
+            let resp = client
+                .head(&url)
+                .send()
+                .await
+                .map_err(|e| sanitize_single_line(&e.to_string()))?;
+            Ok(format!("TLS HTTP {}", resp.status().as_u16()))
+        }
+    })
+    .await;
+
+    let latency_ms = started.elapsed().as_millis();
+    match result {
+        Ok(Ok(detail)) => ProbeStatus::Pass { latency_ms, detail },
+        Ok(Err(reason)) => ProbeStatus::Fail {
+            latency_ms,
+            reason: sanitize_single_line(&reason),
+        },
+        Err(_) => ProbeStatus::Fail {
+            latency_ms,
+            reason: "timed out".to_string(),
+        },
+    }
+}
+
+fn spawn_attached_diagnostics_probes(
+    tasks: &mut JoinSet<()>,
+    engine: &DashboardEngine,
+    enable_doh: bool,
+    diag_state: &Arc<Mutex<DiagnosticsState>>,
+    run_id: u64,
+    targets: [(usize, &'static str); 4],
+) {
+    match engine {
+        DashboardEngine::Proxy { primary_addr, .. } => {
+            let proxy_addr = *primary_addr;
+            for (idx, host) in targets {
+                let diag = Arc::clone(diag_state);
+                tasks.spawn(async move {
+                    let status = probe_via_http_connect(proxy_addr, host).await;
+                    let mut guard = diag.lock().unwrap_or_else(|e| e.into_inner());
+                    if guard.run_id == run_id {
+                        guard.rows[idx].status = status;
+                    }
+                });
+            }
+        }
+        DashboardEngine::Tun { .. } => {
+            let shared_client = reqwest::Client::builder()
+                .https_only(true)
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(PROBE_TIMEOUT)
+                .build()
+                .ok()
+                .map(Arc::new);
+            for (idx, host) in targets {
+                let diag = Arc::clone(diag_state);
+                let client = shared_client.clone();
+                tasks.spawn(async move {
+                    let status = probe_via_tun_direct(client, enable_doh, idx, host).await;
+                    let mut guard = diag.lock().unwrap_or_else(|e| e.into_inner());
+                    if guard.run_id == run_id {
+                        guard.rows[idx].status = status;
+                    }
+                });
+            }
+        }
+    }
+}
+
 fn spawn_diagnostics_probes(
     tasks: &mut JoinSet<()>,
     ctx: &EngineContext,
@@ -812,6 +1491,9 @@ where
     let now = Instant::now();
     let mut state = DashboardState::new(info, logs, color, now);
     state.update_telemetry(ctx.telemetry_snapshot(), now);
+    state.rss_kb = vdpi::health::read_self_rss_kb();
+    state.isp_stage = Some(ctx.preferred_stage().label().to_string());
+    let mut last_rss_sample = now;
     if let Some(ref probe) = tun_meta_probe {
         state.refresh_tun_meta(probe());
     }
@@ -827,6 +1509,11 @@ where
         while state.diag_tasks.try_join_next().is_some() {}
         let now = Instant::now();
         state.update_telemetry(ctx.telemetry_snapshot(), now);
+        state.isp_stage = Some(ctx.preferred_stage().label().to_string());
+        if now.saturating_duration_since(last_rss_sample) >= Duration::from_secs(1) {
+            state.rss_kb = vdpi::health::read_self_rss_kb();
+            last_rss_sample = now;
+        }
         if let Some(ref probe) = tun_meta_probe {
             state.refresh_tun_meta(probe());
         }
@@ -866,7 +1553,7 @@ where
                                     targets,
                                 );
                             }
-                            KeyAction::Redraw | KeyAction::None => {}
+                            KeyAction::Refresh | KeyAction::Redraw | KeyAction::None => {}
                         }
                     }
                     // Resize and other events simply trigger the next redraw iteration.
@@ -887,11 +1574,180 @@ where
     Ok(())
 }
 
+/// Runs the remote-attach live dashboard connected to an already-running background
+/// `vdpi` service. Polls `probe_fn` on a background `spawn_blocking` timer every
+/// 500 ms (or immediately on `[r]`) so keyboard input never stutters, synthesizes
+/// non-spammy activity log entries for state transitions, and detaches cleanly on
+/// `q`, `Esc`, `Ctrl-C`, or `external_shutdown` without stopping the daemon.
+pub async fn run_attached_dashboard<P, F>(
+    initial_info: DashboardInfo,
+    initial_snap: EngineTelemetrySnapshot,
+    initial_rss_kb: Option<u64>,
+    initial_isp_stage: Option<String>,
+    probe_fn: P,
+    external_shutdown: F,
+) -> Result<()>
+where
+    P: Fn() -> Option<AttachedTelemetry> + Send + Sync + 'static,
+    F: Future<Output = ()>,
+{
+    let color = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
+    let mut guard = DashboardGuard::enter()?;
+
+    let now = Instant::now();
+    let logs = new_log_ring();
+    let mut tracker = AttachedActivityTracker::new(
+        Arc::clone(&logs),
+        &initial_info,
+        initial_snap,
+        initial_isp_stage.as_deref(),
+    );
+    let mut state = DashboardState::new_attached(
+        initial_info,
+        initial_snap,
+        initial_rss_kb,
+        initial_isp_stage,
+        logs,
+        color,
+        now,
+    );
+
+    let probe_fn = Arc::new(probe_fn);
+    let (refresh_tx, mut refresh_rx) = mpsc::channel::<()>(4);
+    let (poll_tx, mut poll_rx) = mpsc::channel::<Option<AttachedTelemetry>>(4);
+    let _poller_guard = TaskAbortGuard::new(tokio::spawn(async move {
+        let mut poll_tick = tokio::time::interval(ATTACHED_POLL_INTERVAL);
+        poll_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Consume immediate first tick; initial_snap is already rendered.
+        poll_tick.tick().await;
+        loop {
+            tokio::select! {
+                biased;
+                maybe_req = refresh_rx.recv() => {
+                    if maybe_req.is_none() {
+                        break;
+                    }
+                    while refresh_rx.try_recv().is_ok() {}
+                    poll_tick.reset();
+                }
+                _ = poll_tick.tick() => {}
+            }
+            let probe = Arc::clone(&probe_fn);
+            let sample = tokio::task::spawn_blocking(move || probe())
+                .await
+                .ok()
+                .flatten();
+            if poll_tx.send(sample).await.is_err() {
+                break;
+            }
+        }
+    }));
+
+    let mut reader_guard = EventReaderGuard::spawn();
+    let mut tick = tokio::time::interval(TICK_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut manual_refresh_pending = false;
+
+    tokio::pin!(external_shutdown);
+
+    let loop_result: io::Result<()> = loop {
+        while state.diag_tasks.try_join_next().is_some() {}
+        let now = Instant::now();
+        state.tick_reconnecting(now);
+
+        if let Err(err) = guard
+            .terminal
+            .draw(|frame| render_dashboard(frame, &mut state))
+        {
+            break Err(err);
+        }
+
+        tokio::select! {
+            biased;
+            _ = &mut external_shutdown => {
+                break Ok(());
+            }
+            maybe_ev = reader_guard.recv() => {
+                match maybe_ev {
+                    Some(Event::Key(key)) => {
+                        match handle_key_event(&mut state, key) {
+                            KeyAction::Quit => break Ok(()),
+                            KeyAction::Refresh => {
+                                manual_refresh_pending = true;
+                                let _ = refresh_tx.try_send(());
+                                state.set_notice("Refreshing...", Instant::now());
+                            }
+                            KeyAction::RunDiagnostics => {
+                                let (run_id, targets) = state.begin_diagnostics_run();
+                                spawn_attached_diagnostics_probes(
+                                    &mut state.diag_tasks,
+                                    &state.info.engine,
+                                    state.info.enable_doh,
+                                    &state.diagnostics,
+                                    run_id,
+                                    targets,
+                                );
+                            }
+                            KeyAction::ClearCache | KeyAction::Redraw | KeyAction::None => {}
+                        }
+                    }
+                    // Resize and other events simply trigger the next redraw iteration.
+                    Some(_) => {}
+                    None => break Ok(()),
+                }
+            }
+            maybe_sample = poll_rx.recv() => {
+                let sample_now = Instant::now();
+                match maybe_sample {
+                    Some(Some(sample)) => {
+                        tracker.on_sample(&state, &sample, sample_now);
+                        state.apply_attached_sample(sample, sample_now);
+                        if manual_refresh_pending {
+                            manual_refresh_pending = false;
+                            state.set_notice("Refreshed", sample_now);
+                        }
+                    }
+                    Some(None) => {
+                        tracker.on_offline(&state);
+                        state.mark_reconnecting(sample_now);
+                        if manual_refresh_pending {
+                            manual_refresh_pending = false;
+                            state.set_notice("Daemon unreachable", sample_now);
+                        }
+                    }
+                    None => {
+                        tracker.on_offline(&state);
+                        state.mark_reconnecting(sample_now);
+                    }
+                }
+            }
+            _ = tick.tick() => {}
+        }
+    };
+
+    state.abort_diagnostics_tasks();
+    drop(_poller_guard);
+    drop(refresh_tx);
+    drop(reader_guard);
+    drop(guard);
+
+    loop_result?;
+    Ok(())
+}
+
 fn render_dashboard(frame: &mut Frame<'_>, state: &mut DashboardState) {
     let area = frame.area();
     if area.width < 12 || area.height < 8 {
-        let msg = Line::from(format!("vdpi v{}  (q quit)", env!("CARGO_PKG_VERSION")))
-            .style(state.palette.title);
+        let quit_hint = if state.is_attached {
+            "q back"
+        } else {
+            "q quit"
+        };
+        let version = state
+            .remote_version
+            .as_deref()
+            .unwrap_or(env!("CARGO_PKG_VERSION"));
+        let msg = Line::from(format!("vdpi v{version}  ({quit_hint})")).style(state.palette.title);
         frame.render_widget(Paragraph::new(msg), area);
         return;
     }
@@ -958,7 +1814,10 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
         return;
     }
 
-    let version = env!("CARGO_PKG_VERSION");
+    let version = state
+        .remote_version
+        .as_deref()
+        .unwrap_or(env!("CARGO_PKG_VERSION"));
     let mode = format_desync_mode(state.info.mode);
     let dns = if state.info.enable_doh { "DoH" } else { "UDP" };
     let uptime = format_uptime(state.started_at.elapsed());
@@ -967,15 +1826,70 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
     let sep = Span::styled(" · ", p.dim);
 
     // "● vdpi v{version}" = 8 chars + version length.
-    let head_len = 8 + version.len();
+    let head_len = 8 + version.chars().count();
+    let dot_style = if state.is_attached && state.reconnecting {
+        p.amber
+    } else {
+        p.emerald
+    };
 
     let mut spans = vec![
-        Span::styled("●", p.emerald),
+        Span::styled("●", dot_style),
         Span::raw(" "),
         Span::styled("vdpi", p.title),
         Span::raw(" "),
         Span::styled(format!("v{version}"), p.label),
     ];
+
+    if state.is_attached && state.reconnecting {
+        const RECONNECTING: &str = "Reconnecting…";
+        let reconnecting_len = RECONNECTING.chars().count();
+        let engine_tag = match &state.info.engine {
+            DashboardEngine::Proxy { primary_addr, .. } => primary_addr.to_string(),
+            DashboardEngine::Tun { interface, .. } => format!("TUN {interface}"),
+        };
+        let engine_len = engine_tag.chars().count();
+
+        let full_len =
+            head_len + 3 + reconnecting_len + 3 + engine_len + 3 + "Uptime ".len() + uptime.len();
+        let med_len = head_len + 3 + reconnecting_len + 3 + engine_len + 3 + uptime.len();
+        let compact_len = head_len + 3 + reconnecting_len + 3 + uptime.len();
+        let min_len = head_len + 3 + reconnecting_len;
+
+        if w >= full_len {
+            spans.push(sep.clone());
+            spans.push(Span::styled(RECONNECTING, p.amber));
+            spans.push(sep.clone());
+            spans.push(Span::styled(engine_tag, p.label));
+            spans.push(sep);
+            spans.push(Span::styled("Uptime ", p.label));
+            spans.push(Span::styled(uptime, p.text));
+        } else if w >= med_len {
+            spans.push(sep.clone());
+            spans.push(Span::styled(RECONNECTING, p.amber));
+            spans.push(sep.clone());
+            spans.push(Span::styled(engine_tag, p.label));
+            spans.push(sep);
+            spans.push(Span::styled(uptime, p.text));
+        } else if w >= compact_len {
+            spans.push(sep.clone());
+            spans.push(Span::styled(RECONNECTING, p.amber));
+            spans.push(sep);
+            spans.push(Span::styled(uptime, p.text));
+        } else if w >= min_len {
+            spans.push(sep);
+            spans.push(Span::styled(RECONNECTING, p.amber));
+        } else {
+            let rem = w.saturating_sub(head_len + 3);
+            if rem > 0 {
+                spans.push(sep);
+                spans.push(Span::styled(truncate_chars(RECONNECTING, rem), p.amber));
+            }
+        }
+
+        frame.render_widget(Paragraph::new(Line::from(spans)), inner);
+        return;
+    }
 
     match &state.info.engine {
         DashboardEngine::Proxy {
@@ -1202,15 +2116,38 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
 
 fn render_stats_panel(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) {
     let p = state.palette;
-    let block = Block::bordered()
+    let avail = area.width.saturating_sub(2) as usize;
+    let left_title = " Traffic & Engine ";
+    let left_len = left_title.chars().count();
+    let rss_title = state.rss_kb.and_then(|kb| {
+        let formatted = format_rss_kb(kb);
+        let full_len = " RSS ".len() + formatted.len() + 1;
+        if left_len + 1 + full_len <= avail {
+            Some(Line::from(vec![
+                Span::styled(" RSS ", p.label),
+                Span::styled(formatted, p.text),
+                Span::raw(" "),
+            ]))
+        } else {
+            let compact_len = 1 + formatted.len() + 1;
+            (left_len + 1 + compact_len <= avail).then(|| {
+                Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(formatted, p.text),
+                    Span::raw(" "),
+                ])
+            })
+        }
+    });
+
+    let mut block = Block::bordered()
         .border_type(p.border_type)
         .border_style(p.border)
         .padding(Padding::horizontal(1))
-        .title_top(
-            Line::from(" Traffic & Engine ")
-                .style(p.title)
-                .left_aligned(),
-        );
+        .title_top(Line::from(left_title).style(p.title).left_aligned());
+    if let Some(rss) = rss_title {
+        block = block.title_top(rss.right_aligned());
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1362,6 +2299,40 @@ fn render_sparkline_panel(frame: &mut Frame<'_>, area: Rect, state: &DashboardSt
     if let Some(right) = right_title {
         block = block.title_top(Line::from(right).style(p.label).right_aligned());
     }
+    if let Some(stage) = state
+        .isp_stage
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let full_len = " ISP Stage ".len() + stage.chars().count() + 1;
+        let short_len = " Stage ".len() + stage.chars().count() + 1;
+        let bottom = if full_len <= avail {
+            Some(Line::from(vec![
+                Span::styled(" ISP Stage ", p.label),
+                Span::styled(stage.to_string(), p.text),
+                Span::raw(" "),
+            ]))
+        } else if short_len <= avail {
+            Some(Line::from(vec![
+                Span::styled(" Stage ", p.label),
+                Span::styled(stage.to_string(), p.text),
+                Span::raw(" "),
+            ]))
+        } else if avail > " Stage ".len() + 2 {
+            let budget = avail - " Stage ".len() - 1;
+            Some(Line::from(vec![
+                Span::styled(" Stage ", p.label),
+                Span::styled(truncate_chars(stage, budget), p.text),
+                Span::raw(" "),
+            ]))
+        } else {
+            None
+        };
+        if let Some(line) = bottom {
+            block = block.title_bottom(line.left_aligned());
+        }
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1475,7 +2446,60 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) {
     };
 
     let w = usize::from(legend_area.width);
-    let legend = if w >= 57 {
+    let legend = if state.is_attached {
+        if w >= 47 {
+            let sep = Span::styled(" · ", p.dim);
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled("d", p.key_hint),
+                Span::styled(" diagnostics", p.dim),
+                sep.clone(),
+                Span::styled("r", p.key_hint),
+                Span::styled(" refresh", p.dim),
+                sep.clone(),
+                Span::styled("↑↓", p.key_hint),
+                Span::styled(" scroll", p.dim),
+                sep,
+                Span::styled("q", p.key_hint),
+                Span::styled(" back", p.dim),
+            ])
+        } else if w >= 40 {
+            let sep = Span::styled(" · ", p.dim);
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled("d", p.key_hint),
+                Span::styled(" diag", p.dim),
+                sep.clone(),
+                Span::styled("r", p.key_hint),
+                Span::styled(" refresh", p.dim),
+                sep.clone(),
+                Span::styled("↑↓", p.key_hint),
+                Span::styled(" scroll", p.dim),
+                sep,
+                Span::styled("q", p.key_hint),
+                Span::styled(" back", p.dim),
+            ])
+        } else if w >= 20 {
+            let sep = Span::styled(" · ", p.dim);
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled("d", p.key_hint),
+                sep.clone(),
+                Span::styled("r", p.key_hint),
+                sep.clone(),
+                Span::styled("↑↓", p.key_hint),
+                sep,
+                Span::styled("q", p.key_hint),
+                Span::styled(" back", p.dim),
+            ])
+        } else {
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled("q", p.key_hint),
+                Span::styled(" back", p.dim),
+            ])
+        }
+    } else if w >= 57 {
         let sep = Span::styled("  ·  ", p.dim);
         Line::from(vec![
             Span::raw(" "),
@@ -1654,7 +2678,11 @@ fn render_diagnostics_modal(frame: &mut Frame<'_>, area: Rect, state: &Dashboard
         let total = snapshot.rows.len();
         let done = passed + failed;
         let summary = if done < total {
-            format!("Probing {done}/{total} targets via engine DNS...")
+            if state.is_attached {
+                format!("Probing {done}/{total} targets via live daemon...")
+            } else {
+                format!("Probing {done}/{total} targets via engine DNS...")
+            }
         } else if failed == 0 {
             format!("All {total}/{total} probes passed")
         } else {
@@ -1750,6 +2778,17 @@ fn format_bytes(bytes: u64) -> String {
 
 fn format_rate(bytes_per_sec: u64) -> String {
     format!("{}/s", format_bytes(bytes_per_sec))
+}
+
+fn format_rss_kb(rss_kb: u64) -> String {
+    if rss_kb < 1024 {
+        format!("{rss_kb} KB")
+    } else if rss_kb < 1024 * 1024 {
+        let mb = rss_kb.saturating_add(512) / 1024;
+        format!("{mb} MB")
+    } else {
+        format!("{:.1} GB", rss_kb as f64 / (1024.0 * 1024.0))
+    }
 }
 
 fn truncate_chars(text: &str, max_chars: usize) -> String {
@@ -2663,5 +3702,490 @@ mod tests {
         let stored = &guard.back().unwrap().message;
         assert_eq!(stored.chars().count(), MAX_LOG_MESSAGE_CHARS);
         assert!(stored.ends_with('…'));
+    }
+
+    fn sample_attached_state(color: bool, reconnecting: bool, tun_mode: bool) -> DashboardState {
+        let now = Instant::now();
+        let info = if tun_mode {
+            sample_tun_info(Some("WireGuard"))
+        } else {
+            sample_info()
+        };
+        let initial_snap = EngineTelemetrySnapshot {
+            active_connections: 6,
+            total_connections: 120,
+            bytes_tx: 8 * 1024 * 1024,
+            bytes_rx: 42 * 1024 * 1024,
+            tls_handshakes: 95,
+            auto_heal_escalations: 1,
+            learned_hosts: 14,
+            udp_flows_active: 9,
+            quic_blocked: 5,
+            dns_queries: 64,
+        };
+        let logs = new_log_ring();
+        let _tracker = AttachedActivityTracker::new(
+            Arc::clone(&logs),
+            &info,
+            initial_snap,
+            Some("ComboMultiRecord"),
+        );
+        let mut state = DashboardState::new_attached(
+            info,
+            initial_snap,
+            Some(29 * 1024),
+            Some("ComboMultiRecord".to_string()),
+            logs,
+            color,
+            now,
+        );
+        state.remote_version = Some(env!("CARGO_PKG_VERSION").to_string());
+        state.rx_rate = 256 * 1024;
+        state.tx_rate = 32 * 1024;
+        for v in [30_000, 80_000, 180_000, 288 * 1024] {
+            state.throughput.push(v);
+        }
+        state.reconnecting = reconnecting;
+        state
+    }
+
+    #[test]
+    fn telemetry_rate_seeding_delta_and_counter_reset_recovery() {
+        let t0 = Instant::now();
+        let logs = new_log_ring();
+        let initial = EngineTelemetrySnapshot {
+            bytes_rx: 500_000_000,
+            bytes_tx: 80_000_000,
+            ..Default::default()
+        };
+
+        // Seeding on first snapshot must produce 0 initial spike even if elapsed >= 1s.
+        let mut fresh = DashboardState::new(sample_info(), Arc::clone(&logs), true, t0);
+        fresh.update_telemetry(initial, t0 + Duration::from_secs(5));
+        assert_eq!(fresh.rx_rate, 0);
+        assert_eq!(fresh.tx_rate, 0);
+        assert_eq!(fresh.throughput.latest(), 0);
+        assert_eq!(fresh.throughput.peak(), 0);
+
+        // Attached constructor also seeds without spiking.
+        let mut state = DashboardState::new_attached(
+            sample_info(),
+            initial,
+            Some(29 * 1024),
+            Some("ComboMultiRecord".to_string()),
+            logs,
+            true,
+            t0,
+        );
+        assert_eq!(state.rx_rate, 0);
+        assert_eq!(state.tx_rate, 0);
+        assert_eq!(state.throughput.peak(), 0);
+
+        // Subsequent 2s delta computes exact bytes/sec rates.
+        let t1 = t0 + Duration::from_secs(2);
+        let snap1 = EngineTelemetrySnapshot {
+            bytes_rx: initial.bytes_rx + 200_000,
+            bytes_tx: initial.bytes_tx + 40_000,
+            ..Default::default()
+        };
+        state.update_telemetry(snap1, t1);
+        assert_eq!(state.rx_rate, 100_000);
+        assert_eq!(state.tx_rate, 20_000);
+        assert_eq!(state.throughput.latest(), 120_000);
+
+        // Daemon restart: counters drop below previous baseline -> clean zero reset, no underflow.
+        let t2 = t1 + Duration::from_secs(1);
+        let snap_reset = EngineTelemetrySnapshot {
+            bytes_rx: 4_096,
+            bytes_tx: 512,
+            ..Default::default()
+        };
+        state.update_telemetry(snap_reset, t2);
+        assert_eq!(state.rx_rate, 0);
+        assert_eq!(state.tx_rate, 0);
+        assert_eq!(state.prev_rx, 4_096);
+        assert_eq!(state.prev_tx, 512);
+        assert_eq!(state.throughput.latest(), 0);
+
+        // Next 1s sample after reset recovers accurate rate immediately.
+        let t3 = t2 + Duration::from_secs(1);
+        let snap_recovered = EngineTelemetrySnapshot {
+            bytes_rx: 4_096 + 20_000,
+            bytes_tx: 512 + 4_000,
+            ..Default::default()
+        };
+        state.update_telemetry(snap_recovered, t3);
+        assert_eq!(state.rx_rate, 20_000);
+        assert_eq!(state.tx_rate, 4_000);
+        assert_eq!(state.throughput.latest(), 24_000);
+
+        // Reconnect after offline window re-baselines instead of producing a fake catch-up spike.
+        let t4 = t3 + Duration::from_secs(2);
+        state.mark_reconnecting(t4);
+        assert!(state.reconnecting);
+        assert_eq!(state.rx_rate, 0);
+        assert_eq!(state.tx_rate, 0);
+
+        let t5 = t4 + Duration::from_secs(3);
+        state.apply_attached_sample(
+            AttachedTelemetry {
+                snap: EngineTelemetrySnapshot {
+                    bytes_rx: snap_recovered.bytes_rx + 5_000_000,
+                    bytes_tx: snap_recovered.bytes_tx + 1_000_000,
+                    ..Default::default()
+                },
+                engine: sample_info().engine,
+                mode: DesyncMode::Combo,
+                doh: true,
+                block_quic: true,
+                rss_kb: Some(30 * 1024),
+                isp_stage: Some("OobSniDesync".to_string()),
+                version: Some("0.5.5".to_string()),
+            },
+            t5,
+        );
+        assert!(!state.reconnecting);
+        assert_eq!(state.rx_rate, 0);
+        assert_eq!(state.tx_rate, 0);
+        assert_eq!(state.rss_kb, Some(30 * 1024));
+        assert_eq!(state.isp_stage.as_deref(), Some("OobSniDesync"));
+    }
+
+    #[test]
+    fn renders_attached_dashboard_across_all_sizes_connected_and_reconnecting() {
+        for (w, h) in [(100u16, 30u16), (80, 24), (60, 22), (46, 18)] {
+            // Connected Proxy mode
+            let mut connected = sample_attached_state(true, false, false);
+            let backend = TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| render_dashboard(frame, &mut connected))
+                .unwrap();
+            let screen = buffer_to_string(terminal.backend());
+            let buf = terminal.backend().buffer();
+
+            assert_eq!(
+                buf[(w - 1, 1)].symbol(),
+                "│",
+                "status bar right border clipped at {w}x{h} (connected)"
+            );
+            assert!(
+                screen.contains("RSS 29 MB"),
+                "missing RSS 29 MB at {w}x{h}:\n{screen}"
+            );
+            assert!(
+                screen.contains("ISP Stage ComboMultiRecord"),
+                "missing ISP Stage at {w}x{h}:\n{screen}"
+            );
+            assert!(
+                screen.contains("q back"),
+                "missing 'q back' footer at {w}x{h}:\n{screen}"
+            );
+            assert!(
+                !screen.contains("clear cache") && !screen.contains("q quit"),
+                "attached footer leaked foreground hints at {w}x{h}:\n{screen}"
+            );
+            if w >= 60 {
+                assert!(
+                    screen.contains("d diagnostics · r refresh · ↑↓ scroll · q back"),
+                    "expected full attached footer at {w}x{h}:\n{screen}"
+                );
+            } else {
+                assert!(
+                    screen.contains("d diag · r refresh · ↑↓ scroll · q back"),
+                    "expected compact attached footer at {w}x{h}:\n{screen}"
+                );
+            }
+            let dot_x = (0..w)
+                .find(|&x| buf[(x, 1)].symbol() == "●")
+                .expect("connected status dot");
+            assert_eq!(buf[(dot_x, 1)].fg, EMERALD_ACTIVE);
+
+            // Reconnecting Proxy mode
+            let mut reconnecting = sample_attached_state(true, true, false);
+            let backend = TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| render_dashboard(frame, &mut reconnecting))
+                .unwrap();
+            let screen = buffer_to_string(terminal.backend());
+            let buf = terminal.backend().buffer();
+
+            assert_eq!(
+                buf[(w - 1, 1)].symbol(),
+                "│",
+                "status bar right border clipped at {w}x{h} (reconnecting)"
+            );
+            assert!(
+                screen.contains("Reconnecting…"),
+                "missing Reconnecting… at {w}x{h}:\n{screen}"
+            );
+            assert!(screen.contains("RSS 29 MB"));
+            assert!(screen.contains("ISP Stage ComboMultiRecord"));
+            assert!(screen.contains("q back"));
+
+            let dot_x = (0..w)
+                .find(|&x| buf[(x, 1)].symbol() == "●")
+                .expect("reconnecting status dot");
+            assert_eq!(buf[(dot_x, 1)].fg, AMBER_WARN);
+            let rec_x = (0..w.saturating_sub(3))
+                .find(|&x| {
+                    buf[(x, 1)].symbol() == "R"
+                        && buf[(x + 1, 1)].symbol() == "e"
+                        && buf[(x + 2, 1)].symbol() == "c"
+                })
+                .expect("Reconnecting… text in status bar");
+            assert_eq!(buf[(rec_x, 1)].fg, AMBER_WARN);
+        }
+
+        // NO_COLOR verification for both connected and reconnecting (wide + compact).
+        for reconnecting in [false, true] {
+            for (w, h) in [(100u16, 30u16), (46, 18)] {
+                let mut state = sample_attached_state(false, reconnecting, true);
+                let backend = TestBackend::new(w, h);
+                let mut terminal = Terminal::new(backend).unwrap();
+                terminal
+                    .draw(|frame| render_dashboard(frame, &mut state))
+                    .unwrap();
+                let screen = buffer_to_string(terminal.backend());
+                assert!(screen.contains('┌'));
+                assert!(!screen.contains('╭'));
+                assert!(screen.contains("RSS 29 MB"));
+                assert!(screen.contains("ISP Stage ComboMultiRecord"));
+                assert!(screen.contains("q back"));
+                if reconnecting {
+                    assert!(screen.contains("Reconnecting…"));
+                }
+
+                let buf = terminal.backend().buffer();
+                for y in 0..buf.area.height {
+                    for x in 0..buf.area.width {
+                        let cell = &buf[(x, y)];
+                        assert_eq!(
+                            cell.fg,
+                            Color::Reset,
+                            "unexpected fg color at ({x},{y}) in NO_COLOR attached mode"
+                        );
+                        assert_eq!(
+                            cell.bg,
+                            Color::Reset,
+                            "unexpected bg color at ({x},{y}) in NO_COLOR attached mode"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn attached_key_handling_refresh_diagnostics_and_modal_esc() {
+        let mut state = sample_attached_state(true, false, false);
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        // 'c' is ignored in attached mode (no remote cache-clear endpoint).
+        assert_eq!(
+            handle_key_event(&mut state, press(KeyCode::Char('c'))),
+            KeyAction::None
+        );
+
+        // 'r' triggers manual refresh when diagnostics modal is closed.
+        assert_eq!(
+            handle_key_event(&mut state, press(KeyCode::Char('r'))),
+            KeyAction::Refresh
+        );
+
+        // 'd' opens diagnostics modal and runs probes.
+        assert_eq!(
+            handle_key_event(&mut state, press(KeyCode::Char('d'))),
+            KeyAction::RunDiagnostics
+        );
+        assert!(state.diagnostics_open);
+
+        // While modal is open, 'r' re-runs diagnostics and 'Esc' closes modal without quitting.
+        assert_eq!(
+            handle_key_event(&mut state, press(KeyCode::Char('r'))),
+            KeyAction::RunDiagnostics
+        );
+        assert_eq!(
+            handle_key_event(&mut state, press(KeyCode::Esc)),
+            KeyAction::Redraw
+        );
+        assert!(!state.diagnostics_open);
+
+        // Once modal is closed, 'Esc', 'q', and Ctrl-C all detach/quit cleanly.
+        assert_eq!(
+            handle_key_event(&mut state, press(KeyCode::Esc)),
+            KeyAction::Quit
+        );
+        assert_eq!(
+            handle_key_event(&mut state, press(KeyCode::Char('q'))),
+            KeyAction::Quit
+        );
+        assert_eq!(
+            handle_key_event(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            ),
+            KeyAction::Quit
+        );
+    }
+
+    #[test]
+    fn attached_activity_tracker_synthesizes_non_spammy_transitions() {
+        let t0 = Instant::now();
+        let logs = new_log_ring();
+        let initial_info = sample_info();
+        let initial_snap = EngineTelemetrySnapshot {
+            bytes_rx: 1024,
+            bytes_tx: 512,
+            auto_heal_escalations: 1,
+            learned_hosts: 2,
+            ..Default::default()
+        };
+        let mut tracker = AttachedActivityTracker::new(
+            Arc::clone(&logs),
+            &initial_info,
+            initial_snap,
+            Some("ComboMultiRecord"),
+        );
+        let mut state = DashboardState::new_attached(
+            initial_info,
+            initial_snap,
+            Some(29 * 1024),
+            Some("ComboMultiRecord".to_string()),
+            Arc::clone(&logs),
+            true,
+            t0,
+        );
+
+        // Startup log present.
+        assert!(logs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.message.contains("attached to live vdpi daemon")));
+
+        // Offline warning fires only once while staying offline.
+        tracker.on_offline(&state);
+        state.mark_reconnecting(t0 + Duration::from_secs(1));
+        tracker.on_offline(&state);
+        let offline_count = logs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.message.contains("daemon unreachable"))
+            .count();
+        assert_eq!(offline_count, 1);
+
+        // Reconnect + mode/engine/ISP-stage/VPN-conflict transitions.
+        let sample = AttachedTelemetry {
+            snap: EngineTelemetrySnapshot {
+                bytes_rx: 12 * 1024 * 1024,
+                bytes_tx: 2 * 1024 * 1024,
+                total_connections: 25,
+                auto_heal_escalations: 3,
+                learned_hosts: 8,
+                ..Default::default()
+            },
+            engine: sample_tun_info(Some("WireGuard")).engine,
+            mode: DesyncMode::TlsRecord,
+            doh: false,
+            block_quic: true,
+            rss_kb: Some(31 * 1024),
+            isp_stage: Some("OobSniDesync".to_string()),
+            version: Some("0.5.5".to_string()),
+        };
+        let t1 = t0 + Duration::from_secs(2);
+        tracker.on_sample(&state, &sample, t1);
+        state.apply_attached_sample(sample, t1);
+
+        let messages: Vec<String> = logs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.message.clone())
+            .collect();
+        assert!(messages
+            .iter()
+            .any(|m| m.contains("reconnected to live vdpi daemon")));
+        assert!(messages
+            .iter()
+            .any(|m| m.contains("engine switched to TUN vdpi0")));
+        assert!(messages
+            .iter()
+            .any(|m| m.contains("VPN conflict active: WireGuard")));
+        assert!(messages
+            .iter()
+            .any(|m| m.contains("desync mode changed: Combo -> TLS Record")));
+        assert!(messages
+            .iter()
+            .any(|m| m.contains("DNS transport changed: DoH -> UDP")));
+        assert!(messages
+            .iter()
+            .any(|m| m.contains("ISP stage changed: ComboMultiRecord -> OobSniDesync")));
+        assert!(messages
+            .iter()
+            .any(|m| m.contains("auto-heal escalated (+2, total 3)")));
+        assert!(messages.iter().any(|m| m.contains("traffic milestone:")));
+    }
+
+    #[tokio::test]
+    async fn attached_http_connect_probe_passes_and_fails_cleanly() {
+        assert_eq!(
+            normalize_loopback_connect_addr(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                8080
+            )),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080)
+        );
+        assert_eq!(
+            normalize_loopback_connect_addr(SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                8080
+            )),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8080)
+        );
+
+        let ok_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ok_addr = ok_listener.local_addr().unwrap();
+        let ok_server = tokio::spawn(async move {
+            let (mut sock, _) = ok_listener.accept().await.unwrap();
+            let mut req_buf = [0u8; 512];
+            let _ = sock.read(&mut req_buf).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await;
+        });
+        let pass = probe_via_http_connect(ok_addr, "discord.com").await;
+        ok_server.await.unwrap();
+        assert!(
+            matches!(pass, ProbeStatus::Pass { ref detail, .. } if detail == "CONNECT 200"),
+            "expected CONNECT 200 pass, got {pass:?}"
+        );
+
+        let fail_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fail_addr = fail_listener.local_addr().unwrap();
+        let fail_server = tokio::spawn(async move {
+            let (mut sock, _) = fail_listener.accept().await.unwrap();
+            let mut req_buf = [0u8; 512];
+            let _ = sock.read(&mut req_buf).await;
+            let _ = sock
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        });
+        let fail = probe_via_http_connect(fail_addr, "www.roblox.com").await;
+        fail_server.await.unwrap();
+        assert!(
+            matches!(fail, ProbeStatus::Fail { ref reason, .. } if reason.contains("502 Bad Gateway")),
+            "expected 502 fail, got {fail:?}"
+        );
+    }
+
+    #[test]
+    fn format_rss_kb_formats_kb_mb_and_gb_cleanly() {
+        assert_eq!(format_rss_kb(512), "512 KB");
+        assert_eq!(format_rss_kb(29 * 1024), "29 MB");
+        assert_eq!(format_rss_kb(29 * 1024 + 511), "29 MB");
+        assert_eq!(format_rss_kb(1_536 * 1024), "1.5 GB");
     }
 }

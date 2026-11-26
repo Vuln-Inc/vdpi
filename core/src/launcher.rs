@@ -8,6 +8,7 @@ use vdpi::config::EngineMode;
 use vdpi::server::REPOSITORY_URL;
 use vdpi::service::{ControlCenterStatus, InstalledInfo, LiveEngineStatus, ServiceState};
 use vdpi::update::VersionRelation;
+use vdpi_core::config::SplitTunnelConfig;
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod tui;
@@ -26,6 +27,8 @@ pub enum Choice {
     SwitchEngine(EngineMode),
     SelectDns,
     SetDns(&'static str),
+    SplitTunnel,
+    Dashboard,
     Doctor,
     Uninstall,
     Cancel,
@@ -98,6 +101,14 @@ fn dns_server_item(current_dns: &str) -> MenuItem {
         Choice::SelectDns,
         format!("Choose DNS server · {}", format_dns_label(current_dns)),
         "Pick Cloudflare, Google, AdGuard, Quad9, or Family DoH.",
+    )
+}
+
+fn split_tunnel_item(split: &SplitTunnelConfig) -> MenuItem {
+    MenuItem::new(
+        Choice::SplitTunnel,
+        format!("Split tunneling · {}", split.summary_label()),
+        "Choose which apps use or bypass anti-DPI (with live search).",
     )
 }
 
@@ -450,6 +461,14 @@ fn switch_engine_item(current: EngineMode) -> MenuItem {
     }
 }
 
+fn dashboard_item() -> MenuItem {
+    MenuItem::new(
+        Choice::Dashboard,
+        "Open live dashboard",
+        "Real-time throughput, connections, ISP stage & diagnostics.",
+    )
+}
+
 fn quit_item() -> MenuItem {
     MenuItem::new(Choice::Cancel, "Quit", "Exit without changing anything.")
 }
@@ -458,91 +477,111 @@ fn build_same_version_items(
     service_state: ServiceState,
     current_engine: EngineMode,
     configured_dns: &str,
+    split_tunnel: &SplitTunnelConfig,
+    has_live_engine: bool,
 ) -> Vec<MenuItem> {
     match service_state {
-        ServiceState::Running => vec![
-            MenuItem::new(
-                Choice::PauseService,
-                "Pause background service",
-                "Temporarily stops vdpi and restores routes & proxies.",
-            ),
-            switch_engine_item(current_engine),
-            dns_server_item(configured_dns),
-            MenuItem::new(
-                Choice::Update,
-                "Check for updates online",
-                "Checks GitHub Releases and updates automatically.",
-            ),
-            MenuItem::new(
-                Choice::Doctor,
-                "Run diagnostics",
-                "Tests DNS ring and anti-DPI bypass connectivity.",
-            ),
-            MenuItem::new(
-                Choice::Install,
-                "Reinstall / repair service",
-                "Rewrites the background service and restarts it.",
-            ),
-            uninstall_item(),
-            quit_item(),
-        ],
-        ServiceState::Stopped => vec![
-            MenuItem::new(
+        ServiceState::Running => {
+            let mut items = Vec::with_capacity(if has_live_engine { 9 } else { 8 });
+            if has_live_engine {
+                items.push(dashboard_item());
+            }
+            items.extend([
+                MenuItem::new(
+                    Choice::PauseService,
+                    "Pause background service",
+                    "Temporarily stops vdpi and restores routes & proxies.",
+                ),
+                switch_engine_item(current_engine),
+                dns_server_item(configured_dns),
+                split_tunnel_item(split_tunnel),
+                MenuItem::new(
+                    Choice::Doctor,
+                    "Run diagnostics",
+                    "Tests DNS ring and anti-DPI bypass connectivity.",
+                ),
+                MenuItem::new(
+                    Choice::Update,
+                    "Check for updates online",
+                    "Checks GitHub Releases and updates automatically.",
+                ),
+                uninstall_item(),
+                quit_item(),
+            ]);
+            items
+        }
+        ServiceState::Stopped => {
+            let mut items = Vec::with_capacity(9);
+            if has_live_engine {
+                items.push(dashboard_item());
+            }
+            items.push(MenuItem::new(
                 Choice::ResumeService,
                 "Resume background service",
                 "Starts the service and re-enables routes & proxies.",
-            ),
-            switch_engine_item(current_engine),
-            dns_server_item(configured_dns),
-            MenuItem::new(
-                Choice::Run,
-                "Run directly (this session)",
-                "Active while this terminal is open.",
-            ),
-            MenuItem::new(
-                Choice::Update,
-                "Check for updates online",
-                "Checks GitHub Releases and updates automatically.",
-            ),
-            MenuItem::new(
-                Choice::Doctor,
-                "Run diagnostics",
-                "Tests DNS ring and anti-DPI bypass connectivity.",
-            ),
-            MenuItem::new(
+            ));
+            items.push(switch_engine_item(current_engine));
+            items.push(dns_server_item(configured_dns));
+            items.push(split_tunnel_item(split_tunnel));
+            if !has_live_engine {
+                items.push(MenuItem::new(
+                    Choice::Run,
+                    "Run directly (this session)",
+                    "Active while this terminal is open.",
+                ));
+            }
+            items.extend([
+                MenuItem::new(
+                    Choice::Doctor,
+                    "Run diagnostics",
+                    "Tests DNS ring and anti-DPI bypass connectivity.",
+                ),
+                MenuItem::new(
+                    Choice::Update,
+                    "Check for updates online",
+                    "Checks GitHub Releases and updates automatically.",
+                ),
+                uninstall_item(),
+                quit_item(),
+            ]);
+            items
+        }
+        ServiceState::NotInstalled => {
+            let mut items = Vec::with_capacity(9);
+            if has_live_engine {
+                items.push(dashboard_item());
+            }
+            items.push(MenuItem::new(
                 Choice::Install,
                 "Reinstall / repair service",
                 "Rewrites the background service and restarts it.",
-            ),
-            uninstall_item(),
-            quit_item(),
-        ],
-        ServiceState::NotInstalled => vec![
-            MenuItem::new(
-                Choice::Install,
-                "Reinstall / repair service",
-                "Rewrites the background service and restarts it.",
-            ),
-            switch_engine_item(current_engine),
-            dns_server_item(configured_dns),
-            MenuItem::new(
-                Choice::Run,
-                "Run directly (this session)",
-                "Active while this terminal is open.",
-            ),
-            MenuItem::new(
-                Choice::Update,
-                "Check for updates online",
-                "Checks GitHub Releases and updates automatically.",
-            ),
-            MenuItem::new(
-                Choice::Doctor,
-                "Run diagnostics",
-                "Tests DNS ring and anti-DPI bypass connectivity.",
-            ),
-            uninstall_item(),
-            quit_item(),
-        ],
+            ));
+            items.push(switch_engine_item(current_engine));
+            items.push(dns_server_item(configured_dns));
+            items.push(split_tunnel_item(split_tunnel));
+            if !has_live_engine {
+                items.push(MenuItem::new(
+                    Choice::Run,
+                    "Run directly (this session)",
+                    "Active while this terminal is open.",
+                ));
+            }
+            items.extend([
+                MenuItem::new(
+                    Choice::Doctor,
+                    "Run diagnostics",
+                    "Tests DNS ring and anti-DPI bypass connectivity.",
+                ),
+                MenuItem::new(
+                    Choice::Update,
+                    "Check for updates online",
+                    "Checks GitHub Releases and updates automatically.",
+                ),
+                uninstall_item(),
+                quit_item(),
+            ]);
+            items
+        }
     }
 }
 
@@ -551,10 +590,25 @@ pub(super) fn build_menu(status: &ControlCenterStatus, notice: Option<&str>) -> 
     build_menu_with_dns(status, notice, DNS_PRESETS[0].addr)
 }
 
+#[allow(dead_code)]
 pub(super) fn build_menu_with_dns(
     status: &ControlCenterStatus,
     notice: Option<&str>,
     configured_dns: &str,
+) -> LauncherMenu {
+    build_menu_with_options(
+        status,
+        notice,
+        configured_dns,
+        &SplitTunnelConfig::default(),
+    )
+}
+
+pub(super) fn build_menu_with_options(
+    status: &ControlCenterStatus,
+    notice: Option<&str>,
+    configured_dns: &str,
+    split_tunnel: &SplitTunnelConfig,
 ) -> LauncherMenu {
     let status_rows = build_status_rows(status);
     let notice = notice
@@ -562,46 +616,63 @@ pub(super) fn build_menu_with_dns(
         .filter(|s| !s.is_empty())
         .map(str::to_string);
     let current_engine = active_or_configured_engine(status);
+    let has_live_engine = status.live_engine.is_some();
 
     let items = match (status.installed.as_ref(), status.service_state) {
-        (None, ServiceState::NotInstalled) => vec![
-            MenuItem::new(
-                Choice::Run,
-                "Run directly",
-                "Active while this terminal is open.",
-            ),
-            switch_engine_item(current_engine),
-            MenuItem::new(
-                Choice::Install,
-                "Install for automatic startup",
-                "Runs in the background after you close it.",
-            ),
-            dns_server_item(configured_dns),
-            MenuItem::new(
-                Choice::Doctor,
-                "Run diagnostics",
-                "Tests DNS ring and anti-DPI bypass connectivity.",
-            ),
-            quit_item(),
-        ],
-        (None, service_state) => {
-            build_same_version_items(service_state, current_engine, configured_dns)
+        (None, ServiceState::NotInstalled) => {
+            let mut items = Vec::with_capacity(if has_live_engine { 8 } else { 7 });
+            if has_live_engine {
+                items.push(dashboard_item());
+            }
+            items.extend([
+                MenuItem::new(
+                    Choice::Run,
+                    "Run directly",
+                    "Active while this terminal is open.",
+                ),
+                switch_engine_item(current_engine),
+                MenuItem::new(
+                    Choice::Install,
+                    "Install for automatic startup",
+                    "Runs in the background after you close it.",
+                ),
+                dns_server_item(configured_dns),
+                split_tunnel_item(split_tunnel),
+                MenuItem::new(
+                    Choice::Doctor,
+                    "Run diagnostics",
+                    "Tests DNS ring and anti-DPI bypass connectivity.",
+                ),
+                quit_item(),
+            ]);
+            items
         }
+        (None, service_state) => build_same_version_items(
+            service_state,
+            current_engine,
+            configured_dns,
+            split_tunnel,
+            has_live_engine,
+        ),
         (Some(info), service_state) => match info.relation {
             VersionRelation::Newer => {
                 let old = info.installed_version.as_deref().unwrap_or("unknown");
                 let new = info.current_version;
-                let mut items = Vec::with_capacity(7);
+                let mut items = Vec::with_capacity(9);
                 items.push(MenuItem::new(
                     Choice::Install,
                     format!("Update installed vdpi (v{old} -> v{new})"),
                     "Replaces the installed service and restarts cleanly.",
                 ));
+                if has_live_engine {
+                    items.push(dashboard_item());
+                }
                 if let Some(toggle) = pause_or_resume_item(service_state) {
                     items.push(toggle);
                 }
                 items.push(switch_engine_item(current_engine));
                 items.push(dns_server_item(configured_dns));
+                items.push(split_tunnel_item(split_tunnel));
                 items.push(MenuItem::new(
                     Choice::Run,
                     "Run directly without updating",
@@ -611,13 +682,20 @@ pub(super) fn build_menu_with_dns(
                 items.push(quit_item());
                 items
             }
-            VersionRelation::Same => {
-                build_same_version_items(service_state, current_engine, configured_dns)
-            }
+            VersionRelation::Same => build_same_version_items(
+                service_state,
+                current_engine,
+                configured_dns,
+                split_tunnel,
+                has_live_engine,
+            ),
             VersionRelation::Older => {
                 let inst = info.installed_version.as_deref().unwrap_or("newer");
                 let cur = info.current_version;
-                let mut items = Vec::with_capacity(7);
+                let mut items = Vec::with_capacity(9);
+                if has_live_engine {
+                    items.push(dashboard_item());
+                }
                 items.push(MenuItem::new(
                     Choice::Run,
                     "Run directly",
@@ -628,6 +706,7 @@ pub(super) fn build_menu_with_dns(
                 }
                 items.push(switch_engine_item(current_engine));
                 items.push(dns_server_item(configured_dns));
+                items.push(split_tunnel_item(split_tunnel));
                 items.push(MenuItem::new(
                     Choice::Install,
                     format!("Downgrade installed vdpi (v{inst} -> v{cur})"),
@@ -639,7 +718,10 @@ pub(super) fn build_menu_with_dns(
             }
             VersionRelation::Unknown => {
                 let cur = info.current_version;
-                let mut items = Vec::with_capacity(7);
+                let mut items = Vec::with_capacity(9);
+                if has_live_engine {
+                    items.push(dashboard_item());
+                }
                 items.push(MenuItem::new(
                     Choice::Install,
                     format!("Update / repair installed vdpi (to v{cur})"),
@@ -650,6 +732,7 @@ pub(super) fn build_menu_with_dns(
                 }
                 items.push(switch_engine_item(current_engine));
                 items.push(dns_server_item(configured_dns));
+                items.push(split_tunnel_item(split_tunnel));
                 items.push(MenuItem::new(
                     Choice::Run,
                     "Run directly",
@@ -680,11 +763,33 @@ fn should_auto_run(
         && status.service_state == ServiceState::NotInstalled
 }
 
+#[allow(dead_code)]
 pub fn choose<F>(
     explicit: bool,
     status: &ControlCenterStatus,
     notice: Option<&str>,
     configured_dns: &str,
+    refresh: F,
+) -> Result<Choice>
+where
+    F: FnMut() -> ControlCenterStatus,
+{
+    choose_with_options(
+        explicit,
+        status,
+        notice,
+        configured_dns,
+        &SplitTunnelConfig::default(),
+        refresh,
+    )
+}
+
+pub fn choose_with_options<F>(
+    explicit: bool,
+    status: &ControlCenterStatus,
+    notice: Option<&str>,
+    configured_dns: &str,
+    split_tunnel: &SplitTunnelConfig,
     mut refresh: F,
 ) -> Result<Choice>
 where
@@ -705,24 +810,33 @@ where
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             if env::var("TERM").as_deref() == Ok("dumb") {
-                read_choice_with_dns(
+                read_choice_with_options(
                     io::stdin().lock(),
                     io::stderr().lock(),
                     status,
                     notice,
                     configured_dns,
+                    split_tunnel,
                     &mut tracked_refresh,
                 )?
             } else {
                 let color = env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
-                match tui::choose(color, status, notice, configured_dns, &mut tracked_refresh) {
+                match tui::choose_with_options(
+                    color,
+                    status,
+                    notice,
+                    configured_dns,
+                    split_tunnel,
+                    &mut tracked_refresh,
+                ) {
                     Ok(choice) => choice,
-                    Err(_) => read_choice_with_dns(
+                    Err(_) => read_choice_with_options(
                         io::stdin().lock(),
                         io::stderr().lock(),
                         status,
                         notice,
                         configured_dns,
+                        split_tunnel,
                         &mut tracked_refresh,
                     )
                     .context("running the terminal launcher")?,
@@ -731,12 +845,13 @@ where
         }
         #[cfg(any(target_os = "android", target_os = "ios"))]
         {
-            read_choice_with_dns(
+            read_choice_with_options(
                 io::stdin().lock(),
                 io::stderr().lock(),
                 status,
                 notice,
                 configured_dns,
+                split_tunnel,
                 &mut tracked_refresh,
             )?
         }
@@ -912,12 +1027,13 @@ fn read_choice<F>(
 where
     F: FnMut() -> ControlCenterStatus,
 {
-    read_choice_with_dns(
+    read_choice_with_options(
         input,
         output,
         initial_status,
         notice,
         DNS_PRESETS[0].addr,
+        &SplitTunnelConfig::default(),
         refresh,
     )
 }
@@ -978,18 +1094,19 @@ fn read_dns_choice(
     }
 }
 
-fn read_choice_with_dns<F>(
+fn read_choice_with_options<F>(
     mut input: impl BufRead,
     mut output: impl Write,
     initial_status: &ControlCenterStatus,
     notice: Option<&str>,
     configured_dns: &str,
+    split_tunnel: &SplitTunnelConfig,
     mut refresh: F,
 ) -> io::Result<Choice>
 where
     F: FnMut() -> ControlCenterStatus,
 {
-    let mut menu = build_menu_with_dns(initial_status, notice, configured_dns);
+    let mut menu = build_menu_with_options(initial_status, notice, configured_dns, split_tunnel);
     if menu.items.is_empty() {
         return Ok(Choice::Cancel);
     }
@@ -1001,7 +1118,12 @@ where
         let count = menu.items.len();
         let choices: Vec<String> = (1..=count)
             .map(|n| n.to_string())
-            .chain(["d".to_string(), "r".to_string(), "q".to_string()])
+            .chain([
+                "d".to_string(),
+                "s".to_string(),
+                "r".to_string(),
+                "q".to_string(),
+            ])
             .collect();
         let prompt_choices = choices.join(" / ");
 
@@ -1017,7 +1139,12 @@ where
         }
         if trimmed.eq_ignore_ascii_case("r") {
             let latest = refresh();
-            menu = build_menu_with_dns(&latest, Some("Status refreshed."), configured_dns);
+            menu = build_menu_with_options(
+                &latest,
+                Some("Status refreshed."),
+                configured_dns,
+                split_tunnel,
+            );
             if menu.items.is_empty() {
                 return Ok(Choice::Cancel);
             }
@@ -1032,6 +1159,14 @@ where
             {
                 return Ok(item.choice);
             }
+        }
+        if trimmed.eq_ignore_ascii_case("s")
+            && menu
+                .items
+                .iter()
+                .any(|item| item.choice == Choice::SplitTunnel)
+        {
+            return Ok(Choice::SplitTunnel);
         }
         if trimmed.eq_ignore_ascii_case("d") {
             if let Some(addr) = read_dns_choice(&mut input, &mut output, configured_dns)? {
@@ -1119,6 +1254,10 @@ mod tests {
             quic_blocked: None,
             dns_queries: None,
             rss_kb: Some(14_336),
+            bytes_rx: Some(1_048_576),
+            bytes_tx: Some(262_144),
+            tls_handshakes: Some(28),
+            auto_heal_escalations: Some(1),
         }
     }
 
@@ -1143,6 +1282,10 @@ mod tests {
             quic_blocked: Some(42),
             dns_queries: Some(89),
             rss_kb: Some(16_384),
+            bytes_rx: Some(4_194_304),
+            bytes_tx: Some(524_288),
+            tls_handshakes: Some(64),
+            auto_heal_escalations: Some(2),
         }
     }
 
@@ -1167,6 +1310,10 @@ mod tests {
             quic_blocked: None,
             dns_queries: None,
             rss_kb: None,
+            bytes_rx: None,
+            bytes_tx: None,
+            tls_handshakes: None,
+            auto_heal_escalations: None,
         }
     }
 
@@ -1201,7 +1348,7 @@ mod tests {
                 StatusTone::Neutral
             )
         );
-        assert_eq!(menu.items.len(), 6);
+        assert_eq!(menu.items.len(), 7);
         assert_eq!(menu.items[0].choice, Choice::Run);
         assert_eq!(menu.items[0].title, "Run directly");
         assert_eq!(menu.items[1].choice, Choice::SwitchEngine(EngineMode::Tun));
@@ -1214,10 +1361,16 @@ mod tests {
         assert_eq!(menu.items[2].title, "Install for automatic startup");
         assert_eq!(menu.items[3].choice, Choice::SelectDns);
         assert!(menu.items[3].title.contains("Cloudflare (1.1.1.1)"));
-        assert_eq!(menu.items[4].choice, Choice::Doctor);
-        assert_eq!(menu.items[4].title, "Run diagnostics");
-        assert_eq!(menu.items[5].choice, Choice::Cancel);
-        assert_eq!(menu.items[5].title, "Quit");
+        assert_eq!(menu.items[4].choice, Choice::SplitTunnel);
+        assert_eq!(menu.items[4].title, "Split tunneling · All apps");
+        assert_eq!(
+            menu.items[4].hint,
+            "Choose which apps use or bypass anti-DPI (with live search)."
+        );
+        assert_eq!(menu.items[5].choice, Choice::Doctor);
+        assert_eq!(menu.items[5].title, "Run diagnostics");
+        assert_eq!(menu.items[6].choice, Choice::Cancel);
+        assert_eq!(menu.items[6].title, "Quit");
 
         let mut fresh_tun = fresh_status();
         fresh_tun.configured_engine = EngineMode::Tun;
@@ -1271,12 +1424,13 @@ mod tests {
         assert_eq!(
             menu.items.iter().map(|i| i.choice).collect::<Vec<_>>(),
             vec![
+                Choice::Dashboard,
                 Choice::PauseService,
                 Choice::SwitchEngine(EngineMode::Tun),
                 Choice::SelectDns,
-                Choice::Update,
+                Choice::SplitTunnel,
                 Choice::Doctor,
-                Choice::Install,
+                Choice::Update,
                 Choice::Uninstall,
                 Choice::Cancel,
             ]
@@ -1369,8 +1523,9 @@ mod tests {
                 StatusTone::Active
             )
         );
+        assert_eq!(tun_menu.items[0].choice, Choice::Dashboard);
         assert_eq!(
-            tun_menu.items[1],
+            tun_menu.items[2],
             MenuItem::new(
                 Choice::SwitchEngine(EngineMode::Proxy),
                 "Switch to Proxy mode",
@@ -1471,10 +1626,10 @@ mod tests {
                 Choice::ResumeService,
                 Choice::SwitchEngine(EngineMode::Proxy),
                 Choice::SelectDns,
+                Choice::SplitTunnel,
                 Choice::Run,
-                Choice::Update,
                 Choice::Doctor,
-                Choice::Install,
+                Choice::Update,
                 Choice::Uninstall,
                 Choice::Cancel,
             ]
@@ -1518,9 +1673,11 @@ mod tests {
             menu.items.iter().map(|i| i.choice).collect::<Vec<_>>(),
             vec![
                 Choice::Install,
+                Choice::Dashboard,
                 Choice::PauseService,
                 Choice::SwitchEngine(EngineMode::Tun),
                 Choice::SelectDns,
+                Choice::SplitTunnel,
                 Choice::Run,
                 Choice::Uninstall,
                 Choice::Cancel,
@@ -1569,6 +1726,7 @@ mod tests {
                 Choice::PauseService,
                 Choice::SwitchEngine(EngineMode::Tun),
                 Choice::SelectDns,
+                Choice::SplitTunnel,
                 Choice::Install,
                 Choice::Uninstall,
                 Choice::Cancel,
@@ -1595,6 +1753,7 @@ mod tests {
                 Choice::ResumeService,
                 Choice::SwitchEngine(EngineMode::Tun),
                 Choice::SelectDns,
+                Choice::SplitTunnel,
                 Choice::Run,
                 Choice::Uninstall,
                 Choice::Cancel,
@@ -1642,11 +1801,22 @@ mod tests {
         assert!(output.contains("Run directly"));
         assert!(output.contains("Switch to TUN mode"));
         assert!(output.contains("Install for automatic startup"));
+        assert!(output.contains("Split tunneling · All apps"));
         assert!(output.contains("Run diagnostics"));
-        assert!(output.contains("Enter a number from 1 to 6, r to refresh, or q to quit."));
-        assert!(output.contains("Choose [1 / 2 / 3 / 4 / 5 / 6 / d / r / q]: "));
+        assert!(output.contains("Enter a number from 1 to 7, r to refresh, or q to quit."));
+        assert!(output.contains("Choose [1 / 2 / 3 / 4 / 5 / 6 / 7 / d / s / r / q]: "));
         assert!(output.contains(REPOSITORY_URL));
         assert!(!output.contains('\x1b'));
+
+        // Console 's' / 'S' shortcut selects SplitTunnel directly.
+        assert_eq!(
+            read_choice(&b"s\n"[..], Vec::new(), &fresh, None, fresh_status).unwrap(),
+            Choice::SplitTunnel
+        );
+        assert_eq!(
+            read_choice(&b"S\n"[..], Vec::new(), &fresh, None, fresh_status).unwrap(),
+            Choice::SplitTunnel
+        );
 
         // Console 'd' shortcut opens DNS preset picker and selects AdGuard on '3'.
         let mut dns_out = Vec::new();
@@ -1658,7 +1828,7 @@ mod tests {
         assert!(dns_out.contains("AdGuard"));
         assert!(dns_out.contains("94.140.14.14"));
 
-        // Console renders inline [VPN: Mullvad] badge and returns SwitchEngine on slot 2.
+        // Console renders inline [VPN: Mullvad] badge, returns Dashboard on slot 1 and SwitchEngine on slot 3.
         let mut tun_with_vpn = sample_live_tun_engine();
         tun_with_vpn.vpn_conflict = Some("Mullvad".to_string());
         let running_tun = ControlCenterStatus {
@@ -1668,9 +1838,16 @@ mod tests {
             configured_engine: EngineMode::Tun,
             vpn_conflict: None,
         };
+        assert_eq!(
+            read_choice(&b"1\n"[..], Vec::new(), &running_tun, None, || {
+                running_tun.clone()
+            })
+            .unwrap(),
+            Choice::Dashboard
+        );
         let mut tun_out = Vec::new();
         assert_eq!(
-            read_choice(&b"2\n"[..], &mut tun_out, &running_tun, None, || {
+            read_choice(&b"3\n"[..], &mut tun_out, &running_tun, None, || {
                 running_tun.clone()
             })
             .unwrap(),
@@ -1678,6 +1855,7 @@ mod tests {
         );
         let tun_out = String::from_utf8(tun_out).unwrap();
         assert!(tun_out.contains("Engine    TUN · vdpi0 · Ethernet · 16 MB  [VPN: Mullvad]"));
+        assert!(tun_out.contains("Open live dashboard"));
         assert!(tun_out.contains("Switch to Proxy mode"));
 
         // Shortcut 'm' also triggers SwitchEngine in console fallback.
@@ -1717,7 +1895,7 @@ mod tests {
         let mut confirm_out = Vec::new();
         assert_eq!(
             read_choice(
-                &b"7\nn\n7\ny\n"[..],
+                &b"8\nn\n8\ny\n"[..],
                 &mut confirm_out,
                 &running,
                 None,
@@ -1914,7 +2092,8 @@ mod tests {
             StatusRow::new("Engine", "Proxy · 127.0.0.1:8080", StatusTone::Active)
                 .with_badge(Some(("VPN: ProtonVPN".to_string(), StatusTone::Warning)))
         );
-        assert!(proxy_menu.items[0].hint.contains("routes & proxies"));
+        assert_eq!(proxy_menu.items[1].choice, Choice::PauseService);
+        assert!(proxy_menu.items[1].hint.contains("routes & proxies"));
 
         // Live vpn_conflict takes precedence over top-level status.vpn_conflict.
         let mut live_override = sample_live_tun_engine();
@@ -1930,5 +2109,227 @@ mod tests {
             build_menu(&override_status, None).status_rows[1].badge,
             Some(("VPN: Tailscale".to_string(), StatusTone::Warning))
         );
+    }
+
+    #[test]
+    fn dashboard_item_present_when_live_engine_active_and_within_nine_slots() {
+        let same_running = ControlCenterStatus {
+            installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
+            service_state: ServiceState::Running,
+            live_engine: Some(sample_live_proxy_engine()),
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: None,
+        };
+        let same_menu = build_menu(&same_running, None);
+        assert_eq!(same_menu.items.len(), 9);
+        assert_eq!(
+            same_menu.items[0],
+            MenuItem::new(
+                Choice::Dashboard,
+                "Open live dashboard",
+                "Real-time throughput, connections, ISP stage & diagnostics.",
+            )
+        );
+
+        let newer_running = ControlCenterStatus {
+            installed: Some(sample_info(Some("0.4.2"), "0.5.0", VersionRelation::Newer)),
+            service_state: ServiceState::Running,
+            live_engine: Some(sample_live_proxy_engine()),
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: None,
+        };
+        let newer_menu = build_menu(&newer_running, None);
+        assert!(newer_menu.items.len() <= 9);
+        assert_eq!(newer_menu.items[0].choice, Choice::Install);
+        assert_eq!(newer_menu.items[1].choice, Choice::Dashboard);
+
+        let older_running = ControlCenterStatus {
+            installed: Some(sample_info(Some("0.6.0"), "0.5.0", VersionRelation::Older)),
+            service_state: ServiceState::Running,
+            live_engine: Some(sample_live_tun_engine()),
+            configured_engine: EngineMode::Tun,
+            vpn_conflict: None,
+        };
+        let older_menu = build_menu(&older_running, None);
+        assert!(older_menu.items.len() <= 9);
+        assert_eq!(older_menu.items[0].choice, Choice::Dashboard);
+        assert_eq!(older_menu.items[1].choice, Choice::Run);
+
+        let unknown_running = ControlCenterStatus {
+            installed: Some(sample_info(None, "0.5.0", VersionRelation::Unknown)),
+            service_state: ServiceState::Running,
+            live_engine: Some(sample_live_proxy_engine()),
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: None,
+        };
+        let unknown_menu = build_menu(&unknown_running, None);
+        assert!(unknown_menu.items.len() <= 9);
+        assert_eq!(unknown_menu.items[0].choice, Choice::Dashboard);
+        assert_eq!(unknown_menu.items[1].choice, Choice::Install);
+
+        let running_daemon_no_install = ControlCenterStatus {
+            installed: None,
+            service_state: ServiceState::Running,
+            live_engine: Some(sample_live_tun_engine()),
+            configured_engine: EngineMode::Tun,
+            vpn_conflict: None,
+        };
+        let daemon_menu = build_menu(&running_daemon_no_install, None);
+        assert_eq!(daemon_menu.items.len(), 9);
+        assert_eq!(daemon_menu.items[0].choice, Choice::Dashboard);
+
+        let standalone_live_not_installed = ControlCenterStatus {
+            installed: None,
+            service_state: ServiceState::NotInstalled,
+            live_engine: Some(sample_live_proxy_engine()),
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: None,
+        };
+        let standalone_menu = build_menu(&standalone_live_not_installed, None);
+        assert_eq!(standalone_menu.items.len(), 8);
+        assert_eq!(standalone_menu.items[0].choice, Choice::Dashboard);
+
+        let stopped_with_live = ControlCenterStatus {
+            installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
+            service_state: ServiceState::Stopped,
+            live_engine: Some(sample_live_proxy_engine()),
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: None,
+        };
+        let stopped_live_menu = build_menu(&stopped_with_live, None);
+        assert_eq!(stopped_live_menu.items.len(), 9);
+        assert_eq!(stopped_live_menu.items[0].choice, Choice::Dashboard);
+        assert_eq!(stopped_live_menu.items[1].choice, Choice::ResumeService);
+    }
+
+    #[test]
+    fn dashboard_item_absent_when_offline_or_paused() {
+        let cases = [
+            fresh_status(),
+            ControlCenterStatus {
+                installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
+                service_state: ServiceState::Stopped,
+                live_engine: None,
+                configured_engine: EngineMode::Tun,
+                vpn_conflict: None,
+            },
+            ControlCenterStatus {
+                installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
+                service_state: ServiceState::Running,
+                live_engine: None,
+                configured_engine: EngineMode::Proxy,
+                vpn_conflict: None,
+            },
+            ControlCenterStatus {
+                installed: Some(sample_info(Some("0.4.2"), "0.5.0", VersionRelation::Newer)),
+                service_state: ServiceState::Stopped,
+                live_engine: None,
+                configured_engine: EngineMode::Proxy,
+                vpn_conflict: None,
+            },
+            ControlCenterStatus {
+                installed: Some(sample_info(Some("0.6.0"), "0.5.0", VersionRelation::Older)),
+                service_state: ServiceState::Running,
+                live_engine: None,
+                configured_engine: EngineMode::Proxy,
+                vpn_conflict: None,
+            },
+            ControlCenterStatus {
+                installed: Some(sample_info(None, "0.5.0", VersionRelation::Unknown)),
+                service_state: ServiceState::Stopped,
+                live_engine: None,
+                configured_engine: EngineMode::Proxy,
+                vpn_conflict: None,
+            },
+            ControlCenterStatus {
+                installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
+                service_state: ServiceState::NotInstalled,
+                live_engine: None,
+                configured_engine: EngineMode::Tun,
+                vpn_conflict: None,
+            },
+        ];
+
+        for status in &cases {
+            let menu = build_menu(status, None);
+            assert!(menu.items.len() <= 9);
+            assert!(
+                !menu
+                    .items
+                    .iter()
+                    .any(|item| item.choice == Choice::Dashboard),
+                "Choice::Dashboard should be absent when live_engine is None"
+            );
+        }
+    }
+
+    #[test]
+    fn split_tunnel_item_present_with_summary_and_within_nine_slots_in_all_branches() {
+        use vdpi_core::config::SplitTunnelMode;
+
+        let exclude_cfg = SplitTunnelConfig {
+            mode: SplitTunnelMode::Exclude,
+            apps: vec!["discord.exe".to_string(), "steam.exe".to_string()],
+        };
+        let include_cfg = SplitTunnelConfig {
+            mode: SplitTunnelMode::Include,
+            apps: vec!["chrome.exe".to_string()],
+        };
+
+        let all_item = split_tunnel_item(&SplitTunnelConfig::default());
+        assert_eq!(all_item.choice, Choice::SplitTunnel);
+        assert_eq!(all_item.title, "Split tunneling · All apps");
+        assert_eq!(
+            all_item.hint,
+            "Choose which apps use or bypass anti-DPI (with live search)."
+        );
+
+        let exclude_item = split_tunnel_item(&exclude_cfg);
+        assert_eq!(exclude_item.title, "Split tunneling · Exclude (2 apps)");
+
+        let include_item = split_tunnel_item(&include_cfg);
+        assert_eq!(include_item.title, "Split tunneling · Include (1 app)");
+
+        let states = [
+            ServiceState::NotInstalled,
+            ServiceState::Running,
+            ServiceState::Stopped,
+        ];
+        let installs = [
+            None,
+            Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
+            Some(sample_info(Some("0.4.2"), "0.5.0", VersionRelation::Newer)),
+            Some(sample_info(Some("0.6.0"), "0.5.0", VersionRelation::Older)),
+            Some(sample_info(None, "0.5.0", VersionRelation::Unknown)),
+        ];
+        let lives = [None, Some(sample_live_proxy_engine())];
+
+        for service_state in states {
+            for installed in &installs {
+                for live_engine in &lives {
+                    let status = ControlCenterStatus {
+                        installed: installed.clone(),
+                        service_state,
+                        live_engine: live_engine.clone(),
+                        configured_engine: EngineMode::Proxy,
+                        vpn_conflict: None,
+                    };
+                    let menu =
+                        build_menu_with_options(&status, None, DNS_PRESETS[0].addr, &exclude_cfg);
+                    assert!(
+                        menu.items.len() <= 9,
+                        "branch ({installed:?}, {service_state:?}, live={}) exceeded 9 items: {}",
+                        live_engine.is_some(),
+                        menu.items.len()
+                    );
+                    let split = menu
+                        .items
+                        .iter()
+                        .find(|item| item.choice == Choice::SplitTunnel)
+                        .expect("every menu branch must include Choice::SplitTunnel");
+                    assert_eq!(split.title, "Split tunneling · Exclude (2 apps)");
+                }
+            }
+        }
     }
 }

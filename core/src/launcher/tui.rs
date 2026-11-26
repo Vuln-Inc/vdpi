@@ -1,5 +1,5 @@
 use super::{
-    build_menu_with_dns, dns_preset_index, format_dns_label, Choice, LauncherMenu, MenuItem,
+    build_menu_with_options, dns_preset_index, format_dns_label, Choice, LauncherMenu, MenuItem,
     StatusRow, StatusTone, DNS_PRESETS,
 };
 use crossterm::cursor::{Hide, Show};
@@ -16,6 +16,7 @@ use std::borrow::Cow;
 use std::io;
 use vdpi::server::REPOSITORY_URL;
 use vdpi::service::ControlCenterStatus;
+use vdpi_core::config::SplitTunnelConfig;
 
 const MAX_CARD_WIDTH: u16 = 72;
 const VERSION_LABEL: &str = concat!("v", env!("CARGO_PKG_VERSION"));
@@ -156,6 +157,7 @@ struct UiState {
     selecting_dns: bool,
     dns_selected: usize,
     configured_dns: String,
+    split_tunnel: SplitTunnelConfig,
 }
 
 impl UiState {
@@ -164,10 +166,25 @@ impl UiState {
         Self::new_with_dns(status, notice, DNS_PRESETS[0].addr)
     }
 
+    #[allow(dead_code)]
     fn new_with_dns(
         status: &ControlCenterStatus,
         notice: Option<&str>,
         configured_dns: &str,
+    ) -> Self {
+        Self::new_with_options(
+            status,
+            notice,
+            configured_dns,
+            &SplitTunnelConfig::default(),
+        )
+    }
+
+    fn new_with_options(
+        status: &ControlCenterStatus,
+        notice: Option<&str>,
+        configured_dns: &str,
+        split_tunnel: &SplitTunnelConfig,
     ) -> Self {
         let dns = configured_dns.trim();
         let dns = if dns.is_empty() {
@@ -176,12 +193,13 @@ impl UiState {
             dns
         };
         Self {
-            menu: build_menu_with_dns(status, notice, dns),
+            menu: build_menu_with_options(status, notice, dns, split_tunnel),
             selected: 0,
             confirming_uninstall: false,
             selecting_dns: false,
             dns_selected: dns_preset_index(dns),
             configured_dns: dns.to_string(),
+            split_tunnel: split_tunnel.clone(),
         }
     }
 }
@@ -541,17 +559,39 @@ enum Action {
     Ignore,
 }
 
+#[allow(dead_code)]
 pub(super) fn choose<F>(
     color: bool,
     initial_status: &ControlCenterStatus,
     notice: Option<&str>,
     configured_dns: &str,
+    refresh: F,
+) -> io::Result<Choice>
+where
+    F: FnMut() -> ControlCenterStatus,
+{
+    choose_with_options(
+        color,
+        initial_status,
+        notice,
+        configured_dns,
+        &SplitTunnelConfig::default(),
+        refresh,
+    )
+}
+
+pub(super) fn choose_with_options<F>(
+    color: bool,
+    initial_status: &ControlCenterStatus,
+    notice: Option<&str>,
+    configured_dns: &str,
+    split_tunnel: &SplitTunnelConfig,
     mut refresh: F,
 ) -> io::Result<Choice>
 where
     F: FnMut() -> ControlCenterStatus,
 {
-    let mut state = UiState::new_with_dns(initial_status, notice, configured_dns);
+    let mut state = UiState::new_with_options(initial_status, notice, configured_dns, split_tunnel);
     if state.menu.items.is_empty() {
         return Ok(Choice::Cancel);
     }
@@ -582,7 +622,12 @@ where
 }
 
 fn apply_refresh(state: &mut UiState, latest: &ControlCenterStatus) {
-    state.menu = build_menu_with_dns(latest, Some("Status refreshed."), &state.configured_dns);
+    state.menu = build_menu_with_options(
+        latest,
+        Some("Status refreshed."),
+        &state.configured_dns,
+        &state.split_tunnel,
+    );
     state.confirming_uninstall = false;
     state.selecting_dns = false;
     if state.menu.items.is_empty() {
@@ -697,6 +742,32 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Action {
             {
                 state.selected = index;
                 return Action::Finish(item.choice);
+            }
+            return Action::Ignore;
+        }
+        KeyCode::Char('l' | 'L') => {
+            if let Some((index, _)) = state
+                .menu
+                .items
+                .iter()
+                .enumerate()
+                .find(|(_, item)| item.choice == Choice::Dashboard)
+            {
+                state.selected = index;
+                return Action::Finish(Choice::Dashboard);
+            }
+            return Action::Ignore;
+        }
+        KeyCode::Char('s' | 'S') => {
+            if let Some((index, _)) = state
+                .menu
+                .items
+                .iter()
+                .enumerate()
+                .find(|(_, item)| item.choice == Choice::SplitTunnel)
+            {
+                state.selected = index;
+                return Action::Finish(Choice::SplitTunnel);
             }
             return Action::Ignore;
         }
@@ -1011,7 +1082,14 @@ fn render(frame: &mut Frame<'_>, state: &UiState, color: bool) {
     let mut footer_y = bottom;
     if plan.show_footer && footer_y > y {
         footer_y = footer_y.saturating_sub(1);
-        render_footer(frame, row(footer_y), menu.items.len(), ctx);
+        render_footer(
+            frame,
+            row(footer_y),
+            menu.items.len(),
+            menu_has_dashboard(menu),
+            menu_has_split_tunnel(menu),
+            ctx,
+        );
     }
     if plan.bottom_divider() && footer_y > y {
         footer_y = footer_y.saturating_sub(1);
@@ -1676,7 +1754,26 @@ fn render_confirm_footer(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx) {
     frame.render_widget(line, area);
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect, item_count: usize, ctx: RenderCtx) {
+fn menu_has_dashboard(menu: &LauncherMenu) -> bool {
+    menu.items
+        .iter()
+        .any(|item| item.choice == Choice::Dashboard)
+}
+
+fn menu_has_split_tunnel(menu: &LauncherMenu) -> bool {
+    menu.items
+        .iter()
+        .any(|item| item.choice == Choice::SplitTunnel)
+}
+
+fn render_footer(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    item_count: usize,
+    has_dashboard: bool,
+    has_split_tunnel: bool,
+    ctx: RenderCtx,
+) {
     if area.is_empty() {
         return;
     }
@@ -1696,12 +1793,73 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, item_count: usize, ctx: Rend
 
     let range = range_label(item_count);
     let width = usize::from(area.width);
+    let full_live_split_cols = pad.len() * 2 + 61 + range.len();
+    let full_live_cols = pad.len() * 2 + 63 + range.len();
+    let full_split_cols = pad.len() * 2 + 59 + range.len();
     let full_cols = pad.len() * 2 + 62 + range.len();
+    let medium_live_cols = pad.len() * 2 + 50 + range.len();
+    let medium_split_cols = pad.len() * 2 + 51 + range.len();
     let medium_cols = pad.len() * 2 + 41 + range.len();
     let compact_medium_cols = pad.len() * 2 + 34 + range.len();
     let short_cols = pad.len() * 2 + 21 + range.len();
 
-    let line = if width >= full_cols {
+    let line = if has_dashboard && has_split_tunnel && width >= full_live_split_cols {
+        Line::from(vec![
+            Span::raw(pad),
+            Span::styled("↑↓", key),
+            Span::styled(" · ", text),
+            Span::styled(range, key),
+            Span::styled(" · ", text),
+            Span::styled("l", key),
+            Span::styled(" live · ", text),
+            Span::styled("d", key),
+            Span::styled(" dns · ", text),
+            Span::styled("s", key),
+            Span::styled(" split · ", text),
+            Span::styled("r", key),
+            Span::styled(" refresh · ", text),
+            Span::styled("enter", key),
+            Span::styled(" · ", text),
+            Span::styled("q", key),
+            Span::styled(" quit", text),
+        ])
+    } else if has_dashboard && !has_split_tunnel && width >= full_live_cols {
+        Line::from(vec![
+            Span::raw(pad),
+            Span::styled("↑↓", key),
+            Span::styled(" move · ", text),
+            Span::styled(range, key),
+            Span::styled(" select · ", text),
+            Span::styled("l", key),
+            Span::styled(" live · ", text),
+            Span::styled("d", key),
+            Span::styled(" dns · ", text),
+            Span::styled("r", key),
+            Span::styled(" refresh · ", text),
+            Span::styled("enter", key),
+            Span::styled(" · ", text),
+            Span::styled("q", key),
+            Span::styled(" quit", text),
+        ])
+    } else if !has_dashboard && has_split_tunnel && width >= full_split_cols {
+        Line::from(vec![
+            Span::raw(pad),
+            Span::styled("↑↓", key),
+            Span::styled(" · ", text),
+            Span::styled(range, key),
+            Span::styled(" select · ", text),
+            Span::styled("d", key),
+            Span::styled(" dns · ", text),
+            Span::styled("s", key),
+            Span::styled(" split · ", text),
+            Span::styled("r", key),
+            Span::styled(" refresh · ", text),
+            Span::styled("enter", key),
+            Span::styled(" · ", text),
+            Span::styled("q", key),
+            Span::styled(" quit", text),
+        ])
+    } else if !has_dashboard && !has_split_tunnel && width >= full_cols {
         Line::from(vec![
             Span::raw(pad),
             Span::styled("↑↓", key),
@@ -1714,6 +1872,38 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, item_count: usize, ctx: Rend
             Span::styled(" refresh · ", text),
             Span::styled("enter", key),
             Span::styled(" ok · ", text),
+            Span::styled("q", key),
+            Span::styled(" quit", text),
+        ])
+    } else if has_dashboard && width >= medium_live_cols {
+        Line::from(vec![
+            Span::raw(pad),
+            Span::styled("↑↓", key),
+            Span::styled(" · ", text),
+            Span::styled(range, key),
+            Span::styled(" select · ", text),
+            Span::styled("l", key),
+            Span::styled(" live · ", text),
+            Span::styled("r", key),
+            Span::styled(" refresh · ", text),
+            Span::styled("enter", key),
+            Span::styled(" · ", text),
+            Span::styled("q", key),
+            Span::styled(" quit", text),
+        ])
+    } else if !has_dashboard && has_split_tunnel && width >= medium_split_cols {
+        Line::from(vec![
+            Span::raw(pad),
+            Span::styled("↑↓", key),
+            Span::styled(" · ", text),
+            Span::styled(range, key),
+            Span::styled(" select · ", text),
+            Span::styled("s", key),
+            Span::styled(" split · ", text),
+            Span::styled("r", key),
+            Span::styled(" refresh · ", text),
+            Span::styled("enter", key),
+            Span::styled(" · ", text),
             Span::styled("q", key),
             Span::styled(" quit", text),
         ])
@@ -1809,7 +1999,14 @@ fn render_minimal(
 
     if area.height >= 3 {
         let footer_area = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
-        render_footer(frame, footer_area, state.menu.items.len(), ctx);
+        render_footer(
+            frame,
+            footer_area,
+            state.menu.items.len(),
+            menu_has_dashboard(&state.menu),
+            menu_has_split_tunnel(&state.menu),
+            ctx,
+        );
     }
 }
 
@@ -1859,6 +2056,10 @@ mod tests {
             quic_blocked: None,
             dns_queries: None,
             rss_kb: None,
+            bytes_rx: Some(1_048_576),
+            bytes_tx: Some(524_288),
+            tls_handshakes: Some(42),
+            auto_heal_escalations: Some(1),
         }
     }
 
@@ -1955,8 +2156,8 @@ mod tests {
             "missing selected item hint:\n{text}"
         );
         assert!(
-            text.contains("↑↓ move · 1-8 select · d dns · r refresh · enter ok · q quit"),
-            "missing full footer:\n{text}"
+            text.contains("↑↓ · 1-9 · l live · d dns · s split · r refresh · enter · q quit"),
+            "missing full live+split footer:\n{text}"
         );
         assert!(buf
             .content()
@@ -1997,7 +2198,7 @@ mod tests {
         }
         assert!(text.contains(&state.menu.items[0].hint));
         assert!(
-            text.contains("↑↓ move · 1-9 select · d dns · r refresh · enter ok · q quit"),
+            text.contains("↑↓ · 1-9 select · d dns · s split · r refresh · enter · q quit"),
             "missing full 1-9 footer:\n{text}"
         );
         assert!(buf
@@ -2025,9 +2226,12 @@ mod tests {
         assert!(fresh_text.contains("Offline · routes & proxies restored"));
         assert!(fresh_text.contains("Run directly"));
         assert!(fresh_text.contains("Install for automatic startup"));
+        assert!(fresh_text.contains("Split tunneling · All apps"));
         assert!(fresh_text.contains("Run diagnostics"));
         assert!(fresh_text.contains("Quit"));
-        assert!(fresh_text.contains("↑↓ move · 1-6 select · d dns · r refresh · enter ok · q quit"));
+        assert!(
+            fresh_text.contains("↑↓ · 1-7 select · d dns · s split · r refresh · enter · q quit")
+        );
 
         let update = UiState::new(&status_update_available(), None);
         let update_buf = render_state(80, 24, &update, true);
@@ -2209,16 +2413,16 @@ mod tests {
             Action::Refresh
         );
 
-        // Apply refresh to NotInstalled (6 items): selection clamps cleanly to 5 and notice updates.
+        // Apply refresh to NotInstalled (7 items): selection clamps cleanly to 6 and notice updates.
         apply_refresh(&mut state, &status_not_installed());
-        assert_eq!(state.selected, 5);
+        assert_eq!(state.selected, 6);
         assert_eq!(state.menu.notice.as_deref(), Some("Status refreshed."));
         assert!(!state.confirming_uninstall);
 
         let buf = render_state(80, 24, &state, true);
         let text = buffer_text(&buf);
         assert!(text.contains("✓ Status refreshed."));
-        assert!(text.contains("▸ [6] Quit"));
+        assert!(text.contains("▸ [7] Quit"));
     }
 
     #[test]
@@ -2303,6 +2507,7 @@ mod tests {
             selecting_dns: false,
             dns_selected: 0,
             configured_dns: DNS_PRESETS[0].addr.to_string(),
+            split_tunnel: SplitTunnelConfig::default(),
         };
 
         for state in [&paused, &confirm, &empty] {
@@ -2338,12 +2543,12 @@ mod tests {
         let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
 
         assert_eq!(handle_key(&mut state, press(KeyCode::Up)), Action::Redraw);
-        assert_eq!(state.selected, 5);
+        assert_eq!(state.selected, 6);
         assert_eq!(
             handle_key(&mut state, press(KeyCode::Char('k'))),
             Action::Redraw
         );
-        assert_eq!(state.selected, 4);
+        assert_eq!(state.selected, 5);
         assert_eq!(
             handle_key(
                 &mut state,
@@ -2351,7 +2556,7 @@ mod tests {
             ),
             Action::Redraw
         );
-        assert_eq!(state.selected, 3);
+        assert_eq!(state.selected, 4);
         assert_eq!(handle_key(&mut state, press(KeyCode::Home)), Action::Redraw);
         assert_eq!(state.selected, 0);
         assert_eq!(handle_key(&mut state, press(KeyCode::Down)), Action::Redraw);
@@ -2367,6 +2572,8 @@ mod tests {
         assert_eq!(state.selected, 4);
         assert_eq!(handle_key(&mut state, press(KeyCode::Tab)), Action::Redraw);
         assert_eq!(state.selected, 5);
+        assert_eq!(handle_key(&mut state, press(KeyCode::Tab)), Action::Redraw);
+        assert_eq!(state.selected, 6);
         assert_eq!(handle_key(&mut state, press(KeyCode::Tab)), Action::Redraw);
         assert_eq!(state.selected, 0);
 
@@ -2394,6 +2601,10 @@ mod tests {
         );
         assert_eq!(
             handle_key(&mut state, press(KeyCode::Char('5'))),
+            Action::Finish(Choice::SplitTunnel)
+        );
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('6'))),
             Action::Finish(Choice::Doctor)
         );
         assert_eq!(
@@ -2496,6 +2707,7 @@ mod tests {
             selecting_dns: false,
             dns_selected: 0,
             configured_dns: DNS_PRESETS[0].addr.to_string(),
+            split_tunnel: SplitTunnelConfig::default(),
         }
     }
 
@@ -2738,6 +2950,7 @@ mod tests {
             selecting_dns: false,
             dns_selected: 0,
             configured_dns: DNS_PRESETS[0].addr.to_string(),
+            split_tunnel: SplitTunnelConfig::default(),
         };
         let tones_text = buffer_text(&render_state(80, 24, &tones_state, false));
         assert!(tones_text.contains("● Active"));
@@ -2825,6 +3038,7 @@ mod tests {
             selecting_dns: false,
             dns_selected: 0,
             configured_dns: DNS_PRESETS[0].addr.to_string(),
+            split_tunnel: SplitTunnelConfig::default(),
         };
         assert_eq!(
             handle_key(&mut no_switch, press(KeyCode::Char('m'))),
@@ -2929,5 +3143,326 @@ mod tests {
             let _ = render_state(w, h, &state, true);
             let _ = render_state(w, h, &state, false);
         }
+    }
+
+    #[test]
+    fn live_dashboard_l_hotkey_and_footer_hint() {
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        let mut running = UiState::new(&status_running_live(), None);
+        let dashboard_idx = running
+            .menu
+            .items
+            .iter()
+            .position(|item| item.choice == Choice::Dashboard)
+            .expect("running live menu includes Dashboard");
+
+        running.selected = running.menu.items.len() - 1;
+        assert_eq!(
+            handle_key(&mut running, press(KeyCode::Char('l'))),
+            Action::Finish(Choice::Dashboard)
+        );
+        assert_eq!(running.selected, dashboard_idx);
+
+        running.selected = running.menu.items.len() - 1;
+        assert_eq!(
+            handle_key(&mut running, press(KeyCode::Char('L'))),
+            Action::Finish(Choice::Dashboard)
+        );
+        assert_eq!(running.selected, dashboard_idx);
+
+        // Repeat/Release and modified keys must be ignored.
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            for ch in ['l', 'L'] {
+                assert_eq!(
+                    handle_key(
+                        &mut running,
+                        KeyEvent::new_with_kind(KeyCode::Char(ch), KeyModifiers::NONE, kind)
+                    ),
+                    Action::Ignore
+                );
+            }
+        }
+        assert_eq!(
+            handle_key(
+                &mut running,
+                KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)
+            ),
+            Action::Ignore
+        );
+        assert_eq!(
+            handle_key(
+                &mut running,
+                KeyEvent::new(KeyCode::Char('l'), KeyModifiers::ALT)
+            ),
+            Action::Ignore
+        );
+
+        // Confirm and DNS picker modes must ignore 'l' and 'L'.
+        running.confirming_uninstall = true;
+        assert_eq!(
+            handle_key(&mut running, press(KeyCode::Char('l'))),
+            Action::Ignore
+        );
+        assert_eq!(
+            handle_key(&mut running, press(KeyCode::Char('L'))),
+            Action::Ignore
+        );
+        running.confirming_uninstall = false;
+
+        running.selecting_dns = true;
+        assert_eq!(
+            handle_key(&mut running, press(KeyCode::Char('l'))),
+            Action::Ignore
+        );
+        assert_eq!(
+            handle_key(&mut running, press(KeyCode::Char('L'))),
+            Action::Ignore
+        );
+        running.selecting_dns = false;
+
+        // Paused and offline/not-installed menus ignore 'l' and 'L' and omit 'l live' from footer.
+        for offline_status in [status_paused(), status_not_installed()] {
+            let mut offline = UiState::new(&offline_status, None);
+            assert_eq!(
+                handle_key(&mut offline, press(KeyCode::Char('l'))),
+                Action::Ignore
+            );
+            assert_eq!(
+                handle_key(&mut offline, press(KeyCode::Char('L'))),
+                Action::Ignore
+            );
+            assert_eq!(offline.selected, 0);
+
+            let offline_text = buffer_text(&render_state(80, 24, &offline, true));
+            assert!(
+                !offline_text.contains("l live"),
+                "offline menu must not show 'l live' in footer:\n{offline_text}"
+            );
+        }
+
+        // Full 80x24 (MAX_CARD_WIDTH = 72) footer fits 'l live' cleanly without overflowing.
+        let full_buf = render_state(80, 24, &running, true);
+        let full_text = buffer_text(&full_buf);
+        let header_y = u16::try_from(
+            full_text
+                .lines()
+                .position(|line| line.contains(repo_display()))
+                .expect("header row"),
+        )
+        .expect("header y fits u16");
+        let footer_y = u16::try_from(
+            full_text
+                .lines()
+                .position(|line| line.contains("l live") && line.contains("q quit"))
+                .expect("full live footer row"),
+        )
+        .expect("footer y fits u16");
+        let header_right = rightmost_content_col(&full_buf, header_y).expect("header right col");
+        let footer_right = rightmost_content_col(&full_buf, footer_y).expect("footer right col");
+        assert!(
+            footer_right <= header_right,
+            "live footer must not overflow MAX_CARD_WIDTH right margin ({footer_right} > {header_right}):\n{full_text}"
+        );
+        let card_right_border = (0..full_buf.area.width)
+            .rev()
+            .find(|&x| full_buf[(x, footer_y)].symbol() == "│")
+            .expect("footer right border");
+        assert!(footer_right < card_right_border);
+
+        // Medium 60x24 width keeps 'l live' without overflowing the card border.
+        let med_buf = render_state(60, 24, &running, true);
+        let med_text = buffer_text(&med_buf);
+        assert!(
+            med_text.contains("↑↓ · 1-9 select · l live · r refresh · enter · q quit"),
+            "medium 60x24 footer should keep 'l live':\n{med_text}"
+        );
+        let med_footer_y = u16::try_from(
+            med_text
+                .lines()
+                .position(|line| line.contains("l live"))
+                .expect("medium footer row"),
+        )
+        .expect("medium footer y fits u16");
+        assert_eq!(med_buf[(59, med_footer_y)].symbol(), "│");
+
+        // Compact narrow 46x18 width gracefully drops 'l live' so nothing overflows.
+        let narrow_buf = render_state(46, 18, &running, true);
+        let narrow_text = buffer_text(&narrow_buf);
+        assert!(
+            !narrow_text.contains("l live"),
+            "compact narrow 46x18 footer must drop 'l live':\n{narrow_text}"
+        );
+        assert!(narrow_text.contains("r refresh"));
+        let narrow_footer_y = u16::try_from(
+            narrow_text
+                .lines()
+                .position(|line| line.contains("r refresh"))
+                .expect("narrow footer row"),
+        )
+        .expect("narrow footer y fits u16");
+        assert_eq!(narrow_buf[(45, narrow_footer_y)].symbol(), "│");
+    }
+
+    #[test]
+    fn split_tunnel_s_hotkey_summary_refresh_and_footer_fit() {
+        use vdpi_core::config::SplitTunnelMode;
+
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let split_cfg = SplitTunnelConfig {
+            mode: SplitTunnelMode::Exclude,
+            apps: vec!["discord.exe".to_string(), "steam.exe".to_string()],
+        };
+
+        let mut running =
+            UiState::new_with_options(&status_running_live(), None, "1.1.1.1", &split_cfg);
+        let split_idx = running
+            .menu
+            .items
+            .iter()
+            .position(|item| item.choice == Choice::SplitTunnel)
+            .expect("running live menu includes SplitTunnel");
+        assert_eq!(split_idx, 4);
+        assert_eq!(
+            running.menu.items[split_idx].title,
+            "Split tunneling · Exclude (2 apps)"
+        );
+
+        running.selected = 0;
+        assert_eq!(
+            handle_key(&mut running, press(KeyCode::Char('s'))),
+            Action::Finish(Choice::SplitTunnel)
+        );
+        assert_eq!(running.selected, split_idx);
+
+        running.selected = 0;
+        assert_eq!(
+            handle_key(&mut running, press(KeyCode::Char('S'))),
+            Action::Finish(Choice::SplitTunnel)
+        );
+        assert_eq!(running.selected, split_idx);
+
+        // Repeat/Release and modified keys must be ignored.
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            for ch in ['s', 'S'] {
+                assert_eq!(
+                    handle_key(
+                        &mut running,
+                        KeyEvent::new_with_kind(KeyCode::Char(ch), KeyModifiers::NONE, kind)
+                    ),
+                    Action::Ignore
+                );
+            }
+        }
+        assert_eq!(
+            handle_key(
+                &mut running,
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)
+            ),
+            Action::Ignore
+        );
+        assert_eq!(
+            handle_key(
+                &mut running,
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT)
+            ),
+            Action::Ignore
+        );
+
+        // Confirm and DNS picker modes must ignore 's' and 'S'.
+        running.confirming_uninstall = true;
+        assert_eq!(
+            handle_key(&mut running, press(KeyCode::Char('s'))),
+            Action::Ignore
+        );
+        assert_eq!(
+            handle_key(&mut running, press(KeyCode::Char('S'))),
+            Action::Ignore
+        );
+        running.confirming_uninstall = false;
+
+        running.selecting_dns = true;
+        assert_eq!(
+            handle_key(&mut running, press(KeyCode::Char('s'))),
+            Action::Ignore
+        );
+        assert_eq!(
+            handle_key(&mut running, press(KeyCode::Char('S'))),
+            Action::Ignore
+        );
+        running.selecting_dns = false;
+
+        // Refresh preserves split_tunnel summary label.
+        apply_refresh(&mut running, &status_paused());
+        assert!(running
+            .menu
+            .items
+            .iter()
+            .any(|item| item.title == "Split tunneling · Exclude (2 apps)"));
+
+        // Menus without SplitTunnel ignore 's' and 'S' and omit 's split' from footer.
+        let mut without_split = tun_vpn_state();
+        assert_eq!(
+            handle_key(&mut without_split, press(KeyCode::Char('s'))),
+            Action::Ignore
+        );
+        assert_eq!(
+            handle_key(&mut without_split, press(KeyCode::Char('S'))),
+            Action::Ignore
+        );
+        let without_text = buffer_text(&render_state(80, 24, &without_split, true));
+        assert!(
+            !without_text.contains("s split"),
+            "menu without SplitTunnel must not show 's split':\n{without_text}"
+        );
+
+        // Full 80x24 footer for both live and offline menus fits 's split' within MAX_CARD_WIDTH.
+        for status in [
+            status_running_live(),
+            status_paused(),
+            status_not_installed(),
+        ] {
+            let state = UiState::new_with_options(&status, None, "1.1.1.1", &split_cfg);
+            let buf = render_state(80, 24, &state, true);
+            let text = buffer_text(&buf);
+            assert!(
+                text.contains("Split tunneling · Exclude (2 apps)"),
+                "rendered menu missing split tunnel title:\n{text}"
+            );
+            let header_y = u16::try_from(
+                text.lines()
+                    .position(|line| line.contains(repo_display()))
+                    .expect("header row"),
+            )
+            .expect("header y fits u16");
+            let footer_y = u16::try_from(
+                text.lines()
+                    .position(|line| line.contains("s split") && line.contains("q quit"))
+                    .expect("full split footer row"),
+            )
+            .expect("footer y fits u16");
+            let header_right = rightmost_content_col(&buf, header_y).expect("header right col");
+            let footer_right = rightmost_content_col(&buf, footer_y).expect("footer right col");
+            assert!(
+                footer_right <= header_right,
+                "split footer must not overflow MAX_CARD_WIDTH right margin ({footer_right} > {header_right}):\n{text}"
+            );
+        }
+
+        // Medium 60x24 offline menu keeps 's split' cleanly; narrow 46x18 drops it cleanly.
+        let paused = UiState::new_with_options(&status_paused(), None, "1.1.1.1", &split_cfg);
+        let med_buf = render_state(60, 24, &paused, true);
+        let med_text = buffer_text(&med_buf);
+        assert!(
+            med_text.contains("↑↓ · 1-9 select · s split · r refresh · enter · q quit"),
+            "medium 60x24 offline footer should keep 's split':\n{med_text}"
+        );
+        let narrow_buf = render_state(46, 18, &paused, true);
+        let narrow_text = buffer_text(&narrow_buf);
+        assert!(
+            !narrow_text.contains("s split"),
+            "narrow 46x18 footer must drop 's split':\n{narrow_text}"
+        );
+        assert!(narrow_text.contains("r refresh"));
     }
 }

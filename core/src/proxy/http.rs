@@ -1,4 +1,6 @@
-use super::HANDSHAKE_TIMEOUT;
+use super::{
+    check_split_tunnel_bypass, relay_direct_tunnel, relay_direct_with_initial, HANDSHAKE_TIMEOUT,
+};
 use crate::desync::EngineContext;
 use crate::health::{handle_health_http_request, HealthRuntimeMeta};
 use crate::tls::expected_tls_record_len;
@@ -87,9 +89,8 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
         return handle_health_http_request(&mut client, method, header_str, &ctx, &meta).await;
     }
 
-    let is_loopback_peer = client
-        .peer_addr()
-        .is_ok_and(|p| p.ip().to_canonical().is_loopback());
+    let peer_addr = client.peer_addr().ok();
+    let is_loopback_peer = peer_addr.is_some_and(|p| p.ip().to_canonical().is_loopback());
     let local_addr = client.local_addr().ok();
 
     if method.eq_ignore_ascii_case("CONNECT") {
@@ -114,6 +115,7 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
             bail!("forbidden HTTP CONNECT target '{host}:{port}'");
         }
 
+        let split_bypass = check_split_tunnel_bypass(&ctx, peer_addr);
         debug!(host = %host, port = port, "HTTP CONNECT request");
         match ctx.connect_target(&host, port).await {
             Ok((remote, remote_addr)) => {
@@ -133,6 +135,17 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
                     .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                     .await?;
                 client.flush().await?;
+
+                if let Some(bypass) = split_bypass {
+                    bypass.log_bypass(&host);
+                    if !leftover.is_empty() {
+                        let initial = leftover.to_vec();
+                        drop(buf);
+                        return relay_direct_with_initial(&ctx, client, remote, initial).await;
+                    }
+                    drop(buf);
+                    return relay_direct_tunnel(&ctx, client, remote).await;
+                }
 
                 if !leftover.is_empty() {
                     let mut initial = leftover.to_vec();
@@ -196,6 +209,7 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
         bail!("forbidden HTTP proxy target '{host}:{port}'");
     }
 
+    let split_bypass = check_split_tunnel_bypass(&ctx, peer_addr);
     let rewritten = rewrite_http_request(method, &origin_path, version, header_str, leftover);
     drop(buf);
     match ctx.connect_target(&host, port).await {
@@ -211,6 +225,10 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
                 };
                 let _ = client.write_all(status).await;
                 bail!("forbidden resolved HTTP proxy target '{remote_addr}'");
+            }
+            if let Some(bypass) = split_bypass {
+                bypass.log_bypass(&host);
+                return relay_direct_with_initial(&ctx, client, remote, rewritten).await;
             }
             ctx.establish_and_relay(client, remote, &rewritten, Some(&host), remote_addr)
                 .await

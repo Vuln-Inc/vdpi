@@ -266,6 +266,10 @@ fn control_center_status_struct_sanity() {
         quic_blocked: Some(5),
         dns_queries: Some(19),
         rss_kb: Some(18432),
+        bytes_rx: Some(4096),
+        bytes_tx: Some(2048),
+        tls_handshakes: Some(7),
+        auto_heal_escalations: Some(1),
     };
 
     let running_status = ControlCenterStatus {

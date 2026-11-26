@@ -13,6 +13,15 @@ Runs as a transparent system-wide TUN adapter or a lightweight local proxy with 
 
 </div>
 
+<p align="center">
+  <img src="docs/screenshots/hero-showcase.png" alt="vdpi Live Dashboard, Control Center TUI, and mobile app" width="100%">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/tui-showcase.png" alt="vdpi doctor diagnostics and TUI DNS server picker" width="49%">
+  <img src="docs/screenshots/mobile-showcase.png" alt="vdpi mobile Settings, Tunnel status, and Diagnostics" width="49%">
+</p>
+
 ---
 
 ## Highlights
@@ -41,7 +50,7 @@ Runs as a transparent system-wide TUN adapter or a lightweight local proxy with 
   <tr>
     <td valign="top" width="50%">
       <strong>Control Center TUI</strong><br>
-      Interactive <code>ratatui</code> launcher and live throughput sparkline dashboard (<code>vdpi</code>), SHA-256-verified self-updater (<code>vdpi update</code>), and <code>config.toml</code> persistence.
+      Interactive <code>ratatui</code> launcher with <strong>Open live dashboard</strong> (<code>l</code>, attach live without restarting), per-app <strong>Split tunneling</strong> picker (<code>s</code>, fuzzy search + Include/Exclude), SHA-256-verified self-updater (<code>vdpi update</code>), and <code>config.toml</code> persistence.
     </td>
     <td valign="top" width="50%">
       <strong>Local-only &amp; verifiable</strong><br>
@@ -139,7 +148,9 @@ For anti-DPI framing modes (`--mode combo` default with 7-stage self-healing aut
 ## Getting Started
 
 ```bash
-vdpi              # Open the interactive Control Center TUI (install, switch engine, live telemetry)
+vdpi              # Open the Control Center TUI (`l` Open live dashboard, `s` Split tunneling, switch engine)
+vdpi dashboard    # Attach the live throughput & telemetry dashboard to the running background service
+vdpi split        # Open the per-app Split tunneling picker (alias `vdpi apps`; `--split-mode`, `--split-app`)
 vdpi engine tun   # Switch desktop engine to TUN mode (or `vdpi engine proxy`)
 vdpi pause        # Temporarily pause the background service (`vdpi resume` to re-enable)
 vdpi doctor       # Run live end-to-end DPI bypass and DoH diagnostics

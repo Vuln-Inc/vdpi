@@ -8,11 +8,18 @@ use std::io::{ErrorKind, Read, Write as _};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tracing::warn;
-use vdpi_core::config::{DesyncMode, EngineMode, VpnCoexistence};
+use vdpi_core::config::{
+    normalize_split_app_name, DesyncMode, EngineMode, RuntimeConfig, SplitTunnelMode,
+    VpnCoexistence,
+};
 
 /// Current `config.toml` schema version.
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+
+/// Maximum number of per-application split-tunnel entries persisted or applied.
+pub const MAX_SPLIT_TUNNEL_APPS: usize = 256;
 
 const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_ARRAY_DEPTH: usize = 8;
@@ -34,6 +41,8 @@ pub struct FileConfig {
     pub dns_addr: Option<String>,
     pub bypass_domains: Option<Vec<String>>,
     pub include_domains: Option<Vec<String>>,
+    pub split_tunnel_mode: Option<SplitTunnelMode>,
+    pub split_tunnel_apps: Option<Vec<String>>,
     pub vpn_coexistence: Option<VpnCoexistence>,
     pub tun_ipv6: Option<bool>,
     pub chunk_size: Option<usize>,
@@ -46,6 +55,134 @@ pub struct FileConfig {
     pub system_proxy: Option<bool>,
     pub socks_system_proxy: Option<bool>,
     pub env_proxy: Option<bool>,
+}
+
+impl FileConfig {
+    /// Merges `overlay` on top of `self`, returning a new [`FileConfig`] where
+    /// any `Some` field in `overlay` takes precedence over `self`.
+    pub fn merge(&self, overlay: &FileConfig) -> FileConfig {
+        FileConfig {
+            schema_version: overlay.schema_version.or(self.schema_version),
+            engine: overlay.engine.or(self.engine),
+            mode: overlay.mode.or(self.mode),
+            doh: overlay.doh.or(self.doh),
+            block_quic: overlay.block_quic.or(self.block_quic),
+            dns_addr: overlay.dns_addr.clone().or_else(|| self.dns_addr.clone()),
+            bypass_domains: overlay
+                .bypass_domains
+                .clone()
+                .or_else(|| self.bypass_domains.clone()),
+            include_domains: overlay
+                .include_domains
+                .clone()
+                .or_else(|| self.include_domains.clone()),
+            split_tunnel_mode: overlay.split_tunnel_mode.or(self.split_tunnel_mode),
+            split_tunnel_apps: overlay
+                .split_tunnel_apps
+                .clone()
+                .or_else(|| self.split_tunnel_apps.clone()),
+            vpn_coexistence: overlay.vpn_coexistence.or(self.vpn_coexistence),
+            tun_ipv6: overlay.tun_ipv6.or(self.tun_ipv6),
+            chunk_size: overlay.chunk_size.or(self.chunk_size),
+            bind: overlay.bind.or(self.bind),
+            port: overlay.port.or(self.port),
+            socks_port: overlay.socks_port.or(self.socks_port),
+            dns_port: overlay.dns_port.or(self.dns_port),
+            ipv4_only: overlay.ipv4_only.or(self.ipv4_only),
+            timeout_ms: overlay.timeout_ms.or(self.timeout_ms),
+            system_proxy: overlay.system_proxy.or(self.system_proxy),
+            socks_system_proxy: overlay.socks_system_proxy.or(self.socks_system_proxy),
+            env_proxy: overlay.env_proxy.or(self.env_proxy),
+        }
+    }
+
+    /// Applies every `Some` field from `self` onto `runtime`, leaving unset
+    /// (`None`) fields untouched.
+    pub fn apply_to_runtime(&self, runtime: &mut RuntimeConfig) {
+        if let Some(engine) = self.engine {
+            runtime.engine = engine;
+        }
+        if let Some(mode) = self.mode {
+            runtime.mode = mode;
+        }
+        if let Some(doh) = self.doh {
+            runtime.enable_doh = doh;
+        }
+        if let Some(block_quic) = self.block_quic {
+            runtime.block_quic = block_quic;
+        }
+        if let Some(ref dns_addr) = self.dns_addr {
+            let trimmed = dns_addr.trim();
+            if !trimmed.is_empty() {
+                runtime.dns_addr = trimmed.to_string();
+            }
+        }
+        if let Some(ref domains) = self.bypass_domains {
+            runtime.bypass_domains = domains.clone();
+        }
+        if let Some(ref domains) = self.include_domains {
+            runtime.patterns = domains.clone();
+        }
+        if let Some(mode) = self.split_tunnel_mode {
+            runtime.split_tunnel.mode = mode;
+        }
+        if let Some(ref apps) = self.split_tunnel_apps {
+            runtime.split_tunnel.apps = sanitize_split_tunnel_apps(apps);
+        }
+        if let Some(coex) = self.vpn_coexistence {
+            runtime.vpn_coexistence = coex;
+        }
+        if let Some(tun_ipv6) = self.tun_ipv6 {
+            runtime.tun_ipv6 = tun_ipv6;
+        }
+        if let Some(chunk_size) = self.chunk_size {
+            runtime.chunk_size = chunk_size.max(1);
+        }
+        if let Some(bind) = self.bind {
+            runtime.addr = bind;
+        }
+        if let Some(port) = self.port {
+            runtime.port = port;
+            if runtime.socks_port == Some(port) {
+                runtime.socks_port = None;
+            }
+        }
+        if let Some(socks_port) = self.socks_port {
+            runtime.socks_port = if socks_port == 0 || socks_port == runtime.port {
+                None
+            } else {
+                Some(socks_port)
+            };
+        }
+        if let Some(dns_port) = self.dns_port {
+            runtime.dns_port = dns_port;
+        }
+        if let Some(ipv4_only) = self.ipv4_only {
+            runtime.dns_ipv4_only = ipv4_only;
+        }
+        if let Some(timeout_ms) = self.timeout_ms {
+            runtime.connect_timeout = if timeout_ms == 0 {
+                Duration::from_millis(8000)
+            } else {
+                Duration::from_millis(timeout_ms)
+            };
+        }
+        if let Some(system_proxy) = self.system_proxy {
+            runtime.system_proxy = system_proxy;
+        }
+        if let Some(socks_system_proxy) = self.socks_system_proxy {
+            runtime.socks_system_proxy =
+                runtime.system_proxy && socks_system_proxy && runtime.socks_port.is_some();
+        } else if self.system_proxy.is_some() || self.socks_port.is_some() || self.port.is_some() {
+            runtime.socks_system_proxy =
+                runtime.system_proxy && runtime.socks_system_proxy && runtime.socks_port.is_some();
+        }
+        if let Some(env_proxy) = self.env_proxy {
+            runtime.env_proxy = runtime.system_proxy && env_proxy;
+        } else if self.system_proxy.is_some() {
+            runtime.env_proxy = runtime.system_proxy && runtime.env_proxy;
+        }
+    }
 }
 
 /// Returns the OS-standard machine-wide `config.toml` path.
@@ -382,8 +519,9 @@ fn atomic_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// Sets a single configuration key on `cfg` from a string representation.
 ///
 /// Accepts both `snake_case` and `kebab-case` key names. Array fields
-/// (`bypass_domains`, `include_domains`) accept either a TOML array literal
-/// (`["a.com", "b.com"]`) or a comma-separated list (`a.com, b.com`).
+/// (`bypass_domains`, `include_domains`, `split_tunnel_apps`) accept either a
+/// TOML array literal (`["a.com", "b.com"]`) or a comma-separated list
+/// (`a.com, b.com`).
 pub fn set_config_key(cfg: &mut FileConfig, key: &str, value: &str) -> Result<()> {
     let normalized = normalize_key(key);
     let trimmed = value.trim();
@@ -415,6 +553,13 @@ pub fn set_config_key(cfg: &mut FileConfig, key: &str, value: &str) -> Result<()
         }
         "include_domains" => {
             cfg.include_domains = Some(parse_string_list_arg(trimmed, "include_domains"));
+        }
+        "split_tunnel_mode" => {
+            cfg.split_tunnel_mode = Some(parse_split_tunnel_mode(trimmed)?);
+        }
+        "split_tunnel_apps" => {
+            let raw = parse_string_list_arg(trimmed, "split_tunnel_apps");
+            cfg.split_tunnel_apps = Some(validate_split_tunnel_apps(&raw)?);
         }
         "vpn_coexistence" => {
             cfg.vpn_coexistence = Some(parse_vpn_coexistence(trimmed)?);
@@ -487,6 +632,11 @@ pub fn get_config_key(cfg: &FileConfig, key: &str) -> Result<Option<String>> {
             .include_domains
             .as_deref()
             .map(format_string_array_inline),
+        "split_tunnel_mode" => cfg.split_tunnel_mode.map(|v| v.as_str().to_string()),
+        "split_tunnel_apps" => cfg
+            .split_tunnel_apps
+            .as_deref()
+            .map(format_string_array_inline),
         "vpn_coexistence" => cfg.vpn_coexistence.map(|v| v.as_str().to_string()),
         "tun_ipv6" => cfg.tun_ipv6.map(|v| v.to_string()),
         "chunk_size" => cfg.chunk_size.map(|v| v.to_string()),
@@ -518,6 +668,8 @@ pub fn unset_config_key(cfg: &mut FileConfig, key: &str) -> Result<()> {
         "dns_addr" => cfg.dns_addr = None,
         "bypass_domains" => cfg.bypass_domains = None,
         "include_domains" => cfg.include_domains = None,
+        "split_tunnel_mode" => cfg.split_tunnel_mode = None,
+        "split_tunnel_apps" => cfg.split_tunnel_apps = None,
         "vpn_coexistence" => cfg.vpn_coexistence = None,
         "tun_ipv6" => cfg.tun_ipv6 = None,
         "chunk_size" => cfg.chunk_size = None,
@@ -625,6 +777,63 @@ fn parse_vpn_coexistence(value: &str) -> Result<VpnCoexistence> {
     }
 }
 
+fn parse_split_tunnel_mode(value: &str) -> Result<SplitTunnelMode> {
+    value.parse::<SplitTunnelMode>().map_err(|_| {
+        let other = value.trim().to_ascii_lowercase();
+        anyhow::anyhow!(
+            "invalid value '{other}' for 'split_tunnel_mode' (expected 'all', 'exclude', or 'include')"
+        )
+    })
+}
+
+/// Validates and sanitizes per-application split-tunnel entries.
+///
+/// Rejects entries containing control characters or newlines, trims whitespace,
+/// skips empty/blank entries, deduplicates case-insensitively by normalized
+/// executable name (preserving first-seen order), and caps the list at
+/// [`MAX_SPLIT_TUNNEL_APPS`].
+pub fn validate_split_tunnel_apps(apps: &[String]) -> Result<Vec<String>> {
+    if apps.iter().any(|raw| raw.chars().any(char::is_control)) {
+        bail!("value for 'split_tunnel_apps' cannot contain control characters or newlines");
+    }
+    Ok(sanitize_split_tunnel_apps(apps))
+}
+
+/// Lossily sanitizes per-application split-tunnel entries for rendering/apply.
+///
+/// Drops entries containing control characters or newlines, trims whitespace,
+/// skips empty/blank entries, deduplicates by normalized executable name
+/// (preserving first-seen order), and caps the list at
+/// [`MAX_SPLIT_TUNNEL_APPS`].
+pub fn sanitize_split_tunnel_apps(apps: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(apps.len().min(MAX_SPLIT_TUNNEL_APPS));
+    let mut seen = HashSet::with_capacity(apps.len().min(MAX_SPLIT_TUNNEL_APPS));
+
+    for raw in apps {
+        if raw.chars().any(char::is_control) {
+            continue;
+        }
+        let trimmed = raw.trim();
+        let key = normalize_split_app_name(trimmed);
+        if trimmed.is_empty() || key.is_empty() {
+            continue;
+        }
+        if !seen.insert(key) {
+            continue;
+        }
+        if out.len() >= MAX_SPLIT_TUNNEL_APPS {
+            warn!(
+                limit = MAX_SPLIT_TUNNEL_APPS,
+                "split_tunnel_apps exceeds maximum entries; truncating"
+            );
+            break;
+        }
+        out.push(trimmed.to_string());
+    }
+
+    out
+}
+
 const fn desync_mode_as_str(mode: DesyncMode) -> &'static str {
     match mode {
         DesyncMode::Combo => "combo",
@@ -666,6 +875,17 @@ pub fn render_config_toml(cfg: &FileConfig) -> String {
     }
     if let Some(ref domains) = cfg.include_domains {
         write_string_array(&mut out, "include_domains", domains);
+    }
+    if let Some(split_mode) = cfg.split_tunnel_mode {
+        let _ = writeln!(
+            out,
+            "split_tunnel_mode = {}",
+            escape_toml_string(split_mode.as_str())
+        );
+    }
+    if let Some(ref apps) = cfg.split_tunnel_apps {
+        let sanitized = sanitize_split_tunnel_apps(apps);
+        write_string_array(&mut out, "split_tunnel_apps", &sanitized);
     }
     if let Some(coex) = cfg.vpn_coexistence {
         let _ = writeln!(
@@ -852,6 +1072,20 @@ fn apply_parsed_entry(
         "include_domains" => {
             let arr = extract_array(val, val_line, key)?;
             cfg.include_domains = Some(extract_string_array(arr, val_line, key)?);
+        }
+        "split_tunnel_mode" => {
+            let s = extract_string(val, val_line, key)?;
+            cfg.split_tunnel_mode = Some(
+                parse_split_tunnel_mode(&s).map_err(|e| anyhow::anyhow!("line {val_line}: {e}"))?,
+            );
+        }
+        "split_tunnel_apps" => {
+            let arr = extract_array(val, val_line, key)?;
+            let raw = extract_string_array(arr, val_line, key)?;
+            cfg.split_tunnel_apps = Some(
+                validate_split_tunnel_apps(&raw)
+                    .map_err(|e| anyhow::anyhow!("line {val_line}: {e}"))?,
+            );
         }
         "vpn_coexistence" => {
             let s = extract_string(val, val_line, key)?;
@@ -1445,6 +1679,11 @@ mod tests {
                 r#"quote"and\slash"#.to_string(),
             ]),
             include_domains: Some(vec!["discord.com".to_string()]),
+            split_tunnel_mode: Some(SplitTunnelMode::Exclude),
+            split_tunnel_apps: Some(vec![
+                "discord.exe".to_string(),
+                "robloxplayerbeta.exe".to_string(),
+            ]),
             vpn_coexistence: Some(VpnCoexistence::Warn),
             tun_ipv6: Some(true),
             chunk_size: Some(12),
@@ -1602,6 +1841,13 @@ port = 9090
         set_config_key(&mut cfg, "bypass_domains", "a.com, b.com").expect("set bypass_domains");
         set_config_key(&mut cfg, "include_domains", "[\"c.com\", \"d.com\"]")
             .expect("set include_domains");
+        set_config_key(&mut cfg, "split-tunnel-mode", "include").expect("set split_tunnel_mode");
+        set_config_key(
+            &mut cfg,
+            "split-tunnel-apps",
+            "discord.exe, robloxplayerbeta.exe",
+        )
+        .expect("set split_tunnel_apps");
         set_config_key(&mut cfg, "vpn-coexistence", "off").expect("set vpn_coexistence");
         set_config_key(&mut cfg, "tun_ipv6", "true").expect("set tun_ipv6");
         set_config_key(&mut cfg, "chunk_size", "16").expect("set chunk_size");
@@ -1628,6 +1874,14 @@ port = 9090
         assert_eq!(
             cfg.include_domains,
             Some(vec!["c.com".to_string(), "d.com".to_string()])
+        );
+        assert_eq!(cfg.split_tunnel_mode, Some(SplitTunnelMode::Include));
+        assert_eq!(
+            cfg.split_tunnel_apps,
+            Some(vec![
+                "discord.exe".to_string(),
+                "robloxplayerbeta.exe".to_string(),
+            ])
         );
         assert_eq!(cfg.vpn_coexistence, Some(VpnCoexistence::Off));
         assert_eq!(cfg.tun_ipv6, Some(true));
@@ -1657,6 +1911,8 @@ port = 9090
             "dns_addr",
             "bypass_domains",
             "include_domains",
+            "split_tunnel_mode",
+            "split_tunnel_apps",
             "vpn_coexistence",
             "tun_ipv6",
             "chunk_size",
@@ -2009,5 +2265,248 @@ port = 8081
             let service_paths = candidate_config_paths(true);
             assert_eq!(service_paths, vec![system_config_path()]);
         }
+    }
+
+    #[test]
+    fn split_tunnel_toml_roundtrip_all_modes_and_empty_apps() {
+        for mode in [
+            SplitTunnelMode::All,
+            SplitTunnelMode::Exclude,
+            SplitTunnelMode::Include,
+        ] {
+            let cfg = FileConfig {
+                split_tunnel_mode: Some(mode),
+                split_tunnel_apps: Some(vec![
+                    "discord.exe".to_string(),
+                    "robloxplayerbeta.exe".to_string(),
+                ]),
+                ..Default::default()
+            };
+            let rendered = render_config_toml(&cfg);
+            assert!(rendered.contains(&format!("split_tunnel_mode = \"{}\"", mode.as_str())));
+            assert!(rendered.contains("split_tunnel_apps = ["));
+            let parsed = parse_config_toml(&rendered).expect("split tunnel config roundtrips");
+            assert_eq!(parsed, cfg);
+        }
+
+        let empty_apps = FileConfig {
+            split_tunnel_mode: Some(SplitTunnelMode::Exclude),
+            split_tunnel_apps: Some(Vec::new()),
+            ..Default::default()
+        };
+        let rendered_empty = render_config_toml(&empty_apps);
+        assert!(rendered_empty.contains("split_tunnel_apps = []"));
+        assert_eq!(
+            parse_config_toml(&rendered_empty).expect("empty split_tunnel_apps parses"),
+            empty_apps
+        );
+
+        let kebab = "\
+split-tunnel-mode = \"include\"
+split-tunnel-apps = [\"discord.exe\", \"firefox\"]
+";
+        let parsed_kebab = parse_config_toml(kebab).expect("kebab split tunnel keys parse");
+        assert_eq!(
+            parsed_kebab.split_tunnel_mode,
+            Some(SplitTunnelMode::Include)
+        );
+        assert_eq!(
+            parsed_kebab.split_tunnel_apps,
+            Some(vec!["discord.exe".to_string(), "firefox".to_string()])
+        );
+        assert_eq!(
+            get_config_key(&parsed_kebab, "split-tunnel-mode")
+                .unwrap()
+                .as_deref(),
+            Some("include")
+        );
+        assert_eq!(
+            get_config_key(&parsed_kebab, "split-tunnel-apps")
+                .unwrap()
+                .as_deref(),
+            Some("[\"discord.exe\", \"firefox\"]")
+        );
+    }
+
+    #[test]
+    fn split_tunnel_rejects_invalid_mode_and_control_chars() {
+        let invalid_cases = [
+            ("split_tunnel_mode = \"bypass\"", "line 1:"),
+            ("split_tunnel_mode = \"only\"", "line 1:"),
+            ("split_tunnel_mode = \"\"", "line 1:"),
+            ("split_tunnel_mode = 123", "line 1:"),
+            ("split_tunnel_apps = \"discord.exe\"", "line 1:"),
+            ("split_tunnel_apps = [123]", "line 1:"),
+            ("split_tunnel_apps = [\"discord.exe\\nwhoami\"]", "line 1:"),
+            ("split_tunnel_apps = [\"discord.exe\\r\"]", "line 1:"),
+            ("split_tunnel_apps = [\"bad\\u0000app.exe\"]", "line 1:"),
+            ("split_tunnel_apps = [\"bad\\tapp.exe\"]", "line 1:"),
+            ("\nsplit_tunnel_mode = \"invalid\"", "line 2:"),
+        ];
+
+        for (input, expected_prefix) in invalid_cases {
+            let Err(err) = parse_config_toml(input) else {
+                panic!("input should fail to parse: {input:?}");
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains(expected_prefix),
+                "error '{msg}' for input {input:?} did not contain '{expected_prefix}'"
+            );
+        }
+
+        let mut cfg = FileConfig::default();
+        assert!(set_config_key(&mut cfg, "split_tunnel_mode", "bogus").is_err());
+        assert!(set_config_key(&mut cfg, "split_tunnel_apps", "discord.exe\nevil.exe").is_err());
+        assert!(set_config_key(&mut cfg, "split_tunnel_apps", "[\"bad\\u001B.exe\"]").is_err());
+    }
+
+    #[test]
+    fn split_tunnel_deduplicates_sanitizes_and_caps_apps_on_load_and_save() {
+        let input = "\
+split_tunnel_mode = \"exclude\"
+split_tunnel_apps = [
+  \"  Discord.exe  \",
+  \"discord.exe\",
+  \"discord\",
+  \"\",
+  \"   \",
+  \".exe\",
+  \"robloxplayerbeta.exe\",
+  \"RobloxPlayerBeta\",
+  \"steam.exe\",
+]
+";
+        let parsed = parse_config_toml(input).expect("sanitized split_tunnel_apps parses");
+        assert_eq!(
+            parsed.split_tunnel_apps,
+            Some(vec![
+                "Discord.exe".to_string(),
+                "robloxplayerbeta.exe".to_string(),
+                "steam.exe".to_string(),
+            ])
+        );
+
+        // Verify render_config_toml sanitizes dirty in-memory values (control chars, dupes, >256).
+        let mut oversized: Vec<String> = (0..(MAX_SPLIT_TUNNEL_APPS + 20))
+            .map(|i| format!("app-{i}.exe"))
+            .collect();
+        oversized.insert(0, "bad\nentry.exe".to_string());
+        oversized.insert(2, "APP-0.EXE".to_string());
+        oversized.insert(3, "   ".to_string());
+
+        let dirty = FileConfig {
+            split_tunnel_mode: Some(SplitTunnelMode::Include),
+            split_tunnel_apps: Some(oversized),
+            ..Default::default()
+        };
+        let rendered = render_config_toml(&dirty);
+        assert!(!rendered.contains("bad"));
+        let reparsed = parse_config_toml(&rendered).expect("rendered sanitized TOML parses");
+        let reparsed_apps = reparsed
+            .split_tunnel_apps
+            .expect("split_tunnel_apps present");
+        assert_eq!(reparsed_apps.len(), MAX_SPLIT_TUNNEL_APPS);
+        assert_eq!(reparsed_apps[0], "app-0.exe");
+        assert_eq!(
+            reparsed_apps[MAX_SPLIT_TUNNEL_APPS - 1],
+            format!("app-{}.exe", MAX_SPLIT_TUNNEL_APPS - 1)
+        );
+
+        // Verify parse_config_toml also gracefully caps lists exceeding MAX_SPLIT_TUNNEL_APPS.
+        let mut big_toml = String::from("split_tunnel_apps = [\n");
+        for i in 0..(MAX_SPLIT_TUNNEL_APPS + 15) {
+            let _ = writeln!(big_toml, "  \"proc-{i}.exe\",");
+        }
+        big_toml.push_str("]\n");
+        let capped = parse_config_toml(&big_toml).expect("oversized TOML array is capped");
+        let capped_apps = capped.split_tunnel_apps.expect("apps present");
+        assert_eq!(capped_apps.len(), MAX_SPLIT_TUNNEL_APPS);
+        assert_eq!(capped_apps[0], "proc-0.exe");
+        assert_eq!(
+            capped_apps[MAX_SPLIT_TUNNEL_APPS - 1],
+            format!("proc-{}.exe", MAX_SPLIT_TUNNEL_APPS - 1)
+        );
+    }
+
+    #[test]
+    fn file_config_merge_precedence() {
+        let base = FileConfig {
+            engine: Some(EngineMode::Proxy),
+            port: Some(8080),
+            split_tunnel_mode: Some(SplitTunnelMode::Exclude),
+            split_tunnel_apps: Some(vec!["discord.exe".to_string()]),
+            ..Default::default()
+        };
+        let overlay = FileConfig {
+            engine: Some(EngineMode::Tun),
+            split_tunnel_mode: Some(SplitTunnelMode::Include),
+            split_tunnel_apps: None,
+            ..Default::default()
+        };
+
+        let merged = base.merge(&overlay);
+        assert_eq!(merged.engine, Some(EngineMode::Tun));
+        assert_eq!(merged.port, Some(8080));
+        assert_eq!(merged.split_tunnel_mode, Some(SplitTunnelMode::Include));
+        assert_eq!(
+            merged.split_tunnel_apps,
+            Some(vec!["discord.exe".to_string()])
+        );
+
+        // Explicit empty list in overlay overrides non-empty list in base.
+        let clearing_overlay = FileConfig {
+            split_tunnel_apps: Some(Vec::new()),
+            ..Default::default()
+        };
+        let cleared = base.merge(&clearing_overlay);
+        assert_eq!(cleared.split_tunnel_mode, Some(SplitTunnelMode::Exclude));
+        assert_eq!(cleared.split_tunnel_apps, Some(Vec::new()));
+    }
+
+    #[test]
+    fn file_config_apply_to_runtime_wires_split_tunnel() {
+        let mut runtime = RuntimeConfig::default();
+        assert_eq!(runtime.split_tunnel.mode, SplitTunnelMode::All);
+        assert!(runtime.split_tunnel.apps.is_empty());
+
+        let file_cfg = FileConfig {
+            engine: Some(EngineMode::Tun),
+            split_tunnel_mode: Some(SplitTunnelMode::Exclude),
+            split_tunnel_apps: Some(vec![
+                "  discord.exe ".to_string(),
+                "DISCORD.EXE".to_string(),
+                "bad\napp.exe".to_string(),
+                "robloxplayerbeta.exe".to_string(),
+            ]),
+            ..Default::default()
+        };
+        file_cfg.apply_to_runtime(&mut runtime);
+
+        assert_eq!(runtime.engine, EngineMode::Tun);
+        assert_eq!(runtime.split_tunnel.mode, SplitTunnelMode::Exclude);
+        assert_eq!(
+            runtime.split_tunnel.apps,
+            vec![
+                "discord.exe".to_string(),
+                "robloxplayerbeta.exe".to_string(),
+            ]
+        );
+
+        // Unset fields in a subsequent FileConfig leave runtime split_tunnel untouched.
+        let partial = FileConfig {
+            port: Some(9090),
+            ..Default::default()
+        };
+        partial.apply_to_runtime(&mut runtime);
+        assert_eq!(runtime.port, 9090);
+        assert_eq!(runtime.split_tunnel.mode, SplitTunnelMode::Exclude);
+        assert_eq!(
+            runtime.split_tunnel.apps,
+            vec![
+                "discord.exe".to_string(),
+                "robloxplayerbeta.exe".to_string(),
+            ]
+        );
     }
 }
