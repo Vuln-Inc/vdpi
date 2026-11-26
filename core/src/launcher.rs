@@ -16,7 +16,7 @@ mod tui;
 const RUN_NOTICE: &str =
     "vdpi is running without installation. Run `vdpi install` to enable automatic startup.";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Choice {
     Run,
     Unattended,
@@ -26,7 +26,7 @@ pub enum Choice {
     ResumeService,
     SwitchEngine(EngineMode),
     SelectDns,
-    SetDns(&'static str),
+    SetDns(String),
     SplitTunnel,
     Dashboard,
     Doctor,
@@ -74,6 +74,47 @@ pub const DNS_PRESETS: [DnsPreset; 6] = [
     },
 ];
 
+#[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
+pub(super) const CUSTOM_DNS_HINT: &str = "Enter any custom IPv4, IPv6, or https:// DoH URL.";
+
+pub(super) fn is_custom_dns(addr: &str) -> bool {
+    let trimmed = addr.trim();
+    !trimmed.is_empty()
+        && !DNS_PRESETS
+            .iter()
+            .any(|p| p.addr.eq_ignore_ascii_case(trimmed))
+}
+
+pub(super) fn shorten_custom_dns(addr: &str, max_chars: usize) -> String {
+    let trimmed = addr.trim();
+    let stripped = if trimmed
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
+        &trimmed[8..]
+    } else {
+        trimmed
+    }
+    .trim_end_matches('/');
+    let display = if stripped.is_empty() {
+        trimmed
+    } else {
+        stripped
+    };
+    if max_chars == 0 {
+        return String::new();
+    }
+    if display.chars().count() <= max_chars {
+        return display.to_string();
+    }
+    if max_chars == 1 {
+        return display.chars().take(1).collect();
+    }
+    let mut out: String = display.chars().take(max_chars - 1).collect();
+    out.push('…');
+    out
+}
+
 pub fn format_dns_label(addr: &str) -> String {
     let trimmed = addr.trim();
     if let Some(preset) = DNS_PRESETS
@@ -84,23 +125,27 @@ pub fn format_dns_label(addr: &str) -> String {
     } else if trimmed.is_empty() {
         format!("{} ({})", DNS_PRESETS[0].name, DNS_PRESETS[0].addr)
     } else {
-        format!("Custom ({trimmed})")
+        format!("Custom ({})", shorten_custom_dns(trimmed, 28))
     }
 }
 
+#[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
 pub(super) fn dns_preset_index(addr: &str) -> usize {
     let trimmed = addr.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
     DNS_PRESETS
         .iter()
         .position(|p| p.addr.eq_ignore_ascii_case(trimmed))
-        .unwrap_or(0)
+        .unwrap_or(DNS_PRESETS.len())
 }
 
 fn dns_server_item(current_dns: &str) -> MenuItem {
     MenuItem::new(
         Choice::SelectDns,
         format!("Choose DNS server · {}", format_dns_label(current_dns)),
-        "Pick Cloudflare, Google, AdGuard, Quad9, or Family DoH.",
+        "Pick a preset or enter a custom DNS / DoH server.",
     )
 }
 
@@ -1044,11 +1089,44 @@ where
     )
 }
 
+fn read_custom_dns_input(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> io::Result<Option<String>> {
+    let mut answer = String::new();
+    loop {
+        write!(
+            output,
+            "  Enter custom DNS (IPv4, IPv6, or https:// DoH URL, or b back): "
+        )?;
+        output.flush()?;
+        answer.clear();
+        if input.read_line(&mut answer)? == 0 {
+            return Ok(None);
+        }
+        let trimmed = answer.trim();
+        if trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("b")
+            || trimmed.eq_ignore_ascii_case("q")
+        {
+            return Ok(None);
+        }
+        match vdpi_core::dns::validate_custom_dns_input(trimmed) {
+            Ok(normalized) => return Ok(Some(normalized)),
+            Err(err) => {
+                writeln!(output, "  Invalid DNS server: {err}")?;
+            }
+        }
+    }
+}
+
 fn read_dns_choice(
     input: &mut impl BufRead,
     output: &mut impl Write,
     configured_dns: &str,
-) -> io::Result<Option<&'static str>> {
+) -> io::Result<Option<String>> {
+    let custom_slot = DNS_PRESETS.len() + 1;
+    let custom_active = is_custom_dns(configured_dns);
     writeln!(
         output,
         "\n  Choose DNS server (current: {})",
@@ -1069,9 +1147,23 @@ fn read_dns_choice(
             preset.hint
         )?;
     }
+    if custom_active {
+        writeln!(
+            output,
+            "  {custom_slot}  {:<18} {} [active]",
+            "Custom DNS",
+            configured_dns.trim()
+        )?;
+    } else {
+        writeln!(
+            output,
+            "  {custom_slot}  {:<18} IP or https:// DoH URL",
+            "Custom DNS"
+        )?;
+    }
     let mut answer = String::new();
     loop {
-        write!(output, "  Choose DNS [1-{} / b back]: ", DNS_PRESETS.len())?;
+        write!(output, "  Choose DNS [1-{custom_slot} / b back]: ")?;
         output.flush()?;
         answer.clear();
         if input.read_line(&mut answer)? == 0 {
@@ -1084,18 +1176,20 @@ fn read_dns_choice(
         {
             return Ok(None);
         }
-        if let Some(preset) = trimmed
-            .parse::<usize>()
-            .ok()
-            .and_then(|n| n.checked_sub(1))
-            .and_then(|i| DNS_PRESETS.get(i))
-        {
-            return Ok(Some(preset.addr));
+        if let Ok(num) = trimmed.parse::<usize>() {
+            if let Some(preset) = num.checked_sub(1).and_then(|i| DNS_PRESETS.get(i)) {
+                return Ok(Some(preset.addr.to_string()));
+            }
+            if num == custom_slot {
+                if let Some(custom) = read_custom_dns_input(input, output)? {
+                    return Ok(Some(custom));
+                }
+                continue;
+            }
         }
         writeln!(
             output,
-            "  Enter a number from 1 to {}, or b to go back.",
-            DNS_PRESETS.len()
+            "  Enter a number from 1 to {custom_slot}, or b to go back."
         )?;
     }
 }
@@ -1163,7 +1257,7 @@ where
                 .iter()
                 .find(|item| matches!(item.choice, Choice::SwitchEngine(_)))
             {
-                return Ok(item.choice);
+                return Ok(item.choice.clone());
             }
         }
         if trimmed.eq_ignore_ascii_case("s")
@@ -1211,7 +1305,7 @@ where
                 writeln!(output, "  Uninstall canceled.")?;
                 continue;
             }
-            return Ok(item.choice);
+            return Ok(item.choice.clone());
         }
         writeln!(
             output,
@@ -1367,6 +1461,10 @@ mod tests {
         assert_eq!(menu.items[2].title, "Install for automatic startup");
         assert_eq!(menu.items[3].choice, Choice::SelectDns);
         assert!(menu.items[3].title.contains("Cloudflare (1.1.1.1)"));
+        assert_eq!(
+            menu.items[3].hint,
+            "Pick a preset or enter a custom DNS / DoH server."
+        );
         assert_eq!(menu.items[4].choice, Choice::SplitTunnel);
         assert_eq!(menu.items[4].title, "Split tunneling · All apps");
         assert_eq!(
@@ -1428,7 +1526,10 @@ mod tests {
             )
         );
         assert_eq!(
-            menu.items.iter().map(|i| i.choice).collect::<Vec<_>>(),
+            menu.items
+                .iter()
+                .map(|i| i.choice.clone())
+                .collect::<Vec<_>>(),
             vec![
                 Choice::Dashboard,
                 Choice::PauseService,
@@ -1627,7 +1728,10 @@ mod tests {
             )
         );
         assert_eq!(
-            menu.items.iter().map(|i| i.choice).collect::<Vec<_>>(),
+            menu.items
+                .iter()
+                .map(|i| i.choice.clone())
+                .collect::<Vec<_>>(),
             vec![
                 Choice::ResumeService,
                 Choice::SwitchEngine(EngineMode::Proxy),
@@ -1676,7 +1780,10 @@ mod tests {
             )
         );
         assert_eq!(
-            menu.items.iter().map(|i| i.choice).collect::<Vec<_>>(),
+            menu.items
+                .iter()
+                .map(|i| i.choice.clone())
+                .collect::<Vec<_>>(),
             vec![
                 Choice::Install,
                 Choice::Dashboard,
@@ -1725,7 +1832,7 @@ mod tests {
             older_menu
                 .items
                 .iter()
-                .map(|i| i.choice)
+                .map(|i| i.choice.clone())
                 .collect::<Vec<_>>(),
             vec![
                 Choice::Run,
@@ -1752,7 +1859,7 @@ mod tests {
             unknown_menu
                 .items
                 .iter()
-                .map(|i| i.choice)
+                .map(|i| i.choice.clone())
                 .collect::<Vec<_>>(),
             vec![
                 Choice::Install,
@@ -1828,11 +1935,13 @@ mod tests {
         let mut dns_out = Vec::new();
         assert_eq!(
             read_choice(&b"d\n3\n"[..], &mut dns_out, &fresh, None, fresh_status).unwrap(),
-            Choice::SetDns("94.140.14.14")
+            Choice::SetDns("94.140.14.14".to_string())
         );
         let dns_out = String::from_utf8(dns_out).unwrap();
         assert!(dns_out.contains("AdGuard"));
         assert!(dns_out.contains("94.140.14.14"));
+        assert!(dns_out.contains("Custom DNS"));
+        assert!(dns_out.contains("Choose DNS [1-7 / b back]: "));
 
         // Console renders inline [VPN: Mullvad] badge, returns Dashboard on slot 1 and SwitchEngine on slot 3.
         let mut tun_with_vpn = sample_live_tun_engine();
@@ -2337,5 +2446,73 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn custom_dns_helpers_and_console_picker_validate_and_return_normalized() {
+        assert!(!is_custom_dns("1.1.1.1"));
+        assert!(!is_custom_dns(""));
+        assert!(is_custom_dns("76.76.2.0"));
+        assert!(is_custom_dns("https://dns.nextdns.io/abc123"));
+
+        assert_eq!(dns_preset_index("1.1.1.1"), 0);
+        assert_eq!(dns_preset_index(""), 0);
+        assert_eq!(dns_preset_index("9.9.9.9"), 4);
+        assert_eq!(dns_preset_index("76.76.2.0"), DNS_PRESETS.len());
+        assert_eq!(
+            dns_preset_index("https://dns.nextdns.io/abc123"),
+            DNS_PRESETS.len()
+        );
+
+        assert_eq!(format_dns_label("1.1.1.1"), "Cloudflare (1.1.1.1)");
+        assert_eq!(format_dns_label(""), "Cloudflare (1.1.1.1)");
+        assert_eq!(format_dns_label("76.76.2.0"), "Custom (76.76.2.0)");
+        assert_eq!(
+            format_dns_label("https://dns.nextdns.io/abc123"),
+            "Custom (dns.nextdns.io/abc123)"
+        );
+
+        let fresh = fresh_status();
+
+        // Console [7] Custom DNS rejects invalid input, reprompts, and accepts valid IPv4.
+        let mut ip_out = Vec::new();
+        assert_eq!(
+            read_choice(
+                &b"d\n7\nnot-a-dns\n76.76.2.0\n"[..],
+                &mut ip_out,
+                &fresh,
+                None,
+                fresh_status
+            )
+            .unwrap(),
+            Choice::SetDns("76.76.2.0".to_string())
+        );
+        let ip_out = String::from_utf8(ip_out).unwrap();
+        assert!(ip_out.contains("Invalid DNS server:"));
+        assert!(ip_out.contains("Custom DNS"));
+
+        // Console [7] Custom DNS accepts valid https:// DoH URL and shows [active] when configured.
+        let mut doh_out = Vec::new();
+        assert_eq!(
+            read_choice_with_options(
+                &b"d\n7\nhttps://dns.nextdns.io/abc123\n"[..],
+                &mut doh_out,
+                &fresh,
+                None,
+                "76.76.2.0",
+                &SplitTunnelConfig::default(),
+                fresh_status
+            )
+            .unwrap(),
+            Choice::SetDns("https://dns.nextdns.io/abc123".to_string())
+        );
+        let doh_out = String::from_utf8(doh_out).unwrap();
+        assert!(doh_out.contains("76.76.2.0 [active]"));
+
+        // Pressing 'b' in custom DNS prompt returns to DNS list where a preset can be chosen.
+        assert_eq!(
+            read_choice(&b"d\n7\nb\n2\n"[..], Vec::new(), &fresh, None, fresh_status).unwrap(),
+            Choice::SetDns("8.8.8.8".to_string())
+        );
     }
 }

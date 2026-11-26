@@ -43,14 +43,14 @@ Runs as a transparent system-wide TUN adapter or a lightweight local proxy with 
       Self-healing 7-stage adaptive TLS desync engine, anti-poisoning RFC 8484 DoH ring, UDP/443 QUIC blocking, ~10-20 MB RAM, and crash-proof OS teardown.
     </td>
     <td valign="top" width="50%">
-      <strong>VPN &amp; gaming safe</strong><br>
-      Auto-yields to Mullvad, WireGuard, OpenVPN, ProtonVPN, and WARP and auto-resumes; coexists with Tailscale, Docker, and LAN; WHQL-signed Wintun (anticheat safe) and low-latency UDP NAT for Discord, Roblox, and games.
+      <strong>VPN, audio &amp; gaming safe</strong><br>
+      Gigabit TUN with zero-audio-stutter thread budgeting (VoiceMeeter safe), auto-yields to Mullvad, WireGuard, OpenVPN, ProtonVPN, and WARP and auto-resumes; coexists with Tailscale, Docker, and LAN; embedded WHQL-signed Wintun (anticheat safe) and low-latency UDP NAT for Discord, Roblox, and games.
     </td>
   </tr>
   <tr>
     <td valign="top" width="50%">
       <strong>Control Center TUI</strong><br>
-      Interactive <code>ratatui</code> launcher with <strong>Open live dashboard</strong> (<code>l</code>, attach live without restarting), per-app <strong>Split tunneling</strong> picker (<code>s</code>, fuzzy search + Include/Exclude), SHA-256-verified self-updater (<code>vdpi update</code>), and <code>config.toml</code> persistence.
+      Interactive <code>ratatui</code> launcher with <strong>Open live dashboard</strong> (<code>l</code>, attach live without restarting), <strong>Choose DNS server</strong> (<code>d</code>, presets + <code>[7] Custom DNS</code> IP/DoH picker), per-app <strong>Split tunneling</strong> picker (<code>s</code>, fuzzy search + Include/Exclude), SHA-256-verified self-updater (<code>vdpi update</code>), and <code>config.toml</code> persistence.
     </td>
     <td valign="top" width="50%">
       <strong>Local-only &amp; verifiable</strong><br>
@@ -79,9 +79,9 @@ winget install Vuln-Inc.vdpi
 cargo install vdpi
 ```
 
-> **Note:** On Windows, `cargo install vdpi` installs `vdpi.exe` (Proxy mode works immediately; for TUN mode, place `wintun.dll` beside `vdpi.exe` or install via Scoop, WinGet, or `install.ps1`).
+> **Note:** Official Windows releases ship as a single standalone `vdpi.exe` with the pinned WHQL-signed Wintun `0.14.1` driver embedded directly inside the binary (no loose `wintun.dll` required). `cargo install vdpi` builds `vdpi.exe` without the embedded driver (Proxy mode works immediately; for TUN mode, place `wintun.dll` beside `vdpi.exe` or install via Scoop, WinGet, or `install.ps1`).
 
-Direct download: [`vdpi-windows-x86_64.zip`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-windows-x86_64.zip) (bundles pinned WHQL-signed `wintun.dll`) or [crates.io/crates/vdpi](https://crates.io/crates/vdpi).
+Direct download: [`vdpi-windows-x86_64.zip`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-windows-x86_64.zip) (single standalone `vdpi.exe` with embedded WHQL-signed Wintun `0.14.1`) or [crates.io/crates/vdpi](https://crates.io/crates/vdpi).
 
 ### macOS & Linux (`universal` / `x86_64` & `arm64`)
 
@@ -175,4 +175,5 @@ Run `vdpi install` to register automatic background startup (Windows Service, ma
 
 ## License
 
-Released under the [MIT License](./LICENSE) · [Changelog](./CHANGELOG.md) · [Security](./SECURITY.md) · Official repository: [github.com/Vuln-Inc/vdpi](https://github.com/Vuln-Inc/vdpi) · Copyright (c) 2026 [Vuln-Inc](https://github.com/Vuln-Inc).
+Released under the [MIT License](./LICENSE) · [Changelog](./CHANGELOG.md) · [Security](./SECURITY.md) · Official repository: [github.com/Vuln-Inc/vdpi](https://github.com/Vuln-Inc/vdpi) · Copyright (c) 2026 [Vuln-Inc](https://github.com/Vuln-Inc).  
+Official Windows release binaries embed the unmodified WHQL-signed Wintun `0.14.1` driver (Copyright (C) WireGuard LLC, distributed under the Wintun / GPLv2 license - see [wintun.net](https://www.wintun.net/)).

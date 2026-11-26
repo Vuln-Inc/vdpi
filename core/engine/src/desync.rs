@@ -43,10 +43,14 @@ const MAX_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(12);
 const DIRECT_PASSTHROUGH_FALLBACK_BUDGET: Duration = Duration::from_millis(2000);
 const RETRY_DNS_TIMEOUT: Duration = Duration::from_millis(1500);
 
-#[cfg(any(target_os = "android", target_os = "ios"))]
+#[cfg(target_os = "ios")]
 const RELAY_BUF_SIZE: usize = 16 * 1024;
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-const RELAY_BUF_SIZE: usize = 128 * 1024;
+#[cfg(target_os = "android")]
+const RELAY_BUF_SIZE: usize = 64 * 1024;
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+const RELAY_BUF_SIZE: usize = 256 * 1024;
+
+const TELEMETRY_BATCH_BYTES: u64 = RELAY_BUF_SIZE as u64;
 
 #[cfg(any(target_os = "android", target_os = "ios"))]
 const IDLE_RELAY_TIMEOUT: Duration = Duration::from_secs(120);
@@ -509,38 +513,61 @@ pub struct EngineTelemetrySnapshot {
     pub dns_queries: u64,
 }
 
-/// Wraps an upstream stream to update `bytes_tx` / `bytes_rx` live on every I/O completion
-/// (rather than only after clean EOF) and tracks monotonic activity timestamps so truly
-/// idle connections can be reaped without cutting active unidirectional streams.
-struct CountingStream<S> {
+/// Wraps an upstream stream to track `bytes_tx` / `bytes_rx` with batched `Relaxed` atomic
+/// updates (flushed on batch threshold, yield/Pending, EOF, flush, shutdown, and drop) and a
+/// zero-syscall activity flag so idle connections can be reaped without per-chunk `Instant::now()`
+/// calls or cross-core cache-line contention at Gigabit speeds.
+struct CountingStream<'a, S> {
     inner: S,
-    telemetry: Arc<EngineTelemetry>,
-    started: Instant,
-    last_activity_ms: Arc<AtomicU64>,
+    telemetry: &'a EngineTelemetry,
+    active: &'a AtomicBool,
+    pending_rx: u64,
+    pending_tx: u64,
 }
 
-impl<S> CountingStream<S> {
-    fn new(
-        inner: S,
-        telemetry: Arc<EngineTelemetry>,
-        started: Instant,
-        last_activity_ms: Arc<AtomicU64>,
-    ) -> Self {
+impl<'a, S> CountingStream<'a, S> {
+    fn new(inner: S, telemetry: &'a EngineTelemetry, active: &'a AtomicBool) -> Self {
         Self {
             inner,
             telemetry,
-            started,
-            last_activity_ms,
+            active,
+            pending_rx: 0,
+            pending_tx: 0,
         }
     }
 
+    #[inline]
     fn touch_activity(&self) {
-        let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        self.last_activity_ms.store(elapsed, Ordering::Relaxed);
+        if !self.active.load(Ordering::Relaxed) {
+            self.active.store(true, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn flush_rx(&mut self) {
+        if self.pending_rx > 0 {
+            let n = std::mem::take(&mut self.pending_rx);
+            self.telemetry.bytes_rx.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn flush_tx(&mut self) {
+        if self.pending_tx > 0 {
+            let n = std::mem::take(&mut self.pending_tx);
+            self.telemetry.bytes_tx.fetch_add(n, Ordering::Relaxed);
+        }
     }
 }
 
-impl<S: AsyncRead + Unpin> AsyncRead for CountingStream<S> {
+impl<S> Drop for CountingStream<'_, S> {
+    fn drop(&mut self) {
+        self.flush_rx();
+        self.flush_tx();
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for CountingStream<'_, S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
@@ -548,38 +575,51 @@ impl<S: AsyncRead + Unpin> AsyncRead for CountingStream<S> {
     ) -> Poll<std::io::Result<()>> {
         let before = buf.filled().len();
         let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if let Poll::Ready(Ok(())) = &poll {
-            let n = buf.filled().len().saturating_sub(before);
-            if n > 0 {
-                self.touch_activity();
-                self.telemetry
-                    .bytes_rx
-                    .fetch_add(n as u64, Ordering::Relaxed);
+        match &poll {
+            Poll::Ready(Ok(())) => {
+                let n = buf.filled().len().saturating_sub(before);
+                if n > 0 {
+                    self.touch_activity();
+                    self.pending_rx += n as u64;
+                    if self.pending_rx >= TELEMETRY_BATCH_BYTES {
+                        self.flush_rx();
+                    }
+                } else {
+                    self.flush_rx();
+                }
+            }
+            Poll::Pending | Poll::Ready(Err(_)) => {
+                self.flush_rx();
             }
         }
         poll
     }
 }
 
-impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<S> {
+impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<'_, S> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
-        if let Poll::Ready(Ok(n)) = &poll {
-            if *n > 0 {
+        match &poll {
+            Poll::Ready(Ok(n)) if *n > 0 => {
                 self.touch_activity();
-                self.telemetry
-                    .bytes_tx
-                    .fetch_add(*n as u64, Ordering::Relaxed);
+                self.pending_tx += *n as u64;
+                if self.pending_tx >= TELEMETRY_BATCH_BYTES {
+                    self.flush_tx();
+                }
+            }
+            Poll::Pending | Poll::Ready(Ok(_)) | Poll::Ready(Err(_)) => {
+                self.flush_tx();
             }
         }
         poll
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        self.flush_tx();
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
@@ -587,6 +627,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<S> {
         mut self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
     ) -> Poll<std::io::Result<()>> {
+        self.flush_tx();
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
@@ -1315,7 +1356,7 @@ impl EngineContext {
                     // ClientHello), read until the complete outer TLS record has arrived before splitting records.
                     if let Some(expected_total) = expected_tls_record_len(&first_buf[..filled]) {
                         if expected_total <= first_buf.len() && filled < expected_total {
-                            let _ = tokio::time::timeout(Duration::from_millis(400), async {
+                            let _ = tokio::time::timeout(Duration::from_millis(600), async {
                                 while filled < expected_total {
                                     let n =
                                         client.read(&mut first_buf[filled..expected_total]).await?;
@@ -1382,6 +1423,7 @@ impl EngineContext {
         known_host: Option<&str>,
         remote_addr: SocketAddr,
     ) -> Result<()> {
+        let _ = client.set_nodelay(true);
         self.establish_and_relay_stream(client, remote, payload, known_host, remote_addr)
             .await
     }
@@ -1398,6 +1440,7 @@ impl EngineContext {
     where
         C: AsyncRead + AsyncWrite + Unpin,
     {
+        let _ = remote.set_nodelay(true);
         let _guard = ActiveConnGuard::enter(&self.telemetry);
         let established = self
             .establish_initial_flight(&mut client, remote, payload, known_host, remote_addr)
@@ -1713,6 +1756,44 @@ impl EngineContext {
                                         } else {
                                             0usize
                                         };
+                                    // If CCS arrived alone or the CH #2 5-byte TLS record header was split
+                                    // across TCP reads, finish reading the header before inspecting record len.
+                                    let header_end = ccs_prefix + 5;
+                                    if filled2 < header_end
+                                        && (filled2 == ccs_prefix
+                                            || (ch2_buf[ccs_prefix] == 0x16
+                                                && (filled2 - ccs_prefix < 2
+                                                    || ch2_buf[ccs_prefix + 1] == 0x03)
+                                                && (filled2 - ccs_prefix < 3
+                                                    || ch2_buf[ccs_prefix + 2] <= 0x04)))
+                                    {
+                                        let _ = tokio::time::timeout(
+                                            Duration::from_millis(400),
+                                            async {
+                                                while filled2 < header_end {
+                                                    let m = client
+                                                        .read(&mut ch2_buf[filled2..header_end])
+                                                        .await?;
+                                                    if m == 0 {
+                                                        break;
+                                                    }
+                                                    filled2 += m;
+                                                    let ch2_have = filled2 - ccs_prefix;
+                                                    if (ch2_have >= 1
+                                                        && ch2_buf[ccs_prefix] != 0x16)
+                                                        || (ch2_have >= 2
+                                                            && ch2_buf[ccs_prefix + 1] != 0x03)
+                                                        || (ch2_have >= 3
+                                                            && ch2_buf[ccs_prefix + 2] > 0x04)
+                                                    {
+                                                        break;
+                                                    }
+                                                }
+                                                Ok::<(), std::io::Error>(())
+                                            },
+                                        )
+                                        .await;
+                                    }
                                     if let Some(expected2) =
                                         expected_tls_record_len(&ch2_buf[ccs_prefix..filled2])
                                     {
@@ -2214,29 +2295,23 @@ fn compute_stage_deadline(
 async fn relay_bidirectional<C>(
     client: &mut C,
     remote: TcpStream,
-    telemetry: &Arc<EngineTelemetry>,
+    telemetry: &EngineTelemetry,
 ) -> std::io::Result<(u64, u64)>
 where
     C: AsyncRead + AsyncWrite + Unpin,
 {
-    let started = Instant::now();
-    let last_activity_ms = Arc::new(AtomicU64::new(0));
-    let mut counted = CountingStream::new(
-        remote,
-        Arc::clone(telemetry),
-        started,
-        Arc::clone(&last_activity_ms),
-    );
+    let active = AtomicBool::new(false);
+    let mut counted = CountingStream::new(remote, telemetry, &active);
     let idle_watcher = async {
-        let timeout_ms = u64::try_from(IDLE_RELAY_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
+        let mut last_active = Instant::now();
         let mut check_interval = tokio::time::interval(Duration::from_secs(15));
         check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         check_interval.tick().await;
         loop {
             check_interval.tick().await;
-            let now_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-            let last_ms = last_activity_ms.load(Ordering::Relaxed);
-            if now_ms.saturating_sub(last_ms) >= timeout_ms {
+            if active.swap(false, Ordering::Relaxed) {
+                last_active = Instant::now();
+            } else if last_active.elapsed() >= IDLE_RELAY_TIMEOUT {
                 break;
             }
         }
@@ -4008,5 +4083,241 @@ mod tests {
                 .copied(),
             Some(LearnedStrategy::DirectPassthrough)
         );
+    }
+
+    #[test]
+    fn relay_buf_size_matches_platform_budget() {
+        #[cfg(target_os = "ios")]
+        assert_eq!(RELAY_BUF_SIZE, 16 * 1024);
+        #[cfg(target_os = "android")]
+        assert_eq!(RELAY_BUF_SIZE, 64 * 1024);
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        assert_eq!(RELAY_BUF_SIZE, 256 * 1024);
+        assert_eq!(TELEMETRY_BATCH_BYTES, RELAY_BUF_SIZE as u64);
+    }
+
+    #[tokio::test]
+    async fn relay_stream_reassembles_large_post_quantum_client_hello_across_multiple_reads() {
+        let config = RuntimeConfig {
+            system_proxy: false,
+            chunk_size: 10,
+            patterns: vec!["pq-test\\.example$".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let ctx = EngineContext::new(config).unwrap();
+
+        // ~1,800+ byte ClientHello modeling Chrome / WinHTTP X25519MLKEM768 Post-Quantum flight.
+        let ch = build_synthetic_client_hello("chrome.pq-test.example", 1800);
+        assert!(
+            ch.len() > 1700,
+            "PQ ClientHello should exceed 1460-byte MSS"
+        );
+        let expected_payload = ch[5..].to_vec();
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = upstream.accept().await.unwrap();
+            let mut reassembled = Vec::with_capacity(expected_payload.len());
+            let mut record_count = 0usize;
+            while reassembled.len() < expected_payload.len() {
+                let mut hdr = [0u8; 5];
+                sock.read_exact(&mut hdr).await.unwrap();
+                assert_eq!(hdr[0], 0x16);
+                let rlen = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                let mut body = vec![0u8; rlen];
+                sock.read_exact(&mut body).await.unwrap();
+                assert!(!body.windows(22).any(|w| w == b"chrome.pq-test.example"));
+                reassembled.extend_from_slice(&body);
+                record_count += 1;
+            }
+            assert_eq!(reassembled, expected_payload);
+            assert!(record_count >= 2);
+
+            sock.write_all(&[0x16, 0x03, 0x03, 0x00, 0x05, b'P', b'Q', b'_', b'O', b'K'])
+                .await
+                .unwrap();
+            // Steady-state bulk download (> RELAY_BUF_SIZE) after handshake
+            let bulk = vec![0x5Au8; 320 * 1024];
+            sock.write_all(&bulk).await.unwrap();
+            let _ = sock.shutdown().await;
+            bulk.len()
+        });
+
+        let (mut app_side, tun_side) = tokio::io::duplex(64 * 1024);
+        let ch_send = ch.clone();
+        let app_task = tokio::spawn(async move {
+            // Split across 2 TCP reads at standard 1460-byte Ethernet/IPv4 MSS boundary.
+            app_side.write_all(&ch_send[..1460]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            app_side.write_all(&ch_send[1460..]).await.unwrap();
+
+            let mut sh = [0u8; 10];
+            app_side.read_exact(&mut sh).await.unwrap();
+            let mut rest = Vec::new();
+            app_side.read_to_end(&mut rest).await.unwrap();
+            (sh, rest)
+        });
+
+        let remote = ctx.connect_upstream_addr(upstream_addr).await.unwrap();
+        ctx.relay_stream(
+            tun_side,
+            remote,
+            Some("chrome.pq-test.example"),
+            upstream_addr,
+        )
+        .await
+        .unwrap();
+
+        let bulk_len = server.await.unwrap();
+        let (sh, rest) = app_task.await.unwrap();
+        assert_eq!(
+            &sh,
+            &[0x16, 0x03, 0x03, 0x00, 0x05, b'P', b'Q', b'_', b'O', b'K']
+        );
+        assert_eq!(rest.len(), bulk_len);
+        assert!(rest.iter().all(|&b| b == 0x5A));
+
+        let snap = ctx.telemetry_snapshot();
+        assert_eq!(snap.active_connections, 0);
+        assert_eq!(snap.tls_handshakes, 1);
+        assert_eq!(snap.bytes_tx, ch.len() as u64);
+        assert_eq!(snap.bytes_rx, (10 + bulk_len) as u64);
+    }
+
+    #[tokio::test]
+    async fn counting_stream_batches_telemetry_and_tracks_activity_without_clock_calls() {
+        let telemetry = EngineTelemetry::default();
+        let active = AtomicBool::new(false);
+
+        let (mut peer, local) = tokio::io::duplex(64 * 1024);
+        let mut counted = CountingStream::new(local, &telemetry, &active);
+
+        // Small write (< TELEMETRY_BATCH_BYTES) stays batched until flush/pending, while setting active.
+        let small = b"ping-frame";
+        counted.write_all(small).await.unwrap();
+        assert!(active.load(Ordering::Relaxed));
+        counted.flush().await.unwrap();
+        assert_eq!(
+            telemetry.bytes_tx.load(Ordering::Relaxed),
+            small.len() as u64
+        );
+
+        let mut got = [0u8; 10];
+        peer.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, small);
+
+        // Large read (> TELEMETRY_BATCH_BYTES) flushes live during streaming and exact on EOF.
+        let total_rx = RELAY_BUF_SIZE + 12_345;
+        let writer = tokio::spawn(async move {
+            let chunk = vec![0xABu8; 32 * 1024];
+            let mut remaining = total_rx;
+            while remaining > 0 {
+                let n = remaining.min(chunk.len());
+                peer.write_all(&chunk[..n]).await.unwrap();
+                remaining -= n;
+            }
+            peer.shutdown().await.unwrap();
+        });
+
+        active.store(false, Ordering::Relaxed);
+        let mut drained = Vec::with_capacity(total_rx);
+        counted.read_to_end(&mut drained).await.unwrap();
+        writer.await.unwrap();
+        assert_eq!(drained.len(), total_rx);
+        assert!(active.load(Ordering::Relaxed));
+        assert_eq!(telemetry.bytes_rx.load(Ordering::Relaxed), total_rx as u64);
+    }
+
+    #[tokio::test]
+    async fn hrr_split_ccs_and_pq_client_hello2_reassembles_and_desyncs() {
+        let config = RuntimeConfig {
+            system_proxy: false,
+            chunk_size: 10,
+            patterns: vec!["hrr-pq\\.example$".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let ctx = EngineContext::new(config).unwrap();
+
+        let ch1 = build_synthetic_client_hello("edge.hrr-pq.example", 512);
+        let ch2 = build_synthetic_client_hello("edge.hrr-pq.example", 1750);
+        let ch1_payload_len = ch1.len() - 5;
+        let ch2_expected_payload = ch2[5..].to_vec();
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = upstream.accept().await.unwrap();
+            // Drain desynced ClientHello #1
+            let mut got1 = 0usize;
+            while got1 < ch1_payload_len {
+                let mut hdr = [0u8; 5];
+                sock.read_exact(&mut hdr).await.unwrap();
+                let rlen = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                let mut body = vec![0u8; rlen];
+                sock.read_exact(&mut body).await.unwrap();
+                got1 += rlen;
+            }
+
+            // Send TLS 1.3 HelloRetryRequest ServerHello
+            let mut hrr = vec![
+                0x16, 0x03, 0x03, 0x00, 0x30, 0x02, 0x00, 0x00, 0x2c, 0x03, 0x03,
+            ];
+            hrr.extend_from_slice(&TLS13_HELLO_RETRY_REQUEST_RANDOM);
+            hrr.extend_from_slice(&[0u8; 10]);
+            sock.write_all(&hrr).await.unwrap();
+
+            // Expect 6-byte ChangeCipherSpec followed by desynced multi-record ClientHello #2
+            let mut ccs = [0u8; 6];
+            sock.read_exact(&mut ccs).await.unwrap();
+            assert_eq!(ccs, [0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
+
+            let mut reassembled2 = Vec::with_capacity(ch2_expected_payload.len());
+            let mut ch2_records = 0usize;
+            while reassembled2.len() < ch2_expected_payload.len() {
+                let mut hdr = [0u8; 5];
+                sock.read_exact(&mut hdr).await.unwrap();
+                assert_eq!(hdr[0], 0x16);
+                let rlen = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                let mut body = vec![0u8; rlen];
+                sock.read_exact(&mut body).await.unwrap();
+                assert!(!body.windows(19).any(|w| w == b"edge.hrr-pq.example"));
+                reassembled2.extend_from_slice(&body);
+                ch2_records += 1;
+            }
+            assert_eq!(reassembled2, ch2_expected_payload);
+            assert!(ch2_records >= 2);
+            let _ = sock.shutdown().await;
+        });
+
+        let (mut app_side, tun_side) = tokio::io::duplex(64 * 1024);
+        let ch1_send = ch1.clone();
+        let ch2_send = ch2.clone();
+        let app_task = tokio::spawn(async move {
+            app_side.write_all(&ch1_send).await.unwrap();
+            let mut hrr_reply = [0u8; 53];
+            app_side.read_exact(&mut hrr_reply).await.unwrap();
+
+            // Send CCS alone first, then PQ ClientHello #2 split across 2 TCP reads.
+            app_side
+                .write_all(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01])
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            app_side.write_all(&ch2_send[..1460]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            app_side.write_all(&ch2_send[1460..]).await.unwrap();
+            app_side.shutdown().await.unwrap();
+        });
+
+        let remote = ctx.connect_upstream_addr(upstream_addr).await.unwrap();
+        ctx.relay_stream(tun_side, remote, Some("edge.hrr-pq.example"), upstream_addr)
+            .await
+            .unwrap();
+
+        app_task.await.unwrap();
+        server.await.unwrap();
     }
 }

@@ -2,7 +2,9 @@ use anyhow::{anyhow, Result};
 use smoltcp::{
     iface::{Config as InterfaceConfig, Interface, PollResult, SocketHandle, SocketSet},
     phy::{Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken},
-    socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState},
+    socket::tcp::{
+        CongestionControl, Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState,
+    },
     storage::RingBuffer,
     time::{Duration as SmolDuration, Instant as SmolInstant},
     wire::{
@@ -16,6 +18,7 @@ use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
@@ -24,13 +27,46 @@ use tokio::sync::{mpsc, watch, Notify};
 use tracing::{debug, trace};
 
 const INGRESS_DRAIN_LIMIT: usize = 128;
-const POLL_BURST_LIMIT: usize = 8;
+const POLL_BURST_LIMIT: usize = 16;
+const ZERO_DELAY_BACKOFF_MIN_MS: u64 = 1;
+const ZERO_DELAY_BACKOFF_MAX_MS: u64 = 10;
+const SMALL_TX_POOL_MAX_BYTES: usize = 128;
+const TX_HEADER_ZERO_LEN: usize = 100;
 const FIN_WAIT_2_TIMEOUT: SmolDuration = SmolDuration::from_secs(15);
 const LISTEN_ORPHAN_TIMEOUT: StdDuration = StdDuration::from_secs(3);
 const TIME_WAIT_REAP_TIMEOUT: StdDuration = StdDuration::from_secs(2);
 const CLOSING_REAP_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 const DEFERRED_SYN_TTL: StdDuration = StdDuration::from_secs(2);
 const MAX_DEFERRED_SYNS: usize = 32;
+
+/// Monotonic microsecond clock for `smoltcp`, anchored above `Instant::ZERO` so
+/// Windows NTP clock adjustments can never move timestamps backwards or collide
+/// with `smoltcp`'s `Instant::ZERO` expired-timer sentinel.
+struct MonotonicClock {
+    epoch: StdInstant,
+}
+
+impl MonotonicClock {
+    const BASE_MICROS: i64 = 1_000_000_000;
+
+    fn new() -> Self {
+        Self {
+            epoch: StdInstant::now(),
+        }
+    }
+
+    #[inline]
+    fn smol_from(&self, instant: StdInstant) -> SmolInstant {
+        let elapsed = instant.saturating_duration_since(self.epoch).as_micros();
+        let offset = i64::try_from(elapsed).unwrap_or(i64::MAX - Self::BASE_MICROS);
+        SmolInstant::from_micros(Self::BASE_MICROS.saturating_add(offset))
+    }
+
+    #[inline]
+    fn now(&self) -> SmolInstant {
+        self.smol_from(StdInstant::now())
+    }
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum HalfState {
@@ -47,18 +83,35 @@ struct TcpSocketControl {
     recv_waker: Option<Waker>,
     recv_state: HalfState,
     send_state: HalfState,
+    /// True when the reactor paused draining `smoltcp` RX because `recv_buffer` filled up.
+    /// `poll_read` only notifies the reactor when this flag is set, eliminating spurious wakeups.
+    rx_backpressured: bool,
 }
 
-type SharedControl = Arc<Mutex<TcpSocketControl>>;
+struct SocketShared {
+    tx_dirty: AtomicBool,
+    rx_dirty: AtomicBool,
+    control: Mutex<TcpSocketControl>,
+}
+
+impl SocketShared {
+    fn lock_control(&self) -> std::sync::MutexGuard<'_, TcpSocketControl> {
+        self.control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+type SharedControl = Arc<SocketShared>;
 
 /// In-tree userspace TCP stream backed by `smoltcp` 0.14 with immediate ACKs
-/// (`ack_delay = None`), Nagle disabled, RFC 7323 window scaling, and zero-copy
-/// direct queue handoff to the TUN pipeline.
+/// (`ack_delay = None`), Nagle disabled, `CongestionControl::None` on the local
+/// zero-loss virtual TUN hop, RFC 7323 window scaling, and batched queue handoff.
 pub(crate) struct TunNetstackTcpStream {
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
     notify: Arc<Notify>,
-    control: SharedControl,
+    shared: SharedControl,
 }
 
 impl TunNetstackTcpStream {
@@ -73,10 +126,7 @@ impl TunNetstackTcpStream {
 
 impl Drop for TunNetstackTcpStream {
     fn drop(&mut self) {
-        let mut control = self
-            .control
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut control = self.shared.lock_control();
         if matches!(control.recv_state, HalfState::Normal) {
             control.recv_state = HalfState::Close;
         }
@@ -84,6 +134,8 @@ impl Drop for TunNetstackTcpStream {
             control.send_state = HalfState::Close;
         }
         drop(control);
+        self.shared.tx_dirty.store(true, Ordering::Release);
+        self.shared.rx_dirty.store(true, Ordering::Release);
         self.notify.notify_one();
     }
 }
@@ -94,10 +146,11 @@ impl AsyncRead for TunNetstackTcpStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let mut control = self
-            .control
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        let mut control = self.shared.lock_control();
 
         if control.recv_buffer.is_empty() {
             if matches!(control.recv_state, HalfState::Closed) {
@@ -111,12 +164,20 @@ impl AsyncRead for TunNetstackTcpStream {
             return Poll::Pending;
         }
 
-        let unfilled = buf.initialize_unfilled();
+        let to_read = control.recv_buffer.len().min(buf.remaining());
+        let unfilled = buf.initialize_unfilled_to(to_read);
         let n = control.recv_buffer.dequeue_slice(unfilled);
         buf.advance(n);
+        let should_notify = if n > 0 && control.rx_backpressured {
+            control.rx_backpressured = false;
+            true
+        } else {
+            false
+        };
         drop(control);
 
-        if n > 0 {
+        if should_notify {
+            self.shared.rx_dirty.store(true, Ordering::Release);
             self.notify.notify_one();
         }
         Poll::Ready(Ok(()))
@@ -129,10 +190,11 @@ impl AsyncWrite for TunNetstackTcpStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let mut control = self
-            .control
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        let mut control = self.shared.lock_control();
 
         if !matches!(control.send_state, HalfState::Normal) {
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
@@ -151,6 +213,7 @@ impl AsyncWrite for TunNetstackTcpStream {
         drop(control);
 
         if n > 0 {
+            self.shared.tx_dirty.store(true, Ordering::Release);
             self.notify.notify_one();
         }
         Poll::Ready(Ok(n))
@@ -161,10 +224,7 @@ impl AsyncWrite for TunNetstackTcpStream {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let mut control = self
-            .control
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut control = self.shared.lock_control();
 
         if matches!(control.send_state, HalfState::Closed) {
             return Poll::Ready(Ok(()));
@@ -181,32 +241,114 @@ impl AsyncWrite for TunNetstackTcpStream {
         }
         drop(control);
 
+        self.shared.tx_dirty.store(true, Ordering::Release);
         self.notify.notify_one();
         Poll::Pending
     }
 }
 
-struct VirtualRxToken(Vec<u8>);
+struct VirtualRxToken<'a> {
+    buf: Vec<u8>,
+    recycle: &'a mut Vec<Vec<u8>>,
+    recycle_cap: usize,
+    max_buf_cap: usize,
+}
 
-impl RxToken for VirtualRxToken {
+impl RxToken for VirtualRxToken<'_> {
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
     {
-        f(&self.0)
+        let res = f(&self.buf);
+        let cap = self.buf.capacity();
+        if self.recycle.len() < self.recycle_cap && (40..=self.max_buf_cap).contains(&cap) {
+            self.recycle.push(self.buf);
+        }
+        res
     }
 }
 
-struct VirtualTxToken<'a>(&'a mut VecDeque<Vec<u8>>);
+struct TxBufferPool {
+    small: Vec<Vec<u8>>,
+    large: Vec<Vec<u8>>,
+    small_cap: usize,
+    large_cap: usize,
+    max_buf_cap: usize,
+}
+
+impl TxBufferPool {
+    fn new(mtu: usize, small_cap: usize, large_cap: usize) -> Self {
+        Self {
+            small: Vec::with_capacity(small_cap),
+            large: Vec::with_capacity(large_cap),
+            small_cap,
+            large_cap,
+            max_buf_cap: mtu.max(2048),
+        }
+    }
+
+    #[inline]
+    fn checkout(&mut self, len: usize) -> Vec<u8> {
+        let reused = if len <= SMALL_TX_POOL_MAX_BYTES {
+            self.small
+                .iter()
+                .rposition(|b| b.capacity() >= len)
+                .map(|idx| self.small.swap_remove(idx))
+                .or_else(|| self.small.pop())
+        } else {
+            self.large
+                .iter()
+                .rposition(|b| b.capacity() >= len)
+                .map(|idx| self.large.swap_remove(idx))
+        };
+
+        match reused {
+            Some(mut buf) => {
+                let prev_len = buf.len();
+                if prev_len >= len {
+                    buf.truncate(len);
+                    buf[..len.min(TX_HEADER_ZERO_LEN)].fill(0);
+                } else {
+                    buf.resize(len, 0);
+                    buf[..prev_len.min(TX_HEADER_ZERO_LEN)].fill(0);
+                }
+                buf
+            }
+            None => vec![0u8; len],
+        }
+    }
+
+    #[inline]
+    fn recycle_all(&mut self, incoming: &mut Vec<Vec<u8>>) {
+        for buf in incoming.drain(..) {
+            let cap = buf.capacity();
+            if !(40..=self.max_buf_cap).contains(&cap) {
+                continue;
+            }
+            if cap <= SMALL_TX_POOL_MAX_BYTES {
+                if self.small.len() < self.small_cap {
+                    self.small.push(buf);
+                }
+            } else if self.large.len() < self.large_cap {
+                self.large.push(buf);
+            }
+        }
+    }
+}
+
+struct VirtualTxToken<'a> {
+    tx_queue: &'a mut VecDeque<Vec<u8>>,
+    pool: &'a mut TxBufferPool,
+}
 
 impl TxToken for VirtualTxToken<'_> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buf = vec![0u8; len];
+        let mut buf = self.pool.checkout(len);
         let res = f(&mut buf);
-        self.0.push_back(buf);
+        self.tx_queue.push_back(buf);
         res
     }
 }
@@ -214,25 +356,46 @@ impl TxToken for VirtualTxToken<'_> {
 struct VirtualDevice {
     mtu: usize,
     tx_queue_high_water: usize,
+    tx_throttled: bool,
     rx_queue: VecDeque<Vec<u8>>,
     tx_queue: VecDeque<Vec<u8>>,
+    rx_recycle: Vec<Vec<u8>>,
+    tx_pool: TxBufferPool,
+    recycle_cap: usize,
 }
 
 impl VirtualDevice {
-    fn new(mtu: usize, tx_queue_high_water: usize) -> Self {
+    fn new(mtu: usize, tx_queue_high_water: usize, low_memory: bool) -> Self {
         let tx_queue_high_water = tx_queue_high_water.max(16);
+        let (small_cap, large_cap) = if low_memory {
+            (16, 8)
+        } else {
+            (64, tx_queue_high_water.clamp(32, 128))
+        };
+        let recycle_cap = small_cap + large_cap;
         Self {
             mtu,
             tx_queue_high_water,
+            tx_throttled: false,
             rx_queue: VecDeque::with_capacity(INGRESS_DRAIN_LIMIT),
             tx_queue: VecDeque::with_capacity(INGRESS_DRAIN_LIMIT.min(tx_queue_high_water)),
+            rx_recycle: Vec::with_capacity(recycle_cap.min(INGRESS_DRAIN_LIMIT)),
+            tx_pool: TxBufferPool::new(mtu, small_cap, large_cap),
+            recycle_cap,
+        }
+    }
+
+    #[inline]
+    fn recycle_consumed_rx(&mut self) {
+        if !self.rx_recycle.is_empty() {
+            self.tx_pool.recycle_all(&mut self.rx_recycle);
         }
     }
 }
 
 impl Device for VirtualDevice {
     type RxToken<'a>
-        = VirtualRxToken
+        = VirtualRxToken<'a>
     where
         Self: 'a;
     type TxToken<'a>
@@ -247,14 +410,30 @@ impl Device for VirtualDevice {
         // Never gate inbound RX (especially ACKs, window updates, FINs, and RSTs) on
         // `tx_queue_high_water`: inbound ACKs are what allow TX buffers to drain.
         let pkt = self.rx_queue.pop_front()?;
-        Some((VirtualRxToken(pkt), VirtualTxToken(&mut self.tx_queue)))
+        let max_buf_cap = self.tx_pool.max_buf_cap;
+        Some((
+            VirtualRxToken {
+                buf: pkt,
+                recycle: &mut self.rx_recycle,
+                recycle_cap: self.recycle_cap,
+                max_buf_cap,
+            },
+            VirtualTxToken {
+                tx_queue: &mut self.tx_queue,
+                pool: &mut self.tx_pool,
+            },
+        ))
     }
 
     fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
         if self.tx_queue.len() >= self.tx_queue_high_water {
+            self.tx_throttled = true;
             return None;
         }
-        Some(VirtualTxToken(&mut self.tx_queue))
+        Some(VirtualTxToken {
+            tx_queue: &mut self.tx_queue,
+            pool: &mut self.tx_pool,
+        })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -272,19 +451,32 @@ impl Device for VirtualDevice {
 }
 
 struct SocketEntry {
-    control: SharedControl,
+    shared: SharedControl,
     endpoints: (SocketAddr, SocketAddr),
     created_at: StdInstant,
     saw_non_listen: bool,
     fin_wait_2_shortened: bool,
     closing_since: Option<StdInstant>,
     time_wait_since: Option<StdInstant>,
+    /// Reactor-owned mirrors of `TcpSocketControl` state so idle sockets require zero mutex locks.
+    tx_has_pending: bool,
+    rx_backpressured: bool,
+    recv_open: bool,
+    recv_closing: bool,
+    send_closing: bool,
+    app_closed_both: bool,
+}
+
+enum InboundTcpKind {
+    Invalid,
+    NonSyn,
+    InitialSyn(SocketAddr, SocketAddr),
 }
 
 enum EnqueueOutcome {
     Enqueued,
     Dropped,
-    Deferred(Vec<u8>),
+    Deferred(SocketAddr, Vec<u8>),
 }
 
 fn internet_checksum_sum(data: &[u8]) -> u32 {
@@ -432,10 +624,7 @@ fn evict_reclaimable_socket(
         }
         if let Some(entry) = sockets.remove(&handle) {
             active_endpoints.remove(&entry.endpoints);
-            let mut control = entry
-                .control
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut control = entry.shared.lock_control();
             control.send_state = HalfState::Closed;
             control.recv_state = HalfState::Closed;
             if let Some(w) = control.send_waker.take() {
@@ -453,10 +642,13 @@ fn evict_reclaimable_socket(
 }
 
 /// Decouples `TcpSocketControl` ring sizes from `smoltcp`'s `TcpSocketBuffer` so iOS
-/// (`<= 32 KiB`) uses 16 KiB control rings while desktop (`512 KiB`) caps rings at 128 KiB.
+/// (`<= 32 KiB`) uses 16 KiB control rings, `512 KiB` desktop uses 128 KiB, and
+/// `>= 1 MiB` desktop buffers use 256 KiB rings to cut lock/notify frequency at 1 Gbps.
 fn control_ring_size(tcp_buffer_size: usize) -> usize {
     if tcp_buffer_size <= 32 * 1024 {
         tcp_buffer_size.min(16 * 1024)
+    } else if tcp_buffer_size >= 1024 * 1024 {
+        tcp_buffer_size.min(256 * 1024)
     } else {
         tcp_buffer_size.min(128 * 1024)
     }
@@ -473,10 +665,10 @@ fn generate_random_seed() -> u64 {
     hasher.finish()
 }
 
-fn create_interface(device: &mut VirtualDevice) -> Result<Interface> {
+fn create_interface(device: &mut VirtualDevice, now: SmolInstant) -> Result<Interface> {
     let mut iface_config = InterfaceConfig::new(HardwareAddress::Ip);
     iface_config.random_seed = generate_random_seed();
-    let mut iface = Interface::new(iface_config, device, SmolInstant::now());
+    let mut iface = Interface::new(iface_config, device, now);
     iface.update_ip_addrs(|ip_addrs| {
         let _ = ip_addrs.push(IpCidr::new(IpAddress::v4(0, 0, 0, 1), 0));
         let _ = ip_addrs.push(IpCidr::new(IpAddress::v6(0, 0, 0, 0, 0, 0, 0, 1), 0));
@@ -493,8 +685,57 @@ fn create_interface(device: &mut VirtualDevice) -> Result<Interface> {
     Ok(iface)
 }
 
+/// Fast-path classifier for inbound IPv4/IPv6 TCP frames.
+/// Avoids constructing `SocketAddr` on the 99.9% non-SYN data/ACK hot path.
+#[inline]
+fn classify_inbound_tcp(frame: &[u8]) -> InboundTcpKind {
+    let Some(&first) = frame.first() else {
+        return InboundTcpKind::Invalid;
+    };
+    match first >> 4 {
+        4 => {
+            let Ok(ip) = Ipv4Packet::new_checked(frame) else {
+                return InboundTcpKind::Invalid;
+            };
+            if ip.next_header() != IpProtocol::Tcp {
+                return InboundTcpKind::Invalid;
+            }
+            let Ok(tcp) = TcpPacket::new_checked(ip.payload()) else {
+                return InboundTcpKind::Invalid;
+            };
+            if tcp.syn() && !tcp.ack() && !tcp.rst() && !tcp.fin() {
+                let src_addr = SocketAddr::new(IpAddr::V4(ip.src_addr()), tcp.src_port());
+                let dst_addr = SocketAddr::new(IpAddr::V4(ip.dst_addr()), tcp.dst_port());
+                InboundTcpKind::InitialSyn(src_addr, dst_addr)
+            } else {
+                InboundTcpKind::NonSyn
+            }
+        }
+        6 => {
+            let Ok(ip) = Ipv6Packet::new_checked(frame) else {
+                return InboundTcpKind::Invalid;
+            };
+            if ip.next_header() != IpProtocol::Tcp {
+                return InboundTcpKind::Invalid;
+            }
+            let Ok(tcp) = TcpPacket::new_checked(ip.payload()) else {
+                return InboundTcpKind::Invalid;
+            };
+            if tcp.syn() && !tcp.ack() && !tcp.rst() && !tcp.fin() {
+                let src_addr = SocketAddr::new(IpAddr::V6(ip.src_addr()), tcp.src_port());
+                let dst_addr = SocketAddr::new(IpAddr::V6(ip.dst_addr()), tcp.dst_port());
+                InboundTcpKind::InitialSyn(src_addr, dst_addr)
+            } else {
+                InboundTcpKind::NonSyn
+            }
+        }
+        _ => InboundTcpKind::Invalid,
+    }
+}
+
 /// Inspects an IPv4/IPv6 frame to see whether it is a valid TCP packet.
 /// Returns `Some((src_addr, dst_addr, is_initial_syn))` for valid TCP frames.
+#[cfg(test)]
 fn inspect_tcp_frame(frame: &[u8]) -> Option<(SocketAddr, SocketAddr, bool)> {
     let version = frame.first()? >> 4;
     let (src_ip, dst_ip, payload) = match version {
@@ -530,6 +771,29 @@ fn inspect_tcp_frame(frame: &[u8]) -> Option<(SocketAddr, SocketAddr, bool)> {
     Some((src_addr, dst_addr, is_initial_syn))
 }
 
+#[inline]
+fn configure_local_tun_socket(socket: &mut TcpSocket<'_>) {
+    // Disable delayed ACK, Nagle, and local congestion control on the zero-loss
+    // in-memory TUN leg (real congestion control runs on the OS outbound socket).
+    socket.set_ack_delay(None);
+    socket.set_nagle_enabled(false);
+    socket.set_congestion_control(CongestionControl::None);
+    socket.set_keep_alive(Some(SmolDuration::from_secs(20)));
+    socket.set_timeout(Some(SmolDuration::from_secs(60)));
+}
+
+#[inline]
+fn is_recv_open_state(state: TcpState) -> bool {
+    matches!(
+        state,
+        TcpState::Listen
+            | TcpState::SynReceived
+            | TcpState::Established
+            | TcpState::FinWait1
+            | TcpState::FinWait2
+    )
+}
+
 async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
     if *rx.borrow() {
         return;
@@ -542,8 +806,9 @@ async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
 }
 
 /// Spawns the in-tree `smoltcp` 0.14 TCP netstack runner directly bridging `tcp_in_rx`
-/// and `outbound_tx` with zero intermediate channels/tasks, `ack_delay = None`,
-/// `nagle = false`, `Checksum::Tx`, and poll-to-quiescence batching.
+/// and `outbound_tx` with batched ingress draining before a single `iface.poll()`,
+/// `ack_delay = None`, `nagle = false`, `CongestionControl::None`, `Checksum::Tx`,
+/// zero-spin async readiness parking, and reusable Tokio timers.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_tcp_netstack(
     mut tcp_in_rx: mpsc::Receiver<Vec<u8>>,
@@ -560,10 +825,12 @@ pub(crate) fn spawn_tcp_netstack(
 )> {
     let max_tcp_sessions = max_tcp_sessions.max(1);
     let hard_handle_cap = max_tcp_sessions.saturating_mul(2);
+    let low_memory = tcp_recv_buffer_size <= 32 * 1024;
     let control_recv_size = control_ring_size(tcp_recv_buffer_size);
     let control_send_size = control_ring_size(tcp_send_buffer_size);
-    let mut device = VirtualDevice::new(mtu, tx_queue_high_water);
-    let mut iface = create_interface(&mut device)?;
+    let clock = MonotonicClock::new();
+    let mut device = VirtualDevice::new(mtu, tx_queue_high_water, low_memory);
+    let mut iface = create_interface(&mut device, clock.now())?;
     let (stream_tx, stream_rx) = mpsc::channel(max_tcp_sessions.clamp(16, 256));
     let notify = Arc::new(Notify::new());
 
@@ -573,10 +840,19 @@ pub(crate) fn spawn_tcp_netstack(
         let mut active_endpoints: HashSet<(SocketAddr, SocketAddr)> = HashSet::new();
         let mut listening_dsts: HashSet<SocketAddr> = HashSet::new();
         let mut sockets_to_remove: Vec<SocketHandle> = Vec::new();
-        let mut deferred_syns: VecDeque<(StdInstant, Vec<u8>)> = VecDeque::new();
+        let mut deferred_syns: VecDeque<(StdInstant, SocketAddr, Vec<u8>)> = VecDeque::new();
+        let mut rx_batch: Vec<Vec<u8>> = Vec::with_capacity(INGRESS_DRAIN_LIMIT);
         let mut burst_iters: usize = 0;
+        let mut zero_delay_spins: u32 = 0;
+
+        // Single reusable Tokio timer to avoid registering/cancelling a timer-wheel entry
+        // tens of thousands of times per second during Gigabit packet bursts.
+        let timer = tokio::time::sleep(StdDuration::from_secs(3600));
+        tokio::pin!(timer);
+        let mut timer_deadline: Option<tokio::time::Instant> = None;
 
         let enqueue_inbound = |frame: Vec<u8>,
+                               wall_now: StdInstant,
                                device: &mut VirtualDevice,
                                socket_set: &mut SocketSet<'static>,
                                sockets: &mut HashMap<SocketHandle, SocketEntry>,
@@ -585,104 +861,117 @@ pub(crate) fn spawn_tcp_netstack(
                                stream_tx: &mpsc::Sender<TunNetstackTcpStream>,
                                notify: &Arc<Notify>|
          -> EnqueueOutcome {
-            let Some((src_addr, dst_addr, is_initial_syn)) = inspect_tcp_frame(&frame) else {
-                return EnqueueOutcome::Dropped;
-            };
-
-            if is_initial_syn && !active_endpoints.contains(&(src_addr, dst_addr)) {
-                // Prevent smoltcp SocketSet slot-reuse cross-wiring when multiple parallel
-                // SYNs target the same dst_addr in one ingress batch: defer the second SYN
-                // into `deferred_syns` WITHOUT halting `tcp_in_rx` for other flows/ACKs.
-                if listening_dsts.contains(&dst_addr) {
-                    return EnqueueOutcome::Deferred(frame);
+            match classify_inbound_tcp(&frame) {
+                InboundTcpKind::Invalid => EnqueueOutcome::Dropped,
+                InboundTcpKind::NonSyn => {
+                    device.rx_queue.push_back(frame);
+                    EnqueueOutcome::Enqueued
                 }
+                InboundTcpKind::InitialSyn(src_addr, dst_addr) => {
+                    if !active_endpoints.contains(&(src_addr, dst_addr)) {
+                        // Prevent smoltcp SocketSet slot-reuse cross-wiring when multiple parallel
+                        // SYNs target the same dst_addr in one ingress batch: defer the second SYN
+                        // into `deferred_syns` WITHOUT halting `tcp_in_rx` for other flows/ACKs.
+                        if listening_dsts.contains(&dst_addr) {
+                            return EnqueueOutcome::Deferred(dst_addr, frame);
+                        }
 
-                // Count only active non-closing sockets (`Listen`, `SynReceived`, `Established`)
-                // against `max_tcp_sessions` so `TimeWait` and closing sockets cannot starve new
-                // connections, while still enforcing a hard handle cap (`2 * max_tcp_sessions`)
-                // via immediate reclaim of `TimeWait`/closing handles to protect iOS Jetsam RAM.
-                if sockets.len() >= hard_handle_cap {
-                    let _ = evict_reclaimable_socket(socket_set, sockets, active_endpoints);
-                }
-                let active_count = sockets
-                    .keys()
-                    .filter(|&&h| is_active_tcp_state(socket_set.get::<TcpSocket>(h).state()))
-                    .count();
-                if active_count >= max_tcp_sessions || sockets.len() >= hard_handle_cap {
-                    debug!(
-                        %src_addr,
-                        %dst_addr,
-                        active = active_count,
-                        total = sockets.len(),
-                        limit = max_tcp_sessions,
-                        "TCP session limit reached; sending RST+ACK"
-                    );
-                    if let Some(rst) = build_tcp_rst_ack_reply(&frame) {
-                        device.tx_queue.push_back(rst);
+                        // Count only active non-closing sockets (`Listen`, `SynReceived`, `Established`)
+                        // against `max_tcp_sessions` so `TimeWait` and closing sockets cannot starve new
+                        // connections, while still enforcing a hard handle cap (`2 * max_tcp_sessions`)
+                        // via immediate reclaim of `TimeWait`/closing handles to protect iOS Jetsam RAM.
+                        if sockets.len() >= hard_handle_cap {
+                            let _ = evict_reclaimable_socket(socket_set, sockets, active_endpoints);
+                        }
+                        let active_count = sockets
+                            .keys()
+                            .filter(|&&h| {
+                                is_active_tcp_state(socket_set.get::<TcpSocket>(h).state())
+                            })
+                            .count();
+                        if active_count >= max_tcp_sessions || sockets.len() >= hard_handle_cap {
+                            debug!(
+                                %src_addr,
+                                %dst_addr,
+                                active = active_count,
+                                total = sockets.len(),
+                                limit = max_tcp_sessions,
+                                "TCP session limit reached; sending RST+ACK"
+                            );
+                            if let Some(rst) = build_tcp_rst_ack_reply(&frame) {
+                                device.tx_queue.push_back(rst);
+                            }
+                            return EnqueueOutcome::Dropped;
+                        }
+
+                        let mut socket = TcpSocket::new(
+                            TcpSocketBuffer::new(vec![0u8; tcp_recv_buffer_size]),
+                            TcpSocketBuffer::new(vec![0u8; tcp_send_buffer_size]),
+                        );
+                        configure_local_tun_socket(&mut socket);
+
+                        if let Err(err) = socket.listen(dst_addr) {
+                            debug!(%src_addr, %dst_addr, error = ?err, "smoltcp listen failed");
+                            return EnqueueOutcome::Dropped;
+                        }
+
+                        let shared = Arc::new(SocketShared {
+                            tx_dirty: AtomicBool::new(false),
+                            rx_dirty: AtomicBool::new(false),
+                            control: Mutex::new(TcpSocketControl {
+                                send_buffer: RingBuffer::new(vec![0u8; control_send_size]),
+                                send_waker: None,
+                                recv_buffer: RingBuffer::new(vec![0u8; control_recv_size]),
+                                recv_waker: None,
+                                recv_state: HalfState::Normal,
+                                send_state: HalfState::Normal,
+                                rx_backpressured: false,
+                            }),
+                        });
+
+                        let stream = TunNetstackTcpStream {
+                            src_addr,
+                            dst_addr,
+                            notify: Arc::clone(notify),
+                            shared: Arc::clone(&shared),
+                        };
+
+                        if stream_tx.try_send(stream).is_err() {
+                            debug!(%src_addr, %dst_addr, "accepted TCP queue full; sending RST+ACK");
+                            if let Some(rst) = build_tcp_rst_ack_reply(&frame) {
+                                device.tx_queue.push_back(rst);
+                            }
+                            return EnqueueOutcome::Dropped;
+                        }
+
+                        let handle = socket_set.add(socket);
+                        active_endpoints.insert((src_addr, dst_addr));
+                        listening_dsts.insert(dst_addr);
+                        sockets.insert(
+                            handle,
+                            SocketEntry {
+                                shared,
+                                endpoints: (src_addr, dst_addr),
+                                created_at: wall_now,
+                                saw_non_listen: false,
+                                fin_wait_2_shortened: false,
+                                closing_since: None,
+                                time_wait_since: None,
+                                tx_has_pending: false,
+                                rx_backpressured: false,
+                                recv_open: true,
+                                recv_closing: false,
+                                send_closing: false,
+                                app_closed_both: false,
+                            },
+                        );
+                        trace!(%src_addr, %dst_addr, "created TUN TCP socket");
                     }
-                    return EnqueueOutcome::Dropped;
+
+                    device.rx_queue.push_back(frame);
+                    EnqueueOutcome::Enqueued
                 }
-
-                let mut socket = TcpSocket::new(
-                    TcpSocketBuffer::new(vec![0u8; tcp_recv_buffer_size]),
-                    TcpSocketBuffer::new(vec![0u8; tcp_send_buffer_size]),
-                );
-                // Disable delayed ACK and Nagle on local virtual TUN links to prevent
-                // 10-56 ms local RTT stalls and maximize Gigabit TCP throughput.
-                socket.set_ack_delay(None);
-                socket.set_nagle_enabled(false);
-                socket.set_keep_alive(Some(SmolDuration::from_secs(20)));
-                socket.set_timeout(Some(SmolDuration::from_secs(60)));
-
-                if let Err(err) = socket.listen(dst_addr) {
-                    debug!(%src_addr, %dst_addr, error = ?err, "smoltcp listen failed");
-                    return EnqueueOutcome::Dropped;
-                }
-
-                let control = Arc::new(Mutex::new(TcpSocketControl {
-                    send_buffer: RingBuffer::new(vec![0u8; control_send_size]),
-                    send_waker: None,
-                    recv_buffer: RingBuffer::new(vec![0u8; control_recv_size]),
-                    recv_waker: None,
-                    recv_state: HalfState::Normal,
-                    send_state: HalfState::Normal,
-                }));
-
-                let stream = TunNetstackTcpStream {
-                    src_addr,
-                    dst_addr,
-                    notify: Arc::clone(notify),
-                    control: Arc::clone(&control),
-                };
-
-                if stream_tx.try_send(stream).is_err() {
-                    debug!(%src_addr, %dst_addr, "accepted TCP queue full; sending RST+ACK");
-                    if let Some(rst) = build_tcp_rst_ack_reply(&frame) {
-                        device.tx_queue.push_back(rst);
-                    }
-                    return EnqueueOutcome::Dropped;
-                }
-
-                let handle = socket_set.add(socket);
-                active_endpoints.insert((src_addr, dst_addr));
-                listening_dsts.insert(dst_addr);
-                sockets.insert(
-                    handle,
-                    SocketEntry {
-                        control,
-                        endpoints: (src_addr, dst_addr),
-                        created_at: StdInstant::now(),
-                        saw_non_listen: false,
-                        fin_wait_2_shortened: false,
-                        closing_since: None,
-                        time_wait_since: None,
-                    },
-                );
-                trace!(%src_addr, %dst_addr, "created TUN TCP socket");
             }
-
-            device.rx_queue.push_back(frame);
-            EnqueueOutcome::Enqueued
         };
 
         'runner: loop {
@@ -691,25 +980,31 @@ pub(crate) fn spawn_tcp_netstack(
             }
 
             // 1. Re-try deferred same-destination SYNs first (dropping stale >2s entries),
-            //    then drain ready inbound TCP packets without ever halting `tcp_in_rx`.
+            //    then batch-drain up to `INGRESS_DRAIN_LIMIT` ready inbound IP packets into
+            //    `VirtualDevice` BEFORE calling `iface.poll()` ONCE.
             let wall_now = StdInstant::now();
             let mut ingress_drained = 0usize;
             let mut enqueued_any = false;
 
             let deferred_count = deferred_syns.len();
             for _ in 0..deferred_count {
-                let Some((ts, frame)) = deferred_syns.pop_front() else {
+                let Some((ts, dst_addr, frame)) = deferred_syns.pop_front() else {
                     break;
                 };
                 if wall_now.saturating_duration_since(ts) >= DEFERRED_SYN_TTL {
                     continue;
                 }
+                if listening_dsts.contains(&dst_addr) {
+                    deferred_syns.push_back((ts, dst_addr, frame));
+                    continue;
+                }
                 if ingress_drained >= INGRESS_DRAIN_LIMIT {
-                    deferred_syns.push_front((ts, frame));
+                    deferred_syns.push_front((ts, dst_addr, frame));
                     break;
                 }
                 match enqueue_inbound(
                     frame,
+                    wall_now,
                     &mut device,
                     &mut socket_set,
                     &mut sockets,
@@ -725,8 +1020,37 @@ pub(crate) fn spawn_tcp_netstack(
                     EnqueueOutcome::Dropped => {
                         ingress_drained += 1;
                     }
-                    EnqueueOutcome::Deferred(frame) => {
-                        deferred_syns.push_back((ts, frame));
+                    EnqueueOutcome::Deferred(dst_addr, frame) => {
+                        deferred_syns.push_back((ts, dst_addr, frame));
+                    }
+                }
+            }
+
+            // Drain any packets already collected by `recv_many` when waking from park.
+            for frame in rx_batch.drain(..) {
+                match enqueue_inbound(
+                    frame,
+                    wall_now,
+                    &mut device,
+                    &mut socket_set,
+                    &mut sockets,
+                    &mut active_endpoints,
+                    &mut listening_dsts,
+                    &stream_tx,
+                    &notify,
+                ) {
+                    EnqueueOutcome::Enqueued => {
+                        ingress_drained += 1;
+                        enqueued_any = true;
+                    }
+                    EnqueueOutcome::Dropped => {
+                        ingress_drained += 1;
+                    }
+                    EnqueueOutcome::Deferred(dst_addr, frame) => {
+                        if deferred_syns.len() < MAX_DEFERRED_SYNS {
+                            deferred_syns.push_back((wall_now, dst_addr, frame));
+                        }
+                        ingress_drained += 1;
                     }
                 }
             }
@@ -739,6 +1063,7 @@ pub(crate) fn spawn_tcp_netstack(
                 };
                 match enqueue_inbound(
                     frame,
+                    wall_now,
                     &mut device,
                     &mut socket_set,
                     &mut sockets,
@@ -754,23 +1079,27 @@ pub(crate) fn spawn_tcp_netstack(
                     EnqueueOutcome::Dropped => {
                         ingress_drained += 1;
                     }
-                    EnqueueOutcome::Deferred(frame) => {
+                    EnqueueOutcome::Deferred(dst_addr, frame) => {
                         if deferred_syns.len() < MAX_DEFERRED_SYNS {
-                            deferred_syns.push_back((wall_now, frame));
+                            deferred_syns.push_back((wall_now, dst_addr, frame));
                         }
                         ingress_drained += 1;
                     }
                 }
             }
+            let ingress_hit_limit = ingress_drained >= INGRESS_DRAIN_LIMIT;
 
             // 2. Drain application TX buffers into smoltcp BEFORE polling so segments emit immediately.
-            let mut made_progress = enqueued_any;
-            for (&handle, entry) in &sockets {
+            //    Skip idle sockets with zero mutex locks via per-socket `tx_dirty` atomic.
+            let mut pre_poll_tx = false;
+            for (&handle, entry) in &mut sockets {
+                let tx_dirty = entry.shared.tx_dirty.swap(false, Ordering::AcqRel);
                 let socket = socket_set.get_mut::<TcpSocket>(handle);
-                let mut control = entry
-                    .control
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !(tx_dirty || (entry.tx_has_pending && socket.can_send())) {
+                    continue;
+                }
+
+                let mut control = entry.shared.lock_control();
 
                 // If the application dropped the stream before the handshake completed,
                 // abort immediately so it does not stall in Listen/SynReceived/FinWait1.
@@ -781,7 +1110,12 @@ pub(crate) fn spawn_tcp_netstack(
                     socket.abort();
                     control.send_state = HalfState::Closed;
                     control.recv_state = HalfState::Closed;
-                    made_progress = true;
+                    entry.tx_has_pending = false;
+                    entry.recv_open = false;
+                    entry.recv_closing = false;
+                    entry.send_closing = false;
+                    entry.app_closed_both = true;
+                    pre_poll_tx = true;
                     continue;
                 }
 
@@ -793,7 +1127,7 @@ pub(crate) fn spawn_tcp_netstack(
                     }) {
                         Ok(n) if n > 0 => {
                             wake_sender = true;
-                            made_progress = true;
+                            pre_poll_tx = true;
                         }
                         Ok(_) => break,
                         Err(err) => {
@@ -803,6 +1137,7 @@ pub(crate) fn spawn_tcp_netstack(
                                 control.send_state = HalfState::Closed;
                             }
                             wake_sender = true;
+                            pre_poll_tx = true;
                             break;
                         }
                     }
@@ -812,8 +1147,20 @@ pub(crate) fn spawn_tcp_netstack(
                 {
                     socket.close();
                     control.send_state = HalfState::Closing;
-                    made_progress = true;
+                    pre_poll_tx = true;
                 }
+
+                entry.tx_has_pending = !control.send_buffer.is_empty()
+                    || matches!(control.send_state, HalfState::Close);
+                entry.recv_open = matches!(control.recv_state, HalfState::Normal);
+                entry.recv_closing = matches!(control.recv_state, HalfState::Close);
+                entry.send_closing = matches!(control.send_state, HalfState::Closing);
+                entry.app_closed_both =
+                    matches!(control.recv_state, HalfState::Close | HalfState::Closed)
+                        && matches!(
+                            control.send_state,
+                            HalfState::Close | HalfState::Closing | HalfState::Closed
+                        );
 
                 if wake_sender {
                     if let Some(waker) = control.send_waker.take() {
@@ -822,27 +1169,29 @@ pub(crate) fn spawn_tcp_netstack(
                 }
             }
 
-            // 3. Drive smoltcp state machine (ingress + egress).
-            let now = SmolInstant::now();
-            if matches!(
+            // 3. Drive smoltcp state machine ONCE for the entire drained ingress/TX batch.
+            let now = clock.smol_from(wall_now);
+            device.tx_throttled = false;
+            let poll_changed = matches!(
                 iface.poll(now, &mut device, &mut socket_set),
                 PollResult::SocketStateChanged
-            ) {
-                made_progress = true;
-            }
+            );
+            device.recycle_consumed_rx();
 
             // 4. Drain smoltcp RX buffers into application buffers, refill TX if freed, reap closed.
+            //    Idle sockets bypass mutex locking completely.
+            let mut post_poll_mutated = false;
+            let mut earliest_reap_delay: Option<StdDuration> = None;
             sockets_to_remove.clear();
             listening_dsts.clear();
+
             for (&handle, entry) in &mut sockets {
                 let socket = socket_set.get_mut::<TcpSocket>(handle);
-                let mut control = entry
-                    .control
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let state = socket.state();
 
-                if socket.state() == TcpState::Closed {
+                if state == TcpState::Closed {
                     sockets_to_remove.push(handle);
+                    let mut control = entry.shared.lock_control();
                     control.send_state = HalfState::Closed;
                     control.recv_state = HalfState::Closed;
                     if let Some(waker) = control.send_waker.take() {
@@ -854,29 +1203,24 @@ pub(crate) fn spawn_tcp_netstack(
                     continue;
                 }
 
-                // Catch streams dropped mid-tick while still in Listen/SynReceived so they
-                // abort immediately and reap on the very next tick.
-                if matches!(control.recv_state, HalfState::Close)
-                    && matches!(control.send_state, HalfState::Close | HalfState::Closing)
-                    && matches!(socket.state(), TcpState::Listen | TcpState::SynReceived)
-                {
-                    socket.abort();
-                    control.send_state = HalfState::Closed;
-                    control.recv_state = HalfState::Closed;
-                    made_progress = true;
-                    continue;
+                let rx_dirty = entry.shared.rx_dirty.swap(false, Ordering::AcqRel);
+                let tx_dirty = entry.shared.tx_dirty.swap(false, Ordering::AcqRel);
+                if rx_dirty {
+                    entry.rx_backpressured = false;
                 }
 
                 // Track whether this socket has ever left `Listen`. In smoltcp 0.14, receiving a
                 // TCP RST in `SynReceived` clears `tuple` and reverts the socket BACK to `Listen`
                 // instead of `Closed` (disabling its idle timer and poisoning `listening_dsts`).
-                // Abort any reverted `Listen` socket immediately on this tick!
-                if socket.state() != TcpState::Listen {
+                // Abort and immediately reap any reverted `Listen` socket on this tick.
+                if state != TcpState::Listen {
                     entry.saw_non_listen = true;
                 } else if entry.saw_non_listen
                     || wall_now.saturating_duration_since(entry.created_at) >= LISTEN_ORPHAN_TIMEOUT
                 {
                     socket.abort();
+                    sockets_to_remove.push(handle);
+                    let mut control = entry.shared.lock_control();
                     control.send_state = HalfState::Closed;
                     control.recv_state = HalfState::Closed;
                     if let Some(waker) = control.send_waker.take() {
@@ -885,38 +1229,209 @@ pub(crate) fn spawn_tcp_netstack(
                     if let Some(waker) = control.recv_waker.take() {
                         waker.wake();
                     }
-                    made_progress = true;
                     continue;
                 }
 
                 // Rapidly reclaim TIME_WAIT sockets after 2s so bursty mobile apps don't hold
                 // memory or socket handles across 10s smoltcp CLOSE_DELAY windows.
-                if socket.state() == TcpState::TimeWait {
+                if state == TcpState::TimeWait {
                     let since = *entry.time_wait_since.get_or_insert(wall_now);
-                    if wall_now.saturating_duration_since(since) >= TIME_WAIT_REAP_TIMEOUT {
+                    let elapsed = wall_now.saturating_duration_since(since);
+                    if elapsed >= TIME_WAIT_REAP_TIMEOUT {
                         socket.abort();
+                        let mut control = entry.shared.lock_control();
                         control.send_state = HalfState::Closed;
                         control.recv_state = HalfState::Closed;
-                        made_progress = true;
+                        post_poll_mutated = true;
                         continue;
                     }
+                    let rem = TIME_WAIT_REAP_TIMEOUT - elapsed;
+                    earliest_reap_delay = Some(earliest_reap_delay.map_or(rem, |d| d.min(rem)));
                 } else {
                     entry.time_wait_since = None;
                 }
 
+                // Prevent infinite FIN_WAIT_2 permit leaks: disable keep-alive probes that
+                // would keep resetting smoltcp's idle timer and bound FIN_WAIT_2 to 15s.
+                if state == TcpState::FinWait2 && !entry.fin_wait_2_shortened {
+                    socket.set_keep_alive(None);
+                    socket.set_timeout(Some(FIN_WAIT_2_TIMEOUT));
+                    entry.fin_wait_2_shortened = true;
+                }
+
+                // Fast path for discarded-reader sockets without locking control mutex.
+                if entry.recv_closing && !rx_dirty && !tx_dirty {
+                    while socket.can_recv() {
+                        if socket.recv(|buf| (buf.len(), ())).is_err() {
+                            socket.abort();
+                            post_poll_mutated = true;
+                            break;
+                        }
+                    }
+                }
+
+                let need_rx_drain = socket.can_recv()
+                    && (!entry.rx_backpressured || rx_dirty || entry.recv_closing);
+                let need_recv_eof =
+                    entry.recv_open && !socket.may_recv() && !is_recv_open_state(state);
+                let need_tx_refill = tx_dirty || (entry.tx_has_pending && socket.can_send());
+                let need_send_close_done = entry.send_closing
+                    && matches!(
+                        state,
+                        TcpState::FinWait2 | TcpState::TimeWait | TcpState::Closed
+                    );
+                let need_lock = rx_dirty
+                    || tx_dirty
+                    || need_rx_drain
+                    || need_recv_eof
+                    || need_tx_refill
+                    || need_send_close_done;
+
+                if need_lock {
+                    let mut control = entry.shared.lock_control();
+
+                    // Catch streams dropped mid-tick while still in Listen/SynReceived so they
+                    // abort immediately and reap on the very next tick.
+                    if matches!(control.recv_state, HalfState::Close)
+                        && matches!(control.send_state, HalfState::Close | HalfState::Closing)
+                        && matches!(state, TcpState::Listen | TcpState::SynReceived)
+                    {
+                        socket.abort();
+                        control.send_state = HalfState::Closed;
+                        control.recv_state = HalfState::Closed;
+                        if state == TcpState::Listen {
+                            sockets_to_remove.push(handle);
+                        } else {
+                            post_poll_mutated = true;
+                        }
+                        continue;
+                    }
+
+                    let mut wake_receiver = false;
+                    if matches!(control.recv_state, HalfState::Close) {
+                        // Reader dropped; discard unread bytes so peer FIN can complete cleanly.
+                        while socket.can_recv() {
+                            if socket.recv(|buf| (buf.len(), ())).is_err() {
+                                socket.abort();
+                                post_poll_mutated = true;
+                                break;
+                            }
+                        }
+                        control.rx_backpressured = false;
+                    } else {
+                        while socket.can_recv() && !control.recv_buffer.is_full() {
+                            match socket.recv(|buf| {
+                                let n = control.recv_buffer.enqueue_slice(buf);
+                                (n, n)
+                            }) {
+                                Ok(n) if n > 0 => {
+                                    wake_receiver = true;
+                                }
+                                Ok(_) => break,
+                                Err(err) => {
+                                    debug!(error = ?err, state = ?socket.state(), "smoltcp recv error");
+                                    socket.abort();
+                                    post_poll_mutated = true;
+                                    if matches!(control.recv_state, HalfState::Normal) {
+                                        control.recv_state = HalfState::Closed;
+                                    }
+                                    wake_receiver = true;
+                                    break;
+                                }
+                            }
+                        }
+                        control.rx_backpressured =
+                            socket.can_recv() && control.recv_buffer.is_full();
+                    }
+
+                    if matches!(control.recv_state, HalfState::Normal)
+                        && !socket.may_recv()
+                        && !is_recv_open_state(socket.state())
+                    {
+                        control.recv_state = HalfState::Closed;
+                        wake_receiver = true;
+                    }
+
+                    if wake_receiver {
+                        if let Some(waker) = control.recv_waker.take() {
+                            waker.wake();
+                        }
+                    }
+
+                    // Refill TX immediately if ACK freed window space during poll().
+                    let mut wake_sender = false;
+                    while socket.can_send() && !control.send_buffer.is_empty() {
+                        match socket.send(|buf| {
+                            let n = control.send_buffer.dequeue_slice(buf);
+                            (n, n)
+                        }) {
+                            Ok(n) if n > 0 => {
+                                wake_sender = true;
+                                post_poll_mutated = true;
+                            }
+                            Ok(_) => break,
+                            Err(err) => {
+                                debug!(error = ?err, state = ?socket.state(), "smoltcp post-poll send error");
+                                socket.abort();
+                                post_poll_mutated = true;
+                                if matches!(control.send_state, HalfState::Normal) {
+                                    control.send_state = HalfState::Closed;
+                                }
+                                wake_sender = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if matches!(control.send_state, HalfState::Close)
+                        && control.send_buffer.is_empty()
+                    {
+                        socket.close();
+                        control.send_state = HalfState::Closing;
+                        post_poll_mutated = true;
+                    }
+
+                    if matches!(control.send_state, HalfState::Closing)
+                        && matches!(
+                            socket.state(),
+                            TcpState::FinWait2 | TcpState::TimeWait | TcpState::Closed
+                        )
+                    {
+                        control.send_state = HalfState::Closed;
+                        wake_sender = true;
+                    }
+
+                    entry.tx_has_pending = !control.send_buffer.is_empty()
+                        || matches!(control.send_state, HalfState::Close);
+                    entry.rx_backpressured = control.rx_backpressured;
+                    entry.recv_open = matches!(control.recv_state, HalfState::Normal);
+                    entry.recv_closing = matches!(control.recv_state, HalfState::Close);
+                    entry.send_closing = matches!(control.send_state, HalfState::Closing);
+                    entry.app_closed_both =
+                        matches!(control.recv_state, HalfState::Close | HalfState::Closed)
+                            && matches!(
+                                control.send_state,
+                                HalfState::Close | HalfState::Closing | HalfState::Closed
+                            );
+
+                    if wake_sender {
+                        if let Some(waker) = control.send_waker.take() {
+                            waker.wake();
+                        }
+                    }
+                }
+
                 // Bound half-closed / peer-dropped closing states to 5s (disabling keep-alive
                 // probes that would otherwise keep resetting smoltcp's idle timer).
-                if matches!(
-                    socket.state(),
-                    TcpState::FinWait1
-                        | TcpState::FinWait2
-                        | TcpState::Closing
-                        | TcpState::LastAck
-                        | TcpState::CloseWait
-                ) && matches!(control.recv_state, HalfState::Close | HalfState::Closed)
+                let current_state = socket.state();
+                if entry.app_closed_both
                     && matches!(
-                        control.send_state,
-                        HalfState::Close | HalfState::Closing | HalfState::Closed
+                        current_state,
+                        TcpState::FinWait1
+                            | TcpState::FinWait2
+                            | TcpState::Closing
+                            | TcpState::LastAck
+                            | TcpState::CloseWait
                     )
                 {
                     if entry.closing_since.is_none() {
@@ -924,125 +1439,20 @@ pub(crate) fn spawn_tcp_netstack(
                         socket.set_timeout(Some(SmolDuration::from_secs(5)));
                     }
                     let since = *entry.closing_since.get_or_insert(wall_now);
-                    if wall_now.saturating_duration_since(since) >= CLOSING_REAP_TIMEOUT {
+                    let elapsed = wall_now.saturating_duration_since(since);
+                    if elapsed >= CLOSING_REAP_TIMEOUT {
                         socket.abort();
+                        let mut control = entry.shared.lock_control();
                         control.send_state = HalfState::Closed;
                         control.recv_state = HalfState::Closed;
-                        made_progress = true;
+                        post_poll_mutated = true;
                         continue;
                     }
+                    let rem = CLOSING_REAP_TIMEOUT - elapsed;
+                    earliest_reap_delay = Some(earliest_reap_delay.map_or(rem, |d| d.min(rem)));
                 }
 
-                // Prevent infinite FIN_WAIT_2 permit leaks: disable keep-alive probes that
-                // would keep resetting smoltcp's idle timer and bound FIN_WAIT_2 to 15s.
-                if socket.state() == TcpState::FinWait2 && !entry.fin_wait_2_shortened {
-                    socket.set_keep_alive(None);
-                    socket.set_timeout(Some(FIN_WAIT_2_TIMEOUT));
-                    entry.fin_wait_2_shortened = true;
-                }
-
-                let mut wake_receiver = false;
-                if matches!(control.recv_state, HalfState::Close) {
-                    // Reader dropped; discard unread bytes so peer FIN can complete cleanly.
-                    while socket.can_recv() {
-                        if socket.recv(|buf| (buf.len(), ())).is_err() {
-                            socket.abort();
-                            break;
-                        }
-                    }
-                } else {
-                    while socket.can_recv() && !control.recv_buffer.is_full() {
-                        match socket.recv(|buf| {
-                            let n = control.recv_buffer.enqueue_slice(buf);
-                            (n, n)
-                        }) {
-                            Ok(n) if n > 0 => {
-                                wake_receiver = true;
-                                made_progress = true;
-                            }
-                            Ok(_) => break,
-                            Err(err) => {
-                                debug!(error = ?err, state = ?socket.state(), "smoltcp recv error");
-                                socket.abort();
-                                if matches!(control.recv_state, HalfState::Normal) {
-                                    control.recv_state = HalfState::Closed;
-                                }
-                                wake_receiver = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                let recv_open_states = [
-                    TcpState::Listen,
-                    TcpState::SynReceived,
-                    TcpState::Established,
-                    TcpState::FinWait1,
-                    TcpState::FinWait2,
-                ];
-                if matches!(control.recv_state, HalfState::Normal)
-                    && !socket.may_recv()
-                    && !recv_open_states.contains(&socket.state())
-                {
-                    control.recv_state = HalfState::Closed;
-                    wake_receiver = true;
-                }
-
-                if wake_receiver {
-                    if let Some(waker) = control.recv_waker.take() {
-                        waker.wake();
-                    }
-                }
-
-                // Refill TX immediately if ACK freed window space during poll().
-                let mut wake_sender = false;
-                while socket.can_send() && !control.send_buffer.is_empty() {
-                    match socket.send(|buf| {
-                        let n = control.send_buffer.dequeue_slice(buf);
-                        (n, n)
-                    }) {
-                        Ok(n) if n > 0 => {
-                            wake_sender = true;
-                            made_progress = true;
-                        }
-                        Ok(_) => break,
-                        Err(err) => {
-                            debug!(error = ?err, state = ?socket.state(), "smoltcp post-poll send error");
-                            socket.abort();
-                            if matches!(control.send_state, HalfState::Normal) {
-                                control.send_state = HalfState::Closed;
-                            }
-                            wake_sender = true;
-                            break;
-                        }
-                    }
-                }
-
-                if matches!(control.send_state, HalfState::Close) && control.send_buffer.is_empty()
-                {
-                    socket.close();
-                    control.send_state = HalfState::Closing;
-                    made_progress = true;
-                }
-
-                if matches!(control.send_state, HalfState::Closing)
-                    && matches!(
-                        socket.state(),
-                        TcpState::FinWait2 | TcpState::TimeWait | TcpState::Closed
-                    )
-                {
-                    control.send_state = HalfState::Closed;
-                    wake_sender = true;
-                }
-
-                if wake_sender {
-                    if let Some(waker) = control.send_waker.take() {
-                        waker.wake();
-                    }
-                }
-
-                if socket.state() == TcpState::Listen {
+                if current_state == TcpState::Listen {
                     listening_dsts.insert(entry.endpoints.1);
                 }
             }
@@ -1054,9 +1464,9 @@ pub(crate) fn spawn_tcp_netstack(
                 socket_set.remove(handle);
             }
 
-            // 5. Flush emitted packets straight onto outbound_tx (zero silent drops).
+            // 5. Flush ALL emitted outbound packets in one pass onto outbound_tx (zero silent drops).
+            let tx_emitted = !device.tx_queue.is_empty();
             while let Some(pkt) = device.tx_queue.pop_front() {
-                made_progress = true;
                 match outbound_tx.try_send(pkt) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(pkt)) => {
@@ -1074,15 +1484,41 @@ pub(crate) fn spawn_tcp_netstack(
                 }
             }
 
-            let next_delay = iface.poll_delay(now, &socket_set);
-            let deferred_ready = deferred_syns.iter().any(|(_, frame)| {
-                inspect_tcp_frame(frame)
-                    .is_none_or(|(_, dst_addr, _)| !listening_dsts.contains(&dst_addr))
-            });
-            let immediate_poll = made_progress
+            // 6. Decide whether genuine follow-up work remains vs parking cleanly with ZERO busy-spin.
+            let post_now = clock.now();
+            let next_delay = iface.poll_delay(post_now, &socket_set);
+            let deferred_ready = !deferred_syns.is_empty()
+                && deferred_syns
+                    .iter()
+                    .any(|(_, dst_addr, _)| !listening_dsts.contains(dst_addr));
+            let has_pending_work = ingress_hit_limit
                 || !device.rx_queue.is_empty()
-                || deferred_ready
-                || next_delay == Some(SmolDuration::ZERO);
+                || device.tx_throttled
+                || post_poll_mutated
+                || deferred_ready;
+            let did_smoltcp_progress =
+                enqueued_any || pre_poll_tx || poll_changed || tx_emitted || post_poll_mutated;
+
+            let immediate_poll = if has_pending_work {
+                zero_delay_spins = 0;
+                true
+            } else if next_delay == Some(SmolDuration::ZERO) {
+                if did_smoltcp_progress {
+                    zero_delay_spins = 0;
+                    true
+                } else if zero_delay_spins == 0 {
+                    // Allow one immediate retry (e.g. RX drain triggered `window_to_update()`).
+                    zero_delay_spins = 1;
+                    true
+                } else {
+                    // Zero-progress `PollAt::Now` guard: never busy-spin a CPU core.
+                    zero_delay_spins = zero_delay_spins.saturating_add(1);
+                    false
+                }
+            } else {
+                zero_delay_spins = 0;
+                false
+            };
 
             if immediate_poll {
                 burst_iters += 1;
@@ -1095,69 +1531,56 @@ pub(crate) fn spawn_tcp_netstack(
 
             burst_iters = 0;
 
-            let effective_delay = if !deferred_syns.is_empty() {
-                let cap = SmolDuration::from_millis(50);
-                Some(next_delay.map_or(cap, |d| d.min(cap)))
-            } else {
-                next_delay
-            };
+            let mut effective_delay = next_delay.map(StdDuration::from);
+            if matches!(effective_delay, Some(d) if d.is_zero()) {
+                // Bounded non-zero backoff when `poll_delay` stays at ZERO without progress,
+                // while `tcp_in_rx` and `notify` still wake immediately at 0us latency.
+                let backoff_ms = (ZERO_DELAY_BACKOFF_MIN_MS
+                    << (zero_delay_spins.saturating_sub(1).min(3)))
+                .min(ZERO_DELAY_BACKOFF_MAX_MS);
+                effective_delay = Some(StdDuration::from_millis(backoff_ms));
+            }
+            if !deferred_syns.is_empty() {
+                let cap = StdDuration::from_millis(50);
+                effective_delay = Some(effective_delay.map_or(cap, |d| d.min(cap)));
+            }
+            if let Some(reap_delay) = earliest_reap_delay {
+                let reap_delay = reap_delay.max(StdDuration::from_millis(1));
+                effective_delay = Some(effective_delay.map_or(reap_delay, |d| d.min(reap_delay)));
+            }
 
-            // 6. Park cleanly until new inbound packet, stream wake, smoltcp timer, or shutdown.
+            // 7. Park cleanly until batched inbound packets, stream wake, smoltcp timer, or shutdown.
             match effective_delay {
                 Some(delay) => {
-                    let sleep = tokio::time::sleep(std::time::Duration::from(delay));
-                    tokio::pin!(sleep);
+                    let now_tokio = tokio::time::Instant::now();
+                    let desired = now_tokio + delay;
+                    let needs_reset = timer.is_elapsed()
+                        || timer_deadline.is_none_or(|cur| desired < cur || cur <= now_tokio);
+                    if needs_reset {
+                        timer.as_mut().reset(desired);
+                        timer_deadline = Some(desired);
+                    }
                     tokio::select! {
                         biased;
                         _ = wait_shutdown(&mut shutdown_rx) => break 'runner,
-                        maybe_pkt = tcp_in_rx.recv() => {
-                            match maybe_pkt {
-                                Some(frame) => {
-                                    if let EnqueueOutcome::Deferred(deferred) = enqueue_inbound(
-                                        frame,
-                                        &mut device,
-                                        &mut socket_set,
-                                        &mut sockets,
-                                        &mut active_endpoints,
-                                        &mut listening_dsts,
-                                        &stream_tx,
-                                        &notify,
-                                    ) {
-                                        if deferred_syns.len() < MAX_DEFERRED_SYNS {
-                                            deferred_syns.push_back((StdInstant::now(), deferred));
-                                        }
-                                    }
-                                }
-                                None => break 'runner,
+                        n = tcp_in_rx.recv_many(&mut rx_batch, INGRESS_DRAIN_LIMIT) => {
+                            if n == 0 {
+                                break 'runner;
                             }
                         }
                         _ = notify.notified() => {}
-                        _ = &mut sleep => {}
+                        _ = &mut timer => {
+                            timer_deadline = None;
+                        }
                     }
                 }
                 None => {
                     tokio::select! {
                         biased;
                         _ = wait_shutdown(&mut shutdown_rx) => break 'runner,
-                        maybe_pkt = tcp_in_rx.recv() => {
-                            match maybe_pkt {
-                                Some(frame) => {
-                                    if let EnqueueOutcome::Deferred(deferred) = enqueue_inbound(
-                                        frame,
-                                        &mut device,
-                                        &mut socket_set,
-                                        &mut sockets,
-                                        &mut active_endpoints,
-                                        &mut listening_dsts,
-                                        &stream_tx,
-                                        &notify,
-                                    ) {
-                                        if deferred_syns.len() < MAX_DEFERRED_SYNS {
-                                            deferred_syns.push_back((StdInstant::now(), deferred));
-                                        }
-                                    }
-                                }
-                                None => break 'runner,
+                        n = tcp_in_rx.recv_many(&mut rx_batch, INGRESS_DRAIN_LIMIT) => {
+                            if n == 0 {
+                                break 'runner;
                             }
                         }
                         _ = notify.notified() => {}
@@ -1181,6 +1604,285 @@ mod tests {
         assert_eq!(control_ring_size(32 * 1024), 16 * 1024);
         assert_eq!(control_ring_size(64 * 1024), 64 * 1024);
         assert_eq!(control_ring_size(512 * 1024), 128 * 1024);
+        assert_eq!(control_ring_size(1024 * 1024), 256 * 1024);
+    }
+
+    #[test]
+    fn local_tun_socket_disables_ack_delay_nagle_and_congestion_control() {
+        let mut sock = TcpSocket::new(
+            TcpSocketBuffer::new(vec![0u8; 1024 * 1024]),
+            TcpSocketBuffer::new(vec![0u8; 1024 * 1024]),
+        );
+        configure_local_tun_socket(&mut sock);
+        assert_eq!(sock.ack_delay(), None);
+        assert!(!sock.nagle_enabled());
+        assert_eq!(sock.congestion_control(), CongestionControl::None);
+        assert_eq!(sock.recv_capacity(), 1024 * 1024);
+        assert_eq!(sock.send_capacity(), 1024 * 1024);
+    }
+
+    #[test]
+    fn tx_buffer_pool_recycles_small_and_large_buffers_with_zeroed_headers() {
+        let mut pool = TxBufferPool::new(16_384, 8, 8);
+        let mut incoming = vec![vec![0xFFu8; 64], vec![0xAAu8; 4096]];
+        let small_ptr = incoming[0].as_ptr();
+        let large_ptr = incoming[1].as_ptr();
+
+        pool.recycle_all(&mut incoming);
+        assert!(incoming.is_empty());
+
+        let small_out = pool.checkout(40);
+        assert_eq!(small_out.len(), 40);
+        assert_eq!(small_out.as_ptr(), small_ptr);
+        assert!(small_out.iter().all(|&b| b == 0));
+
+        let large_out = pool.checkout(1500);
+        assert_eq!(large_out.len(), 1500);
+        assert_eq!(large_out.as_ptr(), large_ptr);
+        assert!(large_out[..TX_HEADER_ZERO_LEN].iter().all(|&b| b == 0));
+    }
+
+    #[tokio::test]
+    async fn one_mib_buffers_negotiate_rfc7323_window_scale_shift_5_and_transfer_cleanly() {
+        const MTU: usize = 16_384;
+        const BUF_1MIB: usize = 1024 * 1024;
+        const PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+
+        let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(2048);
+        let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(2048);
+        let (stop_tx, stop_rx) = watch::channel(false);
+
+        let (mut stream_rx, runner_handle) =
+            spawn_tcp_netstack(in_rx, out_tx, MTU, BUF_1MIB, BUF_1MIB, 32, 512, stop_rx).unwrap();
+
+        let clock = MonotonicClock::new();
+        let mut client_dev = VirtualDevice::new(MTU, 512, false);
+        let mut client_cfg = InterfaceConfig::new(HardwareAddress::Ip);
+        client_cfg.random_seed = 0x1122_3344_5566_7788;
+        let mut client_iface = Interface::new(client_cfg, &mut client_dev, clock.now());
+        client_iface.update_ip_addrs(|addrs| {
+            let _ = addrs.push(IpCidr::new(IpAddress::v4(198, 18, 0, 1), 30));
+        });
+        client_iface
+            .routes_mut()
+            .add_default_ipv4_route(Ipv4Address::new(198, 18, 0, 2))
+            .unwrap();
+
+        let mut client_sockets = SocketSet::new(Vec::new());
+        let mut client_sock = TcpSocket::new(
+            TcpSocketBuffer::new(vec![0u8; BUF_1MIB]),
+            TcpSocketBuffer::new(vec![0u8; BUF_1MIB]),
+        );
+        configure_local_tun_socket(&mut client_sock);
+        client_sock
+            .connect(
+                client_iface.context(),
+                (Ipv4Address::new(1, 1, 1, 1), 443),
+                49_100,
+            )
+            .unwrap();
+        let client_handle = client_sockets.add(client_sock);
+
+        client_iface.poll(clock.now(), &mut client_dev, &mut client_sockets);
+        let syn_pkt = client_dev.tx_queue.pop_front().expect("SYN emitted");
+        in_tx.send(syn_pkt).await.unwrap();
+
+        let mut server_stream =
+            tokio::time::timeout(std::time::Duration::from_secs(3), stream_rx.recv())
+                .await
+                .expect("accept timeout")
+                .expect("accepted stream");
+
+        // Inspect SYN-ACK emitted by netstack to verify RFC 7323 Window Scale shift == 5 for 1 MiB.
+        let syn_ack = tokio::time::timeout(std::time::Duration::from_secs(3), out_rx.recv())
+            .await
+            .expect("syn-ack timeout")
+            .expect("syn-ack pkt");
+        let ip = Ipv4Packet::new_checked(&syn_ack).unwrap();
+        let tcp = TcpPacket::new_checked(ip.payload()).unwrap();
+        let tcp_repr = smoltcp::wire::TcpRepr::parse(
+            &tcp,
+            &IpAddress::Ipv4(ip.src_addr()),
+            &IpAddress::Ipv4(ip.dst_addr()),
+            &ChecksumCapabilities::ignored(),
+        )
+        .unwrap();
+        assert!(tcp.syn() && tcp.ack());
+        assert_eq!(
+            tcp_repr.window_scale,
+            Some(5),
+            "1 MiB RX buffer must negotiate RFC 7323 window_scale shift = 5"
+        );
+        client_dev.rx_queue.push_back(syn_ack);
+
+        let server_task = tokio::spawn(async move {
+            let chunk = vec![0x3Cu8; 128 * 1024];
+            let mut remaining = PAYLOAD_BYTES;
+            while remaining > 0 {
+                let n = remaining.min(chunk.len());
+                server_stream.write_all(&chunk[..n]).await.unwrap();
+                remaining -= n;
+            }
+            server_stream.shutdown().await.unwrap();
+        });
+
+        let mut received = 0usize;
+        let deadline = StdInstant::now() + StdDuration::from_secs(10);
+        loop {
+            assert!(
+                StdInstant::now() < deadline,
+                "1 MiB window-scaled transfer timed out at {received}/{PAYLOAD_BYTES}"
+            );
+            while let Ok(pkt) = out_rx.try_recv() {
+                client_dev.rx_queue.push_back(pkt);
+            }
+            client_iface.poll(clock.now(), &mut client_dev, &mut client_sockets);
+            {
+                let sock = client_sockets.get_mut::<TcpSocket>(client_handle);
+                while sock.can_recv() {
+                    received += sock
+                        .recv(|buf| {
+                            assert!(buf.iter().all(|&b| b == 0x3C));
+                            (buf.len(), buf.len())
+                        })
+                        .unwrap();
+                }
+                if received == PAYLOAD_BYTES && !sock.may_recv() {
+                    sock.close();
+                }
+            }
+            client_iface.poll(clock.now(), &mut client_dev, &mut client_sockets);
+            while let Some(pkt) = client_dev.tx_queue.pop_front() {
+                in_tx.send(pkt).await.unwrap();
+            }
+            if received == PAYLOAD_BYTES
+                && client_sockets.get::<TcpSocket>(client_handle).state() == TcpState::Closed
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        server_task.await.unwrap();
+        let _ = stop_tx.send(true);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), runner_handle).await;
+    }
+
+    #[tokio::test]
+    async fn backpressured_rx_ring_resumes_cleanly_without_stalls() {
+        // Exercises RX backpressure (`control.recv_buffer` = 16 KiB < smoltcp 32 KiB < 256 KiB payload)
+        // to prove `rx_backpressured` + `rx_dirty` wakes cleanly with zero stalls on LOW_MEMORY sizes.
+        const MTU: usize = 1500;
+        const BUF: usize = 32 * 1024;
+        const PAYLOAD_BYTES: usize = 256 * 1024;
+
+        let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (stop_tx, stop_rx) = watch::channel(false);
+
+        let (mut stream_rx, runner_handle) =
+            spawn_tcp_netstack(in_rx, out_tx, MTU, BUF, BUF, 16, 128, stop_rx).unwrap();
+
+        let clock = MonotonicClock::new();
+        let mut client_dev = VirtualDevice::new(MTU, 128, true);
+        let mut client_cfg = InterfaceConfig::new(HardwareAddress::Ip);
+        client_cfg.random_seed = 0xaaaa_bbbb_cccc_dddd;
+        let mut client_iface = Interface::new(client_cfg, &mut client_dev, clock.now());
+        client_iface.update_ip_addrs(|addrs| {
+            let _ = addrs.push(IpCidr::new(IpAddress::v4(198, 18, 0, 1), 30));
+        });
+        client_iface
+            .routes_mut()
+            .add_default_ipv4_route(Ipv4Address::new(198, 18, 0, 2))
+            .unwrap();
+
+        let mut client_sockets = SocketSet::new(Vec::new());
+        let mut client_sock = TcpSocket::new(
+            TcpSocketBuffer::new(vec![0u8; BUF]),
+            TcpSocketBuffer::new(vec![0u8; BUF]),
+        );
+        configure_local_tun_socket(&mut client_sock);
+        client_sock
+            .connect(
+                client_iface.context(),
+                (Ipv4Address::new(1, 1, 1, 1), 443),
+                49_200,
+            )
+            .unwrap();
+        let client_handle = client_sockets.add(client_sock);
+
+        client_iface.poll(clock.now(), &mut client_dev, &mut client_sockets);
+        in_tx
+            .send(client_dev.tx_queue.pop_front().unwrap())
+            .await
+            .unwrap();
+
+        let mut server_stream = tokio::time::timeout(StdDuration::from_secs(3), stream_rx.recv())
+            .await
+            .expect("accept timeout")
+            .expect("accepted stream");
+
+        let server_task = tokio::spawn(async move {
+            let mut total = 0usize;
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let n = server_stream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                assert!(buf[..n].iter().all(|&b| b == 0x7E));
+                total += n;
+            }
+            assert_eq!(total, PAYLOAD_BYTES);
+            server_stream.shutdown().await.unwrap();
+        });
+
+        let chunk = vec![0x7Eu8; 8192];
+        let mut sent = 0usize;
+        let mut closed_send = false;
+        let deadline = StdInstant::now() + StdDuration::from_secs(10);
+        loop {
+            assert!(
+                StdInstant::now() < deadline,
+                "RX backpressure transfer timed out at sent={sent}/{PAYLOAD_BYTES}"
+            );
+            while let Ok(pkt) = out_rx.try_recv() {
+                client_dev.rx_queue.push_back(pkt);
+            }
+            client_iface.poll(clock.now(), &mut client_dev, &mut client_sockets);
+            {
+                let sock = client_sockets.get_mut::<TcpSocket>(client_handle);
+                while sent < PAYLOAD_BYTES && sock.can_send() {
+                    let rem = (PAYLOAD_BYTES - sent).min(chunk.len());
+                    let n = sock.send_slice(&chunk[..rem]).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    sent += n;
+                }
+                if sent == PAYLOAD_BYTES && !closed_send && sock.can_send() {
+                    sock.close();
+                    closed_send = true;
+                }
+            }
+            client_iface.poll(clock.now(), &mut client_dev, &mut client_sockets);
+            while let Some(pkt) = client_dev.tx_queue.pop_front() {
+                in_tx.send(pkt).await.unwrap();
+            }
+            if closed_send
+                && matches!(
+                    client_sockets.get::<TcpSocket>(client_handle).state(),
+                    TcpState::TimeWait | TcpState::Closed
+                )
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        server_task.await.unwrap();
+        let _ = stop_tx.send(true);
+        let _ = tokio::time::timeout(StdDuration::from_secs(2), runner_handle).await;
     }
 
     #[tokio::test]
@@ -1197,7 +1899,7 @@ mod tests {
             spawn_tcp_netstack(in_rx, out_tx, MTU, BUF, BUF, 64, 512, stop_rx).unwrap();
 
         // Build a peer smoltcp TCP client speaking raw IPv4 frames across in_tx / out_rx.
-        let mut client_dev = VirtualDevice::new(MTU, 512);
+        let mut client_dev = VirtualDevice::new(MTU, 512, false);
         let mut client_cfg = InterfaceConfig::new(HardwareAddress::Ip);
         client_cfg.random_seed = 0x1234_5678_9abc_def0;
         let mut client_iface = Interface::new(client_cfg, &mut client_dev, SmolInstant::now());
@@ -1341,7 +2043,7 @@ mod tests {
         let (mut stream_rx, runner_handle) =
             spawn_tcp_netstack(in_rx, out_tx, MTU, BUF, BUF, MAX_SESSIONS, 128, stop_rx).unwrap();
 
-        let mut client_dev = VirtualDevice::new(MTU, 128);
+        let mut client_dev = VirtualDevice::new(MTU, 128, true);
         let mut client_cfg = InterfaceConfig::new(HardwareAddress::Ip);
         client_cfg.random_seed = 0x0fed_cba9_8765_4321;
         let mut client_iface = Interface::new(client_cfg, &mut client_dev, SmolInstant::now());
@@ -1431,7 +2133,7 @@ mod tests {
         let (mut stream_rx, runner_handle) =
             spawn_tcp_netstack(in_rx, out_tx, MTU, BUF, BUF, MAX_SESSIONS, 128, stop_rx).unwrap();
 
-        let mut client_dev = VirtualDevice::new(MTU, 128);
+        let mut client_dev = VirtualDevice::new(MTU, 128, true);
         let mut client_cfg = InterfaceConfig::new(HardwareAddress::Ip);
         client_cfg.random_seed = 0x55aa_1234_9876_fedc;
         let mut client_iface = Interface::new(client_cfg, &mut client_dev, SmolInstant::now());

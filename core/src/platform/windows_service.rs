@@ -7,7 +7,9 @@ use crate::health::{
 };
 use crate::platform::vpn::{detect_active_vpn, VpnScope};
 use crate::platform::vpn_guard::{GuardAction, VpnGuard};
-use crate::platform::windows::{clear_all_windows_proxies, set_running_as_service};
+use crate::platform::windows::{
+    clear_all_windows_proxies, notify_wininet_refresh, set_running_as_service,
+};
 use crate::platform::windows_tun::{find_verified_wintun_dll, WindowsTunSession, VDPI_TUN_NAME};
 use crate::platform::SystemProxySession;
 use crate::server::{bind_listeners, serve_until_shutdown};
@@ -596,6 +598,7 @@ impl TunSlot {
         self.pipeline_stop_tx = Some(pipeline_stop_tx);
         self.pipeline_task = Some(pipeline_task);
         self.route_rx = Some(route_rx);
+        let _ = tokio::task::spawn_blocking(notify_wininet_refresh).await;
         Ok(())
     }
 
@@ -756,6 +759,22 @@ impl TunSupervisor {
     }
 }
 
+const SERVICE_MAX_BLOCKING_THREADS: usize = 16;
+const TUN_RECONCILE_ACTIVE_INTERVAL: Duration = Duration::from_secs(10);
+const TUN_RECONCILE_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
+
+fn service_tokio_worker_threads() -> usize {
+    std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 4))
+}
+
+fn tun_reconcile_interval(tun_running: bool, vpn_yielded: bool) -> Duration {
+    if tun_running && !vpn_yielded {
+        TUN_RECONCILE_ACTIVE_INTERVAL
+    } else {
+        TUN_RECONCILE_RECOVERY_INTERVAL
+    }
+}
+
 fn run_service_runtime(handle: ServiceStatusHandle, cfg: RuntimeConfig) -> Result<()> {
     let (stop_tx, stop_rx) = watch::channel::<Option<StopReason>>(None);
     let (reconcile_tx, reconcile_rx) = watch::channel::<u64>(0);
@@ -768,7 +787,11 @@ fn run_service_runtime(handle: ServiceStatusHandle, cfg: RuntimeConfig) -> Resul
         });
     }
 
+    // Cap worker and blocking threads so gigabit TUN bursts never wake 16+ workers
+    // competing with real-time Windows audio engines (VoiceMeeter/WASAPI/ASIO).
     let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(service_tokio_worker_threads())
+        .max_blocking_threads(SERVICE_MAX_BLOCKING_THREADS)
         .enable_all()
         .build()
         .context("failed to initialize Tokio runtime for Windows service")?;
@@ -896,7 +919,10 @@ async fn run_tun_service_runtime(
     let (health_shutdown_tx, health_shutdown_rx) = watch::channel(false);
     let meta_state = Arc::clone(&health_meta);
     let meta_binder = Arc::clone(&binder);
+    let meta_ctx = ctx.clone();
+    let meta_tun_stats = Arc::clone(&tun_stats);
     let meta_fn: HealthMetaFn = Arc::new(move || {
+        sync_tun_telemetry(&meta_ctx, &meta_tun_stats);
         let mut meta = meta_state
             .lock()
             .map(|g| g.clone())
@@ -943,15 +969,14 @@ async fn run_tun_service_runtime(
         last_warned_provider,
     };
 
-    let mut ticker = tokio::time::interval(Duration::from_secs(1));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    ticker.tick().await;
     let mut reconcile_open = true;
 
     let reason = loop {
         if let Some(r) = *stop_rx.borrow() {
             break r;
         }
+        let poll_interval =
+            tun_reconcile_interval(slot.is_running(), supervisor.vpn_guard.is_yielded());
         tokio::select! {
             biased;
             changed = stop_rx.changed() => {
@@ -985,7 +1010,11 @@ async fn run_tun_service_runtime(
                 }
             } => {
                 if changed.is_ok() {
+                    let was_running = slot.is_running();
                     supervisor.reconcile(&mut slot).await;
+                    if was_running && slot.is_running() {
+                        let _ = tokio::task::spawn_blocking(notify_wininet_refresh).await;
+                    }
                 } else {
                     slot.route_rx = None;
                 }
@@ -998,12 +1027,16 @@ async fn run_tun_service_runtime(
                 }
             } => {
                 if changed.is_ok() {
+                    let was_running = slot.is_running();
                     supervisor.reconcile(&mut slot).await;
+                    if was_running && slot.is_running() {
+                        let _ = tokio::task::spawn_blocking(notify_wininet_refresh).await;
+                    }
                 } else {
                     reconcile_open = false;
                 }
             }
-            _ = ticker.tick() => {
+            _ = tokio::time::sleep(poll_interval) => {
                 supervisor.reconcile(&mut slot).await;
             }
         }
@@ -1956,5 +1989,17 @@ mod tests {
                 .and_then(|n| n.to_str()),
             Some("vdpi")
         );
+    }
+
+    #[test]
+    fn service_runtime_thread_caps_and_reconcile_intervals_are_bounded() {
+        let workers = service_tokio_worker_threads();
+        assert!((2..=4).contains(&workers));
+        assert_eq!(SERVICE_MAX_BLOCKING_THREADS, 16);
+
+        assert_eq!(tun_reconcile_interval(true, false), Duration::from_secs(10));
+        assert_eq!(tun_reconcile_interval(true, true), Duration::from_secs(1));
+        assert_eq!(tun_reconcile_interval(false, false), Duration::from_secs(1));
+        assert_eq!(tun_reconcile_interval(false, true), Duration::from_secs(1));
     }
 }

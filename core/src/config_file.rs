@@ -112,9 +112,8 @@ impl FileConfig {
             runtime.block_quic = block_quic;
         }
         if let Some(ref dns_addr) = self.dns_addr {
-            let trimmed = dns_addr.trim();
-            if !trimmed.is_empty() {
-                runtime.dns_addr = trimmed.to_string();
+            if let Ok(validated) = vdpi_core::dns::validate_custom_dns_input(dns_addr) {
+                runtime.dns_addr = validated;
             }
         }
         if let Some(ref domains) = self.bypass_domains {
@@ -543,10 +542,10 @@ pub fn set_config_key(cfg: &mut FileConfig, key: &str, value: &str) -> Result<()
             cfg.block_quic = Some(parse_bool_str(trimmed, "block_quic")?);
         }
         "dns_addr" => {
-            if trimmed.is_empty() {
-                bail!("value for 'dns_addr' cannot be empty");
-            }
-            cfg.dns_addr = Some(trimmed.to_string());
+            let validated = vdpi_core::dns::validate_custom_dns_input(trimmed).map_err(|msg| {
+                anyhow::anyhow!("invalid value '{trimmed}' for 'dns_addr': {msg}")
+            })?;
+            cfg.dns_addr = Some(validated);
         }
         "bypass_domains" => {
             cfg.bypass_domains = Some(parse_string_list_arg(trimmed, "bypass_domains"));
@@ -1059,11 +1058,9 @@ fn apply_parsed_entry(
         }
         "dns_addr" => {
             let s = extract_string(val, val_line, key)?;
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                bail!("line {val_line}: key 'dns_addr' cannot be empty");
-            }
-            cfg.dns_addr = Some(trimmed.to_string());
+            let validated = vdpi_core::dns::validate_custom_dns_input(&s)
+                .map_err(|e| anyhow::anyhow!("line {val_line}: key 'dns_addr': {e}"))?;
+            cfg.dns_addr = Some(validated);
         }
         "bypass_domains" => {
             let arr = extract_array(val, val_line, key)?;
@@ -1733,10 +1730,10 @@ engine = 'tun' # literal string
 mode = \"fragment\"
 doh = true#attached comment
 block_quic = false
-dns_addr = \"1.1.1.1#not-a-comment\\t\\n\\\\\\\"ok\\\"\"
+dns_addr = \"https://dns.nextdns.io/abc123\"
 bypass_domains = [
   # first entry
-  \"alpha.example\", # inline array comment
+  \"alpha.example#not-a-comment\\t\\n\\\\\\\"ok\\\"\", # inline array comment
   'beta\\literal.example',
 ] # trailing array comment
 include_domains = [\"one.example\", \"two.example\",]
@@ -1753,12 +1750,12 @@ timeout_ms = 8_000
         assert_eq!(cfg.block_quic, Some(false));
         assert_eq!(
             cfg.dns_addr.as_deref(),
-            Some("1.1.1.1#not-a-comment\t\n\\\"ok\"")
+            Some("https://dns.nextdns.io/abc123")
         );
         assert_eq!(
             cfg.bypass_domains,
             Some(vec![
-                "alpha.example".to_string(),
+                "alpha.example#not-a-comment\t\n\\\"ok\"".to_string(),
                 r"beta\literal.example".to_string(),
             ])
         );
@@ -2508,5 +2505,72 @@ split_tunnel_apps = [
                 "robloxplayerbeta.exe".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn custom_dns_roundtrips_ipv4_ipv6_and_doh_urls_and_rejects_invalid() {
+        let dir = TestTempDir::new("custom-dns");
+        let valid_cases = [
+            "76.76.2.0",
+            "2606:4700:4700::1111",
+            "https://dns.nextdns.io/abc123",
+            "https://freedns.controld.com/p2",
+            "https://dns.example.com:8443/dns-query",
+        ];
+
+        for (idx, dns) in valid_cases.iter().enumerate() {
+            let mut cfg = FileConfig {
+                schema_version: Some(CONFIG_SCHEMA_VERSION),
+                engine: Some(EngineMode::Tun),
+                ..Default::default()
+            };
+            set_config_key(&mut cfg, "dns_addr", dns)
+                .unwrap_or_else(|e| panic!("set_config_key failed for valid DNS '{dns}': {e:#}"));
+            assert_eq!(
+                get_config_key(&cfg, "dns-addr").unwrap().as_deref(),
+                Some(*dns)
+            );
+
+            let rendered = render_config_toml(&cfg);
+            let parsed = parse_config_toml(&rendered)
+                .unwrap_or_else(|e| panic!("parse_config_toml failed for '{dns}': {e:#}"));
+            assert_eq!(parsed.dns_addr.as_deref(), Some(*dns));
+
+            let path = dir.path().join(format!("config-{idx}.toml"));
+            save_file_config_atomic(&path, &cfg).expect("atomic save custom DNS");
+            let (_, reloaded) =
+                load_file_config(Some(&path), false).expect("reload custom DNS config");
+            assert_eq!(reloaded, cfg);
+
+            let mut runtime = RuntimeConfig::default();
+            reloaded.apply_to_runtime(&mut runtime);
+            assert_eq!(runtime.engine, EngineMode::Tun);
+            assert_eq!(runtime.dns_addr, *dns);
+        }
+
+        // Invalid custom DNS values must be rejected in both set_config_key and parse_config_toml.
+        let invalid_cases = [
+            "",
+            "   ",
+            "http://dns.nextdns.io/abc123",
+            "not-a-valid-dns",
+            "https://",
+            "76.76.2.0\nwhoami",
+        ];
+        let mut cfg = FileConfig::default();
+        for bad in invalid_cases {
+            assert!(
+                set_config_key(&mut cfg, "dns_addr", bad).is_err(),
+                "set_config_key should reject invalid DNS {bad:?}"
+            );
+            let toml = format!("dns_addr = {}\n", escape_toml_string(bad));
+            let err = parse_config_toml(&toml).expect_err(&format!(
+                "parse_config_toml should reject invalid DNS {bad:?}"
+            ));
+            assert!(
+                err.to_string().contains("line 1:"),
+                "expected line 1 error for {bad:?}, got: {err}"
+            );
+        }
     }
 }

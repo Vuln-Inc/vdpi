@@ -31,6 +31,9 @@ pub const LINUX_TUN_MTU: u16 = vdpi_tun::config::DESKTOP_MTU as u16;
 pub const LINUX_TUN_MTU: u16 = 16_384;
 /// Default transmit queue length configured on `vdpi0`.
 pub const LINUX_TUN_TXQUEUELEN: u32 = 4096;
+/// Descending `txqueuelen` fallback ladder tried when bringing up `vdpi0`, keeping Gigabit
+/// burst headroom (4096 -> 2000 -> 1000) instead of dropping straight to the 500-packet default.
+pub const LINUX_TUN_TXQUEUELEN_LADDER: [u32; 3] = [LINUX_TUN_TXQUEUELEN, 2000, 1000];
 /// Linux `SO_MARK` fwmark (`"VD"`) applied to `vdpi`'s own outbound sockets.
 pub const VDPI_SO_MARK: u32 = 0x5644;
 /// Bitmask applied to `fwmark` policy rules so upper mark bits (e.g. Tailscale/WireGuard)
@@ -668,7 +671,7 @@ mod imp {
         write_file_atomic, IpRuleSpec, LinuxDnsBackend, LinuxTunState, ResolvBackupMeta,
         ALL_RP_FILTER_PATH, LINUX_IFNAMSIZ, LINUX_TUN_DNS_V4, LINUX_TUN_DNS_V6, LINUX_TUN_IFACE,
         LINUX_TUN_IPV4_CIDR, LINUX_TUN_IPV6_CIDR, LINUX_TUN_LOCK_PATH, LINUX_TUN_MTU,
-        LINUX_TUN_STATE_DIR, LINUX_TUN_STATE_PATH, LINUX_TUN_TXQUEUELEN, NM_DNS_CONF_PATH,
+        LINUX_TUN_STATE_DIR, LINUX_TUN_STATE_PATH, LINUX_TUN_TXQUEUELEN_LADDER, NM_DNS_CONF_PATH,
         RESOLV_CONF_BACKUP_PATH, RESOLV_CONF_META_PATH, RESOLV_CONF_PATH, TRUSTED_BIN_PREFIXES,
         VDPI_ROUTE_TABLE, VDPI_SO_MARK,
     };
@@ -876,16 +879,21 @@ mod imp {
                 .save_to_path(Path::new(LINUX_TUN_STATE_PATH))
                 .context("failed to persist initial Linux TUN state")?;
 
-            let setup_res = Self::configure_network(&iface, &binder, tun_ipv6, &mut state);
-            if let Err(err) = setup_res {
-                binder.update(OutboundTarget::default());
-                let _ = cleanup_linux_tun_state_locked();
-                return Err(err);
-            }
+            let applied_txqueuelen =
+                match Self::configure_network(&iface, &binder, tun_ipv6, &mut state) {
+                    Ok(qlen) => qlen,
+                    Err(err) => {
+                        binder.update(OutboundTarget::default());
+                        let _ = cleanup_linux_tun_state_locked();
+                        return Err(err);
+                    }
+                };
 
             let fwmark_hex = format!("0x{VDPI_SO_MARK:x}");
             info!(
                 iface = %iface,
+                mtu = LINUX_TUN_MTU,
+                txqueuelen = ?applied_txqueuelen,
                 table = VDPI_ROUTE_TABLE,
                 fwmark = %fwmark_hex,
                 ipv6 = state.ipv6_enabled,
@@ -914,29 +922,40 @@ mod imp {
             binder: &Arc<DynamicOutboundBinder>,
             tun_ipv6: bool,
             state: &mut LinuxTunState,
-        ) -> Result<()> {
+        ) -> Result<Option<u32>> {
             let mtu_str = LINUX_TUN_MTU.to_string();
-            let qlen_str = LINUX_TUN_TXQUEUELEN.to_string();
 
             run_ip(&["-4", "addr", "replace", LINUX_TUN_IPV4_CIDR, "dev", iface])
                 .context("failed to assign IPv4 address to TUN interface")?;
-            if let Err(err) = run_ip(&[
-                "link",
-                "set",
-                "dev",
-                iface,
-                "mtu",
-                &mtu_str,
-                "txqueuelen",
-                &qlen_str,
-                "up",
-            ]) {
-                warn!(
-                    iface = %iface,
-                    txqueuelen = LINUX_TUN_TXQUEUELEN,
-                    error = %err,
-                    "ip link set with txqueuelen failed; retrying without txqueuelen"
-                );
+            let mut applied_txqueuelen: Option<u32> = None;
+            for qlen in LINUX_TUN_TXQUEUELEN_LADDER {
+                let qlen_str = qlen.to_string();
+                match run_ip(&[
+                    "link",
+                    "set",
+                    "dev",
+                    iface,
+                    "mtu",
+                    &mtu_str,
+                    "txqueuelen",
+                    &qlen_str,
+                    "up",
+                ]) {
+                    Ok(()) => {
+                        applied_txqueuelen = Some(qlen);
+                        break;
+                    }
+                    Err(err) => {
+                        warn!(
+                            iface = %iface,
+                            txqueuelen = qlen,
+                            error = %err,
+                            "ip link set with txqueuelen failed; trying smaller fallback"
+                        );
+                    }
+                }
+            }
+            if applied_txqueuelen.is_none() {
                 run_ip(&["link", "set", "dev", iface, "mtu", &mtu_str, "up"])
                     .context("failed to bring up Linux TUN interface")?;
             }
@@ -978,7 +997,7 @@ mod imp {
                 .save_to_path(Path::new(LINUX_TUN_STATE_PATH))
                 .context("failed to persist active Linux TUN state")?;
 
-            Ok(())
+            Ok(applied_txqueuelen)
         }
     }
 
@@ -1911,6 +1930,7 @@ default via 192.168.1.1 dev wlan0 proto dhcp src 192.168.1.42 metric 600
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         assert_eq!(LINUX_TUN_MTU, vdpi_tun::config::DESKTOP_MTU as u16);
         assert_eq!(LINUX_TUN_TXQUEUELEN, 4096);
+        assert_eq!(LINUX_TUN_TXQUEUELEN_LADDER, [4096, 2000, 1000]);
 
         assert!(resolv_conf_uses_systemd_resolved(
             Some("/run/systemd/resolve/stub-resolv.conf"),

@@ -32,6 +32,22 @@ pub const MACOS_TUN_DNS_V6: &str = "fd00:7664:7069::2";
 /// Fallback MTU configured on the macOS `utun` interface when Jumbo MTUs are rejected.
 pub const MACOS_TUN_MTU: u16 = 1500;
 
+/// Descending `SO_RCVBUF` / `SO_SNDBUF` fallback ladder (4 MiB -> 2 MiB -> 1 MiB -> 512 KiB)
+/// requested on the macOS `utun` kernel control socket so XNU doesn't tail-drop Gigabit bursts
+/// with `ENOBUFS` while staying compatible with lower `kern.ipc.maxsockbuf` limits.
+pub const MACOS_UTUN_SOCKBUF_LADDER: [usize; 4] =
+    [4 * 1024 * 1024, 2 * 1024 * 1024, 1024 * 1024, 512 * 1024];
+
+/// Assumed fallback `SO_RCVBUF` size (512 KiB, XNU `ctl_rcvbspace` default) when `getsockopt`
+/// fails to report the effective `utun` socket buffer size.
+pub const MACOS_UTUN_DEFAULT_RCVBUF: usize = 512 * 1024;
+
+/// Upper bound on `UTUN_OPT_MAX_PENDING_PACKETS` (matches desktop 128-packet burst batching).
+pub const MACOS_UTUN_MAX_PENDING_PACKETS_CAP: u32 = 128;
+
+/// 4-byte Darwin protocol-family header prepended to each `utun` control-socket frame.
+const MACOS_UTUN_PI_LEN: usize = 4;
+
 /// Hidden CLI flag used to invoke the detached macOS TUN crash-cleanup guard process.
 pub const MACOS_TUN_GUARD_ARG: &str = "--internal-macos-tun-guard";
 
@@ -333,6 +349,31 @@ fn write_file_atomic(path: &Path, contents: &str, mode: u32) -> Result<()> {
     Ok(())
 }
 
+/// Computes a safe `UTUN_OPT_MAX_PENDING_PACKETS` queue depth bounded by the effective
+/// `SO_RCVBUF` byte budget and active `utun` MTU.
+///
+/// XNU `if_utun.c` pauses interface transmission cleanly once `utun_max_pending_packets`
+/// frames are queued, whereas exceeding `SO_RCVBUF` (`kern_control.c` `ctl_rcvbspace`)
+/// tail-drops packets with `ENOBUFS`. Keeping the packet cap at `7/8` of `SO_RCVBUF`
+/// divided by `mtu + 4` (clamped to `1..=MACOS_UTUN_MAX_PENDING_PACKETS_CAP`) unlocks
+/// full Gigabit burst batching while preventing `ENOBUFS` drops on constrained `maxsockbuf`
+/// hosts.
+pub fn compute_utun_max_pending_packets(rcvbuf_bytes: usize, mtu: u16) -> u32 {
+    let frame_bytes = usize::from(mtu).saturating_add(MACOS_UTUN_PI_LEN).max(1);
+    let safe_budget = rcvbuf_bytes.saturating_mul(7) / 8;
+    let packets = safe_budget / frame_bytes;
+    u32::try_from(packets)
+        .unwrap_or(MACOS_UTUN_MAX_PENDING_PACKETS_CAP)
+        .clamp(1, MACOS_UTUN_MAX_PENDING_PACKETS_CAP)
+}
+
+/// Converts a remaining debounce duration into a `poll(2)` millisecond timeout, rounding
+/// any non-zero sub-millisecond remainder up to the next whole millisecond so `poll(2)`
+/// never busy-spins with `timeout_ms = 0` waiting for the final sub-millisecond to elapse.
+pub fn poll_timeout_ms_ceil(remaining: std::time::Duration) -> i32 {
+    i32::try_from(remaining.as_nanos().div_ceil(1_000_000)).unwrap_or(i32::MAX)
+}
+
 /// Serializes [`MacosTunGuardState`] as a single newline-delimited JSON payload for the
 /// detached crash guard's stdin pipe.
 pub fn build_macos_tun_cleanup_payload(state: &MacosTunGuardState) -> Result<String> {
@@ -345,10 +386,12 @@ pub fn build_macos_tun_cleanup_payload(state: &MacosTunGuardState) -> Result<Str
 #[cfg(target_os = "macos")]
 mod imp {
     use super::{
-        build_macos_tun_cleanup_payload, is_relevant_pf_route_msg, is_vdpi_owned_dns_servers,
-        parse_dns_servers_output, parse_route_get_default, MacosTunGuardState, ManagedRoute,
+        build_macos_tun_cleanup_payload, compute_utun_max_pending_packets,
+        is_relevant_pf_route_msg, is_vdpi_owned_dns_servers, parse_dns_servers_output,
+        parse_route_get_default, poll_timeout_ms_ceil, MacosTunGuardState, ManagedRoute,
         MACOS_TUN_DNS_V4, MACOS_TUN_DNS_V6, MACOS_TUN_GUARD_ARG, MACOS_TUN_IPV4, MACOS_TUN_IPV6,
-        MACOS_TUN_MTU, MACOS_TUN_NETMASK_V4, MACOS_TUN_STATE_PATH,
+        MACOS_TUN_MTU, MACOS_TUN_NETMASK_V4, MACOS_TUN_STATE_PATH, MACOS_UTUN_DEFAULT_RCVBUF,
+        MACOS_UTUN_SOCKBUF_LADDER,
     };
     use crate::binder::{DynamicOutboundBinder, OutboundTarget};
     use crate::platform::macos::list_configurable_network_services;
@@ -369,6 +412,9 @@ mod imp {
     use tracing::{debug, info, warn};
 
     const UTUN_CONTROL_NAME: &CStr = c"com.apple.net.utun_control";
+    /// Darwin `<net/if_utun.h>` `UTUN_OPT_MAX_PENDING_PACKETS` (level `SYSPROTO_CONTROL`,
+    /// `u_int32_t`). Not yet exposed by `libc 0.2.x`; defaults to `1` in XNU.
+    const UTUN_OPT_MAX_PENDING_PACKETS: libc::c_int = 16;
     const GUARD_READY: &str = "ready";
 
     const RFC1918_EXCLUSIONS: &[&str] = &["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"];
@@ -821,9 +867,125 @@ mod imp {
             bail!("kernel returned empty utun interface name");
         }
 
+        let preferred_mtu = u16::try_from(vdpi_tun::config::DESKTOP_MTU).unwrap_or(MACOS_TUN_MTU);
+        tune_utun_socket(fd, preferred_mtu);
+
         set_nonblocking(fd)?;
 
         Ok((owned_fd, iface_name))
+    }
+
+    fn get_socket_buf_size(fd: libc::c_int, optname: libc::c_int) -> Option<usize> {
+        let mut val: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `fd` is an open socket descriptor and `val` matches `len` (`sizeof(c_int)`).
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                optname,
+                ptr::from_mut(&mut val).cast::<c_void>(),
+                &mut len,
+            )
+        };
+        if rc == 0 && val > 0 {
+            usize::try_from(val).ok()
+        } else {
+            None
+        }
+    }
+
+    fn raise_socket_buf_with_fallback(fd: libc::c_int, optname: libc::c_int, label: &str) -> usize {
+        let initial = get_socket_buf_size(fd, optname).unwrap_or(0);
+        let mut applied = false;
+        for &candidate in &MACOS_UTUN_SOCKBUF_LADDER {
+            if initial >= candidate {
+                applied = true;
+                break;
+            }
+            let Ok(size) = libc::c_int::try_from(candidate) else {
+                continue;
+            };
+            // SAFETY: `fd` is a connected utun control socket and `size` is a live `c_int`
+            // matching `optlen`.
+            let rc = unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    optname,
+                    ptr::from_ref(&size).cast::<c_void>(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            if rc == 0 {
+                applied = true;
+                break;
+            }
+            let err = io::Error::last_os_error();
+            debug!(
+                option = label,
+                requested_bytes = candidate,
+                error = %err,
+                "utun setsockopt buffer size rejected; trying smaller fallback"
+            );
+        }
+        let effective = get_socket_buf_size(fd, optname).unwrap_or(MACOS_UTUN_DEFAULT_RCVBUF);
+        if !applied {
+            warn!(
+                option = label,
+                effective_bytes = effective,
+                "all utun socket buffer ladder sizes were rejected; keeping kernel default"
+            );
+        }
+        effective
+    }
+
+    fn tune_utun_max_pending_packets(
+        fd: libc::c_int,
+        rcvbuf_bytes: usize,
+        mtu: u16,
+    ) -> Option<u32> {
+        let target = compute_utun_max_pending_packets(rcvbuf_bytes, mtu);
+        // SAFETY: `fd` is a connected utun control socket and `target` is a live `u32`
+        // matching XNU `if_utun.c` `UTUN_OPT_MAX_PENDING_PACKETS` (`sizeof(u_int32_t)`).
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SYSPROTO_CONTROL,
+                UTUN_OPT_MAX_PENDING_PACKETS,
+                ptr::from_ref(&target).cast::<c_void>(),
+                std::mem::size_of::<u32>() as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            debug!(
+                max_pending_packets = target,
+                rcvbuf_bytes, mtu, "configured macOS utun UTUN_OPT_MAX_PENDING_PACKETS"
+            );
+            Some(target)
+        } else {
+            // Older macOS kernels without UTUN_OPT_MAX_PENDING_PACKETS return ENOPROTOOPT;
+            // ignore gracefully so startup remains backward-compatible.
+            debug!(
+                requested = target,
+                error = %io::Error::last_os_error(),
+                "UTUN_OPT_MAX_PENDING_PACKETS unsupported or rejected on this macOS kernel; keeping default"
+            );
+            None
+        }
+    }
+
+    fn tune_utun_socket(fd: libc::c_int, mtu: u16) {
+        let rcvbuf = raise_socket_buf_with_fallback(fd, libc::SO_RCVBUF, "SO_RCVBUF");
+        let sndbuf = raise_socket_buf_with_fallback(fd, libc::SO_SNDBUF, "SO_SNDBUF");
+        let max_pending = tune_utun_max_pending_packets(fd, rcvbuf, mtu);
+        debug!(
+            rcvbuf_bytes = rcvbuf,
+            sndbuf_bytes = sndbuf,
+            ?max_pending,
+            mtu,
+            "tuned macOS utun control socket buffers"
+        );
     }
 
     struct RouteMonitor {
@@ -952,6 +1114,12 @@ mod imp {
             rollback.state.iface_name = iface_name.clone();
 
             let (mtu, ipv6_active) = configure_utun_interface(&iface_name, tun_ipv6)?;
+            let rcvbuf = get_socket_buf_size(tun_fd.as_raw_fd(), libc::SO_RCVBUF)
+                .unwrap_or(MACOS_UTUN_DEFAULT_RCVBUF);
+            let sndbuf = get_socket_buf_size(tun_fd.as_raw_fd(), libc::SO_SNDBUF)
+                .unwrap_or(MACOS_UTUN_DEFAULT_RCVBUF);
+            let max_pending_packets =
+                tune_utun_max_pending_packets(tun_fd.as_raw_fd(), rcvbuf, mtu);
 
             // Persist initial crash-recovery state atomically (0600) BEFORE mutating routes.
             save_macos_tun_state(&rollback.state)?;
@@ -1131,6 +1299,9 @@ mod imp {
                 iface = %guard_state.iface_name,
                 physical_nic = %phys_iface,
                 mtu,
+                rcvbuf,
+                sndbuf,
+                ?max_pending_packets,
                 if_index_v4,
                 ?if_index_v6,
                 routes = guard_state.routes.len(),
@@ -1397,7 +1568,7 @@ mod imp {
                 Some((burst_start, deadline)) => {
                     let effective = deadline.min(burst_start + ROUTE_DEBOUNCE_MAX_WAIT);
                     let rem = effective.saturating_duration_since(Instant::now());
-                    libc::c_int::try_from(rem.as_millis()).unwrap_or(libc::c_int::MAX)
+                    poll_timeout_ms_ceil(rem)
                 }
             };
 
@@ -2436,5 +2607,52 @@ destination: default
         let loaded = MacosTunGuardState::load_from_path(&tmp_path).unwrap();
         assert_eq!(loaded, Some(state));
         let _ = fs::remove_file(&tmp_path);
+    }
+
+    #[test]
+    fn utun_sockbuf_ladder_and_max_pending_packets_sizing() {
+        assert_eq!(
+            MACOS_UTUN_SOCKBUF_LADDER,
+            [4 * 1024 * 1024, 2 * 1024 * 1024, 1024 * 1024, 512 * 1024]
+        );
+        // 4 MiB @ 16384 MTU -> capped at 128 packets (matching DESKTOP batch size).
+        assert_eq!(
+            compute_utun_max_pending_packets(4 * 1024 * 1024, 16_384),
+            MACOS_UTUN_MAX_PENDING_PACKETS_CAP
+        );
+        // 2 MiB @ 16384 MTU -> 111 packets (~1.73 MiB < 7/8 of 2 MiB, avoiding ENOBUFS).
+        assert_eq!(
+            compute_utun_max_pending_packets(2 * 1024 * 1024, 16_384),
+            111
+        );
+        // 1 MiB @ 16384 MTU -> 55 packets.
+        assert_eq!(compute_utun_max_pending_packets(1024 * 1024, 16_384), 55);
+        // 512 KiB @ 16384 MTU -> 27 packets.
+        assert_eq!(compute_utun_max_pending_packets(512 * 1024, 16_384), 27);
+        // 512 KiB @ 1500 MTU -> capped at 128 packets.
+        assert_eq!(
+            compute_utun_max_pending_packets(512 * 1024, MACOS_TUN_MTU),
+            MACOS_UTUN_MAX_PENDING_PACKETS_CAP
+        );
+        // Never returns 0 (XNU rejects 0 with EINVAL) and never overflows on huge inputs.
+        assert_eq!(compute_utun_max_pending_packets(0, 16_384), 1);
+        assert_eq!(
+            compute_utun_max_pending_packets(usize::MAX, 16_384),
+            MACOS_UTUN_MAX_PENDING_PACKETS_CAP
+        );
+    }
+
+    #[test]
+    fn poll_timeout_ms_ceil_prevents_submillisecond_spin() {
+        use std::time::Duration;
+
+        assert_eq!(poll_timeout_ms_ceil(Duration::ZERO), 0);
+        assert_eq!(poll_timeout_ms_ceil(Duration::from_nanos(1)), 1);
+        assert_eq!(poll_timeout_ms_ceil(Duration::from_micros(400)), 1);
+        assert_eq!(poll_timeout_ms_ceil(Duration::from_micros(999)), 1);
+        assert_eq!(poll_timeout_ms_ceil(Duration::from_millis(1)), 1);
+        assert_eq!(poll_timeout_ms_ceil(Duration::from_micros(1001)), 2);
+        assert_eq!(poll_timeout_ms_ceil(Duration::from_millis(350)), 350);
+        assert_eq!(poll_timeout_ms_ceil(Duration::MAX), i32::MAX);
     }
 }

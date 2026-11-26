@@ -11,7 +11,7 @@ use std::future::Future;
 use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
@@ -36,6 +36,11 @@ const TCP_SLOT_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(250);
 const PASSTHROUGH_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const STUN_FLOW_MAX_ENTRIES: usize = 256;
 const STUN_FLOW_TTL_SECS: u64 = 120;
+const UDP_APP_BYPASS_CACHE_MAX_ENTRIES: usize = 512;
+const UDP_APP_BYPASS_CACHE_TTL_SECS: u64 = 5;
+const MIN_PASSTHROUGH_COPY_BUF: usize = 16 * 1024;
+const MAX_PASSTHROUGH_COPY_BUF: usize = 512 * 1024;
+const TCP_KERNEL_BUF_MIN_OPT_BYTES: usize = 256 * 1024;
 
 /// Wraps `TunNetstackTcpStream` so `poll_shutdown` flushes buffered writes and
 /// polls TCP FIN cleanly within a bounded 2-second deadline without stalling
@@ -189,6 +194,15 @@ impl ReverseDnsCache {
             .get(&ip)
             .cloned()
     }
+
+    fn should_desync_dst(&self, ip: IpAddr, ctx: &EngineContext) -> bool {
+        let guard = self
+            .map
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let known_host = guard.get(&ip).map(String::as_str);
+        ctx.bypass.should_desync(known_host, Some(ip))
+    }
 }
 
 /// Lock-free per-second counter capping synthesized QUIC ICMP rejects to <= 64/sec.
@@ -279,6 +293,93 @@ impl StunFlowCache {
             self.entries.remove(&flow);
         }
         false
+    }
+}
+
+/// Task-local, lock-free TTL cache of UDP app-bypass verdicts keyed by `(src_ip, src_port)`.
+/// Prevents UDP/443 QUIC bursts from repeatedly acquiring `ProcessSocketResolver`'s lock or
+/// invoking OS socket-table scans inside the `tun_to_stack` packet demux loop.
+#[derive(Debug, Default)]
+struct UdpAppBypassCache {
+    entries: HashMap<(IpAddr, u16), (bool, u64)>,
+}
+
+impl UdpAppBypassCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    fn should_bypass(
+        &mut self,
+        src_ip: IpAddr,
+        src_port: u16,
+        now: u64,
+        hook: &AppBypassHook,
+    ) -> bool {
+        let key = (src_ip, src_port);
+        if let Some(&(bypass, cached_at)) = self.entries.get(&key) {
+            if now.saturating_sub(cached_at) < UDP_APP_BYPASS_CACHE_TTL_SECS {
+                return bypass;
+            }
+            self.entries.remove(&key);
+        }
+
+        let bypass = hook.should_bypass(src_ip, src_port, true);
+        if self.entries.len() >= UDP_APP_BYPASS_CACHE_MAX_ENTRIES
+            && !self.entries.contains_key(&key)
+        {
+            self.entries
+                .retain(|_, (_, ts)| now.saturating_sub(*ts) < UDP_APP_BYPASS_CACHE_TTL_SECS);
+            if self.entries.len() >= UDP_APP_BYPASS_CACHE_MAX_ENTRIES {
+                if let Some(oldest) = self
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, (_, ts))| *ts)
+                    .map(|(k, _)| *k)
+                {
+                    self.entries.remove(&oldest);
+                }
+            }
+        }
+        self.entries.insert(key, (bypass, now));
+        bypass
+    }
+}
+
+#[inline]
+fn is_fast_tcp_packet(pkt: &[u8]) -> bool {
+    match pkt.first().map(|b| b >> 4) {
+        Some(4) => pkt.len() >= 20 && pkt[9] == 6,
+        Some(6) => pkt.len() >= 40 && pkt[6] == 6,
+        _ => false,
+    }
+}
+
+#[inline]
+fn passthrough_copy_buf_size(buf_size: usize) -> usize {
+    buf_size.clamp(MIN_PASSTHROUGH_COPY_BUF, MAX_PASSTHROUGH_COPY_BUF)
+}
+
+fn tune_upstream_tcp_socket(
+    stream: &tokio::net::TcpStream,
+    recv_buf_bytes: usize,
+    send_buf_bytes: usize,
+) {
+    let _ = stream.set_nodelay(true);
+    // Only enlarge kernel TCP socket buffers on desktop-class profiles (>= 256 KiB) so
+    // mobile/LOW_MEMORY profiles never shrink OS auto-tuned receive/send buffers.
+    if recv_buf_bytes >= TCP_KERNEL_BUF_MIN_OPT_BYTES
+        || send_buf_bytes >= TCP_KERNEL_BUF_MIN_OPT_BYTES
+    {
+        let sock_ref = socket2::SockRef::from(stream);
+        if recv_buf_bytes >= TCP_KERNEL_BUF_MIN_OPT_BYTES {
+            let _ = sock_ref.set_recv_buffer_size(recv_buf_bytes);
+        }
+        if send_buf_bytes >= TCP_KERNEL_BUF_MIN_OPT_BYTES {
+            let _ = sock_ref.set_send_buffer_size(send_buf_bytes);
+        }
     }
 }
 
@@ -379,6 +480,7 @@ fn should_drop_inbound_quic(
     stats: &TunStats,
     events: &EventRing,
     stun_flows: &mut StunFlowCache,
+    app_bypass_cache: &mut UdpAppBypassCache,
     icmp_reject: Option<(&IcmpRateLimiter, &mpsc::Sender<Vec<u8>>)>,
     app_bypass: Option<&AppBypassHook>,
 ) -> bool {
@@ -396,15 +498,11 @@ fn should_drop_inbound_quic(
     if !ctx.config.block_quic || !is_blocked_quic_udp(udp.dst_port, udp.payload) {
         return false;
     }
-    let known_host = rdns.lookup(udp.dst_ip);
-    if !ctx
-        .bypass
-        .should_desync(known_host.as_deref(), Some(udp.dst_ip))
-    {
+    if !rdns.should_desync_dst(udp.dst_ip, ctx) {
         return false;
     }
     if let Some(hook) = app_bypass {
-        if hook.should_bypass(udp.src_ip, udp.src_port, true) {
+        if app_bypass_cache.should_bypass(udp.src_ip, udp.src_port, now, hook) {
             return false;
         }
     }
@@ -527,7 +625,7 @@ pub async fn run_tun_pipeline_with_app_bypass(
         profile.tcp_recv_buffer_size as usize,
         profile.tcp_send_buffer_size as usize,
         profile.max_tcp_sessions,
-        profile.channel_capacity.clamp(128, 512),
+        profile.channel_capacity.clamp(128, 4096),
         internal_stop_rx.clone(),
     )
     .context("failed to build smoltcp netstack")?;
@@ -563,151 +661,28 @@ pub async fn run_tun_pipeline_with_app_bypass(
     let emit_quic_icmp_reject = profile.emit_quic_icmp_reject;
     let max_udp_flows = profile.max_udp_flows;
     let udp_socket_buf_bytes = profile.udp_socket_buf_bytes;
+    let demux_batch_size = profile.batch_size.max(1);
     let quic_icmp_limiter = IcmpRateLimiter::new(MAX_QUIC_ICMP_PER_SEC);
     let mut stop_in = internal_stop_rx.clone();
     let in_stop_tx = internal_stop_tx.clone();
     let tun_to_stack = tokio::spawn(async move {
         let mut stun_flows = StunFlowCache::new();
-        loop {
-            tokio::select! {
+        let mut app_bypass_cache = UdpAppBypassCache::new();
+        let mut pkt_batch: Vec<Vec<u8>> = Vec::with_capacity(demux_batch_size);
+        'demux: loop {
+            let received = tokio::select! {
                 biased;
                 _ = wait_shutdown(&mut stop_in) => break,
-                pkt = inbound_rx.recv() => {
-                    let Some(pkt) = pkt else {
-                        let _ = in_stop_tx.send(true);
-                        break;
-                    };
+                n = inbound_rx.recv_many(&mut pkt_batch, demux_batch_size) => n,
+            };
+            if received == 0 {
+                let _ = in_stop_tx.send(true);
+                break;
+            }
 
-                    if let Some(udp) = inspect_inbound_udp(&pkt) {
-                        let src_addr = SocketAddr::new(udp.src_ip, udp.src_port);
-                        let dst_addr = SocketAddr::new(udp.dst_ip, udp.dst_port);
-
-                        // 1. UDP/53 DNS -> bounded DoH handler synthesizing raw IP+UDP reply onto outbound_tx
-                        if udp.dst_port == 53 {
-                            let Ok(permit) = in_dns_slots.clone().try_acquire_owned() else {
-                                continue;
-                            };
-                            let query = udp.payload.to_vec();
-                            let dns_ctx = in_ctx.clone();
-                            let rdns = Arc::clone(&in_rdns);
-                            let reply_out_tx = in_outbound_tx.clone();
-                            let mut dns_stop = in_stop_root.clone();
-                            tokio::spawn(async move {
-                                let _permit = permit;
-                                tokio::select! {
-                                    biased;
-                                    _ = wait_shutdown(&mut dns_stop) => {}
-                                    res = tokio::time::timeout(
-                                        Duration::from_secs(5),
-                                        dns_ctx.dns.resolve_wire_query(&query, dns_ctx.config.block_quic),
-                                    ) => {
-                                        match res {
-                                            Ok(Ok((resp, meta))) => {
-                                                if let Some((domain, ips)) = meta {
-                                                    for ip in ips {
-                                                        rdns.insert(ip, domain.clone());
-                                                    }
-                                                }
-                                                let max_udp = max_dns_udp_payload_for_mtu(clamped_mtu, dst_addr.is_ipv4());
-                                                let wire = if resp.len() > max_udp {
-                                                    build_truncated_dns_reply(&query, &resp)
-                                                } else {
-                                                    resp
-                                                };
-                                                if let Some(reply_pkt) = build_udp_packet(dst_addr, src_addr, &wire) {
-                                                    tokio::select! {
-                                                        biased;
-                                                        _ = wait_shutdown(&mut dns_stop) => {}
-                                                        _ = reply_out_tx.send(reply_pkt) => {}
-                                                    }
-                                                }
-                                            }
-                                            Ok(Err(e)) => {
-                                                debug!(error = %e, "TUN DNS wire query failed");
-                                            }
-                                            Err(_) => {
-                                                debug!("TUN UDP/53 DNS wire query timed out (5s)");
-                                            }
-                                        }
-                                    }
-                                }
-                            });
-                            continue;
-                        }
-
-                        // 2. UDP/443 QUIC block (exempting RFC 5389 STUN and STUN-authenticated TURN/DTLS/SRTP flows)
-                        let icmp_reject =
-                            emit_quic_icmp_reject.then_some((&quic_icmp_limiter, &in_outbound_tx));
-                        if should_drop_inbound_quic(
-                            &pkt,
-                            &udp,
-                            src_addr,
-                            dst_addr,
-                            &in_ctx,
-                            &in_rdns,
-                            &in_stats,
-                            &in_events,
-                            &mut stun_flows,
-                            icmp_reject,
-                            in_app_bypass.as_ref(),
-                        ) {
-                            continue;
-                        }
-
-                        // 3. Direct Cone-NAT UDP relay: synchronous non-blocking fast path inline;
-                        //    socket bind / WouldBlock slow paths run on bounded spawned tasks so
-                        //    UDP bursts never stall DNS or TCP demuxing.
-                        if let UdpFastPath::NeedsSlowPath(existing) = try_forward_udp_fast(
-                            udp.payload,
-                            src_addr,
-                            dst_addr,
-                            &in_udp_nat,
-                            &in_udp_lru_seq,
-                            &in_ctx,
-                            &in_stats,
-                            max_udp_flows,
-                        ) {
-                            let Ok(permit) = in_udp_slow_slots.clone().try_acquire_owned() else {
-                                in_stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
-                                continue;
-                            };
-                            let payload = udp.payload.to_vec();
-                            let nat = Arc::clone(&in_udp_nat);
-                            let lru_seq = Arc::clone(&in_udp_lru_seq);
-                            let reply_out_tx = in_outbound_tx.clone();
-                            let udp_ctx = in_ctx.clone();
-                            let udp_stats = Arc::clone(&in_stats);
-                            let udp_stop_root = in_stop_root.clone();
-                            let mut udp_stop = in_stop_root.clone();
-                            tokio::spawn(async move {
-                                let _permit = permit;
-                                tokio::select! {
-                                    biased;
-                                    _ = wait_shutdown(&mut udp_stop) => {}
-                                    _ = forward_udp_cone_nat_slow(
-                                        payload,
-                                        src_addr,
-                                        dst_addr,
-                                        existing,
-                                        nat,
-                                        lru_seq,
-                                        reply_out_tx,
-                                        udp_ctx,
-                                        udp_stats,
-                                        udp_stop_root,
-                                        clamped_mtu,
-                                        max_udp_flows,
-                                        udp_socket_buf_bytes,
-                                    ) => {}
-                                }
-                            });
-                        }
-                        continue;
-                    }
-
-                    if !matches!(pkt.first().map(|b| b >> 4), Some(4 | 6)) {
-                        continue;
-                    }
+            for pkt in pkt_batch.drain(..) {
+                // Hot-path shortcut: IPv4/IPv6 TCP frames bypass UDP header inspection completely.
+                if is_fast_tcp_packet(&pkt) {
                     match tcp_in_tx.try_send(pkt) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -717,8 +692,153 @@ pub async fn run_tun_pipeline_with_app_bypass(
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             let _ = in_stop_tx.send(true);
-                            break;
+                            break 'demux;
                         }
+                    }
+                    continue;
+                }
+
+                if let Some(udp) = inspect_inbound_udp(&pkt) {
+                    let src_addr = SocketAddr::new(udp.src_ip, udp.src_port);
+                    let dst_addr = SocketAddr::new(udp.dst_ip, udp.dst_port);
+
+                    // 1. UDP/53 DNS -> bounded DoH handler synthesizing raw IP+UDP reply onto outbound_tx
+                    if udp.dst_port == 53 {
+                        let Ok(permit) = in_dns_slots.clone().try_acquire_owned() else {
+                            continue;
+                        };
+                        let query = udp.payload.to_vec();
+                        let dns_ctx = in_ctx.clone();
+                        let rdns = Arc::clone(&in_rdns);
+                        let reply_out_tx = in_outbound_tx.clone();
+                        let mut dns_stop = in_stop_root.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            tokio::select! {
+                                biased;
+                                _ = wait_shutdown(&mut dns_stop) => {}
+                                res = tokio::time::timeout(
+                                    Duration::from_secs(5),
+                                    dns_ctx.dns.resolve_wire_query(&query, dns_ctx.config.block_quic),
+                                ) => {
+                                    match res {
+                                        Ok(Ok((resp, meta))) => {
+                                            if let Some((domain, ips)) = meta {
+                                                for ip in ips {
+                                                    rdns.insert(ip, domain.clone());
+                                                }
+                                            }
+                                            let max_udp = max_dns_udp_payload_for_mtu(clamped_mtu, dst_addr.is_ipv4());
+                                            let wire = if resp.len() > max_udp {
+                                                build_truncated_dns_reply(&query, &resp)
+                                            } else {
+                                                resp
+                                            };
+                                            if let Some(reply_pkt) = build_udp_packet(dst_addr, src_addr, &wire) {
+                                                tokio::select! {
+                                                    biased;
+                                                    _ = wait_shutdown(&mut dns_stop) => {}
+                                                    _ = reply_out_tx.send(reply_pkt) => {}
+                                                }
+                                            }
+                                        }
+                                        Ok(Err(e)) => {
+                                            debug!(error = %e, "TUN DNS wire query failed");
+                                        }
+                                        Err(_) => {
+                                            debug!("TUN UDP/53 DNS wire query timed out (5s)");
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                        continue;
+                    }
+
+                    // 2. UDP/443 QUIC block (exempting RFC 5389 STUN and STUN-authenticated TURN/DTLS/SRTP flows)
+                    let icmp_reject =
+                        emit_quic_icmp_reject.then_some((&quic_icmp_limiter, &in_outbound_tx));
+                    if should_drop_inbound_quic(
+                        &pkt,
+                        &udp,
+                        src_addr,
+                        dst_addr,
+                        &in_ctx,
+                        &in_rdns,
+                        &in_stats,
+                        &in_events,
+                        &mut stun_flows,
+                        &mut app_bypass_cache,
+                        icmp_reject,
+                        in_app_bypass.as_ref(),
+                    ) {
+                        continue;
+                    }
+
+                    // 3. Direct Cone-NAT UDP relay: synchronous non-blocking fast path inline;
+                    //    socket bind / WouldBlock slow paths run on bounded spawned tasks so
+                    //    UDP bursts never stall DNS or TCP demuxing.
+                    if let UdpFastPath::NeedsSlowPath(existing) = try_forward_udp_fast(
+                        udp.payload,
+                        src_addr,
+                        dst_addr,
+                        &in_udp_nat,
+                        &in_udp_lru_seq,
+                        &in_ctx,
+                        &in_stats,
+                        max_udp_flows,
+                    ) {
+                        let Ok(permit) = in_udp_slow_slots.clone().try_acquire_owned() else {
+                            in_stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        };
+                        let payload = udp.payload.to_vec();
+                        let nat = Arc::clone(&in_udp_nat);
+                        let lru_seq = Arc::clone(&in_udp_lru_seq);
+                        let reply_out_tx = in_outbound_tx.clone();
+                        let udp_ctx = in_ctx.clone();
+                        let udp_stats = Arc::clone(&in_stats);
+                        let udp_stop_root = in_stop_root.clone();
+                        let mut udp_stop = in_stop_root.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            tokio::select! {
+                                biased;
+                                _ = wait_shutdown(&mut udp_stop) => {}
+                                _ = forward_udp_cone_nat_slow(
+                                    payload,
+                                    src_addr,
+                                    dst_addr,
+                                    existing,
+                                    nat,
+                                    lru_seq,
+                                    reply_out_tx,
+                                    udp_ctx,
+                                    udp_stats,
+                                    udp_stop_root,
+                                    clamped_mtu,
+                                    max_udp_flows,
+                                    udp_socket_buf_bytes,
+                                ) => {}
+                            }
+                        });
+                    }
+                    continue;
+                }
+
+                if !matches!(pkt.first().map(|b| b >> 4), Some(4 | 6)) {
+                    continue;
+                }
+                match tcp_in_tx.try_send(pkt) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        // Never block `tun_to_stack` on TCP backpressure: TCP retransmits,
+                        // whereas blocking here freezes DNS and UDP across the entire OS.
+                        in_stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        let _ = in_stop_tx.send(true);
+                        break 'demux;
                     }
                 }
             }
@@ -735,6 +855,8 @@ pub async fn run_tun_pipeline_with_app_bypass(
     let tcp_stage_tracker = Arc::clone(&observed_stage);
     let tcp_app_bypass = app_bypass;
     let tcp_relay_buf_size = profile.tcp_relay_buf_size;
+    let tcp_recv_buf_size = profile.tcp_recv_buffer_size as usize;
+    let tcp_send_buf_size = profile.tcp_send_buffer_size as usize;
     let tcp_stop_root = internal_stop_rx.clone();
     let mut stop_tcp = internal_stop_rx.clone();
     let tcp_stop_tx = internal_stop_tx.clone();
@@ -806,32 +928,52 @@ pub async fn run_tun_pipeline_with_app_bypass(
                     biased;
                     _ = wait_shutdown(&mut conn_stop) => {}
                     _ = async {
-                        let bypass_dpi = conn_app_bypass
-                            .as_ref()
-                            .is_some_and(|hook| hook.should_bypass(src.ip(), src.port(), false));
                         let known_host = rdns.lookup(dst.ip());
-                        let upstream_res = match conn_ctx.connect_upstream_addr(dst).await {
-                            Ok(remote) => Ok((remote, dst)),
-                            Err(primary_err) => {
-                                // On IPv4-only networks, cached IPv6 addresses from before
-                                // tunnel start fail with ENETUNREACH after smoltcp has
-                                // already accepted the local TCP SYN. Rescue over IPv4.
-                                if dst.is_ipv6() {
-                                    if let Some(host) = known_host.as_deref() {
-                                        match resolve_and_connect_ipv4(&conn_ctx, host, dst.port()).await {
-                                            Some(pair) => Ok(pair),
-                                            None => Err(primary_err),
+                        let bypass_fut = async {
+                            if let Some(hook) = conn_app_bypass {
+                                let src_ip = src.ip();
+                                let src_port = src.port();
+                                tokio::task::spawn_blocking(move || {
+                                    hook.should_bypass(src_ip, src_port, false)
+                                })
+                                .await
+                                .unwrap_or(false)
+                            } else {
+                                false
+                            }
+                        };
+                        let connect_fut = async {
+                            match conn_ctx.connect_upstream_addr(dst).await {
+                                Ok(remote) => Ok((remote, dst)),
+                                Err(primary_err) => {
+                                    // On IPv4-only networks, cached IPv6 addresses from before
+                                    // tunnel start fail with ENETUNREACH after smoltcp has
+                                    // already accepted the local TCP SYN. Rescue over IPv4.
+                                    if dst.is_ipv6() {
+                                        if let Some(host) = known_host.as_deref() {
+                                            match resolve_and_connect_ipv4(&conn_ctx, host, dst.port())
+                                                .await
+                                            {
+                                                Some(pair) => Ok(pair),
+                                                None => Err(primary_err),
+                                            }
+                                        } else {
+                                            Err(primary_err)
                                         }
                                     } else {
                                         Err(primary_err)
                                     }
-                                } else {
-                                    Err(primary_err)
                                 }
                             }
                         };
+                        let (bypass_dpi, upstream_res) = tokio::join!(bypass_fut, connect_fut);
                         match upstream_res {
                             Ok((remote, effective_dst)) => {
+                                tune_upstream_tcp_socket(
+                                    &remote,
+                                    tcp_recv_buf_size,
+                                    tcp_send_buf_size,
+                                );
                                 if bypass_dpi {
                                     debug!(%src, %effective_dst, host = ?known_host, "TUN TCP passthrough (app bypassed)");
                                     if let Err(e) = relay_tcp_passthrough(
@@ -963,14 +1105,64 @@ pub async fn run_tun_pipeline_with_app_bypass(
     }
 }
 
-struct PassthroughCountingStream {
+struct PassthroughCountingStream<'a> {
     inner: tokio::net::TcpStream,
-    telemetry: Arc<EngineTelemetry>,
-    started: Instant,
-    last_activity_ms: Arc<AtomicU64>,
+    telemetry: &'a EngineTelemetry,
+    active: &'a AtomicBool,
+    batch_bytes: u64,
+    pending_rx: u64,
+    pending_tx: u64,
 }
 
-impl AsyncRead for PassthroughCountingStream {
+impl<'a> PassthroughCountingStream<'a> {
+    fn new(
+        inner: tokio::net::TcpStream,
+        telemetry: &'a EngineTelemetry,
+        active: &'a AtomicBool,
+        batch_bytes: u64,
+    ) -> Self {
+        Self {
+            inner,
+            telemetry,
+            active,
+            batch_bytes,
+            pending_rx: 0,
+            pending_tx: 0,
+        }
+    }
+
+    #[inline]
+    fn touch_activity(&self) {
+        if !self.active.load(Ordering::Relaxed) {
+            self.active.store(true, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn flush_rx(&mut self) {
+        if self.pending_rx > 0 {
+            let n = std::mem::take(&mut self.pending_rx);
+            self.telemetry.bytes_rx.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn flush_tx(&mut self) {
+        if self.pending_tx > 0 {
+            let n = std::mem::take(&mut self.pending_tx);
+            self.telemetry.bytes_tx.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for PassthroughCountingStream<'_> {
+    fn drop(&mut self) {
+        self.flush_rx();
+        self.flush_tx();
+    }
+}
+
+impl AsyncRead for PassthroughCountingStream<'_> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
@@ -979,22 +1171,28 @@ impl AsyncRead for PassthroughCountingStream {
         let this = self.get_mut();
         let before = buf.filled().len();
         let poll = Pin::new(&mut this.inner).poll_read(cx, buf);
-        if let Poll::Ready(Ok(())) = &poll {
-            let read_bytes = buf.filled().len().saturating_sub(before);
-            if read_bytes > 0 {
-                this.telemetry
-                    .bytes_rx
-                    .fetch_add(read_bytes as u64, Ordering::Relaxed);
-                let elapsed_ms =
-                    u64::try_from(this.started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                this.last_activity_ms.store(elapsed_ms, Ordering::Relaxed);
+        match &poll {
+            Poll::Ready(Ok(())) => {
+                let read_bytes = buf.filled().len().saturating_sub(before);
+                if read_bytes > 0 {
+                    this.touch_activity();
+                    this.pending_rx += read_bytes as u64;
+                    if this.pending_rx >= this.batch_bytes {
+                        this.flush_rx();
+                    }
+                } else {
+                    this.flush_rx();
+                }
+            }
+            Poll::Pending | Poll::Ready(Err(_)) => {
+                this.flush_rx();
             }
         }
         poll
     }
 }
 
-impl AsyncWrite for PassthroughCountingStream {
+impl AsyncWrite for PassthroughCountingStream<'_> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
@@ -1002,25 +1200,31 @@ impl AsyncWrite for PassthroughCountingStream {
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
         let poll = Pin::new(&mut this.inner).poll_write(cx, buf);
-        if let Poll::Ready(Ok(n)) = &poll {
-            if *n > 0 {
-                this.telemetry
-                    .bytes_tx
-                    .fetch_add(*n as u64, Ordering::Relaxed);
-                let elapsed_ms =
-                    u64::try_from(this.started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                this.last_activity_ms.store(elapsed_ms, Ordering::Relaxed);
+        match &poll {
+            Poll::Ready(Ok(n)) if *n > 0 => {
+                this.touch_activity();
+                this.pending_tx += *n as u64;
+                if this.pending_tx >= this.batch_bytes {
+                    this.flush_tx();
+                }
+            }
+            Poll::Pending | Poll::Ready(Ok(_)) | Poll::Ready(Err(_)) => {
+                this.flush_tx();
             }
         }
         poll
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        let this = self.get_mut();
+        this.flush_tx();
+        Pin::new(&mut this.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        let this = self.get_mut();
+        this.flush_tx();
+        Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
 
@@ -1048,31 +1252,26 @@ async fn relay_tcp_passthrough(
         .fetch_add(1, Ordering::Relaxed);
     let _conn_guard = TelemetryConnGuard(Arc::clone(&ctx.telemetry));
 
-    let started = Instant::now();
-    let last_activity_ms = Arc::new(AtomicU64::new(0));
-    let mut counted_remote = PassthroughCountingStream {
-        inner: remote,
-        telemetry: Arc::clone(&ctx.telemetry),
-        started,
-        last_activity_ms: Arc::clone(&last_activity_ms),
-    };
+    let copy_buf = passthrough_copy_buf_size(buf_size);
+    let active = AtomicBool::new(false);
+    let mut counted_remote =
+        PassthroughCountingStream::new(remote, &ctx.telemetry, &active, copy_buf as u64);
 
     let idle_watcher = async {
-        let timeout_ms = u64::try_from(PASSTHROUGH_IDLE_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
+        let mut last_active = Instant::now();
         let mut interval = tokio::time::interval(Duration::from_secs(15));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         interval.tick().await;
         loop {
             interval.tick().await;
-            let now_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-            let last_ms = last_activity_ms.load(Ordering::Relaxed);
-            if now_ms.saturating_sub(last_ms) >= timeout_ms {
+            if active.swap(false, Ordering::Relaxed) {
+                last_active = Instant::now();
+            } else if last_active.elapsed() >= PASSTHROUGH_IDLE_TIMEOUT {
                 break;
             }
         }
     };
 
-    let copy_buf = buf_size.clamp(16 * 1024, 128 * 1024);
     tokio::select! {
         biased;
         res = tokio::io::copy_bidirectional_with_sizes(&mut client, &mut counted_remote, copy_buf, copy_buf) => {
@@ -1276,46 +1475,51 @@ fn try_forward_udp_fast(
     }
 
     let key = (src_addr, dst_addr.is_ipv4());
-    let existing = {
+    let fatal_evict = {
         let guard = nat
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.get(&key).map(|entry| {
-            (
-                Arc::clone(&entry.socket),
-                Arc::clone(&entry.last_active_secs),
-                Arc::clone(&entry.last_seq),
-            )
-        })
+        let Some(entry) = guard.get(&key) else {
+            if max_udp_flows == 0 {
+                return UdpFastPath::Done;
+            }
+            return UdpFastPath::NeedsSlowPath(None);
+        };
+
+        // Issue the non-blocking send under the shared read lock to avoid 3x Arc::clone + 3x
+        // Arc::drop atomic refcount ops per UDP datagram on the hot path.
+        match entry.socket.try_send_to(payload, dst_addr) {
+            Ok(_) => {
+                let now = now_secs();
+                if entry.last_active_secs.load(Ordering::Relaxed) != now {
+                    entry.last_active_secs.store(now, Ordering::Relaxed);
+                }
+                entry.last_seq.store(
+                    lru_seq.fetch_add(1, Ordering::Relaxed) + 1,
+                    Ordering::Relaxed,
+                );
+                ctx.add_udp_bytes(payload.len() as u64, 0);
+                return UdpFastPath::Done;
+            }
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                return UdpFastPath::NeedsSlowPath(Some((
+                    Arc::clone(&entry.socket),
+                    Arc::clone(&entry.last_active_secs),
+                    Arc::clone(&entry.last_seq),
+                )));
+            }
+            Err(e) if is_fatal_udp_send_error(&e) => {
+                debug!(%dst_addr, error = %e, "evicting dead UDP NAT entry after fatal send error");
+                Some(Arc::clone(&entry.socket))
+            }
+            Err(_) => return UdpFastPath::Done,
+        }
     };
 
-    let Some((outbound, last_active_secs, last_seq)) = existing else {
-        if max_udp_flows == 0 {
-            return UdpFastPath::Done;
-        }
-        return UdpFastPath::NeedsSlowPath(None);
-    };
-
-    match outbound.try_send_to(payload, dst_addr) {
-        Ok(_) => {
-            last_active_secs.store(now_secs(), Ordering::Relaxed);
-            last_seq.store(
-                lru_seq.fetch_add(1, Ordering::Relaxed) + 1,
-                Ordering::Relaxed,
-            );
-            ctx.add_udp_bytes(payload.len() as u64, 0);
-            UdpFastPath::Done
-        }
-        Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-            UdpFastPath::NeedsSlowPath(Some((outbound, last_active_secs, last_seq)))
-        }
-        Err(e) if is_fatal_udp_send_error(&e) => {
-            debug!(%dst_addr, error = %e, "evicting dead UDP NAT entry after fatal send error");
-            evict_udp_nat_entry(nat, key, &outbound, stats, ctx);
-            UdpFastPath::Done
-        }
-        Err(_) => UdpFastPath::Done,
+    if let Some(outbound) = fatal_evict {
+        evict_udp_nat_entry(nat, key, &outbound, stats, ctx);
     }
+    UdpFastPath::Done
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2338,5 +2542,85 @@ mod tests {
         stop_tx.send(true).unwrap();
         pipeline.await.unwrap().unwrap();
         assert_eq!(ctx.telemetry.active_connections.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn passthrough_copy_buf_preserves_desktop_256k_and_bounds_extremes() {
+        assert_eq!(
+            passthrough_copy_buf_size(TunProfile::DESKTOP.tcp_relay_buf_size),
+            256 * 1024
+        );
+        assert_eq!(
+            passthrough_copy_buf_size(TunProfile::STANDARD.tcp_relay_buf_size),
+            32 * 1024
+        );
+        assert_eq!(
+            passthrough_copy_buf_size(TunProfile::LOW_MEMORY.tcp_relay_buf_size),
+            16 * 1024
+        );
+        assert_eq!(passthrough_copy_buf_size(0), MIN_PASSTHROUGH_COPY_BUF);
+        assert_eq!(
+            passthrough_copy_buf_size(4 * 1024 * 1024),
+            MAX_PASSTHROUGH_COPY_BUF
+        );
+    }
+
+    #[test]
+    fn fast_tcp_packet_classifier_distinguishes_tcp_from_udp_and_garbage() {
+        let mut ipv4_tcp = vec![0u8; 40];
+        ipv4_tcp[0] = 0x45;
+        ipv4_tcp[9] = 6;
+        assert!(is_fast_tcp_packet(&ipv4_tcp));
+
+        let mut ipv4_udp = ipv4_tcp.clone();
+        ipv4_udp[9] = 17;
+        assert!(!is_fast_tcp_packet(&ipv4_udp));
+
+        let mut ipv6_tcp = vec![0u8; 60];
+        ipv6_tcp[0] = 0x60;
+        ipv6_tcp[6] = 6;
+        assert!(is_fast_tcp_packet(&ipv6_tcp));
+
+        let mut ipv6_udp = ipv6_tcp.clone();
+        ipv6_udp[6] = 17;
+        assert!(!is_fast_tcp_packet(&ipv6_udp));
+
+        assert!(!is_fast_tcp_packet(&[]));
+        assert!(!is_fast_tcp_packet(&[0x45; 10]));
+        assert!(!is_fast_tcp_packet(&[0x60; 20]));
+    }
+
+    #[test]
+    fn udp_app_bypass_cache_deduplicates_hook_calls_and_enforces_ttl_and_cap() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_hook = Arc::clone(&calls);
+        let hook = AppBypassHook::new(move |_ip, port, is_udp| {
+            calls_hook.fetch_add(1, Ordering::Relaxed);
+            is_udp && port == 60000
+        });
+
+        let mut cache = UdpAppBypassCache::new();
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        // Repeated UDP/443 QUIC packets on the same flow hit cache without re-invoking OS lookup.
+        for _ in 0..64 {
+            assert!(cache.should_bypass(ip, 60000, 100, &hook));
+            assert!(!cache.should_bypass(ip, 60001, 100, &hook));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+        // Within TTL (100 + 4 < 105): still cached.
+        assert!(cache.should_bypass(ip, 60000, 104, &hook));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+        // At TTL expiry (100 + 5 == 105): refreshes once.
+        assert!(cache.should_bypass(ip, 60000, 100 + UDP_APP_BYPASS_CACHE_TTL_SECS, &hook));
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+
+        // Capacity stays strictly bounded at UDP_APP_BYPASS_CACHE_MAX_ENTRIES.
+        for idx in 0..(UDP_APP_BYPASS_CACHE_MAX_ENTRIES + 32) {
+            let _ = cache.should_bypass(ip, 10_000 + idx as u16, 200 + (idx % 3) as u64, &hook);
+        }
+        assert_eq!(cache.entries.len(), UDP_APP_BYPASS_CACHE_MAX_ENTRIES);
     }
 }

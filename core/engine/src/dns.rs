@@ -96,7 +96,7 @@ enum DohError {
 
 type DohAttemptResult = (usize, String, std::result::Result<DnsOutcome, DohError>);
 
-fn build_doh_http_client() -> Result<Client> {
+fn doh_http_client_builder() -> reqwest::ClientBuilder {
     // `.no_proxy()` prevents vdpi from routing its own DoH traffic through itself
     // when HTTP_PROXY / HTTPS_PROXY environment variables are active.
     // HTTP/2 + TCP keepalives detect half-open mobile/NAT sockets promptly instead of
@@ -112,8 +112,92 @@ fn build_doh_http_client() -> Result<Client> {
         .http2_keep_alive_interval(Some(Duration::from_secs(20)))
         .http2_keep_alive_timeout(Duration::from_secs(5))
         .http2_keep_alive_while_idle(true)
+}
+
+fn build_doh_http_client() -> Result<Client> {
+    doh_http_client_builder()
         .build()
         .context("failed to build DoH HTTP client")
+}
+
+fn build_pinned_doh_http_client(
+    host: &str,
+    addrs: &[SocketAddr],
+    #[cfg(test)] extra_root_cert_der: Option<&[u8]>,
+) -> Result<Client> {
+    // Disable redirects so a custom DoH server can never redirect onto an unbootstrapped
+    // hostname and trigger an OS GaiResolver lookup inside TUN mode.
+    #[cfg_attr(not(test), allow(unused_mut))]
+    let mut builder = doh_http_client_builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(host, addrs);
+    #[cfg(test)]
+    if let Some(der) = extra_root_cert_der {
+        let cert = reqwest::Certificate::from_der(der)
+            .context("failed to parse test DoH root certificate")?;
+        builder = builder.add_root_certificate(cert);
+    }
+    builder
+        .build()
+        .context("failed to build bootstrapped DoH HTTP client")
+}
+
+struct CustomHostnameDohState {
+    ips: Vec<IpAddr>,
+    expires_at: Instant,
+    pinned_http: Option<Client>,
+    last_failed_at: Option<Instant>,
+}
+
+struct CustomHostnameDoh {
+    request_url: String,
+    host: String,
+    port: u16,
+    host_header: String,
+    path_and_query: String,
+    state: RwLock<CustomHostnameDohState>,
+    bootstrap_lock: tokio::sync::Mutex<()>,
+}
+
+impl CustomHostnameDoh {
+    fn new(
+        request_url: String,
+        host: String,
+        port: u16,
+        host_header: String,
+        path_and_query: String,
+    ) -> Self {
+        Self {
+            request_url,
+            host,
+            port,
+            host_header,
+            path_and_query,
+            state: RwLock::new(CustomHostnameDohState {
+                ips: Vec::new(),
+                expires_at: Instant::now(),
+                pinned_http: None,
+                last_failed_at: None,
+            }),
+            bootstrap_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    async fn clear(&self) {
+        let mut guard = self.state.write().await;
+        guard.ips.clear();
+        guard.expires_at = Instant::now();
+        guard.pinned_http = None;
+        guard.last_failed_at = None;
+    }
+
+    async fn record_transport_failure(&self) {
+        let mut guard = self.state.write().await;
+        guard.ips.clear();
+        guard.expires_at = Instant::now();
+        guard.pinned_http = None;
+        guard.last_failed_at = Some(Instant::now());
+    }
 }
 
 #[derive(Clone)]
@@ -123,6 +207,7 @@ pub struct DnsResolver {
     disable_system_dns_fallback: bool,
     udp_dns_servers: Vec<SocketAddr>,
     doh_endpoints: Vec<String>,
+    custom_doh: Option<Arc<CustomHostnameDoh>>,
     preferred_doh_idx: Arc<AtomicUsize>,
     preferred_udp_idx: Arc<AtomicUsize>,
     doh_backoff_until_ms: Arc<AtomicU64>,
@@ -132,6 +217,8 @@ pub struct DnsResolver {
     outbound_binder: Option<Arc<dyn OutboundBinder>>,
     bound_tls_connector: Option<TlsConnector>,
     cache: Arc<RwLock<HashMap<String, CacheEntry>>>,
+    #[cfg(test)]
+    test_root_cert_der: Option<Vec<u8>>,
 }
 
 impl DnsResolver {
@@ -183,6 +270,18 @@ impl DnsResolver {
             require_ip_literal,
             ipv4_only,
         );
+        let custom_doh = parse_doh_url_validated(dns_addr.trim())
+            .ok()
+            .and_then(|parsed| match parsed.host {
+                DohHost::Domain(host) => Some(Arc::new(CustomHostnameDoh::new(
+                    parsed.request_url,
+                    host,
+                    parsed.port,
+                    parsed.host_header,
+                    parsed.path_and_query,
+                ))),
+                DohHost::Ip(_) => None,
+            });
 
         Ok(Self {
             enable_doh,
@@ -190,6 +289,7 @@ impl DnsResolver {
             disable_system_dns_fallback,
             udp_dns_servers,
             doh_endpoints,
+            custom_doh,
             preferred_doh_idx: Arc::new(AtomicUsize::new(0)),
             preferred_udp_idx: Arc::new(AtomicUsize::new(0)),
             doh_backoff_until_ms: Arc::new(AtomicU64::new(0)),
@@ -199,6 +299,8 @@ impl DnsResolver {
             outbound_binder,
             bound_tls_connector,
             cache: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(test)]
+            test_root_cert_der: None,
         })
     }
 
@@ -254,6 +356,9 @@ impl DnsResolver {
     pub async fn clear_cache(&self) {
         self.cache.write().await.clear();
         self.clear_doh_backoff();
+        if let Some(custom) = &self.custom_doh {
+            custom.clear().await;
+        }
         // Rebuild the pooled HTTP/2 client on route change / wake so dead half-open
         // connections from the previous network path are evicted immediately.
         if let Ok(fresh) = build_doh_http_client() {
@@ -817,30 +922,329 @@ impl DnsResolver {
         });
     }
 
+    async fn bootstrap_custom_doh_host(
+        &self,
+        custom: &CustomHostnameDoh,
+    ) -> Result<(Vec<IpAddr>, Duration)> {
+        let mut ips = Vec::new();
+        let mut min_ttl = Duration::from_secs(300);
+
+        // Tier 1: Bootstrap via IP-literal DoH endpoints ONLY (never via custom_doh itself
+        // and never via OS DNS) so hostname-based DoH cannot deadlock on itself.
+        if let Ok(wire_a) = encode_dns_query(&custom.host, QTYPE_A) {
+            if self.ipv4_only {
+                if let Ok(DnsOutcome::Records(v4, ttl)) = self
+                    .query_doh_ring_type(&custom.host, &wire_a, QTYPE_A, true)
+                    .await
+                {
+                    if !v4.is_empty() {
+                        min_ttl = min_ttl.min(ttl);
+                        ips.extend(v4);
+                    }
+                }
+            } else if let Ok(wire_aaaa) = encode_dns_query(&custom.host, QTYPE_AAAA) {
+                let (v4_res, v6_res) = tokio::join!(
+                    self.query_doh_ring_type(&custom.host, &wire_a, QTYPE_A, true),
+                    tokio::time::timeout(
+                        Duration::from_millis(700),
+                        self.query_doh_ring_type(&custom.host, &wire_aaaa, QTYPE_AAAA, true)
+                    )
+                );
+                if let Ok(DnsOutcome::Records(v4, ttl)) = v4_res {
+                    if !v4.is_empty() {
+                        min_ttl = min_ttl.min(ttl);
+                        ips.extend(v4);
+                    }
+                }
+                if let Ok(Ok(DnsOutcome::Records(v6, ttl))) = v6_res {
+                    if !v6.is_empty() {
+                        min_ttl = min_ttl.min(ttl);
+                        for ip in v6 {
+                            if !ips.contains(&ip) {
+                                ips.push(ip);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Tier 2: IP-literal UDP DNS fallback (still zero OS DNS recursion).
+        if ips.is_empty() {
+            if let Ok(resolved) = self.resolve_via_udp(&custom.host).await {
+                if let DnsOutcome::Records(udp_ips, ttl) = resolved.outcome {
+                    if !udp_ips.is_empty() {
+                        min_ttl = min_ttl.min(ttl);
+                        ips = udp_ips;
+                    }
+                }
+            }
+        }
+
+        // Tier 3: OS resolver fallback ONLY when system DNS fallback is permitted (proxy mode).
+        if ips.is_empty() && !self.is_system_dns_disabled() {
+            if let Ok(sys_ips) = self.resolve_via_system(&custom.host, true).await {
+                if !sys_ips.is_empty() {
+                    min_ttl = Duration::from_secs(60);
+                    ips = sys_ips;
+                }
+            }
+        }
+
+        if self.ipv4_only {
+            ips.retain(IpAddr::is_ipv4);
+        }
+        ips.retain(|ip| validate_dns_ip_addr(*ip).is_ok());
+
+        if ips.is_empty() {
+            bail!(
+                "failed to bootstrap custom DoH host '{}' via bootstrap DNS",
+                custom.host
+            );
+        }
+
+        Ok((
+            ips,
+            min_ttl.clamp(Duration::from_secs(60), Duration::from_secs(3600)),
+        ))
+    }
+
+    async fn ensure_custom_doh_bootstrapped(
+        &self,
+        custom: &CustomHostnameDoh,
+    ) -> Result<(Vec<IpAddr>, Option<Client>)> {
+        {
+            let guard = custom.state.read().await;
+            if !guard.ips.is_empty() && Instant::now() < guard.expires_at {
+                return Ok((guard.ips.clone(), guard.pinned_http.clone()));
+            }
+            if guard
+                .last_failed_at
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(DOH_BACKOFF_SECS))
+            {
+                bail!("custom DoH '{}' in short failure cooldown", custom.host);
+            }
+        }
+
+        let _singleflight = custom.bootstrap_lock.lock().await;
+        {
+            let guard = custom.state.read().await;
+            if !guard.ips.is_empty() && Instant::now() < guard.expires_at {
+                return Ok((guard.ips.clone(), guard.pinned_http.clone()));
+            }
+            if guard
+                .last_failed_at
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(DOH_BACKOFF_SECS))
+            {
+                bail!("custom DoH '{}' in short failure cooldown", custom.host);
+            }
+        }
+
+        let (ips, ttl) = match self.bootstrap_custom_doh_host(custom).await {
+            Ok(res) => res,
+            Err(err) => {
+                custom.record_transport_failure().await;
+                return Err(err);
+            }
+        };
+
+        let pinned_http = if self.outbound_binder.is_none() {
+            let addrs: Vec<SocketAddr> = ips
+                .iter()
+                .map(|ip| SocketAddr::new(*ip, custom.port))
+                .collect();
+            Some(build_pinned_doh_http_client(
+                &custom.host,
+                &addrs,
+                #[cfg(test)]
+                self.test_root_cert_der.as_deref(),
+            )?)
+        } else {
+            None
+        };
+
+        debug!(
+            host = %custom.host,
+            ips = ?ips,
+            ttl_secs = ttl.as_secs(),
+            "bootstrapped custom DoH hostname"
+        );
+
+        let mut guard = custom.state.write().await;
+        guard.ips = ips.clone();
+        guard.expires_at = Instant::now() + ttl;
+        guard.pinned_http = pinned_http.clone();
+        guard.last_failed_at = None;
+        Ok((ips, pinned_http))
+    }
+
+    async fn send_custom_doh_wire(
+        &self,
+        custom: &CustomHostnameDoh,
+        wire_query: &[u8],
+    ) -> Result<Vec<u8>> {
+        let (ips, pinned_http) = self.ensure_custom_doh_bootstrapped(custom).await?;
+
+        let result = if let (Some(binder), Some(connector)) = (
+            self.outbound_binder.as_deref(),
+            self.bound_tls_connector.as_ref(),
+        ) {
+            let server_name = ServerName::try_from(custom.host.clone())
+                .map_err(|_| anyhow!("invalid TLS SNI hostname '{}'", custom.host))?;
+            let mut last_err = None;
+            let mut ok_bytes = None;
+            for ip in ips.iter().take(2) {
+                let target = BoundDohTarget {
+                    addr: SocketAddr::new(*ip, custom.port),
+                    host_header: custom.host_header.clone(),
+                    path: custom.path_and_query.clone(),
+                    server_name: server_name.clone(),
+                };
+                match send_doh_bound_tls_target(
+                    binder,
+                    connector,
+                    &target,
+                    &custom.request_url,
+                    wire_query,
+                )
+                .await
+                {
+                    Ok(bytes) => {
+                        ok_bytes = Some(bytes);
+                        break;
+                    }
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            ok_bytes.ok_or_else(|| {
+                last_err.unwrap_or_else(|| anyhow!("bound custom DoH failed for {}", custom.host))
+            })
+        } else {
+            let client = match pinned_http {
+                Some(c) => c,
+                None => {
+                    let addrs: Vec<SocketAddr> = ips
+                        .iter()
+                        .map(|ip| SocketAddr::new(*ip, custom.port))
+                        .collect();
+                    build_pinned_doh_http_client(
+                        &custom.host,
+                        &addrs,
+                        #[cfg(test)]
+                        self.test_root_cert_der.as_deref(),
+                    )?
+                }
+            };
+            send_doh_request_pinned(&client, &custom.request_url, wire_query).await
+        };
+
+        if result.is_err() {
+            custom.record_transport_failure().await;
+        }
+        result
+    }
+
+    async fn query_custom_doh_type(
+        &self,
+        custom: &CustomHostnameDoh,
+        domain: &str,
+        wire_query: &[u8],
+        qtype: u16,
+    ) -> std::result::Result<DnsOutcome, DohError> {
+        let bytes = self
+            .send_custom_doh_wire(custom, wire_query)
+            .await
+            .map_err(DohError::Transport)?;
+        let outcome = classify_doh_wire_reply(&bytes, qtype, &custom.request_url)?;
+        debug!(
+            domain = %domain,
+            qtype = qtype,
+            endpoint = %custom.request_url,
+            "custom bootstrapped DoH query succeeded"
+        );
+        Ok(outcome)
+    }
+
     async fn query_doh_type(
         &self,
         domain: &str,
         qtype: u16,
     ) -> std::result::Result<DnsOutcome, DohError> {
         let wire_query = encode_dns_query(domain, qtype).map_err(DohError::Transport)?;
-        let count = self.doh_endpoints.len();
+        let mut custom_protocol_err: Option<DohError> = None;
+
+        // When a custom hostname DoH URL is configured (e.g. https://dns.nextdns.io/abc123),
+        // resolve its host via our IP-literal bootstrap ring first and connect over a pinned or
+        // socket-bound TLS channel. Never query the custom endpoint to resolve its own hostname.
+        if let Some(custom) = &self.custom_doh {
+            if !domain.eq_ignore_ascii_case(&custom.host) {
+                match self
+                    .query_custom_doh_type(custom, domain, &wire_query, qtype)
+                    .await
+                {
+                    Ok(outcome) => return Ok(outcome),
+                    Err(err @ DohError::ProtocolError { .. }) => {
+                        custom_protocol_err = Some(err);
+                    }
+                    Err(DohError::Transport(cause)) => {
+                        debug!(
+                            domain = %domain,
+                            qtype = qtype,
+                            endpoint = %custom.request_url,
+                            error = %cause,
+                            "custom hostname DoH failed; falling back to IP-literal DoH ring"
+                        );
+                    }
+                }
+            }
+        }
+
+        match self
+            .query_doh_ring_type(domain, &wire_query, qtype, self.custom_doh.is_some())
+            .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(DohError::Transport(_)) if custom_protocol_err.is_some() => {
+                Err(custom_protocol_err.unwrap())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn query_doh_ring_type(
+        &self,
+        domain: &str,
+        wire_query: &[u8],
+        qtype: u16,
+        ip_literal_only: bool,
+    ) -> std::result::Result<DnsOutcome, DohError> {
+        let eligible: Vec<usize> = self
+            .doh_endpoints
+            .iter()
+            .enumerate()
+            .filter(|(_, ep)| !ip_literal_only || is_ip_literal_doh_endpoint(ep))
+            .map(|(i, _)| i)
+            .collect();
+        let count = eligible.len();
         if count == 0 {
             return Err(DohError::Transport(anyhow!("no DoH endpoints configured")));
         }
 
         let mut protocol_err: Option<DohError> = None;
         let mut last_transport_err: Option<anyhow::Error> = None;
-        let require_ip_literal = self.is_system_dns_disabled();
+        let require_ip_literal = ip_literal_only || self.is_system_dns_disabled();
 
         // Fast-path: try the currently sticky healthy DoH endpoint first.
-        let start = self.preferred_doh_idx.load(Ordering::Relaxed) % count;
+        let pref = self.preferred_doh_idx.load(Ordering::Relaxed);
+        let start_pos = eligible.iter().position(|&idx| idx == pref).unwrap_or(0);
+        let start_idx = eligible[start_pos];
         let http = self.http_client();
         match send_doh_request(
             &http,
             self.outbound_binder.as_deref(),
             self.bound_tls_connector.as_ref(),
-            &self.doh_endpoints[start],
-            &wire_query,
+            &self.doh_endpoints[start_idx],
+            wire_query,
             qtype,
             require_ip_literal,
         )
@@ -850,7 +1254,7 @@ impl DnsResolver {
                 debug!(
                     domain = %domain,
                     qtype = qtype,
-                    endpoint = %self.doh_endpoints[start],
+                    endpoint = %self.doh_endpoints[start_idx],
                     "DoH query succeeded"
                 );
                 return Ok(parsed);
@@ -866,13 +1270,13 @@ impl DnsResolver {
         // Preferred DoH endpoint failed: race remaining endpoints with bounded concurrency
         // (at most MAX_DOH_FAILOVER_CONCURRENCY = 2 in flight per query) so concurrent bursts
         // cannot exhaust tight mobile FD limits (e.g. iOS 256 RLIMIT_NOFILE -> EMFILE).
-        let mut remaining_indices = (1..count).map(|offset| (start + offset) % count);
+        let mut remaining_indices = (1..count).map(|offset| eligible[(start_pos + offset) % count]);
         let mut join_set: tokio::task::JoinSet<DohAttemptResult> = tokio::task::JoinSet::new();
         for _ in 0..MAX_DOH_FAILOVER_CONCURRENCY {
             let Some(idx) = remaining_indices.next() else {
                 break;
             };
-            self.spawn_doh_attempt(&mut join_set, idx, &wire_query, qtype);
+            self.spawn_doh_attempt(&mut join_set, idx, wire_query, qtype);
         }
 
         while let Some(joined) = join_set.join_next().await {
@@ -898,7 +1302,7 @@ impl DnsResolver {
                 }
             }
             if let Some(next_idx) = remaining_indices.next() {
-                self.spawn_doh_attempt(&mut join_set, next_idx, &wire_query, qtype);
+                self.spawn_doh_attempt(&mut join_set, next_idx, wire_query, qtype);
             }
         }
 
@@ -1197,20 +1601,45 @@ impl DnsResolver {
     }
 
     async fn query_doh_raw(&self, wire_query: &[u8]) -> Result<Vec<u8>> {
-        let count = self.doh_endpoints.len();
-        if count == 0 {
-            bail!("no DoH endpoints configured");
-        }
         let mut normalized_query = wire_query.to_vec();
         if normalized_query.len() >= 2 {
             normalized_query[0] = 0;
             normalized_query[1] = 0;
         }
-        let start = self.preferred_doh_idx.load(Ordering::Relaxed) % count;
-        let require_ip_literal = self.is_system_dns_disabled();
+
+        if let Some(custom) = &self.custom_doh {
+            let queries_self = parse_dns_question(wire_query).is_ok_and(|q| {
+                q.qname
+                    .trim_end_matches('.')
+                    .eq_ignore_ascii_case(&custom.host)
+            });
+            if !queries_self {
+                if let Ok(bytes) = self.send_custom_doh_wire(custom, &normalized_query).await {
+                    if is_valid_raw_dns_reply(&bytes, false) {
+                        return Ok(bytes);
+                    }
+                }
+            }
+        }
+
+        let ip_literal_only = self.custom_doh.is_some();
+        let eligible: Vec<usize> = self
+            .doh_endpoints
+            .iter()
+            .enumerate()
+            .filter(|(_, ep)| !ip_literal_only || is_ip_literal_doh_endpoint(ep))
+            .map(|(i, _)| i)
+            .collect();
+        let count = eligible.len();
+        if count == 0 {
+            bail!("no DoH endpoints configured");
+        }
+        let pref = self.preferred_doh_idx.load(Ordering::Relaxed);
+        let start_pos = eligible.iter().position(|&idx| idx == pref).unwrap_or(0);
+        let require_ip_literal = ip_literal_only || self.is_system_dns_disabled();
         let http = self.http_client();
         for offset in 0..count.min(3) {
-            let idx = (start + offset) % count;
+            let idx = eligible[(start_pos + offset) % count];
             let Ok(bytes) = send_doh_wire(
                 &http,
                 self.outbound_binder.as_deref(),
@@ -1575,6 +2004,285 @@ fn build_bound_tls_connector() -> Result<TlsConnector> {
     Ok(TlsConnector::from(Arc::new(cfg)))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DohHost {
+    Ip(IpAddr),
+    Domain(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedDohUrl {
+    normalized_url: String,
+    request_url: String,
+    host: DohHost,
+    port: u16,
+    host_header: String,
+    path_and_query: String,
+}
+
+fn validate_dns_ip_addr(ip: IpAddr) -> std::result::Result<(), String> {
+    match ip {
+        IpAddr::V4(v4) => {
+            if v4.is_unspecified() {
+                return Err("DNS IP cannot be 0.0.0.0".to_string());
+            }
+            if v4.is_multicast() {
+                return Err("DNS IP cannot be a multicast address".to_string());
+            }
+            if v4.is_broadcast() {
+                return Err("DNS IP cannot be a broadcast address".to_string());
+            }
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_unspecified() {
+                return Err("DNS IP cannot be ::".to_string());
+            }
+            if v6.is_multicast() {
+                return Err("DNS IP cannot be a multicast address".to_string());
+            }
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                validate_dns_ip_addr(IpAddr::V4(v4))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_doh_port(port_str: &str) -> std::result::Result<u16, String> {
+    if port_str.is_empty() || !port_str.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("Invalid port in DoH URL (must be 1-65535)".to_string());
+    }
+    let port = port_str
+        .parse::<u16>()
+        .map_err(|_| "Invalid port in DoH URL (must be 1-65535)".to_string())?;
+    if port == 0 {
+        return Err("Invalid port in DoH URL (must be 1-65535)".to_string());
+    }
+    Ok(port)
+}
+
+fn validate_doh_hostname(raw: &str) -> std::result::Result<String, String> {
+    let trimmed = raw.strip_suffix('.').unwrap_or(raw);
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.is_empty() || lower.len() > MAX_DNS_NAME_BYTES {
+        return Err("Invalid hostname in DoH URL".to_string());
+    }
+    let labels: Vec<&str> = lower.split('.').collect();
+    if labels.len() < 2 {
+        return Err("Invalid hostname in DoH URL".to_string());
+    }
+    for label in &labels {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err("Invalid hostname in DoH URL".to_string());
+        }
+    }
+    let tld = labels.last().copied().unwrap_or("");
+    if !tld.bytes().any(|b| b.is_ascii_alphabetic()) {
+        return Err("Invalid hostname or IPv4 address in DoH URL".to_string());
+    }
+    Ok(lower)
+}
+
+fn validate_doh_path_and_query(suffix: &str) -> std::result::Result<(), String> {
+    let bytes = suffix.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'%' {
+            if i + 2 >= bytes.len()
+                || !bytes[i + 1].is_ascii_hexdigit()
+                || !bytes[i + 2].is_ascii_hexdigit()
+            {
+                return Err("Invalid percent-encoding in DoH URL path".to_string());
+            }
+            i += 3;
+            continue;
+        }
+        let allowed = b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'/'
+                    | b'?'
+                    | b':'
+                    | b'@'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+            );
+        if !allowed {
+            return Err("Invalid character in DoH URL path or query".to_string());
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+fn parse_doh_url_validated(raw: &str) -> std::result::Result<ParsedDohUrl, String> {
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return Err("DoH URL must start with https://".to_string());
+    };
+    if !scheme.eq_ignore_ascii_case("https") {
+        if scheme.eq_ignore_ascii_case("http") {
+            return Err("DoH URL must use https:// (http:// is not supported)".to_string());
+        }
+        return Err("DoH URL must start with https://".to_string());
+    }
+    if rest.contains('#') {
+        return Err("DoH URL cannot contain a '#' fragment".to_string());
+    }
+    let (authority, raw_suffix) = match rest.find(['/', '?']) {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, ""),
+    };
+    if authority.is_empty() {
+        return Err("DoH URL is missing a hostname or IP".to_string());
+    }
+    if authority.contains('@') {
+        return Err("DoH URL cannot contain userinfo (@)".to_string());
+    }
+
+    let (host, explicit_port) = if let Some(after_open) = authority.strip_prefix('[') {
+        let Some(close) = after_open.find(']') else {
+            return Err("Unclosed '[' in IPv6 DoH URL".to_string());
+        };
+        let ip_str = &after_open[..close];
+        let v6: Ipv6Addr = ip_str
+            .parse()
+            .map_err(|_| "Invalid IPv6 address in DoH URL".to_string())?;
+        validate_dns_ip_addr(IpAddr::V6(v6))?;
+        let tail = &after_open[close + 1..];
+        let port = if let Some(port_str) = tail.strip_prefix(':') {
+            Some(parse_doh_port(port_str)?)
+        } else if tail.is_empty() {
+            None
+        } else {
+            return Err("Invalid characters after IPv6 address in DoH URL".to_string());
+        };
+        (DohHost::Ip(IpAddr::V6(v6)), port)
+    } else {
+        if authority.contains('[') || authority.contains(']') {
+            return Err("Invalid brackets in DoH URL host".to_string());
+        }
+        if authority.matches(':').count() > 1 {
+            return Err("Wrap IPv6 DoH hosts in [...] brackets".to_string());
+        }
+        let (host_raw, port) = match authority.split_once(':') {
+            Some((h, p)) => (h, Some(parse_doh_port(p)?)),
+            None => (authority, None),
+        };
+        if host_raw.is_empty() {
+            return Err("DoH URL is missing a hostname or IP".to_string());
+        }
+        if let Ok(v4) = host_raw.parse::<Ipv4Addr>() {
+            validate_dns_ip_addr(IpAddr::V4(v4))?;
+            (DohHost::Ip(IpAddr::V4(v4)), port)
+        } else {
+            let domain = validate_doh_hostname(host_raw)?;
+            (DohHost::Domain(domain), port)
+        }
+    };
+
+    if !raw_suffix.is_empty() {
+        validate_doh_path_and_query(raw_suffix)?;
+    }
+
+    let port = explicit_port.unwrap_or(443);
+    let host_for_url = match &host {
+        DohHost::Ip(IpAddr::V4(v4)) => v4.to_string(),
+        DohHost::Ip(IpAddr::V6(v6)) => format!("[{v6}]"),
+        DohHost::Domain(d) => d.clone(),
+    };
+    let host_header = if port == 443 {
+        host_for_url.clone()
+    } else {
+        format!("{host_for_url}:{port}")
+    };
+    let authority_normalized = match explicit_port {
+        Some(p) => format!("{host_for_url}:{p}"),
+        None => host_for_url,
+    };
+    let normalized_suffix = if raw_suffix.starts_with('?') {
+        format!("/{raw_suffix}")
+    } else {
+        raw_suffix.to_string()
+    };
+    let normalized_url = format!("https://{authority_normalized}{normalized_suffix}");
+    let path_and_query = if raw_suffix.is_empty() {
+        "/dns-query".to_string()
+    } else if raw_suffix.starts_with('?') {
+        format!("/dns-query{raw_suffix}")
+    } else {
+        raw_suffix.to_string()
+    };
+    let request_url = format!("https://{authority_normalized}{path_and_query}");
+
+    Ok(ParsedDohUrl {
+        normalized_url,
+        request_url,
+        host,
+        port,
+        host_header,
+        path_and_query,
+    })
+}
+
+/// Validates and normalizes a custom DNS server input (IPv4, IPv6, or `https://` DoH URL).
+///
+/// Returns a normalized string ready for config persistence and `DnsResolver::new*`, or a short
+/// human-friendly error suitable for inline TUI / CLI display.
+pub fn validate_custom_dns_input(raw: &str) -> std::result::Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("DNS server cannot be empty".to_string());
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err("DNS server cannot contain control characters".to_string());
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err("DNS server cannot contain whitespace".to_string());
+    }
+
+    if trimmed.contains("://") {
+        return parse_doh_url_validated(trimmed).map(|parsed| parsed.normalized_url);
+    }
+
+    let ip_opt = if trimmed.starts_with('[') || trimmed.ends_with(']') {
+        trimmed
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .and_then(|inner| inner.parse::<Ipv6Addr>().ok())
+            .map(IpAddr::V6)
+    } else {
+        trimmed.parse::<IpAddr>().ok()
+    };
+
+    match ip_opt {
+        Some(ip) => {
+            validate_dns_ip_addr(ip)?;
+            Ok(ip.to_string())
+        }
+        None => Err("Enter a valid IPv4/IPv6 address or https:// DoH URL".to_string()),
+    }
+}
+
 struct BoundDohTarget {
     addr: SocketAddr,
     host_header: String,
@@ -1583,61 +2291,14 @@ struct BoundDohTarget {
 }
 
 fn parse_bound_doh_endpoint(endpoint: &str) -> Result<BoundDohTarget> {
-    let rest = endpoint
-        .strip_prefix("https://")
-        .ok_or_else(|| anyhow!("bound DoH endpoint must use https://: {endpoint}"))?;
-    let (authority, path) = match rest.find('/') {
-        Some(idx) => (&rest[..idx], &rest[idx..]),
-        None => (rest, "/dns-query"),
+    let parsed = parse_doh_url_validated(endpoint).map_err(|msg| anyhow!("{msg}: {endpoint}"))?;
+    let DohHost::Ip(ip) = parsed.host else {
+        bail!("bound DoH requires IP-literal endpoint: {endpoint}");
     };
-    let (ip, port, host_header) = if let Some(after_open) = authority.strip_prefix('[') {
-        let close = after_open
-            .find(']')
-            .ok_or_else(|| anyhow!("invalid IPv6 bracket in DoH endpoint: {endpoint}"))?;
-        let ip_str = &after_open[..close];
-        let ip: IpAddr = ip_str
-            .parse()
-            .with_context(|| format!("invalid IPv6 literal in DoH endpoint: {endpoint}"))?;
-        let tail = &after_open[close + 1..];
-        let port = if let Some(port_str) = tail.strip_prefix(':') {
-            port_str
-                .parse::<u16>()
-                .with_context(|| format!("invalid port in DoH endpoint: {endpoint}"))?
-        } else if tail.is_empty() {
-            443
-        } else {
-            bail!("unexpected trailing characters in DoH authority: {endpoint}");
-        };
-        let host_header = if port == 443 {
-            format!("[{ip}]")
-        } else {
-            format!("[{ip}]:{port}")
-        };
-        (ip, port, host_header)
-    } else {
-        let (host_str, port) = match authority.rsplit_once(':') {
-            Some((h, p)) => (
-                h,
-                p.parse::<u16>()
-                    .with_context(|| format!("invalid port in DoH endpoint: {endpoint}"))?,
-            ),
-            None => (authority, 443),
-        };
-        let ip: IpAddr = host_str
-            .parse()
-            .with_context(|| format!("bound DoH requires IP-literal endpoint: {endpoint}"))?;
-        let host_header = if port == 443 {
-            ip.to_string()
-        } else {
-            format!("{ip}:{port}")
-        };
-        (ip, port, host_header)
-    };
-
     Ok(BoundDohTarget {
-        addr: SocketAddr::new(ip, port),
-        host_header,
-        path: path.to_string(),
+        addr: SocketAddr::new(ip, parsed.port),
+        host_header: parsed.host_header,
+        path: parsed.path_and_query,
         server_name: ServerName::from(ip),
     })
 }
@@ -1808,6 +2469,16 @@ async fn send_doh_bound_tls(
     wire_query: &[u8],
 ) -> Result<Vec<u8>> {
     let target = parse_bound_doh_endpoint(endpoint)?;
+    send_doh_bound_tls_target(binder, connector, &target, endpoint, wire_query).await
+}
+
+async fn send_doh_bound_tls_target(
+    binder: &dyn OutboundBinder,
+    connector: &TlsConnector,
+    target: &BoundDohTarget,
+    endpoint: &str,
+    wire_query: &[u8],
+) -> Result<Vec<u8>> {
     let sock = if target.addr.is_ipv4() {
         TcpSocket::new_v4()?
     } else {
@@ -1820,18 +2491,20 @@ async fn send_doh_bound_tls(
         .map_err(|_| anyhow!("bound DoH TCP connect timeout to {}", target.addr))??;
     let _ = tcp.set_nodelay(true);
 
+    let server_name = target.server_name.clone();
+    let req_head = format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/dns-message\r\nAccept: application/dns-message\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        target.path,
+        target.host_header,
+        wire_query.len()
+    );
+
     tokio::time::timeout(Duration::from_millis(2000), async move {
         let mut tls = connector
-            .connect(target.server_name, tcp)
+            .connect(server_name, tcp)
             .await
             .with_context(|| format!("bound DoH TLS handshake failed to {endpoint}"))?;
 
-        let req_head = format!(
-            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/dns-message\r\nAccept: application/dns-message\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            target.path,
-            target.host_header,
-            wire_query.len()
-        );
         tls.write_all(req_head.as_bytes()).await?;
         tls.write_all(wire_query).await?;
         tls.flush().await?;
@@ -1885,6 +2558,14 @@ async fn send_doh_wire(
     }
 }
 
+async fn send_doh_request_pinned(
+    http: &Client,
+    endpoint: &str,
+    wire_query: &[u8],
+) -> Result<Vec<u8>> {
+    send_doh_http_post(http, endpoint, wire_query).await
+}
+
 async fn send_doh_request_raw(
     http: &Client,
     endpoint: &str,
@@ -1896,6 +2577,10 @@ async fn send_doh_request_raw(
             "hostname-based DoH endpoint rejected when system DNS fallback is disabled: {endpoint}"
         );
     }
+    send_doh_http_post(http, endpoint, wire_query).await
+}
+
+async fn send_doh_http_post(http: &Client, endpoint: &str, wire_query: &[u8]) -> Result<Vec<u8>> {
     let mut resp = http
         .post(endpoint)
         .header("content-type", "application/dns-message")
@@ -1922,26 +2607,12 @@ async fn send_doh_request_raw(
     Ok(bytes)
 }
 
-async fn send_doh_request(
-    http: &Client,
-    outbound_binder: Option<&dyn OutboundBinder>,
-    bound_tls: Option<&TlsConnector>,
-    endpoint: &str,
-    wire_query: &[u8],
+fn classify_doh_wire_reply(
+    bytes: &[u8],
     qtype: u16,
-    require_ip_literal: bool,
+    endpoint: &str,
 ) -> std::result::Result<DnsOutcome, DohError> {
-    let bytes = send_doh_wire(
-        http,
-        outbound_binder,
-        bound_tls,
-        endpoint,
-        wire_query,
-        require_ip_literal,
-    )
-    .await
-    .map_err(DohError::Transport)?;
-    match decode_dns_outcome_classified(&bytes, qtype) {
+    match decode_dns_outcome_classified(bytes, qtype) {
         Ok(DnsOutcome::NxDomain(ttl)) => Ok(DnsOutcome::NxDomain(ttl)),
         Ok(DnsOutcome::Records(ips, ttl)) => {
             let had_ips = !ips.is_empty();
@@ -1964,6 +2635,28 @@ async fn send_doh_request(
         }),
         Err(DnsDecodeError::Malformed(err)) => Err(DohError::Transport(err)),
     }
+}
+
+async fn send_doh_request(
+    http: &Client,
+    outbound_binder: Option<&dyn OutboundBinder>,
+    bound_tls: Option<&TlsConnector>,
+    endpoint: &str,
+    wire_query: &[u8],
+    qtype: u16,
+    require_ip_literal: bool,
+) -> std::result::Result<DnsOutcome, DohError> {
+    let bytes = send_doh_wire(
+        http,
+        outbound_binder,
+        bound_tls,
+        endpoint,
+        wire_query,
+        require_ip_literal,
+    )
+    .await
+    .map_err(DohError::Transport)?;
+    classify_doh_wire_reply(&bytes, qtype, endpoint)
 }
 
 fn is_ip_literal_doh_endpoint(endpoint: &str) -> bool {
@@ -1993,21 +2686,34 @@ fn build_doh_endpoints(
 ) -> Vec<String> {
     let mut list = Vec::new();
     let trimmed = dns_addr.trim();
-    if trimmed.starts_with("https://") {
-        if !require_ip_literal || is_ip_literal_doh_endpoint(trimmed) {
-            list.push(trimmed.to_string());
+    if let Ok(parsed) = parse_doh_url_validated(trimmed) {
+        match parsed.host {
+            DohHost::Ip(_) => {
+                list.push(parsed.request_url);
+            }
+            DohHost::Domain(_) => {
+                if !require_ip_literal {
+                    list.push(parsed.request_url);
+                }
+            }
         }
     } else if !trimmed.is_empty() {
-        let stripped = trimmed.trim_matches(|c| c == '[' || c == ']');
-        let primary = match stripped {
-            "1.1.1.1" | "1.0.0.1" => format!("https://{stripped}/dns-query"),
-            "8.8.8.8" | "8.8.4.4" => format!("https://{stripped}/dns-query"),
-            "9.9.9.9" | "149.112.112.112" => format!("https://{stripped}/dns-query"),
-            other if other.parse::<Ipv4Addr>().is_ok() => format!("https://{other}/dns-query"),
-            other if other.parse::<Ipv6Addr>().is_ok() => format!("https://[{other}]/dns-query"),
-            _ => "https://1.1.1.1/dns-query".to_string(),
+        let ip_opt = if trimmed.starts_with('[') || trimmed.ends_with(']') {
+            trimmed
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+                .and_then(|inner| inner.parse::<Ipv6Addr>().ok())
+                .map(IpAddr::V6)
+        } else {
+            trimmed.parse::<IpAddr>().ok()
         };
-        list.push(primary);
+        if let Some(ip) = ip_opt.filter(|ip| validate_dns_ip_addr(*ip).is_ok()) {
+            let primary = match ip {
+                IpAddr::V4(v4) => format!("https://{v4}/dns-query"),
+                IpAddr::V6(v6) => format!("https://[{v6}]/dns-query"),
+            };
+            list.push(primary);
+        }
     }
 
     // Multi-provider IP-literal DoH ring interleaved across independent networks
@@ -2051,12 +2757,24 @@ fn build_doh_endpoints(
 
 fn build_udp_dns_servers(dns_addr: &str, dns_port: u16) -> Vec<SocketAddr> {
     let mut servers = Vec::new();
-    let trimmed_dns = dns_addr.trim().trim_matches(|c| c == '[' || c == ']');
+    let effective_port = if dns_port == 0 { 53 } else { dns_port };
+    let trimmed_dns = dns_addr.trim();
+    let custom_ip = if trimmed_dns.starts_with('[') || trimmed_dns.ends_with(']') {
+        trimmed_dns
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .and_then(|inner| inner.parse::<Ipv6Addr>().ok())
+            .map(IpAddr::V6)
+    } else {
+        trimmed_dns.parse::<IpAddr>().ok()
+    }
+    .filter(|ip| validate_dns_ip_addr(*ip).is_ok());
+
     // Non-standard ports (1253, 443, 5353) bypass transparent ISP port-53 DNS interceptors
     // on strict fiber and broadband networks worldwide.
-    if let Ok(ip) = trimmed_dns.parse::<IpAddr>() {
-        if dns_port != 53 {
-            servers.push(SocketAddr::new(ip, dns_port));
+    if let Some(ip) = custom_ip {
+        if effective_port != 53 {
+            servers.push(SocketAddr::new(ip, effective_port));
         }
     }
     for (ip, port) in [
@@ -2071,8 +2789,8 @@ fn build_udp_dns_servers(dns_addr: &str, dns_port: u16) -> Vec<SocketAddr> {
             servers.push(sa);
         }
     }
-    if let Ok(ip) = trimmed_dns.parse::<IpAddr>() {
-        let sa = SocketAddr::new(ip, dns_port);
+    if let Some(ip) = custom_ip {
+        let sa = SocketAddr::new(ip, effective_port);
         if !servers.contains(&sa) {
             servers.push(sa);
         }
@@ -3793,5 +4511,446 @@ mod tests {
             "DoH failover exceeded 2 concurrent backup requests: peak={}",
             peak_in_flight.load(Ordering::SeqCst)
         );
+    }
+
+    #[test]
+    fn validate_custom_dns_input_accepts_and_normalizes_ipv4_ipv6_and_doh_urls() {
+        // IPv4
+        assert_eq!(validate_custom_dns_input("76.76.2.0").unwrap(), "76.76.2.0");
+        assert_eq!(
+            validate_custom_dns_input("  94.140.14.15  ").unwrap(),
+            "94.140.14.15"
+        );
+        assert_eq!(validate_custom_dns_input("127.0.0.1").unwrap(), "127.0.0.1");
+
+        // IPv6 (bare, bracketed, and unnormalized)
+        assert_eq!(
+            validate_custom_dns_input("2606:4700:4700::1111").unwrap(),
+            "2606:4700:4700::1111"
+        );
+        assert_eq!(
+            validate_custom_dns_input("[2606:4700:4700::1111]").unwrap(),
+            "2606:4700:4700::1111"
+        );
+        assert_eq!(
+            validate_custom_dns_input("[2606:4700:4700:0000:0000:0000:0000:1111]").unwrap(),
+            "2606:4700:4700::1111"
+        );
+        assert_eq!(validate_custom_dns_input("::1").unwrap(), "::1");
+
+        // Custom https:// DoH URLs (hostnames, IP literals, ports, paths, queries)
+        assert_eq!(
+            validate_custom_dns_input("https://dns.nextdns.io/abc123").unwrap(),
+            "https://dns.nextdns.io/abc123"
+        );
+        assert_eq!(
+            validate_custom_dns_input("  HTTPS://DNS.NextDNS.io/AbC123  ").unwrap(),
+            "https://dns.nextdns.io/AbC123"
+        );
+        assert_eq!(
+            validate_custom_dns_input("https://freedns.controld.com/p2").unwrap(),
+            "https://freedns.controld.com/p2"
+        );
+        assert_eq!(
+            validate_custom_dns_input("https://1.1.1.1/dns-query").unwrap(),
+            "https://1.1.1.1/dns-query"
+        );
+        assert_eq!(
+            validate_custom_dns_input("https://dns.quad9.net:443/dns-query").unwrap(),
+            "https://dns.quad9.net:443/dns-query"
+        );
+        assert_eq!(
+            validate_custom_dns_input("https://[2606:4700:4700:0::1111]:8443/dns-query").unwrap(),
+            "https://[2606:4700:4700::1111]:8443/dns-query"
+        );
+        assert_eq!(
+            validate_custom_dns_input("https://doh.example.com/dns-query?token=a1_b2").unwrap(),
+            "https://doh.example.com/dns-query?token=a1_b2"
+        );
+        assert_eq!(
+            validate_custom_dns_input("https://dns.nextdns.io").unwrap(),
+            "https://dns.nextdns.io"
+        );
+    }
+
+    #[test]
+    fn validate_custom_dns_input_rejects_invalid_schemes_ips_whitespace_and_garbage() {
+        let invalid_cases = [
+            "",
+            "   ",
+            "76.76.2.0 1.1.1.1",
+            "https://dns.nextdns.io/abc 123",
+            "76.76.2.0\x00",
+            "\x1b76.76.2.0",
+            "https://dns.nextdns.io/abc\r\nX-Injected: 1",
+            "0.0.0.0",
+            "::",
+            "[::]",
+            "::ffff:0.0.0.0",
+            "224.0.0.1",
+            "ff02::1",
+            "255.255.255.255",
+            "https://0.0.0.0/dns-query",
+            "https://[::]/dns-query",
+            "https://224.0.0.1/dns-query",
+            "http://1.1.1.1/dns-query",
+            "http://dns.nextdns.io/abc123",
+            "HTTP://dns.google/dns-query",
+            "ftp://1.1.1.1/dns-query",
+            "https://",
+            "https:///dns-query",
+            "https://garbage",
+            "https://999.999.999.999/dns-query",
+            "https://-bad.example.com/dns-query",
+            "https://bad-.example.com/dns-query",
+            "https://a..b.com/dns-query",
+            "https://dns.quad9.net:0/dns-query",
+            "https://dns.quad9.net:65536/dns-query",
+            "https://dns.quad9.net:abc/dns-query",
+            "https://dns.quad9.net:/dns-query",
+            "https://user:pass@dns.nextdns.io/abc123",
+            "https://dns.nextdns.io/abc123#frag",
+            "https://dns.nextdns.io/abc%ZZ",
+            "https://2606:4700:4700::1111/dns-query",
+            "[1.1.1.1]",
+            "[2606:4700:4700::1111",
+            "not-a-dns",
+            "999.999.999.999",
+        ];
+
+        for raw in invalid_cases {
+            let err = validate_custom_dns_input(raw)
+                .expect_err(&format!("expected invalid custom DNS input: {raw:?}"));
+            assert!(
+                !err.is_empty(),
+                "error message should be non-empty for {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_ip_and_custom_doh_resolver_configuration() {
+        // Arbitrary custom IPv4 (e.g. Control D 76.76.2.0)
+        let r_v4 = DnsResolver::new("76.76.2.0", 53, true, false).unwrap();
+        assert!(r_v4.custom_doh.is_none());
+        assert_eq!(r_v4.doh_endpoints[0], "https://76.76.2.0/dns-query");
+        assert!(r_v4
+            .udp_dns_servers
+            .contains(&"76.76.2.0:53".parse::<SocketAddr>().unwrap()));
+
+        // Arbitrary custom IPv6 with brackets and custom UDP port
+        let r_v6 = DnsResolver::new("[2606:4700:4700:0::1111]", 5353, true, false).unwrap();
+        assert!(r_v6.custom_doh.is_none());
+        assert_eq!(
+            r_v6.doh_endpoints[0],
+            "https://[2606:4700:4700::1111]/dns-query"
+        );
+        assert_eq!(
+            r_v6.udp_dns_servers[0],
+            "[2606:4700:4700::1111]:5353".parse::<SocketAddr>().unwrap()
+        );
+
+        // Custom hostname DoH URL in strict TUN mode: custom_doh is active while doh_endpoints
+        // stays strictly IP-literal for zero-deadlock bootstrapping and fallback.
+        let r_nextdns = DnsResolver::new_with_options(
+            "https://dns.nextdns.io/abc123",
+            53,
+            true,
+            false,
+            true,
+            None,
+        )
+        .unwrap();
+        let custom = r_nextdns
+            .custom_doh
+            .as_ref()
+            .expect("custom hostname DoH must be configured");
+        assert_eq!(custom.host, "dns.nextdns.io");
+        assert_eq!(custom.port, 443);
+        assert_eq!(custom.host_header, "dns.nextdns.io");
+        assert_eq!(custom.path_and_query, "/abc123");
+        assert_eq!(custom.request_url, "https://dns.nextdns.io/abc123");
+        assert!(r_nextdns
+            .doh_endpoints
+            .iter()
+            .all(|ep| is_ip_literal_doh_endpoint(ep)));
+
+        // Custom DoH URL with explicit :443 port and path
+        let r_q9 =
+            DnsResolver::new("https://dns.quad9.net:443/dns-query", 53, true, false).unwrap();
+        let q9_custom = r_q9.custom_doh.as_ref().unwrap();
+        assert_eq!(q9_custom.host, "dns.quad9.net");
+        assert_eq!(q9_custom.port, 443);
+        assert_eq!(q9_custom.host_header, "dns.quad9.net");
+        assert_eq!(q9_custom.path_and_query, "/dns-query");
+
+        // Unusable IP (0.0.0.0) passed directly is ignored in favor of healthy defaults.
+        let r_unspec = DnsResolver::new("0.0.0.0", 53, true, false).unwrap();
+        assert_eq!(r_unspec.doh_endpoints[0], "https://1.1.1.1/dns-query");
+        assert!(!r_unspec
+            .udp_dns_servers
+            .iter()
+            .any(|sa| sa.ip().is_unspecified()));
+    }
+
+    #[tokio::test]
+    async fn custom_hostname_doh_bootstraps_via_ip_literal_ring_and_avoids_self_deadlock() {
+        let (server_cfg, connector) = make_local_doh_tls_pair();
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_cfg);
+        let bootstrap_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bootstrap_addr = bootstrap_listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (tcp, _) = bootstrap_listener.accept().await.unwrap();
+                let mut tls = acceptor.accept(tcp).await.unwrap();
+                let query = read_doh_test_request(&mut tls).await;
+                let parsed = parse_dns_question(&query).unwrap();
+                assert_eq!(parsed.qname, "dns.nextdns.io");
+                let wire_resp = build_dns_wire_response(
+                    parsed.tx_id,
+                    parsed.flags,
+                    &query[12..parsed.question_end],
+                    0,
+                    &[IpAddr::V4(Ipv4Addr::new(45, 90, 28, 10))],
+                    300,
+                );
+                write_doh_test_response(&mut tls, &wire_resp).await;
+            }
+        });
+
+        let binder: Arc<dyn OutboundBinder> = Arc::new(NoopBinder);
+        let mut resolver = DnsResolver::new_with_binder(
+            "https://dns.nextdns.io/abc123",
+            53,
+            true,
+            true,
+            Some(binder),
+        )
+        .unwrap();
+        resolver.bound_tls_connector = Some(connector);
+        resolver.doh_endpoints = vec![format!(
+            "https://127.0.0.1:{}/dns-query",
+            bootstrap_addr.port()
+        )];
+        resolver.udp_dns_servers = Vec::new();
+
+        // 1. Bootstrapping resolves dns.nextdns.io via the IP-literal ring (no OS DNS, no recursion).
+        let custom = resolver.custom_doh.as_ref().unwrap();
+        let (bootstrapped_ips, _) = resolver
+            .ensure_custom_doh_bootstrapped(custom)
+            .await
+            .unwrap();
+        assert_eq!(
+            bootstrapped_ips,
+            vec![IpAddr::V4(Ipv4Addr::new(45, 90, 28, 10))]
+        );
+
+        // 2. Resolving the DoH host itself bypasses custom_doh and uses the IP-literal ring directly.
+        let self_ips = resolver.resolve("dns.nextdns.io").await.unwrap();
+        assert_eq!(self_ips, vec![IpAddr::V4(Ipv4Addr::new(45, 90, 28, 10))]);
+
+        server_task.await.unwrap();
+    }
+
+    fn make_hostname_doh_tls_pair(
+        hostname: &str,
+    ) -> (Arc<rustls::ServerConfig>, TlsConnector, Vec<u8>) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert_key = rcgen::generate_simple_self_signed(vec![hostname.to_string()]).unwrap();
+        let cert_der_bytes = cert_key.cert.der().to_vec();
+        let cert_der = CertificateDer::from(cert_der_bytes.clone());
+        let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert_key.key_pair.serialize_der()),
+        );
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let server_cfg = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der).unwrap();
+        let mut client_cfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        (
+            Arc::new(server_cfg),
+            TlsConnector::from(Arc::new(client_cfg)),
+            cert_der_bytes,
+        )
+    }
+
+    #[tokio::test]
+    async fn custom_hostname_doh_works_over_bound_and_pinned_http_and_fails_over() {
+        let hostname = "custom-doh.example";
+        let (custom_server_cfg, custom_connector, custom_cert_der) =
+            make_hostname_doh_tls_pair(hostname);
+        let custom_acceptor = tokio_rustls::TlsAcceptor::from(custom_server_cfg);
+        let custom_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let custom_addr = custom_listener.local_addr().unwrap();
+        let custom_url = format!("https://{hostname}:{}/abc123", custom_addr.port());
+
+        let custom_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (tcp, _) = custom_listener.accept().await.unwrap();
+                let mut tls = custom_acceptor.accept(tcp).await.unwrap();
+                let mut req = Vec::new();
+                let mut buf = [0u8; 2048];
+                let (head_end, body_len) = loop {
+                    let n = tls.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    req.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = std::str::from_utf8(&req[..pos]).unwrap();
+                        assert!(
+                            head.starts_with("POST /abc123 HTTP/1.1\r\n"),
+                            "unexpected custom DoH request line: {head}"
+                        );
+                        assert!(
+                            head.to_ascii_lowercase()
+                                .contains("host: custom-doh.example"),
+                            "missing custom Host header: {head}"
+                        );
+                        let cl: usize = head
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                if k.trim().eq_ignore_ascii_case("content-length") {
+                                    v.trim().parse::<usize>().ok()
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap();
+                        if req.len() >= pos + 4 + cl {
+                            break (pos + 4, cl);
+                        }
+                    }
+                };
+                let query = &req[head_end..head_end + body_len];
+                let parsed = parse_dns_question(query).unwrap();
+                let wire_resp = build_dns_wire_response(
+                    parsed.tx_id,
+                    parsed.flags,
+                    &query[12..parsed.question_end],
+                    0,
+                    &[IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+                    120,
+                );
+                write_doh_test_response(&mut tls, &wire_resp).await;
+            }
+        });
+
+        // 1. Bound TUN mode: connects to bootstrapped IP with SNI=custom-doh.example and custom path.
+        let counter = Arc::new(CountingBinder::default());
+        let binder: Arc<dyn OutboundBinder> = counter.clone();
+        let mut bound_resolver =
+            DnsResolver::new_with_binder(&custom_url, 53, true, true, Some(binder)).unwrap();
+        bound_resolver.bound_tls_connector = Some(custom_connector);
+        bound_resolver.doh_endpoints = Vec::new();
+        bound_resolver.udp_dns_servers = Vec::new();
+        {
+            let custom = bound_resolver.custom_doh.as_ref().unwrap();
+            let mut state = custom.state.write().await;
+            state.ips = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
+            state.expires_at = Instant::now() + Duration::from_secs(300);
+        }
+        let bound_ips = bound_resolver
+            .resolve("bound-target.example")
+            .await
+            .unwrap();
+        assert_eq!(bound_ips, vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
+        assert_eq!(counter.calls.load(Ordering::Relaxed), 1);
+
+        // 2. Unbound TUN mode (disable_system_dns_fallback = true): uses reqwest resolve_to_addrs
+        //    pinned to the bootstrapped IP so zero OS DNS lookup occurs.
+        let mut pinned_resolver =
+            DnsResolver::new_with_options(&custom_url, 53, true, true, true, None).unwrap();
+        pinned_resolver.test_root_cert_der = Some(custom_cert_der);
+        pinned_resolver.doh_endpoints = Vec::new();
+        pinned_resolver.udp_dns_servers = Vec::new();
+        {
+            let custom = pinned_resolver.custom_doh.as_ref().unwrap();
+            let pinned_http = build_pinned_doh_http_client(
+                &custom.host,
+                &[custom_addr],
+                pinned_resolver.test_root_cert_der.as_deref(),
+            )
+            .unwrap();
+            let mut state = custom.state.write().await;
+            state.ips = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
+            state.expires_at = Instant::now() + Duration::from_secs(300);
+            state.pinned_http = Some(pinned_http);
+        }
+        let pinned_ips = pinned_resolver
+            .resolve("pinned-target.example")
+            .await
+            .unwrap();
+        assert_eq!(
+            pinned_ips,
+            vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]
+        );
+
+        custom_task.await.unwrap();
+
+        // 3. Failover: when custom hostname DoH cannot bootstrap/connect, falls back cleanly to
+        //    the IP-literal DoH ring without deadlocking.
+        let (fb_server_cfg, fb_connector) = make_local_doh_tls_pair();
+        let fb_acceptor = tokio_rustls::TlsAcceptor::from(fb_server_cfg);
+        let fb_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fb_addr = fb_listener.local_addr().unwrap();
+
+        let fb_task = tokio::spawn(async move {
+            let (tcp, _) = fb_listener.accept().await.unwrap();
+            let mut tls = fb_acceptor.accept(tcp).await.unwrap();
+            let query = read_doh_test_request(&mut tls).await;
+            let parsed = parse_dns_question(&query).unwrap();
+            let wire_resp = build_dns_wire_response(
+                parsed.tx_id,
+                parsed.flags,
+                &query[12..parsed.question_end],
+                0,
+                &[IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))],
+                120,
+            );
+            write_doh_test_response(&mut tls, &wire_resp).await;
+        });
+
+        let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_port = dead_listener.local_addr().unwrap().port();
+        drop(dead_listener);
+
+        let binder: Arc<dyn OutboundBinder> = Arc::new(NoopBinder);
+        let mut failover_resolver = DnsResolver::new_with_binder(
+            format!("https://dead-custom.example:{dead_port}/abc123"),
+            53,
+            true,
+            true,
+            Some(binder),
+        )
+        .unwrap();
+        failover_resolver.bound_tls_connector = Some(fb_connector);
+        failover_resolver.doh_endpoints =
+            vec![format!("https://127.0.0.1:{}/dns-query", fb_addr.port())];
+        failover_resolver.udp_dns_servers = Vec::new();
+        {
+            let custom = failover_resolver.custom_doh.as_ref().unwrap();
+            let mut state = custom.state.write().await;
+            state.ips = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
+            state.expires_at = Instant::now() + Duration::from_secs(300);
+        }
+
+        let fb_ips = failover_resolver
+            .resolve("fallback-after-custom.example")
+            .await
+            .unwrap();
+        fb_task.await.unwrap();
+        assert_eq!(fb_ips, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
+        assert!(!failover_resolver.is_doh_in_backoff());
     }
 }

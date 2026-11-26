@@ -341,11 +341,13 @@ fn main() -> Result<()> {
                 launcher::Choice::SetDns(dns_addr) => {
                     let was_installed = status.installed.is_some()
                         || status.service_state != ServiceState::NotInstalled;
-                    match vdpi::service::set_service_dns_quiet(dns_addr, &cfg) {
-                        Ok(()) => {
-                            cfg.dns_addr = dns_addr.to_string();
-                            session_dns_override = Some(dns_addr.to_string());
-                            let label = launcher::format_dns_label(dns_addr);
+                    match resolve_dns_target(&dns_addr).and_then(|validated| {
+                        vdpi::service::set_service_dns_quiet(&validated, &cfg).map(|()| validated)
+                    }) {
+                        Ok(validated) => {
+                            let label = launcher::format_dns_label(&validated);
+                            cfg.dns_addr = validated.clone();
+                            session_dns_override = Some(validated);
                             notice = Some(if was_installed {
                                 format!("DNS server set to {label}.")
                             } else {
@@ -516,7 +518,10 @@ fn main() -> Result<()> {
         Some(Command::Dns { addr }) => {
             init_tracing(&cfg);
             match addr {
-                Some(target) => vdpi::service::set_service_dns(&target, &cfg),
+                Some(target) => {
+                    let validated = resolve_dns_target(&target)?;
+                    vdpi::service::set_service_dns(&validated, &cfg)
+                }
                 None => {
                     let current = vdpi::service::load_configured_dns(&cfg.dns_addr);
                     println!("DNS: {}", launcher::format_dns_label(&current));
@@ -949,6 +954,7 @@ fn dashboard_info_from_live(
         engine: dashboard_engine_from_live(live, fallback_cfg.system_proxy),
         mode: parse_live_desync_mode(live.mode.as_deref(), fallback_cfg.mode),
         enable_doh: live.doh.unwrap_or(fallback_cfg.enable_doh),
+        dns_addr: Some(vdpi::service::load_configured_dns(&fallback_cfg.dns_addr)),
     }
 }
 
@@ -962,6 +968,7 @@ fn attached_telemetry_from_live(
         engine: dashboard_engine_from_live(live, fallback_cfg.system_proxy),
         mode: parse_live_desync_mode(live.mode.as_deref(), fallback_cfg.mode),
         doh: live.doh.unwrap_or(fallback_cfg.enable_doh),
+        dns_addr: Some(vdpi::service::load_configured_dns(&fallback_cfg.dns_addr)),
         block_quic: live.block_quic.unwrap_or(fallback_cfg.block_quic),
         rss_kb: live.rss_kb,
         isp_stage: live.isp_stage.clone(),
@@ -1254,8 +1261,46 @@ fn format_live_engine_line(live: &vdpi::service::LiveEngineStatus) -> String {
     }
 }
 
+fn resolve_dns_target(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!(
+            "DNS server cannot be empty (enter a preset name, IPv4/IPv6 address, or https:// DoH URL)"
+        );
+    }
+    let normalized_key: String = trimmed
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    for preset in &launcher::DNS_PRESETS {
+        let preset_key: String = preset
+            .name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        if normalized_key == preset_key || trimmed.eq_ignore_ascii_case(preset.addr) {
+            return Ok(preset.addr.to_string());
+        }
+    }
+    if normalized_key == "family" {
+        return Ok("1.1.1.3".to_string());
+    }
+    vdpi_core::dns::validate_custom_dns_input(trimmed)
+        .map_err(|err| anyhow::anyhow!("invalid DNS server '{trimmed}': {err}"))
+}
+
+fn foreground_tokio_worker_threads() -> usize {
+    std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 4))
+}
+
 fn build_runtime() -> Result<tokio::runtime::Runtime> {
+    // Cap foreground Tokio workers to 2..=4 instead of spawning 16-24 workers on
+    // high-core desktops so foreground TUN traffic never preempts real-time audio
+    // engines such as VoiceMeeter.
     tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(foreground_tokio_worker_threads())
         .enable_all()
         .build()
         .map_err(Into::into)
@@ -1720,6 +1765,7 @@ async fn run_daemon(
             },
             mode: cfg.mode,
             enable_doh: cfg.enable_doh,
+            dns_addr: Some(cfg.dns_addr.clone()),
         };
 
         if let Err(err) = tui_dashboard::run_dashboard(
@@ -2087,7 +2133,8 @@ mod desktop_tun {
                 return anyhow::anyhow!(
                     "failed to start Windows TUN mode: {chain}\n\n\
                      To fix this:\n  \
-                     - Ensure the official WHQL-signed wintun.dll is next to vdpi.exe (re-download the release archive or run `vdpi update --force`).\n  \
+                     - Official Windows release builds embed the WHQL-signed Wintun driver inside vdpi.exe (run `vdpi update --force` or re-download the official release archive).\n  \
+                     - For source / `cargo install` builds without embedded Wintun, place the official WHQL-signed wintun.dll next to vdpi.exe.\n  \
                      - Or switch to Proxy mode without a virtual adapter: `vdpi --proxy start` (or `vdpi engine proxy`)."
                 );
             }
@@ -2106,7 +2153,7 @@ mod desktop_tun {
             }
             anyhow::anyhow!(
                 "failed to start Windows TUN mode: {chain}\n\n\
-                 Tip: Run elevated as Administrator with wintun.dll next to vdpi.exe, or switch to Proxy mode with `vdpi --proxy start` (`vdpi engine proxy`)."
+                 Tip: Run elevated as Administrator (official release builds embed Wintun inside vdpi.exe; source builds need wintun.dll next to vdpi.exe), or switch to Proxy mode with `vdpi --proxy start` (`vdpi engine proxy`)."
             )
         }
         #[cfg(target_os = "macos")]
@@ -2829,6 +2876,7 @@ mod desktop_tun {
                 },
                 mode: cfg.mode,
                 enable_doh: cfg.enable_doh,
+                dns_addr: Some(cfg.dns_addr.clone()),
             };
             let probe_meta = Arc::clone(&health_meta);
             let probe_binder = Arc::clone(&binder);
@@ -3169,10 +3217,41 @@ mod tests {
         ));
         let msg = missing_dll.to_string();
         assert!(msg.contains("--proxy"));
+        #[cfg(target_os = "windows")]
+        assert!(msg.contains("embed"));
 
         let priv_err =
             desktop_tun::format_tun_start_error(anyhow::anyhow!("Access is denied (os error 5)"));
         assert!(priv_err.to_string().contains("--proxy"));
+    }
+
+    #[test]
+    fn foreground_tokio_worker_threads_is_clamped_for_audio_safety() {
+        let workers = foreground_tokio_worker_threads();
+        assert!((2..=4).contains(&workers));
+    }
+
+    #[test]
+    fn resolve_dns_target_accepts_presets_ips_and_doh_urls() {
+        assert_eq!(resolve_dns_target("cloudflare").unwrap(), "1.1.1.1");
+        assert_eq!(resolve_dns_target("Google").unwrap(), "8.8.8.8");
+        assert_eq!(
+            resolve_dns_target("adguard-unfiltered").unwrap(),
+            "94.140.14.140"
+        );
+        assert_eq!(resolve_dns_target("family").unwrap(), "1.1.1.3");
+        assert_eq!(resolve_dns_target("9.9.9.9").unwrap(), "9.9.9.9");
+        assert_eq!(
+            resolve_dns_target("2606:4700:4700::1111").unwrap(),
+            "2606:4700:4700::1111"
+        );
+        assert_eq!(
+            resolve_dns_target("https://dns.nextdns.io/abc123/my-profile").unwrap(),
+            "https://dns.nextdns.io/abc123/my-profile"
+        );
+        assert!(resolve_dns_target("").is_err());
+        assert!(resolve_dns_target("not a valid dns").is_err());
+        assert!(resolve_dns_target("http://insecure.example/dns-query").is_err());
     }
 
     #[test]

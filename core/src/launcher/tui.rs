@@ -1,6 +1,6 @@
 use super::{
-    build_menu_with_options, dns_preset_index, format_dns_label, Choice, LauncherMenu, MenuItem,
-    StatusRow, StatusTone, DNS_PRESETS,
+    build_menu_with_options, dns_preset_index, format_dns_label, is_custom_dns, shorten_custom_dns,
+    Choice, LauncherMenu, MenuItem, StatusRow, StatusTone, CUSTOM_DNS_HINT, DNS_PRESETS,
 };
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -27,6 +27,11 @@ const KEY_BADGES: [&str; 9] = [
 ];
 const RANGE_LABELS: [&str; 9] = ["1", "1-2", "1-3", "1-4", "1-5", "1-6", "1-7", "1-8", "1-9"];
 const COMPACT_VPN_BADGE: &str = "[VPN]";
+const DNS_PICKER_ITEM_COUNT: usize = DNS_PRESETS.len() + 1;
+const MAX_CUSTOM_DNS_INPUT_CHARS: usize = 200;
+const CUSTOM_DNS_PLACEHOLDER: &str = "IP or https:// DoH URL";
+const CUSTOM_DNS_EDITOR_HINT: &str =
+    "IPv4, IPv6, or https:// DoH URL (e.g. 76.76.2.0 or https://dns.nextdns.io/id)";
 const UNINSTALL_CONFIRM_BODY: &str = "This stops the background service, removes installed files and PATH entries, and restores routes & proxies.";
 
 // Restrained cool slate / white / emerald / ice-blue / semantic amber & red palette.
@@ -64,6 +69,7 @@ struct Palette {
     inactive_badge: Style,
     inactive_title: Style,
     inactive_hint: Style,
+    input_bg: Style,
     footer_key: Style,
     footer_text: Style,
 }
@@ -92,6 +98,7 @@ impl Palette {
                 inactive_badge: Style::new().fg(SLATE_DIM),
                 inactive_title: Style::new().fg(TEXT_LIGHT),
                 inactive_hint: Style::new().fg(SLATE_DIM),
+                input_bg: Style::new().fg(TEXT_WHITE).bg(ACTIVE_BG),
                 footer_key: Style::new().fg(TEXT_WHITE).add_modifier(Modifier::BOLD),
                 footer_text: Style::new().fg(SLATE_DIM),
             }
@@ -120,6 +127,7 @@ impl Palette {
                 inactive_badge: dim,
                 inactive_title: plain,
                 inactive_hint: dim,
+                input_bg: bold,
                 footer_key: bold,
                 footer_text: dim,
             }
@@ -156,6 +164,9 @@ struct UiState {
     confirming_uninstall: bool,
     selecting_dns: bool,
     dns_selected: usize,
+    editing_custom_dns: bool,
+    custom_dns_input: String,
+    custom_dns_error: Option<String>,
     configured_dns: String,
     split_tunnel: SplitTunnelConfig,
 }
@@ -198,9 +209,35 @@ impl UiState {
             confirming_uninstall: false,
             selecting_dns: false,
             dns_selected: dns_preset_index(dns),
+            editing_custom_dns: false,
+            custom_dns_input: String::new(),
+            custom_dns_error: None,
             configured_dns: dns.to_string(),
             split_tunnel: split_tunnel.clone(),
         }
+    }
+
+    fn open_dns_picker(&mut self) {
+        self.dns_selected = dns_preset_index(&self.configured_dns);
+        self.selecting_dns = true;
+        self.editing_custom_dns = false;
+        self.custom_dns_input.clear();
+        self.custom_dns_error = None;
+    }
+
+    fn open_custom_dns_editor(&mut self) {
+        self.dns_selected = DNS_PRESETS.len();
+        self.editing_custom_dns = true;
+        self.custom_dns_input = if is_custom_dns(&self.configured_dns) {
+            self.configured_dns
+                .trim()
+                .chars()
+                .take(MAX_CUSTOM_DNS_INPUT_CHARS)
+                .collect()
+        } else {
+            String::new()
+        };
+        self.custom_dns_error = None;
     }
 }
 
@@ -630,10 +667,122 @@ fn apply_refresh(state: &mut UiState, latest: &ControlCenterStatus) {
     );
     state.confirming_uninstall = false;
     state.selecting_dns = false;
+    state.editing_custom_dns = false;
+    state.custom_dns_input.clear();
+    state.custom_dns_error = None;
     if state.menu.items.is_empty() {
         state.selected = 0;
     } else {
         state.selected = state.selected.min(state.menu.items.len() - 1);
+    }
+}
+
+fn handle_custom_dns_key(state: &mut UiState, key: KeyEvent) -> Action {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('u' | 'U'))
+    {
+        if key.kind != KeyEventKind::Press {
+            return Action::Ignore;
+        }
+        if !state.custom_dns_input.is_empty() || state.custom_dns_error.is_some() {
+            state.custom_dns_input.clear();
+            state.custom_dns_error = None;
+            return Action::Redraw;
+        }
+        return Action::Ignore;
+    }
+
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return Action::Ignore;
+    }
+
+    match key.code {
+        KeyCode::Backspace => {
+            if state.custom_dns_input.pop().is_some() || state.custom_dns_error.is_some() {
+                state.custom_dns_error = None;
+                return Action::Redraw;
+            }
+            Action::Ignore
+        }
+        _ if key.kind != KeyEventKind::Press => Action::Ignore,
+        KeyCode::Esc => {
+            state.editing_custom_dns = false;
+            state.custom_dns_error = None;
+            Action::Redraw
+        }
+        KeyCode::Enter => {
+            match vdpi_core::dns::validate_custom_dns_input(&state.custom_dns_input) {
+                Ok(normalized) => Action::Finish(Choice::SetDns(normalized)),
+                Err(err) => {
+                    state.custom_dns_error = Some(sanitize_inline(&err).into_owned());
+                    Action::Redraw
+                }
+            }
+        }
+        KeyCode::Char(ch) if !ch.is_control() => {
+            if state.custom_dns_input.chars().count() < MAX_CUSTOM_DNS_INPUT_CHARS {
+                state.custom_dns_input.push(ch);
+                state.custom_dns_error = None;
+                return Action::Redraw;
+            }
+            Action::Ignore
+        }
+        _ => Action::Ignore,
+    }
+}
+
+fn handle_dns_picker_key(state: &mut UiState, key: KeyEvent) -> Action {
+    let count = DNS_PICKER_ITEM_COUNT;
+    if state.dns_selected >= count {
+        state.dns_selected = count.saturating_sub(1);
+    }
+    match key.code {
+        KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
+            state.dns_selected = (state.dns_selected + count - 1) % count;
+            Action::Redraw
+        }
+        KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
+            state.dns_selected = (state.dns_selected + 1) % count;
+            Action::Redraw
+        }
+        KeyCode::Home => {
+            state.dns_selected = 0;
+            Action::Redraw
+        }
+        KeyCode::End => {
+            state.dns_selected = count - 1;
+            Action::Redraw
+        }
+        _ if key.kind != KeyEventKind::Press => Action::Ignore,
+        KeyCode::Enter => {
+            if let Some(preset) = DNS_PRESETS.get(state.dns_selected) {
+                Action::Finish(Choice::SetDns(preset.addr.to_string()))
+            } else {
+                state.open_custom_dns_editor();
+                Action::Redraw
+            }
+        }
+        KeyCode::Char(c @ '1'..='9') => {
+            let index = usize::from(c as u8 - b'1');
+            if let Some(preset) = DNS_PRESETS.get(index) {
+                state.dns_selected = index;
+                Action::Finish(Choice::SetDns(preset.addr.to_string()))
+            } else if index == DNS_PRESETS.len() {
+                state.open_custom_dns_editor();
+                Action::Redraw
+            } else {
+                Action::Ignore
+            }
+        }
+        KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('q' | 'Q' | 'b' | 'B') => {
+            state.selecting_dns = false;
+            state.editing_custom_dns = false;
+            state.custom_dns_error = None;
+            Action::Redraw
+        }
+        _ => Action::Ignore,
     }
 }
 
@@ -644,6 +793,9 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Action {
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
     {
         return Action::Finish(Choice::Cancel);
+    }
+    if state.selecting_dns && state.editing_custom_dns {
+        return handle_custom_dns_key(state, key);
     }
     if key
         .modifiers
@@ -667,45 +819,7 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Action {
     }
 
     if state.selecting_dns {
-        let count = DNS_PRESETS.len();
-        if state.dns_selected >= count {
-            state.dns_selected = count.saturating_sub(1);
-        }
-        match key.code {
-            KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
-                state.dns_selected = (state.dns_selected + count - 1) % count;
-                return Action::Redraw;
-            }
-            KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
-                state.dns_selected = (state.dns_selected + 1) % count;
-                return Action::Redraw;
-            }
-            KeyCode::Home => {
-                state.dns_selected = 0;
-                return Action::Redraw;
-            }
-            KeyCode::End => {
-                state.dns_selected = count - 1;
-                return Action::Redraw;
-            }
-            _ if key.kind != KeyEventKind::Press => return Action::Ignore,
-            KeyCode::Enter => {
-                return Action::Finish(Choice::SetDns(DNS_PRESETS[state.dns_selected].addr));
-            }
-            KeyCode::Char(c @ '1'..='9') => {
-                let index = usize::from(c as u8 - b'1');
-                if let Some(preset) = DNS_PRESETS.get(index) {
-                    state.dns_selected = index;
-                    return Action::Finish(Choice::SetDns(preset.addr));
-                }
-                return Action::Ignore;
-            }
-            KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('q' | 'Q' | 'b' | 'B') => {
-                state.selecting_dns = false;
-                return Action::Redraw;
-            }
-            _ => return Action::Ignore,
-        }
+        return handle_dns_picker_key(state, key);
     }
 
     let count = state.menu.items.len();
@@ -728,8 +842,7 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Action {
         _ if key.kind != KeyEventKind::Press => return Action::Ignore,
         KeyCode::Char('r' | 'R') => return Action::Refresh,
         KeyCode::Char('d' | 'D') => {
-            state.dns_selected = dns_preset_index(&state.configured_dns);
-            state.selecting_dns = true;
+            state.open_dns_picker();
             return Action::Redraw;
         }
         KeyCode::Char('m' | 'M') => {
@@ -741,7 +854,7 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Action {
                 .find(|(_, item)| matches!(item.choice, Choice::SwitchEngine(_)))
             {
                 state.selected = index;
-                return Action::Finish(item.choice);
+                return Action::Finish(item.choice.clone());
             }
             return Action::Ignore;
         }
@@ -772,14 +885,13 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Action {
             return Action::Ignore;
         }
         KeyCode::Enter => {
-            let choice = state.menu.items[state.selected].choice;
+            let choice = state.menu.items[state.selected].choice.clone();
             if choice == Choice::Uninstall {
                 state.confirming_uninstall = true;
                 return Action::Redraw;
             }
             if choice == Choice::SelectDns {
-                state.dns_selected = dns_preset_index(&state.configured_dns);
-                state.selecting_dns = true;
+                state.open_dns_picker();
                 return Action::Redraw;
             }
             return Action::Finish(choice);
@@ -794,11 +906,10 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Action {
                 }
                 if item.choice == Choice::SelectDns {
                     state.selected = index;
-                    state.dns_selected = dns_preset_index(&state.configured_dns);
-                    state.selecting_dns = true;
+                    state.open_dns_picker();
                     return Action::Redraw;
                 }
-                return Action::Finish(item.choice);
+                return Action::Finish(item.choice.clone());
             }
             return Action::Ignore;
         }
@@ -812,6 +923,41 @@ fn repo_display() -> &'static str {
     REPOSITORY_URL
         .trim_start_matches("https://")
         .trim_start_matches("http://")
+}
+
+fn sanitize_inline(text: &str) -> Cow<'_, str> {
+    if !text.chars().any(char::is_control) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_control() {
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+    }
+    Cow::Owned(out)
+}
+
+fn truncate_head(text: &str, max_chars: usize) -> Cow<'_, str> {
+    if max_chars == 0 {
+        return Cow::Borrowed("");
+    }
+    let len = text.chars().count();
+    if len <= max_chars {
+        return Cow::Borrowed(text);
+    }
+    if max_chars == 1 {
+        return Cow::Borrowed("…");
+    }
+    let skip = len - (max_chars - 1);
+    let mut out = String::with_capacity(max_chars + '…'.len_utf8());
+    out.push('…');
+    for ch in text.chars().skip(skip) {
+        out.push(ch);
+    }
+    Cow::Owned(out)
 }
 
 fn truncate_text(text: &str, max_chars: usize) -> Cow<'_, str> {
@@ -1509,6 +1655,175 @@ fn render_item_hint(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn render_custom_dns_editor_card(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    card_width: u16,
+    padding: Padding,
+    inset: bool,
+    state: &UiState,
+    palette: Palette,
+    color: bool,
+) {
+    let inner_width = card_width
+        .saturating_sub(2)
+        .saturating_sub(padding.left.saturating_add(padding.right));
+    let pad = if inset { " " } else { "" };
+    let right_margin = usize::from(inset);
+    let hint_wrap_width = usize::from(inner_width)
+        .saturating_sub(pad.len() + right_margin)
+        .max(1);
+    let hint_lines = wrap_words(CUSTOM_DNS_EDITOR_HINT, hint_wrap_width);
+    let hint_count = u16::try_from(hint_lines.len()).unwrap_or(2);
+    let err_rows = u16::from(state.custom_dns_error.is_some());
+    // borders(2) + header(1) + top_div(1) + title(1) + gap(1) + input(1) + hint(h) + err(0|1) + gap(1) + bot_div(1) + footer(1)
+    let ideal_height = 10u16.saturating_add(hint_count).saturating_add(err_rows);
+    let card_height = ideal_height.min(area.height).max(5);
+    let card_area = centered_rect(area, card_width, card_height);
+    let block = Block::bordered()
+        .border_type(if color {
+            BorderType::Rounded
+        } else {
+            BorderType::Plain
+        })
+        .border_style(palette.border)
+        .padding(padding);
+    let inner = block.inner(card_area);
+    frame.render_widget(block, card_area);
+
+    if inner.is_empty() {
+        return;
+    }
+
+    let ctx = RenderCtx { palette, inset };
+    let mut y = inner.y;
+    let bottom = inner.y.saturating_add(inner.height);
+    let row = |row_y: u16| Rect::new(inner.x, row_y, inner.width, 1);
+
+    if y < bottom {
+        render_header(frame, row(y), ctx);
+        y = y.saturating_add(1);
+    }
+    if y + 2 < bottom {
+        render_divider(frame, row(y), ctx);
+        y = y.saturating_add(1);
+    }
+
+    let show_footer = inner.height >= 5;
+    let show_bot_divider = inner.height >= 9;
+    let footer_reserve = u16::from(show_footer) + u16::from(show_bot_divider);
+    let body_bottom = bottom.saturating_sub(footer_reserve).max(y);
+    let width = usize::from(inner.width);
+
+    if y < body_bottom {
+        let heading = if is_custom_dns(&state.configured_dns) {
+            format!(
+                "Choose DNS server · {}",
+                format_dns_label(&state.configured_dns)
+            )
+        } else {
+            "Choose DNS server · Custom DNS".to_string()
+        };
+        let budget = width.saturating_sub(pad.len() + 2 + right_margin);
+        let title_line = Line::from(vec![
+            Span::raw(pad),
+            Span::styled("● ", palette.status_accent),
+            Span::styled(truncate_text(&heading, budget), palette.active_title),
+        ]);
+        frame.render_widget(title_line, row(y));
+        y = y.saturating_add(1);
+    }
+
+    // Breathing gap before input when vertical room permits.
+    let needed_body = 1u16.saturating_add(hint_count).saturating_add(err_rows);
+    if body_bottom.saturating_sub(y) > needed_body && y < body_bottom {
+        y = y.saturating_add(1);
+    }
+
+    // Inline input row: `Custom DNS: <input>▏`
+    if y < body_bottom {
+        let prompt = "Custom DNS: ";
+        let cursor = "▏";
+        let prompt_cols = prompt.chars().count();
+        let cursor_cols = cursor.chars().count();
+        let bar_width = width.saturating_sub(pad.len() + right_margin);
+        let sanitized = sanitize_inline(&state.custom_dns_input);
+        let line = if bar_width > prompt_cols + cursor_cols {
+            let input_budget = bar_width.saturating_sub(prompt_cols + cursor_cols);
+            let visible_input = truncate_head(&sanitized, input_budget).into_owned();
+            let used = prompt_cols + visible_input.chars().count() + cursor_cols;
+            let fill = bar_width.saturating_sub(used);
+            let bg = palette.input_bg;
+            let mut spans = vec![
+                Span::raw(pad),
+                Span::styled(prompt, bg.patch(palette.active_marker)),
+                Span::styled(visible_input, bg),
+                Span::styled(cursor, bg.patch(palette.status_accent)),
+            ];
+            if fill > 0 && color {
+                spans.push(Span::styled(" ".repeat(fill), bg));
+            }
+            Line::from(spans)
+        } else {
+            let compact = format!("{prompt}{sanitized}{cursor}");
+            Line::from(vec![
+                Span::raw(pad),
+                Span::styled(
+                    truncate_head(&compact, bar_width).into_owned(),
+                    palette.active_marker,
+                ),
+            ])
+        };
+        frame.render_widget(line, row(y));
+        y = y.saturating_add(1);
+    }
+
+    // Reserve 1 row for inline validation error when present.
+    let hint_limit = if state.custom_dns_error.is_some() {
+        body_bottom.saturating_sub(1).max(y)
+    } else {
+        body_bottom
+    };
+    for hint_line in &hint_lines {
+        if y >= hint_limit {
+            break;
+        }
+        let line = Line::from(vec![
+            Span::raw(pad),
+            Span::styled(hint_line.as_str(), palette.active_hint),
+        ]);
+        frame.render_widget(line, row(y));
+        y = y.saturating_add(1);
+    }
+
+    if let Some(err) = state.custom_dns_error.as_deref() {
+        if y < body_bottom {
+            let err_prefix = if color { "● " } else { "! " };
+            let err_budget =
+                width.saturating_sub(pad.len() + err_prefix.chars().count() + right_margin);
+            let msg = truncate_text(err, err_budget);
+            let line = Line::from(vec![
+                Span::raw(pad),
+                Span::styled(err_prefix, palette.danger_bold),
+                Span::styled(msg, palette.danger_bold),
+            ]);
+            frame.render_widget(line, row(y));
+            y = y.saturating_add(1);
+        }
+    }
+
+    let mut footer_y = bottom;
+    if show_footer && footer_y > y {
+        footer_y = footer_y.saturating_sub(1);
+        render_custom_dns_footer(frame, row(footer_y), ctx);
+    }
+    if show_bot_divider && footer_y > y {
+        footer_y = footer_y.saturating_sub(1);
+        render_divider(frame, row(footer_y), ctx);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_dns_picker_card(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1519,9 +1834,16 @@ fn render_dns_picker_card(
     palette: Palette,
     color: bool,
 ) {
-    let preset_count = u16::try_from(DNS_PRESETS.len()).unwrap_or(6);
-    // borders(2) + header(1) + top_div(1) + title(1) + gap(1) + presets(6) + gap(1) + hint(1) + bot_div(1) + footer(1)
-    let ideal_height = 2 + 1 + 1 + 1 + 1 + preset_count + 1 + 1 + 1 + 1;
+    if state.editing_custom_dns {
+        render_custom_dns_editor_card(
+            frame, area, card_width, padding, inset, state, palette, color,
+        );
+        return;
+    }
+
+    let item_count = u16::try_from(DNS_PICKER_ITEM_COUNT).unwrap_or(7);
+    // borders(2) + header(1) + top_div(1) + title(1) + gap(1) + items(7) + gap(1) + hint(1) + bot_div(1) + footer(1)
+    let ideal_height = 2 + 1 + 1 + 1 + 1 + item_count + 1 + 1 + 1 + 1;
     let card_height = ideal_height.min(area.height).max(5);
     let card_area = centered_rect(area, card_width, card_height);
     let block = Block::bordered()
@@ -1561,7 +1883,9 @@ fn render_dns_picker_card(
     let pad = if inset { " " } else { "" };
     let width = usize::from(inner.width);
     let right_margin = usize::from(inset);
-    let selected = state.dns_selected.min(DNS_PRESETS.len().saturating_sub(1));
+    let selected = state
+        .dns_selected
+        .min(DNS_PICKER_ITEM_COUNT.saturating_sub(1));
 
     if y < body_bottom {
         let current_label = format_dns_label(&state.configured_dns);
@@ -1576,12 +1900,12 @@ fn render_dns_picker_card(
         y = y.saturating_add(1);
     }
 
-    let remaining_for_presets = body_bottom.saturating_sub(y);
-    if remaining_for_presets >= preset_count + 2 && y < body_bottom {
+    let remaining_for_items = body_bottom.saturating_sub(y);
+    if remaining_for_items >= item_count + 2 && y < body_bottom {
         y = y.saturating_add(1);
     }
 
-    let show_hint = body_bottom.saturating_sub(y) > preset_count;
+    let show_hint = body_bottom.saturating_sub(y) > item_count;
     let list_bottom = if show_hint {
         body_bottom.saturating_sub(1)
     } else {
@@ -1593,20 +1917,14 @@ fn render_dns_picker_card(
     } else {
         (selected + 1).saturating_sub(visible_slots)
     };
+    let custom_active = is_custom_dns(&state.configured_dns);
+    let prefix_cols = if inset { 3usize } else { 2usize };
 
-    for (index, preset) in DNS_PRESETS
-        .iter()
-        .enumerate()
-        .skip(start_index)
-        .take(visible_slots)
-    {
+    for index in (start_index..DNS_PICKER_ITEM_COUNT).take(visible_slots) {
         if y >= list_bottom {
             break;
         }
         let is_selected = index == selected;
-        let is_active = preset
-            .addr
-            .eq_ignore_ascii_case(state.configured_dns.trim());
         let prefix = if is_selected {
             if inset {
                 " ▸ "
@@ -1619,12 +1937,11 @@ fn render_dns_picker_card(
             "  "
         };
         let badge = key_badge(index);
-        let active_tag = if is_active { " [Active]" } else { "" };
-        let label = format!("{:<19} {}", preset.name, preset.addr);
-        let used = prefix.len() + badge.len() + 1 + active_tag.len() + right_margin;
-        let budget = width.saturating_sub(used);
-        let display_label = truncate_text(&label, budget);
-
+        let title_style = if is_selected {
+            palette.active_title
+        } else {
+            palette.inactive_title
+        };
         let mut spans = vec![
             Span::styled(
                 prefix,
@@ -1635,7 +1952,7 @@ fn render_dns_picker_card(
                 },
             ),
             Span::styled(
-                badge,
+                badge.clone(),
                 if is_selected {
                     palette.active_badge
                 } else {
@@ -1643,19 +1960,79 @@ fn render_dns_picker_card(
                 },
             ),
             Span::raw(" "),
-            Span::styled(
-                display_label,
-                if is_selected {
-                    palette.active_title
-                } else {
-                    palette.inactive_title
-                },
-            ),
         ];
-        if is_active {
-            spans.push(Span::styled(active_tag, palette.status_active));
+
+        if let Some(preset) = DNS_PRESETS.get(index) {
+            let is_active = preset
+                .addr
+                .eq_ignore_ascii_case(state.configured_dns.trim());
+            let active_tag = if is_active { " [Active]" } else { "" };
+            let label = format!("{:<19} {}", preset.name, preset.addr);
+            let used = prefix_cols + badge.len() + 1 + active_tag.len() + right_margin;
+            let budget = width.saturating_sub(used);
+            let display_label = truncate_text(&label, budget).into_owned();
+            spans.push(Span::styled(display_label, title_style));
+            if is_active {
+                spans.push(Span::styled(active_tag, palette.status_active));
+            }
+        } else {
+            // [7] Custom DNS row
+            let active_tag = if custom_active { " [Active]" } else { "" };
+            let used = prefix_cols + badge.len() + 1 + active_tag.len() + right_margin;
+            let budget = width.saturating_sub(used);
+            if custom_active {
+                let short_full =
+                    shorten_custom_dns(&state.configured_dns, budget.saturating_sub(12));
+                if budget >= 20 + short_full.chars().count() || budget >= 42 {
+                    let val_budget = budget.saturating_sub(20);
+                    let display_val = shorten_custom_dns(&state.configured_dns, val_budget);
+                    let label = format!("{:<19} {display_val}", "Custom DNS");
+                    spans.push(Span::styled(label, title_style));
+                } else if budget >= 16 {
+                    let val_budget = budget.saturating_sub(12);
+                    let display_val = shorten_custom_dns(&state.configured_dns, val_budget);
+                    let label = format!("Custom DNS  {display_val}");
+                    spans.push(Span::styled(label, title_style));
+                } else {
+                    let label = truncate_text("Custom DNS", budget);
+                    spans.push(Span::styled(label, title_style));
+                }
+                spans.push(Span::styled(active_tag, palette.status_active));
+            } else {
+                let muted_style = if is_selected {
+                    palette.active_hint
+                } else {
+                    palette.inactive_hint
+                };
+                if budget >= 20 + CUSTOM_DNS_PLACEHOLDER.len() || budget >= 42 {
+                    let val_budget = budget.saturating_sub(20);
+                    spans.push(Span::styled(format!("{:<19} ", "Custom DNS"), title_style));
+                    spans.push(Span::styled(
+                        truncate_text(CUSTOM_DNS_PLACEHOLDER, val_budget),
+                        muted_style,
+                    ));
+                } else if budget >= 16 {
+                    let val_budget = budget.saturating_sub(12);
+                    spans.push(Span::styled("Custom DNS  ", title_style));
+                    spans.push(Span::styled(
+                        truncate_text(CUSTOM_DNS_PLACEHOLDER, val_budget),
+                        muted_style,
+                    ));
+                } else {
+                    spans.push(Span::styled(
+                        truncate_text("Custom DNS", budget),
+                        title_style,
+                    ));
+                }
+            }
         }
-        frame.render_widget(Line::from(spans), row(y));
+
+        let line = if is_selected {
+            Line::from(spans).style(palette.active_row)
+        } else {
+            Line::from(spans)
+        };
+        frame.render_widget(line, row(y));
         y = y.saturating_add(1);
     }
 
@@ -1663,7 +2040,10 @@ fn render_dns_picker_card(
         let hint_y = body_bottom.saturating_sub(1);
         let indent = if inset { "       " } else { "      " };
         let budget = width.saturating_sub(indent.len() + right_margin);
-        let hint = truncate_text(DNS_PRESETS[selected].hint, budget);
+        let raw_hint = DNS_PRESETS
+            .get(selected)
+            .map_or(CUSTOM_DNS_HINT, |preset| preset.hint);
+        let hint = truncate_text(raw_hint, budget);
         let line = Line::from(vec![
             Span::raw(indent),
             Span::styled(hint, palette.active_hint),
@@ -1682,6 +2062,56 @@ fn render_dns_picker_card(
     }
 }
 
+fn render_custom_dns_footer(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx) {
+    if area.is_empty() {
+        return;
+    }
+    let pad = if ctx.inset { " " } else { "" };
+    let key = ctx.palette.footer_key;
+    let text = ctx.palette.footer_text;
+    let width = usize::from(area.width);
+
+    let line = if width >= pad.len() * 2 + 54 {
+        Line::from(vec![
+            Span::raw(pad),
+            Span::styled("type IP or URL · ", text),
+            Span::styled("enter", key),
+            Span::styled(" apply · ", text),
+            Span::styled("ctrl+u", key),
+            Span::styled(" clear · ", text),
+            Span::styled("esc", key),
+            Span::styled(" back", text),
+        ])
+    } else if width >= pad.len() * 2 + 37 {
+        Line::from(vec![
+            Span::raw(pad),
+            Span::styled("enter", key),
+            Span::styled(" apply · ", text),
+            Span::styled("ctrl+u", key),
+            Span::styled(" clear · ", text),
+            Span::styled("esc", key),
+            Span::styled(" back", text),
+        ])
+    } else if width >= pad.len() * 2 + 22 {
+        Line::from(vec![
+            Span::raw(pad),
+            Span::styled("enter", key),
+            Span::styled(" · ", text),
+            Span::styled("^u", key),
+            Span::styled(" clear · ", text),
+            Span::styled("esc", key),
+        ])
+    } else {
+        Line::from(vec![
+            Span::raw(pad),
+            Span::styled("enter", key),
+            Span::styled(" · ", text),
+            Span::styled("esc", key),
+        ])
+    };
+    frame.render_widget(line, area);
+}
+
 fn render_dns_footer(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx) {
     if area.is_empty() {
         return;
@@ -1690,9 +2120,9 @@ fn render_dns_footer(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx) {
     let key = ctx.palette.footer_key;
     let text = ctx.palette.footer_text;
     let width = usize::from(area.width);
-    let range = range_label(DNS_PRESETS.len());
+    let range = range_label(DNS_PICKER_ITEM_COUNT);
 
-    let line = if width >= pad.len() * 2 + 46 + range.len() {
+    let line = if width >= pad.len() * 2 + 40 + range.len() {
         Line::from(vec![
             Span::raw(pad),
             Span::styled("↑↓", key),
@@ -1704,7 +2134,7 @@ fn render_dns_footer(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx) {
             Span::styled("esc", key),
             Span::styled(" back", text),
         ])
-    } else if width >= pad.len() * 2 + 24 + range.len() {
+    } else if width >= pad.len() * 2 + 19 + range.len() {
         Line::from(vec![
             Span::raw(pad),
             Span::styled("↑↓", key),
@@ -1986,6 +2416,22 @@ fn render_minimal(
             let prompt = truncate_text("Uninstall? [y/n]", usize::from(area.width));
             frame.render_widget(
                 Line::styled(prompt, palette.danger_bold),
+                Rect::new(area.x, area.y + 1, area.width, 1),
+            );
+        }
+        return;
+    }
+
+    if state.selecting_dns {
+        if area.height >= 2 {
+            let text = if state.editing_custom_dns {
+                let prompt = format!("DNS: {}▏", sanitize_inline(&state.custom_dns_input));
+                truncate_head(&prompt, usize::from(area.width)).into_owned()
+            } else {
+                truncate_text("Choose DNS [1-7]", usize::from(area.width)).into_owned()
+            };
+            frame.render_widget(
+                Line::styled(text, palette.active_title),
                 Rect::new(area.x, area.y + 1, area.width, 1),
             );
         }
@@ -2506,6 +2952,9 @@ mod tests {
             confirming_uninstall: false,
             selecting_dns: false,
             dns_selected: 0,
+            editing_custom_dns: false,
+            custom_dns_input: String::new(),
+            custom_dns_error: None,
             configured_dns: DNS_PRESETS[0].addr.to_string(),
             split_tunnel: SplitTunnelConfig::default(),
         };
@@ -2706,6 +3155,9 @@ mod tests {
             confirming_uninstall: false,
             selecting_dns: false,
             dns_selected: 0,
+            editing_custom_dns: false,
+            custom_dns_input: String::new(),
+            custom_dns_error: None,
             configured_dns: DNS_PRESETS[0].addr.to_string(),
             split_tunnel: SplitTunnelConfig::default(),
         }
@@ -2949,6 +3401,9 @@ mod tests {
             confirming_uninstall: false,
             selecting_dns: false,
             dns_selected: 0,
+            editing_custom_dns: false,
+            custom_dns_input: String::new(),
+            custom_dns_error: None,
             configured_dns: DNS_PRESETS[0].addr.to_string(),
             split_tunnel: SplitTunnelConfig::default(),
         };
@@ -3037,6 +3492,9 @@ mod tests {
             confirming_uninstall: false,
             selecting_dns: false,
             dns_selected: 0,
+            editing_custom_dns: false,
+            custom_dns_input: String::new(),
+            custom_dns_error: None,
             configured_dns: DNS_PRESETS[0].addr.to_string(),
             split_tunnel: SplitTunnelConfig::default(),
         };
@@ -3116,7 +3574,19 @@ mod tests {
         assert!(text.contains("Cloudflare"), "Cloudflare missing:\n{text}");
         assert!(text.contains("AdGuard"), "AdGuard missing:\n{text}");
         assert!(text.contains("94.140.14.14"), "AdGuard IP missing:\n{text}");
+        assert!(
+            text.contains("[7] Custom DNS"),
+            "[7] Custom DNS missing:\n{text}"
+        );
+        assert!(
+            text.contains("IP or https:// DoH URL"),
+            "Custom DNS muted placeholder missing:\n{text}"
+        );
         assert!(text.contains("[Active]"), "Active tag missing:\n{text}");
+        assert!(
+            text.contains("↑↓ move · 1-7 pick · enter apply · esc back"),
+            "DNS list footer missing:\n{text}"
+        );
 
         // Move down twice (Cloudflare -> Google -> AdGuard) and press Enter.
         assert_eq!(handle_key(&mut state, press(KeyCode::Down)), Action::Redraw);
@@ -3124,13 +3594,13 @@ mod tests {
         assert_eq!(state.dns_selected, 2);
         assert_eq!(
             handle_key(&mut state, press(KeyCode::Enter)),
-            Action::Finish(Choice::SetDns("94.140.14.14"))
+            Action::Finish(Choice::SetDns("94.140.14.14".to_string()))
         );
 
         // Digit '5' directly picks Quad9.
         assert_eq!(
             handle_key(&mut state, press(KeyCode::Char('5'))),
-            Action::Finish(Choice::SetDns("9.9.9.9"))
+            Action::Finish(Choice::SetDns("9.9.9.9".to_string()))
         );
 
         // Esc closes DNS picker back to main menu without exiting.
@@ -3142,6 +3612,272 @@ mod tests {
         for (w, h) in [(80, 24), (46, 18), (24, 12)] {
             let _ = render_state(w, h, &state, true);
             let _ = render_state(w, h, &state, false);
+        }
+    }
+
+    #[test]
+    fn custom_dns_picker_inline_input_validation_navigation_and_active_badge() {
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let type_str = |state: &mut UiState, s: &str| {
+            for ch in s.chars() {
+                assert_eq!(
+                    handle_key(state, KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)),
+                    Action::Redraw
+                );
+            }
+        };
+
+        // Start with built-in preset active -> [7] Custom DNS shows muted placeholder & hint.
+        let mut state = UiState::new_with_dns(&status_running_live(), None, "1.1.1.1");
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('d'))),
+            Action::Redraw
+        );
+        assert!(state.selecting_dns && !state.editing_custom_dns);
+        assert_eq!(state.dns_selected, 0);
+
+        // Move to row 7 via End and inspect hint text.
+        assert_eq!(handle_key(&mut state, press(KeyCode::End)), Action::Redraw);
+        assert_eq!(state.dns_selected, 6);
+        let list_buf = render_state(80, 24, &state, true);
+        let list_text = buffer_text(&list_buf);
+        assert!(
+            list_text.contains("[7] Custom DNS")
+                && list_text.contains("IP or https:// DoH URL")
+                && list_text.contains(CUSTOM_DNS_HINT),
+            "row 7 highlight & hint missing:\n{list_text}"
+        );
+
+        // Enter on row 7 opens empty custom DNS inline editor.
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Enter)),
+            Action::Redraw
+        );
+        assert!(state.selecting_dns && state.editing_custom_dns);
+        assert!(state.custom_dns_input.is_empty());
+
+        let editor_buf = render_state(80, 24, &state, true);
+        let editor_text = buffer_text(&editor_buf);
+        assert!(
+            editor_text.contains("Custom DNS: ▏"),
+            "editor prompt missing:\n{editor_text}"
+        );
+        assert!(
+            editor_text.contains("IPv4, IPv6, or https:// DoH URL"),
+            "editor hint missing:\n{editor_text}"
+        );
+        assert!(
+            editor_text.contains("type IP or URL · enter apply · ctrl+u clear · esc back"),
+            "editor footer missing:\n{editor_text}"
+        );
+        // Verify ice-blue focus accent on prompt & cursor.
+        let prompt_y = editor_text
+            .lines()
+            .position(|l| l.contains("Custom DNS: ▏"))
+            .expect("prompt row") as u16;
+        let cursor_x = (0..editor_buf.area.width)
+            .find(|&x| editor_buf[(x, prompt_y)].symbol() == "▏")
+            .expect("cursor cell");
+        assert_eq!(editor_buf[(cursor_x, prompt_y)].fg, ICE_BLUE);
+
+        // KeyEventKind::Release must be ignored in custom input mode (Windows ConPTY safety).
+        assert_eq!(
+            handle_key(
+                &mut state,
+                KeyEvent::new_with_kind(
+                    KeyCode::Char('7'),
+                    KeyModifiers::NONE,
+                    KeyEventKind::Release
+                )
+            ),
+            Action::Ignore
+        );
+        assert!(state.custom_dns_input.is_empty());
+
+        // Esc exits custom input mode back to the 7-item DNS picker (does NOT close picker).
+        assert_eq!(handle_key(&mut state, press(KeyCode::Esc)), Action::Redraw);
+        assert!(state.selecting_dns && !state.editing_custom_dns);
+        assert_eq!(state.dns_selected, 6);
+
+        // Digit '7' directly enters custom input mode.
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('7'))),
+            Action::Redraw
+        );
+        assert!(state.selecting_dns && state.editing_custom_dns);
+
+        // Invalid input is rejected with an inline red error line, and typing clears it.
+        type_str(&mut state, "not-a-valid-dns");
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Enter)),
+            Action::Redraw
+        );
+        assert!(state.editing_custom_dns);
+        assert!(state.custom_dns_error.is_some());
+        let err_buf = render_state(80, 24, &state, true);
+        let err_text = buffer_text(&err_buf);
+        assert!(
+            err_buf
+                .content()
+                .iter()
+                .any(|c| c.symbol() == "●" && c.fg == RED_DANGER),
+            "validation error should render in RED_DANGER:\n{err_text}"
+        );
+
+        // Ctrl+U clears input and error cleanly.
+        assert_eq!(
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)
+            ),
+            Action::Redraw
+        );
+        assert!(state.custom_dns_input.is_empty());
+        assert!(state.custom_dns_error.is_none());
+
+        // Typing a custom IPv4 + Backspace edit -> Enter validates and returns Choice::SetDns.
+        type_str(&mut state, "76.76.2.09");
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Backspace)),
+            Action::Redraw
+        );
+        assert_eq!(state.custom_dns_input, "76.76.2.0");
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Enter)),
+            Action::Finish(Choice::SetDns("76.76.2.0".to_string()))
+        );
+
+        // Typing a custom DoH URL -> Enter validates and returns normalized Choice::SetDns.
+        assert_eq!(
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)
+            ),
+            Action::Redraw
+        );
+        type_str(&mut state, "https://dns.nextdns.io/abc123");
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Enter)),
+            Action::Finish(Choice::SetDns("https://dns.nextdns.io/abc123".to_string()))
+        );
+
+        // Input is capped at 200 characters.
+        state.custom_dns_input = "a".repeat(MAX_CUSTOM_DNS_INPUT_CHARS);
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('z'))),
+            Action::Ignore
+        );
+        assert_eq!(state.custom_dns_input.len(), MAX_CUSTOM_DNS_INPUT_CHARS);
+    }
+
+    #[test]
+    fn custom_dns_active_badge_prefill_no_color_and_viewport_matrix() {
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        // Active custom IPv4 shows header `Custom (76.76.2.0)` and emerald `[Active]` on [7].
+        let mut ip_state = UiState::new_with_dns(&status_running_live(), None, "76.76.2.0");
+        assert_eq!(
+            handle_key(&mut ip_state, press(KeyCode::Char('d'))),
+            Action::Redraw
+        );
+        assert_eq!(ip_state.dns_selected, 6);
+        let ip_buf = render_state(80, 24, &ip_state, true);
+        let ip_text = buffer_text(&ip_buf);
+        assert!(
+            ip_text.contains("Choose DNS server · Custom (76.76.2.0)"),
+            "custom IP header missing:\n{ip_text}"
+        );
+        assert!(
+            ip_text.contains("[7] Custom DNS")
+                && ip_text.contains("76.76.2.0")
+                && ip_text.contains("[Active]"),
+            "custom IP row or [Active] missing:\n{ip_text}"
+        );
+        let row7_y = ip_text
+            .lines()
+            .position(|l| l.contains("[7] Custom DNS") && l.contains("[Active]"))
+            .expect("row 7 with [Active]") as u16;
+        let active_x = (0..ip_buf.area.width)
+            .find(|&x| {
+                ip_buf[(x, row7_y)].symbol() == "["
+                    && x + 1 < ip_buf.area.width
+                    && ip_buf[(x + 1, row7_y)].symbol() == "A"
+            })
+            .expect("[Active] start cell");
+        assert_eq!(ip_buf[(active_x, row7_y)].fg, EMERALD_ACTIVE);
+
+        // Active custom DoH URL shows shortened label and pre-fills full URL when editing.
+        let mut doh_state = UiState::new_with_dns(
+            &status_running_live(),
+            None,
+            "https://dns.nextdns.io/abc123",
+        );
+        assert_eq!(
+            handle_key(&mut doh_state, press(KeyCode::Char('d'))),
+            Action::Redraw
+        );
+        assert_eq!(doh_state.dns_selected, 6);
+        let doh_buf = render_state(80, 24, &doh_state, true);
+        let doh_text = buffer_text(&doh_buf);
+        assert!(
+            doh_text.contains("Choose DNS server · Custom (dns.nextdns.io/abc123)"),
+            "custom DoH header missing:\n{doh_text}"
+        );
+        assert!(
+            doh_text.contains("[7] Custom DNS")
+                && doh_text.contains("dns.nextdns.io/abc123")
+                && doh_text.contains("[Active]"),
+            "custom DoH row missing:\n{doh_text}"
+        );
+
+        // Entering edit mode pre-fills the full active custom DoH URL.
+        assert_eq!(
+            handle_key(&mut doh_state, press(KeyCode::Enter)),
+            Action::Redraw
+        );
+        assert!(doh_state.editing_custom_dns);
+        assert_eq!(doh_state.custom_dns_input, "https://dns.nextdns.io/abc123");
+
+        // NO_COLOR renders both 7-item list and custom editor (with error) with plain borders and zero RGB.
+        doh_state.custom_dns_error = Some("Enter a valid IP or https:// URL".to_string());
+        for editing in [false, true] {
+            doh_state.editing_custom_dns = editing;
+            for (w, h) in [(80, 24), (60, 24), (46, 18)] {
+                let no_color = render_state(w, h, &doh_state, false);
+                let nc_text = buffer_text(&no_color);
+                assert!(
+                    nc_text.contains('┌') && nc_text.contains('└') && !nc_text.contains('╭'),
+                    "NO_COLOR editing={editing} {w}x{h} must use plain border:\n{nc_text}"
+                );
+                assert!(
+                    no_color
+                        .content()
+                        .iter()
+                        .all(|c| c.fg == Color::Reset && c.bg == Color::Reset),
+                    "NO_COLOR editing={editing} {w}x{h} must not emit RGB colors"
+                );
+                if editing {
+                    assert!(
+                        nc_text.contains("! Enter a valid IP")
+                            || nc_text.contains("! Enter a valid"),
+                        "NO_COLOR error prefix missing at {w}x{h}:\n{nc_text}"
+                    );
+                } else {
+                    assert!(
+                        nc_text.contains("[7] Custom DNS"),
+                        "NO_COLOR list missing [7] at {w}x{h}:\n{nc_text}"
+                    );
+                }
+                // Color rendering at 46x18..80x24 must keep intact borders without panicking.
+                let color_buf = render_state(w, h, &doh_state, true);
+                let color_text = buffer_text(&color_buf);
+                assert!(color_text.contains('╭') && color_text.contains('╰'));
+            }
+            // Degenerate sizes must never panic.
+            for (w, h) in [(24, 12), (14, 5), (8, 3), (0, 0)] {
+                let _ = render_state(w, h, &doh_state, true);
+                let _ = render_state(w, h, &doh_state, false);
+            }
         }
     }
 

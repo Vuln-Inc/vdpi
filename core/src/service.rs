@@ -596,7 +596,7 @@ pub fn load_configured_dns(fallback: &str) -> String {
         if let Some(dns) = config_file::load_file_config(Some(&sys_path), true)
             .ok()
             .and_then(|(_, file_cfg)| file_cfg.dns_addr)
-            .filter(|s| !s.trim().is_empty())
+            .and_then(|s| vdpi_core::dns::validate_custom_dns_input(&s).ok())
         {
             return dns;
         }
@@ -608,7 +608,7 @@ pub fn load_configured_dns(fallback: &str) -> String {
         if let Some(dns) = config_file::load_file_config(Some(&sys_path), true)
             .ok()
             .and_then(|(_, file_cfg)| file_cfg.dns_addr)
-            .filter(|s| !s.trim().is_empty())
+            .and_then(|s| vdpi_core::dns::validate_custom_dns_input(&s).ok())
         {
             return dns;
         }
@@ -620,7 +620,7 @@ pub fn load_configured_dns(fallback: &str) -> String {
         if let Some(dns) = config_file::load_file_config(Some(&sys_path), true)
             .ok()
             .and_then(|(_, file_cfg)| file_cfg.dns_addr)
-            .filter(|s| !s.trim().is_empty())
+            .and_then(|s| vdpi_core::dns::validate_custom_dns_input(&s).ok())
         {
             return dns;
         }
@@ -630,7 +630,7 @@ pub fn load_configured_dns(fallback: &str) -> String {
     if let Some(dns) = config_file::load_file_config(Some(&user_path), false)
         .ok()
         .and_then(|(_, file_cfg)| file_cfg.dns_addr)
-        .filter(|s| !s.trim().is_empty())
+        .and_then(|s| vdpi_core::dns::validate_custom_dns_input(&s).ok())
     {
         return dns;
     }
@@ -638,11 +638,11 @@ pub fn load_configured_dns(fallback: &str) -> String {
     if let Some(dns) = config_file::load_file_config(Some(&sys_path), true)
         .ok()
         .and_then(|(_, file_cfg)| file_cfg.dns_addr)
-        .filter(|s| !s.trim().is_empty())
+        .and_then(|s| vdpi_core::dns::validate_custom_dns_input(&s).ok())
     {
         return dns;
     }
-    fallback.to_string()
+    vdpi_core::dns::validate_custom_dns_input(fallback).unwrap_or_else(|_| fallback.to_string())
 }
 
 fn extract_split_tunnel_from_file_config(
@@ -1268,9 +1268,11 @@ pub fn build_service_cli_args(cfg: &RuntimeConfig) -> Vec<String> {
         args.push(mode_str.to_string());
     }
 
-    if cfg.dns_addr != "1.1.1.1" {
+    let normalized_dns = vdpi_core::dns::validate_custom_dns_input(&cfg.dns_addr)
+        .unwrap_or_else(|_| cfg.dns_addr.trim().to_string());
+    if !normalized_dns.is_empty() && normalized_dns != "1.1.1.1" {
         args.push("--dns".to_string());
-        args.push(cfg.dns_addr.clone());
+        args.push(normalized_dns);
     }
     if cfg.dns_port != 53 {
         args.push("--dns-port".to_string());
@@ -1523,7 +1525,10 @@ fn file_config_from_runtime(cfg: &RuntimeConfig) -> FileConfig {
         mode: Some(cfg.mode),
         doh: Some(cfg.enable_doh),
         block_quic: Some(cfg.block_quic),
-        dns_addr: Some(cfg.dns_addr.clone()),
+        dns_addr: Some(
+            vdpi_core::dns::validate_custom_dns_input(&cfg.dns_addr)
+                .unwrap_or_else(|_| cfg.dns_addr.trim().to_string()),
+        ),
         bypass_domains: (!cfg.bypass_domains.is_empty()).then(|| cfg.bypass_domains.clone()),
         include_domains: (!cfg.patterns.is_empty()).then(|| cfg.patterns.clone()),
         split_tunnel_mode: cfg
@@ -1562,7 +1567,9 @@ fn apply_file_config_to_runtime(base: &RuntimeConfig, file_cfg: &FileConfig) -> 
         out.block_quic = block_quic;
     }
     if let Some(ref dns_addr) = file_cfg.dns_addr {
-        out.dns_addr.clone_from(dns_addr);
+        if let Ok(validated) = vdpi_core::dns::validate_custom_dns_input(dns_addr) {
+            out.dns_addr = validated;
+        }
     }
     if let Some(ref bypass) = file_cfg.bypass_domains {
         out.bypass_domains.clone_from(bypass);
@@ -1760,7 +1767,9 @@ pub(crate) fn migrate_legacy_service_cmdline_to_file_config(cmdline: &str) -> Fi
             }
             "--dns" | "--dns-addr" => {
                 if let Some(dns) = next {
-                    cfg.dns_addr = Some(dns.to_string());
+                    if let Ok(validated) = vdpi_core::dns::validate_custom_dns_input(dns) {
+                        cfg.dns_addr = Some(validated);
+                    }
                     i += 2;
                     continue;
                 }
@@ -2019,26 +2028,30 @@ fn copy_verified_sibling_wintun_with_backup(
     bin_dir: &Path,
     retain_backup: bool,
 ) -> Result<(bool, Option<ReplacedFileBackup>)> {
-    let src_wintun = match crate::platform::windows_tun::find_verified_wintun_dll() {
-        Ok(path) => path,
-        Err(err) => {
-            // Distinguish genuinely absent wintun.dll (allowed for Proxy installs) from
-            // a present DLL that failed SHA-256 verification (always fatal).
-            let any_candidate_present = std::env::current_exe().ok().is_some_and(|exe| {
-                let canonical = fs::canonicalize(&exe).ok();
-                crate::platform::windows_tun::resolve_wintun_dll_candidates(
-                    &exe,
-                    canonical.as_deref(),
-                )
-                .into_iter()
-                .any(|cand| cand.is_file())
-            });
-            if any_candidate_present {
-                return Err(err);
-            }
-            return Ok((false, None));
-        }
+    let Ok(current_exe) = std::env::current_exe() else {
+        return Ok((false, None));
     };
+    copy_verified_sibling_wintun_from_exe_with_backup(&current_exe, bin_dir, retain_backup)
+}
+
+#[cfg(target_os = "windows")]
+fn copy_verified_sibling_wintun_from_exe_with_backup(
+    current_exe: &Path,
+    bin_dir: &Path,
+    retain_backup: bool,
+) -> Result<(bool, Option<ReplacedFileBackup>)> {
+    let canonical = fs::canonicalize(current_exe).ok();
+    let Some(src_wintun) = crate::platform::windows_tun::resolve_wintun_dll_candidates(
+        current_exe,
+        canonical.as_deref(),
+    )
+    .into_iter()
+    .find(|cand| cand.is_file()) else {
+        // No loose sibling wintun.dll next to current_exe; vdpi.exe embeds wintun.dll directly.
+        return Ok((false, None));
+    };
+    let expected_sha256 = crate::platform::windows_tun::expected_wintun_dll_sha256()?;
+    crate::platform::windows_tun::verify_wintun_dll_sha256(&src_wintun, expected_sha256)?;
 
     let target_wintun = bin_dir.join("wintun.dll");
     let same_file = match (
@@ -3110,7 +3123,7 @@ fn switch_service_engine_impl(
             stop_windows_service_if_running,
         };
         use crate::platform::windows_tun::{
-            find_verified_wintun_dll, verify_wintun_dll_sha256, WINTUN_DLL_AMD64_SHA256,
+            expected_wintun_dll_sha256, find_verified_wintun_dll, verify_wintun_dll_sha256,
             WINTUN_VERSION,
         };
 
@@ -3160,25 +3173,23 @@ fn switch_service_engine_impl(
             let target_wintun = bin_dir.join("wintun.dll");
 
             if target == EngineMode::Tun {
-                if let Err(sibling_err) = find_verified_wintun_dll() {
-                    if !target_wintun.is_file() {
-                        bail!(
-                            "cannot switch Windows service to TUN mode: {} is missing ({sibling_err}). \
-                             Place the verified amd64 wintun.dll (v{WINTUN_VERSION}) in {} or reinstall vdpi.",
-                            target_wintun.display(),
-                            bin_dir.display()
-                        );
-                    }
-                    verify_wintun_dll_sha256(&target_wintun, WINTUN_DLL_AMD64_SHA256).with_context(
+                let expected_sha256 = expected_wintun_dll_sha256()?;
+                if target_wintun.is_file() {
+                    verify_wintun_dll_sha256(&target_wintun, expected_sha256).with_context(
                         || {
                             format!(
                                 "cannot switch Windows service to TUN mode: {} failed SHA-256 verification; \
-                                 replace it with the verified amd64 wintun.dll (v{WINTUN_VERSION}) or reinstall vdpi",
+                                 remove or replace it with the verified wintun.dll (v{WINTUN_VERSION}) or reinstall vdpi",
                                 target_wintun.display()
                             )
                         },
                     )?;
                 }
+                find_verified_wintun_dll().with_context(|| {
+                    format!(
+                        "cannot switch Windows service to TUN mode: verified wintun.dll (v{WINTUN_VERSION}) is unavailable"
+                    )
+                })?;
             }
 
             let was_running = matches!(svc.state, "RUNNING" | "START_PENDING");
@@ -3187,23 +3198,18 @@ fn switch_service_engine_impl(
 
             if target == EngineMode::Tun {
                 let _ = copy_verified_sibling_wintun(&bin_dir)?;
-                if !target_wintun.is_file() {
-                    bail!(
-                        "cannot switch Windows service to TUN mode: {} is missing. \
-                         Place the verified amd64 wintun.dll (v{WINTUN_VERSION}) in {} or reinstall vdpi.",
-                        target_wintun.display(),
-                        bin_dir.display()
-                    );
+                if target_wintun.is_file() {
+                    let expected_sha256 = expected_wintun_dll_sha256()?;
+                    verify_wintun_dll_sha256(&target_wintun, expected_sha256).with_context(
+                        || {
+                            format!(
+                                "cannot switch Windows service to TUN mode: {} failed SHA-256 verification; \
+                                 remove or replace it with the verified wintun.dll (v{WINTUN_VERSION}) or reinstall vdpi",
+                                target_wintun.display()
+                            )
+                        },
+                    )?;
                 }
-                verify_wintun_dll_sha256(&target_wintun, WINTUN_DLL_AMD64_SHA256).with_context(
-                    || {
-                        format!(
-                            "cannot switch Windows service to TUN mode: {} failed SHA-256 verification; \
-                             replace it with the verified amd64 wintun.dll (v{WINTUN_VERSION}) or reinstall vdpi",
-                            target_wintun.display()
-                        )
-                    },
-                )?;
                 clear_all_system_proxies()?;
             }
 
@@ -3556,10 +3562,8 @@ pub fn set_service_dns_quiet(dns_addr: &str, cfg: &RuntimeConfig) -> Result<()> 
 }
 
 fn set_service_dns_impl(dns_addr: &str, cfg: &RuntimeConfig, verbose: bool) -> Result<()> {
-    let trimmed = dns_addr.trim();
-    let mut validator = config_file::FileConfig::default();
-    config_file::set_config_key(&mut validator, "dns_addr", trimmed)?;
-    let validated = validator.dns_addr.unwrap_or_else(|| trimmed.to_string());
+    let validated =
+        vdpi_core::dns::validate_custom_dns_input(dns_addr).map_err(|msg| anyhow::anyhow!(msg))?;
 
     #[cfg(target_os = "windows")]
     {
@@ -6879,5 +6883,145 @@ mod tests {
         let fresh_proxy = build_unix_install_sudo_args(&cfg, false);
         assert!(fresh_proxy.iter().any(|a| a == "--proxy"));
         assert_eq!(fresh_proxy.last().map(String::as_str), Some("install"));
+    }
+
+    #[test]
+    fn custom_dns_ipv4_ipv6_and_doh_roundtrip_across_manifests_and_config() {
+        let unique = format!(
+            "vdpi-custom-dns-service-test-{}-{}",
+            std::process::id(),
+            unix_now_secs()
+        );
+        let root = std::env::temp_dir().join(unique);
+        fs::create_dir_all(&root).expect("create temp dir");
+
+        let valid_cases = [
+            "76.76.2.0",
+            "2606:4700:4700::1111",
+            "https://dns.nextdns.io/abc123",
+            "https://freedns.controld.com/p2",
+            "https://dns.example.com:8443/dns-query",
+        ];
+
+        for (idx, dns) in valid_cases.iter().enumerate() {
+            let mut cfg = CliArgs::parse_from_iter(["vdpi", "--tun", "--dns", dns])
+                .expect("CLI should parse custom DNS in TUN mode")
+                .into_runtime_config();
+            assert_eq!(cfg.engine, EngineMode::Tun);
+            assert_eq!(cfg.dns_addr, *dns);
+
+            // CLI service args must emit `--dns <value>` verbatim.
+            let cli_args = build_service_cli_args(&cfg);
+            let dns_idx = cli_args
+                .iter()
+                .position(|a| a == "--dns")
+                .expect("--dns flag missing");
+            assert_eq!(cli_args.get(dns_idx + 1).map(String::as_str), Some(*dns));
+
+            // Windows service binPath round-trip (TUN mode + custom DoH URL never parses as Ipv4Addr).
+            let win_bin = build_windows_service_bin_path(
+                Path::new(r"C:\Program Files\vdpi\bin\vdpi.exe"),
+                &cfg,
+            );
+            assert!(
+                win_bin.contains(&format!("--dns {dns}")),
+                "Windows binPath missing custom DNS '{dns}': {win_bin}"
+            );
+            let migrated = migrate_legacy_service_cmdline_to_file_config(&win_bin);
+            assert_eq!(migrated.engine, Some(EngineMode::Tun));
+            assert_eq!(migrated.dns_addr.as_deref(), Some(*dns));
+
+            // macOS LaunchDaemon and LaunchAgent plists.
+            let daemon_plist = generate_launch_daemon_plist(Path::new(UNIX_SYSTEM_BIN_PATH), &cfg);
+            assert!(daemon_plist.contains("<string>--dns</string>"));
+            assert!(daemon_plist.contains(&format!("<string>{}</string>", xml_escape(dns))));
+            let agent_plist =
+                generate_launch_agent_plist(Path::new("/Users/test/.vdpi/bin/vdpi"), &cfg);
+            assert!(agent_plist.contains("<string>--dns</string>"));
+            assert!(agent_plist.contains(&format!("<string>{}</string>", xml_escape(dns))));
+
+            // Linux systemd system and user units.
+            let sys_unit = generate_systemd_system_unit(Path::new(UNIX_SYSTEM_BIN_PATH), &cfg);
+            assert!(sys_unit.contains(&format!("\"--dns\" {}", quote_systemd_arg(dns))));
+            let user_unit = generate_systemd_unit(Path::new("/home/test/.vdpi/bin/vdpi"), &cfg);
+            assert!(user_unit.contains(&format!("\"--dns\" {}", quote_systemd_arg(dns))));
+
+            // FileConfig TOML persistence and runtime re-hydration round-trip.
+            let file_cfg = file_config_from_runtime(&cfg);
+            assert_eq!(file_cfg.dns_addr.as_deref(), Some(*dns));
+            let cfg_path = root.join(format!("config-{idx}.toml"));
+            config_file::save_file_config_atomic(&cfg_path, &file_cfg)
+                .expect("save custom DNS config");
+            let (_, reloaded) =
+                config_file::load_file_config(Some(&cfg_path), true).expect("reload custom DNS");
+            assert_eq!(reloaded.dns_addr.as_deref(), Some(*dns));
+
+            let fresh = CliArgs::parse_from_iter(["vdpi"])
+                .unwrap()
+                .into_runtime_config();
+            let applied = apply_file_config_to_runtime(&fresh, &reloaded);
+            assert_eq!(applied.engine, EngineMode::Tun);
+            assert_eq!(applied.dns_addr, *dns);
+
+            // Proxy mode also preserves the exact custom DNS argument.
+            cfg.engine = EngineMode::Proxy;
+            let proxy_args = build_service_cli_args(&cfg);
+            let proxy_dns_idx = proxy_args
+                .iter()
+                .position(|a| a == "--dns")
+                .expect("proxy --dns flag missing");
+            assert_eq!(
+                proxy_args.get(proxy_dns_idx + 1).map(String::as_str),
+                Some(*dns)
+            );
+        }
+
+        // set_service_dns_quiet must reject invalid DNS strings up front before touching files/services.
+        let base_cfg = CliArgs::parse_from_iter(["vdpi", "--tun"])
+            .unwrap()
+            .into_runtime_config();
+        for bad in ["", "   ", "http://dns.nextdns.io/abc123", "not-a-dns"] {
+            assert!(
+                set_service_dns_quiet(bad, &base_cfg).is_err(),
+                "set_service_dns_quiet should reject invalid DNS {bad:?}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn sibling_wintun_copy_succeeds_without_loose_dll_and_rejects_tampered_sibling() {
+        let unique = format!(
+            "vdpi-wintun-sibling-test-{}-{}",
+            std::process::id(),
+            unix_now_secs()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let src_dir = root.join("src");
+        let dst_dir = root.join("dst");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+        fs::create_dir_all(&dst_dir).expect("create dst dir");
+
+        let fake_exe = src_dir.join("vdpi.exe");
+        fs::write(&fake_exe, b"fake-exe").expect("write fake exe");
+
+        // No loose wintun.dll next to current_exe: must succeed with (false, None) and never fail.
+        let (copied, backup) =
+            copy_verified_sibling_wintun_from_exe_with_backup(&fake_exe, &dst_dir, false)
+                .expect("missing loose wintun.dll must never fail install");
+        assert!(!copied);
+        assert!(backup.is_none());
+        assert!(!dst_dir.join("wintun.dll").exists());
+
+        // Present but tampered sibling wintun.dll must fail SHA-256 verification.
+        fs::write(src_dir.join("wintun.dll"), b"tampered-bytes").expect("write tampered dll");
+        assert!(
+            copy_verified_sibling_wintun_from_exe_with_backup(&fake_exe, &dst_dir, false).is_err(),
+            "tampered loose sibling wintun.dll must be rejected"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

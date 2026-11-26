@@ -253,6 +253,7 @@ pub struct DashboardInfo {
     pub engine: DashboardEngine,
     pub mode: DesyncMode,
     pub enable_doh: bool,
+    pub dns_addr: Option<String>,
 }
 
 /// Live telemetry snapshot returned by a remote-attach probe callback for
@@ -264,6 +265,7 @@ pub struct AttachedTelemetry {
     pub engine: DashboardEngine,
     pub mode: DesyncMode,
     pub doh: bool,
+    pub dns_addr: Option<String>,
     pub block_quic: bool,
     pub rss_kb: Option<u64>,
     pub isp_stage: Option<String>,
@@ -512,6 +514,9 @@ impl DashboardState {
         self.info.engine = sample.engine;
         self.info.mode = sample.mode;
         self.info.enable_doh = sample.doh;
+        if sample.dns_addr.is_some() {
+            self.info.dns_addr = normalize_opt_string(sample.dns_addr);
+        }
         self.rss_kb = sample.rss_kb;
         self.isp_stage = normalize_opt_string(sample.isp_stage);
         self.remote_version = normalize_opt_string(sample.version).and_then(|v| {
@@ -961,11 +966,8 @@ impl AttachedActivityTracker {
 
         let engine_summary = format_engine_summary(&initial_info.engine);
         let mode = format_desync_mode(initial_info.mode);
-        let dns = if initial_info.enable_doh {
-            "DoH"
-        } else {
-            "UDP"
-        };
+        let (dns, _) =
+            format_dashboard_dns_tag(initial_info.dns_addr.as_deref(), initial_info.enable_doh);
         let mut startup =
             format!("attached to live vdpi daemon · {engine_summary} · {mode} · {dns}");
         if let Some(stage) = initial_isp_stage.map(str::trim).filter(|s| !s.is_empty()) {
@@ -1819,7 +1821,11 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
         .as_deref()
         .unwrap_or(env!("CARGO_PKG_VERSION"));
     let mode = format_desync_mode(state.info.mode);
-    let dns = if state.info.enable_doh { "DoH" } else { "UDP" };
+    let (dns_full, dns_short) =
+        format_dashboard_dns_tag(state.info.dns_addr.as_deref(), state.info.enable_doh);
+    let dns_full_len = dns_full.chars().count();
+    let dns_short_len = dns_short.chars().count();
+    let has_custom_dns_tag = dns_full != dns_short;
     let uptime = format_uptime(state.started_at.elapsed());
 
     let w = inner.width as usize;
@@ -1910,7 +1916,7 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
                 + 3
                 + mode.len()
                 + 3
-                + dns.len()
+                + dns_full_len
                 + 3
                 + "Uptime ".len()
                 + uptime.len();
@@ -1922,10 +1928,12 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
                 + 3
                 + mode.len()
                 + 3
-                + dns.len()
+                + dns_full_len
                 + 3
                 + "Uptime ".len()
                 + uptime.len();
+            let compact_dns_len =
+                head_len + 3 + primary.len() + 3 + mode.len() + 3 + dns_full_len + 3 + uptime.len();
             let compact_len = head_len
                 + 3
                 + primary.len()
@@ -1933,7 +1941,7 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
                 + 3
                 + mode.len()
                 + 1
-                + dns.len()
+                + dns_short_len
                 + 3
                 + uptime.len();
 
@@ -1947,7 +1955,7 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
                     spans.push(Span::styled(sa, p.text));
                 }
                 spans.push(sep.clone());
-                spans.push(Span::styled(format!("{mode} · {dns}"), p.text));
+                spans.push(Span::styled(format!("{mode} · {dns_full}"), p.text));
                 spans.push(sep);
                 spans.push(Span::styled("Uptime ", p.label));
                 spans.push(Span::styled(uptime, p.text));
@@ -1961,9 +1969,16 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
                     spans.push(Span::styled(sa, p.text));
                 }
                 spans.push(sep.clone());
-                spans.push(Span::styled(format!("{mode} · {dns}"), p.text));
+                spans.push(Span::styled(format!("{mode} · {dns_full}"), p.text));
                 spans.push(sep);
                 spans.push(Span::styled("Uptime ", p.label));
+                spans.push(Span::styled(uptime, p.text));
+            } else if has_custom_dns_tag && w >= compact_dns_len {
+                spans.push(sep.clone());
+                spans.push(Span::styled(primary, p.text));
+                spans.push(sep.clone());
+                spans.push(Span::styled(format!("{mode} · {dns_full}"), p.label));
+                spans.push(sep);
                 spans.push(Span::styled(uptime, p.text));
             } else if w >= compact_len {
                 spans.push(sep.clone());
@@ -1974,14 +1989,28 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
                     spans.push(Span::styled(sa, p.text));
                 }
                 spans.push(sep.clone());
-                spans.push(Span::styled(format!("{mode}/{dns}"), p.label));
+                spans.push(Span::styled(format!("{mode}/{dns_short}"), p.label));
                 spans.push(sep);
                 spans.push(Span::styled(uptime, p.text));
             } else {
-                spans.push(sep.clone());
-                spans.push(Span::styled(primary, p.text));
-                spans.push(sep);
-                spans.push(Span::styled(uptime, p.text));
+                let min_with_primary = head_len + 3 + primary.len() + 3 + uptime.len();
+                if w >= min_with_primary {
+                    spans.push(sep.clone());
+                    spans.push(Span::styled(primary, p.text));
+                    spans.push(sep);
+                    spans.push(Span::styled(uptime, p.text));
+                } else {
+                    let rem = w.saturating_sub(head_len + 3 + 3 + uptime.len());
+                    if rem > 0 {
+                        spans.push(sep.clone());
+                        spans.push(Span::styled(truncate_chars(&primary, rem), p.text));
+                        spans.push(sep);
+                        spans.push(Span::styled(uptime, p.text));
+                    } else if w >= head_len + 3 + uptime.len() {
+                        spans.push(sep);
+                        spans.push(Span::styled(uptime, p.text));
+                    }
+                }
             }
         }
         DashboardEngine::Tun {
@@ -2014,7 +2043,7 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
                 + 3
                 + mode.len()
                 + 3
-                + dns.len()
+                + dns_full_len
                 + 3
                 + "Uptime ".len()
                 + uptime.len();
@@ -2027,7 +2056,18 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
                 + 3
                 + mode.len()
                 + 1
-                + dns.len()
+                + dns_full_len
+                + 3
+                + uptime.len();
+            let compact_dns_len = head_len
+                + 3
+                + "TUN ".len()
+                + iface_chars
+                + vpn_extra
+                + 3
+                + mode.len()
+                + 1
+                + dns_full_len
                 + 3
                 + uptime.len();
             let compact_len = head_len
@@ -2038,7 +2078,7 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
                 + 3
                 + mode.len()
                 + 1
-                + dns.len()
+                + dns_short_len
                 + 3
                 + uptime.len();
 
@@ -2054,7 +2094,7 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
                     spans.push(Span::styled(badge, p.amber));
                 }
                 spans.push(sep.clone());
-                spans.push(Span::styled(format!("{mode} · {dns}"), p.text));
+                spans.push(Span::styled(format!("{mode} · {dns_full}"), p.text));
                 spans.push(sep);
                 spans.push(Span::styled("Uptime ", p.label));
                 spans.push(Span::styled(uptime, p.text));
@@ -2070,7 +2110,19 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
                     spans.push(Span::styled(badge, p.amber));
                 }
                 spans.push(sep.clone());
-                spans.push(Span::styled(format!("{mode}/{dns}"), p.label));
+                spans.push(Span::styled(format!("{mode}/{dns_full}"), p.label));
+                spans.push(sep);
+                spans.push(Span::styled(uptime, p.text));
+            } else if has_custom_dns_tag && w >= compact_dns_len {
+                spans.push(sep.clone());
+                spans.push(Span::styled("TUN ", p.label));
+                spans.push(Span::styled(iface.to_string(), p.text));
+                if let Some(badge) = vpn_badge {
+                    spans.push(sep.clone());
+                    spans.push(Span::styled(badge, p.amber));
+                }
+                spans.push(sep.clone());
+                spans.push(Span::styled(format!("{mode}/{dns_full}"), p.label));
                 spans.push(sep);
                 spans.push(Span::styled(uptime, p.text));
             } else if w >= compact_len {
@@ -2082,31 +2134,45 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
                     spans.push(Span::styled(badge, p.amber));
                 }
                 spans.push(sep.clone());
-                spans.push(Span::styled(format!("{mode}/{dns}"), p.label));
+                spans.push(Span::styled(format!("{mode}/{dns_short}"), p.label));
                 spans.push(sep);
                 spans.push(Span::styled(uptime, p.text));
             } else {
-                spans.push(sep.clone());
-                spans.push(Span::styled("TUN ", p.label));
-                spans.push(Span::styled(iface.to_string(), p.text));
-                if let Some(full_badge) = vpn_badge {
-                    let base_len = head_len + 3 + "TUN ".len() + iface_chars + 3 + uptime.len();
-                    let full_with_badge = base_len + 3 + full_badge.chars().count();
-                    let compact_with_badge = base_len + 3 + "[VPN]".len();
-                    let chosen_badge = if w >= full_with_badge {
-                        Some(full_badge)
-                    } else if w >= compact_with_badge {
-                        Some("[VPN]".to_string())
-                    } else {
-                        None
-                    };
-                    if let Some(badge_text) = chosen_badge {
+                let base_len = head_len + 3 + "TUN ".len() + iface_chars + 3 + uptime.len();
+                if w >= base_len {
+                    spans.push(sep.clone());
+                    spans.push(Span::styled("TUN ", p.label));
+                    spans.push(Span::styled(iface.to_string(), p.text));
+                    if let Some(full_badge) = vpn_badge {
+                        let full_with_badge = base_len + 3 + full_badge.chars().count();
+                        let compact_with_badge = base_len + 3 + "[VPN]".len();
+                        let chosen_badge = if w >= full_with_badge {
+                            Some(full_badge)
+                        } else if w >= compact_with_badge {
+                            Some("[VPN]".to_string())
+                        } else {
+                            None
+                        };
+                        if let Some(badge_text) = chosen_badge {
+                            spans.push(sep.clone());
+                            spans.push(Span::styled(badge_text, p.amber));
+                        }
+                    }
+                    spans.push(sep);
+                    spans.push(Span::styled(uptime, p.text));
+                } else {
+                    let rem = w.saturating_sub(head_len + 3 + "TUN ".len() + 3 + uptime.len());
+                    if rem > 0 {
                         spans.push(sep.clone());
-                        spans.push(Span::styled(badge_text, p.amber));
+                        spans.push(Span::styled("TUN ", p.label));
+                        spans.push(Span::styled(truncate_chars(iface, rem), p.text));
+                        spans.push(sep);
+                        spans.push(Span::styled(uptime, p.text));
+                    } else if w >= head_len + 3 + uptime.len() {
+                        spans.push(sep);
+                        spans.push(Span::styled(uptime, p.text));
                     }
                 }
-                spans.push(sep);
-                spans.push(Span::styled(uptime, p.text));
             }
         }
     }
@@ -2229,7 +2295,9 @@ fn render_stats_panel(frame: &mut Frame<'_>, area: Rect, state: &DashboardState)
                 ),
                 ("QUIC Blocked", snap.quic_blocked.to_string(), p.text),
                 (
-                    if state.info.enable_doh {
+                    if state.info.enable_doh
+                        || state.info.dns_addr.as_deref().is_some_and(is_doh_url)
+                    {
                         "DoH Queries"
                     } else {
                         "DNS Queries"
@@ -2791,6 +2859,43 @@ fn format_rss_kb(rss_kb: u64) -> String {
     }
 }
 
+const MAX_DASHBOARD_DNS_HOST_CHARS: usize = 24;
+
+fn is_doh_url(addr: &str) -> bool {
+    let trimmed = addr.trim();
+    trimmed
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+}
+
+fn format_dashboard_dns_tag(dns_addr: Option<&str>, enable_doh: bool) -> (String, &'static str) {
+    let trimmed = dns_addr.map(str::trim).filter(|s| !s.is_empty());
+    let doh_url = trimmed.is_some_and(is_doh_url);
+    let short = if enable_doh || doh_url { "DoH" } else { "UDP" };
+    let Some(raw) = trimmed else {
+        return (short.to_string(), short);
+    };
+    if raw == "1.1.1.1" {
+        return (short.to_string(), short);
+    }
+    if doh_url {
+        let rest = &raw[8..];
+        let authority = rest
+            .split(['/', '?', '#'])
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(rest.trim_end_matches('/'));
+        let compact = truncate_chars(authority, MAX_DASHBOARD_DNS_HOST_CHARS);
+        if compact.is_empty() {
+            return ("DoH".to_string(), "DoH");
+        }
+        return (format!("DoH ({compact})"), "DoH");
+    }
+    let compact = truncate_chars(raw, MAX_DASHBOARD_DNS_HOST_CHARS);
+    (format!("{short} ({compact})"), short)
+}
+
 fn truncate_chars(text: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
@@ -2821,6 +2926,7 @@ mod tests {
             },
             mode: DesyncMode::Combo,
             enable_doh: true,
+            dns_addr: None,
         }
     }
 
@@ -2833,6 +2939,7 @@ mod tests {
             },
             mode: DesyncMode::Combo,
             enable_doh: true,
+            dns_addr: None,
         }
     }
 
@@ -3837,6 +3944,7 @@ mod tests {
                 engine: sample_info().engine,
                 mode: DesyncMode::Combo,
                 doh: true,
+                dns_addr: None,
                 block_quic: true,
                 rss_kb: Some(30 * 1024),
                 isp_stage: Some("OobSniDesync".to_string()),
@@ -4090,6 +4198,7 @@ mod tests {
             engine: sample_tun_info(Some("WireGuard")).engine,
             mode: DesyncMode::TlsRecord,
             doh: false,
+            dns_addr: None,
             block_quic: true,
             rss_kb: Some(31 * 1024),
             isp_stage: Some("OobSniDesync".to_string()),
@@ -4187,5 +4296,96 @@ mod tests {
         assert_eq!(format_rss_kb(29 * 1024), "29 MB");
         assert_eq!(format_rss_kb(29 * 1024 + 511), "29 MB");
         assert_eq!(format_rss_kb(1_536 * 1024), "1.5 GB");
+    }
+
+    #[test]
+    fn renders_long_custom_doh_urls_without_breaking_borders_from_46x18_to_80x24() {
+        assert_eq!(
+            format_dashboard_dns_tag(Some("1.1.1.1"), true),
+            ("DoH".to_string(), "DoH")
+        );
+        assert_eq!(
+            format_dashboard_dns_tag(Some("https://dns.nextdns.io/abc123/my-profile"), true),
+            ("DoH (dns.nextdns.io)".to_string(), "DoH")
+        );
+        let ultra_long_doh =
+            "https://very-long-custom-doh-resolver-subdomain.enterprise.example.com/abc123/my-profile?token=secret";
+        let (ultra_full, ultra_short) = format_dashboard_dns_tag(Some(ultra_long_doh), true);
+        assert_eq!(ultra_short, "DoH");
+        assert!(ultra_full.starts_with("DoH ("));
+        assert!(ultra_full.ends_with("…)"));
+        assert!(!ultra_full.contains("abc123"));
+        assert!(!ultra_full.contains("secret"));
+
+        for doh_url in ["https://dns.nextdns.io/abc123/my-profile", ultra_long_doh] {
+            for is_tun in [false, true] {
+                for (w, h) in [(46u16, 18u16), (60, 22), (72, 24), (80, 24), (100, 30)] {
+                    let mut state = if is_tun {
+                        sample_tun_state(true, None)
+                    } else {
+                        sample_state(true)
+                    };
+                    state.info.dns_addr = Some(doh_url.to_string());
+                    push_log_entry(
+                        &state.logs,
+                        LogEntry {
+                            timestamp: "12:00:05".to_string(),
+                            level: Level::INFO,
+                            message: format!("upstream DoH configured: {doh_url}"),
+                        },
+                    );
+
+                    let backend = TestBackend::new(w, h);
+                    let mut terminal = Terminal::new(backend).unwrap();
+                    terminal
+                        .draw(|frame| render_dashboard(frame, &mut state))
+                        .unwrap();
+
+                    let buf = terminal.backend().buffer();
+                    assert_eq!(
+                        buf[(0, 0)].symbol(),
+                        "╭",
+                        "top-left border broken at {w}x{h} (tun={is_tun})"
+                    );
+                    assert_eq!(
+                        buf[(w - 1, 0)].symbol(),
+                        "╮",
+                        "top-right border broken at {w}x{h} (tun={is_tun})"
+                    );
+                    assert_eq!(
+                        buf[(0, 1)].symbol(),
+                        "│",
+                        "status bar left border broken at {w}x{h} (tun={is_tun})"
+                    );
+                    assert_eq!(
+                        buf[(w - 1, 1)].symbol(),
+                        "│",
+                        "status bar right border clipped at {w}x{h} (tun={is_tun})"
+                    );
+                    assert_eq!(
+                        buf[(0, 2)].symbol(),
+                        "╰",
+                        "status bar bottom-left border broken at {w}x{h} (tun={is_tun})"
+                    );
+                    assert_eq!(
+                        buf[(w - 1, 2)].symbol(),
+                        "╯",
+                        "status bar bottom-right border broken at {w}x{h} (tun={is_tun})"
+                    );
+
+                    let status_line: String = (0..w).map(|x| buf[(x, 1)].symbol()).collect();
+                    assert!(
+                        !status_line.contains("/abc123/my-profile"),
+                        "raw custom DoH path leaked into status bar at {w}x{h}: {status_line}"
+                    );
+                    if doh_url == "https://dns.nextdns.io/abc123/my-profile" && w >= 80 {
+                        assert!(
+                            status_line.contains("DoH (dns.nextdns.io)"),
+                            "expected compact custom DoH host at {w}x{h} (tun={is_tun}): {status_line}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

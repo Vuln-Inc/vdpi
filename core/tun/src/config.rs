@@ -80,24 +80,25 @@ pub struct TunProfile {
 
 impl TunProfile {
     /// Tuned for gigabit desktop virtual TUN adapters (Wintun / utun / `/dev/net/tun`):
-    /// 512 KiB smoltcp TCP buffers (enabling RFC 7323 TCP Window Scaling), 2048-deep queues,
-    /// 128 KiB TCP relay buffers, and 128-packet I/O bursts paired with `DESKTOP_MTU = 16384`.
+    /// 1 MiB smoltcp TCP buffers (enabling RFC 7323 TCP Window Scaling), 4096-deep queues,
+    /// 512 TCP sessions / 512 UDP flows, 256 KiB TCP relay & UDP socket buffers, and
+    /// 128-packet I/O bursts paired with `DESKTOP_MTU = 16384`.
     pub const DESKTOP: Self = Self {
-        stack_buffer_size: 2048,
-        tcp_buffer_size: 512,
-        udp_buffer_size: 512,
-        tcp_recv_buffer_size: 512 * 1024,
-        tcp_send_buffer_size: 512 * 1024,
-        max_tcp_sessions: 128,
-        max_udp_flows: 256,
-        max_dns_inflight: 128,
-        max_reverse_dns_entries: 4096,
-        channel_capacity: 2048,
-        udp_reply_capacity: 2048,
-        tcp_relay_buf_size: 128 * 1024,
-        packet_pool_size: 512,
+        stack_buffer_size: 4096,
+        tcp_buffer_size: 1024,
+        udp_buffer_size: 1024,
+        tcp_recv_buffer_size: 1024 * 1024,
+        tcp_send_buffer_size: 1024 * 1024,
+        max_tcp_sessions: 512,
+        max_udp_flows: 512,
+        max_dns_inflight: 256,
+        max_reverse_dns_entries: 8192,
+        channel_capacity: 4096,
+        udp_reply_capacity: 4096,
+        tcp_relay_buf_size: 256 * 1024,
+        packet_pool_size: 1024,
         batch_size: 128,
-        udp_socket_buf_bytes: 128 * 1024,
+        udp_socket_buf_bytes: 256 * 1024,
         emit_quic_icmp_reject: true,
     };
 
@@ -347,35 +348,40 @@ mod tests {
         let std = TunProfile::STANDARD;
 
         assert!(desk.stack_buffer_size > std.stack_buffer_size);
-        assert_eq!(desk.stack_buffer_size, 2048);
+        assert_eq!(desk.stack_buffer_size, 4096);
+        assert_eq!(desk.tcp_buffer_size, 1024);
+        assert_eq!(desk.udp_buffer_size, 1024);
         assert!(desk.tcp_buffer_size > std.tcp_buffer_size);
         assert!(desk.udp_buffer_size > std.udp_buffer_size);
-        assert_eq!(desk.tcp_recv_buffer_size, 512 * 1024);
-        assert_eq!(desk.tcp_send_buffer_size, 512 * 1024);
-        assert_eq!(desk.max_tcp_sessions, 128);
+        assert_eq!(desk.tcp_recv_buffer_size, 1024 * 1024);
+        assert_eq!(desk.tcp_send_buffer_size, 1024 * 1024);
+        assert_eq!(desk.max_tcp_sessions, 512);
         assert_eq!(std.max_tcp_sessions, 128);
-        assert_eq!(desk.max_udp_flows, 256);
+        assert_eq!(desk.max_udp_flows, 512);
         assert_eq!(std.max_udp_flows, 128);
+        assert!(desk.max_tcp_sessions > std.max_tcp_sessions);
         assert!(desk.max_udp_flows > std.max_udp_flows);
+        assert_eq!(desk.max_dns_inflight, 256);
         assert!(desk.max_dns_inflight > std.max_dns_inflight);
+        assert_eq!(desk.max_reverse_dns_entries, 8192);
         assert!(desk.max_reverse_dns_entries > std.max_reverse_dns_entries);
-        assert_eq!(desk.channel_capacity, 2048);
-        assert_eq!(desk.udp_reply_capacity, 2048);
+        assert_eq!(desk.channel_capacity, 4096);
+        assert_eq!(desk.udp_reply_capacity, 4096);
         assert!(desk.channel_capacity > std.channel_capacity);
         assert!(desk.udp_reply_capacity > std.udp_reply_capacity);
-        assert_eq!(desk.tcp_relay_buf_size, 128 * 1024);
-        assert_eq!(desk.packet_pool_size, 512);
+        assert_eq!(desk.tcp_relay_buf_size, 256 * 1024);
+        assert_eq!(desk.packet_pool_size, 1024);
         assert!(desk.packet_pool_size > std.packet_pool_size);
         assert_eq!(desk.batch_size, 128);
         assert!(desk.batch_size > std.batch_size);
-        assert_eq!(desk.udp_socket_buf_bytes, 128 * 1024);
+        assert_eq!(desk.udp_socket_buf_bytes, 256 * 1024);
         assert_eq!(std.udp_socket_buf_bytes, 128 * 1024);
         assert!(desk.emit_quic_icmp_reject);
 
-        // Worst-case desktop smoltcp TCP buffer footprint: 128 sessions * (512 KiB + 512 KiB) = 128 MiB.
+        // Worst-case desktop smoltcp TCP buffer footprint: 512 sessions * (1 MiB + 1 MiB) = 1 GiB.
         let max_tcp_mem = desk.max_tcp_sessions
             * (desk.tcp_recv_buffer_size as usize + desk.tcp_send_buffer_size as usize);
-        assert_eq!(max_tcp_mem, 128 * 1024 * 1024);
+        assert_eq!(max_tcp_mem, 1024 * 1024 * 1024);
         // Android STANDARD FD budget stays well under the 1024 FD ceiling.
         assert!(std.max_tcp_sessions + std.max_udp_flows <= 256);
 

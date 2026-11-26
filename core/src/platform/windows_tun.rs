@@ -1,10 +1,14 @@
 //! Windows Wintun + IP Helper API transparent TUN backend.
 //!
 //! Architecture & safety invariants:
-//! - **Pinned supply chain**: `wintun.dll` (0.14.1, amd64/arm64) is resolved strictly beside
-//!   `current_exe()` or `fs::canonicalize(current_exe())` (for WinGet symlink shims) —
-//!   never from CWD or `PATH` — and verified against [`expected_wintun_dll_sha256`] while held
-//!   open with `FILE_SHARE_READ` across `LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_SYSTEM32)`.
+//! - **Pinned supply chain**: `wintun.dll` (0.14.1, amd64/arm64) is resolved strictly from
+//!   trusted on-disk locations (`current_exe()`, `fs::canonicalize(current_exe())`,
+//!   `%ProgramFiles%\vdpi\bin`, or the runtime cache under `%ProgramData%\vdpi\runtime` /
+//!   `%LOCALAPPDATA%\vdpi\runtime`) — or materialized into the hidden runtime cache from an
+//!   embedded WHQL-signed payload compiled into `vdpi.exe` (never writing next to `vdpi.exe`
+//!   and never searching CWD or `PATH`) — and verified against [`expected_wintun_dll_sha256`]
+//!   while held open with `FILE_SHARE_READ` across
+//!   `LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_SYSTEM32)`.
 //! - **Crash-proof routing**: Zero routes or DNS entries are ever mutated on the physical
 //!   NIC. All disjoint public IPv4 complement CIDRs (and `2000::/3` when IPv6 TUN is active)
 //!   are installed exclusively on the `vdpi0` Wintun LUID. If the process crashes, is killed
@@ -14,10 +18,17 @@
 //!   off-callback physical uplink re-detection that atomically updates [`DynamicOutboundBinder`]
 //!   and notifies route-change watchers (such as `VpnGuard`).
 
+#[cfg(any(target_os = "windows", test))]
+use crate::update::sha256_hex;
 use crate::update::{sha256_file, strip_windows_verbatim_prefix};
 use anyhow::{bail, Context, Result};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
+
+/// Optional WHQL-signed `wintun.dll` (`amd64`, v0.14.1) embedded directly into `vdpi.exe`
+/// when built with `VDPI_EMBED_WINTUN_DLL` pointing at the verified DLL.
+#[cfg(all(target_os = "windows", target_arch = "x86_64", vdpi_embedded_wintun))]
+const EMBEDDED_WINTUN_DLL: &[u8] = include_bytes!(env!("VDPI_EMBEDDED_WINTUN_PATH"));
 
 /// Pinned Wintun release version.
 pub const WINTUN_VERSION: &str = "0.14.1";
@@ -295,6 +306,23 @@ pub fn rank_physical_uplink(
         .min_by_key(|c| (c.combined_metric(), c.if_index, c.luid))
 }
 
+fn push_unique_path(out: &mut Vec<PathBuf>, candidate: PathBuf) {
+    let dup = out.iter().any(|existing| {
+        existing == &candidate
+            || (cfg!(windows)
+                && existing
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&candidate.to_string_lossy()))
+    });
+    if !dup {
+        out.push(candidate);
+    }
+}
+
+fn runtime_wintun_dll_filename() -> String {
+    format!("wintun-{WINTUN_VERSION}.dll")
+}
+
 /// Returns ordered, deduplicated absolute candidate paths for `wintun.dll` located strictly
 /// beside `exe_path` and (when distinct, e.g. WinGet symlink shims) beside `canonical_exe_path`.
 ///
@@ -313,17 +341,7 @@ pub fn resolve_wintun_dll_candidates(
         if dir.as_os_str().is_empty() {
             return;
         }
-        let dll = dir.join("wintun.dll");
-        let dup = out.iter().any(|existing| {
-            existing == &dll
-                || (cfg!(windows)
-                    && existing
-                        .to_string_lossy()
-                        .eq_ignore_ascii_case(&dll.to_string_lossy()))
-        });
-        if !dup {
-            out.push(dll);
-        }
+        push_unique_path(out, dir.join("wintun.dll"));
     };
 
     push_dir(&mut out, exe_path);
@@ -332,6 +350,67 @@ pub fn resolve_wintun_dll_candidates(
     }
 
     out
+}
+
+/// Returns ordered, deduplicated hidden runtime-cache paths used to store or materialize the
+/// pinned `wintun.dll` (`%ProgramData%\vdpi\runtime\wintun-0.14.1.dll`, then
+/// `%LOCALAPPDATA%\vdpi\runtime\wintun-0.14.1.dll`, then `<temp>\vdpi-runtime\wintun-0.14.1.dll`).
+///
+/// Never includes the directory containing `vdpi.exe`.
+fn resolve_runtime_wintun_cache_targets(
+    program_data: Option<&Path>,
+    local_app_data: Option<&Path>,
+    temp_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let filename = runtime_wintun_dll_filename();
+    let mut out: Vec<PathBuf> = Vec::with_capacity(3);
+
+    for root in [program_data, local_app_data].into_iter().flatten() {
+        let cleaned = strip_windows_verbatim_prefix(root);
+        if !cleaned.as_os_str().is_empty() {
+            push_unique_path(
+                &mut out,
+                cleaned.join("vdpi").join("runtime").join(&filename),
+            );
+        }
+    }
+
+    if let Some(tmp) = temp_dir {
+        let cleaned = strip_windows_verbatim_prefix(tmp);
+        if !cleaned.as_os_str().is_empty() {
+            push_unique_path(&mut out, cleaned.join("vdpi-runtime").join(&filename));
+        }
+    }
+
+    out
+}
+
+/// Returns `(primary_candidates, cache_candidates)` for resolving `wintun.dll` on disk:
+/// - `primary_candidates`: beside `exe_path`, beside `canonical_exe_path`, and
+///   `%ProgramFiles%\vdpi\bin\wintun.dll` (a SHA-256 mismatch in any primary location is fatal).
+/// - `cache_candidates`: hidden runtime cache locations (`%ProgramData%\vdpi\runtime`,
+///   `%LOCALAPPDATA%\vdpi\runtime`, and `<temp>\vdpi-runtime`).
+fn resolve_all_wintun_dll_candidates(
+    exe_path: &Path,
+    canonical_exe_path: Option<&Path>,
+    program_files: Option<&Path>,
+    program_data: Option<&Path>,
+    local_app_data: Option<&Path>,
+    temp_dir: Option<&Path>,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut primary = resolve_wintun_dll_candidates(exe_path, canonical_exe_path);
+    if let Some(pf) = program_files {
+        let cleaned = strip_windows_verbatim_prefix(pf);
+        if !cleaned.as_os_str().is_empty() {
+            push_unique_path(
+                &mut primary,
+                cleaned.join("vdpi").join("bin").join("wintun.dll"),
+            );
+        }
+    }
+
+    let cache = resolve_runtime_wintun_cache_targets(program_data, local_app_data, temp_dir);
+    (primary, cache)
 }
 
 /// Verifies that the file at `path` matches `expected_sha256` (case-insensitive lowercase hex).
@@ -365,26 +444,173 @@ fn normalize_load_library_path(path: &Path) -> PathBuf {
     }
 }
 
-/// Locates `wintun.dll` beside the running executable (or its canonical symlink target)
-/// and verifies its SHA-256 digest against [`expected_wintun_dll_sha256`].
-///
-/// Never falls back to CWD or `PATH`. Exposed publicly so CLI `doctor` and preflight checks
-/// can verify Wintun readiness cleanly.
-pub fn find_verified_wintun_dll() -> Result<PathBuf> {
-    let expected_sha256 = expected_wintun_dll_sha256()?;
-    let exe = std::env::current_exe().context("failed to determine current executable path")?;
-    let canonical = std::fs::canonicalize(&exe).ok();
-    let candidates = resolve_wintun_dll_candidates(&exe, canonical.as_deref());
+#[cfg(any(target_os = "windows", test))]
+fn atomic_write_verified_wintun_dll(
+    target: &Path,
+    bytes: &[u8],
+    expected_sha256: &str,
+) -> Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    for cand in &candidates {
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("runtime cache path has no parent: {}", target.display()))?;
+    std::fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create wintun runtime directory {}",
+            parent.display()
+        )
+    })?;
+
+    let file_name = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("wintun.dll");
+    let pid = std::process::id();
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = parent.join(format!("{file_name}.tmp.{pid}.{seq}"));
+
+    let write_res = (|| -> Result<()> {
+        let mut tmp_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .with_context(|| format!("failed to create staging file {}", tmp_path.display()))?;
+        tmp_file
+            .write_all(bytes)
+            .with_context(|| format!("failed to write staging file {}", tmp_path.display()))?;
+        tmp_file
+            .sync_all()
+            .with_context(|| format!("failed to sync staging file {}", tmp_path.display()))?;
+        Ok(())
+    })();
+
+    if let Err(err) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    if let Err(rename_err) = std::fs::rename(&tmp_path, target) {
+        let _ = std::fs::remove_file(&tmp_path);
+        // Another concurrent vdpi instance may have already materialized and loaded the exact
+        // verified DLL at `target` (holding a loaded image mapping that blocks replacement).
+        if target.is_file() && verify_wintun_dll_sha256(target, expected_sha256).is_ok() {
+            return Ok(());
+        }
+        return Err(rename_err).with_context(|| {
+            format!(
+                "failed to atomically install wintun.dll into {}",
+                target.display()
+            )
+        });
+    }
+
+    verify_wintun_dll_sha256(target, expected_sha256)?;
+    Ok(())
+}
+
+/// Verifies `embedded_bytes` against `expected_sha256` and atomically writes it into the first
+/// writable hidden runtime cache destination in `targets`.
+///
+/// Never writes into the directory containing `vdpi.exe`.
+#[cfg(any(target_os = "windows", test))]
+fn extract_verified_embedded_wintun_dll(
+    embedded_bytes: &[u8],
+    expected_sha256: &str,
+    targets: &[PathBuf],
+) -> Result<PathBuf> {
+    let actual = sha256_hex(embedded_bytes);
+    if !actual.eq_ignore_ascii_case(expected_sha256) {
+        bail!(
+            "embedded wintun.dll SHA-256 verification failed: expected {expected_sha256}, got {actual}"
+        );
+    }
+
+    let mut errors: Vec<String> = Vec::new();
+    for target in targets {
+        match atomic_write_verified_wintun_dll(target, embedded_bytes, expected_sha256) {
+            Ok(()) => return Ok(target.clone()),
+            Err(err) => errors.push(format!("{}: {err:#}", target.display())),
+        }
+    }
+
+    bail!(
+        "failed to materialize embedded wintun.dll into any runtime cache directory ({})",
+        errors.join("; ")
+    )
+}
+
+fn env_non_empty_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_or_materialize_wintun_dll(
+    exe: &Path,
+    canonical_exe: Option<&Path>,
+    program_files: Option<&Path>,
+    program_data: Option<&Path>,
+    local_app_data: Option<&Path>,
+    temp_dir: Option<&Path>,
+    expected_sha256: &str,
+    embedded_bytes: Option<&[u8]>,
+) -> Result<PathBuf> {
+    let (primary_candidates, cache_candidates) = resolve_all_wintun_dll_candidates(
+        exe,
+        canonical_exe,
+        program_files,
+        program_data,
+        local_app_data,
+        temp_dir,
+    );
+
+    // 1. Check explicit installation / sibling locations first. A tampered DLL here is always fatal.
+    for cand in &primary_candidates {
         if cand.is_file() {
             verify_wintun_dll_sha256(cand, expected_sha256)?;
             return Ok(cand.clone());
         }
     }
 
-    let checked = candidates
+    // 2. Check existing hidden runtime cache copies. If embedded bytes are compiled in and a
+    //    cached copy was truncated or corrupted, allow embedded extraction to self-heal it.
+    let mut first_cache_hash_err: Option<anyhow::Error> = None;
+    for cand in &cache_candidates {
+        if cand.is_file() {
+            match verify_wintun_dll_sha256(cand, expected_sha256) {
+                Ok(()) => return Ok(cand.clone()),
+                Err(err) => {
+                    if first_cache_hash_err.is_none() {
+                        first_cache_hash_err = Some(err);
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Materialize the verified embedded DLL strictly into the hidden runtime cache
+    //    (%ProgramData%\vdpi\runtime -> %LOCALAPPDATA%\vdpi\runtime -> <temp>\vdpi-runtime),
+    //    never beside vdpi.exe.
+    #[cfg(any(target_os = "windows", test))]
+    if let Some(bytes) = embedded_bytes {
+        return extract_verified_embedded_wintun_dll(bytes, expected_sha256, &cache_candidates);
+    }
+    #[cfg(not(any(target_os = "windows", test)))]
+    let _ = embedded_bytes;
+
+    if let Some(err) = first_cache_hash_err {
+        return Err(err);
+    }
+
+    let checked = primary_candidates
         .iter()
+        .chain(cache_candidates.iter())
         .map(|p| p.display().to_string())
         .collect::<Vec<_>>()
         .join(", ");
@@ -394,8 +620,53 @@ pub fn find_verified_wintun_dll() -> Result<PathBuf> {
         "amd64"
     };
     bail!(
-        "wintun.dll (v{WINTUN_VERSION}) not found beside vdpi executable (checked: {checked}); \
-         place the verified {arch_label} wintun.dll next to vdpi.exe"
+        "wintun.dll (v{WINTUN_VERSION}) not found beside vdpi executable or runtime cache \
+         (checked: {checked}); place the verified {arch_label} wintun.dll next to vdpi.exe"
+    )
+}
+
+/// Locates `wintun.dll` from trusted on-disk locations (beside `vdpi.exe`, its canonical symlink
+/// target, `%ProgramFiles%\vdpi\bin`, or the hidden runtime cache) and verifies its SHA-256
+/// digest against [`expected_wintun_dll_sha256`].
+///
+/// When no verified on-disk copy exists and `vdpi.exe` was built with an embedded WHQL-signed
+/// `wintun.dll`, verifies the embedded bytes and atomically materializes them into the hidden
+/// runtime cache (`%ProgramData%\vdpi\runtime\wintun-0.14.1.dll`, falling back to
+/// `%LOCALAPPDATA%\vdpi\runtime\wintun-0.14.1.dll`, then `<temp>\vdpi-runtime\wintun-0.14.1.dll`),
+/// never writing into the directory containing `vdpi.exe`.
+///
+/// Never falls back to CWD or `PATH`. Exposed publicly so CLI `doctor` and preflight checks
+/// can verify Wintun readiness cleanly.
+pub fn find_verified_wintun_dll() -> Result<PathBuf> {
+    let expected_sha256 = expected_wintun_dll_sha256()?;
+    let exe = std::env::current_exe().context("failed to determine current executable path")?;
+    let canonical = std::fs::canonicalize(&exe).ok();
+
+    let program_files = cfg!(target_os = "windows")
+        .then(|| env_non_empty_path("ProgramFiles"))
+        .flatten();
+    let program_data = cfg!(target_os = "windows")
+        .then(|| env_non_empty_path("ProgramData"))
+        .flatten();
+    let local_app_data = cfg!(target_os = "windows")
+        .then(|| env_non_empty_path("LOCALAPPDATA"))
+        .flatten();
+    let temp_dir = cfg!(target_os = "windows").then(std::env::temp_dir);
+
+    #[cfg(all(target_os = "windows", target_arch = "x86_64", vdpi_embedded_wintun))]
+    let embedded_bytes: Option<&[u8]> = Some(EMBEDDED_WINTUN_DLL);
+    #[cfg(not(all(target_os = "windows", target_arch = "x86_64", vdpi_embedded_wintun)))]
+    let embedded_bytes: Option<&[u8]> = None;
+
+    resolve_or_materialize_wintun_dll(
+        &exe,
+        canonical.as_deref(),
+        program_files.as_deref(),
+        program_data.as_deref(),
+        local_app_data.as_deref(),
+        temp_dir.as_deref(),
+        expected_sha256,
+        embedded_bytes,
     )
 }
 
@@ -403,7 +674,6 @@ pub fn find_verified_wintun_dll() -> Result<PathBuf> {
 mod win32 {
     use super::*;
     use crate::binder::{DynamicOutboundBinder, OutboundBinder, OutboundTarget};
-    use crate::update::sha256_hex;
     use anyhow::anyhow;
     use std::collections::{HashMap, HashSet};
     use std::ffi::{c_void, OsStr};
@@ -460,13 +730,10 @@ mod win32 {
     /// Bounded Tokio channel depth for inbound/outbound IP packets (matches `TunProfile::DESKTOP`).
     const TUN_CHANNEL_CAPACITY: usize = vdpi_tun::config::TunProfile::DESKTOP.channel_capacity;
     /// Maximum outbound IP packets drained per wakeup via `blocking_recv_many`.
-    const TX_BATCH_LIMIT: usize = 64;
-    /// Brief retries on `ERROR_BUFFER_OVERFLOW` before dropping an outbound packet.
-    const TX_OVERFLOW_MAX_RETRIES: usize = 5;
-    /// Short sleep duration on later `ERROR_BUFFER_OVERFLOW` retries (50 us).
-    const TX_OVERFLOW_RETRY_SLEEP: Duration = Duration::from_micros(50);
-    /// Success return code from `winmm.dll`'s `timeBeginPeriod` / `timeEndPeriod`.
-    const TIMERR_NOERROR: u32 = 0;
+    pub(super) const TX_BATCH_LIMIT: usize = 128;
+    /// Maximum inbound IP packets drained per burst from `WintunReceivePacket` before handing
+    /// off to the async channel (continues draining until `ERROR_NO_MORE_ITEMS` before waiting).
+    pub(super) const RX_BURST_LIMIT: usize = 128;
     /// Maximum IP packet size supported by Wintun.
     const WINTUN_MAX_IP_PACKET_SIZE: usize = 65_535;
     /// Interface metric assigned to `vdpi0`.
@@ -527,7 +794,6 @@ mod win32 {
     type SetInterfaceDnsSettingsFn =
         unsafe extern "system" fn(interface: GUID, settings: *const DNS_INTERFACE_SETTINGS) -> u32;
     type DnsFlushResolverCacheFn = unsafe extern "system" fn() -> i32;
-    type TimePeriodFn = unsafe extern "system" fn(period_ms: u32) -> u32;
 
     /// Send/Sync wrapper around an opaque Win32 handle (`HANDLE`, `HMODULE`, Wintun handles).
     #[derive(Clone, Copy)]
@@ -671,27 +937,7 @@ mod win32 {
     impl WintunApi {
         fn load_verified() -> Result<Arc<Self>> {
             let expected_sha256 = expected_wintun_dll_sha256()?;
-            let exe =
-                std::env::current_exe().context("failed to determine current executable path")?;
-            let canonical_exe = std::fs::canonicalize(&exe).ok();
-            let candidates = resolve_wintun_dll_candidates(&exe, canonical_exe.as_deref());
-
-            let Some(dll_path) = candidates.iter().find(|p| p.is_file()).cloned() else {
-                let checked = candidates
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let arch_label = if cfg!(target_arch = "aarch64") {
-                    "arm64"
-                } else {
-                    "amd64"
-                };
-                bail!(
-                    "wintun.dll (v{WINTUN_VERSION}) not found beside vdpi executable (checked: {checked}); \
-                     place the verified {arch_label} wintun.dll next to vdpi.exe"
-                );
-            };
+            let dll_path = find_verified_wintun_dll()?;
 
             let canonical_dll = std::fs::canonicalize(&dll_path).unwrap_or(dll_path);
             let load_path = normalize_load_library_path(&canonical_dll);
@@ -1416,6 +1662,9 @@ mod win32 {
     }
 
     /// Best-effort call to `DnsFlushResolverCache()` in `dnsapi.dll`.
+    ///
+    /// Clears stale ISP-poisoned DNS entries from Windows `Dnscache` so browsers (such as Chrome)
+    /// drop pre-TUN sockets and pick up the TUN interface immediately without a restart.
     fn flush_dns_resolver_cache() {
         let dnsapi_w = encode_wide("dnsapi.dll");
         let hmod = unsafe {
@@ -1434,62 +1683,7 @@ mod win32 {
             unsafe { load_proc::<DnsFlushResolverCacheFn>(hmod, c"DnsFlushResolverCache") }
         {
             let ok = unsafe { flush_fn() };
-            trace!(ok = (ok != 0), "invoked DnsFlushResolverCache()");
-        }
-    }
-
-    /// RAII guard holding a 1 ms Windows multimedia timer period (`timeBeginPeriod(1)`)
-    /// so Tokio timers and TCP pacing/retransmit wakeups are not quantized to 15.625 ms.
-    struct TimerResolutionGuard {
-        module: SendHandle,
-        end_fn: TimePeriodFn,
-        period_ms: u32,
-    }
-
-    impl TimerResolutionGuard {
-        fn acquire(period_ms: u32) -> Option<Self> {
-            let winmm_w = encode_wide("winmm.dll");
-            let hmod = unsafe {
-                LoadLibraryExW(
-                    winmm_w.as_ptr(),
-                    ptr::null_mut(),
-                    LOAD_LIBRARY_SEARCH_SYSTEM32,
-                )
-            };
-            if hmod.is_null() {
-                debug!("could not load winmm.dll for high-resolution timer period");
-                return None;
-            }
-            let guard = ModuleGuard(hmod);
-            let begin_fn = unsafe { load_proc::<TimePeriodFn>(hmod, c"timeBeginPeriod") }.ok()?;
-            let end_fn = unsafe { load_proc::<TimePeriodFn>(hmod, c"timeEndPeriod") }.ok()?;
-            let rc = unsafe { begin_fn(period_ms) };
-            if rc != TIMERR_NOERROR {
-                debug!(
-                    period_ms,
-                    rc, "timeBeginPeriod failed; keeping default Windows timer resolution"
-                );
-                return None;
-            }
-            let _ = guard.into_raw();
-            debug!(period_ms, "enabled high-resolution Windows timer period");
-            Some(Self {
-                module: SendHandle(hmod),
-                end_fn,
-                period_ms,
-            })
-        }
-    }
-
-    impl Drop for TimerResolutionGuard {
-        fn drop(&mut self) {
-            if !self.module.is_null() {
-                unsafe {
-                    let _ = (self.end_fn)(self.period_ms);
-                    let _ = FreeLibrary(self.module.as_raw());
-                }
-                self.module = SendHandle(ptr::null_mut());
-            }
+            debug!(ok = (ok != 0), "invoked DnsFlushResolverCache()");
         }
     }
 
@@ -1632,6 +1826,8 @@ mod win32 {
             .context("failed to spawn Windows route watcher thread")
     }
 
+    /// Spawns the Wintun RX reader thread at normal OS priority (never elevated above MMCSS
+    /// audio threads such as VoiceMeeter).
     fn spawn_rx_thread(
         wintun: Arc<WintunApi>,
         session: SendHandle,
@@ -1644,27 +1840,52 @@ mod win32 {
             .name("vdpi-wintun-rx".to_string())
             .spawn(move || {
                 let handles = [read_event.as_raw(), stop_event.as_raw()];
+                let mut burst: Vec<Vec<u8>> = Vec::with_capacity(RX_BURST_LIMIT);
 
                 'outer: loop {
                     if stop_flag.load(Ordering::Acquire) {
                         break;
                     }
 
-                    // Drain every queued IP packet per wakeup to minimize syscall overhead.
+                    // Drain queued IP packets in full bursts from WintunReceivePacket until the
+                    // ring reports ERROR_NO_MORE_ITEMS before waiting on WaitForMultipleObjects.
                     loop {
-                        if stop_flag.load(Ordering::Acquire) {
+                        burst.clear();
+                        let mut ring_empty = false;
+
+                        while burst.len() < RX_BURST_LIMIT {
+                            if stop_flag.load(Ordering::Acquire) {
+                                break 'outer;
+                            }
+                            let mut pkt_size: u32 = 0;
+                            let pkt_ptr =
+                                unsafe { (wintun.receive_packet)(session.as_raw(), &mut pkt_size) };
+                            if !pkt_ptr.is_null() {
+                                let pkt = unsafe {
+                                    std::slice::from_raw_parts(pkt_ptr, pkt_size as usize).to_vec()
+                                };
+                                // Release ring slot immediately before touching the async channel.
+                                unsafe {
+                                    (wintun.release_receive_packet)(session.as_raw(), pkt_ptr);
+                                }
+                                burst.push(pkt);
+                                continue;
+                            }
+
+                            let err = unsafe { GetLastError() };
+                            if err == ERROR_NO_MORE_ITEMS {
+                                ring_empty = true;
+                                break;
+                            }
+                            if err == ERROR_HANDLE_EOF {
+                                debug!("Wintun RX ring reached EOF; exiting RX thread");
+                                break 'outer;
+                            }
+                            warn!(error = err, "WintunReceivePacket failed; exiting RX thread");
                             break 'outer;
                         }
-                        let mut pkt_size: u32 = 0;
-                        let pkt_ptr =
-                            unsafe { (wintun.receive_packet)(session.as_raw(), &mut pkt_size) };
-                        if !pkt_ptr.is_null() {
-                            let pkt = unsafe {
-                                std::slice::from_raw_parts(pkt_ptr, pkt_size as usize).to_vec()
-                            };
-                            // Release ring slot immediately before touching the async channel.
-                            unsafe { (wintun.release_receive_packet)(session.as_raw(), pkt_ptr) };
 
+                        for pkt in burst.drain(..) {
                             match inbound_tx.try_send(pkt) {
                                 Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(pkt)) => {
@@ -1681,19 +1902,11 @@ mod win32 {
                                     break 'outer;
                                 }
                             }
-                            continue;
                         }
 
-                        let err = unsafe { GetLastError() };
-                        if err == ERROR_NO_MORE_ITEMS {
+                        if ring_empty {
                             break;
                         }
-                        if err == ERROR_HANDLE_EOF {
-                            debug!("Wintun RX ring reached EOF; exiting RX thread");
-                            break 'outer;
-                        }
-                        warn!(error = err, "WintunReceivePacket failed; exiting RX thread");
-                        break 'outer;
                     }
 
                     let wait = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
@@ -1728,32 +1941,23 @@ mod win32 {
         if dst.is_null() {
             let mut err = unsafe { GetLastError() };
             if err == ERROR_BUFFER_OVERFLOW {
-                for attempt in 0..TX_OVERFLOW_MAX_RETRIES {
-                    if stop_flag.load(Ordering::Acquire) {
-                        return false;
-                    }
-                    if attempt < 2 {
-                        thread::yield_now();
-                    } else {
-                        thread::sleep(TX_OVERFLOW_RETRY_SLEEP);
-                    }
-                    dst = unsafe {
-                        (wintun.allocate_send_packet)(session.as_raw(), pkt.len() as u32)
-                    };
-                    if !dst.is_null() {
-                        break;
-                    }
+                if stop_flag.load(Ordering::Acquire) {
+                    return false;
+                }
+                // With a 16 MiB ring, overflow only happens under true saturation. Yield at most
+                // once (no microsecond sleeps or spin loops that spike Windows DPC/audio latency),
+                // then tail-drop cleanly so TCP congestion control adapts naturally.
+                thread::yield_now();
+                dst = unsafe { (wintun.allocate_send_packet)(session.as_raw(), pkt.len() as u32) };
+                if dst.is_null() {
                     err = unsafe { GetLastError() };
-                    if err != ERROR_BUFFER_OVERFLOW {
-                        break;
-                    }
                 }
             }
             if dst.is_null() {
                 if err == ERROR_BUFFER_OVERFLOW {
                     trace!(
                         len = pkt.len(),
-                        "Wintun TX ring full after retries; dropping outbound packet"
+                        "Wintun TX ring full; tail-dropping outbound packet"
                     );
                     return true;
                 }
@@ -1772,6 +1976,8 @@ mod win32 {
         true
     }
 
+    /// Spawns the Wintun TX writer thread at normal OS priority (never elevated above MMCSS
+    /// audio threads such as VoiceMeeter).
     fn spawn_tx_thread(
         wintun: Arc<WintunApi>,
         session: SendHandle,
@@ -1818,7 +2024,6 @@ mod win32 {
         tx_thread: Option<JoinHandle<()>>,
         vdpi_luid: u64,
         ipv6_enabled: bool,
-        _timer_resolution: Option<TimerResolutionGuard>,
     }
 
     /// Tuple returned by [`WindowsTunSession::start`]: the running session handle,
@@ -1891,8 +2096,6 @@ mod win32 {
                 add_ipv6_route(vdpi_luid, Ipv6Addr::new(0x2000, 0, 0, 0, 0, 0, 0, 0), 3)?;
             }
 
-            flush_dns_resolver_cache();
-
             // Start Wintun packet ring session (16 MiB per ring).
             let raw_session = unsafe {
                 (wintun.start_session)(adapter_guard.handle.as_raw(), WINTUN_RING_CAPACITY)
@@ -1960,7 +2163,6 @@ mod win32 {
                 tx_thread: None,
                 vdpi_luid,
                 ipv6_enabled,
-                _timer_resolution: TimerResolutionGuard::acquire(1),
             };
             binder_guard.disarm();
 
@@ -1986,6 +2188,10 @@ mod win32 {
                 stop_flag,
                 outbound_rx,
             )?);
+
+            // Flush Windows Dnscache once routes, DNS, and Wintun I/O threads are live so
+            // browsers immediately drop stale ISP-poisoned DNS entries and pre-TUN sockets.
+            flush_dns_resolver_cache();
 
             info!(
                 iface = VDPI_TUN_NAME,
@@ -2448,5 +2654,247 @@ mod tests {
         let long_dir = "a".repeat(240);
         let long_verbatim = PathBuf::from(format!(r"\\?\C:\{long_dir}\wintun.dll"));
         assert_eq!(normalize_load_library_path(&long_verbatim), long_verbatim);
+    }
+
+    #[test]
+    fn resolve_all_wintun_dll_candidates_orders_primary_and_hidden_runtime_cache() {
+        let exe_dir = PathBuf::from("C:/Users/Arda/Desktop/vdpi");
+        let exe = exe_dir.join("vdpi.exe");
+        let pf = PathBuf::from("C:/Program Files");
+        let pd = PathBuf::from("C:/ProgramData");
+        let lad = PathBuf::from("C:/Users/Arda/AppData/Local");
+        let tmp = PathBuf::from("C:/Users/Arda/AppData/Local/Temp");
+
+        let (primary, cache) = resolve_all_wintun_dll_candidates(
+            &exe,
+            None,
+            Some(&pf),
+            Some(&pd),
+            Some(&lad),
+            Some(&tmp),
+        );
+
+        assert_eq!(
+            primary,
+            vec![
+                exe_dir.join("wintun.dll"),
+                pf.join("vdpi").join("bin").join("wintun.dll"),
+            ]
+        );
+        let runtime_name = format!("wintun-{WINTUN_VERSION}.dll");
+        assert_eq!(
+            cache,
+            vec![
+                pd.join("vdpi").join("runtime").join(&runtime_name),
+                lad.join("vdpi").join("runtime").join(&runtime_name),
+                tmp.join("vdpi-runtime").join(&runtime_name),
+            ]
+        );
+        assert!(cache.iter().all(|p| p.parent() != Some(exe_dir.as_path())));
+    }
+
+    #[test]
+    fn embedded_wintun_materializes_only_into_runtime_cache_with_fallbacks_and_never_beside_exe() {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "vdpi-embed-wintun-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let exe_dir = root.join("user-folder");
+        let pf_dir = root.join("ProgramFiles");
+        let pd_dir = root.join("ProgramData");
+        let lad_dir = root.join("LocalAppData");
+        let tmp_dir = root.join("Temp");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        let exe = exe_dir.join("vdpi.exe");
+
+        let payload = b"verified-embedded-wintun-dll-test-bytes";
+        let expected_sha = sha256_hex(payload);
+
+        // 1. Tampered embedded bytes must be rejected and write nothing anywhere.
+        let bad_err = resolve_or_materialize_wintun_dll(
+            &exe,
+            None,
+            Some(&pf_dir),
+            Some(&pd_dir),
+            Some(&lad_dir),
+            Some(&tmp_dir),
+            &expected_sha,
+            Some(b"tampered-bytes"),
+        )
+        .expect_err("tampered embedded payload must fail SHA-256 verification");
+        assert!(bad_err.to_string().contains("SHA-256 verification failed"));
+        assert_eq!(std::fs::read_dir(&exe_dir).unwrap().count(), 0);
+        assert!(!pd_dir.exists());
+
+        // 2. Valid embedded bytes materialize into ProgramData runtime cache; exe_dir stays clean.
+        let materialized = resolve_or_materialize_wintun_dll(
+            &exe,
+            None,
+            Some(&pf_dir),
+            Some(&pd_dir),
+            Some(&lad_dir),
+            Some(&tmp_dir),
+            &expected_sha,
+            Some(payload),
+        )
+        .expect("embedded extraction into ProgramData runtime cache");
+        let runtime_name = format!("wintun-{WINTUN_VERSION}.dll");
+        let expected_pd = pd_dir.join("vdpi").join("runtime").join(&runtime_name);
+        assert_eq!(materialized, expected_pd);
+        assert_eq!(std::fs::read(&materialized).unwrap(), payload);
+        assert_eq!(
+            std::fs::read_dir(&exe_dir).unwrap().count(),
+            0,
+            "vdpi.exe folder must remain completely clean"
+        );
+        // No staging temp files left behind.
+        let runtime_entries: Vec<_> = std::fs::read_dir(expected_pd.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(runtime_entries, vec![runtime_name.clone()]);
+
+        // 3. Subsequent resolution reuses the verified cached copy without needing embedded bytes.
+        let cached = resolve_or_materialize_wintun_dll(
+            &exe,
+            None,
+            Some(&pf_dir),
+            Some(&pd_dir),
+            Some(&lad_dir),
+            Some(&tmp_dir),
+            &expected_sha,
+            None,
+        )
+        .expect("cached runtime DLL reuse");
+        assert_eq!(cached, expected_pd);
+
+        // 4. Corrupt runtime cache copy is self-healed when verified embedded bytes are available.
+        std::fs::write(&expected_pd, b"corrupted").unwrap();
+        let healed = resolve_or_materialize_wintun_dll(
+            &exe,
+            None,
+            Some(&pf_dir),
+            Some(&pd_dir),
+            Some(&lad_dir),
+            Some(&tmp_dir),
+            &expected_sha,
+            Some(payload),
+        )
+        .expect("self-heal corrupt runtime cache");
+        assert_eq!(healed, expected_pd);
+        assert_eq!(std::fs::read(&healed).unwrap(), payload);
+
+        // 5. Unwritable ProgramData falls back to LOCALAPPDATA; unwritable LOCALAPPDATA falls
+        //    back to temp_dir/vdpi-runtime — never writing next to vdpi.exe.
+        let blocked_pd = root.join("blocked-pd-file");
+        std::fs::write(&blocked_pd, b"not-a-directory").unwrap();
+        let lad_path = resolve_or_materialize_wintun_dll(
+            &exe,
+            None,
+            Some(&pf_dir),
+            Some(&blocked_pd),
+            Some(&lad_dir),
+            Some(&tmp_dir),
+            &expected_sha,
+            Some(payload),
+        )
+        .expect("fallback to LOCALAPPDATA runtime cache");
+        let expected_lad = lad_dir.join("vdpi").join("runtime").join(&runtime_name);
+        assert_eq!(lad_path, expected_lad);
+        assert_eq!(std::fs::read(&lad_path).unwrap(), payload);
+        assert_eq!(std::fs::read_dir(&exe_dir).unwrap().count(), 0);
+
+        let blocked_lad = root.join("blocked-lad-file");
+        std::fs::write(&blocked_lad, b"not-a-directory").unwrap();
+        let tmp_path = resolve_or_materialize_wintun_dll(
+            &exe,
+            None,
+            Some(&pf_dir),
+            Some(&blocked_pd),
+            Some(&blocked_lad),
+            Some(&tmp_dir),
+            &expected_sha,
+            Some(payload),
+        )
+        .expect("fallback to temp vdpi-runtime cache");
+        let expected_tmp = tmp_dir.join("vdpi-runtime").join(&runtime_name);
+        assert_eq!(tmp_path, expected_tmp);
+        assert_eq!(std::fs::read(&tmp_path).unwrap(), payload);
+        assert_eq!(std::fs::read_dir(&exe_dir).unwrap().count(), 0);
+
+        // 6. On-disk ProgramFiles candidate takes precedence over cache/embedded extraction.
+        let pf_dll = pf_dir.join("vdpi").join("bin").join("wintun.dll");
+        std::fs::create_dir_all(pf_dll.parent().unwrap()).unwrap();
+        std::fs::write(&pf_dll, payload).unwrap();
+        let from_pf = resolve_or_materialize_wintun_dll(
+            &exe,
+            None,
+            Some(&pf_dir),
+            Some(&blocked_pd),
+            Some(&blocked_lad),
+            Some(&tmp_dir),
+            &expected_sha,
+            Some(payload),
+        )
+        .expect("ProgramFiles candidate resolution");
+        assert_eq!(from_pf, pf_dll);
+
+        // 7. A tampered sibling DLL beside vdpi.exe must always fail fatally.
+        let tampered_sibling = exe_dir.join("wintun.dll");
+        std::fs::write(&tampered_sibling, b"evil-dll").unwrap();
+        let sibling_err = resolve_or_materialize_wintun_dll(
+            &exe,
+            None,
+            Some(&pf_dir),
+            Some(&pd_dir),
+            Some(&lad_dir),
+            Some(&tmp_dir),
+            &expected_sha,
+            Some(payload),
+        )
+        .expect_err("tampered sibling wintun.dll must fail fatally");
+        assert!(sibling_err
+            .to_string()
+            .contains("SHA-256 verification failed"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_winmm_timer_hijacking_or_overflow_sleep_and_gigabit_batching_enabled() {
+        let src = include_str!("windows_tun.rs");
+        assert!(
+            !src.contains(concat!("timeBegin", "Period")),
+            "windows_tun.rs must not hijack Windows multimedia timer resolution"
+        );
+        assert!(
+            !src.contains(concat!("timeEnd", "Period")),
+            "windows_tun.rs must not call multimedia timer teardown"
+        );
+        assert!(
+            !src.contains(concat!("winmm", ".dll")),
+            "windows_tun.rs must not load winmm"
+        );
+        assert!(
+            !src.contains(concat!("TimerResolution", "Guard")),
+            "multimedia timer guard must be removed"
+        );
+        assert!(
+            !src.contains(concat!("TX_OVERFLOW_RETRY", "_SLEEP")),
+            "microsecond TX overflow sleep loop must be removed"
+        );
+        assert!(
+            src.contains("DnsFlushResolverCache"),
+            "windows_tun.rs must flush Windows DNS cache on TUN start and teardown"
+        );
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(win32::TX_BATCH_LIMIT, 128);
+            assert_eq!(win32::RX_BURST_LIMIT, 128);
+        }
     }
 }

@@ -6,6 +6,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.5.7] - 2026-11-27
+
+### Added
+- **Standalone Windows `vdpi.exe` with embedded WHQL-signed Wintun**:
+  - Release CI now downloads and verifies Wintun `0.14.1` (archive SHA-256, DLL SHA-256, and `WireGuard LLC` Authenticode signature) prior to compilation and embeds it directly inside `vdpi.exe` via `VDPI_EMBED_WINTUN_DLL`, shipping a single standalone `vdpi.exe` inside `vdpi-windows-x86_64.zip` with no loose `wintun.dll` sidecar.
+- **Interactive TUI `[7] Custom DNS` IP & DoH picker**:
+  - Added `[7] Custom DNS` input in the Control Center DNS server selector and unified CLI (`vdpi dns`) + TUI validation via `vdpi_core::dns::validate_custom_dns_input`, accepting preset names as well as any valid IPv4, IPv6, or `https://` DoH URL.
+  - Added compact formatting and truncation for long custom DoH URLs in the live TUI dashboard so panel borders stay intact down to `46x18`.
+
+### Fixed
+- **Gigabit TUN + zero-audio-stutter overhaul**:
+  - Capped foreground Tokio runtime worker threads (`2..=4`) so high-throughput desktop TUN traffic never preempts real-time audio engines such as VoiceMeeter.
+  - Updated Windows missing-`wintun.dll` hints to note embedded Wintun in official release builds.
+
 ## [0.5.6] - 2026-11-26
 
 ### Added
@@ -170,7 +184,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Configured `CODE_SIGN_ENTITLEMENTS` in iOS `project.yml` so XcodeGen preserves `.entitlements` files.
 - Fixed release workflow entitlement verification and restricted automatic release runs to version tags and manual dispatch.
 
-[Unreleased]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.6...HEAD
+[Unreleased]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.7...HEAD
+[0.5.7]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.6...v0.5.7
 [0.5.6]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.5...v0.5.6
 [0.5.5]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.3...v0.5.4
