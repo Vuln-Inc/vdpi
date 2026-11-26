@@ -1,9 +1,11 @@
-use crate::bypass::build_no_proxy_value;
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::ffi::c_void;
+use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::windows::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info, warn};
@@ -17,6 +19,9 @@ use windows_sys::Win32::System::Threading::{
 };
 
 pub mod foreground;
+
+pub const VDPI_PAC_PATH: &str = "/vdpi.pac";
+pub const WINDOWS_PROXY_STATE_FILENAME: &str = "windows-proxy-state.json";
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const INTERNET_SETTINGS_SUBKEY: &str =
@@ -69,6 +74,33 @@ pub fn is_vdpi_owned_wininet_server(s: &str) -> bool {
     lower.starts_with("127.0.0.1:") || lower.starts_with("[::1]:")
 }
 
+pub fn build_windows_pac_url(addr: IpAddr, port: u16) -> String {
+    let connect_ip = normalize_client_proxy_ip(addr);
+    let authority = SocketAddr::new(connect_ip, port);
+    format!("http://{authority}{VDPI_PAC_PATH}")
+}
+
+pub fn is_vdpi_owned_pac_url(s: &str) -> bool {
+    let lower = s.trim().to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("http://") else {
+        return false;
+    };
+    let Some((authority, path)) = rest.split_once('/') else {
+        return false;
+    };
+    if authority.is_empty() || authority.contains(char::is_whitespace) {
+        return false;
+    }
+    let path_without_query = path.split(['?', '#']).next().unwrap_or("");
+    if path_without_query != "vdpi.pac" {
+        return false;
+    }
+    let Some((host, port_str)) = authority.rsplit_once(':') else {
+        return false;
+    };
+    !host.is_empty() && !port_str.is_empty() && port_str.bytes().all(|b| b.is_ascii_digit())
+}
+
 fn normalize_client_proxy_ip(addr: IpAddr) -> IpAddr {
     match addr.to_canonical() {
         IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -77,14 +109,312 @@ fn normalize_client_proxy_ip(addr: IpAddr) -> IpAddr {
     }
 }
 
+/// Snapshot of a single Registry hive's prior WinINET settings captured before `vdpi`
+/// enables its fail-open PAC `AutoConfigURL`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedWininetHiveState {
+    #[serde(default)]
+    pub proxy_enable: bool,
+    #[serde(default)]
+    pub proxy_server: Option<String>,
+    #[serde(default)]
+    pub proxy_override: Option<String>,
+    #[serde(default)]
+    pub auto_config_url: Option<String>,
+}
+
+/// Persisted WinINET proxy snapshots keyed by Registry hive root (e.g. `HKCU`, `HKU\S-1-5-21-...`).
+///
+/// Uses `#[serde(default)]` on every field so older single-hive `state.json` / proxy-state files
+/// lacking `auto_config_url` or `hives` remain backwards-compatible.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedWindowsProxyState {
+    #[serde(default)]
+    pub proxy_enable: bool,
+    #[serde(default)]
+    pub proxy_server: Option<String>,
+    #[serde(default)]
+    pub proxy_override: Option<String>,
+    #[serde(default)]
+    pub auto_config_url: Option<String>,
+    #[serde(default)]
+    pub hives: BTreeMap<String, SavedWininetHiveState>,
+}
+
+impl SavedWindowsProxyState {
+    pub fn state_for_root(&self, root: &str) -> Option<SavedWininetHiveState> {
+        if let Some((_, entry)) = self
+            .hives
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(root))
+        {
+            return Some(entry.clone());
+        }
+        if self.hives.is_empty()
+            && root.eq_ignore_ascii_case("HKCU")
+            && (self.proxy_enable
+                || self.proxy_server.is_some()
+                || self.proxy_override.is_some()
+                || self.auto_config_url.is_some())
+        {
+            return Some(SavedWininetHiveState {
+                proxy_enable: self.proxy_enable,
+                proxy_server: self.proxy_server.clone(),
+                proxy_override: self.proxy_override.clone(),
+                auto_config_url: self.auto_config_url.clone(),
+            });
+        }
+        None
+    }
+
+    fn record_hive_if_absent(&mut self, root: &str, raw: SavedWininetHiveState) {
+        if self.hives.keys().any(|k| k.eq_ignore_ascii_case(root)) {
+            return;
+        }
+        let sanitized = sanitize_captured_wininet_state(raw);
+        if root.eq_ignore_ascii_case("HKCU") {
+            self.proxy_enable = sanitized.proxy_enable;
+            self.proxy_server = sanitized.proxy_server.clone();
+            self.proxy_override = sanitized.proxy_override.clone();
+            self.auto_config_url = sanitized.auto_config_url.clone();
+        }
+        self.hives.insert(root.to_string(), sanitized);
+    }
+
+    fn merge_missing_from(&mut self, other: &SavedWindowsProxyState) {
+        for (root, state) in &other.hives {
+            self.record_hive_if_absent(root, state.clone());
+        }
+        if other.hives.is_empty() {
+            if let Some(hkcu) = other.state_for_root("HKCU") {
+                self.record_hive_if_absent("HKCU", hkcu);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CurrentWininetState {
+    proxy_enable: bool,
+    proxy_server: String,
+    auto_config_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AutoConfigAction {
+    Keep,
+    Delete,
+    Set(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManualProxyAction {
+    Keep,
+    Disable,
+    Restore {
+        server: String,
+        override_list: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WininetRestorePlan {
+    auto_config: AutoConfigAction,
+    manual_proxy: ManualProxyAction,
+}
+
+fn sanitize_captured_wininet_state(raw: SavedWininetHiveState) -> SavedWininetHiveState {
+    let auto_config_url = raw
+        .auto_config_url
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty() && !is_vdpi_owned_pac_url(u));
+
+    let vdpi_manual = raw
+        .proxy_server
+        .as_deref()
+        .is_some_and(is_vdpi_owned_wininet_server);
+
+    let (proxy_enable, proxy_server, proxy_override) = if vdpi_manual {
+        (false, None, None)
+    } else {
+        (
+            raw.proxy_enable,
+            raw.proxy_server
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            raw.proxy_override
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+        )
+    };
+
+    SavedWininetHiveState {
+        proxy_enable,
+        proxy_server,
+        proxy_override,
+        auto_config_url,
+    }
+}
+
+fn plan_wininet_restore(
+    current: &CurrentWininetState,
+    prior: Option<&SavedWininetHiveState>,
+) -> WininetRestorePlan {
+    let valid_prior_pac = prior
+        .and_then(|p| p.auto_config_url.as_deref())
+        .map(str::trim)
+        .filter(|u| !u.is_empty() && !is_vdpi_owned_pac_url(u))
+        .map(ToString::to_string);
+
+    let current_pac = current
+        .auto_config_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty());
+
+    let auto_config = match current_pac {
+        Some(curr) if is_vdpi_owned_pac_url(curr) => match valid_prior_pac {
+            Some(prev) => AutoConfigAction::Set(prev),
+            None => AutoConfigAction::Delete,
+        },
+        None => match valid_prior_pac {
+            Some(prev) => AutoConfigAction::Set(prev),
+            None => AutoConfigAction::Keep,
+        },
+        Some(_) => AutoConfigAction::Keep,
+    };
+
+    let valid_prior_manual = prior.and_then(|p| {
+        if !p.proxy_enable {
+            return None;
+        }
+        let server = p.proxy_server.as_deref()?.trim();
+        if server.is_empty() || is_vdpi_owned_wininet_server(server) {
+            return None;
+        }
+        let override_list = p
+            .proxy_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string);
+        Some((server.to_string(), override_list))
+    });
+
+    let manual_proxy =
+        if current.proxy_enable && is_vdpi_owned_wininet_server(&current.proxy_server) {
+            match valid_prior_manual {
+                Some((server, override_list)) => ManualProxyAction::Restore {
+                    server,
+                    override_list,
+                },
+                None => ManualProxyAction::Disable,
+            }
+        } else if !current.proxy_enable {
+            match valid_prior_manual {
+                Some((server, override_list)) => ManualProxyAction::Restore {
+                    server,
+                    override_list,
+                },
+                None => ManualProxyAction::Keep,
+            }
+        } else {
+            ManualProxyAction::Keep
+        };
+
+    WininetRestorePlan {
+        auto_config,
+        manual_proxy,
+    }
+}
+
+fn windows_proxy_state_write_path() -> Option<PathBuf> {
+    if is_running_as_service() {
+        let base = std::env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+        return Some(base.join("vdpi").join(WINDOWS_PROXY_STATE_FILENAME));
+    }
+    if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
+        return Some(
+            PathBuf::from(local_appdata)
+                .join("vdpi")
+                .join(WINDOWS_PROXY_STATE_FILENAME),
+        );
+    }
+    std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .map(|home| home.join(".vdpi").join(WINDOWS_PROXY_STATE_FILENAME))
+}
+
+fn windows_proxy_state_read_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let pd = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    paths.push(pd.join("vdpi").join(WINDOWS_PROXY_STATE_FILENAME));
+    if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
+        let p = PathBuf::from(local_appdata)
+            .join("vdpi")
+            .join(WINDOWS_PROXY_STATE_FILENAME);
+        if !paths.contains(&p) {
+            paths.push(p);
+        }
+    }
+    if let Some(home) = std::env::var_os("USERPROFILE") {
+        let p = PathBuf::from(home)
+            .join(".vdpi")
+            .join(WINDOWS_PROXY_STATE_FILENAME);
+        if !paths.contains(&p) {
+            paths.push(p);
+        }
+    }
+    paths
+}
+
+fn load_saved_windows_proxy_state() -> SavedWindowsProxyState {
+    let mut merged = SavedWindowsProxyState::default();
+    for path in windows_proxy_state_read_paths() {
+        if let Ok(raw) = fs::read_to_string(&path) {
+            if let Ok(parsed) = serde_json::from_str::<SavedWindowsProxyState>(&raw) {
+                merged.merge_missing_from(&parsed);
+            }
+        }
+    }
+    merged
+}
+
+fn save_windows_proxy_state(state: &SavedWindowsProxyState) {
+    let Some(path) = windows_proxy_state_write_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let Ok(json) = serde_json::to_string(state) else {
+        return;
+    };
+    let tmp = path.with_extension("json.tmp");
+    if fs::write(&tmp, json).is_ok() {
+        let _ = fs::remove_file(&path);
+        let _ = fs::rename(&tmp, &path);
+    }
+}
+
+fn remove_saved_windows_proxy_state_files() {
+    for path in windows_proxy_state_read_paths() {
+        let _ = fs::remove_file(path);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WindowsProxySession {
     addr: IpAddr,
     http_port: u16,
-    proxy_override: String,
-    env_configured: bool,
-    no_proxy_csv: String,
     vpn_coexistence: VpnCoexistence,
+    saved_state: SavedWindowsProxyState,
 }
 
 impl WindowsProxySession {
@@ -93,57 +423,63 @@ impl WindowsProxySession {
         http_port: u16,
         _socks_port: Option<u16>,
         _enable_socks_system_proxy: bool,
-        enable_env_proxy: bool,
-        extra_bypass: &[String],
+        _enable_env_proxy: bool,
+        _extra_bypass: &[String],
     ) -> Result<Self> {
         let client_ip = normalize_client_proxy_ip(addr);
-        let server_val = SocketAddr::new(client_ip, http_port).to_string();
-        let proxy_override = build_windows_proxy_override(extra_bypass);
-        let no_proxy_csv = build_no_proxy_value(extra_bypass);
+        let pac_url = build_windows_pac_url(client_ip, http_port);
         let service_mode = is_running_as_service();
         let roots = target_proxy_roots();
 
+        // Preserve any already-saved pre-vdpi state across crash/restart so Defender kills
+        // or abrupt restarts never overwrite the user's original proxy configuration.
+        let mut saved_state = load_saved_windows_proxy_state();
         for root in &roots {
             let inet_key = internet_settings_key(root);
-            if let Err(e) = apply_wininet_proxy(&inet_key, &server_val, &proxy_override) {
+            saved_state.record_hive_if_absent(root, capture_wininet_state(&inet_key));
+        }
+        save_windows_proxy_state(&saved_state);
+
+        let mut env_cleaned = false;
+        for root in &roots {
+            let inet_key = internet_settings_key(root);
+            if let Err(e) = apply_wininet_pac_proxy(&inet_key, &pac_url) {
                 if service_mode {
-                    warn!(hive = %root, error = %e, "failed to apply WinINET proxy to user hive");
+                    warn!(hive = %root, error = %e, "failed to apply WinINET fail-open PAC proxy to user hive");
                 } else {
                     return Err(e);
                 }
             }
 
-            if enable_env_proxy {
-                let env_key = user_env_key(root);
-                let proxy_url = format!("http://{server_val}");
-                set_windows_user_env(&env_key, &proxy_url, &no_proxy_csv);
+            // Never write persistent HKCU\Environment HTTP_PROXY/HTTPS_PROXY/NO_PROXY because
+            // Registry env vars cannot fail open if vdpi.exe is killed or quarantined. Clean up
+            // any stale vdpi-owned env vars left over from older versions so upgrades auto-heal.
+            let env_key = user_env_key(root);
+            if unset_windows_user_env(&env_key) {
+                env_cleaned = true;
             }
         }
 
-        if service_mode {
-            apply_winhttp_proxy_if_safe(&server_val, &proxy_override);
-        }
+        // Auto-heal any legacy fail-closed WinHTTP manual proxy left by older vdpi versions.
+        reset_winhttp_proxy_if_vdpi();
 
         notify_wininet_refresh();
-        if enable_env_proxy {
+        if env_cleaned {
             broadcast_environment_change();
         }
 
         info!(
-            proxy = %server_val,
-            env_proxy = enable_env_proxy,
+            pac_url = %pac_url,
             service_mode,
             hives = roots.len(),
-            "configured Windows WinINET system proxy"
+            "configured Windows WinINET fail-open PAC system proxy"
         );
 
         Ok(Self {
             addr: client_ip,
             http_port,
-            proxy_override,
-            env_configured: enable_env_proxy,
-            no_proxy_csv,
             vpn_coexistence: VpnCoexistence::AutoYield,
+            saved_state,
         })
     }
 
@@ -154,15 +490,9 @@ impl WindowsProxySession {
 
     pub fn summary(&self) -> String {
         if is_running_as_service() {
-            if self.env_configured {
-                "active (Windows Service -> WinINET Registry + User Environment)".to_string()
-            } else {
-                "active (Windows Service -> WinINET Registry)".to_string()
-            }
-        } else if self.env_configured {
-            "active (Windows WinINET Registry + User Environment)".to_string()
+            "active (Windows Service -> WinINET Fail-Open PAC AutoConfigURL)".to_string()
         } else {
-            "active (Windows WinINET Registry)".to_string()
+            "active (Windows WinINET Fail-Open PAC AutoConfigURL)".to_string()
         }
     }
 
@@ -174,41 +504,32 @@ impl WindowsProxySession {
             return;
         }
 
-        let expected_server =
-            SocketAddr::new(normalize_client_proxy_ip(self.addr), self.http_port).to_string();
-        let expected_url = format!("http://{expected_server}");
+        let expected_pac_url = build_windows_pac_url(self.addr, self.http_port);
         let roots = target_proxy_roots();
         let mut wininet_changed = false;
         let mut env_changed = false;
 
         for root in &roots {
             let inet_key = internet_settings_key(root);
-            let (enabled, current_server) = query_wininet_state(&inet_key);
-            if !enabled || !current_server.eq_ignore_ascii_case(&expected_server) {
-                if let Err(e) =
-                    apply_wininet_proxy(&inet_key, &expected_server, &self.proxy_override)
-                {
-                    warn!(hive = %root, error = %e, "failed to reconcile Windows proxy settings");
+            let current = query_current_wininet_state(&inet_key);
+            let pac_aligned = current
+                .auto_config_url
+                .as_deref()
+                .is_some_and(|u| u.trim().eq_ignore_ascii_case(&expected_pac_url));
+            if !pac_aligned || current.proxy_enable {
+                if let Err(e) = apply_wininet_pac_proxy(&inet_key, &expected_pac_url) {
+                    warn!(hive = %root, error = %e, "failed to reconcile Windows fail-open PAC proxy settings");
                 } else {
                     wininet_changed = true;
                 }
             }
 
-            if self.env_configured {
-                let env_key = user_env_key(root);
-                if query_reg_sz(&env_key, "HTTP_PROXY").as_deref() != Some(expected_url.as_str())
-                    || query_reg_sz(&env_key, "HTTPS_PROXY").as_deref()
-                        != Some(expected_url.as_str())
-                {
-                    set_windows_user_env(&env_key, &expected_url, &self.no_proxy_csv);
-                    env_changed = true;
-                }
+            let env_key = user_env_key(root);
+            if unset_windows_user_env(&env_key) {
+                env_changed = true;
             }
         }
 
-        if is_running_as_service() {
-            apply_winhttp_proxy_if_safe(&expected_server, &self.proxy_override);
-        }
         if wininet_changed {
             notify_wininet_refresh();
         }
@@ -218,22 +539,84 @@ impl WindowsProxySession {
     }
 
     pub fn deactivate(&self) {
-        let _ = clear_all_windows_proxies();
+        let _ = clear_all_windows_proxies_with_fallback(Some(&self.saved_state));
         debug!("restored Windows WinINET proxy state");
     }
 }
 
 pub fn clear_all_windows_proxies() -> Result<()> {
+    clear_all_windows_proxies_with_fallback(None)
+}
+
+fn clear_all_windows_proxies_with_fallback(
+    fallback_saved: Option<&SavedWindowsProxyState>,
+) -> Result<()> {
+    let mut saved = load_saved_windows_proxy_state();
+    if let Some(fb) = fallback_saved {
+        saved.merge_missing_from(fb);
+    }
+
     let mut wininet_changed = false;
     let mut env_changed = false;
     for root in all_cleanup_roots() {
         let inet_key = internet_settings_key(&root);
-        let (enabled, server) = query_wininet_state(&inet_key);
-        if enabled
-            && is_vdpi_owned_wininet_server(&server)
-            && run_reg(&[
+        let current = query_current_wininet_state(&inet_key);
+        let prior = saved.state_for_root(&root);
+        let plan = plan_wininet_restore(&current, prior.as_ref());
+        if execute_wininet_restore_plan(&inet_key, &plan) {
+            wininet_changed = true;
+        }
+        let env_key = user_env_key(&root);
+        if unset_windows_user_env(&env_key) {
+            env_changed = true;
+        }
+    }
+    reset_winhttp_proxy_if_vdpi();
+    remove_saved_windows_proxy_state_files();
+    if wininet_changed {
+        notify_wininet_refresh();
+    }
+    if env_changed {
+        broadcast_environment_change();
+    }
+    Ok(())
+}
+
+fn execute_wininet_restore_plan(inet_key: &str, plan: &WininetRestorePlan) -> bool {
+    let mut changed = false;
+
+    match &plan.auto_config {
+        AutoConfigAction::Keep => {}
+        AutoConfigAction::Delete => {
+            if run_reg(&["delete", inet_key, "/v", "AutoConfigURL", "/f"]).is_ok() {
+                changed = true;
+            }
+        }
+        AutoConfigAction::Set(prev_url) => {
+            if run_reg(&[
                 "add",
-                &inet_key,
+                inet_key,
+                "/v",
+                "AutoConfigURL",
+                "/t",
+                "REG_SZ",
+                "/d",
+                prev_url,
+                "/f",
+            ])
+            .is_ok()
+            {
+                changed = true;
+            }
+        }
+    }
+
+    match &plan.manual_proxy {
+        ManualProxyAction::Keep => {}
+        ManualProxyAction::Disable => {
+            if run_reg(&[
+                "add",
+                inet_key,
                 "/v",
                 "ProxyEnable",
                 "/t",
@@ -243,22 +626,61 @@ pub fn clear_all_windows_proxies() -> Result<()> {
                 "/f",
             ])
             .is_ok()
-        {
-            wininet_changed = true;
+            {
+                changed = true;
+            }
         }
-        let env_key = user_env_key(&root);
-        if unset_windows_user_env(&env_key) {
-            env_changed = true;
+        ManualProxyAction::Restore {
+            server,
+            override_list,
+        } => {
+            let mut restored = run_reg(&[
+                "add",
+                inet_key,
+                "/v",
+                "ProxyServer",
+                "/t",
+                "REG_SZ",
+                "/d",
+                server,
+                "/f",
+            ])
+            .is_ok();
+            if let Some(ov) = override_list {
+                let _ = run_reg(&[
+                    "add",
+                    inet_key,
+                    "/v",
+                    "ProxyOverride",
+                    "/t",
+                    "REG_SZ",
+                    "/d",
+                    ov,
+                    "/f",
+                ]);
+            }
+            if run_reg(&[
+                "add",
+                inet_key,
+                "/v",
+                "ProxyEnable",
+                "/t",
+                "REG_DWORD",
+                "/d",
+                "1",
+                "/f",
+            ])
+            .is_ok()
+            {
+                restored = true;
+            }
+            if restored {
+                changed = true;
+            }
         }
     }
-    reset_winhttp_proxy_if_vdpi();
-    if wininet_changed {
-        notify_wininet_refresh();
-    }
-    if env_changed {
-        broadcast_environment_change();
-    }
-    Ok(())
+
+    changed
 }
 
 fn query_winhttp_proxy_server() -> Option<String> {
@@ -298,24 +720,6 @@ fn parse_winhttp_proxy_server(text: &str) -> Option<String> {
     fallback_value
 }
 
-fn apply_winhttp_proxy_if_safe(server: &str, bypass_list: &str) {
-    // Only configure WinHTTP when no unrelated external proxy is already set.
-    if let Some(current) = query_winhttp_proxy_server() {
-        if current.eq_ignore_ascii_case(server) {
-            return;
-        }
-        if !is_vdpi_owned_wininet_server(&current) {
-            return;
-        }
-    }
-    let proxy_arg = format!("proxy-server={server}");
-    let bypass_arg = format!("bypass-list={bypass_list}");
-    let _ = Command::new("netsh")
-        .creation_flags(CREATE_NO_WINDOW)
-        .args(["winhttp", "set", "proxy", &proxy_arg, &bypass_arg])
-        .output();
-}
-
 fn reset_winhttp_proxy_if_vdpi() {
     if query_winhttp_proxy_server()
         .as_deref()
@@ -331,21 +735,31 @@ fn reset_winhttp_proxy_if_vdpi() {
 pub fn print_windows_proxy_status() {
     let inet_key = internet_settings_key("HKCU");
     let env_key = user_env_key("HKCU");
-    let (enabled, server) = query_wininet_state(&inet_key);
+    let current = query_current_wininet_state(&inet_key);
     let override_val = query_reg_sz(&inet_key, "ProxyOverride").unwrap_or_else(|| "<unset>".into());
     let https_env = query_reg_sz(&env_key, "HTTPS_PROXY").unwrap_or_else(|| "<unset>".into());
+    let auto_config_url = current
+        .auto_config_url
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("<unset>");
 
     println!("\n=== Windows System Proxy (WinINET) ===");
+    println!("AutoConfigURL (PAC)       : {auto_config_url}");
     println!(
         "ProxyEnable               : {}",
-        if enabled { "ON (1)" } else { "OFF (0)" }
+        if current.proxy_enable {
+            "ON (1)"
+        } else {
+            "OFF (0)"
+        }
     );
     println!(
         "ProxyServer               : {}",
-        if server.is_empty() {
+        if current.proxy_server.is_empty() {
             "<unset>"
         } else {
-            &server
+            &current.proxy_server
         }
     );
     println!("ProxyOverride             : {override_val}");
@@ -402,11 +816,9 @@ fn all_cleanup_roots() -> Vec<String> {
     if is_running_as_service() {
         enumerate_interactive_hku_roots()
     } else {
-        let mut roots = vec!["HKCU".to_string()];
-        for hku in enumerate_interactive_hku_roots() {
-            if !roots.iter().any(|r| r.eq_ignore_ascii_case(&hku)) {
-                roots.push(hku);
-            }
+        let mut roots = enumerate_interactive_hku_roots();
+        if !roots.iter().any(|r| r.eq_ignore_ascii_case("HKCU")) {
+            roots.push("HKCU".to_string());
         }
         roots
     }
@@ -420,29 +832,20 @@ fn user_env_key(root: &str) -> String {
     format!(r"{root}\{USER_ENV_SUBKEY}")
 }
 
-fn apply_wininet_proxy(inet_key: &str, server: &str, proxy_override: &str) -> Result<()> {
+fn apply_wininet_pac_proxy(inet_key: &str, pac_url: &str) -> Result<()> {
     run_reg(&[
         "add",
         inet_key,
         "/v",
-        "ProxyServer",
+        "AutoConfigURL",
         "/t",
         "REG_SZ",
         "/d",
-        server,
+        pac_url,
         "/f",
     ])?;
-    run_reg(&[
-        "add",
-        inet_key,
-        "/v",
-        "ProxyOverride",
-        "/t",
-        "REG_SZ",
-        "/d",
-        proxy_override,
-        "/f",
-    ])?;
+    // Explicitly disable manual ProxyEnable so Windows evaluates the fail-open PAC
+    // (`PROXY 127.0.0.1:<port>; DIRECT`) and automatically falls back to DIRECT if vdpi exits.
     run_reg(&[
         "add",
         inet_key,
@@ -451,27 +854,10 @@ fn apply_wininet_proxy(inet_key: &str, server: &str, proxy_override: &str) -> Re
         "/t",
         "REG_DWORD",
         "/d",
-        "1",
+        "0",
         "/f",
     ])?;
     Ok(())
-}
-
-fn set_windows_user_env(env_key: &str, proxy_url: &str, no_proxy: &str) {
-    for key in ["HTTP_PROXY", "HTTPS_PROXY"] {
-        let _ = run_reg(&[
-            "add", env_key, "/v", key, "/t", "REG_SZ", "/d", proxy_url, "/f",
-        ]);
-    }
-    let _ = run_reg(&[
-        "add", env_key, "/v", "NO_PROXY", "/t", "REG_SZ", "/d", no_proxy, "/f",
-    ]);
-    if query_reg_sz(env_key, "ALL_PROXY")
-        .as_deref()
-        .is_some_and(is_vdpi_owned_proxy_env)
-    {
-        let _ = run_reg(&["delete", env_key, "/v", "ALL_PROXY", "/f"]);
-    }
 }
 
 fn is_vdpi_owned_proxy_env(val: &str) -> bool {
@@ -503,11 +889,27 @@ fn unset_windows_user_env(env_key: &str) -> bool {
     owned
 }
 
-fn query_wininet_state(inet_key: &str) -> (bool, String) {
+fn query_current_wininet_state(inet_key: &str) -> CurrentWininetState {
     let enabled_raw = query_reg_sz(inet_key, "ProxyEnable").unwrap_or_default();
-    let enabled = enabled_raw == "0x1" || enabled_raw == "1";
-    let server = query_reg_sz(inet_key, "ProxyServer").unwrap_or_default();
-    (enabled, server)
+    let proxy_enable = enabled_raw == "0x1" || enabled_raw == "1";
+    let proxy_server = query_reg_sz(inet_key, "ProxyServer").unwrap_or_default();
+    let auto_config_url = query_reg_sz(inet_key, "AutoConfigURL");
+    CurrentWininetState {
+        proxy_enable,
+        proxy_server,
+        auto_config_url,
+    }
+}
+
+fn capture_wininet_state(inet_key: &str) -> SavedWininetHiveState {
+    let current = query_current_wininet_state(inet_key);
+    let proxy_override = query_reg_sz(inet_key, "ProxyOverride");
+    SavedWininetHiveState {
+        proxy_enable: current.proxy_enable,
+        proxy_server: (!current.proxy_server.trim().is_empty()).then_some(current.proxy_server),
+        proxy_override,
+        auto_config_url: current.auto_config_url,
+    }
 }
 
 pub fn query_reg_sz(key: &str, value_name: &str) -> Option<String> {
@@ -981,5 +1383,217 @@ mod tests {
     #[test]
     fn detect_stale_browsers_returns_empty_for_zero_epoch_threshold() {
         assert!(detect_stale_browsers(0).is_empty());
+    }
+
+    #[test]
+    fn builds_fail_open_pac_urls_for_ipv4_ipv6_and_unspecified() {
+        assert_eq!(
+            build_windows_pac_url(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
+            "http://127.0.0.1:8080/vdpi.pac"
+        );
+        assert_eq!(
+            build_windows_pac_url(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 18080),
+            "http://127.0.0.1:18080/vdpi.pac"
+        );
+        assert_eq!(
+            build_windows_pac_url(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 8080),
+            "http://[::1]:8080/vdpi.pac"
+        );
+        assert_eq!(
+            build_windows_pac_url(IpAddr::V6(Ipv6Addr::LOCALHOST), 9090),
+            "http://[::1]:9090/vdpi.pac"
+        );
+        assert_eq!(
+            build_windows_pac_url(IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()), 8080),
+            "http://127.0.0.1:8080/vdpi.pac"
+        );
+    }
+
+    #[test]
+    fn pac_url_ownership_matches_only_vdpi_pac_endpoints() {
+        assert!(is_vdpi_owned_pac_url("http://127.0.0.1:8080/vdpi.pac"));
+        assert!(is_vdpi_owned_pac_url("HTTP://127.0.0.1:18080/VDPI.PAC"));
+        assert!(is_vdpi_owned_pac_url(" http://[::1]:8080/vdpi.pac "));
+        assert!(is_vdpi_owned_pac_url("http://127.0.0.1:8080/vdpi.pac?v=1"));
+        assert!(is_vdpi_owned_pac_url("http://192.168.1.5:8080/vdpi.pac"));
+        assert!(!is_vdpi_owned_pac_url("http://pac.corp.local/proxy.pac"));
+        assert!(!is_vdpi_owned_pac_url("http://127.0.0.1:8080/other.pac"));
+        assert!(!is_vdpi_owned_pac_url("https://127.0.0.1:8080/vdpi.pac"));
+        assert!(!is_vdpi_owned_pac_url("http://127.0.0.1/vdpi.pac"));
+        assert!(!is_vdpi_owned_pac_url(""));
+    }
+
+    #[test]
+    fn saved_proxy_state_deserializes_legacy_json_without_auto_config_url() {
+        let legacy_json = r#"{
+            "proxy_enable": true,
+            "proxy_server": "corp.proxy.local:3128",
+            "proxy_override": "localhost;<local>"
+        }"#;
+        let parsed: SavedWindowsProxyState =
+            serde_json::from_str(legacy_json).expect("legacy state JSON must deserialize");
+        assert!(parsed.proxy_enable);
+        assert_eq!(
+            parsed.proxy_server.as_deref(),
+            Some("corp.proxy.local:3128")
+        );
+        assert_eq!(parsed.proxy_override.as_deref(), Some("localhost;<local>"));
+        assert_eq!(parsed.auto_config_url, None);
+        assert!(parsed.hives.is_empty());
+
+        let hkcu = parsed
+            .state_for_root("HKCU")
+            .expect("legacy flat state should map to HKCU");
+        assert!(hkcu.proxy_enable);
+        assert_eq!(hkcu.proxy_server.as_deref(), Some("corp.proxy.local:3128"));
+        assert_eq!(hkcu.auto_config_url, None);
+
+        // Empty JSON object should also deserialize cleanly via #[serde(default)].
+        let empty: SavedWindowsProxyState =
+            serde_json::from_str("{}").expect("empty JSON must deserialize");
+        assert_eq!(empty, SavedWindowsProxyState::default());
+        assert_eq!(empty.state_for_root("HKCU"), None);
+    }
+
+    #[test]
+    fn saved_proxy_state_round_trips_auto_config_url_and_sanitizes_vdpi_entries() {
+        let mut saved = SavedWindowsProxyState::default();
+        saved.record_hive_if_absent(
+            "HKCU",
+            SavedWininetHiveState {
+                proxy_enable: false,
+                proxy_server: Some("127.0.0.1:8080".into()),
+                proxy_override: Some("localhost;<local>".into()),
+                auto_config_url: Some("http://pac.corp.local/proxy.pac".into()),
+            },
+        );
+        // Second capture for the same root must not overwrite the original snapshot.
+        saved.record_hive_if_absent(
+            "HKCU",
+            SavedWininetHiveState {
+                proxy_enable: false,
+                proxy_server: None,
+                proxy_override: None,
+                auto_config_url: Some("http://127.0.0.1:8080/vdpi.pac".into()),
+            },
+        );
+        // A hive that only had stale vdpi values sanitizes to empty prior state.
+        saved.record_hive_if_absent(
+            r"HKU\S-1-5-21-999",
+            SavedWininetHiveState {
+                proxy_enable: true,
+                proxy_server: Some("127.0.0.1:8080".into()),
+                proxy_override: Some("<local>".into()),
+                auto_config_url: Some("http://127.0.0.1:8080/vdpi.pac".into()),
+            },
+        );
+
+        let json = serde_json::to_string(&saved).expect("serialize saved state");
+        let round_trip: SavedWindowsProxyState =
+            serde_json::from_str(&json).expect("deserialize saved state");
+        assert_eq!(round_trip, saved);
+
+        let hkcu = round_trip.state_for_root("hkcu").expect("HKCU present");
+        assert!(!hkcu.proxy_enable);
+        assert_eq!(hkcu.proxy_server, None);
+        assert_eq!(
+            hkcu.auto_config_url.as_deref(),
+            Some("http://pac.corp.local/proxy.pac")
+        );
+
+        let sid = round_trip
+            .state_for_root(r"HKU\S-1-5-21-999")
+            .expect("SID present");
+        assert_eq!(sid, SavedWininetHiveState::default());
+    }
+
+    #[test]
+    fn restore_plan_cleans_stale_pac_and_legacy_manual_proxy_or_restores_prior() {
+        // 1. No prior state: deletes vdpi AutoConfigURL and disables legacy vdpi ProxyEnable=1.
+        let plan = plan_wininet_restore(
+            &CurrentWininetState {
+                proxy_enable: true,
+                proxy_server: "127.0.0.1:8080".into(),
+                auto_config_url: Some("http://127.0.0.1:8080/vdpi.pac".into()),
+            },
+            None,
+        );
+        assert_eq!(plan.auto_config, AutoConfigAction::Delete);
+        assert_eq!(plan.manual_proxy, ManualProxyAction::Disable);
+
+        // 2. Prior corporate PAC exists: restores corporate PAC instead of deleting.
+        let prior_pac = SavedWininetHiveState {
+            proxy_enable: false,
+            proxy_server: None,
+            proxy_override: None,
+            auto_config_url: Some("http://pac.corp.local/wpad.dat".into()),
+        };
+        let plan = plan_wininet_restore(
+            &CurrentWininetState {
+                proxy_enable: false,
+                proxy_server: String::new(),
+                auto_config_url: Some("http://127.0.0.1:8080/vdpi.pac".into()),
+            },
+            Some(&prior_pac),
+        );
+        assert_eq!(
+            plan.auto_config,
+            AutoConfigAction::Set("http://pac.corp.local/wpad.dat".into())
+        );
+        assert_eq!(plan.manual_proxy, ManualProxyAction::Keep);
+
+        // 3. Prior state erroneously contains a vdpi PAC URL: always deletes AutoConfigURL.
+        let poisoned_prior = SavedWininetHiveState {
+            proxy_enable: true,
+            proxy_server: Some("127.0.0.1:8080".into()),
+            proxy_override: None,
+            auto_config_url: Some("http://127.0.0.1:18080/vdpi.pac".into()),
+        };
+        let plan = plan_wininet_restore(
+            &CurrentWininetState {
+                proxy_enable: true,
+                proxy_server: "[::1]:8080".into(),
+                auto_config_url: Some("http://127.0.0.1:8080/vdpi.pac".into()),
+            },
+            Some(&poisoned_prior),
+        );
+        assert_eq!(plan.auto_config, AutoConfigAction::Delete);
+        assert_eq!(plan.manual_proxy, ManualProxyAction::Disable);
+
+        // 4. Prior corporate manual proxy exists: deletes vdpi PAC and restores corporate manual proxy.
+        let prior_manual = SavedWininetHiveState {
+            proxy_enable: true,
+            proxy_server: Some("proxy.corp.local:3128".into()),
+            proxy_override: Some("*.corp.local;<local>".into()),
+            auto_config_url: None,
+        };
+        let plan = plan_wininet_restore(
+            &CurrentWininetState {
+                proxy_enable: false,
+                proxy_server: String::new(),
+                auto_config_url: Some("http://127.0.0.1:8080/vdpi.pac".into()),
+            },
+            Some(&prior_manual),
+        );
+        assert_eq!(plan.auto_config, AutoConfigAction::Delete);
+        assert_eq!(
+            plan.manual_proxy,
+            ManualProxyAction::Restore {
+                server: "proxy.corp.local:3128".into(),
+                override_list: Some("*.corp.local;<local>".into()),
+            }
+        );
+
+        // 5. Unrelated external proxy & PAC are never clobbered.
+        let plan = plan_wininet_restore(
+            &CurrentWininetState {
+                proxy_enable: true,
+                proxy_server: "proxy.corp.local:3128".into(),
+                auto_config_url: Some("http://pac.corp.local/proxy.pac".into()),
+            },
+            None,
+        );
+        assert_eq!(plan.auto_config, AutoConfigAction::Keep);
+        assert_eq!(plan.manual_proxy, ManualProxyAction::Keep);
     }
 }

@@ -3002,7 +3002,7 @@ fn schedule_delayed_windows_dir_cleanup(vdpi_root: &Path) {
 
 #[cfg(target_os = "windows")]
 fn cleanup_windows_install_files(purge: bool) {
-    use crate::platform::windows::remove_dir_from_windows_path;
+    use crate::platform::windows::{remove_dir_from_windows_path, WINDOWS_PROXY_STATE_FILENAME};
 
     // Release any directory handle held on `C:\Program Files\vdpi\bin` via CWD.
     let _ = std::env::set_current_dir(std::env::temp_dir());
@@ -3033,9 +3033,10 @@ fn cleanup_windows_install_files(purge: bool) {
             }
         } else {
             // Preserve `%LOCALAPPDATA%\vdpi\config.toml` and its parent directory when
-            // uninstall runs without `--purge`; remove only bin/, logs/, and state.json.
+            // uninstall runs without `--purge`; remove only bin/, logs/, and state files.
             let _ = fs::remove_dir_all(legacy.join("logs"));
             let _ = fs::remove_file(legacy.join("state.json"));
+            let _ = fs::remove_file(legacy.join(WINDOWS_PROXY_STATE_FILENAME));
             let legacy_bin_dir = legacy.join("bin");
             if legacy_bin_dir.exists() {
                 let running_from_legacy_bin = current_exe
@@ -3058,6 +3059,7 @@ fn cleanup_windows_install_files(purge: bool) {
             let _ = fs::remove_dir_all(&pd_dir);
         } else {
             let _ = fs::remove_file(pd_dir.join("state.json"));
+            let _ = fs::remove_file(pd_dir.join(WINDOWS_PROXY_STATE_FILENAME));
         }
     }
 
@@ -3084,6 +3086,7 @@ fn cleanup_windows_install_files(purge: bool) {
         } else {
             let _ = fs::remove_dir_all(vdpi_root.join("logs"));
             let _ = fs::remove_file(vdpi_root.join("state.json"));
+            let _ = fs::remove_file(vdpi_root.join(WINDOWS_PROXY_STATE_FILENAME));
             if bin_dir.exists() {
                 let running_from_bin = current_exe
                     .as_ref()
@@ -5170,6 +5173,61 @@ async fn send_quic_initial_probe() -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+fn evaluate_windows_proxy_drift(
+    active_addr: IpAddr,
+    active_port: u16,
+    proxy_enable: bool,
+    proxy_server: &str,
+    auto_config_url: Option<&str>,
+    env_http_proxy: Option<&str>,
+    env_https_proxy: Option<&str>,
+) -> Option<String> {
+    use crate::platform::windows::{
+        build_windows_pac_url, is_vdpi_owned_pac_url, is_vdpi_owned_wininet_server,
+    };
+
+    let expected_pac_url = build_windows_pac_url(active_addr, active_port);
+    let auto_config_trimmed = auto_config_url.map(str::trim).filter(|s| !s.is_empty());
+    let server_trimmed = proxy_server.trim();
+
+    if let Some(pac) = auto_config_trimmed {
+        if is_vdpi_owned_pac_url(pac) && !pac.eq_ignore_ascii_case(&expected_pac_url) {
+            return Some(format!(
+                "WinINET AutoConfigURL points to '{pac}' instead of '{expected_pac_url}'"
+            ));
+        }
+    }
+
+    if proxy_enable && !server_trimmed.is_empty() {
+        if is_vdpi_owned_wininet_server(server_trimmed) {
+            return Some(format!(
+                "WinINET ProxyEnable=1 uses legacy fail-closed ProxyServer '{server_trimmed}' instead of fail-open PAC '{expected_pac_url}'"
+            ));
+        }
+        return Some(format!(
+            "WinINET ProxyServer points to '{server_trimmed}' instead of fail-open PAC '{expected_pac_url}'"
+        ));
+    }
+
+    for (var_name, val) in [
+        ("HTTP_PROXY", env_http_proxy),
+        ("HTTPS_PROXY", env_https_proxy),
+    ] {
+        if let Some(raw) = val {
+            let trimmed = raw.trim();
+            let lower = trimmed.to_ascii_lowercase();
+            if lower.starts_with("http://127.0.0.1:") || lower.starts_with("http://[::1]:") {
+                return Some(format!(
+                    "stale HKCU\\Environment {var_name}='{trimmed}' left from legacy proxy mode (cannot fail open; restart vdpi or run 'vdpi pause' to clear)"
+                ));
+            }
+        }
+    }
+
+    None
+}
+
 fn check_proxy_drift_for_live_daemon(active_addr: IpAddr, active_port: u16) -> Option<String> {
     let expected_server = format!("{active_addr}:{active_port}");
     let expected_url = format!("http://{expected_server}");
@@ -5177,29 +5235,25 @@ fn check_proxy_drift_for_live_daemon(active_addr: IpAddr, active_port: u16) -> O
     #[cfg(target_os = "windows")]
     {
         use crate::platform::windows::query_reg_sz;
+        let _ = (&expected_server, &expected_url);
 
         let inet_key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
         let enabled_raw = query_reg_sz(inet_key, "ProxyEnable").unwrap_or_default();
         let enabled = enabled_raw == "0x1" || enabled_raw == "1";
         let server = query_reg_sz(inet_key, "ProxyServer").unwrap_or_default();
-        if enabled && !server.is_empty() && !server.eq_ignore_ascii_case(&expected_server) {
-            return Some(format!(
-                "WinINET ProxyServer points to '{server}' instead of '{expected_server}'"
-            ));
-        }
+        let auto_config_url = query_reg_sz(inet_key, "AutoConfigURL");
+        let env_http = query_reg_sz(r"HKCU\Environment", "HTTP_PROXY");
+        let env_https = query_reg_sz(r"HKCU\Environment", "HTTPS_PROXY");
 
-        if let Some(env_https) = query_reg_sz(r"HKCU\Environment", "HTTPS_PROXY") {
-            let trimmed = env_https.trim();
-            let lower = trimmed.to_ascii_lowercase();
-            if (lower.starts_with("http://127.0.0.1:") || lower.starts_with("http://[::1]:"))
-                && !trimmed.eq_ignore_ascii_case(&expected_url)
-            {
-                return Some(format!(
-                    "HKCU\\Environment HTTPS_PROXY points to '{trimmed}' instead of '{expected_url}'"
-                ));
-            }
-        }
-        None
+        evaluate_windows_proxy_drift(
+            active_addr,
+            active_port,
+            enabled,
+            &server,
+            auto_config_url.as_deref(),
+            env_http.as_deref(),
+            env_https.as_deref(),
+        )
     }
 
     #[cfg(target_os = "macos")]
@@ -7023,5 +7077,117 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_proxy_drift_recognizes_fail_open_pac_and_flags_stale_manual_or_env() {
+        let lo4 = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let any4 = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let lo6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
+
+        // Healthy fail-open PAC (IPv4 localhost, 0.0.0.0 normalized, and IPv6 localhost).
+        assert_eq!(
+            evaluate_windows_proxy_drift(
+                lo4,
+                8080,
+                false,
+                "",
+                Some("http://127.0.0.1:8080/vdpi.pac"),
+                None,
+                None,
+            ),
+            None
+        );
+        assert_eq!(
+            evaluate_windows_proxy_drift(
+                any4,
+                18080,
+                false,
+                "127.0.0.1:8080",
+                Some("http://127.0.0.1:18080/vdpi.pac"),
+                None,
+                None,
+            ),
+            None
+        );
+        assert_eq!(
+            evaluate_windows_proxy_drift(
+                lo6,
+                8080,
+                false,
+                "",
+                Some("http://[::1]:8080/vdpi.pac"),
+                None,
+                None,
+            ),
+            None
+        );
+
+        // Drifted AutoConfigURL pointing to a different vdpi port must warn.
+        let pac_drift = evaluate_windows_proxy_drift(
+            lo4,
+            8080,
+            false,
+            "",
+            Some("http://127.0.0.1:18080/vdpi.pac"),
+            None,
+            None,
+        )
+        .expect("drifted AutoConfigURL must be flagged");
+        assert!(pac_drift.contains("AutoConfigURL"));
+        assert!(pac_drift.contains("http://127.0.0.1:8080/vdpi.pac"));
+
+        // Legacy fail-closed ProxyEnable=1 pointing at loopback must warn.
+        let legacy_manual = evaluate_windows_proxy_drift(
+            lo4,
+            8080,
+            true,
+            "127.0.0.1:8080",
+            Some("http://127.0.0.1:8080/vdpi.pac"),
+            None,
+            None,
+        )
+        .expect("legacy fail-closed ProxyEnable=1 must be flagged");
+        assert!(legacy_manual.contains("fail-closed"));
+
+        // Stale legacy HKCU\Environment HTTP_PROXY / HTTPS_PROXY must warn.
+        let stale_env = evaluate_windows_proxy_drift(
+            lo4,
+            8080,
+            false,
+            "",
+            Some("http://127.0.0.1:8080/vdpi.pac"),
+            None,
+            Some("http://127.0.0.1:8080"),
+        )
+        .expect("stale HKCU\\Environment HTTPS_PROXY must be flagged");
+        assert!(stale_env.contains("HTTPS_PROXY"));
+
+        let stale_http_env = evaluate_windows_proxy_drift(
+            lo4,
+            8080,
+            false,
+            "",
+            Some("http://127.0.0.1:8080/vdpi.pac"),
+            Some("http://[::1]:8080"),
+            None,
+        )
+        .expect("stale HKCU\\Environment HTTP_PROXY must be flagged");
+        assert!(stale_http_env.contains("HTTP_PROXY"));
+
+        // Unrelated external env proxy and --no-system-proxy mode are left alone.
+        assert_eq!(
+            evaluate_windows_proxy_drift(
+                lo4,
+                8080,
+                false,
+                "",
+                None,
+                Some("http://proxy.corp.local:3128"),
+                Some("http://proxy.corp.local:3128"),
+            ),
+            None
+        );
     }
 }

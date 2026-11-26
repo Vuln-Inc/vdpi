@@ -304,38 +304,61 @@ jobs:
           }
 
           $resolvedDllPath = (Resolve-Path -LiteralPath $dllPath).Path
-          "VDPI_EMBED_WINTUN_DLL=$resolvedDllPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          Write-Host "Verified wintun.dll SHA-256 ($actualDllSha256) and Authenticode signer ($subject); exported VDPI_EMBED_WINTUN_DLL=$resolvedDllPath"
+          $resolvedLicensePath = (Resolve-Path -LiteralPath $licensePath).Path
+          "WINTUN_DLL_PATH=$resolvedDllPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WINTUN_LICENSE_PATH=$resolvedLicensePath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Verified wintun.dll SHA-256 ($actualDllSha256) and Authenticode signer ($subject); staged loose Wintun files for packaging"
       - name: Build Windows Release Binary
         shell: pwsh
         env:
           RUSTFLAGS: "-C target-feature=+crt-static"
         run: |
           $ErrorActionPreference = 'Stop'
-          if (-not $env:VDPI_EMBED_WINTUN_DLL -or -not (Test-Path -LiteralPath $env:VDPI_EMBED_WINTUN_DLL)) {
-            throw "VDPI_EMBED_WINTUN_DLL is missing or invalid: '$($env:VDPI_EMBED_WINTUN_DLL)'"
+          if ($env:VDPI_EMBED_WINTUN_DLL) {
+            throw "VDPI_EMBED_WINTUN_DLL must not be set for official Windows release builds"
           }
           cargo build --locked --release --target x86_64-pc-windows-msvc --bin vdpi
       - name: Package Windows Zip
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          if (-not $env:WINTUN_DLL_PATH -or -not (Test-Path -LiteralPath $env:WINTUN_DLL_PATH)) {
+            throw "WINTUN_DLL_PATH is missing or invalid: '$($env:WINTUN_DLL_PATH)'"
+          }
+          if (-not $env:WINTUN_LICENSE_PATH -or -not (Test-Path -LiteralPath $env:WINTUN_LICENSE_PATH)) {
+            throw "WINTUN_LICENSE_PATH is missing or invalid: '$($env:WINTUN_LICENSE_PATH)'"
+          }
+
           Remove-Item -LiteralPath dist/win -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path dist/win | Out-Null
-          Copy-Item target/x86_64-pc-windows-msvc/release/vdpi.exe dist/win/vdpi.exe
-          Compress-Archive -Path dist/win/vdpi.exe -DestinationPath dist/vdpi-windows-x86_64.zip -Force
+          Copy-Item -LiteralPath target/x86_64-pc-windows-msvc/release/vdpi.exe -Destination dist/win/vdpi.exe
+          Copy-Item -LiteralPath $env:WINTUN_DLL_PATH -Destination dist/win/wintun.dll
+          Copy-Item -LiteralPath $env:WINTUN_LICENSE_PATH -Destination dist/win/WINTUN-LICENSE.txt
+
+          $verInfo = (Get-Item -LiteralPath dist/win/vdpi.exe).VersionInfo
+          if ([string]::IsNullOrWhiteSpace($verInfo.ProductName) -or $verInfo.ProductName -ne 'vdpi') {
+            throw "Expected dist/win/vdpi.exe PE ProductName == 'vdpi', got '$($verInfo.ProductName)'"
+          }
+          if ([string]::IsNullOrWhiteSpace($verInfo.CompanyName) -or $verInfo.CompanyName -ne 'Vuln-Inc') {
+            throw "Expected dist/win/vdpi.exe PE CompanyName == 'Vuln-Inc', got '$($verInfo.CompanyName)'"
+          }
+          Write-Host "Verified PE VersionInfo: ProductName='$($verInfo.ProductName)', CompanyName='$($verInfo.CompanyName)', FileDescription='$($verInfo.FileDescription)', ProductVersion='$($verInfo.ProductVersion)'"
+
+          Compress-Archive -Path dist/win/* -DestinationPath dist/vdpi-windows-x86_64.zip -Force
 
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path 'dist/vdpi-windows-x86_64.zip').Path)
           try {
             $entries = @($zip.Entries | ForEach-Object { $_.FullName })
-            if ($entries.Count -ne 1 -or $entries[0] -ne 'vdpi.exe') {
-              throw "Expected dist/vdpi-windows-x86_64.zip to contain only vdpi.exe, got: $($entries -join ', ')"
+            $expected = @('vdpi.exe', 'wintun.dll', 'WINTUN-LICENSE.txt')
+            $diff = @(Compare-Object -ReferenceObject $expected -DifferenceObject $entries -CaseSensitive)
+            if ($entries.Count -ne $expected.Count -or $diff.Count -ne 0) {
+              throw "Expected dist/vdpi-windows-x86_64.zip to contain $($expected -join ', '), got: $($entries -join ', ')"
             }
           } finally {
             $zip.Dispose()
           }
-          Write-Host "Verified standalone Windows release archive (vdpi.exe only, embedded Wintun 0.14.1)"
+          Write-Host "Verified Windows release archive (vdpi.exe + loose WHQL-signed wintun.dll + WINTUN-LICENSE.txt)"
       - uses: actions/upload-artifact@v4
         with:
           name: release-windows

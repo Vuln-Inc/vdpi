@@ -2,7 +2,7 @@ use super::{
     check_split_tunnel_bypass, relay_direct_tunnel, relay_direct_with_initial, HANDSHAKE_TIMEOUT,
 };
 use crate::desync::EngineContext;
-use crate::health::{handle_health_http_request, HealthRuntimeMeta};
+use crate::health::{handle_health_http_request, is_local_health_host, HealthRuntimeMeta};
 use crate::tls::expected_tls_record_len;
 use anyhow::{bail, Result};
 use std::net::{IpAddr, SocketAddr};
@@ -13,6 +13,7 @@ use tracing::debug;
 use vdpi_core::config::EngineMode;
 
 const MAX_HTTP_HEADER_BYTES: usize = 32 * 1024;
+const PAC_WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Handles an incoming HTTP/1.x proxy request or `CONNECT` tunnel on `client`.
 pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Result<()> {
@@ -87,6 +88,11 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
             ..Default::default()
         };
         return handle_health_http_request(&mut client, method, header_str, &ctx, &meta).await;
+    }
+
+    // Built-in fail-open PAC endpoint for Windows/macOS system proxy auto-config
+    if target == "/vdpi.pac" || target.starts_with("/vdpi.pac?") {
+        return handle_pac_http_request(&mut client, method, header_str, &ctx).await;
     }
 
     let peer_addr = client.peer_addr().ok();
@@ -241,6 +247,139 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
                 .await;
             Err(e)
         }
+    }
+}
+
+async fn write_pac_response(client: &mut TcpStream, bytes: &[u8]) -> Result<()> {
+    tokio::time::timeout(PAC_WRITE_TIMEOUT, async {
+        client.write_all(bytes).await?;
+        client.flush().await
+    })
+    .await??;
+    Ok(())
+}
+
+fn normalize_pac_ip(ip: IpAddr) -> String {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) if v4.is_unspecified() => "127.0.0.1".to_string(),
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) if v6.is_unspecified() => "127.0.0.1".to_string(),
+        IpAddr::V6(v6) => format!("[{v6}]"),
+    }
+}
+
+fn resolve_pac_proxy_authority(
+    header_str: &str,
+    local_addr: Option<SocketAddr>,
+    ctx: &EngineContext,
+) -> String {
+    let fallback_port = local_addr
+        .map(|addr| addr.port())
+        .filter(|&port| port != 0)
+        .or_else(|| (ctx.config.port != 0).then_some(ctx.config.port))
+        .unwrap_or(8080);
+
+    let fallback_host = local_addr
+        .map(|addr| normalize_pac_ip(addr.ip()))
+        .unwrap_or_else(|| normalize_pac_ip(ctx.config.addr));
+
+    for line in header_str.lines().skip(1) {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("host") {
+            continue;
+        }
+        if let Ok((host, port)) = parse_authority(value, fallback_port) {
+            let resolved_port = if port != 0 { port } else { fallback_port };
+            let resolved_host = if let Ok(ip) = host.parse::<IpAddr>() {
+                normalize_pac_ip(ip)
+            } else if host.eq_ignore_ascii_case("localhost") {
+                fallback_host
+            } else {
+                host
+            };
+            return format!("{resolved_host}:{resolved_port}");
+        }
+    }
+
+    format!("{fallback_host}:{fallback_port}")
+}
+
+fn render_pac_script(proxy_authority: &str) -> String {
+    format!(
+        concat!(
+            "function FindProxyForURL(url, host) {{\n",
+            "  if (\n",
+            "    isPlainHostName(host) ||\n",
+            "    host === \"localhost\" ||\n",
+            "    host === \"127.0.0.1\" ||\n",
+            "    host === \"::1\" ||\n",
+            "    shExpMatch(host, \"*.local\") ||\n",
+            "    shExpMatch(host, \"*.localhost\") ||\n",
+            "    shExpMatch(host, \"*.internal\") ||\n",
+            "    shExpMatch(host, \"10.*\") ||\n",
+            "    shExpMatch(host, \"192.168.*\") ||\n",
+            "    shExpMatch(host, \"169.254.*\") ||\n",
+            "    shExpMatch(host, \"172.1[6-9].*\") ||\n",
+            "    shExpMatch(host, \"172.2[0-9].*\") ||\n",
+            "    shExpMatch(host, \"172.3[0-1].*\")\n",
+            "  ) {{\n",
+            "    return \"DIRECT\";\n",
+            "  }}\n",
+            "  return \"PROXY {proxy_authority}; DIRECT\";\n",
+            "}}\n",
+        ),
+        proxy_authority = proxy_authority
+    )
+}
+
+async fn handle_pac_http_request(
+    client: &mut TcpStream,
+    method: &str,
+    header_str: &str,
+    ctx: &EngineContext,
+) -> Result<()> {
+    let is_loopback_peer = client
+        .peer_addr()
+        .is_ok_and(|p| p.ip().to_canonical().is_loopback());
+    if !is_loopback_peer || !is_local_health_host(header_str) {
+        let _ = write_pac_response(
+            client,
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        return Ok(());
+    }
+
+    let is_get = method.eq_ignore_ascii_case("GET");
+    let is_head = method.eq_ignore_ascii_case("HEAD");
+    if !is_get && !is_head {
+        let _ = write_pac_response(
+            client,
+            b"HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        return Ok(());
+    }
+
+    let proxy_authority = resolve_pac_proxy_authority(header_str, client.local_addr().ok(), ctx);
+    let body = render_pac_script(&proxy_authority);
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    if is_head {
+        write_pac_response(client, headers.as_bytes()).await
+    } else {
+        let mut resp = Vec::with_capacity(headers.len() + body.len());
+        resp.extend_from_slice(headers.as_bytes());
+        resp.extend_from_slice(body.as_bytes());
+        write_pac_response(client, &resp).await
     }
 }
 
@@ -867,5 +1006,148 @@ mod tests {
         assert!(foreign_str.starts_with("HTTP/1.1 403 Forbidden\r\n"));
 
         server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn pac_endpoint_serves_fail_open_script_and_enforces_security() {
+        let cli = CliArgs::parse_from_iter(["vdpi", "--no-system-proxy"]).unwrap();
+        let ctx = EngineContext::new(cli.into_runtime_config()).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            for _ in 0..6 {
+                let (sock, _) = listener.accept().await.unwrap();
+                handle_http_client(sock, ctx.clone()).await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+
+        // 1. GET /vdpi.pac with explicit loopback Host:port
+        let mut get_client = TcpStream::connect(addr).await.unwrap();
+        let get_req = format!(
+            "GET /vdpi.pac HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+            addr.port()
+        );
+        get_client.write_all(get_req.as_bytes()).await.unwrap();
+        let mut get_resp = Vec::new();
+        get_client.read_to_end(&mut get_resp).await.unwrap();
+        let get_str = String::from_utf8(get_resp).unwrap();
+        let (headers, body) = get_str.split_once("\r\n\r\n").unwrap();
+        assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(
+            headers.contains("Content-Type: application/x-ns-proxy-autoconfig; charset=utf-8\r\n")
+        );
+        assert!(headers.contains("Cache-Control: no-store\r\n"));
+        assert!(headers.contains(&format!("Content-Length: {}\r\n", body.len())));
+        assert!(headers.contains("Connection: close"));
+        assert!(body.contains("function FindProxyForURL(url, host)"));
+        assert!(body.contains(&format!(
+            "return \"PROXY 127.0.0.1:{}; DIRECT\";",
+            addr.port()
+        )));
+        assert!(!body.contains("dnsResolve"));
+
+        // 2. GET /vdpi.pac?v=1 query string variant
+        let mut query_client = TcpStream::connect(addr).await.unwrap();
+        let query_req = format!(
+            "GET /vdpi.pac?v=1 HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+            addr.port()
+        );
+        query_client.write_all(query_req.as_bytes()).await.unwrap();
+        let mut query_resp = Vec::new();
+        query_client.read_to_end(&mut query_resp).await.unwrap();
+        let query_str = String::from_utf8(query_resp).unwrap();
+        let (query_headers, query_body) = query_str.split_once("\r\n\r\n").unwrap();
+        assert!(query_headers.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert_eq!(query_body, body);
+
+        // 3. HEAD /vdpi.pac returns headers only (with full Content-Length)
+        let mut head_client = TcpStream::connect(addr).await.unwrap();
+        let head_req = format!(
+            "HEAD /vdpi.pac HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+            addr.port()
+        );
+        head_client.write_all(head_req.as_bytes()).await.unwrap();
+        let mut head_resp = Vec::new();
+        head_client.read_to_end(&mut head_resp).await.unwrap();
+        let head_str = String::from_utf8(head_resp).unwrap();
+        let (head_headers, head_body) = head_str.split_once("\r\n\r\n").unwrap();
+        assert!(head_headers.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(head_headers
+            .contains("Content-Type: application/x-ns-proxy-autoconfig; charset=utf-8\r\n"));
+        assert!(head_headers.contains(&format!("Content-Length: {}\r\n", body.len())));
+        assert!(head_body.is_empty());
+
+        // 4. POST /vdpi.pac returns 405 Method Not Allowed
+        let mut post_client = TcpStream::connect(addr).await.unwrap();
+        let post_req = format!(
+            "POST /vdpi.pac HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+            addr.port()
+        );
+        post_client.write_all(post_req.as_bytes()).await.unwrap();
+        let mut post_resp = Vec::new();
+        post_client.read_to_end(&mut post_resp).await.unwrap();
+        let post_str = String::from_utf8(post_resp).unwrap();
+        assert!(post_str.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
+        assert!(post_str.contains("Allow: GET, HEAD\r\n"));
+
+        // 5. Non-loopback Host returns 403 Forbidden
+        let mut foreign_client = TcpStream::connect(addr).await.unwrap();
+        foreign_client
+            .write_all(b"GET /vdpi.pac HTTP/1.1\r\nHost: evil.example\r\n\r\n")
+            .await
+            .unwrap();
+        let mut foreign_resp = Vec::new();
+        foreign_client.read_to_end(&mut foreign_resp).await.unwrap();
+        let foreign_str = String::from_utf8(foreign_resp).unwrap();
+        assert!(foreign_str.starts_with("HTTP/1.1 403 Forbidden\r\n"));
+
+        // 6. Missing Host on HTTP/1.1 returns 403 Forbidden
+        let mut missing_host_client = TcpStream::connect(addr).await.unwrap();
+        missing_host_client
+            .write_all(b"GET /vdpi.pac HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut missing_host_resp = Vec::new();
+        missing_host_client
+            .read_to_end(&mut missing_host_resp)
+            .await
+            .unwrap();
+        let missing_host_str = String::from_utf8(missing_host_resp).unwrap();
+        assert!(missing_host_str.starts_with("HTTP/1.1 403 Forbidden\r\n"));
+
+        server.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn pac_authority_normalizes_unspecified_bind_addresses() {
+        let mut cfg = CliArgs::parse_from_iter(["vdpi", "--no-system-proxy"])
+            .unwrap()
+            .into_runtime_config();
+        cfg.addr = "0.0.0.0".parse().unwrap();
+        cfg.port = 18080;
+        let ctx_v4 = EngineContext::new(cfg.clone()).unwrap();
+        assert_eq!(
+            resolve_pac_proxy_authority("GET /vdpi.pac HTTP/1.0\r\n\r\n", None, &ctx_v4),
+            "127.0.0.1:18080"
+        );
+
+        cfg.addr = "::".parse().unwrap();
+        cfg.port = 18081;
+        let ctx_v6 = EngineContext::new(cfg).unwrap();
+        assert_eq!(
+            resolve_pac_proxy_authority("GET /vdpi.pac HTTP/1.0\r\n\r\n", None, &ctx_v6),
+            "127.0.0.1:18081"
+        );
+        assert_eq!(
+            resolve_pac_proxy_authority(
+                "GET /vdpi.pac HTTP/1.1\r\nHost: [::1]:18081\r\n\r\n",
+                None,
+                &ctx_v6
+            ),
+            "[::1]:18081"
+        );
     }
 }

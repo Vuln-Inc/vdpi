@@ -6,6 +6,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.5.8] - 2026-11-27
+
+### Added
+- **Fail-open PAC system proxy on Windows & macOS**:
+  - Served a local PAC script at `GET /vdpi.pac` returning `PROXY 127.0.0.1:<port>; DIRECT` and configured OS proxy integration via Windows `AutoConfigURL` and macOS `AutoProxyURL` so terminating, crashing, or quarantining `vdpi` automatically falls back to `DIRECT` and can never leave a user's internet broken.
+- **Windows PE `VS_VERSION_INFO` metadata & loose `wintun.dll` packaging**:
+  - Embedded Windows PE `VS_VERSION_INFO` metadata (`ProductName`, `CompanyName`, `FileDescription`, `ProductVersion`) directly into `vdpi.exe`.
+  - Packaged the unmodified WHQL-signed `wintun.dll` and `WINTUN-LICENSE.txt` as loose sidecar files inside `vdpi-windows-x86_64.zip` instead of embedding a binary blob inside `vdpi.exe`, minimizing antivirus false positives.
+
 ## [0.5.7] - 2026-11-27
 
 ### Added
@@ -184,7 +193,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Configured `CODE_SIGN_ENTITLEMENTS` in iOS `project.yml` so XcodeGen preserves `.entitlements` files.
 - Fixed release workflow entitlement verification and restricted automatic release runs to version tags and manual dispatch.
 
-[Unreleased]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.7...HEAD
+[Unreleased]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.8...HEAD
+[0.5.8]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.7...v0.5.8
 [0.5.7]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.6...v0.5.7
 [0.5.6]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.5...v0.5.6
 [0.5.5]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.4...v0.5.5

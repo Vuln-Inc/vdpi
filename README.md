@@ -34,7 +34,7 @@ Runs as a transparent system-wide TUN adapter or a lightweight local proxy with 
     </td>
     <td valign="top" width="50%">
       <strong>Native across all 5 platforms</strong><br>
-      Single self-contained binary on Windows, macOS, and Linux, plus zero-root local VPN apps for Android (APK) and iOS/iPadOS (IPA) sharing the same Rust core.
+      Lightweight native binaries on Windows, macOS, and Linux, plus zero-root local VPN apps for Android (APK) and iOS/iPadOS (IPA) sharing the same Rust core.
     </td>
   </tr>
   <tr>
@@ -44,7 +44,7 @@ Runs as a transparent system-wide TUN adapter or a lightweight local proxy with 
     </td>
     <td valign="top" width="50%">
       <strong>VPN, audio &amp; gaming safe</strong><br>
-      Gigabit TUN with zero-audio-stutter thread budgeting (VoiceMeeter safe), auto-yields to Mullvad, WireGuard, OpenVPN, ProtonVPN, and WARP and auto-resumes; coexists with Tailscale, Docker, and LAN; embedded WHQL-signed Wintun (anticheat safe) and low-latency UDP NAT for Discord, Roblox, and games.
+      Gigabit TUN with zero-audio-stutter thread budgeting (VoiceMeeter safe), auto-yields to Mullvad, WireGuard, OpenVPN, ProtonVPN, and WARP and auto-resumes; coexists with Tailscale, Docker, and LAN; WHQL-signed Wintun (anticheat safe) and low-latency UDP NAT for Discord, Roblox, and games.
     </td>
   </tr>
   <tr>
@@ -79,9 +79,9 @@ winget install Vuln-Inc.vdpi
 cargo install vdpi
 ```
 
-> **Note:** Official Windows releases ship as a single standalone `vdpi.exe` with the pinned WHQL-signed Wintun `0.14.1` driver embedded directly inside the binary (no loose `wintun.dll` required). `cargo install vdpi` builds `vdpi.exe` without the embedded driver (Proxy mode works immediately; for TUN mode, place `wintun.dll` beside `vdpi.exe` or install via Scoop, WinGet, or `install.ps1`).
+> **Note:** Official Windows releases (`vdpi-windows-x86_64.zip`) ship `vdpi.exe` alongside the unmodified WHQL-signed `wintun.dll` (`0.14.1`) and `WINTUN-LICENSE.txt` (needed only for TUN mode). Proxy mode uses a fail-open PAC proxy (`AutoConfigURL` -> `PROXY 127.0.0.1:<port>; DIRECT`) so terminating or crashing `vdpi` can never brick your internet connection. `cargo install vdpi` works in Proxy mode immediately; for TUN mode, place `wintun.dll` beside `vdpi.exe` or install via `install.ps1`, Scoop, or WinGet.
 
-Direct download: [`vdpi-windows-x86_64.zip`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-windows-x86_64.zip) (single standalone `vdpi.exe` with embedded WHQL-signed Wintun `0.14.1`) or [crates.io/crates/vdpi](https://crates.io/crates/vdpi).
+Direct download: [`vdpi-windows-x86_64.zip`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-windows-x86_64.zip) (`vdpi.exe`, WHQL-signed `wintun.dll` `0.14.1`, and `WINTUN-LICENSE.txt`) or [crates.io/crates/vdpi](https://crates.io/crates/vdpi).
 
 ### macOS & Linux (`universal` / `x86_64` & `arm64`)
 
@@ -121,7 +121,7 @@ Direct downloads: [`vdpi-macos-universal.tar.gz`](https://github.com/Vuln-Inc/vd
 | :--- | :--- | :--- |
 | **Traffic capture** | Local `127.0.0.1:8080` (HTTP/HTTPS/SOCKS5/4a) + `:1080` (SOCKS5 TCP/UDP) | Layer 3 virtual NIC (`Wintun` / `utun` / `/dev/net/tun`) + userspace stack |
 | **App coverage** | Browsers, Discord, Telegram & apps honoring system proxy or `HTTP_PROXY` / `HTTPS_PROXY` | System-wide TCP & UDP: games (Roblox, Valorant, etc.), Discord voice, CLI, all apps |
-| **OS integration** | Sets OS proxy & env vars; no virtual adapter, route, or DNS changes | Zero proxy env edits; no browser restart required |
+| **OS integration** | Fail-open PAC proxy (`AutoConfigURL` / `AutoProxyURL`) & env vars; no virtual adapter, route, or DNS changes | Zero proxy env edits; no browser restart required |
 | **Privileges & memory** | Zero admin privileges required; ~8-14 MB RAM | Prompts for UAC (Windows) or `sudo` / Touch ID (macOS & Linux); ~16-22 MB RAM |
 | **VPN & anticheat** | Pure loopback proxy; no virtual adapter; `VpnGuard` auto-yield | `VpnGuard` 0ms auto-yield; WHQL-signed Wintun (anticheat safe) |
 
@@ -176,4 +176,4 @@ Run `vdpi install` to register automatic background startup (Windows Service, ma
 ## License
 
 Released under the [MIT License](./LICENSE) · [Changelog](./CHANGELOG.md) · [Security](./SECURITY.md) · Official repository: [github.com/Vuln-Inc/vdpi](https://github.com/Vuln-Inc/vdpi) · Copyright (c) 2026 [Vuln-Inc](https://github.com/Vuln-Inc).  
-Official Windows release binaries embed the unmodified WHQL-signed Wintun `0.14.1` driver (Copyright (C) WireGuard LLC, distributed under the Wintun / GPLv2 license - see [wintun.net](https://www.wintun.net/)).
+Official Windows release archives bundle the unmodified WHQL-signed Wintun `0.14.1` driver (`wintun.dll` and `WINTUN-LICENSE.txt`, Copyright (C) WireGuard LLC, distributed under the Wintun / GPLv2 license - see [wintun.net](https://www.wintun.net/)).

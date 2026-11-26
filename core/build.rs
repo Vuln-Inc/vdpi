@@ -13,12 +13,26 @@ fn strip_windows_verbatim_prefix(path: &Path) -> PathBuf {
     }
 }
 
-fn main() {
-    println!("cargo:rustc-check-cfg=cfg(vdpi_embedded_wintun)");
-    println!("cargo:rerun-if-env-changed=VDPI_EMBED_WINTUN_DLL");
+#[cfg(windows)]
+fn compile_windows_version_info() {
+    let version = env!("CARGO_PKG_VERSION");
+    let mut res = winresource::WindowsResource::new();
+    res.set("ProductName", "vdpi")
+        .set("FileDescription", "vdpi Anti-DPI Engine")
+        .set("CompanyName", "Vuln-Inc")
+        .set(
+            "LegalCopyright",
+            "Copyright (c) 2026 Vuln-Inc (MIT License)",
+        )
+        .set("OriginalFilename", "vdpi.exe")
+        .set("InternalName", "vdpi")
+        .set("ProductVersion", version)
+        .set("FileVersion", version);
+    res.compile()
+        .expect("failed to compile Windows PE version info resource");
+}
 
-    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+fn configure_embedded_wintun(target_os: &str, target_arch: &str) {
     if target_os != "windows" || target_arch != "x86_64" {
         return;
     }
@@ -71,4 +85,19 @@ fn main() {
     println!("cargo:rerun-if-changed={clean_str}");
     println!("cargo:rustc-cfg=vdpi_embedded_wintun");
     println!("cargo:rustc-env=VDPI_EMBEDDED_WINTUN_PATH={clean_str}");
+}
+
+fn main() {
+    println!("cargo:rustc-check-cfg=cfg(vdpi_embedded_wintun)");
+    println!("cargo:rerun-if-env-changed=VDPI_EMBED_WINTUN_DLL");
+
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+
+    #[cfg(windows)]
+    if target_os == "windows" {
+        compile_windows_version_info();
+    }
+
+    configure_embedded_wintun(&target_os, &target_arch);
 }
