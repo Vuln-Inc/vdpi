@@ -169,6 +169,24 @@ const FALLBACK_STYLES = `
   border-bottom: none;
 }
 
+:where(.settings-row-group) {
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid var(--border-hairline, rgba(255, 255, 255, 0.07));
+}
+
+:where(.settings-row-group:last-child) {
+  border-bottom: none;
+}
+
+:where(.settings-row-group > .settings-row) {
+  border-bottom: none;
+}
+
+:where(.settings-row-group--expanded > .settings-row) {
+  padding-bottom: 10px;
+}
+
 :where(.settings-row--nested) {
   padding-left: 28px;
   background: var(--bg-surface-subtle, rgba(255, 255, 255, 0.02));
@@ -304,12 +322,33 @@ const FALLBACK_STYLES = `
 }
 
 :where(.settings-update-panel) {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
   margin: 0 16px 14px;
-  padding: 12px 14px;
+  padding: 11px 14px;
   border-radius: var(--radius-md, 8px);
   border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.1));
   background: var(--bg-surface-subtle, rgba(255, 255, 255, 0.03));
   box-sizing: border-box;
+}
+
+:where(.settings-update-panel__body) {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+:where(.settings-update-panel__icon) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  margin-top: 1px;
+  flex-shrink: 0;
 }
 
 :where(.settings-update-panel--available) {
@@ -338,9 +377,10 @@ const FALLBACK_STYLES = `
 :where(.settings-update-panel__status) {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   font-size: var(--text-base, 13px);
-  font-weight: var(--weight-medium, 500);
+  font-weight: var(--weight-semibold, 600);
+  line-height: 1.35;
   color: var(--ink-primary, #F3F4F6);
 }
 
@@ -357,7 +397,7 @@ const FALLBACK_STYLES = `
 }
 
 :where(.settings-update-panel__meta) {
-  margin: 4px 0 0;
+  margin: 0;
   font-size: var(--text-sm, 12px);
   line-height: var(--leading-sm, 18px);
   color: var(--ink-secondary, #A1A6B0);
@@ -1577,137 +1617,147 @@ function SettingsViewComponent({
         </div>
 
         <div className="settings-list">
-          <div className="settings-row">
-            <div className="settings-row__copy">
-              <span className="settings-row__label">
-                {tSettings(lang, "desktopAppLabel")}
-              </span>
-              <p className="settings-row__desc">
-                {tSettings(lang, "currentVersionPrefix")}{" "}
-                <span className="mono tabular-nums">{appVersionDisplay}</span>
-              </p>
-            </div>
-            <div className="settings-row__control">
-              <button
-                type="button"
-                className="btn btn-secondary"
-                disabled={checkingUpdates}
-                aria-busy={checkingUpdates}
-                onClick={() => {
-                  void handleCheckUpdates();
-                }}
-              >
-                {checkingUpdates ? (
-                  <span className="settings-spinner" aria-hidden="true" />
-                ) : (
-                  <IconRefresh size={14} />
-                )}
-                <span>
-                  {checkingUpdates
-                    ? tSettings(lang, "btnCheckingUpdates")
-                    : tSettings(lang, "btnCheckUpdates")}
+          <div
+            className={`settings-row-group${
+              updateResult || updateError ? " settings-row-group--expanded" : ""
+            }`}
+          >
+            <div className="settings-row">
+              <div className="settings-row__copy">
+                <span className="settings-row__label">
+                  {tSettings(lang, "desktopAppLabel")}
                 </span>
-              </button>
-            </div>
-          </div>
-
-          {updateResult ? (
-            <div
-              className={`settings-update-panel ${
-                updateResult.hasUpdate
-                  ? "settings-update-panel--available"
-                  : "settings-update-panel--uptodate"
-              }`}
-              role="status"
-              aria-live="polite"
-            >
-              <div className="settings-update-panel__top">
-                <div className="settings-update-panel__status">
-                  <span
-                    className="settings-update-panel__icon"
-                    aria-hidden="true"
-                  >
-                    {updateResult.hasUpdate ? (
-                      <IconRefresh size={15} />
-                    ) : (
-                      <IconCheck size={15} />
-                    )}
-                  </span>
-                  {updateResult.hasUpdate ? (
-                    <span className="tabular-nums">
-                      {tSettings(lang, "updateAvailablePrefix")}{" "}
-                      <span className="mono">
-                        {formatVersion(updateResult.latestVersion)}
-                      </span>
-                    </span>
-                  ) : (
-                    <span>{tSettings(lang, "upToDate")}</span>
-                  )}
-                </div>
-
-                {updateResult.hasUpdate && safeReleaseUrl ? (
-                  <button
-                    type="button"
-                    className="settings-update-link"
-                    disabled={openingExternal}
-                    aria-busy={openingExternal}
-                    onClick={() => {
-                      void handleOpenReleaseUrl(safeReleaseUrl);
-                    }}
-                  >
-                    <span>{tSettings(lang, "viewRelease")}</span>
-                    <IconExternal size={13} />
-                  </button>
-                ) : null}
+                <p className="settings-row__desc">
+                  {tSettings(lang, "currentVersionPrefix")}{" "}
+                  <span className="mono tabular-nums">{appVersionDisplay}</span>
+                </p>
               </div>
-
-              <p className="settings-update-panel__meta tabular-nums">
-                {updateResult.hasUpdate ? (
-                  <>
-                    {tSettings(lang, "installedPrefix")}{" "}
-                    <span className="mono">
-                      {formatVersion(updateResult.currentVersion)}
-                    </span>{" "}
-                    -&gt; {tSettings(lang, "latestPrefix")}{" "}
-                    <span className="mono">
-                      {formatVersion(updateResult.latestVersion)}
-                    </span>
-                  </>
-                ) : (
-                  <>
-                    {tSettings(lang, "runningLatestBefore")}
-                    <span className="mono">
-                      {formatVersion(updateResult.currentVersion)}
-                    </span>
-                    {tSettings(lang, "runningLatestAfter")}
-                  </>
-                )}
-              </p>
-
-              {updateResult.hasUpdate && cleanedReleaseNotes.length > 0 ? (
-                <ul className="settings-update-notes">
-                  {cleanedReleaseNotes.map((note, idx) => (
-                    <li key={`${idx}-${note}`}>{note}</li>
-                  ))}
-                </ul>
-              ) : null}
+              <div className="settings-row__control">
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  disabled={checkingUpdates}
+                  aria-busy={checkingUpdates}
+                  onClick={() => {
+                    void handleCheckUpdates();
+                  }}
+                >
+                  {checkingUpdates ? (
+                    <span className="settings-spinner" aria-hidden="true" />
+                  ) : (
+                    <IconRefresh size={14} />
+                  )}
+                  <span>
+                    {checkingUpdates
+                      ? tSettings(lang, "btnCheckingUpdates")
+                      : tSettings(lang, "btnCheckUpdates")}
+                  </span>
+                </button>
+              </div>
             </div>
-          ) : null}
 
-          {updateError ? (
-            <div
-              className="settings-update-panel settings-update-panel--error"
-              role="alert"
-            >
-              <div className="settings-update-panel__status">
+            {updateResult ? (
+              <div
+                className={`settings-update-panel ${
+                  updateResult.hasUpdate
+                    ? "settings-update-panel--available"
+                    : "settings-update-panel--uptodate"
+                }`}
+                role="status"
+                aria-live="polite"
+              >
+                <span
+                  className="settings-update-panel__icon"
+                  aria-hidden="true"
+                >
+                  {updateResult.hasUpdate ? (
+                    <IconRefresh size={15} />
+                  ) : (
+                    <IconCheck size={15} />
+                  )}
+                </span>
+                <div className="settings-update-panel__body">
+                  <div className="settings-update-panel__top">
+                    <div className="settings-update-panel__status">
+                      {updateResult.hasUpdate ? (
+                        <span className="tabular-nums">
+                          {tSettings(lang, "updateAvailablePrefix")}{" "}
+                          <span className="mono">
+                            {formatVersion(updateResult.latestVersion)}
+                          </span>
+                        </span>
+                      ) : (
+                        <span>{tSettings(lang, "upToDate")}</span>
+                      )}
+                    </div>
+
+                    {updateResult.hasUpdate && safeReleaseUrl ? (
+                      <button
+                        type="button"
+                        className="settings-update-link"
+                        disabled={openingExternal}
+                        aria-busy={openingExternal}
+                        onClick={() => {
+                          void handleOpenReleaseUrl(safeReleaseUrl);
+                        }}
+                      >
+                        <span>{tSettings(lang, "viewRelease")}</span>
+                        <IconExternal size={13} />
+                      </button>
+                    ) : null}
+                  </div>
+
+                  <p className="settings-update-panel__meta tabular-nums">
+                    {updateResult.hasUpdate ? (
+                      <>
+                        {tSettings(lang, "installedPrefix")}{" "}
+                        <span className="mono">
+                          {formatVersion(updateResult.currentVersion)}
+                        </span>{" "}
+                        -&gt; {tSettings(lang, "latestPrefix")}{" "}
+                        <span className="mono">
+                          {formatVersion(updateResult.latestVersion)}
+                        </span>
+                      </>
+                    ) : (
+                      <>
+                        {tSettings(lang, "runningLatestBefore")}
+                        <span className="mono">
+                          {formatVersion(updateResult.currentVersion)}
+                        </span>
+                        {tSettings(lang, "runningLatestAfter")}
+                      </>
+                    )}
+                  </p>
+
+                  {updateResult.hasUpdate && cleanedReleaseNotes.length > 0 ? (
+                    <ul className="settings-update-notes">
+                      {cleanedReleaseNotes.map((note, idx) => (
+                        <li key={`${idx}-${note}`}>{note}</li>
+                      ))}
+                    </ul>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
+
+            {updateError ? (
+              <div
+                className="settings-update-panel settings-update-panel--error"
+                role="alert"
+              >
                 <span className="settings-update-panel__icon" aria-hidden="true">
                   <IconAlert size={15} />
                 </span>
-                <span>{tSettings(lang, "updateCheckFailed")}</span>
+                <div className="settings-update-panel__body">
+                  <div className="settings-update-panel__status">
+                    <span>{tSettings(lang, "updateCheckFailed")}</span>
+                  </div>
+                  <p className="settings-update-panel__meta">{updateError}</p>
+                </div>
               </div>
-              <p className="settings-update-panel__meta">{updateError}</p>
-            </div>
-          ) : null}
+            ) : null}
+          </div>
 
           <div className="settings-row">
             <div className="settings-row__copy">

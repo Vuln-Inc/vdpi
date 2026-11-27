@@ -668,18 +668,18 @@ const FALLBACK_STYLES = `
   gap: 6px;
 }
 
-:where(.diag-empty) {
+.diag-card.diag-empty {
   display: flex;
   flex-direction: column;
-  gap: 16px;
-  padding: 22px;
+  gap: 18px;
+  padding: 20px;
 }
 
 :where(.diag-empty__head) {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 12px;
+  gap: 16px;
   flex-wrap: wrap;
 }
 
@@ -714,6 +714,7 @@ const FALLBACK_STYLES = `
 
 :where(.diag-empty__description) {
   margin: 4px 0 0;
+  max-width: 58ch;
   font-size: 12.5px;
   line-height: 1.5;
   color: var(--_dv-secondary);
@@ -768,8 +769,9 @@ const FALLBACK_STYLES = `
   color: var(--_dv-secondary);
 }
 
-:where(.diag-running-state) {
+.diag-card.diag-running-state {
   display: flex;
+  flex-direction: row;
   align-items: center;
   gap: 12px;
   padding: 20px 18px;
@@ -1680,7 +1682,7 @@ function DiagnosticsViewComponent({
 
       {running && !report ? (
         <section
-          className="card card-flush diag-card diag-running-state"
+          className="card diag-card diag-running-state"
           aria-live="polite"
           aria-busy="true"
         >
@@ -1799,7 +1801,7 @@ function DiagnosticsViewComponent({
         </section>
       ) : !running ? (
         <section
-          className="card card-flush diag-card diag-empty"
+          className="card diag-card diag-empty"
           aria-label={tDiagnostics(lang, "ariaEmptyCard")}
         >
           <div className="diag-empty__head">
