@@ -5859,10 +5859,23 @@ mod tests {
                 _is_ipv4: bool,
             ) -> std::io::Result<()> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
-                let prev = self
-                    .fail_remaining
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
-                if prev.is_ok() {
+                let mut cur = self.fail_remaining.load(Ordering::SeqCst);
+                let mut should_fail = false;
+                while let Some(next) = cur.checked_sub(1) {
+                    match self.fail_remaining.compare_exchange_weak(
+                        cur,
+                        next,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => {
+                            should_fail = true;
+                            break;
+                        }
+                        Err(actual) => cur = actual,
+                    }
+                }
+                if should_fail {
                     return Err(std::io::Error::new(
                         ErrorKind::TimedOut,
                         "simulated SYN-blackholed dead IP",

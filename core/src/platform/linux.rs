@@ -2732,12 +2732,12 @@ fn merge_kde_no_proxy_for(existing: Option<&str>, vdpi_no_proxy_csv: &str) -> St
 }
 
 fn csv_list_eq(a: &str, b: &str) -> bool {
-    let parse = |s: &str| -> Vec<&str> {
+    fn parse(s: &str) -> Vec<&str> {
         s.split(',')
             .map(str::trim)
             .filter(|item| !item.is_empty())
             .collect()
-    };
+    }
     let items_a = parse(a);
     let items_b = parse(b);
     items_a.len() == items_b.len()
