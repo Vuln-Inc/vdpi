@@ -671,7 +671,7 @@ mod tests {
     #[test]
     fn outbound_channel_capacity_caps_fifo_depth_below_inbound() {
         assert_eq!(TUN_TX_CHANNEL_CAPACITY, 128);
-        assert_eq!(TunProfile::DESKTOP.channel_capacity, 4096);
+        assert_eq!(TunProfile::DESKTOP.channel_capacity, 2048);
         assert_eq!(
             outbound_channel_capacity(TunProfile::DESKTOP),
             TUN_TX_CHANNEL_CAPACITY
