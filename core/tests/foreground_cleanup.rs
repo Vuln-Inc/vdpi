@@ -20,8 +20,26 @@ fn desktop_proxy_is_released_after_the_foreground_process_is_killed() {
     fs::write(&program, r#"#!/bin/sh
 key="$HOME/$2.$3"
 case "$1" in
-  get) if [ -f "$key" ]; then read -r value < "$key"; printf '%s\n' "$value"; else printf "'%s'\n" none; fi ;;
-  set) if [ "$3" = mode ]; then printf "'%s'\n" "$4" > "$key"; else printf '%s\n' "$4" > "$key"; fi ;;
+  get)
+    if [ -f "$key" ]; then
+      read -r value < "$key"
+      printf '%s\n' "$value"
+    else
+      case "$3" in
+        mode) printf "'none'\n" ;;
+        ignore-hosts) printf "@as []\n" ;;
+        port) printf "0\n" ;;
+        enabled) printf "false\n" ;;
+        *) printf "''\n" ;;
+      esac
+    fi
+    ;;
+  set)
+    case "$3" in
+      mode|autoconfig-url|host) printf "'%s'\n" "$4" > "$key" ;;
+      *) printf '%s\n' "$4" > "$key" ;;
+    esac
+    ;;
 esac
 "#).unwrap();
     fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
@@ -30,6 +48,7 @@ esac
         .env_clear()
         .env("HOME", &dir)
         .env("PATH", &dir)
+        .env("VDPI_TEST_TRUSTED_BIN_DIR", &dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -46,7 +65,7 @@ esac
         }
         false
     };
-    let enabled = wait_for("'manual'\n");
+    let enabled = wait_for("'auto'\n");
     let _ = child.kill();
     child.wait().unwrap();
     assert!(enabled, "foreground proxy was never enabled");

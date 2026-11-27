@@ -452,6 +452,23 @@ fn resolve_trusted_bin_in(bin: &str, dirs: &[&Path]) -> Option<PathBuf> {
 }
 
 fn resolve_trusted_bin(bin: &str) -> Option<PathBuf> {
+    #[cfg(debug_assertions)]
+    {
+        // Debug-only non-root test hook for integration tests (e.g. foreground_cleanup.rs)
+        // that exercise GNOME proxy activation/cleanup against a temporary fake `gsettings`.
+        // Compiled out completely in release binaries and ignored when running as root.
+        // SAFETY: `geteuid(2)` is always safe to call and never fails.
+        if unsafe { libc::geteuid() } != 0 {
+            if let Some(test_dir) = std::env::var_os("VDPI_TEST_TRUSTED_BIN_DIR")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+            {
+                if let Some(found) = resolve_trusted_bin_in(bin, &[test_dir.as_path()]) {
+                    return Some(found);
+                }
+            }
+        }
+    }
     let dirs: Vec<&Path> = TRUSTED_BIN_DIRS.iter().map(Path::new).collect();
     resolve_trusted_bin_in(bin, &dirs)
 }
