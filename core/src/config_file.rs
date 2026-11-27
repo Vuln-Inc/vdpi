@@ -445,17 +445,24 @@ pub fn load_file_config_or_default(
 
 fn is_unc_device_or_verbatim_path(path: &Path) -> bool {
     let raw = path.as_os_str().as_encoded_bytes();
-    if raw.len() >= 2 && matches!(raw[0], b'\\' | b'/') && matches!(raw[1], b'\\' | b'/') {
-        return true;
-    }
+    let double_sep =
+        raw.len() >= 2 && matches!(raw[0], b'\\' | b'/') && matches!(raw[1], b'\\' | b'/');
     #[cfg(windows)]
     {
+        if double_sep {
+            return true;
+        }
         use std::path::Prefix;
         if let Some(Component::Prefix(prefix)) = path.components().next() {
             return !matches!(prefix.kind(), Prefix::Disk(_));
         }
+        false
     }
-    false
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        double_sep
+    }
 }
 
 fn validate_config_path_syntax(path: &Path) -> Result<()> {

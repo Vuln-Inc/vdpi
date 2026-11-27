@@ -66,12 +66,10 @@ impl IconCache {
     /// Returns `Some(Some(uri))` on positive hit, `Some(None)` on unexpired negative hit,
     /// or `None` on miss / expired negative entry.
     fn get(&mut self, key: &str, now: Instant) -> Option<Option<String>> {
-        let expired = match self.entries.get(key) {
-            Some(entry) => {
-                entry.uri.is_none()
-                    && now.saturating_duration_since(entry.inserted_at) >= NEGATIVE_CACHE_TTL
-            }
-            None => return None,
+        let expired = {
+            let entry = self.entries.get(key)?;
+            entry.uri.is_none()
+                && now.saturating_duration_since(entry.inserted_at) >= NEGATIVE_CACHE_TTL
         };
         if expired {
             self.entries.remove(key);
