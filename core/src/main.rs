@@ -1035,8 +1035,8 @@ fn lookup_unix_passwd_by_uid(uid: u32) -> Option<ElevatedUserInfo> {
         return None;
     }
     Some(ElevatedUserInfo {
-        uid: pwd.pw_uid as u32,
-        gid: pwd.pw_gid as u32,
+        uid: pwd.pw_uid,
+        gid: pwd.pw_gid,
         home_dir: PathBuf::from(OsStr::from_bytes(dir_bytes)),
     })
 }
@@ -1074,8 +1074,8 @@ fn lookup_unix_passwd_by_name(name: &str) -> Option<ElevatedUserInfo> {
         return None;
     }
     Some(ElevatedUserInfo {
-        uid: pwd.pw_uid as u32,
-        gid: pwd.pw_gid as u32,
+        uid: pwd.pw_uid,
+        gid: pwd.pw_gid,
         home_dir: PathBuf::from(OsStr::from_bytes(dir_bytes)),
     })
 }
