@@ -224,6 +224,17 @@ async fn write_health_response(client: &mut TcpStream, bytes: &[u8]) -> Result<(
 async fn write_health_overload_response(mut client: TcpStream) {
     let _ = client.set_nodelay(true);
     let _ = tokio::time::timeout(HEALTH_OVERLOAD_WRITE_TIMEOUT, async {
+        // Wait briefly for the client's request line and drain buffered bytes so BSD/macOS
+        // and Windows TCP stacks emit a clean FIN instead of RST when closing the socket.
+        let mut drain = [0u8; 1024];
+        let _ = tokio::time::timeout(Duration::from_millis(50), client.read(&mut drain)).await;
+        for _ in 0..8 {
+            match client.try_read(&mut drain) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
         client.write_all(HEALTH_OVERLOAD_RESPONSE).await?;
         client.flush().await?;
         let _ = client.shutdown().await;

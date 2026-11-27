@@ -290,17 +290,17 @@ async fn respond_overloaded(mut stream: TcpStream, is_http_listener: bool) {
                 tokio::time::timeout(OVERLOAD_PEEK_TIMEOUT, stream.peek(&mut first)).await,
                 Ok(Ok(1)) if matches!(first[0], 0x04 | 0x05)
             );
-            if !is_socks {
-                // Drain already-buffered HTTP request bytes so Windows does not emit TCP RST
-                // on close before the browser finishes reading the 503 status line.
-                let mut drain = [0u8; 1024];
-                for _ in 0..8 {
-                    match stream.try_read(&mut drain) {
-                        Ok(0) => break,
-                        Ok(_) => continue,
-                        Err(_) => break,
-                    }
+            // Drain already-buffered request bytes (HTTP or SOCKS) so BSD/macOS and
+            // Windows do not emit TCP RST on close before the peer reads 503 or EOF.
+            let mut drain = [0u8; 1024];
+            for _ in 0..8 {
+                match stream.try_read(&mut drain) {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(_) => break,
                 }
+            }
+            if !is_socks {
                 let _ = stream.write_all(HTTP_503_RESPONSE).await;
                 let _ = stream.flush().await;
             }
