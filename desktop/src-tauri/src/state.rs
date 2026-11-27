@@ -1074,6 +1074,7 @@ mod tests {
 
         let updated_prefs = GuiPreferencesDto {
             theme: ThemePreferenceDto::Dark,
+            language: crate::models::LanguagePreferenceDto::Tr,
             keep_in_tray_on_close: true,
             minimize_to_tray: true,
             start_minimized_to_tray: false,

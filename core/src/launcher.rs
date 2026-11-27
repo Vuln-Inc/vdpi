@@ -7,16 +7,72 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use vdpi::config::EngineMode;
+use vdpi::i18n::{self, Lang};
 use vdpi::server::REPOSITORY_URL;
 use vdpi::service::{ControlCenterStatus, InstalledInfo, LiveEngineStatus, ServiceState};
 use vdpi::update::VersionRelation;
-use vdpi_core::config::SplitTunnelConfig;
+use vdpi_core::config::{SplitTunnelConfig, SplitTunnelMode};
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod tui;
 
-const RUN_NOTICE: &str =
-    "vdpi is running without installation. Run `vdpi install` to enable automatic startup.";
+#[cfg(test)]
+#[inline]
+pub(super) fn active_lang() -> Lang {
+    i18n::active_lang_with_fallback(Lang::En)
+}
+
+#[cfg(not(test))]
+#[inline]
+pub(super) fn active_lang() -> Lang {
+    i18n::active_lang()
+}
+
+#[inline]
+pub(super) fn tr(en: &'static str, tr_text: &'static str) -> &'static str {
+    i18n::tr_for(active_lang(), en, tr_text)
+}
+
+fn persist_language_to_config_at(path: &Path, lang: Lang) -> Result<()> {
+    let (_, mut file_cfg) = vdpi::config_file::load_file_config_or_default(Some(path), false)?;
+    file_cfg
+        .schema_version
+        .get_or_insert(vdpi::config_file::CONFIG_SCHEMA_VERSION);
+    file_cfg.language = Some(lang.code().to_string());
+    vdpi::config_file::save_file_config_atomic(path, &file_cfg)
+}
+
+#[cfg(not(test))]
+fn persist_language_to_config(lang: Lang) -> Result<()> {
+    persist_language_to_config_at(&vdpi::config_file::user_config_path(), lang)
+}
+
+#[cfg(test)]
+fn persist_language_to_config(_lang: Lang) -> Result<()> {
+    Ok(())
+}
+
+pub(super) fn toggle_and_persist_language() -> String {
+    let next = active_lang().toggle();
+    i18n::set_language_pref(Some(next));
+    let save_err = persist_language_to_config(next).err();
+    if active_lang() != next {
+        return match next {
+            Lang::En => "Language saved (overridden by VDPI_LANG).".to_string(),
+            Lang::Tr => "Dil kaydedildi (VDPI_LANG etkin).".to_string(),
+        };
+    }
+    match (next, save_err) {
+        (Lang::En, None) => "Language set to English.".to_string(),
+        (Lang::Tr, None) => "Dil Türkçe olarak ayarlandı.".to_string(),
+        (Lang::En, Some(_)) => {
+            "Language set to English (warning: failed to save config).".to_string()
+        }
+        (Lang::Tr, Some(_)) => {
+            "Dil Türkçe olarak ayarlandı (uyarı: yapılandırma kaydedilemedi).".to_string()
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Choice {
@@ -76,8 +132,31 @@ pub const DNS_PRESETS: [DnsPreset; 6] = [
     },
 ];
 
+pub(super) fn dns_preset_hint(preset: &DnsPreset) -> &'static str {
+    match active_lang() {
+        Lang::En => preset.hint,
+        Lang::Tr => match preset.addr {
+            "1.1.1.1" => "Hızlı, gizlilik odaklı genel DNS (varsayılan).",
+            "8.8.8.8" => "Küresel düşük gecikmeli genel DNS.",
+            "94.140.14.14" => "Reklam, izleyici ve oltalama alan adlarını engeller.",
+            "94.140.14.140" => "Reklam filtrelemesiz, gizlilik odaklı DNS.",
+            "9.9.9.9" => "Bilinen zararlı yazılım ve oltalama alan adlarını engeller.",
+            "1.1.1.3" => "Zararlı yazılım ve yetişkin içeriğini engeller.",
+            _ => preset.hint,
+        },
+    }
+}
+
 #[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
 pub(super) const CUSTOM_DNS_HINT: &str = "Enter any custom IPv4, IPv6, or https:// DoH URL.";
+
+#[cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
+pub(super) fn custom_dns_hint() -> &'static str {
+    tr(
+        CUSTOM_DNS_HINT,
+        "Özel bir IPv4, IPv6 veya https:// DoH adresi girin.",
+    )
+}
 
 pub(super) fn is_custom_dns(addr: &str) -> bool {
     let trimmed = addr.trim();
@@ -127,7 +206,8 @@ pub fn format_dns_label(addr: &str) -> String {
     } else if trimmed.is_empty() {
         format!("{} ({})", DNS_PRESETS[0].name, DNS_PRESETS[0].addr)
     } else {
-        format!("Custom ({})", shorten_custom_dns(trimmed, 28))
+        let prefix = tr("Custom", "Özel");
+        format!("{prefix} ({})", shorten_custom_dns(trimmed, 28))
     }
 }
 
@@ -143,19 +223,47 @@ pub(super) fn dns_preset_index(addr: &str) -> usize {
         .unwrap_or(DNS_PRESETS.len())
 }
 
+fn format_split_summary(split: &SplitTunnelConfig) -> String {
+    match active_lang() {
+        Lang::En => split.summary_label(),
+        Lang::Tr => {
+            let count = split.apps.len();
+            match split.mode {
+                SplitTunnelMode::All => "Tüm uygulamalar".to_string(),
+                SplitTunnelMode::Exclude => format!("Hariç tut ({count} uygulama)"),
+                SplitTunnelMode::Include => format!("Dahil et ({count} uygulama)"),
+            }
+        }
+    }
+}
+
 fn dns_server_item(current_dns: &str) -> MenuItem {
     MenuItem::new(
         Choice::SelectDns,
-        format!("Choose DNS server · {}", format_dns_label(current_dns)),
-        "Pick a preset or enter a custom DNS / DoH server.",
+        format!(
+            "{} · {}",
+            tr("Choose DNS server", "DNS sunucusu seç"),
+            format_dns_label(current_dns)
+        ),
+        tr(
+            "Pick a preset or enter a custom DNS / DoH server.",
+            "Hazır bir sunucu seçin veya özel DNS / DoH adresi girin.",
+        ),
     )
 }
 
 fn split_tunnel_item(split: &SplitTunnelConfig) -> MenuItem {
     MenuItem::new(
         Choice::SplitTunnel,
-        format!("Split tunneling · {}", split.summary_label()),
-        "Choose which apps use or bypass anti-DPI (with live search).",
+        format!(
+            "{} · {}",
+            tr("Split tunneling", "Bölünmüş tünelleme"),
+            format_split_summary(split)
+        ),
+        tr(
+            "Choose which apps use or bypass anti-DPI (with live search).",
+            "Hangi uygulamaların anti-DPI kullanacağını veya atlayacağını seçin (canlı arama).",
+        ),
     )
 }
 
@@ -233,44 +341,64 @@ fn format_mode_label(raw: &str) -> &str {
 }
 
 fn build_service_status_row(status: &ControlCenterStatus) -> StatusRow {
+    let label = tr("Service", "Servis");
+    let is_tr = active_lang() == Lang::Tr;
     match (status.service_state, status.installed.as_ref()) {
-        (ServiceState::NotInstalled, None) => {
-            StatusRow::new("Service", "Not installed", StatusTone::Neutral)
-        }
+        (ServiceState::NotInstalled, None) => StatusRow::new(
+            label,
+            tr("Not installed", "Kurulu değil"),
+            StatusTone::Neutral,
+        ),
         (ServiceState::NotInstalled, Some(info)) => {
             let value = match info.installed_version.as_deref() {
+                Some(ver) if is_tr => format!("Kurulu v{ver} (servis kayıtlı değil)"),
                 Some(ver) => format!("Installed v{ver} (service not registered)"),
-                None => "Installed (version unreadable, service not registered)".to_string(),
+                None => tr(
+                    "Installed (version unreadable, service not registered)",
+                    "Kurulu (sürüm okunamadı, servis kayıtlı değil)",
+                )
+                .to_string(),
             };
-            StatusRow::new("Service", value, StatusTone::Warning)
+            StatusRow::new(label, value, StatusTone::Warning)
         }
         (ServiceState::Running, Some(info)) => match info.relation {
             VersionRelation::Newer => {
-                let old = info.installed_version.as_deref().unwrap_or("unknown");
+                let old = info
+                    .installed_version
+                    .as_deref()
+                    .unwrap_or_else(|| tr("unknown", "bilinmiyor"));
                 let new = info.current_version;
-                StatusRow::new(
-                    "Service",
-                    format!("Running · v{old} -> v{new} update ready"),
-                    StatusTone::Accent,
-                )
+                let value = if is_tr {
+                    format!("Çalışıyor · v{old} -> v{new} güncelleme hazır")
+                } else {
+                    format!("Running · v{old} -> v{new} update ready")
+                };
+                StatusRow::new(label, value, StatusTone::Accent)
             }
-            VersionRelation::Same => StatusRow::new(
-                "Service",
-                format!("Running · v{}", info.current_version),
-                StatusTone::Active,
-            ),
+            VersionRelation::Same => {
+                let value = if is_tr {
+                    format!("Çalışıyor · v{}", info.current_version)
+                } else {
+                    format!("Running · v{}", info.current_version)
+                };
+                StatusRow::new(label, value, StatusTone::Active)
+            }
             VersionRelation::Older => {
-                let inst = info.installed_version.as_deref().unwrap_or("newer");
+                let inst = info
+                    .installed_version
+                    .as_deref()
+                    .unwrap_or_else(|| tr("newer", "daha yeni"));
                 let cur = info.current_version;
-                StatusRow::new(
-                    "Service",
-                    format!("Running · v{inst} (newer than this v{cur})"),
-                    StatusTone::Warning,
-                )
+                let value = if is_tr {
+                    format!("Çalışıyor · v{inst} (bu v{cur} sürümünden yeni)")
+                } else {
+                    format!("Running · v{inst} (newer than this v{cur})")
+                };
+                StatusRow::new(label, value, StatusTone::Warning)
             }
             VersionRelation::Unknown => StatusRow::new(
-                "Service",
-                "Running · version unreadable",
+                label,
+                tr("Running · version unreadable", "Çalışıyor · sürüm okunamadı"),
                 StatusTone::Warning,
             ),
         },
@@ -282,44 +410,67 @@ fn build_service_status_row(status: &ControlCenterStatus) -> StatusRow {
                 .map(str::trim)
                 .filter(|v| !v.is_empty())
             {
+                Some(ver) if is_tr => {
+                    format!("Çalışıyor · v{}", ver.trim_start_matches(['v', 'V']))
+                }
                 Some(ver) => format!("Running · v{}", ver.trim_start_matches(['v', 'V'])),
-                None => "Running".to_string(),
+                None => tr("Running", "Çalışıyor").to_string(),
             };
-            StatusRow::new("Service", value, StatusTone::Active)
+            StatusRow::new(label, value, StatusTone::Active)
         }
         (ServiceState::Stopped, Some(info)) => match info.relation {
             VersionRelation::Newer => {
-                let old = info.installed_version.as_deref().unwrap_or("unknown");
+                let old = info
+                    .installed_version
+                    .as_deref()
+                    .unwrap_or_else(|| tr("unknown", "bilinmiyor"));
                 let new = info.current_version;
-                StatusRow::new(
-                    "Service",
-                    format!("Paused · v{old} -> v{new} update ready"),
-                    StatusTone::Accent,
-                )
+                let value = if is_tr {
+                    format!("Duraklatıldı · v{old} -> v{new} güncelleme hazır")
+                } else {
+                    format!("Paused · v{old} -> v{new} update ready")
+                };
+                StatusRow::new(label, value, StatusTone::Accent)
             }
-            VersionRelation::Same => StatusRow::new(
-                "Service",
-                format!("Paused · v{} (temporarily stopped)", info.current_version),
-                StatusTone::Warning,
-            ),
+            VersionRelation::Same => {
+                let value = if is_tr {
+                    format!(
+                        "Duraklatıldı · v{} (geçici olarak durduruldu)",
+                        info.current_version
+                    )
+                } else {
+                    format!("Paused · v{} (temporarily stopped)", info.current_version)
+                };
+                StatusRow::new(label, value, StatusTone::Warning)
+            }
             VersionRelation::Older => {
-                let inst = info.installed_version.as_deref().unwrap_or("newer");
+                let inst = info
+                    .installed_version
+                    .as_deref()
+                    .unwrap_or_else(|| tr("newer", "daha yeni"));
                 let cur = info.current_version;
-                StatusRow::new(
-                    "Service",
-                    format!("Paused · v{inst} (newer than this v{cur})"),
-                    StatusTone::Warning,
-                )
+                let value = if is_tr {
+                    format!("Duraklatıldı · v{inst} (bu v{cur} sürümünden yeni)")
+                } else {
+                    format!("Paused · v{inst} (newer than this v{cur})")
+                };
+                StatusRow::new(label, value, StatusTone::Warning)
             }
             VersionRelation::Unknown => StatusRow::new(
-                "Service",
-                "Paused · version unreadable (temporarily stopped)",
+                label,
+                tr(
+                    "Paused · version unreadable (temporarily stopped)",
+                    "Duraklatıldı · sürüm okunamadı (geçici olarak durduruldu)",
+                ),
                 StatusTone::Warning,
             ),
         },
         (ServiceState::Stopped, None) => StatusRow::new(
-            "Service",
-            "Paused (temporarily stopped)",
+            label,
+            tr(
+                "Paused (temporarily stopped)",
+                "Duraklatıldı (geçici olarak durduruldu)",
+            ),
             StatusTone::Warning,
         ),
     }
@@ -360,31 +511,37 @@ fn build_anti_dpi_row(live: &LiveEngineStatus, configured_dns: &str) -> StatusRo
         } else {
             vdpi_core::dns::is_effective_doh_target(dns_addr, doh)
         };
-        let label = if is_doh { "DoH on" } else { "DoH off" };
+        let label = if is_doh {
+            tr("DoH on", "DoH açık")
+        } else {
+            tr("DoH off", "DoH kapalı")
+        };
         parts.push(label.to_string());
     }
     if let Some(block_quic) = live.block_quic {
         let label = if block_quic {
-            "QUIC blocked"
+            tr("QUIC blocked", "QUIC engelli")
         } else {
-            "QUIC allowed"
+            tr("QUIC allowed", "QUIC açık")
         };
         parts.push(label.to_string());
     }
 
+    let active_word = tr("Active", "Etkin");
     let value = if parts.is_empty() {
         if live.engine == EngineMode::Tun {
-            "Active".to_string()
+            active_word.to_string()
         } else {
-            format!("Active · {}", SocketAddr::new(live.addr, live.port))
+            format!("{active_word} · {}", SocketAddr::new(live.addr, live.port))
         }
     } else {
-        format!("Active · {}", parts.join(" · "))
+        format!("{active_word} · {}", parts.join(" · "))
     };
     StatusRow::new("Anti-DPI", value, StatusTone::Active)
 }
 
 fn build_engine_row(status: &ControlCenterStatus) -> StatusRow {
+    let row_label = tr("Engine", "Motor");
     let badge = status
         .live_engine
         .as_ref()
@@ -433,16 +590,16 @@ fn build_engine_row(status: &ControlCenterStatus) -> StatusRow {
             EngineMode::Proxy => format!("Proxy · {}", SocketAddr::new(live.addr, live.port)),
         };
 
-        return StatusRow::new("Engine", value, StatusTone::Active).with_badge(badge);
+        return StatusRow::new(row_label, value, StatusTone::Active).with_badge(badge);
     }
 
     let label = engine_label(status.configured_engine);
     let state_suffix = match status.service_state {
-        ServiceState::Stopped => "paused",
-        ServiceState::Running | ServiceState::NotInstalled => "selected",
+        ServiceState::Stopped => tr("paused", "duraklatıldı"),
+        ServiceState::Running | ServiceState::NotInstalled => tr("selected", "seçili"),
     };
     StatusRow::new(
-        "Engine",
+        row_label,
         format!("{label} ({state_suffix})"),
         StatusTone::Neutral,
     )
@@ -455,13 +612,19 @@ fn build_status_rows(status: &ControlCenterStatus, configured_dns: &str) -> Vec<
     } else if status.service_state == ServiceState::Running {
         StatusRow::new(
             "Anti-DPI",
-            "Starting or listening on custom port",
+            tr(
+                "Starting or listening on custom port",
+                "Başlatılıyor veya özel portta dinliyor",
+            ),
             StatusTone::Warning,
         )
     } else {
         StatusRow::new(
             "Anti-DPI",
-            "Offline · routes & proxies restored",
+            tr(
+                "Offline · routes & proxies restored",
+                "Çevrimdışı · yönlendirmeler ve proxy geri yüklendi",
+            ),
             StatusTone::Neutral,
         )
     };
@@ -477,13 +640,19 @@ fn pause_or_resume_item(service_state: ServiceState) -> Option<MenuItem> {
     match service_state {
         ServiceState::Running => Some(MenuItem::new(
             Choice::PauseService,
-            "Pause background service",
-            "Temporarily stops vdpi and restores routes & proxies.",
+            tr("Pause background service", "Arka plan servisini duraklat"),
+            tr(
+                "Temporarily stops vdpi and restores routes & proxies.",
+                "vdpi'yi geçici olarak durdurur, yönlendirme ve proxy ayarlarını geri yükler.",
+            ),
         )),
         ServiceState::Stopped => Some(MenuItem::new(
             Choice::ResumeService,
-            "Resume background service",
-            "Starts the service and re-enables routes & proxies.",
+            tr("Resume background service", "Arka plan servisini sürdür"),
+            tr(
+                "Starts the service and re-enables routes & proxies.",
+                "Servisi başlatır, yönlendirme ve proxy ayarlarını yeniden etkinleştirir.",
+            ),
         )),
         ServiceState::NotInstalled => None,
     }
@@ -492,16 +661,22 @@ fn pause_or_resume_item(service_state: ServiceState) -> Option<MenuItem> {
 fn uninstall_item() -> MenuItem {
     MenuItem::new(
         Choice::Uninstall,
-        "Uninstall vdpi",
-        "Removes service and restores network settings.",
+        tr("Uninstall vdpi", "vdpi'yi kaldır"),
+        tr(
+            "Removes service and restores network settings.",
+            "Servisi kaldırır ve ağ ayarlarını geri yükler.",
+        ),
     )
 }
 
 fn doctor_item() -> MenuItem {
     MenuItem::new(
         Choice::Doctor,
-        "Run diagnostics",
-        "Tests DNS and bypass connectivity.",
+        tr("Run diagnostics", "Tanılama çalıştır"),
+        tr(
+            "Tests DNS and bypass connectivity.",
+            "DNS ve bypass bağlantısını test eder.",
+        ),
     )
 }
 
@@ -519,15 +694,28 @@ const TUN_IFACE_LABEL: &str = "vdpi0";
 
 fn switch_engine_item(current: EngineMode) -> MenuItem {
     match current {
-        EngineMode::Proxy => MenuItem::new(
-            Choice::SwitchEngine(EngineMode::Tun),
-            "Switch to TUN mode",
-            format!("All apps, Roblox & Discord voice via {TUN_IFACE_LABEL} (requires Admin)."),
-        ),
+        EngineMode::Proxy => {
+            let hint = match active_lang() {
+                Lang::En => format!(
+                    "All apps, Roblox & Discord voice via {TUN_IFACE_LABEL} (requires Admin)."
+                ),
+                Lang::Tr => format!(
+                    "{TUN_IFACE_LABEL} üzerinden tüm uygulamalar, Roblox ve Discord ses (Yönetici gerekir)."
+                ),
+            };
+            MenuItem::new(
+                Choice::SwitchEngine(EngineMode::Tun),
+                tr("Switch to TUN mode", "TUN moduna geç"),
+                hint,
+            )
+        }
         EngineMode::Tun => MenuItem::new(
             Choice::SwitchEngine(EngineMode::Proxy),
-            "Switch to Proxy mode",
-            "Browsers & apps - no Admin, lightweight, VPN-friendly.",
+            tr("Switch to Proxy mode", "Proxy moduna geç"),
+            tr(
+                "Browsers & apps - no Admin, lightweight, VPN-friendly.",
+                "Tarayıcı ve uygulamalar - Yönetici gerektirmez, hafif, VPN uyumlu.",
+            ),
         ),
     }
 }
@@ -535,13 +723,23 @@ fn switch_engine_item(current: EngineMode) -> MenuItem {
 fn dashboard_item() -> MenuItem {
     MenuItem::new(
         Choice::Dashboard,
-        "Open live dashboard",
-        "Real-time throughput, connections, ISP stage & diagnostics.",
+        tr("Open live dashboard", "Canlı paneli aç"),
+        tr(
+            "Real-time throughput, connections, ISP stage & diagnostics.",
+            "Gerçek zamanlı hız, bağlantılar, ISS aşaması ve tanılama.",
+        ),
     )
 }
 
 fn quit_item() -> MenuItem {
-    MenuItem::new(Choice::Cancel, "Quit", "Exit without changing anything.")
+    MenuItem::new(
+        Choice::Cancel,
+        tr("Quit", "Çıkış"),
+        tr(
+            "Exit without changing anything.",
+            "Hiçbir değişiklik yapmadan çık.",
+        ),
+    )
 }
 
 fn build_same_version_items(
@@ -551,6 +749,33 @@ fn build_same_version_items(
     split_tunnel: &SplitTunnelConfig,
     has_live_engine: bool,
 ) -> Vec<MenuItem> {
+    let update_online = || {
+        MenuItem::new(
+            Choice::Update,
+            tr(
+                "Check for updates online",
+                "Güncellemeleri çevrimiçi denetle",
+            ),
+            tr(
+                "Checks GitHub Releases and updates automatically.",
+                "GitHub sürümlerini kontrol eder ve otomatik günceller.",
+            ),
+        )
+    };
+    let run_this_session = || {
+        MenuItem::new(
+            Choice::Run,
+            tr(
+                "Run directly (this session)",
+                "Doğrudan çalıştır (bu oturum)",
+            ),
+            tr(
+                "Active while this terminal is open.",
+                "Bu terminal açık kaldığı sürece etkindir.",
+            ),
+        )
+    };
+
     match service_state {
         ServiceState::Running => {
             let mut items = Vec::with_capacity(if has_live_engine { 9 } else { 8 });
@@ -560,18 +785,17 @@ fn build_same_version_items(
             items.extend([
                 MenuItem::new(
                     Choice::PauseService,
-                    "Pause background service",
-                    "Temporarily stops vdpi and restores routes & proxies.",
+                    tr("Pause background service", "Arka plan servisini duraklat"),
+                    tr(
+                        "Temporarily stops vdpi and restores routes & proxies.",
+                        "vdpi'yi geçici olarak durdurur, yönlendirme ve proxy ayarlarını geri yükler.",
+                    ),
                 ),
                 switch_engine_item(current_engine),
                 dns_server_item(configured_dns),
                 split_tunnel_item(split_tunnel),
                 doctor_item(),
-                MenuItem::new(
-                    Choice::Update,
-                    "Check for updates online",
-                    "Checks GitHub Releases and updates automatically.",
-                ),
+                update_online(),
                 uninstall_item(),
                 quit_item(),
             ]);
@@ -584,29 +808,19 @@ fn build_same_version_items(
             }
             items.push(MenuItem::new(
                 Choice::ResumeService,
-                "Resume background service",
-                "Starts the service and re-enables routes & proxies.",
+                tr("Resume background service", "Arka plan servisini sürdür"),
+                tr(
+                    "Starts the service and re-enables routes & proxies.",
+                    "Servisi başlatır, yönlendirme ve proxy ayarlarını yeniden etkinleştirir.",
+                ),
             ));
             items.push(switch_engine_item(current_engine));
             items.push(dns_server_item(configured_dns));
             items.push(split_tunnel_item(split_tunnel));
             if !has_live_engine {
-                items.push(MenuItem::new(
-                    Choice::Run,
-                    "Run directly (this session)",
-                    "Active while this terminal is open.",
-                ));
+                items.push(run_this_session());
             }
-            items.extend([
-                doctor_item(),
-                MenuItem::new(
-                    Choice::Update,
-                    "Check for updates online",
-                    "Checks GitHub Releases and updates automatically.",
-                ),
-                uninstall_item(),
-                quit_item(),
-            ]);
+            items.extend([doctor_item(), update_online(), uninstall_item(), quit_item()]);
             items
         }
         ServiceState::NotInstalled => {
@@ -616,29 +830,19 @@ fn build_same_version_items(
             }
             items.push(MenuItem::new(
                 Choice::Install,
-                "Reinstall / repair service",
-                "Rewrites the background service and restarts it.",
+                tr("Reinstall / repair service", "Servisi yeniden kur / onar"),
+                tr(
+                    "Rewrites the background service and restarts it.",
+                    "Arka plan servisini yeniden yazar ve başlatır.",
+                ),
             ));
             items.push(switch_engine_item(current_engine));
             items.push(dns_server_item(configured_dns));
             items.push(split_tunnel_item(split_tunnel));
             if !has_live_engine {
-                items.push(MenuItem::new(
-                    Choice::Run,
-                    "Run directly (this session)",
-                    "Active while this terminal is open.",
-                ));
+                items.push(run_this_session());
             }
-            items.extend([
-                doctor_item(),
-                MenuItem::new(
-                    Choice::Update,
-                    "Check for updates online",
-                    "Checks GitHub Releases and updates automatically.",
-                ),
-                uninstall_item(),
-                quit_item(),
-            ]);
+            items.extend([doctor_item(), update_online(), uninstall_item(), quit_item()]);
             items
         }
     }
@@ -676,6 +880,7 @@ pub(super) fn build_menu_with_options(
         .map(str::to_string);
     let current_engine = active_or_configured_engine(status);
     let has_live_engine = status.live_engine.is_some();
+    let is_tr = active_lang() == Lang::Tr;
 
     let items = match (status.installed.as_ref(), status.service_state) {
         (None, ServiceState::NotInstalled) => {
@@ -686,14 +891,23 @@ pub(super) fn build_menu_with_options(
             items.extend([
                 MenuItem::new(
                     Choice::Run,
-                    "Run directly",
-                    "Active while this terminal is open.",
+                    tr("Run directly", "Doğrudan çalıştır"),
+                    tr(
+                        "Active while this terminal is open.",
+                        "Bu terminal açık kaldığı sürece etkindir.",
+                    ),
                 ),
                 switch_engine_item(current_engine),
                 MenuItem::new(
                     Choice::Install,
-                    "Install for automatic startup",
-                    "Runs in the background after you close it.",
+                    tr(
+                        "Install for automatic startup",
+                        "Otomatik başlatma için kur",
+                    ),
+                    tr(
+                        "Runs in the background after you close it.",
+                        "Kapattıktan sonra arka planda çalışmaya devam eder.",
+                    ),
                 ),
                 dns_server_item(configured_dns),
                 split_tunnel_item(split_tunnel),
@@ -711,13 +925,23 @@ pub(super) fn build_menu_with_options(
         ),
         (Some(info), service_state) => match info.relation {
             VersionRelation::Newer => {
-                let old = info.installed_version.as_deref().unwrap_or("unknown");
+                let old = info
+                    .installed_version
+                    .as_deref()
+                    .unwrap_or_else(|| tr("unknown", "bilinmiyor"));
                 let new = info.current_version;
                 let mut items = Vec::with_capacity(9);
                 items.push(MenuItem::new(
                     Choice::Install,
-                    format!("Update installed vdpi (v{old} -> v{new})"),
-                    "Replaces the installed service and restarts cleanly.",
+                    if is_tr {
+                        format!("Kurulu vdpi'yi güncelle (v{old} -> v{new})")
+                    } else {
+                        format!("Update installed vdpi (v{old} -> v{new})")
+                    },
+                    tr(
+                        "Replaces the installed service and restarts cleanly.",
+                        "Kurulu servisi günceller ve temiz biçimde yeniden başlatır.",
+                    ),
                 ));
                 if has_live_engine {
                     items.push(dashboard_item());
@@ -731,8 +955,14 @@ pub(super) fn build_menu_with_options(
                 if service_state != ServiceState::Running && !has_live_engine {
                     items.push(MenuItem::new(
                         Choice::Run,
-                        "Run directly without updating",
-                        "Active while this terminal is open.",
+                        tr(
+                            "Run directly without updating",
+                            "Güncellemeden doğrudan çalıştır",
+                        ),
+                        tr(
+                            "Active while this terminal is open.",
+                            "Bu terminal açık kaldığı sürece etkindir.",
+                        ),
                     ));
                 }
                 items.push(uninstall_item());
@@ -747,7 +977,10 @@ pub(super) fn build_menu_with_options(
                 has_live_engine,
             ),
             VersionRelation::Older => {
-                let inst = info.installed_version.as_deref().unwrap_or("newer");
+                let inst = info
+                    .installed_version
+                    .as_deref()
+                    .unwrap_or_else(|| tr("newer", "daha yeni"));
                 let cur = info.current_version;
                 let mut items = Vec::with_capacity(9);
                 if has_live_engine {
@@ -756,8 +989,12 @@ pub(super) fn build_menu_with_options(
                 if service_state != ServiceState::Running && !has_live_engine {
                     items.push(MenuItem::new(
                         Choice::Run,
-                        "Run directly",
-                        format!("Keep installed v{inst} untouched."),
+                        tr("Run directly", "Doğrudan çalıştır"),
+                        if is_tr {
+                            format!("Kurulu v{inst} sürümüne dokunma.")
+                        } else {
+                            format!("Keep installed v{inst} untouched.")
+                        },
                     ));
                 }
                 if let Some(toggle) = pause_or_resume_item(service_state) {
@@ -768,8 +1005,16 @@ pub(super) fn build_menu_with_options(
                 items.push(split_tunnel_item(split_tunnel));
                 items.push(MenuItem::new(
                     Choice::Install,
-                    format!("Downgrade installed vdpi (v{inst} -> v{cur})"),
-                    format!("Replaces installed v{inst} with this older v{cur} binary."),
+                    if is_tr {
+                        format!("Kurulu vdpi sürümünü düşür (v{inst} -> v{cur})")
+                    } else {
+                        format!("Downgrade installed vdpi (v{inst} -> v{cur})")
+                    },
+                    if is_tr {
+                        format!("Kurulu v{inst} sürümünü bu eski v{cur} ikilisiyle değiştirir.")
+                    } else {
+                        format!("Replaces installed v{inst} with this older v{cur} binary.")
+                    },
                 ));
                 items.push(uninstall_item());
                 items.push(quit_item());
@@ -783,8 +1028,15 @@ pub(super) fn build_menu_with_options(
                 }
                 items.push(MenuItem::new(
                     Choice::Install,
-                    format!("Update / repair installed vdpi (to v{cur})"),
-                    "Replaces the installed service and restarts cleanly.",
+                    if is_tr {
+                        format!("Kurulu vdpi'yi güncelle / onar (v{cur})")
+                    } else {
+                        format!("Update / repair installed vdpi (to v{cur})")
+                    },
+                    tr(
+                        "Replaces the installed service and restarts cleanly.",
+                        "Kurulu servisi günceller ve temiz biçimde yeniden başlatır.",
+                    ),
                 ));
                 if let Some(toggle) = pause_or_resume_item(service_state) {
                     items.push(toggle);
@@ -795,8 +1047,11 @@ pub(super) fn build_menu_with_options(
                 if service_state != ServiceState::Running && !has_live_engine {
                     items.push(MenuItem::new(
                         Choice::Run,
-                        "Run directly",
-                        "Active while this terminal is open.",
+                        tr("Run directly", "Doğrudan çalıştır"),
+                        tr(
+                            "Active while this terminal is open.",
+                            "Bu terminal açık kaldığı sürece etkindir.",
+                        ),
                     ));
                 }
                 items.push(uninstall_item());
@@ -863,6 +1118,9 @@ pub fn choose_with_options<F>(
 where
     F: FnMut() -> ControlCenterStatus,
 {
+    #[cfg(not(test))]
+    i18n::init_from_config();
+
     let state = preference_path();
     migrate_legacy_preference_at(state.as_deref());
     if should_auto_run(explicit, state.as_deref(), status) {
@@ -929,7 +1187,12 @@ where
 }
 
 pub fn print_run_notice() {
-    eprintln!("  Run directly  |  {RUN_NOTICE}");
+    let run_label = tr("Run directly", "Doğrudan çalıştır");
+    let run_notice = tr(
+        "vdpi is running without installation. Run `vdpi install` to enable automatic startup.",
+        "vdpi kurulumsuz çalışıyor. Otomatik başlatma için `vdpi install` komutunu çalıştırın.",
+    );
+    eprintln!("  {run_label}  |  {run_notice}");
     eprintln!("  GitHub        |  {REPOSITORY_URL}");
 }
 
@@ -947,7 +1210,14 @@ fn write_pause_prompt(
             writeln!(output, "  {line}")?;
         }
     }
-    writeln!(output, "  Press Enter to close this window.")?;
+    writeln!(
+        output,
+        "  {}",
+        tr(
+            "Press Enter to close this window.",
+            "Bu pencereyi kapatmak için Enter'a basın."
+        )
+    )?;
     output.flush()?;
     let _ = input.read_line(&mut String::new())?;
     Ok(())
@@ -980,7 +1250,10 @@ pub fn install_finished(result: &Result<()>, installed_before: Option<&Installed
                 "{}\nGitHub: {REPOSITORY_URL}",
                 install_success_message(installed_before)
             ),
-            Err(error) => format!("Installation did not finish: {error:#}"),
+            Err(error) => format!(
+                "{}: {error:#}",
+                tr("Installation did not finish", "Kurulum tamamlanamadı")
+            ),
         };
         pause_on_own_console(&msg);
     }
@@ -990,10 +1263,18 @@ pub fn install_finished(result: &Result<()>, installed_before: Option<&Installed
 #[allow(dead_code)]
 fn install_success_message(installed_before: Option<&InstalledInfo>) -> String {
     match installed_before {
-        Some(info) if info.relation == VersionRelation::Newer => {
-            format!("vdpi updated to v{} and restarted.", info.current_version)
-        }
-        _ => "vdpi is installed and starts automatically.".to_string(),
+        Some(info) if info.relation == VersionRelation::Newer => match active_lang() {
+            Lang::En => format!("vdpi updated to v{} and restarted.", info.current_version),
+            Lang::Tr => format!(
+                "vdpi v{} sürümüne güncellendi ve yeniden başlatıldı.",
+                info.current_version
+            ),
+        },
+        _ => tr(
+            "vdpi is installed and starts automatically.",
+            "vdpi kuruldu ve otomatik olarak başlayacak.",
+        )
+        .to_string(),
     }
 }
 
@@ -1005,8 +1286,14 @@ pub fn update_finished(result: &Result<()>) {
     #[cfg(windows)]
     if io::stdin().is_terminal() && has_own_console() {
         let msg = match result {
-            Ok(()) => format!("Update completed.\nGitHub: {REPOSITORY_URL}"),
-            Err(error) => format!("Update did not finish: {error:#}"),
+            Ok(()) => format!(
+                "{}\nGitHub: {REPOSITORY_URL}",
+                tr("Update completed.", "Güncelleme tamamlandı.")
+            ),
+            Err(error) => format!(
+                "{}: {error:#}",
+                tr("Update did not finish", "Güncelleme tamamlanamadı")
+            ),
         };
         pause_on_own_console(&msg);
     }
@@ -1021,9 +1308,16 @@ pub fn uninstall_finished(result: &Result<()>) {
     if io::stdin().is_terminal() && has_own_console() {
         let msg = match result {
             Ok(()) => format!(
-                "vdpi has been uninstalled and routes & proxies restored.\nGitHub: {REPOSITORY_URL}"
+                "{}\nGitHub: {REPOSITORY_URL}",
+                tr(
+                    "vdpi has been uninstalled and routes & proxies restored.",
+                    "vdpi kaldırıldı, yönlendirme ve proxy ayarları geri yüklendi.",
+                )
             ),
-            Err(error) => format!("Uninstall did not finish: {error:#}"),
+            Err(error) => format!(
+                "{}: {error:#}",
+                tr("Uninstall did not finish", "Kaldırma tamamlanamadı")
+            ),
         };
         pause_on_own_console(&msg);
     }
@@ -1032,7 +1326,13 @@ pub fn uninstall_finished(result: &Result<()>) {
 #[allow(dead_code)]
 pub fn wait_for_continue_if_interactive() {
     if io::stdin().is_terminal() && io::stdout().is_terminal() {
-        eprintln!("\n  Press Enter to return to vdpi Control Center...");
+        eprintln!(
+            "\n  {}",
+            tr(
+                "Press Enter to return to vdpi Control Center...",
+                "vdpi Kontrol Merkezi'ne dönmek için Enter'a basın...",
+            )
+        );
         let _ = io::stdin().read_line(&mut String::new());
     }
 }
@@ -1082,7 +1382,7 @@ fn print_console_menu(output: &mut impl Write, menu: &LauncherMenu) -> io::Resul
         }
     }
     if let Some(notice) = &menu.notice {
-        writeln!(output, "  Notice    {notice}")?;
+        writeln!(output, "  {:<8}  {notice}", tr("Notice", "Bilgi"))?;
     }
     writeln!(output)?;
 
@@ -1128,7 +1428,11 @@ fn read_custom_dns_input(
     loop {
         write!(
             output,
-            "  Enter custom DNS (IPv4, IPv6, or https:// DoH URL, or b back): "
+            "  {}",
+            tr(
+                "Enter custom DNS (IPv4, IPv6, or https:// DoH URL, or b back): ",
+                "Özel DNS girin (IPv4, IPv6 veya https:// DoH adresi, geri için b): ",
+            )
         )?;
         output.flush()?;
         answer.clear();
@@ -1145,7 +1449,11 @@ fn read_custom_dns_input(
         match vdpi_core::dns::validate_custom_dns_input(trimmed) {
             Ok(normalized) => return Ok(Some(normalized)),
             Err(err) => {
-                writeln!(output, "  Invalid DNS server: {err}")?;
+                writeln!(
+                    output,
+                    "  {}: {err}",
+                    tr("Invalid DNS server", "Geçersiz DNS sunucusu")
+                )?;
             }
         }
     }
@@ -1158,14 +1466,15 @@ fn read_dns_choice(
 ) -> io::Result<Option<String>> {
     let custom_slot = DNS_PRESETS.len() + 1;
     let custom_active = is_custom_dns(configured_dns);
-    writeln!(
-        output,
-        "\n  Choose DNS server (current: {})",
-        format_dns_label(configured_dns)
-    )?;
+    let current_label = format_dns_label(configured_dns);
+    match active_lang() {
+        Lang::En => writeln!(output, "\n  Choose DNS server (current: {current_label})")?,
+        Lang::Tr => writeln!(output, "\n  DNS sunucusu seç (mevcut: {current_label})")?,
+    }
+    let active_tag = tr(" [active]", " [etkin]");
     for (idx, preset) in DNS_PRESETS.iter().enumerate() {
         let active = if preset.addr.eq_ignore_ascii_case(configured_dns.trim()) {
-            " [active]"
+            active_tag
         } else {
             ""
         };
@@ -1175,26 +1484,31 @@ fn read_dns_choice(
             idx + 1,
             preset.name,
             preset.addr,
-            preset.hint
+            dns_preset_hint(preset)
         )?;
     }
+    let custom_label = tr("Custom DNS", "Özel DNS");
     if custom_active {
         writeln!(
             output,
-            "  {custom_slot}  {:<18} {} [active]",
-            "Custom DNS",
+            "  {custom_slot}  {:<18} {}{active_tag}",
+            custom_label,
             redact_custom_dns_display(configured_dns)
         )?;
     } else {
         writeln!(
             output,
-            "  {custom_slot}  {:<18} IP or https:// DoH URL",
-            "Custom DNS"
+            "  {custom_slot}  {:<18} {}",
+            custom_label,
+            tr("IP or https:// DoH URL", "IP veya https:// DoH adresi")
         )?;
     }
     let mut answer = String::new();
     loop {
-        write!(output, "  Choose DNS [1-{custom_slot} / b back]: ")?;
+        match active_lang() {
+            Lang::En => write!(output, "  Choose DNS [1-{custom_slot} / b back]: ")?,
+            Lang::Tr => write!(output, "  DNS seçin [1-{custom_slot} / b geri]: ")?,
+        }
         output.flush()?;
         answer.clear();
         if input.read_line(&mut answer)? == 0 {
@@ -1218,10 +1532,16 @@ fn read_dns_choice(
                 continue;
             }
         }
-        writeln!(
-            output,
-            "  Enter a number from 1 to {custom_slot}, or b to go back."
-        )?;
+        match active_lang() {
+            Lang::En => writeln!(
+                output,
+                "  Enter a number from 1 to {custom_slot}, or b to go back."
+            )?,
+            Lang::Tr => writeln!(
+                output,
+                "  1 ile {custom_slot} arasında bir sayı girin veya geri dönmek için b yazın."
+            )?,
+        }
     }
 }
 
@@ -1258,7 +1578,7 @@ where
             .collect();
         let prompt_choices = choices.join(" / ");
 
-        write!(output, "  Choose [{prompt_choices}]: ")?;
+        write!(output, "  {} [{prompt_choices}]: ", tr("Choose", "Seçin"))?;
         output.flush()?;
         answer.clear();
         if input.read_line(&mut answer)? == 0 {
@@ -1268,11 +1588,26 @@ where
         if trimmed.eq_ignore_ascii_case("q") {
             return Ok(Choice::Cancel);
         }
+        if trimmed.eq_ignore_ascii_case("g") {
+            let notice_msg = toggle_and_persist_language();
+            let latest = refresh();
+            menu = build_menu_with_options(
+                &latest,
+                Some(&notice_msg),
+                configured_dns,
+                split_tunnel,
+            );
+            if menu.items.is_empty() {
+                return Ok(Choice::Cancel);
+            }
+            print_console_menu(&mut output, &menu)?;
+            continue;
+        }
         if trimmed.eq_ignore_ascii_case("r") {
             let latest = refresh();
             menu = build_menu_with_options(
                 &latest,
-                Some("Status refreshed."),
+                Some(tr("Status refreshed.", "Durum yenilendi.")),
                 configured_dns,
                 split_tunnel,
             );
@@ -1322,7 +1657,11 @@ where
             if item.choice == Choice::Uninstall {
                 write!(
                     output,
-                    "  Confirm uninstall? This stops the service, removes files & PATH, and restores routes & proxies. [y/N]: "
+                    "  {}",
+                    tr(
+                        "Confirm uninstall? This stops the service, removes files & PATH, and restores routes & proxies. [y/N]: ",
+                        "Kaldırmayı onaylıyor musunuz? Servis durdurulur, dosyalar ve PATH kaldırılır, yönlendirme ve proxy ayarları geri yüklenir. [e/H]: ",
+                    )
                 )?;
                 output.flush()?;
                 answer.clear();
@@ -1330,18 +1669,32 @@ where
                     return Ok(Choice::Cancel);
                 }
                 let confirm = answer.trim();
-                if confirm.eq_ignore_ascii_case("y") || confirm.eq_ignore_ascii_case("yes") {
+                if confirm.eq_ignore_ascii_case("y")
+                    || confirm.eq_ignore_ascii_case("yes")
+                    || confirm.eq_ignore_ascii_case("e")
+                    || confirm.eq_ignore_ascii_case("evet")
+                {
                     return Ok(Choice::Uninstall);
                 }
-                writeln!(output, "  Uninstall canceled.")?;
+                writeln!(
+                    output,
+                    "  {}",
+                    tr("Uninstall canceled.", "Kaldırma iptal edildi.")
+                )?;
                 continue;
             }
             return Ok(item.choice.clone());
         }
-        writeln!(
-            output,
-            "  Enter a number from 1 to {count}, r to refresh, or q to quit."
-        )?;
+        match active_lang() {
+            Lang::En => writeln!(
+                output,
+                "  Enter a number from 1 to {count}, r to refresh, or q to quit."
+            )?,
+            Lang::Tr => writeln!(
+                output,
+                "  1 ile {count} arasında bir sayı girin, yenilemek için r, çıkmak için q yazın."
+            )?,
+        }
     }
 }
 
@@ -2837,5 +3190,65 @@ mod tests {
             String::from_utf8(empty_out).unwrap(),
             "\n  Press Enter to close this window.\n"
         );
+    }
+
+    #[test]
+    fn builds_turkish_menu_status_rows_and_dns_labels() {
+        let _guard = i18n::push_thread_lang(Some(Lang::Tr));
+        let status = ControlCenterStatus {
+            installed: None,
+            service_state: ServiceState::NotInstalled,
+            live_engine: None,
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: None,
+        };
+        let split = SplitTunnelConfig {
+            mode: SplitTunnelMode::Exclude,
+            apps: vec!["discord.exe".to_string()],
+        };
+        let menu = build_menu_with_options(&status, None, "https://dns.nextdns.io/abc123", &split);
+        assert_eq!(menu.status_rows[0].label, "Servis");
+        assert_eq!(menu.status_rows[0].value, "Kurulu değil");
+        assert_eq!(menu.status_rows[1].label, "Motor");
+        assert_eq!(menu.status_rows[1].value, "Proxy (seçili)");
+        assert_eq!(menu.status_rows[2].label, "Anti-DPI");
+        assert!(menu.status_rows[2].value.contains("Çevrimdışı"));
+        assert_eq!(menu.items[0].title, "Doğrudan çalıştır");
+        assert_eq!(menu.items[1].title, "TUN moduna geç");
+        assert_eq!(menu.items[2].title, "Otomatik başlatma için kur");
+        assert!(menu.items[3].title.contains("DNS sunucusu seç · Özel (dns.nextdns.io)"));
+        assert_eq!(
+            menu.items[4].title,
+            "Bölünmüş tünelleme · Hariç tut (1 uygulama)"
+        );
+        assert_eq!(menu.items[5].title, "Tanılama çalıştır");
+        assert_eq!(menu.items[6].title, "Çıkış");
+        assert!(dns_preset_hint(&DNS_PRESETS[0]).contains("varsayılan"));
+    }
+
+    #[test]
+    fn persist_language_to_config_at_preserves_existing_keys() {
+        let dir = env::temp_dir().join(format!("vdpi-launcher-lang-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("config.toml");
+        let seed = vdpi::config_file::FileConfig {
+            schema_version: Some(1),
+            engine: Some(EngineMode::Tun),
+            ..Default::default()
+        };
+        vdpi::config_file::save_file_config_atomic(&path, &seed).expect("seed config");
+
+        persist_language_to_config_at(&path, Lang::Tr).expect("persist tr");
+        let (_, loaded) =
+            vdpi::config_file::load_file_config(Some(&path), false).expect("reload config");
+        assert_eq!(loaded.engine, Some(EngineMode::Tun));
+        assert_eq!(loaded.language.as_deref(), Some("tr"));
+
+        persist_language_to_config_at(&path, Lang::En).expect("persist en");
+        let (_, loaded_en) =
+            vdpi::config_file::load_file_config(Some(&path), false).expect("reload config");
+        assert_eq!(loaded_en.language.as_deref(), Some("en"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

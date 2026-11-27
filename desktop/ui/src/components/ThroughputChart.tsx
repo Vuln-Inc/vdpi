@@ -1,4 +1,6 @@
 import { memo, useEffect, useMemo } from "react";
+import { useLang, type ResolvedLanguage } from "../i18n/context";
+import { tShell } from "../i18n/shell";
 import type { ThroughputPoint } from "../types";
 import { formatRate } from "../lib/format";
 
@@ -362,16 +364,22 @@ function buildPolylinePoints(
   return coords.join(" ");
 }
 
-function getPausedSubtitle(pausedLabel: string): string {
+function getPausedSubtitle(
+  pausedLabel: string,
+  lang: ResolvedLanguage,
+): string {
   switch (pausedLabel.trim()) {
     case "Checking status...":
-      return "Reading service status...";
+    case "Durum kontrol ediliyor...":
+      return tShell(lang, "chartSubChecking");
     case "Setup required":
-      return "Complete setup to view live throughput.";
+    case "Kurulum gerekli":
+      return tShell(lang, "chartSubSetup");
     case "Starting...":
-      return "Waiting for live telemetry...";
+    case "Başlatılıyor...":
+      return tShell(lang, "chartSubStarting");
     default:
-      return "Live throughput resumes when connected.";
+      return tShell(lang, "chartSubPaused");
   }
 }
 
@@ -380,11 +388,17 @@ function ThroughputChartComponent({
   running = true,
   rxRateBps,
   txRateBps,
-  title = "Throughput",
-  caption = "60s window",
-  pausedLabel = "Protection paused",
+  title,
+  caption,
+  pausedLabel,
   className,
 }: ThroughputChartProps) {
+  const { lang } = useLang();
+  const resolvedTitle = title ?? tShell(lang, "chartDefaultTitle");
+  const resolvedCaption = caption ?? tShell(lang, "chartDefaultCaption");
+  const resolvedPausedLabel =
+    pausedLabel ?? tShell(lang, "chartDefaultPausedLabel");
+
   useEffect(() => {
     ensureStyles();
   }, []);
@@ -446,8 +460,14 @@ function ThroughputChartComponent({
     .join(" ");
 
   const svgAriaLabel = running
-    ? `Throughput history over 60 samples. Download ${formatRate(currentRx)}, upload ${formatRate(currentTx)}, peak download ${formatRate(peakRx)}, peak upload ${formatRate(peakTx)}, scale up to ${formatRate(upperBound)}.`
-    : `Throughput monitoring paused: ${pausedLabel}.`;
+    ? tShell(lang, "chartSvgAriaRunning", {
+        rx: formatRate(currentRx),
+        tx: formatRate(currentTx),
+        peakRx: formatRate(peakRx),
+        peakTx: formatRate(peakTx),
+        bound: formatRate(upperBound),
+      })
+    : tShell(lang, "chartSvgAriaPaused", { label: resolvedPausedLabel });
 
   return (
     <div
@@ -457,40 +477,48 @@ function ThroughputChartComponent({
     >
       <div className="throughput-chart__header">
         <div className="throughput-chart__title-group">
-          {title ? (
-            <h2 className="card-title throughput-chart__title">{title}</h2>
+          {resolvedTitle ? (
+            <h2 className="card-title throughput-chart__title">
+              {resolvedTitle}
+            </h2>
           ) : null}
-          {title && caption ? (
+          {resolvedTitle && resolvedCaption ? (
             <span className="throughput-chart__title-sep" aria-hidden="true">
               ·
             </span>
           ) : null}
-          {caption ? (
+          {resolvedCaption ? (
             <span className="card-caption throughput-chart__caption tabular-nums">
-              {caption}
+              {resolvedCaption}
             </span>
           ) : null}
         </div>
 
         <div className="throughput-chart__stats">
           <div className="throughput-chart__legend">
-            <span className="throughput-chart__series" title="Download rate">
+            <span
+              className="throughput-chart__series"
+              title={tShell(lang, "chartDownloadTitle")}
+            >
               <span
                 className="throughput-chart__swatch throughput-chart__swatch--rx"
                 aria-hidden="true"
               />
-              <span className="sr-only">Download </span>
+              <span className="sr-only">{tShell(lang, "chartDownloadSr")}</span>
               <span className="throughput-chart__value">
                 ↓ {formatRate(currentRx)}
               </span>
             </span>
 
-            <span className="throughput-chart__series" title="Upload rate">
+            <span
+              className="throughput-chart__series"
+              title={tShell(lang, "chartUploadTitle")}
+            >
               <span
                 className="throughput-chart__swatch throughput-chart__swatch--tx"
                 aria-hidden="true"
               />
-              <span className="sr-only">Upload </span>
+              <span className="sr-only">{tShell(lang, "chartUploadSr")}</span>
               <span className="throughput-chart__value">
                 ↑ {formatRate(currentTx)}
               </span>
@@ -498,7 +526,9 @@ function ThroughputChartComponent({
           </div>
 
           <div className="throughput-chart__peaks">
-            <span className="throughput-chart__peak-label">Peak</span>
+            <span className="throughput-chart__peak-label">
+              {tShell(lang, "chartPeak")}
+            </span>
             <span>↓ {formatRate(peakRx)}</span>
             <span className="throughput-chart__peak-sep" aria-hidden="true">
               ·
@@ -557,15 +587,17 @@ function ThroughputChartComponent({
 
           {!running ? (
             <div className="throughput-chart__overlay" role="status">
-              <p className="throughput-chart__overlay-title">{pausedLabel}</p>
+              <p className="throughput-chart__overlay-title">
+                {resolvedPausedLabel}
+              </p>
               <p className="throughput-chart__overlay-sub">
-                {getPausedSubtitle(pausedLabel)}
+                {getPausedSubtitle(resolvedPausedLabel, lang)}
               </p>
             </div>
           ) : windowPoints.length === 0 ? (
             <div className="throughput-chart__overlay" role="status">
               <p className="throughput-chart__overlay-sub">
-                Waiting for telemetry samples...
+                {tShell(lang, "chartWaitingSamples")}
               </p>
             </div>
           ) : null}

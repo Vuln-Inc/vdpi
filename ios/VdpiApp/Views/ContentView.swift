@@ -168,6 +168,8 @@ struct ContentView: View {
             isKeyboardVisible = false
         }
         #endif
+        .environment(\.appLanguage, manager.settings.language)
+        .environment(\.locale, L10n.resolve(manager.settings.language).locale)
     }
 
     // MARK: - Safe Area & Bottom Floating HUD Stack
@@ -254,7 +256,7 @@ struct ContentView: View {
                                             .offset(x: 3, y: -2)
                                     }
 
-                                Text(tab.title)
+                                Text(tab.title(in: manager.settings.language))
                                     .font(.caption.weight(isSelected ? .semibold : .medium))
                                     .dynamicTypeSize(...DynamicTypeSize.large)
                                     .lineLimit(1)
@@ -272,7 +274,7 @@ struct ContentView: View {
                                             .offset(x: 5, y: -2)
                                     }
 
-                                Text(tab.title)
+                                Text(tab.title(in: manager.settings.language))
                                     .font(.caption2.weight(isSelected ? .semibold : .medium))
                                     .dynamicTypeSize(...DynamicTypeSize.large)
                                     .lineLimit(1)

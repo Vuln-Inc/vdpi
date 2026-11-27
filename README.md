@@ -1,17 +1,24 @@
 <div align="center">
 
+**English** · [Türkçe](./README.tr.md)
+
 # `vdpi`
 
 Self-healing anti-DPI engine in Rust, native across Windows, macOS, Linux, Android, and iOS.  
-Runs as a transparent system-wide TUN adapter or a lightweight local proxy with zero remote servers and zero telemetry.
+Ships as a native Desktop GUI, an interactive Control Center TUI, and zero-root mobile apps - running as a transparent system-wide TUN adapter or a lightweight local proxy with zero remote servers and zero telemetry.
 
-[![Release](https://img.shields.io/badge/Release-v0.6.0-38bdf8?style=for-the-badge&logo=github)](https://github.com/Vuln-Inc/vdpi/releases/latest)
+[![Release](https://img.shields.io/badge/Release-v0.6.1-38bdf8?style=for-the-badge&logo=github)](https://github.com/Vuln-Inc/vdpi/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-34d399?style=for-the-badge)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/Platforms-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Android%20%7C%20iOS-818cf8?style=for-the-badge)](#quick-install)
 
 [Quick Install](#quick-install) · [Engines](#engine-modes-proxy-vs-tun) · [Getting Started](#getting-started) · [Docs](#documentation) · [Releases](https://github.com/Vuln-Inc/vdpi/releases/latest) · [Changelog](./CHANGELOG.md) · [Security](./SECURITY.md)
 
 </div>
+
+<p align="center">
+  <img src="docs/screenshots/desktop-gui-overview.png" alt="vdpi Desktop GUI Overview with live throughput chart, TUN/Proxy switch, DNS status, and active connections" width="49%">
+  <img src="docs/screenshots/desktop-gui-split.png" alt="vdpi Desktop GUI Split Tunneling with routing modes, quick presets, and companion app detection" width="49%">
+</p>
 
 <p align="center">
   <img src="docs/screenshots/hero-showcase.png" alt="vdpi Live Dashboard, Control Center TUI, and mobile app" width="100%">
@@ -29,12 +36,22 @@ Runs as a transparent system-wide TUN adapter or a lightweight local proxy with 
 <table>
   <tr>
     <td valign="top" width="50%">
-      <strong>Two desktop engines (TUN + Proxy)</strong><br>
-      Transparent system-wide TUN (<code>Wintun</code> / <code>utun</code> / <code>/dev/net/tun</code>, zero proxy env edits or browser restarts) or classic lightweight local HTTP/SOCKS5 proxy (no virtual adapter, portable) - 1-press switchable.
+      <strong>Native Desktop GUI</strong><br>
+      Lightweight native app for Windows, macOS, and Linux with live 60s throughput telemetry, 1-click TUN/Proxy switching, visual per-app Split Tunneling (with quick presets for Discord, Roblox, Valorant &amp; Riot, Steam, browsers, and OBS plus companion process grouping), DNS &amp; domain rules, Diagnostics, and system tray / menu bar controls.
     </td>
     <td valign="top" width="50%">
+      <strong>Two desktop engines (TUN + Proxy)</strong><br>
+      Transparent system-wide TUN (<code>Wintun</code> / <code>utun</code> / <code>/dev/net/tun</code>, zero proxy env edits or browser restarts) or classic lightweight local HTTP/SOCKS5 proxy (no virtual adapter, portable) - 1-click or 1-press switchable.
+    </td>
+  </tr>
+  <tr>
+    <td valign="top" width="50%">
       <strong>Native across all 5 platforms</strong><br>
-      Lightweight native binaries on Windows, macOS, and Linux, plus zero-root local VPN apps for Android (APK) and iOS/iPadOS (IPA) sharing the same Rust core.
+      Native Desktop GUI packages and lightweight CLI binaries on Windows, macOS, and Linux, plus zero-root local VPN apps for Android (APK) and iOS/iPadOS (IPA) sharing the same Rust core.
+    </td>
+    <td valign="top" width="50%">
+      <strong>English &amp; Turkish (<code>Türkçe</code>) support</strong><br>
+      Full English and Turkish localization across the Desktop GUI, Control Center TUI, Android, and iOS - auto-detected from your system locale or switchable anytime in Settings or <code>config.toml</code>.
     </td>
   </tr>
   <tr>
@@ -63,7 +80,15 @@ Runs as a transparent system-wide TUN adapter or a lightweight local proxy with 
 
 ## Quick Install
 
-### Windows (`x86_64`, Windows 10 & 11)
+### Desktop App (GUI) - Windows, macOS & Linux
+
+- **Windows (`x86_64`, Windows 10 & 11):** [Installer (`.exe`)](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-windows-x86_64-setup.exe) · [Portable (`.zip`)](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-windows-x86_64-portable.zip)
+- **macOS (Universal, Apple Silicon & Intel):** [DMG (`.dmg`)](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-macos-universal.dmg)
+- **Linux (`x86_64`):** [Debian/Ubuntu (`.deb`)](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.deb) · [AppImage (`.AppImage`)](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.AppImage)
+
+> **Note:** Desktop GUI packages bundle the `vdpi` engine binary (and the unmodified WHQL-signed `wintun.dll` `0.14.1` on Windows), integrate with the system tray / menu bar, and share the same `config.toml` and background service as the CLI.
+
+### CLI / Headless - Windows (`x86_64`, Windows 10 & 11)
 
 ```powershell
 # PowerShell one-liner (SHA-256 verified)
@@ -79,11 +104,11 @@ winget install Vuln-Inc.vdpi
 cargo install vdpi
 ```
 
-> **Note:** Official Windows releases (`vdpi-windows-x86_64.zip`) ship `vdpi.exe` alongside the unmodified WHQL-signed `wintun.dll` (`0.14.1`) and `WINTUN-LICENSE.txt` (needed only for TUN mode). Proxy mode uses a fail-open `/vdpi.pac` auto-config proxy across Windows (`AutoConfigURL`), macOS (`AutoProxyURL`), and Linux (GNOME/KDE PAC; Linux also exports user-session `HTTP_PROXY`/`HTTPS_PROXY` unless `--no-env-proxy` is set), so terminating or crashing `vdpi` on Windows/macOS never bricks direct internet access. `cargo install vdpi` works in Proxy mode immediately; for TUN mode on Windows, copy `wintun.dll` from the matching release zip beside `vdpi.exe`.
+> **Note:** Official Windows CLI releases (`vdpi-windows-x86_64.zip`) ship `vdpi.exe` alongside the unmodified WHQL-signed `wintun.dll` (`0.14.1`) and `WINTUN-LICENSE.txt` (needed only for TUN mode). Proxy mode uses a fail-open `/vdpi.pac` auto-config proxy across Windows (`AutoConfigURL`), macOS (`AutoProxyURL`), and Linux (GNOME/KDE PAC; Linux also exports user-session `HTTP_PROXY`/`HTTPS_PROXY` unless `--no-env-proxy` is set), so terminating or crashing `vdpi` on Windows/macOS never bricks direct internet access. `cargo install vdpi` works in Proxy mode immediately; for TUN mode on Windows, copy `wintun.dll` from the matching release zip beside `vdpi.exe`.
 
 Direct download: [`vdpi-windows-x86_64.zip`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-windows-x86_64.zip) (`vdpi.exe`, WHQL-signed `wintun.dll` `0.14.1`, and `WINTUN-LICENSE.txt`) or [crates.io/crates/vdpi](https://crates.io/crates/vdpi).
 
-### macOS & Linux (`universal` / `x86_64` & `arm64`)
+### CLI / Headless - macOS & Linux (`universal` / `x86_64` & `arm64`)
 
 ```bash
 # Shell one-liner (macOS & Linux, SHA-256 verified)
@@ -115,21 +140,22 @@ Direct downloads: [`vdpi-macos-universal.tar.gz`](https://github.com/Vuln-Inc/vd
 
 - **Proxy mode (default):** Zero admin privileges required for portable/foreground runs (and unprivileged background services on macOS/Linux; Admin only for Windows Service install), zero virtual adapter, routing table, or DNS changes, and most stable out of the box for browsers, Discord, Telegram, and apps that honor system proxy.
 - **TUN mode (system-wide):** Captures all TCP & UDP traffic including games (Roblox, Valorant, etc.) and apps that ignore system proxy.
-- **How to switch:** Open the `vdpi` Control Center (`vdpi` with no args) and select **Switch to TUN** / **Switch to Proxy** (automatically prompts for UAC on Windows or `sudo` / Touch ID password on macOS & Linux - no need to pre-run as root), or run `vdpi install --tun` / `vdpi --tun`.
+- **How to switch:** Toggle **TUN / Proxy** directly in the Desktop GUI Overview, open the `vdpi` Control Center (`vdpi` with no args) and select **Switch to TUN** / **Switch to Proxy** (automatically prompts for UAC on Windows or `sudo` / Touch ID / `pkexec` on macOS & Linux - no need to pre-run as root), or run `vdpi install --tun` / `vdpi --tun`.
 
 | Dimension | Proxy Mode (`--proxy`, **Default**) | TUN Mode (`--tun`) |
 | :--- | :--- | :--- |
 | **Traffic capture** | Local `127.0.0.1:8080` (HTTP/HTTPS/SOCKS5/4a) + `:1080` (SOCKS5 TCP/UDP) | Layer 3 virtual NIC (`Wintun` / `utun` / `/dev/net/tun`) + userspace stack |
 | **App coverage** | Browsers, Discord, Telegram & apps honoring OS fail-open PAC (`/vdpi.pac`) or explicit local proxy listeners | System-wide TCP & UDP: games (Roblox, Valorant, etc.), Discord voice, CLI, all apps |
 | **OS integration** | Fail-open `/vdpi.pac` auto-config (Windows `AutoConfigURL` & macOS `AutoProxyURL` with zero env vars; Linux GNOME/KDE PAC plus optional `systemd --user` env vars, disabled via `--no-env-proxy`); no virtual adapter, route, or DNS changes | Zero proxy edits; no browser restart required |
-| **Privileges & memory** | Zero admin for portable/foreground (unprivileged service on macOS/Linux; Admin only for Windows Service install); ~8-14 MB RAM | Prompts for UAC (Windows) or `sudo` / Touch ID (macOS & Linux); ~16-22 MB RAM |
+| **Privileges & memory** | Zero admin for portable/foreground (unprivileged service on macOS/Linux; Admin only for Windows Service install); ~8-14 MB RAM | Prompts for UAC (Windows) or `sudo` / Touch ID / `pkexec` (macOS & Linux); ~16-22 MB RAM |
 | **VPN & anticheat** | Pure loopback proxy; no virtual adapter; `VpnGuard` auto-yield | `VpnGuard` 0ms auto-yield; WHQL-signed Wintun (anticheat safe) |
 
 ### Switching Modes
 
-Your current mode (`Proxy` or `TUN`) is always shown in the `Engine` row of the `vdpi` Control Center and in the Live Dashboard status bar.
+Your current mode (`Proxy` or `TUN`) is always shown in the Desktop GUI Overview and sidebar, in the `Engine` row of the `vdpi` Control Center, and in the Live Dashboard status bar.
 
-- **Interactive TUI:** Run `vdpi` with no args and select **Switch to TUN** / **Switch to Proxy** - `vdpi` automatically prompts for elevation (UAC on Windows, `sudo` / Touch ID password on macOS & Linux; no need to pre-run as root).
+- **Desktop GUI:** Click **TUN** or **Proxy** in the Overview header to switch engines immediately.
+- **Interactive TUI:** Run `vdpi` with no args and select **Switch to TUN** / **Switch to Proxy** - `vdpi` automatically prompts for elevation (UAC on Windows, `sudo` / Touch ID on macOS & Linux; no need to pre-run as root).
 - **CLI:**
   ```bash
   vdpi engine         # Show current engine mode (Proxy or TUN)
@@ -145,7 +171,18 @@ For anti-DPI framing modes (`--mode combo` default with 7-stage self-healing aut
 
 ---
 
+## Language Support
+
+`vdpi` supports **English** and **Turkish (`Türkçe`)** across the Desktop GUI, Control Center TUI, Android, and iOS.
+
+- **Automatic detection:** By default, `vdpi` follows your OS locale and launches in Turkish when your system language is set to Turkish, or English otherwise.
+- **Manual override:** Switch languages anytime in **Settings** (Desktop GUI, Android, and iOS), inside the Control Center TUI, or by setting `language` in `config.toml` (`"system"`, `"en"`, or `"tr"`).
+
+---
+
 ## Getting Started
+
+Launch **vdpi Desktop** for the graphical interface, or use the CLI and Control Center TUI directly:
 
 ```bash
 vdpi              # Open the Control Center TUI (`l` live dashboard, `d` DNS picker, `s` Split tunneling, switch engine)

@@ -433,6 +433,7 @@ struct InsetDivider: View {
 /// Authentic Apple grouped section header (`.footnote`, Dynamic Type, muted ink).
 struct SectionHeader: View {
     @Environment(\.vdpiPalette) private var palette
+    @Environment(\.appLanguage) private var appLanguage
     let title: String
 
     init(title: String) {
@@ -444,9 +445,9 @@ struct SectionHeader: View {
     }
 
     var body: some View {
-        Text(title)
+        let locale = L10n.resolve(appLanguage).locale
+        Text(title.uppercased(with: locale))
             .font(.footnote)
-            .textCase(.uppercase)
             .foregroundStyle(palette.inkMuted)
             .padding(.horizontal, 16)
             .accessibilityAddTraits(.isHeader)

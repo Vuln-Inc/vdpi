@@ -8,7 +8,12 @@ import UIKit
 struct DiagnosticsSheet: View {
     @EnvironmentObject private var manager: TunnelManager
     @Environment(\.vdpiPalette) private var palette
+    @Environment(\.appLanguage) private var appLanguage
     @Environment(\.dismiss) private var dismiss
+
+    private var l10n: L10n.Catalog {
+        L10n.catalog(for: appLanguage)
+    }
 
     private var sheetBackground: Color {
         palette.isDark ? palette.surface : palette.canvas
@@ -25,15 +30,15 @@ struct DiagnosticsSheet: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 10) {
                         if manager.doctorState.running {
-                            SectionHeader(title: "Checks")
+                            SectionHeader(title: l10n.diagnosticsSectionChecks)
                             runningCard
                         } else if let doctorError = manager.doctorState.error {
-                            SectionHeader(title: "Checks")
+                            SectionHeader(title: l10n.diagnosticsSectionChecks)
                             errorCard(doctorError)
                         } else if let report = manager.doctorState.report, !report.checks.isEmpty {
                             summaryStrip(for: report)
 
-                            SectionHeader(title: "Checks")
+                            SectionHeader(title: l10n.diagnosticsSectionChecks)
                                 .padding(.top, 4)
 
                             SheetInsetCard(cornerRadius: 16) {
@@ -51,7 +56,7 @@ struct DiagnosticsSheet: View {
                                 SectionFooter(text: footer)
                             }
                         } else {
-                            SectionHeader(title: "Checks")
+                            SectionHeader(title: l10n.diagnosticsSectionChecks)
                             emptyCard
                         }
                     }
@@ -61,11 +66,11 @@ struct DiagnosticsSheet: View {
                 }
                 .scrollIndicators(.hidden)
             }
-            .navigationTitle("Diagnostics")
+            .navigationTitle(l10n.diagnosticsTitle)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItemGroup(placement: .navigationBarLeading) {
-                    Button("Re-run") {
+                    Button(l10n.rerunButton) {
                         VdpiHaptics.trigger(.light)
                         manager.runDiagnostics()
                     }
@@ -77,11 +82,11 @@ struct DiagnosticsSheet: View {
                     }
                     .foregroundStyle(canShareReport ? palette.accent : palette.inkMuted)
                     .disabled(!canShareReport)
-                    .accessibilityLabel("Share diagnostics report")
+                    .accessibilityLabel(l10n.accessibilityShareDiagnostics)
                 }
 
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("Done") {
+                    Button(l10n.done) {
                         dismiss()
                     }
                     .fontWeight(.semibold)
@@ -108,11 +113,11 @@ struct DiagnosticsSheet: View {
                     .tint(palette.inkSecondary)
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Running Diagnostics")
+                    Text(l10n.runningDiagnosticsTitle)
                         .font(.body)
                         .foregroundStyle(palette.inkPrimary)
 
-                    Text("Testing DNS, DoH, TLS, and QUIC paths.")
+                    Text(l10n.runningDiagnosticsSubtitle)
                         .font(.footnote)
                         .foregroundStyle(palette.inkSecondary)
                 }
@@ -134,7 +139,7 @@ struct DiagnosticsSheet: View {
                     .padding(.top, 1)
 
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Diagnostics Failed")
+                    Text(l10n.diagnosticsFailedTitle)
                         .font(.body)
                         .foregroundStyle(palette.inkPrimary)
 
@@ -154,7 +159,7 @@ struct DiagnosticsSheet: View {
 
     private var emptyCard: some View {
         SheetInsetCard(cornerRadius: 16) {
-            Text("Tap Re-run to verify live DNS, DoH, and TLS desync probes.")
+            Text(l10n.diagnosticsEmptyMessage)
                 .font(.subheadline)
                 .foregroundStyle(palette.inkSecondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -165,7 +170,9 @@ struct DiagnosticsSheet: View {
     // MARK: - Check Row & Summary
 
     private func diagnosticCheckRow(_ check: DoctorCheck) -> some View {
-        HStack(alignment: .top, spacing: 12) {
+        let displayName = l10n.doctorCheckName(check.name)
+
+        return HStack(alignment: .top, spacing: 12) {
             Image(systemName: check.passed ? "checkmark.circle.fill" : "xmark.circle.fill")
                 .font(.title3)
                 .foregroundStyle(check.passed ? palette.signal : palette.danger)
@@ -173,7 +180,7 @@ struct DiagnosticsSheet: View {
                 .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(check.name)
+                Text(displayName)
                     .font(.body)
                     .foregroundStyle(palette.inkPrimary)
 
@@ -206,7 +213,12 @@ struct DiagnosticsSheet: View {
         .padding(.vertical, 12)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
-            "\(check.name), \(check.passed ? "Passed" : "Failed"), \(check.latencyMs) milliseconds, \(check.detail)"
+            l10n.diagnosticsCheckAccessibility(
+                name: displayName,
+                passed: check.passed,
+                latencyMs: check.latencyMs,
+                detail: check.detail
+            )
         )
     }
 
@@ -217,8 +229,8 @@ struct DiagnosticsSheet: View {
         let allPassed = failed == 0
         let statusColor: Color = allPassed ? palette.signal : (passed == 0 ? palette.danger : palette.warning)
         let title = allPassed
-            ? "All \(total) checks passed"
-            : "\(passed) of \(total) passed"
+            ? l10n.diagnosticsAllPassed(total: total)
+            : l10n.diagnosticsPartialPassed(passed: passed, total: total)
 
         return SheetInsetCard(cornerRadius: 14) {
             HStack(spacing: 10) {
@@ -234,7 +246,7 @@ struct DiagnosticsSheet: View {
 
                 Spacer(minLength: 8)
 
-                Text(allPassed ? "Healthy" : "\(failed) failed")
+                Text(allPassed ? l10n.diagnosticsHealthy : l10n.diagnosticsFailedCount(failed))
                     .font(.footnote.weight(.medium))
                     .monospacedDigit()
                     .foregroundStyle(allPassed ? palette.signal : palette.danger)
@@ -244,14 +256,15 @@ struct DiagnosticsSheet: View {
             .padding(.vertical, 6)
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(allPassed ? "All \(total) checks passed, healthy" : "\(passed) of \(total) checks passed, \(failed) failed")
+        .accessibilityLabel(
+            l10n.accessibilityDiagnosticsSummary(passed: passed, total: total, failed: failed)
+        )
     }
 
     private func summaryFooter(for report: DoctorReport) -> String? {
         let failedCount = report.checks.filter { !$0.passed }.count
         guard failedCount > 0 else { return nil }
-        let noun = failedCount == 1 ? "issue" : "issues"
-        return "\(failedCount) \(noun) detected - check DNS or network settings."
+        return l10n.diagnosticsIssuesFooter(failedCount: failedCount)
     }
 }
 
@@ -260,11 +273,16 @@ struct DiagnosticsSheet: View {
 struct EngineLogsSheet: View {
     @EnvironmentObject private var manager: TunnelManager
     @Environment(\.vdpiPalette) private var palette
+    @Environment(\.appLanguage) private var appLanguage
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dismiss) private var dismiss
 
     @State private var copied = false
     @State private var copyFeedbackTask: Task<Void, Never>?
+
+    private var l10n: L10n.Catalog {
+        L10n.catalog(for: appLanguage)
+    }
 
     private var formattedLogs: String {
         manager.telemetry.events.map { ev in
@@ -297,7 +315,7 @@ struct EngineLogsSheet: View {
             .onDisappear {
                 copyFeedbackTask?.cancel()
             }
-            .navigationTitle("Engine Logs")
+            .navigationTitle(l10n.engineLogsTitle)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItemGroup(placement: .navigationBarLeading) {
@@ -310,7 +328,7 @@ struct EngineLogsSheet: View {
                         manager.telemetry.events.isEmpty ? palette.inkMuted : palette.accent
                     )
                     .disabled(manager.telemetry.events.isEmpty)
-                    .accessibilityLabel(copied ? "Copied logs" : "Copy logs")
+                    .accessibilityLabel(copied ? l10n.accessibilityCopiedLogs : l10n.accessibilityCopyLogs)
 
                     ShareLink(item: formattedLogs) {
                         Image(systemName: "square.and.arrow.up")
@@ -319,11 +337,11 @@ struct EngineLogsSheet: View {
                         manager.telemetry.events.isEmpty ? palette.inkMuted : palette.accent
                     )
                     .disabled(manager.telemetry.events.isEmpty)
-                    .accessibilityLabel("Share logs")
+                    .accessibilityLabel(l10n.accessibilityShareLogs)
                 }
 
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("Done") {
+                    Button(l10n.done) {
                         dismiss()
                     }
                     .fontWeight(.semibold)
@@ -342,11 +360,11 @@ struct EngineLogsSheet: View {
                 .foregroundStyle(palette.inkMuted)
                 .accessibilityHidden(true)
 
-            Text("No Engine Logs Yet")
+            Text(l10n.noEngineLogsTitle)
                 .font(.headline)
                 .foregroundStyle(palette.inkPrimary)
 
-            Text("Connect the tunnel to record activity.")
+            Text(l10n.noEngineLogsSubtitle)
                 .font(.subheadline)
                 .foregroundStyle(palette.inkSecondary)
                 .multilineTextAlignment(.center)

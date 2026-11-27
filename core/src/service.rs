@@ -2962,6 +2962,7 @@ fn file_config_from_runtime(cfg: &RuntimeConfig) -> FileConfig {
         system_proxy: Some(cfg.system_proxy),
         socks_system_proxy: Some(cfg.socks_system_proxy),
         env_proxy: Some(cfg.env_proxy),
+        language: None,
     }
 }
 

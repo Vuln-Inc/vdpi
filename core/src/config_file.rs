@@ -55,6 +55,7 @@ pub struct FileConfig {
     pub system_proxy: Option<bool>,
     pub socks_system_proxy: Option<bool>,
     pub env_proxy: Option<bool>,
+    pub language: Option<String>,
 }
 
 impl FileConfig {
@@ -93,6 +94,7 @@ impl FileConfig {
             system_proxy: overlay.system_proxy.or(self.system_proxy),
             socks_system_proxy: overlay.socks_system_proxy.or(self.socks_system_proxy),
             env_proxy: overlay.env_proxy.or(self.env_proxy),
+            language: overlay.language.clone().or_else(|| self.language.clone()),
         }
     }
 
@@ -1405,6 +1407,9 @@ pub fn set_config_key(cfg: &mut FileConfig, key: &str, value: &str) -> Result<()
         "env_proxy" => {
             cfg.env_proxy = Some(parse_bool_str(trimmed, "env_proxy")?);
         }
+        "language" => {
+            cfg.language = Some(parse_language_pref(trimmed)?);
+        }
         _ => bail!("unknown config key '{key}'"),
     }
 
@@ -1450,6 +1455,7 @@ pub fn get_config_key(cfg: &FileConfig, key: &str) -> Result<Option<String>> {
         "system_proxy" => cfg.system_proxy.map(|v| v.to_string()),
         "socks_system_proxy" => cfg.socks_system_proxy.map(|v| v.to_string()),
         "env_proxy" => cfg.env_proxy.map(|v| v.to_string()),
+        "language" => cfg.language.clone(),
         _ => bail!("unknown config key '{key}'"),
     };
 
@@ -1483,6 +1489,7 @@ pub fn unset_config_key(cfg: &mut FileConfig, key: &str) -> Result<()> {
         "system_proxy" => cfg.system_proxy = None,
         "socks_system_proxy" => cfg.socks_system_proxy = None,
         "env_proxy" => cfg.env_proxy = None,
+        "language" => cfg.language = None,
         _ => bail!("unknown config key '{key}'"),
     }
 
@@ -1585,6 +1592,17 @@ fn parse_split_tunnel_mode(value: &str) -> Result<SplitTunnelMode> {
             "invalid value '{other}' for 'split_tunnel_mode' (expected 'all', 'exclude', or 'include')"
         )
     })
+}
+
+fn parse_language_pref(value: &str) -> Result<String> {
+    crate::i18n::parse_config_language(value)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            let other = value.trim().to_ascii_lowercase();
+            anyhow::anyhow!(
+                "invalid value '{other}' for 'language' (expected 'auto', 'en', or 'tr')"
+            )
+        })
 }
 
 /// Validates and sanitizes per-application split-tunnel entries.
@@ -1820,6 +1838,9 @@ pub fn render_config_toml(cfg: &FileConfig) -> String {
     if let Some(v) = cfg.env_proxy {
         let _ = writeln!(out, "env_proxy = {v}");
     }
+    if let Some(ref lang) = cfg.language {
+        let _ = writeln!(out, "language = {}", escape_toml_string(lang));
+    }
 
     out
 }
@@ -2024,6 +2045,12 @@ fn apply_parsed_entry(
         }
         "env_proxy" => {
             cfg.env_proxy = Some(extract_bool(val, val_line, key)?);
+        }
+        "language" => {
+            let s = extract_string(val, val_line, key)?;
+            cfg.language = Some(
+                parse_language_pref(&s).map_err(|e| anyhow::anyhow!("line {val_line}: {e}"))?,
+            );
         }
         unknown => {
             warn!(
@@ -2587,6 +2614,7 @@ mod tests {
             system_proxy: Some(false),
             socks_system_proxy: Some(false),
             env_proxy: Some(true),
+            language: Some("tr".to_string()),
         };
 
         let rendered = render_config_toml(&cfg);
@@ -3720,5 +3748,74 @@ split_tunnel_apps = [
                 "expected line 1 error for {bad:?}, got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn language_config_roundtrips_merges_and_validates() {
+        let dir = TestTempDir::new("language");
+        for (input, expected) in [
+            ("auto", "auto"),
+            (" AUTO ", "auto"),
+            ("en", "en"),
+            ("EN", "en"),
+            ("tr", "tr"),
+            ("Tr", "tr"),
+        ] {
+            let mut cfg = FileConfig {
+                schema_version: Some(CONFIG_SCHEMA_VERSION),
+                ..Default::default()
+            };
+            set_config_key(&mut cfg, "language", input)
+                .unwrap_or_else(|e| panic!("set_config_key failed for '{input}': {e:#}"));
+            assert_eq!(
+                get_config_key(&cfg, "language").unwrap().as_deref(),
+                Some(expected)
+            );
+
+            let rendered = render_config_toml(&cfg);
+            assert!(rendered.contains(&format!("language = \"{expected}\"")));
+            let parsed = parse_config_toml(&rendered).expect("language TOML parses");
+            assert_eq!(parsed.language.as_deref(), Some(expected));
+
+            let path = dir.path().join(format!("lang-{expected}.toml"));
+            save_file_config_atomic(&path, &cfg).expect("atomic save language config");
+            let (_, reloaded) = load_file_config(Some(&path), false).expect("reload language");
+            assert_eq!(reloaded, cfg);
+
+            unset_config_key(&mut cfg, "language").expect("unset language");
+            assert_eq!(get_config_key(&cfg, "language").unwrap(), None);
+        }
+
+        // Backward compatibility: existing TOML without `language` parses with `language: None`.
+        let legacy = parse_config_toml("schema_version = 1\nengine = \"proxy\"\n")
+            .expect("legacy config without language parses");
+        assert_eq!(legacy.language, None);
+
+        // Merge precedence: overlay wins when Some, preserves base when None.
+        let base = FileConfig {
+            language: Some("en".to_string()),
+            ..Default::default()
+        };
+        let empty_overlay = FileConfig::default();
+        assert_eq!(base.merge(&empty_overlay).language.as_deref(), Some("en"));
+        let tr_overlay = FileConfig {
+            language: Some("tr".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(base.merge(&tr_overlay).language.as_deref(), Some("tr"));
+
+        // Invalid values rejected in both set_config_key and parse_config_toml.
+        for bad in ["", "de", "fr", "tr-TR", "turkish"] {
+            let mut cfg = FileConfig::default();
+            assert!(
+                set_config_key(&mut cfg, "language", bad).is_err(),
+                "set_config_key should reject invalid language {bad:?}"
+            );
+            let toml = format!("language = {}\n", escape_toml_string(bad));
+            let err = parse_config_toml(&toml)
+                .expect_err(&format!("parse_config_toml should reject {bad:?}"));
+            assert!(err.to_string().contains("line 1:"));
+        }
+        assert!(parse_config_toml("language = true\n").is_err());
     }
 }

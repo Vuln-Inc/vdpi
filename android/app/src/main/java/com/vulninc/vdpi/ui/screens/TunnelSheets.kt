@@ -83,6 +83,8 @@ import com.vulninc.vdpi.ui.components.InsetGroupedCard
 import com.vulninc.vdpi.ui.components.SectionFooter
 import com.vulninc.vdpi.ui.components.SectionOverline
 import com.vulninc.vdpi.ui.components.sculptedDarkCardBorder
+import com.vulninc.vdpi.ui.i18n.LocalVdpiStrings
+import com.vulninc.vdpi.ui.i18n.VdpiStrings
 import com.vulninc.vdpi.ui.theme.GeistMono
 import com.vulninc.vdpi.ui.theme.GeistSans
 import com.vulninc.vdpi.ui.theme.VdpiTextStyles
@@ -185,6 +187,7 @@ private fun SheetHeaderBar(
     leadingExtra: (@Composable () -> Unit)? = null,
 ) {
     val palette = VdpiThemeTokens.palette
+    val strings = LocalVdpiStrings.current
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -215,7 +218,7 @@ private fun SheetHeaderBar(
                 .padding(horizontal = 8.dp),
         )
         SheetTextButton(
-            label = "Done",
+            label = strings.actionDone,
             emphasized = true,
             onClick = onDismiss,
         )
@@ -264,6 +267,7 @@ internal fun DoctorSheetContent(
     onDismiss: () -> Unit,
 ) {
     val palette = VdpiThemeTokens.palette
+    val strings = LocalVdpiStrings.current
     val context = LocalContext.current
     val cardBackground = if (palette.isDark) palette.surfaceRaised else palette.surface
     val report = doctorState.report
@@ -297,19 +301,20 @@ internal fun DoctorSheetContent(
                 .padding(bottom = if (isLandscape) 14.dp else 24.dp),
         ) {
             SheetHeaderBar(
-                title = "Diagnostics",
-                leadingLabel = "Re-run",
+                title = strings.diagnosticsTitle,
+                leadingLabel = strings.actionRerun,
                 leadingEnabled = !doctorState.running,
                 onLeadingClick = onRerun,
                 onDismiss = onDismiss,
                 leadingExtra = {
                     SheetIconButton(
-                        contentDescription = "Share diagnostics report",
+                        contentDescription = strings.cdShareDiagnostics,
                         enabled = canShare,
                         onClick = {
                             shareDiagnosticsReport(
                                 context = context,
                                 reportText = onFormatDiagnosticsReport(),
+                                strings = strings,
                             )
                         },
                     ) {
@@ -328,7 +333,7 @@ internal fun DoctorSheetContent(
                 Spacer(Modifier.height(if (isLandscape) 10.dp else 14.dp))
             }
 
-            SectionOverline(text = "Checks")
+            SectionOverline(text = strings.diagnosticsChecksHeader)
 
             InsetGroupedCard(
                 modifier = Modifier
@@ -356,7 +361,7 @@ internal fun DoctorSheetContent(
                             )
                             Spacer(Modifier.width(12.dp))
                             Text(
-                                text = "Verifying DNS, DoH, and TLS connectivity...",
+                                text = strings.diagnosticsRunning,
                                 style = VdpiTextStyles.body,
                                 color = palette.inkSecondary,
                             )
@@ -377,14 +382,14 @@ internal fun DoctorSheetContent(
 
                     report != null -> {
                         DoctorMessageBox(
-                            message = "No diagnostic checks were returned. Tap Re-run to try again.",
+                            message = strings.diagnosticsEmptyReturned,
                             isLandscape = isLandscape,
                         )
                     }
 
                     else -> {
                         DoctorMessageBox(
-                            message = "Tap Re-run to verify DNS, DoH, and TLS endpoints.",
+                            message = strings.diagnosticsTapToRun,
                             isLandscape = isLandscape,
                         )
                     }
@@ -392,7 +397,7 @@ internal fun DoctorSheetContent(
             }
 
             if (!doctorState.running && report != null && report.checks.isNotEmpty()) {
-                SectionFooter(text = formatDoctorFooter(report))
+                SectionFooter(text = formatDoctorFooter(report, strings))
             }
         }
     }
@@ -404,13 +409,14 @@ private fun DoctorCheckRow(
     isLandscape: Boolean,
 ) {
     val palette = VdpiThemeTokens.palette
+    val strings = LocalVdpiStrings.current
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .heightIn(min = if (isLandscape) 44.dp else 50.dp)
             .semantics(mergeDescendants = true) {
                 contentDescription =
-                    "${check.name}, ${if (check.passed) "Passed" else "Failed"}, ${check.latencyMs} ms, ${check.detail}"
+                    "${check.name}, ${if (check.passed) strings.statusPassed else strings.statusFailed}, ${check.latencyMs} ms, ${check.detail}"
             }
             .padding(
                 horizontal = 16.dp,
@@ -487,6 +493,7 @@ private fun DoctorSummaryStrip(
     isLandscape: Boolean,
 ) {
     val palette = VdpiThemeTokens.palette
+    val strings = LocalVdpiStrings.current
     val total = report.checks.size
     val passedCount = report.checks.count { it.passed }
     val allPassed = report.ok && passedCount == total
@@ -494,9 +501,9 @@ private fun DoctorSummaryStrip(
     val stripInk = if (allPassed) palette.signal else palette.warning
     val borderColor = stripInk.copy(alpha = if (palette.isDark) 0.24f else 0.18f)
     val summaryText = if (allPassed) {
-        "All $total checks passed"
+        strings.diagnosticsAllPassed(total)
     } else {
-        "$passedCount of $total passed"
+        strings.diagnosticsPartialPassed(passedCount, total)
     }
     val shape = remember { RoundedCornerShape(12.dp) }
 
@@ -573,15 +580,19 @@ private fun ShareGlyph(tint: Color) {
     }
 }
 
-private fun shareDiagnosticsReport(context: Context, reportText: String) {
+private fun shareDiagnosticsReport(
+    context: Context,
+    reportText: String,
+    strings: VdpiStrings,
+) {
     if (reportText.isBlank()) return
     val sendIntent = Intent(Intent.ACTION_SEND).apply {
         type = "text/plain"
-        putExtra(Intent.EXTRA_SUBJECT, "vdpi Diagnostics Report")
+        putExtra(Intent.EXTRA_SUBJECT, strings.diagnosticsShareSubject)
         putExtra(Intent.EXTRA_TEXT, reportText)
     }
     runCatching {
-        context.startActivity(Intent.createChooser(sendIntent, "Share Diagnostics"))
+        context.startActivity(Intent.createChooser(sendIntent, strings.diagnosticsShareChooser))
     }
 }
 
@@ -629,13 +640,12 @@ private fun CrossCircleGlyph(tint: Color) {
     }
 }
 
-private fun formatDoctorFooter(report: DoctorReport): String {
+private fun formatDoctorFooter(report: DoctorReport, strings: VdpiStrings): String {
     val failedCount = report.checks.count { !it.passed }
     return if (report.ok && failedCount == 0) {
-        "All ${report.checks.size} checks passed"
+        strings.diagnosticsAllPassed(report.checks.size)
     } else {
-        val noun = if (failedCount == 1) "issue" else "issues"
-        "$failedCount $noun detected - check DNS or network settings"
+        strings.diagnosticsIssuesDetected(failedCount)
     }
 }
 
@@ -648,6 +658,7 @@ internal fun EngineLogSheetContent(
     onDismiss: () -> Unit,
 ) {
     val palette = VdpiThemeTokens.palette
+    val strings = LocalVdpiStrings.current
     val context = LocalContext.current
     val listState = rememberLazyListState()
     var copiedFeedback by remember { mutableStateOf(false) }
@@ -732,11 +743,11 @@ internal fun EngineLogSheetContent(
                 .padding(bottom = if (isLandscape) 14.dp else 24.dp),
         ) {
             SheetHeaderBar(
-                title = "Engine Logs",
-                leadingLabel = if (copiedFeedback) "Copied" else "Copy",
+                title = strings.logsTitle,
+                leadingLabel = if (copiedFeedback) strings.actionCopied else strings.actionCopy,
                 leadingEnabled = events.isNotEmpty(),
                 onLeadingClick = {
-                    copyEngineLogsToClipboard(context, events)
+                    copyEngineLogsToClipboard(context, events, strings.logsClipboardLabel)
                     copiedFeedback = true
                     copyTick++
                 },
@@ -770,14 +781,14 @@ internal fun EngineLogSheetContent(
                         horizontalAlignment = Alignment.CenterHorizontally,
                     ) {
                         Text(
-                            text = "No Engine Logs Yet",
+                            text = strings.logsEmptyTitle,
                             style = VdpiTextStyles.rowTitle.copy(fontWeight = FontWeight.Medium),
                             color = palette.inkPrimary,
                             textAlign = TextAlign.Center,
                         )
                         Spacer(Modifier.height(4.dp))
                         Text(
-                            text = "Connect the tunnel to record activity.",
+                            text = strings.logsEmptySubtitle,
                             style = VdpiTextStyles.caption,
                             color = palette.inkSecondary,
                             textAlign = TextAlign.Center,
@@ -858,7 +869,11 @@ private fun formatEngineLogDump(events: List<EngineEvent>): String =
         "${formatEventTime(ev.tsMs)} $level [${ev.tag}] ${ev.message}"
     }
 
-private fun copyEngineLogsToClipboard(context: Context, events: List<EngineEvent>) {
+private fun copyEngineLogsToClipboard(
+    context: Context,
+    events: List<EngineEvent>,
+    label: String,
+) {
     val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-    cm?.setPrimaryClip(ClipData.newPlainText("vdpi engine logs", formatEngineLogDump(events)))
+    cm?.setPrimaryClip(ClipData.newPlainText(label, formatEngineLogDump(events)))
 }

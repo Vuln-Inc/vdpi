@@ -740,4 +740,109 @@ final class VdpiSharedTests: XCTestCase {
             "endpoint [https://[2606:4700:4700::1111]/[redacted]] unreachable"
         )
     }
+
+    func testSettingsLanguageBackwardCompatibleDecodeAndRoundTrip() throws {
+        // Default language is `.system`.
+        XCTAssertEqual(VdpiSettings().language, .system)
+
+        // Older persisted JSON without `"language"` key must decode cleanly to `.system`.
+        let legacyJson = """
+        {
+            "desyncMode": "combo",
+            "chunkSize": 10,
+            "dnsAddr": "1.1.1.1",
+            "enableDoh": true,
+            "ipv4Only": false,
+            "blockQuic": true,
+            "mtu": 4064,
+            "bypassDomains": [],
+            "onDemandEnabled": false,
+            "theme": "dark"
+        }
+        """
+        let legacyDecoded = try JSONDecoder().decode(
+            VdpiSettings.self,
+            from: try XCTUnwrap(legacyJson.data(using: .utf8))
+        )
+        XCTAssertEqual(legacyDecoded.language, .system)
+        XCTAssertEqual(legacyDecoded.theme, .dark)
+
+        // Round-trip every AppLanguage value via VdpiSettings and JSON import.
+        for lang in AppLanguage.allCases {
+            var settings = VdpiSettings(theme: .light, language: lang)
+            let data = try JSONEncoder().encode(settings)
+            let dict = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            XCTAssertEqual(dict["language"] as? String, lang.rawValue)
+
+            let decoded = try JSONDecoder().decode(VdpiSettings.self, from: data)
+            XCTAssertEqual(decoded.language, lang)
+
+            // Changing only language must never trigger a tunnel reload.
+            settings.language = (lang == .tr) ? .en : .tr
+            XCTAssertFalse(settings.requiresTunnelReload(comparedTo: decoded))
+            XCTAssertTrue(settings.changedFieldLabels(comparedTo: decoded).isEmpty)
+        }
+
+        // Import JSON containing only `"language": "tr"` is accepted and preserved.
+        let imported = try TunnelManager.parseImportedSettings("{\"language\":\"tr\"}")
+        XCTAssertEqual(imported.language, .tr)
+    }
+
+    func testLocalizationResolutionAndTurkishEnglishLookups() {
+        // `.system` resolves Turkish when first preferred language starts with "tr", else English.
+        XCTAssertEqual(L10n.resolve(.system, preferredLanguages: ["tr-TR", "en-US"]), .tr)
+        XCTAssertEqual(L10n.resolve(.system, preferredLanguages: ["TR", "en"]), .tr)
+        XCTAssertEqual(L10n.resolve(.system, preferredLanguages: ["en-US", "tr-TR"]), .en)
+        XCTAssertEqual(L10n.resolve(.system, preferredLanguages: ["de-DE"]), .en)
+        XCTAssertEqual(L10n.resolve(.system, preferredLanguages: []), .en)
+
+        // Explicit overrides ignore system preferredLanguages.
+        XCTAssertEqual(L10n.resolve(.en, preferredLanguages: ["tr-TR"]), .en)
+        XCTAssertEqual(L10n.resolve(.tr, preferredLanguages: ["en-US"]), .tr)
+
+        let en = L10n.catalog(for: .en)
+        let tr = L10n.catalog(for: .tr)
+
+        XCTAssertEqual(en.tabTunnel, "Tunnel")
+        XCTAssertEqual(tr.tabTunnel, "Tünel")
+        XCTAssertEqual(en.tabSettings, "Settings")
+        XCTAssertEqual(tr.tabSettings, "Ayarlar")
+        XCTAssertEqual(en.buttonConnect, "Connect")
+        XCTAssertEqual(tr.buttonConnect, "Bağlan")
+        XCTAssertEqual(en.buttonDisconnect, "Disconnect")
+        XCTAssertEqual(tr.buttonDisconnect, "Bağlantıyı Kes")
+        XCTAssertEqual(en.sectionLanguage, "Language")
+        XCTAssertEqual(tr.sectionLanguage, "Dil")
+        XCTAssertEqual(en.diagnosticsTitle, "Diagnostics")
+        XCTAssertEqual(tr.diagnosticsTitle, "Tanılama")
+        XCTAssertEqual(en.intentConnected, "Connected vdpi.")
+        XCTAssertEqual(tr.intentConnected, "vdpi bağlandı.")
+        XCTAssertEqual(tr.doctorCheckName("DNS Ring"), "DNS Halkası")
+        XCTAssertEqual(tr.doctorCheckName("Discord API"), "Discord API")
+
+        // AppLanguage endonyms and System/Sistem label.
+        XCTAssertEqual(AppLanguage.system.label(in: .en), "System")
+        XCTAssertEqual(AppLanguage.system.label(in: .tr), "Sistem")
+        XCTAssertEqual(AppLanguage.en.label(in: .tr), "English")
+        XCTAssertEqual(AppLanguage.tr.label(in: .en), "Türkçe")
+
+        // Localized model/formatter helpers.
+        XCTAssertEqual(ThemePreference.dark.label(in: .tr), "Koyu")
+        XCTAssertEqual(ThemePreference.light.label(in: .tr), "Açık")
+        XCTAssertEqual(DesyncMode.combo.label(in: .tr), "Kombo")
+        XCTAssertEqual(VdpiFormatters.formatStageLabel("DirectPassthrough", language: .tr), "Doğrudan Geçiş")
+        XCTAssertEqual(VdpiFormatters.formatStageLabel("DirectPassthrough", language: .en), "Passthrough")
+        XCTAssertEqual(TunnelPhase.connected.label(in: .tr), "Korumalı")
+
+        let baseline = VdpiSettings(desyncMode: .combo, chunkSize: 10, bypassDomains: [])
+        let changed = VdpiSettings(desyncMode: .split, chunkSize: 16, bypassDomains: ["example.com"])
+        XCTAssertEqual(
+            changed.changedFieldLabels(comparedTo: baseline, language: .tr),
+            ["Mod", "Parça", "İstisna"]
+        )
+        XCTAssertEqual(
+            changed.pendingChangeSummary(comparedToApplied: baseline.toNativeConfig(), language: .tr),
+            "Mod, Parça, İstisna"
+        )
+    }
 }

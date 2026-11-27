@@ -910,6 +910,7 @@ fn runtime_to_file_config(cfg: &RuntimeConfig) -> FileConfig {
         system_proxy: Some(cfg.system_proxy),
         socks_system_proxy: Some(cfg.socks_system_proxy),
         env_proxy: Some(cfg.env_proxy),
+        language: None,
     }
 }
 
@@ -922,6 +923,9 @@ fn resolve_effective_config_key(
     let mut effective = runtime_to_file_config(&cli.resolve_runtime_config(file_cfg, raw_args));
     if let Some(ver) = file_cfg.schema_version {
         effective.schema_version = Some(ver);
+    }
+    if let Some(lang) = file_cfg.language.clone() {
+        effective.language = Some(lang);
     }
     get_config_key(&effective, key)
 }

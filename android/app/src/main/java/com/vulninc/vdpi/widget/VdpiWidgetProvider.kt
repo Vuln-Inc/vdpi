@@ -11,6 +11,7 @@ import android.net.VpnService
 import android.widget.RemoteViews
 import com.vulninc.vdpi.MainActivity
 import com.vulninc.vdpi.R
+import com.vulninc.vdpi.data.SettingsRepository
 import com.vulninc.vdpi.vpn.TunnelPhase
 import com.vulninc.vdpi.vpn.TunnelRuntimeState
 import com.vulninc.vdpi.vpn.VdpiVpnService
@@ -60,10 +61,11 @@ class VdpiWidgetProvider : AppWidgetProvider() {
 
             val consentNeeded = runCatching { VpnService.prepare(context) != null }.getOrDefault(true)
             if (consentNeeded) {
+                val strings = SettingsRepository.resolveStrings(context)
                 TunnelRuntimeState.update {
                     it.copy(
                         phase = TunnelPhase.ERROR,
-                        errorMessage = "VPN permission required",
+                        errorMessage = strings.feedbackVpnPermissionRequired,
                     )
                 }
                 requestUpdate(context)
@@ -77,29 +79,30 @@ class VdpiWidgetProvider : AppWidgetProvider() {
 
         private fun buildRemoteViews(context: Context): RemoteViews {
             val phase = TunnelRuntimeState.state.value.phase
+            val strings = SettingsRepository.resolveStrings(context)
             val dotColor: Int
-            val subtitleRes: Int
-            val actionRes: Int
+            val subtitleText: String
+            val actionText: String
             when (phase) {
                 TunnelPhase.CONNECTED -> {
                     dotColor = COLOR_DOT_CONNECTED
-                    subtitleRes = R.string.widget_status_connected
-                    actionRes = R.string.widget_action_disconnect
+                    subtitleText = strings.widgetStatusConnected
+                    actionText = strings.widgetActionDisconnect
                 }
                 TunnelPhase.CONNECTING -> {
                     dotColor = COLOR_DOT_CONNECTING
-                    subtitleRes = R.string.widget_status_connecting
-                    actionRes = R.string.widget_action_disconnect
+                    subtitleText = strings.widgetStatusConnecting
+                    actionText = strings.widgetActionDisconnect
                 }
                 TunnelPhase.DISCONNECTED -> {
                     dotColor = COLOR_DOT_OFF
-                    subtitleRes = R.string.widget_status_off
-                    actionRes = R.string.widget_action_connect
+                    subtitleText = strings.widgetStatusOff
+                    actionText = strings.widgetActionConnect
                 }
                 TunnelPhase.ERROR -> {
                     dotColor = COLOR_DOT_ERROR
-                    subtitleRes = R.string.widget_status_error
-                    actionRes = R.string.widget_action_connect
+                    subtitleText = strings.widgetStatusError
+                    actionText = strings.widgetActionConnect
                 }
             }
 
@@ -151,8 +154,8 @@ class VdpiWidgetProvider : AppWidgetProvider() {
             return RemoteViews(context.packageName, R.layout.widget_vdpi).apply {
                 setInt(R.id.widget_status_dot, "setColorFilter", dotColor)
                 setTextViewText(R.id.widget_title, context.getString(R.string.app_name))
-                setTextViewText(R.id.widget_subtitle, context.getString(subtitleRes))
-                setTextViewText(R.id.widget_toggle_button, context.getString(actionRes))
+                setTextViewText(R.id.widget_subtitle, subtitleText)
+                setTextViewText(R.id.widget_toggle_button, actionText)
                 setOnClickPendingIntent(R.id.widget_info_container, openAppPendingIntent)
                 setOnClickPendingIntent(R.id.widget_toggle_button, togglePendingIntent)
             }

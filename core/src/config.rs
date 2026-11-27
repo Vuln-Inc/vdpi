@@ -1247,6 +1247,7 @@ mod tests {
             system_proxy: Some(false),
             socks_system_proxy: Some(false),
             env_proxy: Some(false),
+            language: None,
         };
 
         let argv = vec!["vdpi".to_string(), "start".to_string()];

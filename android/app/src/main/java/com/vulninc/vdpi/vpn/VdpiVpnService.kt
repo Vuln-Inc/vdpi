@@ -30,6 +30,7 @@ import com.vulninc.vdpi.data.SplitTunnelMode
 import com.vulninc.vdpi.data.VdpiSettings
 import com.vulninc.vdpi.engine.NativeEngine
 import com.vulninc.vdpi.engine.TelemetrySnapshot
+import com.vulninc.vdpi.ui.i18n.VdpiStrings
 import com.vulninc.vdpi.util.formatBytes
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -188,6 +189,7 @@ class VdpiVpnService : VpnService() {
 
     override fun onCreate() {
         super.onCreate()
+        activeInstance = this
         serviceActive.set(true)
         ContextCompat.registerReceiver(
             this,
@@ -219,12 +221,13 @@ class VdpiVpnService : VpnService() {
                 val consentNeeded = runCatching { prepare(this) != null }.getOrDefault(true)
                 if (consentNeeded) {
                     // Satisfy startForegroundService() contract on API 26-35 before stopping.
+                    val strings = localizedStrings()
                     ensureNotificationChannel()
                     clearNotificationState()
                     startForegroundSafe(
                         buildNotification(
                             title = getString(R.string.app_name),
-                            subtitle = "VPN permission required",
+                            subtitle = strings.feedbackVpnPermissionRequired,
                             ongoing = false,
                             showReconnect = false,
                         )
@@ -232,7 +235,7 @@ class VdpiVpnService : VpnService() {
                     TunnelRuntimeState.update {
                         it.copy(
                             phase = TunnelPhase.ERROR,
-                            errorMessage = "VPN permission required",
+                            errorMessage = strings.feedbackVpnPermissionRequired,
                         )
                     }
                     TunnelRuntimeState.setAppliedSettings(null)
@@ -256,9 +259,10 @@ class VdpiVpnService : VpnService() {
         pollJob = null
         ensureNotificationChannel()
 
+        val startStrings = localizedStrings()
         val initialNotif = buildNotification(
-            title = getString(R.string.notification_title_connecting),
-            subtitle = getString(R.string.notification_subtitle_connecting),
+            title = startStrings.notificationTitleConnecting,
+            subtitle = startStrings.notificationSubtitleConnecting,
             ongoing = true,
             showReconnect = false,
             connectedAtMs = null,
@@ -285,7 +289,7 @@ class VdpiVpnService : VpnService() {
                 TunnelRuntimeState.update {
                     it.copy(
                         phase = TunnelPhase.ERROR,
-                        errorMessage = "Background start blocked by system",
+                        errorMessage = startStrings.errorBackgroundStartBlocked,
                     )
                 }
                 TunnelRuntimeState.setAppliedSettings(null)
@@ -315,7 +319,7 @@ class VdpiVpnService : VpnService() {
                     }
                 }
                 if (!asserted) {
-                    failAndStop("Background start blocked by system", startId, gen)
+                    failAndStop(localizedStrings().errorBackgroundStartBlocked, startId, gen)
                     return@withLock
                 }
 
@@ -344,7 +348,7 @@ class VdpiVpnService : VpnService() {
                 val preparedConfig = NativeEngine.prepareStart(nativeConfig)
                 if (preparedConfig.isFailure) {
                     failAndStop(
-                        preparedConfig.exceptionOrNull()?.message ?: "Failed to load native engine",
+                        preparedConfig.exceptionOrNull()?.message ?: localizedStrings().errorNativeEngineLoadFailed,
                         startId,
                         gen,
                     )
@@ -357,7 +361,7 @@ class VdpiVpnService : VpnService() {
                 val vpnInterface = establishVpnInterface(settings, effectiveIpv4Only, activeNetwork)
                 if (vpnInterface == null) {
                     failAndStop(
-                        "VPN permission revoked or interface could not be created",
+                        localizedStrings().errorVpnInterfaceFailed,
                         startId,
                         gen,
                     )
@@ -378,7 +382,7 @@ class VdpiVpnService : VpnService() {
                 )
                 if (startResult.isFailure) {
                     failAndStop(
-                        startResult.exceptionOrNull()?.message ?: "Engine failed to start",
+                        startResult.exceptionOrNull()?.message ?: localizedStrings().errorEngineStartFailed,
                         startId,
                         gen,
                     )
@@ -393,14 +397,15 @@ class VdpiVpnService : VpnService() {
                 val initialSnap = NativeEngine.snapshot()
                 if (!initialSnap.running) {
                     val lastErr = initialSnap.events.lastOrNull { it.level == "error" }?.message
-                        ?: "Engine exited immediately after start"
+                        ?: localizedStrings().errorEngineExitedImmediately
                     failAndStop(lastErr, startId, gen)
                     return@withLock
                 }
                 val connectedAt = System.currentTimeMillis()
-                val initialSubtitle = formatConnectedSubtitle(initialSnap)
+                val connectedStrings = localizedStrings()
+                val initialSubtitle = formatConnectedSubtitle(initialSnap, connectedStrings)
                 val connectedNotif = buildNotification(
-                    title = getString(R.string.notification_title_connected),
+                    title = connectedStrings.notificationTitleConnected,
                     subtitle = initialSubtitle,
                     ongoing = true,
                     showReconnect = true,
@@ -864,7 +869,7 @@ class VdpiVpnService : VpnService() {
                 }
                 if (!snap.running) {
                     val lastErr = snap.events.lastOrNull { it.level == "error" }?.message
-                        ?: "Tunnel stopped unexpectedly"
+                        ?: localizedStrings().heroTunnelStoppedUnexpectedly
                     scope.launch {
                         transitionMutex.withLock {
                             if (sessionGeneration.get() == sessionGen) {
@@ -902,7 +907,8 @@ class VdpiVpnService : VpnService() {
                     sessionGeneration.get() == sessionGen &&
                     TunnelRuntimeState.state.value.phase == TunnelPhase.CONNECTED
                 ) {
-                    val subtitle = formatConnectedSubtitle(snap)
+                    val loopStrings = localizedStrings()
+                    val subtitle = formatConnectedSubtitle(snap, loopStrings)
                     if (subtitle != lastPostedSubtitle) {
                         val connectedAt = synchronized(notificationLock) {
                             if (sessionGeneration.get() == sessionGen && serviceActive.get()) {
@@ -913,11 +919,12 @@ class VdpiVpnService : VpnService() {
                         }
                         if (connectedAt != null) {
                             val notif = buildNotification(
-                                title = getString(R.string.notification_title_connected),
+                                title = loopStrings.notificationTitleConnected,
                                 subtitle = subtitle,
                                 ongoing = true,
                                 showReconnect = true,
                                 connectedAtMs = connectedAt,
+                                strings = loopStrings,
                             )
                             val posted = synchronized(notificationLock) {
                                 if (isActive &&
@@ -988,6 +995,9 @@ class VdpiVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        if (activeInstance === this) {
+            activeInstance = null
+        }
         serviceActive.set(false)
         sessionGeneration.incrementAndGet()
         clearNotificationState()
@@ -1039,9 +1049,51 @@ class VdpiVpnService : VpnService() {
         connectedAtWallMs = null
     }
 
-    private fun formatConnectedSubtitle(snap: TelemetrySnapshot): String {
-        val stage = snap.stageNumber.coerceAtLeast(1)
-        return "Stage $stage · ↓ ${formatBytes(snap.bytesRx)}  ↑ ${formatBytes(snap.bytesTx)}"
+    private fun localizedStrings(): VdpiStrings =
+        SettingsRepository.resolveStrings(applicationContext)
+
+    private fun refreshNotificationForLanguage() {
+        if (!serviceActive.get()) return
+        val strings = localizedStrings()
+        ensureNotificationChannel(applicationContext, strings)
+        synchronized(notificationLock) {
+            if (!serviceActive.get()) return
+            val snapshot = TunnelRuntimeState.state.value
+            val notif = when (snapshot.phase) {
+                TunnelPhase.CONNECTED -> buildNotification(
+                    title = strings.notificationTitleConnected,
+                    subtitle = formatConnectedSubtitle(snapshot.telemetry, strings),
+                    ongoing = true,
+                    showReconnect = true,
+                    connectedAtMs = connectedAtWallMs,
+                    strings = strings,
+                )
+                TunnelPhase.CONNECTING -> buildNotification(
+                    title = strings.notificationTitleConnecting,
+                    subtitle = strings.notificationSubtitleConnecting,
+                    ongoing = true,
+                    showReconnect = false,
+                    connectedAtMs = null,
+                    strings = strings,
+                )
+                TunnelPhase.DISCONNECTED, TunnelPhase.ERROR -> null
+            }
+            if (notif != null) {
+                lastNotification = notif
+                notifySafely(notif)
+            }
+        }
+    }
+
+    private fun formatConnectedSubtitle(
+        snap: TelemetrySnapshot,
+        strings: VdpiStrings = localizedStrings(),
+    ): String {
+        return strings.notificationConnectedSubtitle(
+            stageNumber = snap.stageNumber,
+            rxText = formatBytes(snap.bytesRx),
+            txText = formatBytes(snap.bytesTx),
+        )
     }
 
     private fun canPostNotifications(): Boolean {
@@ -1082,21 +1134,7 @@ class VdpiVpnService : VpnService() {
     }
 
     private fun ensureNotificationChannel() {
-        val manager = getSystemService(NotificationManager::class.java) ?: return
-        runCatching { manager.deleteNotificationChannel(LEGACY_CHANNEL_ID) }
-        val channel = NotificationChannel(
-            CHANNEL_ID,
-            getString(R.string.notification_channel_name),
-            NotificationManager.IMPORTANCE_DEFAULT,
-        ).apply {
-            description = getString(R.string.notification_channel_desc)
-            setSound(null, null)
-            enableVibration(false)
-            enableLights(false)
-            setShowBadge(false)
-            lockscreenVisibility = Notification.VISIBILITY_PUBLIC
-        }
-        manager.createNotificationChannel(channel)
+        ensureNotificationChannel(applicationContext, localizedStrings())
     }
 
     private fun buildNotification(
@@ -1105,6 +1143,7 @@ class VdpiVpnService : VpnService() {
         ongoing: Boolean = true,
         showReconnect: Boolean = false,
         connectedAtMs: Long? = null,
+        strings: VdpiStrings = localizedStrings(),
     ): Notification {
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_vdpi_status)
@@ -1135,9 +1174,9 @@ class VdpiVpnService : VpnService() {
 
         if (ongoing) {
             builder.setDeleteIntent(dismissPendingIntent)
-            builder.addAction(0, getString(R.string.notification_action_disconnect), stopPendingIntent)
+            builder.addAction(0, strings.notificationActionDisconnect, stopPendingIntent)
             if (showReconnect) {
-                builder.addAction(0, getString(R.string.notification_action_reconnect), reconnectPendingIntent)
+                builder.addAction(0, strings.notificationActionReconnect, reconnectPendingIntent)
             }
         }
 
@@ -1261,6 +1300,37 @@ class VdpiVpnService : VpnService() {
 
         private val serviceActive = AtomicBoolean(false)
 
+        @Volatile
+        private var activeInstance: VdpiVpnService? = null
+
+        private fun ensureNotificationChannel(
+            context: Context,
+            strings: VdpiStrings = SettingsRepository.resolveStrings(context),
+        ) {
+            val manager = context.getSystemService(NotificationManager::class.java) ?: return
+            runCatching { manager.deleteNotificationChannel(LEGACY_CHANNEL_ID) }
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                strings.notificationChannelName,
+                NotificationManager.IMPORTANCE_DEFAULT,
+            ).apply {
+                description = strings.notificationChannelDesc
+                setSound(null, null)
+                enableVibration(false)
+                enableLights(false)
+                setShowBadge(false)
+                lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+            }
+            manager.createNotificationChannel(channel)
+        }
+
+        fun refreshLocalizedSurfaces(context: Context) {
+            val appContext = context.applicationContext ?: context
+            runCatching { ensureNotificationChannel(appContext) }
+            activeInstance?.refreshNotificationForLanguage()
+            requestTileAndWidgetSync(appContext)
+        }
+
         private fun requestTileAndWidgetSync(context: Context) {
             val appContext = context.applicationContext
             runCatching {
@@ -1286,10 +1356,11 @@ class VdpiVpnService : VpnService() {
                 context.startForegroundService(intent)
                 true
             }.getOrElse {
+                val strings = SettingsRepository.resolveStrings(context)
                 TunnelRuntimeState.update {
                     it.copy(
                         phase = TunnelPhase.ERROR,
-                        errorMessage = "Unable to start VPN service in background",
+                        errorMessage = strings.errorVpnBackgroundStart,
                     )
                 }
                 TunnelRuntimeState.setAppliedSettings(null)
@@ -1306,10 +1377,11 @@ class VdpiVpnService : VpnService() {
                 context.startForegroundService(intent)
                 true
             }.getOrElse {
+                val strings = SettingsRepository.resolveStrings(context)
                 TunnelRuntimeState.update {
                     it.copy(
                         phase = TunnelPhase.ERROR,
-                        errorMessage = "Unable to reconnect VPN service",
+                        errorMessage = strings.errorVpnReconnect,
                     )
                 }
                 TunnelRuntimeState.setAppliedSettings(null)

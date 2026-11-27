@@ -45,21 +45,26 @@ public enum VdpiFormatters {
     }
 
     public static func formatStageLabel(_ stageLabel: String) -> String {
+        formatStageLabel(stageLabel, language: .en)
+    }
+
+    public static func formatStageLabel(_ stageLabel: String, language: AppLanguage) -> String {
+        let l10n = L10n.catalog(for: language)
         switch stageLabel {
         case "ComboMultiRecord":
-            return "Combo"
+            return l10n.stageCombo
         case "OobSniDesync":
-            return "OOB SNI"
+            return l10n.stageOobSni
         case "MultiRecordOob":
-            return "Multi + OOB"
+            return l10n.stageMultiOob
         case "FineFragment":
-            return "Fine Fragment"
+            return l10n.stageFineFragment
         case "DeepRecordStorm":
-            return "Deep Storm"
+            return l10n.stageDeepStorm
         case "SlowSniSlice":
-            return "Slow SNI"
+            return l10n.stageSlowSni
         case "DirectPassthrough":
-            return "Passthrough"
+            return l10n.stagePassthrough
         default:
             return stageLabel
         }

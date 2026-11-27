@@ -1,5 +1,7 @@
 import { memo, useEffect } from "react";
 import type { ComponentType } from "react";
+import { useLang, type ResolvedLanguage } from "../i18n/context";
+import { tShell } from "../i18n/shell";
 import type {
   DesktopStatusSnapshot,
   NavTab,
@@ -29,16 +31,21 @@ type FooterStatusTone = "active" | "warn" | "paused";
 
 interface NavItemConfig {
   id: NavTab;
-  label: string;
+  labelKey:
+    | "navOverview"
+    | "navSplit"
+    | "navDns"
+    | "navDiagnostics"
+    | "navSettings";
   Icon: ComponentType<{ size?: number; className?: string }>;
 }
 
 const NAV_ITEMS: ReadonlyArray<NavItemConfig> = [
-  { id: "overview", label: "Overview", Icon: IconOverview },
-  { id: "split", label: "Split Tunnel", Icon: IconSplitTunnel },
-  { id: "dns", label: "DNS & Rules", Icon: IconDns },
-  { id: "diagnostics", label: "Diagnostics", Icon: IconDiagnostics },
-  { id: "settings", label: "Settings", Icon: IconSettings },
+  { id: "overview", labelKey: "navOverview", Icon: IconOverview },
+  { id: "split", labelKey: "navSplit", Icon: IconSplitTunnel },
+  { id: "dns", labelKey: "navDns", Icon: IconDns },
+  { id: "diagnostics", labelKey: "navDiagnostics", Icon: IconDiagnostics },
+  { id: "settings", labelKey: "navSettings", Icon: IconSettings },
 ];
 
 const STYLE_ID = "vdpi-sidebar-styles";
@@ -386,7 +393,7 @@ function ensureStyles(): void {
 
 function formatVersionPill(version: string | undefined | null): string {
   const trimmed = version?.trim();
-  const base = trimmed && trimmed.length > 0 ? trimmed : "0.6.0";
+  const base = trimmed && trimmed.length > 0 ? trimmed : "0.6.1";
   return base.startsWith("v") ? base : `v${base}`;
 }
 
@@ -398,13 +405,14 @@ interface FooterStatusPresentation {
 
 function deriveFooterStatus(
   status: DesktopStatusSnapshot | null,
-  vpnCoexistence?: VpnCoexistence,
+  vpnCoexistence: VpnCoexistence | undefined,
+  lang: ResolvedLanguage,
 ): FooterStatusPresentation {
   if (!status) {
     return {
       tone: "paused",
-      label: "Paused",
-      title: "Protection paused",
+      label: tShell(lang, "statusPaused"),
+      title: tShell(lang, "statusPausedTitle"),
     };
   }
 
@@ -421,23 +429,23 @@ function deriveFooterStatus(
   if (status.serviceState === "not_installed") {
     return {
       tone: "warn",
-      label: "Setup needed",
-      title: "Service not installed",
+      label: tShell(lang, "statusSetupNeeded"),
+      title: tShell(lang, "statusServiceNotInstalledTitle"),
     };
   }
 
   if (wintunMissing && !isLiveRunning) {
     return {
       tone: "warn",
-      label: "Driver missing",
-      title: status.wintun.message ?? "wintun.dll missing",
+      label: tShell(lang, "statusDriverMissing"),
+      title: status.wintun.message ?? tShell(lang, "statusWintunMissingTitle"),
     };
   }
 
   const activeEngineLabel =
     engine === "proxy"
-      ? `Proxy · :${live?.port ?? 8080}`
-      : "TUN · Active";
+      ? tShell(lang, "statusProxyActive", { port: live?.port ?? 8080 })
+      : tShell(lang, "statusTunActive");
 
   const isYielded = Boolean(
     status.serviceState === "running" &&
@@ -449,8 +457,8 @@ function deriveFooterStatus(
   if (isYielded && vpnConflict) {
     return {
       tone: "warn",
-      label: "Paused (VPN)",
-      title: `Yielded to VPN (${vpnConflict})`,
+      label: tShell(lang, "statusPausedVpn"),
+      title: tShell(lang, "statusYieldedVpnTitle", { vpn: vpnConflict }),
     };
   }
 
@@ -459,7 +467,7 @@ function deriveFooterStatus(
       return {
         tone: "warn",
         label: activeEngineLabel,
-        title: `VPN conflict detected (${vpnConflict})`,
+        title: tShell(lang, "statusVpnConflictTitle", { vpn: vpnConflict }),
       };
     }
     return {
@@ -467,23 +475,25 @@ function deriveFooterStatus(
       label: activeEngineLabel,
       title:
         engine === "proxy"
-          ? `Protected via local proxy on port ${live?.port ?? 8080}`
-          : "Protected via TUN adapter",
+          ? tShell(lang, "statusProtectedProxyTitle", {
+              port: live?.port ?? 8080,
+            })
+          : tShell(lang, "statusProtectedTunTitle"),
     };
   }
 
   if (status.serviceState === "running") {
     return {
       tone: "warn",
-      label: "Starting...",
-      title: "Starting protection service",
+      label: tShell(lang, "statusStarting"),
+      title: tShell(lang, "statusStartingTitle"),
     };
   }
 
   return {
     tone: "paused",
-    label: "Paused",
-    title: "Protection paused",
+    label: tShell(lang, "statusPaused"),
+    title: tShell(lang, "statusPausedTitle"),
   };
 }
 
@@ -496,6 +506,8 @@ function SidebarComponent({
   vpnCoexistence,
   className,
 }: SidebarProps) {
+  const { lang } = useLang();
+
   useEffect(() => {
     ensureStyles();
   }, []);
@@ -507,31 +519,35 @@ function SidebarComponent({
     status && status.splitTunnelMode === "include" && splitCount === 0,
   );
   const splitCountTitle = isSplitIncludeEmpty
-    ? "0 included apps (no apps protected)"
+    ? tShell(lang, "splitIncludeEmpty")
     : status?.splitTunnelMode === "include"
-      ? `${splitCount} included ${splitCount === 1 ? "app" : "apps"}`
-      : `${splitCount} excluded ${splitCount === 1 ? "app" : "apps"}`;
+      ? splitCount === 1
+        ? tShell(lang, "splitIncludeOne")
+        : tShell(lang, "splitIncludeMany", { count: splitCount })
+      : splitCount === 1
+        ? tShell(lang, "splitExcludeOne")
+        : tShell(lang, "splitExcludeMany", { count: splitCount });
 
-  const footerStatus = deriveFooterStatus(status, vpnCoexistence);
+  const footerStatus = deriveFooterStatus(status, vpnCoexistence, lang);
   const wantsTray = Boolean(trayActive ?? keepInTrayOnClose);
   const traySupported = status?.traySupported !== false;
   const isTrayActive = wantsTray && traySupported;
   const isTrayUnavailable = wantsTray && !traySupported;
   const isMac = status?.platform === "macos";
   const trayLabel = isTrayUnavailable
-    ? "Tray unavailable"
+    ? tShell(lang, "trayUnavailable")
     : isTrayActive
       ? isMac
-        ? "Menu bar"
-        : "Tray on"
-      : "Window only";
+        ? tShell(lang, "trayMenuBar")
+        : tShell(lang, "trayOn")
+      : tShell(lang, "trayWindowOnly");
   const trayTitle = isTrayUnavailable
-    ? "System tray is unavailable in this desktop environment"
+    ? tShell(lang, "trayUnavailableTitle")
     : isTrayActive
       ? isMac
-        ? "vdpi stays available in the menu bar"
-        : "vdpi stays available in the system tray"
-      : "Closing the window exits the UI window";
+        ? tShell(lang, "trayMenuBarTitle")
+        : tShell(lang, "trayOnTitle")
+      : tShell(lang, "trayWindowOnlyTitle");
 
   const sidebarClasses = ["sidebar", className].filter(Boolean).join(" ");
   const splitPillClasses = [
@@ -543,7 +559,7 @@ function SidebarComponent({
     .join(" ");
 
   return (
-    <aside className={sidebarClasses} aria-label="Application navigation">
+    <aside className={sidebarClasses} aria-label={tShell(lang, "navAsideAria")}>
       <div className="sidebar-header">
         <div className="sidebar-brand">
           <span className="sidebar-brand-icon" aria-hidden="true">
@@ -554,10 +570,15 @@ function SidebarComponent({
         <span className="sidebar-version-pill tabular-nums">{versionText}</span>
       </div>
 
-      <nav className="sidebar-nav" role="navigation" aria-label="Primary">
-        {NAV_ITEMS.map(({ id, label, Icon }) => {
+      <nav
+        className="sidebar-nav"
+        role="navigation"
+        aria-label={tShell(lang, "navPrimaryAria")}
+      >
+        {NAV_ITEMS.map(({ id, labelKey, Icon }) => {
           const isActive = activeTab === id;
           const isSplit = id === "split";
+          const label = tShell(lang, labelKey);
           const itemClasses = [
             "sidebar-nav-item",
             isActive ? "is-active" : null,

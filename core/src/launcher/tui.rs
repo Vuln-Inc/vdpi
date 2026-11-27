@@ -1,7 +1,10 @@
 use super::{
-    build_menu_with_options, dns_preset_index, format_dns_label, is_custom_dns, shorten_custom_dns,
-    Choice, LauncherMenu, MenuItem, StatusRow, StatusTone, CUSTOM_DNS_HINT, DNS_PRESETS,
+    active_lang, build_menu_with_options, custom_dns_hint, dns_preset_hint, dns_preset_index,
+    format_dns_label, is_custom_dns, shorten_custom_dns, toggle_and_persist_language, tr, Choice,
+    LauncherMenu, MenuItem, StatusRow, StatusTone, DNS_PRESETS,
 };
+#[cfg(test)]
+use super::CUSTOM_DNS_HINT;
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -17,6 +20,7 @@ use ratatui::widgets::{Block, BorderType, Padding};
 use ratatui::{Frame, Terminal};
 use std::borrow::Cow;
 use std::io;
+use vdpi::i18n::Lang;
 use vdpi::server::REPOSITORY_URL;
 use vdpi::service::{ControlCenterStatus, ServiceState};
 use vdpi_core::config::{EngineMode, SplitTunnelConfig};
@@ -34,10 +38,31 @@ const RANGE_LABELS: [&str; 9] = ["1", "1-2", "1-3", "1-4", "1-5", "1-6", "1-7", 
 const COMPACT_VPN_BADGE: &str = "[VPN]";
 const DNS_PICKER_ITEM_COUNT: usize = DNS_PRESETS.len() + 1;
 const MAX_CUSTOM_DNS_INPUT_CHARS: usize = 200;
-const CUSTOM_DNS_PLACEHOLDER: &str = "IP or https:// DoH URL";
-const CUSTOM_DNS_EDITOR_HINT: &str =
-    "IPv4, IPv6, or https:// DoH URL (e.g. 76.76.2.0 or https://dns.nextdns.io/id)";
-const UNINSTALL_CONFIRM_BODY: &str = "This stops the background service, removes installed files and PATH entries, and restores routes & proxies.";
+
+fn windows_tun_tip() -> &'static str {
+    tr(
+        WINDOWS_TUN_TIP,
+        "İpucu: Roblox ve Discord ses için TUN moduna geçin.",
+    )
+}
+
+fn custom_dns_placeholder() -> &'static str {
+    tr("IP or https:// DoH URL", "IP veya https:// DoH adresi")
+}
+
+fn custom_dns_editor_hint() -> &'static str {
+    tr(
+        "IPv4, IPv6, or https:// DoH URL (e.g. 76.76.2.0 or https://dns.nextdns.io/id)",
+        "IPv4, IPv6 veya https:// DoH adresi (örn. 76.76.2.0 veya https://dns.nextdns.io/id)",
+    )
+}
+
+fn uninstall_confirm_body() -> &'static str {
+    tr(
+        "This stops the background service, removes installed files and PATH entries, and restores routes & proxies.",
+        "Bu işlem arka plan servisini durdurur, kurulu dosyaları ve PATH kayıtlarını kaldırır, yönlendirme ve proxy ayarlarını geri yükler.",
+    )
+}
 
 // Restrained cool slate / white / emerald / ice-blue / semantic amber & red palette.
 const BORDER_SLATE: Color = Color::Rgb(58, 66, 78);
@@ -654,6 +679,7 @@ impl Drop for TerminalGuard {
 enum Action {
     Redraw,
     Refresh,
+    ToggleLanguage,
     Finish(Choice),
     Ignore,
 }
@@ -716,6 +742,15 @@ where
                         }
                         break;
                     }
+                    Action::ToggleLanguage => {
+                        let notice_msg = toggle_and_persist_language();
+                        let latest = refresh();
+                        apply_refresh_with_notice(&mut state, &latest, Some(&notice_msg));
+                        if state.menu.items.is_empty() {
+                            return Ok(Choice::Cancel);
+                        }
+                        break;
+                    }
                     Action::Finish(choice) => return Ok(choice),
                     Action::Ignore => {}
                 },
@@ -726,12 +761,19 @@ where
 }
 
 fn apply_refresh(state: &mut UiState, latest: &ControlCenterStatus) {
-    state.menu = build_menu_with_options(
+    apply_refresh_with_notice(
+        state,
         latest,
-        Some("Status refreshed."),
-        &state.configured_dns,
-        &state.split_tunnel,
+        Some(tr("Status refreshed.", "Durum yenilendi.")),
     );
+}
+
+fn apply_refresh_with_notice(
+    state: &mut UiState,
+    latest: &ControlCenterStatus,
+    notice: Option<&str>,
+) {
+    state.menu = build_menu_with_options(latest, notice, &state.configured_dns, &state.split_tunnel);
     state.confirming_uninstall = false;
     state.selecting_dns = false;
     state.editing_custom_dns = false;
@@ -987,7 +1029,14 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Action {
         }
         return match key.code {
             KeyCode::Char('y' | 'Y') => Action::Finish(Choice::Uninstall),
+            KeyCode::Char('e' | 'E') if active_lang() == Lang::Tr => {
+                Action::Finish(Choice::Uninstall)
+            }
             KeyCode::Char('n' | 'N' | 'q' | 'Q') | KeyCode::Esc => {
+                state.confirming_uninstall = false;
+                Action::Redraw
+            }
+            KeyCode::Char('h' | 'H') if active_lang() == Lang::Tr => {
                 state.confirming_uninstall = false;
                 Action::Redraw
             }
@@ -1018,6 +1067,7 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Action {
         KeyCode::End => state.selected = count - 1,
         _ if key.kind != KeyEventKind::Press => return Action::Ignore,
         KeyCode::Char('r' | 'R') => return Action::Refresh,
+        KeyCode::Char('g' | 'G') => return Action::ToggleLanguage,
         KeyCode::Char('d' | 'D') => {
             state.open_dns_picker();
             return Action::Redraw;
@@ -1330,7 +1380,7 @@ fn render(frame: &mut Frame<'_>, state: &UiState, color: bool) {
         let wrap_width = usize::from(inner_width)
             .saturating_sub(body_indent_len + right_margin)
             .max(1);
-        let body_lines = wrap_words(UNINSTALL_CONFIRM_BODY, wrap_width);
+        let body_lines = wrap_words(uninstall_confirm_body(), wrap_width);
         let confirm_plan =
             ConfirmLayoutPlan::compute(area.height, menu.status_rows.len(), body_lines.len());
         let card_area = centered_rect(area, card_width, confirm_plan.card_height);
@@ -1526,18 +1576,39 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx) {
         return;
     }
     let pad = if ctx.inset { " " } else { "" };
-    let left_line = Line::from(vec![
+    let lang_badge = match active_lang() {
+        Lang::En => "[g: EN]",
+        Lang::Tr => "[g: TR]",
+    };
+    let repo = repo_display();
+    let width = usize::from(area.width);
+    let base_left_len = pad.len() + "vdpi".len() + 1 + VERSION_LABEL.len();
+    let lang_extra = 2 + lang_badge.len();
+    let right_len = repo.len() + pad.len();
+
+    let show_repo = base_left_len + right_len + 2 <= width;
+    let show_lang = if show_repo {
+        base_left_len + lang_extra + right_len + 2 <= width
+    } else {
+        base_left_len + lang_extra <= width
+    };
+
+    let mut left_spans = vec![
         Span::raw(pad),
         Span::styled("vdpi", ctx.palette.brand),
         Span::raw(" "),
         Span::styled(VERSION_LABEL, ctx.palette.version),
-    ]);
+    ];
+    let left_len = if show_lang {
+        left_spans.push(Span::raw("  "));
+        left_spans.push(Span::styled(lang_badge, ctx.palette.repo));
+        base_left_len + lang_extra
+    } else {
+        base_left_len
+    };
+    let left_line = Line::from(left_spans);
 
-    let repo = repo_display();
-    let left_len = pad.len() + "vdpi".len() + 1 + VERSION_LABEL.len();
-    let right_len = repo.len() + pad.len();
-
-    if left_len + right_len + 2 <= usize::from(area.width) {
+    if show_repo {
         let left_w = u16::try_from(left_len).unwrap_or(u16::MAX);
         let right_w = u16::try_from(right_len).unwrap_or(u16::MAX);
         let [left_area, right_area] =
@@ -1686,7 +1757,7 @@ fn render_status_row(frame: &mut Frame<'_>, area: Rect, row: &StatusRow, ctx: Re
 }
 
 fn is_warning_notice(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
+    let lower = text.to_lowercase();
     [
         "wintun.dll",
         "missing",
@@ -1704,6 +1775,18 @@ fn is_warning_notice(text: &str) -> bool {
         "error",
         "issues",
         "already running",
+        "uyarı",
+        "başarısız",
+        "hata",
+        "iptal",
+        "bulunamadı",
+        "eksik",
+        "gerekli",
+        "sorun",
+        "zaten çalışıyor",
+        "desteklenmiyor",
+        "erişilemiyor",
+        "kaydedilemedi",
     ]
     .into_iter()
     .any(|needle| lower.contains(needle))
@@ -1750,12 +1833,13 @@ fn render_tun_tip(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx) {
     if budget == 0 {
         return;
     }
-    let tip = truncate_text(WINDOWS_TUN_TIP, budget);
-    let line = if let Some(rest) = tip.strip_prefix("Tip: ") {
+    let prefix = tr("Tip: ", "İpucu: ");
+    let tip = truncate_text(windows_tun_tip(), budget);
+    let line = if let Some(rest) = tip.strip_prefix(prefix) {
         Line::from(vec![
             Span::raw(pad),
             Span::styled("· ", ctx.palette.status_accent),
-            Span::styled("Tip: ", ctx.palette.status_accent),
+            Span::styled(prefix, ctx.palette.status_accent),
             Span::styled(rest, ctx.palette.active_hint),
         ])
     } else {
@@ -1834,7 +1918,10 @@ fn render_uninstall_confirm(
 
     if y < max_y {
         let header_budget = usize::from(area.width).saturating_sub(pad.len() + 2 + right_margin);
-        let header_text = truncate_text("Confirm uninstall", header_budget);
+        let header_text = truncate_text(
+            tr("Confirm uninstall", "Kaldırmayı onayla"),
+            header_budget,
+        );
         let line = Line::from(vec![
             Span::raw(pad),
             Span::styled(ctx.palette.status_warn_dot, ctx.palette.danger_bold),
@@ -1866,41 +1953,64 @@ fn render_uninstall_confirm(
     if y < max_y {
         let prompt_area = Rect::new(area.x, y, area.width, 1);
         let width = usize::from(area.width);
-        let full_prompt_cols = body_indent.len() + 41 + right_margin;
-        let compact_prompt_cols = body_indent.len() + 30 + right_margin;
-        let tiny_prompt_cols = pad.len() + 16 + right_margin;
+        let full_action = tr("Uninstall vdpi", "vdpi'yi kaldır");
+        let short_action = tr("Uninstall", "Kaldır");
+        let cancel_label = tr("Cancel", "İptal");
+        let yes_label = tr("Yes", "Evet");
+        let no_label = tr("No", "Hayır");
+        let full_prompt_cols = body_indent.len()
+            + "[y] ".len()
+            + full_action.chars().count()
+            + "   ·   ".chars().count()
+            + "[n / Esc] ".len()
+            + cancel_label.chars().count()
+            + right_margin;
+        let compact_prompt_cols = body_indent.len()
+            + "[y] ".len()
+            + short_action.chars().count()
+            + " · ".chars().count()
+            + "[n/Esc] ".len()
+            + cancel_label.chars().count()
+            + right_margin;
+        let tiny_prompt_cols = pad.len()
+            + "[y] ".len()
+            + yes_label.chars().count()
+            + " · ".chars().count()
+            + "[n] ".len()
+            + no_label.chars().count()
+            + right_margin;
         let line = if width >= full_prompt_cols {
             Line::from(vec![
                 Span::raw(body_indent),
                 Span::styled("[y]", ctx.palette.danger_bold),
                 Span::raw(" "),
-                Span::styled("Uninstall vdpi", ctx.palette.active_title),
+                Span::styled(full_action, ctx.palette.active_title),
                 Span::styled("   ·   ", ctx.palette.footer_text),
                 Span::styled("[n / Esc]", ctx.palette.footer_key),
                 Span::raw(" "),
-                Span::styled("Cancel", ctx.palette.inactive_title),
+                Span::styled(cancel_label, ctx.palette.inactive_title),
             ])
         } else if width >= compact_prompt_cols {
             Line::from(vec![
                 Span::raw(body_indent),
                 Span::styled("[y]", ctx.palette.danger_bold),
                 Span::raw(" "),
-                Span::styled("Uninstall", ctx.palette.active_title),
+                Span::styled(short_action, ctx.palette.active_title),
                 Span::styled(" · ", ctx.palette.footer_text),
                 Span::styled("[n/Esc]", ctx.palette.footer_key),
                 Span::raw(" "),
-                Span::styled("Cancel", ctx.palette.inactive_title),
+                Span::styled(cancel_label, ctx.palette.inactive_title),
             ])
         } else if width >= tiny_prompt_cols {
             Line::from(vec![
                 Span::raw(pad),
                 Span::styled("[y]", ctx.palette.danger_bold),
                 Span::raw(" "),
-                Span::styled("Yes", ctx.palette.active_title),
+                Span::styled(yes_label, ctx.palette.active_title),
                 Span::styled(" · ", ctx.palette.footer_text),
                 Span::styled("[n]", ctx.palette.footer_key),
                 Span::raw(" "),
-                Span::styled("No", ctx.palette.inactive_title),
+                Span::styled(no_label, ctx.palette.inactive_title),
             ])
         } else {
             let short = truncate_text("[y]/[n]", width.saturating_sub(pad.len() + right_margin));
@@ -2053,7 +2163,7 @@ fn render_custom_dns_editor_card(
     let hint_wrap_width = usize::from(inner_width)
         .saturating_sub(pad.len() + right_margin)
         .max(1);
-    let hint_lines = wrap_words(CUSTOM_DNS_EDITOR_HINT, hint_wrap_width);
+    let hint_lines = wrap_words(custom_dns_editor_hint(), hint_wrap_width);
     let hint_count = u16::try_from(hint_lines.len()).unwrap_or(2);
     let err_rows = u16::from(state.custom_dns_error.is_some());
     // borders(2) + header(1) + top_div(1) + title(1) + gap(1) + input(1) + hint(h) + err(0|1) + gap(1) + bot_div(1) + footer(1)
@@ -2103,11 +2213,16 @@ fn render_custom_dns_editor_card(
     if y < body_bottom {
         let heading = if is_custom_dns(&state.configured_dns) {
             format!(
-                "Choose DNS server · {}",
+                "{} · {}",
+                tr("Choose DNS server", "DNS sunucusu seç"),
                 format_dns_label(&state.configured_dns)
             )
         } else {
-            "Choose DNS server · Custom DNS".to_string()
+            tr(
+                "Choose DNS server · Custom DNS",
+                "DNS sunucusu seç · Özel DNS",
+            )
+            .to_string()
         };
         let budget = width.saturating_sub(pad.len() + 2 + right_margin);
         let title_line = Line::from(vec![
@@ -2127,7 +2242,7 @@ fn render_custom_dns_editor_card(
 
     // Inline input row: `Custom DNS: <before>▏<after>` with cursor-centered horizontal scroll.
     if y < body_bottom {
-        let prompt = "Custom DNS: ";
+        let prompt = tr("Custom DNS: ", "Özel DNS: ");
         let cursor = "▏";
         let prompt_cols = Span::raw(prompt).width();
         let cursor_cols = Span::raw(cursor).width();
@@ -2300,7 +2415,10 @@ fn render_dns_picker_card(
 
     if y < body_bottom {
         let current_label = format_dns_label(&state.configured_dns);
-        let heading = format!("Choose DNS server · {current_label}");
+        let heading = format!(
+            "{} · {current_label}",
+            tr("Choose DNS server", "DNS sunucusu seç")
+        );
         let budget = width.saturating_sub(pad.len() + 2 + right_margin);
         let title_line = Line::from(vec![
             Span::raw(pad),
@@ -2376,12 +2494,18 @@ fn render_dns_picker_card(
             Span::raw(" "),
         ];
 
+        let active_tag_str = tr(" [Active]", " [Etkin]");
+        let custom_dns_label = tr("Custom DNS", "Özel DNS");
+        let custom_dns_label_cols = custom_dns_label.chars().count();
+        let placeholder = custom_dns_placeholder();
+        let placeholder_cols = placeholder.chars().count();
+
         if let Some(preset) = DNS_PRESETS.get(index) {
             let is_active = preset
                 .addr
                 .eq_ignore_ascii_case(state.configured_dns.trim());
-            let active_tag = if is_active { " [Active]" } else { "" };
-            let used = prefix_cols + badge.len() + 1 + active_tag.len() + right_margin;
+            let active_tag = if is_active { active_tag_str } else { "" };
+            let used = prefix_cols + badge.len() + 1 + active_tag.chars().count() + right_margin;
             let budget = width.saturating_sub(used);
             let display_label =
                 format_dns_preset_label(preset.name, preset.addr, budget, align_columns);
@@ -2391,22 +2515,22 @@ fn render_dns_picker_card(
             }
         } else {
             // [7] Custom DNS row
-            let active_tag = if custom_active { " [Active]" } else { "" };
-            let used = prefix_cols + badge.len() + 1 + active_tag.len() + right_margin;
+            let active_tag = if custom_active { active_tag_str } else { "" };
+            let used = prefix_cols + badge.len() + 1 + active_tag.chars().count() + right_margin;
             let budget = width.saturating_sub(used);
             if custom_active {
                 if align_columns && budget >= 24 {
                     let val_budget = budget.saturating_sub(20);
                     let display_val = shorten_custom_dns(&state.configured_dns, val_budget);
-                    let label = format!("{:<19} {display_val}", "Custom DNS");
+                    let label = format!("{custom_dns_label:<19} {display_val}");
                     spans.push(Span::styled(label, title_style));
-                } else if budget >= 16 {
-                    let val_budget = budget.saturating_sub(12);
+                } else if budget >= custom_dns_label_cols + 6 {
+                    let val_budget = budget.saturating_sub(custom_dns_label_cols + 2);
                     let display_val = shorten_custom_dns(&state.configured_dns, val_budget);
-                    let label = format!("Custom DNS  {display_val}");
+                    let label = format!("{custom_dns_label}  {display_val}");
                     spans.push(Span::styled(label, title_style));
                 } else {
-                    let label = truncate_text("Custom DNS", budget);
+                    let label = truncate_text(custom_dns_label, budget);
                     spans.push(Span::styled(label, title_style));
                 }
                 spans.push(Span::styled(active_tag, palette.status_active));
@@ -2416,23 +2540,26 @@ fn render_dns_picker_card(
                 } else {
                     palette.inactive_hint
                 };
-                if align_columns && budget >= 20 + CUSTOM_DNS_PLACEHOLDER.len() {
+                if align_columns && budget >= 20 + placeholder_cols {
                     let val_budget = budget.saturating_sub(20);
-                    spans.push(Span::styled(format!("{:<19} ", "Custom DNS"), title_style));
                     spans.push(Span::styled(
-                        truncate_text(CUSTOM_DNS_PLACEHOLDER, val_budget),
+                        format!("{custom_dns_label:<19} "),
+                        title_style,
+                    ));
+                    spans.push(Span::styled(
+                        truncate_text(placeholder, val_budget),
                         muted_style,
                     ));
-                } else if budget >= 16 {
-                    let val_budget = budget.saturating_sub(12);
-                    spans.push(Span::styled("Custom DNS  ", title_style));
+                } else if budget >= custom_dns_label_cols + 6 {
+                    let val_budget = budget.saturating_sub(custom_dns_label_cols + 2);
+                    spans.push(Span::styled(format!("{custom_dns_label}  "), title_style));
                     spans.push(Span::styled(
-                        truncate_text(CUSTOM_DNS_PLACEHOLDER, val_budget),
+                        truncate_text(placeholder, val_budget),
                         muted_style,
                     ));
                 } else {
                     spans.push(Span::styled(
-                        truncate_text("Custom DNS", budget),
+                        truncate_text(custom_dns_label, budget),
                         title_style,
                     ));
                 }
@@ -2454,7 +2581,7 @@ fn render_dns_picker_card(
         let budget = width.saturating_sub(indent.len() + right_margin);
         let raw_hint = DNS_PRESETS
             .get(selected)
-            .map_or(CUSTOM_DNS_HINT, |preset| preset.hint);
+            .map_or_else(custom_dns_hint, dns_preset_hint);
         let hint = truncate_text(raw_hint, budget);
         let line = Line::from(vec![
             Span::raw(indent),
@@ -2501,8 +2628,48 @@ fn render_custom_dns_footer(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx) {
     let key = ctx.palette.footer_key;
     let text = ctx.palette.footer_text;
     let width = usize::from(area.width);
+    let is_tr = active_lang() == Lang::Tr;
 
-    let line = if width >= pad.len() * 2 + 54 {
+    let line = if is_tr {
+        if width >= pad.len() * 2 + 53 {
+            Line::from(vec![
+                Span::raw(pad),
+                Span::styled("IP/URL yaz · ", text),
+                Span::styled("enter", key),
+                Span::styled(" uygula · ", text),
+                Span::styled("ctrl+u", key),
+                Span::styled(" temizle · ", text),
+                Span::styled("esc", key),
+                Span::styled(" geri", text),
+            ])
+        } else if width >= pad.len() * 2 + 40 {
+            Line::from(vec![
+                Span::raw(pad),
+                Span::styled("enter", key),
+                Span::styled(" uygula · ", text),
+                Span::styled("ctrl+u", key),
+                Span::styled(" temizle · ", text),
+                Span::styled("esc", key),
+                Span::styled(" geri", text),
+            ])
+        } else if width >= pad.len() * 2 + 24 {
+            Line::from(vec![
+                Span::raw(pad),
+                Span::styled("enter", key),
+                Span::styled(" · ", text),
+                Span::styled("^u", key),
+                Span::styled(" temizle · ", text),
+                Span::styled("esc", key),
+            ])
+        } else {
+            Line::from(vec![
+                Span::raw(pad),
+                Span::styled("enter", key),
+                Span::styled(" · ", text),
+                Span::styled("esc", key),
+            ])
+        }
+    } else if width >= pad.len() * 2 + 54 {
         Line::from(vec![
             Span::raw(pad),
             Span::styled("type IP or URL · ", text),
@@ -2552,8 +2719,21 @@ fn render_dns_footer(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx) {
     let text = ctx.palette.footer_text;
     let width = usize::from(area.width);
     let range = range_label(DNS_PICKER_ITEM_COUNT);
+    let is_tr = active_lang() == Lang::Tr;
 
-    let line = if width >= pad.len() * 2 + 40 + range.len() {
+    let line = if is_tr && width >= pad.len() * 2 + 38 + range.len() {
+        Line::from(vec![
+            Span::raw(pad),
+            Span::styled("↑↓", key),
+            Span::styled(" gez · ", text),
+            Span::styled(range, key),
+            Span::styled(" seç · ", text),
+            Span::styled("enter", key),
+            Span::styled(" uygula · ", text),
+            Span::styled("esc", key),
+            Span::styled(" geri", text),
+        ])
+    } else if !is_tr && width >= pad.len() * 2 + 40 + range.len() {
         Line::from(vec![
             Span::raw(pad),
             Span::styled("↑↓", key),
@@ -2595,8 +2775,17 @@ fn render_confirm_footer(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx) {
     let key = ctx.palette.footer_key;
     let text = ctx.palette.footer_text;
     let width = usize::from(area.width);
+    let is_tr = active_lang() == Lang::Tr;
 
-    let line = if width >= pad.len() * 2 + 30 {
+    let line = if is_tr && width >= pad.len() * 2 + 26 {
+        Line::from(vec![
+            Span::raw(pad),
+            Span::styled("y", ctx.palette.danger_bold),
+            Span::styled(" kaldır  ·  ", text),
+            Span::styled("n / esc", key),
+            Span::styled(" iptal", text),
+        ])
+    } else if !is_tr && width >= pad.len() * 2 + 30 {
         Line::from(vec![
             Span::raw(pad),
             Span::styled("y", ctx.palette.danger_bold),
@@ -2641,12 +2830,13 @@ fn render_footer(
     let pad = if ctx.inset { " " } else { "" };
     let key = ctx.palette.footer_key;
     let text = ctx.palette.footer_text;
+    let is_tr = active_lang() == Lang::Tr;
 
     if item_count == 0 {
         let line = Line::from(vec![
             Span::raw(pad),
             Span::styled("q", key),
-            Span::styled(" quit", text),
+            Span::styled(tr(" quit", " çık"), text),
         ]);
         frame.render_widget(line, area);
         return;
@@ -2654,6 +2844,167 @@ fn render_footer(
 
     let range = range_label(item_count);
     let width = usize::from(area.width);
+    if is_tr {
+        let line = if has_dashboard && has_split_tunnel && width >= pad.len() * 2 + 58 + range.len()
+        {
+            Line::from(vec![
+                Span::raw(pad),
+                Span::styled("↑↓", key),
+                Span::styled(" · ", text),
+                Span::styled(range, key),
+                Span::styled(" · ", text),
+                Span::styled("l", key),
+                Span::styled(" canlı · ", text),
+                Span::styled("d", key),
+                Span::styled(" dns · ", text),
+                Span::styled("s", key),
+                Span::styled(" böl · ", text),
+                Span::styled("r", key),
+                Span::styled(" yenile · ", text),
+                Span::styled("enter", key),
+                Span::styled(" · ", text),
+                Span::styled("q", key),
+                Span::styled(" çık", text),
+            ])
+        } else if has_dashboard && !has_split_tunnel && width >= pad.len() * 2 + 58 + range.len() {
+            Line::from(vec![
+                Span::raw(pad),
+                Span::styled("↑↓", key),
+                Span::styled(" gez · ", text),
+                Span::styled(range, key),
+                Span::styled(" seç · ", text),
+                Span::styled("l", key),
+                Span::styled(" canlı · ", text),
+                Span::styled("d", key),
+                Span::styled(" dns · ", text),
+                Span::styled("r", key),
+                Span::styled(" yenile · ", text),
+                Span::styled("enter", key),
+                Span::styled(" · ", text),
+                Span::styled("q", key),
+                Span::styled(" çık", text),
+            ])
+        } else if !has_dashboard && has_split_tunnel && width >= pad.len() * 2 + 52 + range.len() {
+            Line::from(vec![
+                Span::raw(pad),
+                Span::styled("↑↓", key),
+                Span::styled(" · ", text),
+                Span::styled(range, key),
+                Span::styled(" seç · ", text),
+                Span::styled("d", key),
+                Span::styled(" dns · ", text),
+                Span::styled("s", key),
+                Span::styled(" böl · ", text),
+                Span::styled("r", key),
+                Span::styled(" yenile · ", text),
+                Span::styled("enter", key),
+                Span::styled(" · ", text),
+                Span::styled("q", key),
+                Span::styled(" çık", text),
+            ])
+        } else if !has_dashboard && !has_split_tunnel && width >= pad.len() * 2 + 48 + range.len() {
+            Line::from(vec![
+                Span::raw(pad),
+                Span::styled("↑↓", key),
+                Span::styled(" gez · ", text),
+                Span::styled(range, key),
+                Span::styled(" seç · ", text),
+                Span::styled("d", key),
+                Span::styled(" dns · ", text),
+                Span::styled("r", key),
+                Span::styled(" yenile · ", text),
+                Span::styled("enter", key),
+                Span::styled(" · ", text),
+                Span::styled("q", key),
+                Span::styled(" çık", text),
+            ])
+        } else if has_dashboard && width >= pad.len() * 2 + 46 + range.len() {
+            Line::from(vec![
+                Span::raw(pad),
+                Span::styled("↑↓", key),
+                Span::styled(" · ", text),
+                Span::styled(range, key),
+                Span::styled(" seç · ", text),
+                Span::styled("l", key),
+                Span::styled(" canlı · ", text),
+                Span::styled("r", key),
+                Span::styled(" yenile · ", text),
+                Span::styled("enter", key),
+                Span::styled(" · ", text),
+                Span::styled("q", key),
+                Span::styled(" çık", text),
+            ])
+        } else if !has_dashboard && has_split_tunnel && width >= pad.len() * 2 + 44 + range.len() {
+            Line::from(vec![
+                Span::raw(pad),
+                Span::styled("↑↓", key),
+                Span::styled(" · ", text),
+                Span::styled(range, key),
+                Span::styled(" seç · ", text),
+                Span::styled("s", key),
+                Span::styled(" böl · ", text),
+                Span::styled("r", key),
+                Span::styled(" yenile · ", text),
+                Span::styled("enter", key),
+                Span::styled(" · ", text),
+                Span::styled("q", key),
+                Span::styled(" çık", text),
+            ])
+        } else if width >= pad.len() * 2 + 36 + range.len() {
+            Line::from(vec![
+                Span::raw(pad),
+                Span::styled("↑↓", key),
+                Span::styled(" · ", text),
+                Span::styled(range, key),
+                Span::styled(" seç · ", text),
+                Span::styled("r", key),
+                Span::styled(" yenile · ", text),
+                Span::styled("enter", key),
+                Span::styled(" · ", text),
+                Span::styled("q", key),
+                Span::styled(" çık", text),
+            ])
+        } else if width >= pad.len() * 2 + 32 + range.len() {
+            Line::from(vec![
+                Span::raw(pad),
+                Span::styled("↑↓", key),
+                Span::styled(" · ", text),
+                Span::styled(range, key),
+                Span::styled(" · ", text),
+                Span::styled("r", key),
+                Span::styled(" yenile · ", text),
+                Span::styled("enter", key),
+                Span::styled(" · ", text),
+                Span::styled("q", key),
+                Span::styled(" çık", text),
+            ])
+        } else if width >= pad.len() * 2 + 21 + range.len() {
+            Line::from(vec![
+                Span::raw(pad),
+                Span::styled("↑↓", key),
+                Span::styled(" · ", text),
+                Span::styled(range, key),
+                Span::styled(" · ", text),
+                Span::styled("r", key),
+                Span::styled(" · ", text),
+                Span::styled("enter", key),
+                Span::styled(" · ", text),
+                Span::styled("q", key),
+            ])
+        } else {
+            Line::from(vec![
+                Span::raw(pad),
+                Span::styled(range, key),
+                Span::styled(" · ", text),
+                Span::styled("r", key),
+                Span::styled(" · ", text),
+                Span::styled("q", key),
+            ])
+        };
+        frame.render_widget(line, area);
+        return;
+    }
+
     let full_live_split_cols = pad.len() * 2 + 61 + range.len();
     let full_live_cols = pad.len() * 2 + 63 + range.len();
     let full_split_cols = pad.len() * 2 + 59 + range.len();
@@ -2844,7 +3195,10 @@ fn render_minimal(
 
     if state.confirming_uninstall {
         if area.height >= 2 {
-            let prompt = truncate_text("Uninstall? [y/n]", usize::from(area.width));
+            let prompt = truncate_text(
+                tr("Uninstall? [y/n]", "Kaldırılsın mı? [y/n]"),
+                usize::from(area.width),
+            );
             frame.render_widget(
                 Line::styled(prompt, palette.danger_bold),
                 Rect::new(area.x, area.y + 1, area.width, 1),
@@ -2863,7 +3217,11 @@ fn render_minimal(
                 let prompt = format!("DNS: {vis_before}▏{vis_after}");
                 truncate_head(&prompt, usize::from(area.width)).into_owned()
             } else {
-                let prompt = format!("Choose DNS [{}]", range_label(DNS_PICKER_ITEM_COUNT));
+                let prompt = format!(
+                    "{} [{}]",
+                    tr("Choose DNS", "DNS seç"),
+                    range_label(DNS_PICKER_ITEM_COUNT)
+                );
                 truncate_text(&prompt, usize::from(area.width)).into_owned()
             };
             frame.render_widget(
@@ -5244,5 +5602,54 @@ mod tests {
         );
         assert_eq!(state.custom_dns_input, "https://dns.nextdns.io/abc123");
         assert_eq!(state.custom_dns_cursor, 29);
+    }
+
+    #[test]
+    fn renders_control_center_dns_picker_and_confirm_in_turkish_and_handles_g_key() {
+        let _guard = vdpi::i18n::push_thread_lang(Some(Lang::Tr));
+        let status = status_running_live();
+        let mut state = UiState::new(&status, Some("Durum yenilendi."));
+
+        let buf = render_state(80, 24, &state, true);
+        let text = buffer_text(&buf);
+        assert!(text.contains("[g: TR]"), "missing TR header badge:\n{text}");
+        assert!(text.contains("Servis"), "missing Servis row:\n{text}");
+        assert!(text.contains("Çalışıyor · v0.5.0"), "missing TR running status:\n{text}");
+        assert!(text.contains("Motor"), "missing Motor row:\n{text}");
+        assert!(text.contains("Etkin · Combo · DoH açık · QUIC engelli"), "missing TR Anti-DPI:\n{text}");
+        assert!(text.contains("Canlı paneli aç"), "missing TR dashboard item:\n{text}");
+        assert!(text.contains("Arka plan servisini duraklat"), "missing TR pause item:\n{text}");
+        assert!(text.contains("DNS sunucusu seç"), "missing TR DNS item:\n{text}");
+        assert!(text.contains("Bölünmüş tünelleme"), "missing TR split item:\n{text}");
+        assert!(text.contains("✓ Durum yenilendi."), "missing TR notice:\n{text}");
+        assert!(text.contains("q çık"), "missing TR footer:\n{text}");
+
+        // Pressing 'g' requests language toggle cleanly.
+        assert_eq!(
+            handle_key(&mut state, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)),
+            Action::ToggleLanguage
+        );
+
+        // DNS picker in Turkish
+        state.open_dns_picker();
+        let dns_buf = render_state(80, 24, &state, true);
+        let dns_text = buffer_text(&dns_buf);
+        assert!(dns_text.contains("DNS sunucusu seç · Cloudflare (1.1.1.1)"));
+        assert!(dns_text.contains("[Etkin]"));
+        assert!(dns_text.contains("Özel DNS"));
+        assert!(dns_text.contains("enter uygula"));
+
+        // Confirm uninstall in Turkish
+        state.selecting_dns = false;
+        state.confirming_uninstall = true;
+        let conf_buf = render_state(80, 24, &state, true);
+        let conf_text = buffer_text(&conf_buf);
+        assert!(conf_text.contains("Kaldırmayı onayla"));
+        assert!(conf_text.contains("vdpi'yi kaldır"));
+        assert!(conf_text.contains("İptal"));
+        assert_eq!(
+            handle_key(&mut state, KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)),
+            Action::Finish(Choice::Uninstall)
+        );
     }
 }

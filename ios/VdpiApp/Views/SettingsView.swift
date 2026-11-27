@@ -7,6 +7,7 @@ struct SettingsView: View {
 
     @EnvironmentObject private var manager: TunnelManager
     @Environment(\.vdpiPalette) private var palette
+    @Environment(\.appLanguage) private var appLanguage
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorSchemeContrast) private var colorSchemeContrast
     @Environment(\.verticalSizeClass) private var verticalSizeClass
@@ -19,6 +20,15 @@ struct SettingsView: View {
     private enum Field: Hashable {
         case dns
         case bypass
+    }
+
+    private enum DnsValidationError: Equatable {
+        case invalidEndpoint
+    }
+
+    private enum BypassValidationError: Equatable {
+        case invalidDomain
+        case duplicate
     }
 
     private struct DnsPreset: Identifiable {
@@ -37,9 +47,9 @@ struct SettingsView: View {
     // MARK: - Local State
 
     @State private var dnsDraft: String = ""
-    @State private var dnsError: String?
+    @State private var dnsError: DnsValidationError?
     @State private var bypassDraft: String = ""
-    @State private var bypassError: String?
+    @State private var bypassError: BypassValidationError?
     @State private var showResetConfirm = false
     @State private var showSettingsExporter = false
     @State private var exportDocument = VdpiSettingsDocument()
@@ -47,6 +57,10 @@ struct SettingsView: View {
     @FocusState private var focusedField: Field?
 
     // MARK: - Derived State
+
+    private var l10n: L10n.Catalog {
+        L10n.catalog(for: appLanguage)
+    }
 
     private func isPresetDns(_ addr: String) -> Bool {
         dnsPresets.contains { $0.value.caseInsensitiveCompare(addr) == .orderedSame }
@@ -111,6 +125,7 @@ struct SettingsView: View {
                 tunnelSection
                 bypassDomainsSection
                 appearanceSection
+                languageSection
                 backupSection
                 updatesSection
                 resetSection
@@ -148,11 +163,11 @@ struct SettingsView: View {
             }
         }
         .confirmationDialog(
-            "Reset all tunnel settings to defaults?",
+            l10n.resetConfirmTitle,
             isPresented: $showResetConfirm,
             titleVisibility: .visible
         ) {
-            Button("Reset to Defaults", role: .destructive) {
+            Button(l10n.resetToDefaults, role: .destructive) {
                 VdpiHaptics.trigger(.warning)
                 focusedField = nil
                 manager.resetSettings()
@@ -160,7 +175,7 @@ struct SettingsView: View {
                 dnsError = nil
                 bypassError = nil
             }
-            Button("Cancel", role: .cancel) {}
+            Button(l10n.cancel, role: .cancel) {}
         }
         .fileExporter(
             isPresented: $showSettingsExporter,
@@ -171,14 +186,14 @@ struct SettingsView: View {
             switch result {
             case .success:
                 VdpiHaptics.trigger(.success)
-                manager.showToast("Exported settings")
+                manager.showToast(l10n.toastExportedSettings)
             case .failure(let error):
                 let nsError = error as NSError
                 if nsError.domain == NSCocoaErrorDomain && nsError.code == NSUserCancelledError {
                     return
                 }
                 VdpiHaptics.trigger(.warning)
-                manager.showToast("Export failed")
+                manager.showToast(l10n.toastExportFailed)
             }
         }
         .fileImporter(
@@ -196,7 +211,7 @@ struct SettingsView: View {
                     return
                 }
                 VdpiHaptics.trigger(.warning)
-                manager.showToast("Import failed")
+                manager.showToast(l10n.toastImportFailed)
             }
         }
     }
@@ -205,7 +220,7 @@ struct SettingsView: View {
 
     private var headerBar: some View {
         HStack(alignment: .center, spacing: 12) {
-            Text("Settings")
+            Text(l10n.tabSettings)
                 .font(.largeTitle.bold())
                 .foregroundStyle(palette.inkPrimary)
                 .accessibilityAddTraits(.isHeader)
@@ -215,7 +230,7 @@ struct SettingsView: View {
             if focusedField != nil {
                 GlassCircleButton(
                     systemImage: "keyboard.chevron.compact.down",
-                    accessibilityLabel: "Dismiss keyboard"
+                    accessibilityLabel: l10n.accessibilityDismissKeyboard
                 ) {
                     focusedField = nil
                 }
@@ -235,7 +250,7 @@ struct SettingsView: View {
         let chunkSize = manager.settings.clampedChunkSize
 
         return VStack(alignment: .leading, spacing: 7) {
-            SectionHeader("Desync Engine")
+            SectionHeader(l10n.sectionDesyncEngine)
 
             InsetGroupedCard(cornerRadius: 16) {
                 VStack(spacing: 0) {
@@ -253,10 +268,10 @@ struct SettingsView: View {
                         } label: {
                             HStack(spacing: 12) {
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text(mode.label)
+                                    Text(mode.label(in: appLanguage))
                                         .font(.body)
                                         .foregroundStyle(palette.inkPrimary)
-                                    Text(mode.subtitle)
+                                    Text(mode.subtitle(in: appLanguage))
                                         .font(.footnote)
                                         .foregroundStyle(palette.inkSecondary)
                                         .lineLimit(2)
@@ -284,7 +299,7 @@ struct SettingsView: View {
                     InsetDivider(leadingInset: 16)
 
                     HStack(spacing: 12) {
-                        Text("Chunk Size")
+                        Text(l10n.chunkSizeLabel)
                             .font(.body)
                             .foregroundStyle(palette.inkPrimary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -308,7 +323,7 @@ struct SettingsView: View {
                             }
                             .buttonStyle(.plain)
                             .disabled(chunkSize <= 1)
-                            .accessibilityLabel("Decrease chunk size")
+                            .accessibilityLabel(l10n.accessibilityDecreaseChunk)
 
                             Text("\(chunkSize) B")
                                 .font(.subheadline.weight(.semibold))
@@ -317,7 +332,7 @@ struct SettingsView: View {
                                 .contentTransition(.numericText())
                                 .frame(minWidth: 44)
                                 .multilineTextAlignment(.center)
-                                .accessibilityLabel("Chunk size \(chunkSize) bytes")
+                                .accessibilityLabel(l10n.accessibilityChunkSizeBytes(chunkSize))
 
                             Button {
                                 VdpiHaptics.trigger(.light)
@@ -335,7 +350,7 @@ struct SettingsView: View {
                             }
                             .buttonStyle(.plain)
                             .disabled(chunkSize >= 64)
-                            .accessibilityLabel("Increase chunk size")
+                            .accessibilityLabel(l10n.accessibilityIncreaseChunk)
                         }
                         .background {
                             Capsule()
@@ -356,7 +371,7 @@ struct SettingsView: View {
                 }
             }
 
-            SectionFooter("Splits outbound TLS ClientHello packets into smaller byte chunks (1-64 B) to evade deep packet inspection.")
+            SectionFooter(l10n.desyncFooter)
         }
     }
 
@@ -364,7 +379,7 @@ struct SettingsView: View {
 
     private var dnsSection: some View {
         VStack(alignment: .leading, spacing: 7) {
-            SectionHeader("DNS & Privacy")
+            SectionHeader(l10n.sectionDnsPrivacy)
 
             InsetGroupedCard(cornerRadius: 16) {
                 VStack(spacing: 0) {
@@ -416,7 +431,7 @@ struct SettingsView: View {
 
                     VStack(alignment: .leading, spacing: 6) {
                         HStack(spacing: 12) {
-                            TextField("Custom IP or https:// DoH URL", text: $dnsDraft)
+                            TextField(l10n.customDnsPlaceholder, text: $dnsDraft)
                                 .font(.body)
                                 .foregroundStyle(palette.inkPrimary)
                                 .textInputAutocapitalization(.never)
@@ -431,9 +446,9 @@ struct SettingsView: View {
                                 Image(systemName: "checkmark")
                                     .font(.body.weight(.semibold))
                                     .foregroundStyle(palette.accent)
-                                    .accessibilityLabel("Active custom DNS")
+                                    .accessibilityLabel(l10n.accessibilityActiveCustomDns)
                             } else {
-                                Button("Apply") {
+                                Button(l10n.apply) {
                                     commitDns()
                                 }
                                 .font(.body.weight(.semibold))
@@ -446,8 +461,8 @@ struct SettingsView: View {
                             }
                         }
 
-                        if let dnsError {
-                            Text(dnsError)
+                        if dnsError != nil {
+                            Text(l10n.dnsValidationError)
                                 .font(.footnote)
                                 .foregroundStyle(palette.danger)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -460,8 +475,8 @@ struct SettingsView: View {
                     InsetDivider(leadingInset: 16)
 
                     toggleRow(
-                        title: "DNS over HTTPS",
-                        subtitle: isHttpsDohActive ? "Always enabled for custom https:// resolvers" : nil,
+                        title: l10n.toggleDoh,
+                        subtitle: isHttpsDohActive ? l10n.toggleDohForcedSubtitle : nil,
                         isOn: Binding(
                             get: { isHttpsDohActive || manager.settings.enableDoh },
                             set: { val in
@@ -475,7 +490,7 @@ struct SettingsView: View {
                     InsetDivider(leadingInset: 16)
 
                     toggleRow(
-                        title: "Block QUIC",
+                        title: l10n.toggleBlockQuic,
                         isOn: Binding(
                             get: { manager.settings.blockQuic },
                             set: { val in
@@ -487,7 +502,7 @@ struct SettingsView: View {
                     InsetDivider(leadingInset: 16)
 
                     toggleRow(
-                        title: "IPv4 Only",
+                        title: l10n.toggleIpv4Only,
                         isOn: Binding(
                             get: { manager.settings.ipv4Only },
                             set: { val in
@@ -498,7 +513,7 @@ struct SettingsView: View {
                 }
             }
 
-            SectionFooter("Encrypts resolver lookups with DoH and blocks UDP/443 QUIC so traffic falls back to TCP where TLS desync applies.")
+            SectionFooter(l10n.dnsFooter)
         }
     }
 
@@ -506,11 +521,11 @@ struct SettingsView: View {
 
     private var tunnelSection: some View {
         VStack(alignment: .leading, spacing: 7) {
-            SectionHeader("Tunnel")
+            SectionHeader(l10n.sectionTunnel)
 
             InsetGroupedCard(cornerRadius: 16) {
                 toggleRow(
-                    title: "Connect On-Demand",
+                    title: l10n.toggleConnectOnDemand,
                     isOn: Binding(
                         get: { manager.settings.onDemandEnabled },
                         set: { val in
@@ -520,7 +535,7 @@ struct SettingsView: View {
                 )
             }
 
-            SectionFooter("Automatically keeps the vdpi tunnel active when switching between Wi-Fi and cellular networks.")
+            SectionFooter(l10n.tunnelFooter)
         }
     }
 
@@ -528,13 +543,13 @@ struct SettingsView: View {
 
     private var bypassDomainsSection: some View {
         VStack(alignment: .leading, spacing: 7) {
-            SectionHeader("Bypass Domains")
+            SectionHeader(l10n.sectionBypassDomains)
 
             InsetGroupedCard(cornerRadius: 16) {
                 VStack(spacing: 0) {
                     VStack(alignment: .leading, spacing: 6) {
                         HStack(spacing: 12) {
-                            TextField("Add domain (e.g. example.com)", text: $bypassDraft)
+                            TextField(l10n.bypassPlaceholder, text: $bypassDraft)
                                 .font(.body)
                                 .foregroundStyle(palette.inkPrimary)
                                 .textInputAutocapitalization(.never)
@@ -545,7 +560,7 @@ struct SettingsView: View {
                                 .frame(minHeight: 44)
                                 .onSubmit { addBypassDomain() }
 
-                            Button("Add") {
+                            Button(l10n.add) {
                                 addBypassDomain()
                             }
                             .font(.body.weight(.semibold))
@@ -558,7 +573,11 @@ struct SettingsView: View {
                         }
 
                         if let bypassError {
-                            Text(bypassError)
+                            Text(
+                                bypassError == .duplicate
+                                    ? l10n.bypassDuplicateError
+                                    : l10n.bypassInvalidError
+                            )
                                 .font(.footnote)
                                 .foregroundStyle(palette.danger)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -595,7 +614,7 @@ struct SettingsView: View {
                                     .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
-                            .accessibilityLabel("Remove \(domain)")
+                            .accessibilityLabel(l10n.accessibilityRemoveDomain(domain))
                         }
                         .frame(minHeight: 44)
                         .padding(.leading, 16)
@@ -606,7 +625,7 @@ struct SettingsView: View {
                 .animation(reduceMotion ? nil : VdpiMotion.cardShift, value: manager.settings.bypassDomains)
             }
 
-            SectionFooter("Matching domains and subdomains skip TLS desync. Local networks, banking, and government portals are bypassed automatically.")
+            SectionFooter(l10n.bypassFooter)
         }
     }
 
@@ -614,11 +633,11 @@ struct SettingsView: View {
 
     private var appearanceSection: some View {
         VStack(alignment: .leading, spacing: 7) {
-            SectionHeader("Appearance")
+            SectionHeader(l10n.sectionAppearance)
 
             InsetGroupedCard(cornerRadius: 16) {
                 Picker(
-                    "Appearance",
+                    l10n.sectionAppearance,
                     selection: Binding(
                         get: { manager.settings.theme },
                         set: { pref in
@@ -628,7 +647,7 @@ struct SettingsView: View {
                     )
                 ) {
                     ForEach(ThemePreference.allCases) { pref in
-                        Text(pref.label).tag(pref)
+                        Text(pref.label(in: appLanguage)).tag(pref)
                     }
                 }
                 .pickerStyle(.segmented)
@@ -637,7 +656,38 @@ struct SettingsView: View {
                 .padding(.vertical, 10)
             }
 
-            SectionFooter("System matches your device Light and Dark appearance automatically.")
+            SectionFooter(l10n.appearanceFooter)
+        }
+    }
+
+    // MARK: - Language
+
+    private var languageSection: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            SectionHeader(l10n.sectionLanguage)
+
+            InsetGroupedCard(cornerRadius: 16) {
+                Picker(
+                    l10n.sectionLanguage,
+                    selection: Binding(
+                        get: { manager.settings.language },
+                        set: { lang in
+                            guard manager.settings.language != lang else { return }
+                            manager.updateSettings { $0.language = lang }
+                        }
+                    )
+                ) {
+                    ForEach(AppLanguage.allCases) { lang in
+                        Text(lang.label(in: appLanguage)).tag(lang)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+            }
+
+            SectionFooter(l10n.languageFooter)
         }
     }
 
@@ -645,7 +695,7 @@ struct SettingsView: View {
 
     private var backupSection: some View {
         VStack(alignment: .leading, spacing: 7) {
-            SectionHeader("Backup & Restore")
+            SectionHeader(l10n.sectionBackupRestore)
 
             InsetGroupedCard(cornerRadius: 16) {
                 VStack(spacing: 0) {
@@ -657,7 +707,7 @@ struct SettingsView: View {
                             showSettingsExporter = true
                         } else {
                             VdpiHaptics.trigger(.warning)
-                            manager.showToast("Could not export settings")
+                            manager.showToast(l10n.toastCouldNotExport)
                         }
                     } label: {
                         HStack(spacing: 12) {
@@ -667,7 +717,7 @@ struct SettingsView: View {
                                 .frame(width: 24)
                                 .accessibilityHidden(true)
 
-                            Text("Export Settings")
+                            Text(l10n.exportSettings)
                                 .font(.body)
                                 .foregroundStyle(palette.inkPrimary)
 
@@ -694,7 +744,7 @@ struct SettingsView: View {
                                 .frame(width: 24)
                                 .accessibilityHidden(true)
 
-                            Text("Import Settings")
+                            Text(l10n.importSettings)
                                 .font(.body)
                                 .foregroundStyle(palette.inkPrimary)
 
@@ -709,7 +759,7 @@ struct SettingsView: View {
                 }
             }
 
-            SectionFooter("Save your desync, DNS, and bypass configuration as JSON or restore from a previous backup.")
+            SectionFooter(l10n.backupFooter)
         }
     }
 
@@ -717,7 +767,7 @@ struct SettingsView: View {
 
     private var updatesSection: some View {
         VStack(alignment: .leading, spacing: 7) {
-            SectionHeader("Updates")
+            SectionHeader(l10n.sectionUpdates)
 
             InsetGroupedCard(cornerRadius: 16) {
                 if let update = manager.availableUpdate {
@@ -731,11 +781,11 @@ struct SettingsView: View {
                                 .accessibilityHidden(true)
 
                             VStack(alignment: .leading, spacing: 2) {
-                                Text("Update Available · \(latest)")
+                                Text(l10n.updateAvailableRowTitle(version: latest))
                                     .font(.body)
                                     .foregroundStyle(palette.inkPrimary)
 
-                                Text("Current \(formattedVersion(manager.appVersion)) · Open GitHub Release")
+                                Text(l10n.updateAvailableRowSubtitle(currentVersion: formattedVersion(manager.appVersion)))
                                     .font(.footnote)
                                     .foregroundStyle(palette.inkSecondary)
                                     .lineLimit(1)
@@ -755,7 +805,7 @@ struct SettingsView: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(SettingsRowButtonStyle(highlightColor: palette.surfaceRaised))
-                    .accessibilityLabel("Update available, \(latest). Open GitHub release")
+                    .accessibilityLabel(l10n.accessibilityUpdateRow(version: latest))
                 } else {
                     Button {
                         VdpiHaptics.trigger(.light)
@@ -763,7 +813,7 @@ struct SettingsView: View {
                         manager.checkForUpdates(manual: true)
                     } label: {
                         HStack(spacing: 12) {
-                            Text("Check for Updates")
+                            Text(l10n.checkForUpdates)
                                 .font(.body)
                                 .foregroundStyle(palette.inkPrimary)
 
@@ -774,7 +824,7 @@ struct SettingsView: View {
                                     .progressViewStyle(.circular)
                                     .controlSize(.small)
                                     .tint(palette.inkSecondary)
-                                    .accessibilityLabel("Checking for updates")
+                                    .accessibilityLabel(l10n.accessibilityCheckingUpdates)
                             } else {
                                 let statusText: String = {
                                     if let msg = manager.updateStatusMessage, !msg.isEmpty {
@@ -811,7 +861,7 @@ struct SettingsView: View {
                 focusedField = nil
                 showResetConfirm = true
             } label: {
-                Text("Reset to Defaults")
+                Text(l10n.resetToDefaults)
                     .font(.body)
                     .foregroundStyle(palette.danger)
                     .frame(maxWidth: .infinity, minHeight: 44)
@@ -827,13 +877,13 @@ struct SettingsView: View {
 
     private var aboutSection: some View {
         VStack(alignment: .leading, spacing: 7) {
-            SectionHeader("About")
+            SectionHeader(l10n.sectionAbout)
 
             InsetGroupedCard(cornerRadius: 16) {
                 Link(destination: Self.githubRepositoryURL) {
                     HStack(spacing: 12) {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("GitHub Repository")
+                            Text(l10n.githubRepository)
                                 .font(.body)
                                 .foregroundStyle(palette.inkPrimary)
                             Text("github.com/Vuln-Inc/vdpi")
@@ -856,7 +906,7 @@ struct SettingsView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(SettingsRowButtonStyle(highlightColor: palette.surfaceRaised))
-                .accessibilityLabel("Open vdpi GitHub repository")
+                .accessibilityLabel(l10n.accessibilityOpenGithub)
             }
         }
     }
@@ -875,7 +925,7 @@ struct SettingsView: View {
 
     private func formattedVersion(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "v0.6.0" }
+        guard !trimmed.isEmpty else { return "v0.6.1" }
         return trimmed.lowercased().hasPrefix("v") ? trimmed : "v\(trimmed)"
     }
 
@@ -919,7 +969,7 @@ struct SettingsView: View {
         }
         guard VdpiFormatters.isValidDnsInput(trimmed) else {
             VdpiHaptics.trigger(.warning)
-            dnsError = "Enter an IPv4, IPv6, or https:// DoH URL"
+            dnsError = .invalidEndpoint
             return
         }
         focusedField = nil
@@ -936,19 +986,19 @@ struct SettingsView: View {
                     settings.enableDoh = true
                 }
             }
-            manager.showToast("Updated DNS resolver")
+            manager.showToast(l10n.toastUpdatedDns)
         }
     }
 
     private func addBypassDomain() {
         guard let normalized = VdpiFormatters.normalizeBypassDomain(bypassDraft) else {
             VdpiHaptics.trigger(.warning)
-            bypassError = "Enter a valid domain such as example.com or *.example.com"
+            bypassError = .invalidDomain
             return
         }
         if manager.settings.bypassDomains.contains(normalized) {
             VdpiHaptics.trigger(.warning)
-            bypassError = "Already in bypass list"
+            bypassError = .duplicate
             return
         }
         focusedField = nil
@@ -976,7 +1026,7 @@ struct SettingsView: View {
             let resourceValues = try url.resourceValues(forKeys: [.fileSizeKey])
             if let fileSize = resourceValues.fileSize, fileSize > 262_144 {
                 VdpiHaptics.trigger(.warning)
-                manager.showToast("Settings file is too large (max 256 KB).")
+                manager.showToast(l10n.toastSettingsFileTooLarge)
                 return
             }
             let data = try Data(contentsOf: url)
@@ -984,8 +1034,8 @@ struct SettingsView: View {
                 VdpiHaptics.trigger(.warning)
                 manager.showToast(
                     data.count > 262_144
-                        ? "Settings file is too large (max 256 KB)."
-                        : SettingsImportError.invalidJSON.localizedDescription
+                        ? l10n.toastSettingsFileTooLarge
+                        : SettingsImportError.invalidJSON.localizedMessage(in: appLanguage)
                 )
                 return
             }
@@ -996,11 +1046,11 @@ struct SettingsView: View {
             VdpiHaptics.trigger(.success)
         } catch let importError as SettingsImportError {
             VdpiHaptics.trigger(.warning)
-            manager.showToast(importError.localizedDescription)
+            manager.showToast(importError.localizedMessage(in: appLanguage))
         } catch {
             VdpiHaptics.trigger(.warning)
             let message = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
-            manager.showToast(message.isEmpty ? "Invalid settings file" : message)
+            manager.showToast(message.isEmpty ? l10n.toastInvalidSettingsFile : message)
         }
     }
 }

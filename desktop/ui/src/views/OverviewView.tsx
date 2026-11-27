@@ -1,4 +1,10 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useLang, type ResolvedLanguage } from "../i18n/context";
+import {
+  formatStageLabelLocalized,
+  localizeActivityMessage,
+  tOverview,
+} from "../i18n/overview";
 import type {
   ActivityEvent,
   DesktopSettingsPayload,
@@ -42,34 +48,7 @@ export interface OverviewViewProps {
   onCopyActivity: () => boolean | void | Promise<boolean | void>;
 }
 
-type ProtectionHeadline =
-  | "Checking status..."
-  | "Starting..."
-  | "Protected"
-  | "Paused"
-  | "Yielded to VPN"
-  | "Service Not Installed";
-
 type StatusTone = "active" | "idle" | "warn" | "muted";
-
-const ENGINE_OPTIONS: ReadonlyArray<{ value: EngineMode; label: string }> = [
-  { value: "tun", label: "TUN" },
-  { value: "proxy", label: "Proxy" },
-];
-
-const ENGINE_DESCRIPTIONS: Record<EngineMode, string> = {
-  tun: "Full-PC virtual adapter covering all apps, games, Discord voice (UDP), and DNS without proxy setup.",
-  proxy:
-    "Local HTTP/SOCKS5 proxy on 127.0.0.1 for web browsers and proxy-aware TCP apps (does not cover Discord voice or most games).",
-};
-
-const ACTIVITY_CATEGORY_LABELS: Record<ActivityEvent["category"], string> = {
-  engine: "Engine",
-  dns: "DNS",
-  vpn: "VPN",
-  split: "Split",
-  system: "System",
-};
 
 function formatVersion(version: string | null | undefined): string | null {
   if (!version) return null;
@@ -78,35 +57,40 @@ function formatVersion(version: string | null | undefined): string | null {
   return trimmed.startsWith("v") ? trimmed : `v${trimmed}`;
 }
 
-function formatStageLabel(stage: string): string {
-  switch (stage) {
-    case "ComboMultiRecord":
-      return "Combo";
-    case "OobSniDesync":
-      return "OOB SNI";
-    case "MultiRecordOob":
-      return "Multi + OOB";
-    case "FineFragment":
-      return "Fine Fragment";
-    case "DeepRecordStorm":
-      return "Deep Storm";
-    case "SlowSniSlice":
-      return "Slow SNI";
-    case "DirectPassthrough":
-      return "Passthrough";
-    default:
-      return stage;
+function formatSplitSummary(
+  lang: ResolvedLanguage,
+  mode: SplitTunnelMode,
+  count: number,
+): string {
+  switch (mode) {
+    case "all":
+      return tOverview(lang, "splitAll");
+    case "exclude":
+      return count === 1
+        ? tOverview(lang, "splitExcludeOne")
+        : tOverview(lang, "splitExcludeMany", { count });
+    case "include":
+      return count === 1
+        ? tOverview(lang, "splitIncludeOne")
+        : tOverview(lang, "splitIncludeMany", { count });
   }
 }
 
-function formatSplitSummary(mode: SplitTunnelMode, count: number): string {
-  switch (mode) {
-    case "all":
-      return "Split: All apps";
-    case "exclude":
-      return count === 1 ? "Split: 1 excluded" : `Split: ${count} excluded`;
-    case "include":
-      return count === 1 ? "Split: 1 included" : `Split: ${count} included`;
+function formatActivityCategory(
+  lang: ResolvedLanguage,
+  category: ActivityEvent["category"],
+): string {
+  switch (category) {
+    case "engine":
+      return tOverview(lang, "catEngine");
+    case "dns":
+      return tOverview(lang, "catDns");
+    case "vpn":
+      return tOverview(lang, "catVpn");
+    case "split":
+      return tOverview(lang, "catSplit");
+    case "system":
+      return tOverview(lang, "catSystem");
   }
 }
 
@@ -126,7 +110,17 @@ export function OverviewView({
   onClearActivity,
   onCopyActivity,
 }: OverviewViewProps) {
+  const { lang } = useLang();
   const engineLabelId = useId();
+  const engineOptions = useMemo<
+    ReadonlyArray<{ value: EngineMode; label: string }>
+  >(
+    () => [
+      { value: "tun", label: tOverview(lang, "engineTun") },
+      { value: "proxy", label: tOverview(lang, "engineProxy") },
+    ],
+    [lang],
+  );
   const [activityOpen, setActivityOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const [pendingEngine, setPendingEngine] = useState<EngineMode | null>(null);
@@ -213,30 +207,48 @@ export function OverviewView({
   );
 
   const { headline, statusTone } = useMemo<{
-    headline: ProtectionHeadline;
+    headline: string;
     statusTone: StatusTone;
   }>(() => {
     if (isLoadingStatus) {
-      return { headline: "Checking status...", statusTone: "muted" };
+      return {
+        headline: tOverview(lang, "headlineChecking"),
+        statusTone: "muted",
+      };
     }
     if (isNotInstalled) {
-      return { headline: "Service Not Installed", statusTone: "muted" };
+      return {
+        headline: tOverview(lang, "headlineNotInstalled"),
+        statusTone: "muted",
+      };
     }
     if (isYielded) {
-      return { headline: "Yielded to VPN", statusTone: "warn" };
+      return {
+        headline: tOverview(lang, "headlineYielded"),
+        statusTone: "warn",
+      };
     }
     if (isStarting) {
-      return { headline: "Starting...", statusTone: "warn" };
+      return {
+        headline: tOverview(lang, "headlineStarting"),
+        statusTone: "warn",
+      };
     }
     if (isRunning) {
-      return { headline: "Protected", statusTone: "active" };
+      return {
+        headline: tOverview(lang, "headlineProtected"),
+        statusTone: "active",
+      };
     }
-    return { headline: "Paused", statusTone: "idle" };
-  }, [isLoadingStatus, isNotInstalled, isRunning, isStarting, isYielded]);
+    return {
+      headline: tOverview(lang, "headlinePaused"),
+      statusTone: "idle",
+    };
+  }, [isLoadingStatus, isNotInstalled, isRunning, isStarting, isYielded, lang]);
 
   const subtitle = useMemo(() => {
     if (!status) {
-      return "Reading service status...";
+      return tOverview(lang, "subtitleReadingStatus");
     }
 
     const versionTag = formatVersion(
@@ -244,15 +256,18 @@ export function OverviewView({
     );
 
     if (isNotInstalled) {
-      const parts = ["Background service required", "Admin prompt may appear"];
+      const parts = [
+        tOverview(lang, "subtitleServiceRequired"),
+        tOverview(lang, "subtitleAdminPrompt"),
+      ];
       if (versionTag) parts.push(versionTag);
       return parts.join(" · ");
     }
 
     if (isYielded && vpnConflict) {
       const parts = [
-        `Active tunnel: ${vpnConflict}`,
-        "Auto-resumes on VPN disconnect",
+        tOverview(lang, "subtitleActiveTunnel", { vpn: vpnConflict }),
+        tOverview(lang, "subtitleAutoResumes"),
       ];
       if (versionTag) parts.push(versionTag);
       return parts.join(" · ");
@@ -260,8 +275,10 @@ export function OverviewView({
 
     if (isStarting) {
       const parts = [
-        activeEngine === "tun" ? "TUN adapter" : "Local proxy",
-        "Waiting for live telemetry...",
+        activeEngine === "tun"
+          ? tOverview(lang, "subtitleTunAdapter")
+          : tOverview(lang, "subtitleLocalProxy"),
+        tOverview(lang, "subtitleWaitingTelemetry"),
       ];
       if (versionTag) parts.push(versionTag);
       return parts.join(" · ");
@@ -270,9 +287,15 @@ export function OverviewView({
     if (isRunning && live) {
       const parts: string[] = [];
       if (activeEngine === "tun") {
-        const iface = live.tunInterface?.trim() || "TUN adapter";
+        const iface =
+          live.tunInterface?.trim() || tOverview(lang, "subtitleTunAdapter");
         parts.push(
-          live.physicalNic ? `${iface} via ${live.physicalNic}` : iface,
+          live.physicalNic
+            ? tOverview(lang, "subtitleVia", {
+                iface,
+                nic: live.physicalNic,
+              })
+            : iface,
         );
       } else {
         parts.push(`${live.addr}:${live.port}`);
@@ -285,8 +308,12 @@ export function OverviewView({
     }
 
     const parts = [
-      activeEngine === "tun" ? "TUN adapter" : "Local proxy",
-      serviceState === "running" ? "Protection paused" : "Service stopped",
+      activeEngine === "tun"
+        ? tOverview(lang, "subtitleTunAdapter")
+        : tOverview(lang, "subtitleLocalProxy"),
+      serviceState === "running"
+        ? tOverview(lang, "subtitleProtectionPaused")
+        : tOverview(lang, "subtitleServiceStopped"),
     ];
     if (versionTag) parts.push(versionTag);
     return parts.join(" · ");
@@ -296,6 +323,7 @@ export function OverviewView({
     isRunning,
     isStarting,
     isYielded,
+    lang,
     live,
     serviceState,
     status,
@@ -304,30 +332,32 @@ export function OverviewView({
 
   const primaryButtonLabel = useMemo(() => {
     if (isInstallingService) {
-      return "Setting up...";
+      return tOverview(lang, "btnSettingUp");
     }
     if (isConnecting) {
-      return "Connecting...";
+      return tOverview(lang, "btnConnecting");
     }
     if (isPausing) {
-      return "Pausing...";
+      return tOverview(lang, "btnPausing");
     }
     if (isPrimaryBusy) {
       if (pendingToggleIntentRef.current === "pausing") {
-        return "Pausing...";
+        return tOverview(lang, "btnPausing");
       }
       if (pendingToggleIntentRef.current === "connecting") {
-        return "Connecting...";
+        return tOverview(lang, "btnConnecting");
       }
-      return "Updating...";
+      return tOverview(lang, "btnUpdating");
     }
     if (isLoadingStatus) {
-      return "Checking...";
+      return tOverview(lang, "btnChecking");
     }
     if (isNotInstalled) {
-      return "Set Up & Connect";
+      return tOverview(lang, "btnSetUpAndConnect");
     }
-    return (isRunning || isStarting) && !isYielded ? "Pause" : "Connect";
+    return (isRunning || isStarting) && !isYielded
+      ? tOverview(lang, "btnPause")
+      : tOverview(lang, "btnConnect");
   }, [
     isConnecting,
     isInstallingService,
@@ -338,6 +368,7 @@ export function OverviewView({
     isRunning,
     isStarting,
     isYielded,
+    lang,
   ]);
 
   const primaryButtonVariant = useMemo(() => {
@@ -371,7 +402,9 @@ export function OverviewView({
   const bytesTx = live?.bytesTx ?? 0;
 
   const dnsDisplay =
-    live?.dnsDisplay || settings?.dnsDisplay || "System default";
+    live?.dnsDisplay ||
+    settings?.dnsDisplay ||
+    tOverview(lang, "dnsSystemDefault");
   const dohActive = live
     ? live.dohEnabled
     : Boolean(settings?.effectiveDoh ?? settings?.dohEnabled);
@@ -381,26 +414,30 @@ export function OverviewView({
   const udpFlowsActive = live?.udpFlowsActive ?? 0;
   const connectionModeLabel = useMemo(() => {
     if (live?.ispStage) {
-      return `Adaptive: ${formatStageLabel(live.ispStage)}`;
+      return tOverview(lang, "connAdaptive", {
+        stage: formatStageLabelLocalized(lang, live.ispStage),
+      });
     }
     if (live?.mode) {
-      return `Mode: ${live.mode}`;
+      return tOverview(lang, "connMode", { mode: live.mode });
     }
     if (isLoadingStatus) {
-      return "Checking...";
+      return tOverview(lang, "btnChecking");
     }
     if (isStarting) {
-      return "Starting...";
+      return tOverview(lang, "headlineStarting");
     }
-    return isRunning ? "Adaptive ready" : "Idle";
-  }, [isLoadingStatus, isRunning, isStarting, live?.ispStage, live?.mode]);
+    return isRunning
+      ? tOverview(lang, "connAdaptiveReady")
+      : tOverview(lang, "connIdle");
+  }, [isLoadingStatus, isRunning, isStarting, lang, live?.ispStage, live?.mode]);
 
   const quicBlocked = live?.quicBlocked ?? 0;
   const splitMode: SplitTunnelMode =
     status?.splitTunnelMode ?? settings?.splitTunnelMode ?? "all";
   const splitCount =
     status?.splitTunnelCount ?? settings?.splitTunnelApps.length ?? 0;
-  const splitSummary = formatSplitSummary(splitMode, splitCount);
+  const splitSummary = formatSplitSummary(lang, splitMode, splitCount);
 
   const handlePrimaryClick = () => {
     if (primaryDisabled) return;
@@ -469,21 +506,18 @@ export function OverviewView({
     wintunDetail && /(?:sha-?256|\bhash\b|\bcorrupt(?:ed)?\b)/i.test(wintunDetail),
   );
   const wintunBannerTitle = wintunInvalid
-    ? "Full-PC driver invalid (wintun.dll)"
-    : "Full-PC driver missing (wintun.dll)";
+    ? tOverview(lang, "wintunInvalidTitle")
+    : tOverview(lang, "wintunMissingTitle");
 
   useEffect(() => {
     if (wintunRecheckDoneSeq === 0) return;
     if (wintunMissing) {
       const feedback = wintunInvalid
-        ? "wintun.dll is still invalid (hash verification failed). Replace it with an official copy and re-check."
-        : "wintun.dll is still missing from the app folder.";
+        ? tOverview(lang, "wintunStillInvalid")
+        : tOverview(lang, "wintunStillMissing");
       showWintunFeedback("warn", feedback);
     } else if (status?.wintun.ready) {
-      onPushToast?.(
-        "success",
-        "wintun.dll detected. Full-PC (TUN) mode is ready.",
-      );
+      onPushToast?.("success", tOverview(lang, "wintunDetectedReady"));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wintunRecheckDoneSeq]);
@@ -515,21 +549,18 @@ export function OverviewView({
           showWintunFeedback(
             "warn",
             isInvalid
-              ? "wintun.dll is still invalid (hash verification failed). Replace it with an official copy and re-check."
-              : "wintun.dll is still missing from the app folder.",
+              ? tOverview(lang, "wintunStillInvalid")
+              : tOverview(lang, "wintunStillMissing"),
           );
         } else if (refreshed.wintun.ready) {
-          onPushToast?.(
-            "success",
-            "wintun.dll detected. Full-PC (TUN) mode is ready.",
-          );
+          onPushToast?.("success", tOverview(lang, "wintunDetectedReady"));
         }
       } else {
         setWintunRecheckDoneSeq((prev) => prev + 1);
       }
     } catch {
       if (mountedRef.current) {
-        showWintunFeedback("error", "Could not re-check wintun.dll status.");
+        showWintunFeedback("error", tOverview(lang, "wintunRecheckError"));
       }
     } finally {
       if (mountedRef.current) {
@@ -540,25 +571,25 @@ export function OverviewView({
 
   const chartPausedLabel = useMemo(() => {
     if (isLoadingStatus) {
-      return "Checking status...";
+      return tOverview(lang, "headlineChecking");
     }
     if (isNotInstalled || wintunMissing) {
-      return "Setup required";
+      return tOverview(lang, "chartPausedSetup");
     }
     if (isYielded) {
-      return "Yielded to VPN";
+      return tOverview(lang, "headlineYielded");
     }
     if (isStarting) {
-      return "Starting...";
+      return tOverview(lang, "headlineStarting");
     }
-    return "Protection paused";
-  }, [isLoadingStatus, isNotInstalled, isStarting, isYielded, wintunMissing]);
+    return tOverview(lang, "chartPausedDefault");
+  }, [isLoadingStatus, isNotInstalled, isStarting, isYielded, lang, wintunMissing]);
 
   const engineSwitchAdminNote =
     status?.platform === "windows"
-      ? " A Windows administrator prompt may appear to restart the background service."
+      ? tOverview(lang, "confirmAdminWindows")
       : status?.platform === "macos"
-        ? " A macOS administrator password prompt may appear to restart the background service."
+        ? tOverview(lang, "confirmAdminMac")
         : "";
 
   const handleCopyActivity = async () => {
@@ -580,14 +611,23 @@ export function OverviewView({
   };
 
   const wintunDescription = wintunDetail
-    ? `${wintunDetail.replace(/\.$/, "")}. Proxy mode only covers web browsers (not Discord voice or games).`
-    : "Place wintun.dll in the app folder for full-PC TUN protection. Proxy mode only covers web browsers (not Discord voice or games).";
+    ? tOverview(lang, "wintunDetailWithNote", {
+        detail: wintunDetail.replace(/\.$/, ""),
+      })
+    : tOverview(lang, "wintunDefaultDesc");
 
   const engineHintText = isSwitchingEngine
     ? switchTargetEngine
-      ? `Switching engine to ${switchTargetEngine === "tun" ? "TUN" : "Proxy"}...`
-      : "Switching engine..."
-    : ENGINE_DESCRIPTIONS[activeEngine];
+      ? tOverview(lang, "engineSwitchingTo", {
+          engine:
+            switchTargetEngine === "tun"
+              ? tOverview(lang, "engineTun")
+              : tOverview(lang, "engineProxy"),
+        })
+      : tOverview(lang, "engineSwitching")
+    : activeEngine === "tun"
+      ? tOverview(lang, "engineDescTun")
+      : tOverview(lang, "engineDescProxy");
 
   return (
     <div className="view-stack view-overview">
@@ -621,10 +661,10 @@ export function OverviewView({
         <div className="control-engine-row">
           <div className="control-engine-header">
             <span id={engineLabelId} className="control-engine-label">
-              Engine
+              {tOverview(lang, "engineLabel")}
             </span>
             <SegmentedControl<EngineMode>
-              options={ENGINE_OPTIONS}
+              options={engineOptions}
               value={activeEngine}
               disabled={!status || isAnyBusy}
               ariaLabelledBy={engineLabelId}
@@ -641,18 +681,20 @@ export function OverviewView({
           <InlineBanner
             tone="warn"
             title={
-              isYielded ? "Yielded to active VPN" : "Full-tunnel VPN detected"
+              isYielded
+                ? tOverview(lang, "vpnYieldedTitle")
+                : tOverview(lang, "vpnDetectedTitle")
             }
             description={
               isYielded
-                ? `Active full-tunnel interface (${vpnConflict}) detected. Protection paused automatically to prevent routing conflicts and will resume once the VPN disconnects.`
+                ? tOverview(lang, "vpnYieldedDesc", { vpn: vpnConflict })
                 : settings?.vpnCoexistence === "warn"
-                  ? `Active full-tunnel interface (${vpnConflict}) detected while coexistence is set to warn. Traffic may bypass or conflict with the VPN tunnel.`
+                  ? tOverview(lang, "vpnWarnDesc", { vpn: vpnConflict })
                   : isRunning
-                    ? `Active full-tunnel interface (${vpnConflict}) detected while protection is running. Traffic may bypass or conflict with the VPN tunnel.`
-                    : `Active full-tunnel interface (${vpnConflict}) detected. Protection will yield automatically if connected while this VPN is active.`
+                    ? tOverview(lang, "vpnRunningDesc", { vpn: vpnConflict })
+                    : tOverview(lang, "vpnIdleDesc", { vpn: vpnConflict })
             }
-            actionLabel="VPN Coexistence"
+            actionLabel={tOverview(lang, "vpnAction")}
             onAction={() => onNavigate("dns")}
           />
         )}
@@ -681,7 +723,7 @@ export function OverviewView({
                 disabled={isAnyBusy}
                 onClick={handleOpenAppFolder}
               >
-                Open App Folder
+                {tOverview(lang, "btnOpenAppFolder")}
               </button>
               {onRefreshStatus && (
                 <button
@@ -692,7 +734,9 @@ export function OverviewView({
                     void handleRecheckWintun();
                   }}
                 >
-                  {isRecheckingWintun ? "Checking..." : "Re-check"}
+                  {isRecheckingWintun
+                    ? tOverview(lang, "btnChecking")
+                    : tOverview(lang, "btnRecheck")}
                 </button>
               )}
               <button
@@ -701,7 +745,7 @@ export function OverviewView({
                 disabled={isAnyBusy}
                 onClick={() => handleEngineChange("proxy")}
               >
-                Switch to Proxy
+                {tOverview(lang, "btnSwitchToProxy")}
               </button>
             </div>
           }
@@ -711,30 +755,39 @@ export function OverviewView({
       {isNotInstalled && !wintunMissing && (
         <InlineBanner
           tone="info"
-          title="One-time setup required"
-          description="Click Set Up & Connect above to install the background service and start protection. An administrator prompt may appear to approve the setup."
-          actionLabel="Open Settings"
+          title={tOverview(lang, "setupRequiredTitle")}
+          description={tOverview(lang, "setupRequiredDesc")}
+          actionLabel={tOverview(lang, "btnOpenSettings")}
           onAction={() => onNavigate("settings")}
         />
       )}
 
-      <section className="metrics-grid" aria-label="Live telemetry">
+      <section
+        className="metrics-grid"
+        aria-label={tOverview(lang, "metricsAria")}
+      >
         <article className="card metric-card">
           <div className="metric-header">
-            <span className="metric-label">Session Transfer</span>
+            <span className="metric-label">
+              {tOverview(lang, "metricSessionTransfer")}
+            </span>
           </div>
           <div className="metric-value-stack tabular-nums">
             <span className="metric-rate-down">↓ {formatBytes(bytesRx)}</span>
             <span className="metric-rate-up">↑ {formatBytes(bytesTx)}</span>
           </div>
           <div className="metric-meta tabular-nums">
-            Total {formatBytes(bytesRx + bytesTx)}
+            {tOverview(lang, "metricTotal", {
+              value: formatBytes(bytesRx + bytesTx),
+            })}
           </div>
         </article>
 
         <article className="card metric-card">
           <div className="metric-header">
-            <span className="metric-label">DNS</span>
+            <span className="metric-label">
+              {tOverview(lang, "metricDns")}
+            </span>
             <span
               className={`pill ${dohActive ? "pill-accent" : "pill-neutral"}`}
             >
@@ -748,13 +801,17 @@ export function OverviewView({
             {dnsDisplay}
           </div>
           <div className="metric-meta tabular-nums">
-            {formatCount(dnsQueries)} queries
+            {tOverview(lang, "metricQueries", {
+              count: formatCount(dnsQueries),
+            })}
           </div>
         </article>
 
         <article className="card metric-card">
           <div className="metric-header">
-            <span className="metric-label">Connections</span>
+            <span className="metric-label">
+              {tOverview(lang, "metricConnections")}
+            </span>
           </div>
           <div className="metric-value tabular-nums">
             {formatCount(activeConnections)} TCP · {formatCount(udpFlowsActive)}{" "}
@@ -765,10 +822,14 @@ export function OverviewView({
 
         <article className="card metric-card">
           <div className="metric-header">
-            <span className="metric-label">Protection</span>
+            <span className="metric-label">
+              {tOverview(lang, "metricProtection")}
+            </span>
           </div>
           <div className="metric-value tabular-nums">
-            {formatCount(quicBlocked)} QUIC blocked
+            {tOverview(lang, "metricQuicBlocked", {
+              count: formatCount(quicBlocked),
+            })}
           </div>
           <div className="metric-meta">
             <button
@@ -784,19 +845,25 @@ export function OverviewView({
         </article>
       </section>
 
-      <section className="card chart-card" aria-label="Throughput history">
+      <section
+        className="card chart-card"
+        aria-label={tOverview(lang, "chartAria")}
+      >
         <ThroughputChart
           points={history}
           running={isRunning}
           rxRateBps={rxRateBps}
           txRateBps={txRateBps}
-          title="Throughput"
-          caption="60s window"
+          title={tOverview(lang, "chartTitle")}
+          caption={tOverview(lang, "chartCaption")}
           pausedLabel={chartPausedLabel}
         />
       </section>
 
-      <section className="card activity-card" aria-label="Recent activity">
+      <section
+        className="card activity-card"
+        aria-label={tOverview(lang, "activityAria")}
+      >
         <div className="card-header activity-header">
           <button
             type="button"
@@ -809,7 +876,9 @@ export function OverviewView({
               direction="down"
               className={`activity-chevron${activityOpen ? "" : " is-collapsed"}`}
             />
-            <span className="card-title">Activity</span>
+            <span className="card-title">
+              {tOverview(lang, "activityTitle")}
+            </span>
             <span className="pill pill-neutral tabular-nums">
               {activity.length}
             </span>
@@ -825,7 +894,11 @@ export function OverviewView({
               }}
             >
               {copied ? <IconCheck /> : <IconCopy />}
-              <span>{copied ? "Copied" : "Copy"}</span>
+              <span>
+                {copied
+                  ? tOverview(lang, "btnCopied")
+                  : tOverview(lang, "btnCopy")}
+              </span>
             </button>
             <button
               type="button"
@@ -834,7 +907,7 @@ export function OverviewView({
               onClick={onClearActivity}
             >
               <IconTrash />
-              <span>Clear</span>
+              <span>{tOverview(lang, "btnClear")}</span>
             </button>
           </div>
         </div>
@@ -843,7 +916,7 @@ export function OverviewView({
           <div id="overview-activity-panel" className="activity-body">
             {activity.length === 0 ? (
               <p className="activity-empty">
-                No activity recorded in this session.
+                {tOverview(lang, "activityEmpty")}
               </p>
             ) : (
               <ul className="activity-list">
@@ -861,9 +934,11 @@ export function OverviewView({
                     <span
                       className={`pill pill-cat pill-cat-${event.category}`}
                     >
-                      {ACTIVITY_CATEGORY_LABELS[event.category]}
+                      {formatActivityCategory(lang, event.category)}
                     </span>
-                    <span className="activity-message">{event.message}</span>
+                    <span className="activity-message">
+                      {localizeActivityMessage(lang, event.message)}
+                    </span>
                   </li>
                 ))}
               </ul>
@@ -876,18 +951,24 @@ export function OverviewView({
         open={pendingEngine !== null}
         title={
           pendingEngine === "proxy"
-            ? "Switch engine to Proxy?"
-            : "Switch engine to TUN?"
+            ? tOverview(lang, "confirmProxyTitle")
+            : tOverview(lang, "confirmTunTitle")
         }
         description={
           pendingEngine === "proxy"
-            ? `Switching engines restarts protection and will briefly interrupt active games, voice calls, and ongoing connections. Proxy mode only covers web browsers (not Discord voice or most games).${engineSwitchAdminNote}`
-            : `Switching engines restarts protection and will briefly interrupt active games, voice calls, and ongoing connections while the full-PC TUN adapter starts.${engineSwitchAdminNote}`
+            ? tOverview(lang, "confirmProxyDesc", {
+                adminNote: engineSwitchAdminNote,
+              })
+            : tOverview(lang, "confirmTunDesc", {
+                adminNote: engineSwitchAdminNote,
+              })
         }
         confirmLabel={
-          pendingEngine === "proxy" ? "Switch to Proxy" : "Switch to TUN"
+          pendingEngine === "proxy"
+            ? tOverview(lang, "confirmProxyBtn")
+            : tOverview(lang, "confirmTunBtn")
         }
-        cancelLabel="Cancel"
+        cancelLabel={tOverview(lang, "cancel")}
         onConfirm={handleConfirmEngineSwitch}
         onCancel={() => setPendingEngine(null)}
       />

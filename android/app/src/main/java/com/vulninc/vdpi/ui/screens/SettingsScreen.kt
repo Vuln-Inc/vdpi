@@ -91,6 +91,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.vulninc.vdpi.data.AppLanguage
 import com.vulninc.vdpi.data.ThemePreference
 import com.vulninc.vdpi.data.VdpiSettings
 import com.vulninc.vdpi.engine.DesyncMode
@@ -105,6 +106,7 @@ import com.vulninc.vdpi.ui.components.SectionFooter
 import com.vulninc.vdpi.ui.components.SectionOverline
 import com.vulninc.vdpi.ui.components.SegmentedControl
 import com.vulninc.vdpi.ui.components.sculptedDarkCardBorder
+import com.vulninc.vdpi.ui.i18n.LocalVdpiStrings
 import com.vulninc.vdpi.ui.theme.GeistSans
 import com.vulninc.vdpi.ui.theme.VdpiTextStyles
 import com.vulninc.vdpi.ui.theme.VdpiThemeTokens
@@ -145,6 +147,7 @@ fun SettingsScreen(
     onOpenAlwaysOnVpn: () -> Unit,
     onClearCache: () -> Unit,
     modifier: Modifier = Modifier,
+    onSetLanguage: (AppLanguage) -> Unit = {},
     availableUpdate: UpdateBannerInfo? = null,
     isCheckingUpdate: Boolean = false,
     updateStatusMessage: String? = null,
@@ -229,6 +232,12 @@ fun SettingsScreen(
             )
             Spacer(Modifier.height(sectionGap))
 
+            LanguageSettingsSection(
+                language = settings.language,
+                onSetLanguage = onSetLanguage,
+            )
+            Spacer(Modifier.height(sectionGap))
+
             SystemSettingsSection(
                 onClearCache = onClearCache,
                 onOpenAlwaysOnVpn = onOpenAlwaysOnVpn,
@@ -266,6 +275,7 @@ fun SettingsScreen(
 @Composable
 private fun SettingsHeader(isLandscape: Boolean) {
     val palette = VdpiThemeTokens.palette
+    val strings = LocalVdpiStrings.current
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -273,7 +283,7 @@ private fun SettingsHeader(isLandscape: Boolean) {
         contentAlignment = Alignment.CenterStart,
     ) {
         Text(
-            text = "Settings",
+            text = strings.settingsTitle,
             style = if (isLandscape) {
                 VdpiTextStyles.pageTitle.copy(
                     fontSize = 24.sp,
@@ -299,10 +309,11 @@ private fun DesyncSettingsSection(
     onSetDesyncMode: (DesyncMode) -> Unit,
     onSetChunkSize: (Int) -> Unit,
 ) {
+    val strings = LocalVdpiStrings.current
     val haptic = LocalHapticFeedback.current
 
     Column(modifier = Modifier.fillMaxWidth()) {
-        SectionOverline("Desync Engine")
+        SectionOverline(strings.sectionDesyncEngine)
         InsetGroupedCard(
             modifier = Modifier
                 .fillMaxWidth()
@@ -313,8 +324,8 @@ private fun DesyncSettingsSection(
                 if (idx > 0) HairlineRule(startIndent = 16.dp)
                 val isSelected = desyncMode == mode
                 InsetGroupedRow(
-                    title = mode.label,
-                    subtitle = mode.summary,
+                    title = strings.desyncModeLabel(mode),
+                    subtitle = strings.desyncModeSummary(mode),
                     modifier = Modifier.semantics { selected = isSelected },
                     onClick = {
                         if (!isSelected) {
@@ -342,7 +353,7 @@ private fun DesyncSettingsSection(
                 },
             )
         }
-        SectionFooter("Splits initial TLS ClientHello packets to evade DPI inspection. Chunk size sets the first fragment length (1–64 bytes).")
+        SectionFooter(strings.footerDesyncEngine)
     }
 }
 
@@ -366,6 +377,7 @@ private fun DnsSettingsSection(
     onSetBlockQuic: (Boolean) -> Unit,
     onSetIpv4Only: (Boolean) -> Unit,
 ) {
+    val strings = LocalVdpiStrings.current
     val haptic = LocalHapticFeedback.current
     val focusManager = LocalFocusManager.current
 
@@ -373,7 +385,7 @@ private fun DnsSettingsSection(
     var customDnsInput by rememberSaveable(dnsAddr) {
         mutableStateOf(if (isPresetDns) "" else dnsAddr)
     }
-    var dnsError by remember(dnsAddr) { mutableStateOf<String?>(null) }
+    var showDnsError by remember(dnsAddr) { mutableStateOf(false) }
 
     val isActiveHttpsDns = dnsAddr.trim().startsWith("https://", ignoreCase = true)
     val effectiveEnableDoh = enableDoh || isActiveHttpsDns
@@ -386,10 +398,10 @@ private fun DnsSettingsSection(
     fun submitDns() {
         val candidate = customDnsInput.trim()
         if (!isValidDnsInput(candidate)) {
-            dnsError = "Enter a valid IPv4, IPv6, or https:// DoH URL"
+            showDnsError = true
             return
         }
-        dnsError = null
+        showDnsError = false
         focusManager.clearFocus()
         val addrChanged = !isSameDnsEndpoint(candidate, dnsAddr)
         val shouldEnableDoh = candidate.startsWith("https://", ignoreCase = true) && !enableDoh
@@ -405,7 +417,7 @@ private fun DnsSettingsSection(
     }
 
     Column(modifier = Modifier.fillMaxWidth()) {
-        SectionOverline("DNS & Privacy")
+        SectionOverline(strings.sectionDnsPrivacy)
         InsetGroupedCard(
             modifier = Modifier
                 .fillMaxWidth()
@@ -423,7 +435,7 @@ private fun DnsSettingsSection(
                     onClick = {
                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         customDnsInput = ""
-                        dnsError = null
+                        showDnsError = false
                         focusManager.clearFocus()
                         if (!isSelected) onSetDnsAddr(preset.address)
                     },
@@ -437,18 +449,18 @@ private fun DnsSettingsSection(
 
             BorderlessInputRow(
                 value = customDnsInput,
-                placeholder = "Custom DNS (IP or https://...)",
-                actionLabel = "Apply",
+                placeholder = strings.placeholderCustomDns,
+                actionLabel = strings.actionApply,
                 actionEnabled = dnsDirty,
                 showCheckmark = customDnsActive,
-                errorText = dnsError,
+                errorText = if (showDnsError) strings.errorInvalidDns else null,
                 onValueChange = { next ->
                     customDnsInput = next
                     val trimmed = next.trim()
-                    dnsError = when {
-                        trimmed.isEmpty() -> null
-                        dnsError != null && !isValidDnsInput(trimmed) -> dnsError
-                        else -> null
+                    showDnsError = when {
+                        trimmed.isEmpty() -> false
+                        showDnsError && !isValidDnsInput(trimmed) -> true
+                        else -> false
                     }
                 },
                 onSubmit = ::submitDns,
@@ -457,11 +469,11 @@ private fun DnsSettingsSection(
             HairlineRule(startIndent = 16.dp)
 
             ToggleSettingRow(
-                title = "DNS over HTTPS",
+                title = strings.labelDoh,
                 subtitle = if (isActiveHttpsDns) {
-                    "Required for HTTPS DoH URL"
+                    strings.subtitleDohRequired
                 } else {
-                    "Encrypt DNS queries with automatic failover"
+                    strings.subtitleDohDefault
                 },
                 checked = effectiveEnableDoh,
                 enabled = !isActiveHttpsDns,
@@ -475,8 +487,8 @@ private fun DnsSettingsSection(
             HairlineRule(startIndent = 16.dp)
 
             ToggleSettingRow(
-                title = "Block QUIC",
-                subtitle = "Drop UDP/443 so apps fall back to TCP TLS",
+                title = strings.labelBlockQuic,
+                subtitle = strings.subtitleBlockQuic,
                 checked = blockQuic,
                 onCheckedChange = onSetBlockQuic,
             )
@@ -484,14 +496,19 @@ private fun DnsSettingsSection(
             HairlineRule(startIndent = 16.dp)
 
             ToggleSettingRow(
-                title = "IPv4 Only",
-                subtitle = "Skip AAAA lookups and IPv6 tunnel routes",
+                title = strings.labelIpv4Only,
+                subtitle = strings.subtitleIpv4Only,
                 checked = ipv4Only,
                 onCheckedChange = onSetIpv4Only,
             )
         }
-        SectionFooter("Blocking QUIC forces HTTP/3 traffic onto TCP where DPI desync applies.")
+        SectionFooter(strings.footerDnsPrivacy)
     }
+}
+
+private sealed interface BypassErrorState {
+    data object Invalid : BypassErrorState
+    data class Duplicate(val domain: String) : BypassErrorState
 }
 
 @Composable
@@ -500,23 +517,30 @@ private fun BypassDomainsSection(
     onAddBypassDomain: (String) -> Unit,
     onRemoveBypassDomain: (String) -> Unit,
 ) {
+    val strings = LocalVdpiStrings.current
     val haptic = LocalHapticFeedback.current
     val focusManager = LocalFocusManager.current
 
     var bypassInput by rememberSaveable { mutableStateOf("") }
-    var bypassError by remember { mutableStateOf<String?>(null) }
+    var bypassErrorState by remember { mutableStateOf<BypassErrorState?>(null) }
+
+    val bypassError = when (val err = bypassErrorState) {
+        BypassErrorState.Invalid -> strings.errorInvalidDomain
+        is BypassErrorState.Duplicate -> strings.errorDuplicateDomain(err.domain)
+        null -> null
+    }
 
     fun submitBypass() {
         val cleaned = sanitizeDomainInput(bypassInput)
         if (!isValidBypassDomain(cleaned)) {
-            bypassError = "Enter a valid domain (e.g. example.com or *.example.com)"
+            bypassErrorState = BypassErrorState.Invalid
             return
         }
         if (cleaned in bypassDomains) {
-            bypassError = "$cleaned is already in the bypass list"
+            bypassErrorState = BypassErrorState.Duplicate(cleaned)
             return
         }
-        bypassError = null
+        bypassErrorState = null
         bypassInput = ""
         focusManager.clearFocus()
         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
@@ -524,7 +548,7 @@ private fun BypassDomainsSection(
     }
 
     Column(modifier = Modifier.fillMaxWidth()) {
-        SectionOverline("Bypass Domains")
+        SectionOverline(strings.sectionBypassDomains)
         InsetGroupedCard(
             modifier = Modifier
                 .fillMaxWidth()
@@ -533,14 +557,14 @@ private fun BypassDomainsSection(
         ) {
             BorderlessInputRow(
                 value = bypassInput,
-                placeholder = "Add domain (e.g. example.com)",
-                actionLabel = "Add",
+                placeholder = strings.placeholderAddDomain,
+                actionLabel = strings.actionAdd,
                 actionEnabled = bypassInput.isNotBlank(),
                 showCheckmark = false,
                 errorText = bypassError,
                 onValueChange = { next ->
                     bypassInput = next
-                    if (bypassError != null) bypassError = null
+                    if (bypassErrorState != null) bypassErrorState = null
                 },
                 onSubmit = ::submitBypass,
             )
@@ -563,7 +587,7 @@ private fun BypassDomainsSection(
                 )
             }
         }
-        SectionFooter("Matching domains and subdomains connect directly without DPI desync. Local networks are bypassed automatically.")
+        SectionFooter(strings.footerBypassDomains)
     }
 }
 
@@ -572,13 +596,31 @@ private fun AppearanceSettingsSection(
     theme: ThemePreference,
     onSetTheme: (ThemePreference) -> Unit,
 ) {
+    val strings = LocalVdpiStrings.current
     Column(modifier = Modifier.fillMaxWidth()) {
-        SectionOverline("Appearance")
+        SectionOverline(strings.sectionAppearance)
         SegmentedControl(
             options = ThemePreference.entries,
             selected = theme,
-            labelFor = { it.label },
+            labelFor = { strings.themeLabel(it) },
             onSelect = onSetTheme,
+        )
+    }
+}
+
+@Composable
+private fun LanguageSettingsSection(
+    language: AppLanguage,
+    onSetLanguage: (AppLanguage) -> Unit,
+) {
+    val strings = LocalVdpiStrings.current
+    Column(modifier = Modifier.fillMaxWidth()) {
+        SectionOverline(strings.sectionLanguage)
+        SegmentedControl(
+            options = AppLanguage.entries,
+            selected = language,
+            labelFor = { strings.languageOptionLabel(it) },
+            onSelect = onSetLanguage,
         )
     }
 }
@@ -589,10 +631,11 @@ private fun SystemSettingsSection(
     onOpenAlwaysOnVpn: () -> Unit,
 ) {
     val palette = VdpiThemeTokens.palette
+    val strings = LocalVdpiStrings.current
     val haptic = LocalHapticFeedback.current
 
     Column(modifier = Modifier.fillMaxWidth()) {
-        SectionOverline("System")
+        SectionOverline(strings.sectionSystem)
         InsetGroupedCard(
             modifier = Modifier
                 .fillMaxWidth()
@@ -600,8 +643,8 @@ private fun SystemSettingsSection(
             radius = 16.dp,
         ) {
             InsetGroupedRow(
-                title = "Clear Engine Cache",
-                subtitle = "Reset learned TLS stages and DNS entries",
+                title = strings.labelClearCache,
+                subtitle = strings.subtitleClearCache,
                 onClick = {
                     haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                     onClearCache()
@@ -611,8 +654,8 @@ private fun SystemSettingsSection(
             HairlineRule(startIndent = 16.dp)
 
             InsetGroupedRow(
-                title = "System VPN Settings",
-                subtitle = "Configure Always-on VPN in Android settings",
+                title = strings.labelSystemVpn,
+                subtitle = strings.subtitleSystemVpn,
                 onClick = {
                     haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                     onOpenAlwaysOnVpn()
@@ -631,10 +674,11 @@ private fun BackupRestoreSection(
     onImportSettings: () -> Unit,
 ) {
     val palette = VdpiThemeTokens.palette
+    val strings = LocalVdpiStrings.current
     val haptic = LocalHapticFeedback.current
 
     Column(modifier = Modifier.fillMaxWidth()) {
-        SectionOverline("Backup & Restore")
+        SectionOverline(strings.sectionBackupRestore)
         InsetGroupedCard(
             modifier = Modifier
                 .fillMaxWidth()
@@ -642,8 +686,8 @@ private fun BackupRestoreSection(
             radius = 16.dp,
         ) {
             InsetGroupedRow(
-                title = "Export Settings",
-                subtitle = "Save configuration as JSON",
+                title = strings.labelExportSettings,
+                subtitle = strings.subtitleExportSettings,
                 onClick = {
                     haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                     onExportSettings()
@@ -656,8 +700,8 @@ private fun BackupRestoreSection(
             HairlineRule(startIndent = 16.dp)
 
             InsetGroupedRow(
-                title = "Import Settings",
-                subtitle = "Restore configuration from JSON",
+                title = strings.labelImportSettings,
+                subtitle = strings.subtitleImportSettings,
                 onClick = {
                     haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                     onImportSettings()
@@ -667,7 +711,7 @@ private fun BackupRestoreSection(
                 },
             )
         }
-        SectionFooter("Exports desync, DNS, bypass domains, split tunnel, and theme preferences.")
+        SectionFooter(strings.footerBackupRestore)
     }
 }
 
@@ -681,11 +725,12 @@ private fun UpdatesSettingsSection(
     onOpenReleaseUrl: (String) -> Unit,
 ) {
     val palette = VdpiThemeTokens.palette
+    val strings = LocalVdpiStrings.current
     val haptic = LocalHapticFeedback.current
     val currentVersionTag = formatVersionTag(appVersion)
 
     Column(modifier = Modifier.fillMaxWidth()) {
-        SectionOverline("Updates")
+        SectionOverline(strings.sectionUpdates)
         InsetGroupedCard(
             modifier = Modifier
                 .fillMaxWidth()
@@ -695,8 +740,8 @@ private fun UpdatesSettingsSection(
             if (availableUpdate != null) {
                 val latestTag = formatVersionTag(availableUpdate.latestVersion)
                 InsetGroupedRow(
-                    title = "Update Available · $latestTag",
-                    subtitle = "Open release on GitHub",
+                    title = strings.updateAvailableWithTag(latestTag),
+                    subtitle = strings.subtitleOpenRelease,
                     modifier = Modifier.heightIn(min = 52.dp),
                     onClick = { onOpenReleaseUrl(availableUpdate.releaseUrl) },
                     leading = {
@@ -713,7 +758,7 @@ private fun UpdatesSettingsSection(
                             horizontalArrangement = Arrangement.spacedBy(5.dp),
                         ) {
                             Text(
-                                text = "Download",
+                                text = strings.actionDownload,
                                 fontFamily = GeistSans,
                                 fontWeight = FontWeight.Medium,
                                 fontSize = 14.sp,
@@ -731,7 +776,7 @@ private fun UpdatesSettingsSection(
                 val trailingText = shortStatus ?: currentVersionTag
 
                 InsetGroupedRow(
-                    title = "Check for Updates",
+                    title = strings.labelCheckForUpdates,
                     subtitle = subtitleText,
                     modifier = Modifier.heightIn(min = 52.dp),
                     onClick = if (isCheckingUpdate) {
@@ -770,9 +815,10 @@ private fun AboutSettingsSection(
     onOpenGitHub: () -> Unit,
 ) {
     val palette = VdpiThemeTokens.palette
+    val strings = LocalVdpiStrings.current
 
     Column(modifier = Modifier.fillMaxWidth()) {
-        SectionOverline("About")
+        SectionOverline(strings.sectionAbout)
         InsetGroupedCard(
             modifier = Modifier
                 .fillMaxWidth()
@@ -780,7 +826,7 @@ private fun AboutSettingsSection(
             radius = 16.dp,
         ) {
             InsetGroupedRow(
-                title = "GitHub Repository",
+                title = strings.labelGitHubRepo,
                 subtitle = GITHUB_REPO_LABEL,
                 subtitleTextDirection = TextDirection.Ltr,
                 modifier = Modifier.heightIn(min = 52.dp),
@@ -791,7 +837,7 @@ private fun AboutSettingsSection(
                         horizontalArrangement = Arrangement.spacedBy(5.dp),
                     ) {
                         Text(
-                            text = "Open",
+                            text = strings.actionOpen,
                             fontFamily = GeistSans,
                             fontWeight = FontWeight.Medium,
                             fontSize = 14.sp,
@@ -851,6 +897,7 @@ private fun ChunkSizeRow(
     onIncrease: () -> Unit,
 ) {
     val palette = VdpiThemeTokens.palette
+    val strings = LocalVdpiStrings.current
     val reduceMotion = LocalReduceMotion.current
     val canDecrease = chunkSize > 1
     val canIncrease = chunkSize < 64
@@ -865,7 +912,7 @@ private fun ChunkSizeRow(
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
         Text(
-            text = "Chunk Size",
+            text = strings.labelChunkSize,
             style = VdpiTextStyles.rowTitle,
             color = palette.inkPrimary,
             maxLines = 2,
@@ -893,7 +940,7 @@ private fun ChunkSizeRow(
         ) {
             StepperIconButton(
                 isIncrease = false,
-                contentDescription = "Decrease chunk size",
+                contentDescription = strings.cdDecreaseChunkSize,
                 enabled = canDecrease,
                 onClick = onDecrease,
             )
@@ -951,7 +998,7 @@ private fun ChunkSizeRow(
 
             StepperIconButton(
                 isIncrease = true,
-                contentDescription = "Increase chunk size",
+                contentDescription = strings.cdIncreaseChunkSize,
                 enabled = canIncrease,
                 onClick = onIncrease,
             )
@@ -1216,6 +1263,7 @@ private fun RemoveDomainButton(
     onRemove: () -> Unit,
 ) {
     val palette = VdpiThemeTokens.palette
+    val strings = LocalVdpiStrings.current
     val interaction = remember { MutableInteractionSource() }
     val isPressed by interaction.collectIsPressedAsState()
     val pressWash by animateColorAsState(
@@ -1233,7 +1281,7 @@ private fun RemoveDomainButton(
                 role = Role.Button,
                 onClick = onRemove,
             )
-            .semantics { contentDescription = "Remove $domain" },
+            .semantics { contentDescription = strings.cdRemoveDomain(domain) },
         contentAlignment = Alignment.CenterEnd,
     ) {
         Box(

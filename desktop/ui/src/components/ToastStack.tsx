@@ -1,6 +1,8 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FocusEvent } from "react";
 import { createPortal } from "react-dom";
+import { useLang } from "../i18n/context";
+import { tShell } from "../i18n/shell";
 
 export type ToastTone = "info" | "success" | "warn" | "error";
 
@@ -239,6 +241,7 @@ function ToastStackComponent({
   maxVisible = MAX_VISIBLE_CAP,
   className,
 }: ToastStackProps) {
+  const { lang } = useLang();
   const hoveredIdsRef = useRef<Set<string>>(new Set());
   const focusedIdsRef = useRef<Set<string>>(new Set());
   const onPauseTimerRef = useRef(onPauseTimer);
@@ -375,7 +378,7 @@ function ToastStackComponent({
     <div
       className={stackClasses}
       role="region"
-      aria-label="Notifications"
+      aria-label={tShell(lang, "notificationsAria")}
       data-placement="top-right"
     >
       {visibleToasts.map((toast) => {
@@ -411,7 +414,7 @@ function ToastStackComponent({
             <button
               type="button"
               className="toast__dismiss"
-              aria-label="Dismiss notification"
+              aria-label={tShell(lang, "dismissNotificationAria")}
               onClick={() => handleDismiss(toast.id)}
             >
               <CloseIcon />

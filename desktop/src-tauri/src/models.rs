@@ -40,6 +40,15 @@ pub enum ThemePreferenceDto {
     Light,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LanguagePreferenceDto {
+    #[default]
+    System,
+    En,
+    Tr,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagStatusDto {
@@ -120,26 +129,16 @@ pub struct DesktopStatusSnapshotDto {
     pub config_warning: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct GuiPreferencesDto {
     pub theme: ThemePreferenceDto,
+    #[serde(default)]
+    pub language: LanguagePreferenceDto,
     pub keep_in_tray_on_close: bool,
     pub minimize_to_tray: bool,
     pub start_minimized_to_tray: bool,
     pub show_taskbar_icon_when_minimized: bool,
-}
-
-impl Default for GuiPreferencesDto {
-    fn default() -> Self {
-        Self {
-            theme: ThemePreferenceDto::System,
-            keep_in_tray_on_close: false,
-            minimize_to_tray: false,
-            start_minimized_to_tray: false,
-            show_taskbar_icon_when_minimized: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

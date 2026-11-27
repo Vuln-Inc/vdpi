@@ -1,5 +1,11 @@
 import { memo, useEffect, useMemo } from "react";
 import { IconCheck } from "../components/Icons";
+import { useLang, type ResolvedLanguage } from "../i18n/context";
+import {
+  localizePresetDescription,
+  localizePresetLabel,
+  tSplit,
+} from "../i18n/split";
 import type { SplitTunnelMode, SplitTunnelPreset } from "../types";
 
 export type PresetSelectionState = "none" | "partial" | "all";
@@ -226,16 +232,27 @@ export function getPresetSelectionSummary(
 function buildPresetTooltip(
   preset: SplitTunnelPreset,
   summary: PresetSelectionSummary,
+  lang: ResolvedLanguage,
 ): string {
-  const desc = preset.description.trim();
+  const label = localizePresetLabel(lang, preset);
+  const desc = localizePresetDescription(lang, preset).trim();
   if (summary.totalCount === 0) {
-    return desc || preset.label;
+    return desc || label;
   }
   const suffix =
     summary.matchedCount > 0
-      ? `${summary.matchedCount}/${summary.totalCount} selected`
-      : `${summary.totalCount} ${summary.totalCount === 1 ? "app" : "apps"}`;
-  return desc ? `${desc} (${suffix})` : `${preset.label} (${suffix})`;
+      ? tSplit(lang, "presetTooltipSelected", {
+          matched: summary.matchedCount,
+          total: summary.totalCount,
+        })
+      : tSplit(
+          lang,
+          summary.totalCount === 1
+            ? "presetTooltipAppOne"
+            : "presetTooltipAppMany",
+          { total: summary.totalCount },
+        );
+  return desc ? `${desc} (${suffix})` : `${label} (${suffix})`;
 }
 
 export const SplitTunnelPresets = memo(function SplitTunnelPresets({
@@ -246,6 +263,8 @@ export const SplitTunnelPresets = memo(function SplitTunnelPresets({
   onTogglePreset,
   className,
 }: SplitTunnelPresetsProps) {
+  const { lang } = useLang();
+
   useEffect(() => {
     ensureStyles();
   }, []);
@@ -272,7 +291,7 @@ export const SplitTunnelPresets = memo(function SplitTunnelPresets({
     <div
       className={stripClasses}
       role="group"
-      aria-label="App presets"
+      aria-label={tSplit(lang, "ariaPresetsGroup")}
       data-mode={mode ?? ""}
       data-disabled={stripDisabled ? "true" : "false"}
     >
@@ -286,6 +305,7 @@ export const SplitTunnelPresets = memo(function SplitTunnelPresets({
             : summary.state === "partial"
               ? "mixed"
               : false;
+        const presetLabel = localizePresetLabel(lang, preset);
 
         return (
           <button
@@ -297,7 +317,7 @@ export const SplitTunnelPresets = memo(function SplitTunnelPresets({
             data-state={summary.state}
             aria-pressed={ariaPressed}
             disabled={isChipDisabled}
-            title={buildPresetTooltip(preset, summary)}
+            title={buildPresetTooltip(preset, summary, lang)}
             onClick={() => onTogglePreset(preset, nextSelected)}
           >
             <span className="split-preset-chip__indicator" aria-hidden="true">
@@ -310,7 +330,7 @@ export const SplitTunnelPresets = memo(function SplitTunnelPresets({
               ) : null}
             </span>
 
-            <span className="split-preset-chip__label">{preset.label}</span>
+            <span className="split-preset-chip__label">{presetLabel}</span>
 
             {summary.state === "partial" ? (
               <span className="split-preset-chip__count">

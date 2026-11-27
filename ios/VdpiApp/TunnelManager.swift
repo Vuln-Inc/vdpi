@@ -11,12 +11,17 @@ public enum TunnelPhase: Equatable, Sendable {
     case error
 
     public var label: String {
+        label(in: .en)
+    }
+
+    public func label(in language: AppLanguage) -> String {
+        let l10n = L10n.catalog(for: language)
         switch self {
-        case .disconnected: return "Standby"
-        case .connecting: return "Connecting"
-        case .connected: return "Protected"
-        case .disconnecting: return "Stopping"
-        case .error: return "Error"
+        case .disconnected: return l10n.phaseStandby
+        case .connecting: return l10n.phaseConnecting
+        case .connected: return l10n.phaseProtected
+        case .disconnecting: return l10n.phaseStopping
+        case .error: return l10n.phaseError
         }
     }
 }
@@ -43,17 +48,22 @@ public enum SettingsImportError: LocalizedError, Equatable, Sendable {
     case unrecognizedFormat
     case invalidDnsAddress(String)
 
-    public var errorDescription: String? {
+    public func localizedMessage(in language: AppLanguage) -> String {
+        let l10n = L10n.catalog(for: language)
         switch self {
         case .emptyPayload:
-            return "Settings backup is empty."
+            return l10n.importErrorEmptyPayload
         case .invalidJSON:
-            return "Settings backup is not valid JSON."
+            return l10n.importErrorInvalidJson
         case .unrecognizedFormat:
-            return "JSON does not contain recognized vdpi settings."
+            return l10n.importErrorUnrecognizedFormat
         case .invalidDnsAddress(let addr):
-            return "Invalid DNS address in settings backup: \(addr)"
+            return l10n.importErrorInvalidDns(addr)
         }
+    }
+
+    public var errorDescription: String? {
+        localizedMessage(in: VdpiAppGroup.loadSettings().language)
     }
 }
 
@@ -86,7 +96,7 @@ public final class TunnelManager: ObservableObject {
                 return trimmed
             }
         }
-        return "0.6.0"
+        return "0.6.1"
     }
 
     private static let providerConfigSettingsKey = "vdpiSettingsJSON"
@@ -105,7 +115,18 @@ public final class TunnelManager: ObservableObject {
         "bypassDomains",
         "onDemandEnabled",
         "theme",
+        "language",
     ]
+
+    private enum UpdateStatusKind: Equatable {
+        case failed
+        case upToDate
+        case available(String)
+    }
+
+    private var l10n: L10n.Catalog {
+        L10n.catalog(for: settings.language)
+    }
 
     private var vpnManager: NETunnelProviderManager?
     private nonisolated(unsafe) var statusObserver: NSObjectProtocol?
@@ -119,6 +140,7 @@ public final class TunnelManager: ObservableObject {
     private var toastTask: Task<Void, Never>?
     private var updateCheckTask: Task<Void, Never>?
     private var isManualUpdateCheck: Bool = false
+    private var lastUpdateStatusKind: UpdateStatusKind? = nil
     private var lastThroughputTotalBytes: UInt64?
     private var lastThroughputUptimeNs: UInt64?
     private var reloadGeneration: UInt64 = 0
@@ -185,6 +207,7 @@ public final class TunnelManager: ObservableObject {
         guard next != previous else { return }
 
         let onDemandChanged = next.onDemandEnabled != previous.onDemandEnabled
+        let languageChanged = next.language != previous.language
         let nativeConfigChanged = next.requiresTunnelReload(comparedTo: previous)
 
         // Ensure an active or connecting tunnel always has a baseline config before
@@ -198,6 +221,12 @@ public final class TunnelManager: ObservableObject {
 
         if nativeConfigChanged {
             recomputePendingReconnect(revealPopup: true)
+        } else if languageChanged && pendingReconnect {
+            recomputePendingReconnect(revealPopup: false)
+        }
+
+        if languageChanged {
+            refreshLocalizedUpdateStatusMessage()
         }
 
         if onDemandChanged {
@@ -208,6 +237,18 @@ public final class TunnelManager: ObservableObject {
         }
     }
 
+    private func refreshLocalizedUpdateStatusMessage() {
+        guard let kind = lastUpdateStatusKind else { return }
+        switch kind {
+        case .failed:
+            updateStatusMessage = l10n.updateCheckFailed
+        case .upToDate:
+            updateStatusMessage = l10n.updateUpToDate
+        case .available(let version):
+            updateStatusMessage = l10n.updateAvailableInline(version: version)
+        }
+    }
+
     func dismissReconnectPopup() {
         if reconnectPopupVisible {
             reconnectPopupVisible = false
@@ -215,9 +256,9 @@ public final class TunnelManager: ObservableObject {
     }
 
     func resetSettings() {
-        let defaults = VdpiSettings(theme: settings.theme)
+        let defaults = VdpiSettings(theme: settings.theme, language: settings.language)
         updateSettings { $0 = defaults }
-        showToast("Settings reset to defaults")
+        showToast(l10n.toastSettingsReset)
     }
 
     func toggleTunnel() {
@@ -294,7 +335,7 @@ public final class TunnelManager: ObservableObject {
                             throw NSError(
                                 domain: "com.vulninc.vdpi.app",
                                 code: 1003,
-                                userInfo: [NSLocalizedDescriptionKey: "Previous tunnel did not stop in time. Try again."]
+                                userInfo: [NSLocalizedDescriptionKey: self.l10n.errorPreviousTunnelStopTimeout]
                             )
                         }
                         self.phase = .connecting
@@ -525,7 +566,7 @@ public final class TunnelManager: ObservableObject {
                         self.isReloading = false
                     }
                     self.triggerNotificationHaptic(.success)
-                    self.showToast("Applied updated settings")
+                    self.showToast(self.l10n.toastAppliedSettings)
                     await self.fetchTelemetryOnce()
                 } else {
                     // Fallback to full reconnect if live reload failed.
@@ -600,7 +641,7 @@ public final class TunnelManager: ObservableObject {
                 try? await manager.loadFromPreferences()
             }
             syncStatus(manager.connection.status)
-            showToast("Reconnect timed out - try again")
+            showToast(l10n.toastReconnectTimedOut)
             return false
         }
         return true
@@ -663,16 +704,16 @@ public final class TunnelManager: ObservableObject {
                    let res = ProviderCommandResponse.decodeData(data),
                    res.ok
                 {
-                    self.showToast("Cleared TLS & DNS caches")
+                    self.showToast(self.l10n.toastClearedCaches)
                     await self.fetchTelemetryOnce()
                 } else {
-                    self.showToast("Could not reach tunnel extension")
+                    self.showToast(self.l10n.toastExtensionUnreachable)
                 }
             }
             return true
         } else {
             Self.removeAdaptiveCacheFiles()
-            showToast("Cleared cached TLS strategies")
+            showToast(l10n.toastClearedTlsStrategies)
             return true
         }
     }
@@ -699,7 +740,7 @@ public final class TunnelManager: ObservableObject {
                     self.doctorState = DoctorUiState(
                         running: false,
                         report: nil,
-                        error: "Diagnostics timed out or the tunnel extension did not respond."
+                        error: self.l10n.errorDiagnosticsTimeout
                     )
                     return
                 }
@@ -715,7 +756,7 @@ public final class TunnelManager: ObservableObject {
                 self.doctorState = DoctorUiState(
                     running: false,
                     report: nil,
-                    error: "Native diagnostics returned no probe results."
+                    error: self.l10n.errorDiagnosticsNoResults
                 )
             } else {
                 self.doctorState = DoctorUiState(running: false, report: report, error: nil)
@@ -758,6 +799,7 @@ public final class TunnelManager: ObservableObject {
                 return
             }
         } else {
+            lastUpdateStatusKind = nil
             updateStatusMessage = nil
         }
 
@@ -777,7 +819,8 @@ public final class TunnelManager: ObservableObject {
             switch result {
             case .failed:
                 if manual {
-                    self.updateStatusMessage = "Check failed"
+                    self.lastUpdateStatusKind = .failed
+                    self.updateStatusMessage = self.l10n.updateCheckFailed
                 }
                 return
 
@@ -785,7 +828,8 @@ public final class TunnelManager: ObservableObject {
                 UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastUpdateCheckTimestampKey)
                 self.availableUpdate = nil
                 if manual {
-                    self.updateStatusMessage = "Up to date"
+                    self.lastUpdateStatusKind = .upToDate
+                    self.updateStatusMessage = self.l10n.updateUpToDate
                 }
                 return
 
@@ -802,7 +846,13 @@ public final class TunnelManager: ObservableObject {
                 }
 
                 self.availableUpdate = latest
-                self.updateStatusMessage = manual ? "Update available: v\(latest.latestVersion)" : nil
+                if manual {
+                    self.lastUpdateStatusKind = .available(latest.latestVersion)
+                    self.updateStatusMessage = self.l10n.updateAvailableInline(version: latest.latestVersion)
+                } else {
+                    self.lastUpdateStatusKind = nil
+                    self.updateStatusMessage = nil
+                }
             }
         }
     }
@@ -812,6 +862,7 @@ public final class TunnelManager: ObservableObject {
             UserDefaults.standard.set(version, forKey: Self.dismissedUpdateVersionKey)
         }
         availableUpdate = nil
+        lastUpdateStatusKind = nil
         updateStatusMessage = nil
     }
 
@@ -833,7 +884,7 @@ public final class TunnelManager: ObservableObject {
             VdpiAppGroup.saveSettings(normalized)
             recomputePendingReconnect(revealPopup: false)
         }
-        showToast("Imported settings")
+        showToast(l10n.toastImportedSettings)
     }
 
     nonisolated static func parseImportedSettings(_ rawJSON: String) throws -> VdpiSettings {
@@ -897,40 +948,44 @@ public final class TunnelManager: ObservableObject {
             mtu: decoded.clampedMtu,
             bypassDomains: normalizedBypass,
             onDemandEnabled: decoded.onDemandEnabled,
-            theme: decoded.theme
+            theme: decoded.theme,
+            language: decoded.language
         )
     }
 
     public func formattedDiagnosticsReport() -> String {
+        let lang = settings.language
+        let loc = L10n.catalog(for: lang)
         let effectiveDoh = settings.enableDoh
             || settings.dnsAddr
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .lowercased()
                 .hasPrefix("https://")
         var lines: [String] = [
-            "vdpi Diagnostics Report",
-            "App Version: \(appVersion)",
-            "Engine Version: \(engineVersion)",
-            "Status: \(phase.label)",
-            "Mode: \(settings.desyncMode.label) (\(settings.clampedChunkSize) B)",
-            "DNS: \(Self.redactedDnsSummary(settings.dnsAddr)) (DoH: \(effectiveDoh ? "On" : "Off"))",
-            "QUIC Blocking: \(settings.blockQuic ? "On" : "Off")",
-            "IPv4 Only: \(settings.ipv4Only ? "On" : "Off")",
+            loc.reportHeader,
+            "\(loc.reportAppVersion): \(appVersion)",
+            "\(loc.reportEngineVersion): \(engineVersion)",
+            "\(loc.reportStatus): \(phase.label(in: lang))",
+            "\(loc.reportMode): \(settings.desyncMode.label(in: lang)) (\(settings.clampedChunkSize) B)",
+            "DNS: \(Self.redactedDnsSummary(settings.dnsAddr)) (DoH: \(effectiveDoh ? loc.on : loc.off))",
+            "\(loc.reportQuicBlocking): \(settings.blockQuic ? loc.on : loc.off)",
+            "\(loc.reportIpv4Only): \(settings.ipv4Only ? loc.on : loc.off)",
             "MTU: \(settings.clampedMtu)",
-            "Bypass Rules: \(settings.bypassDomains.count)",
+            "\(loc.reportBypassRules): \(settings.bypassDomains.count)",
         ]
 
         lines.append("")
         if doctorState.running {
-            lines.append("Diagnostics Probes: Running...")
+            lines.append(loc.reportProbesRunning)
         } else if let error = doctorState.error, !error.isEmpty {
-            lines.append("Diagnostics Probes: Error - \(Self.redactHttpsUrls(in: error))")
+            lines.append(loc.reportProbesError(Self.redactHttpsUrls(in: error)))
         } else if let report = doctorState.report, !report.checks.isEmpty {
             let passedCount = report.checks.filter(\.passed).count
-            lines.append("Diagnostics Probes (\(passedCount)/\(report.checks.count) passed):")
+            lines.append(loc.reportProbesPassedHeader(passed: passedCount, total: report.checks.count))
             for check in report.checks {
-                let badge = check.passed ? "PASS" : "FAIL"
-                var entry = "- [\(badge)] \(check.name) (\(check.latencyMs) ms)"
+                let badge = check.passed ? loc.reportBadgePass : loc.reportBadgeFail
+                let checkName = loc.doctorCheckName(check.name)
+                var entry = "- [\(badge)] \(checkName) (\(check.latencyMs) ms)"
                 if !check.target.isEmpty {
                     entry += " · \(Self.redactedDnsSummary(check.target))"
                 }
@@ -940,7 +995,7 @@ public final class TunnelManager: ObservableObject {
                 lines.append(entry)
             }
         } else {
-            lines.append("Diagnostics Probes: Not run")
+            lines.append(loc.reportProbesNotRun)
         }
 
         return lines.joined(separator: "\n")
@@ -1087,7 +1142,10 @@ public final class TunnelManager: ObservableObject {
             return
         }
 
-        let summary = settings.pendingChangeSummary(comparedToApplied: applied)
+        let summary = settings.pendingChangeSummary(
+            comparedToApplied: applied,
+            language: settings.language
+        )
         if summary.isEmpty {
             clearPendingReconnect()
         } else {
@@ -1264,7 +1322,7 @@ public final class TunnelManager: ObservableObject {
             telemetryTask = nil
             resetThroughputHistory()
             phase = .error
-            errorMessage = "Tunnel engine is not running. Tap Connect to restart."
+            errorMessage = l10n.errorEngineNotRunning
             triggerNotificationHaptic(.error)
             return
         }

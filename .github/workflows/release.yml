@@ -1060,18 +1060,54 @@ jobs:
             TRIMMED_TAG_NOTES="$(printf '%s\n' "$RAW_TAG_NOTES" | sed '/^[[:space:]]*$/d' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
           fi
           if [ -n "$TRIMMED_TAG_NOTES" ] && [ "$TRIMMED_TAG_NOTES" != "vdpi $TAG" ] && [ "$TRIMMED_TAG_NOTES" != "$TAG" ]; then
-            printf '%s\n' "$RAW_TAG_NOTES" > release-notes.md
+            printf '%s\n' "$RAW_TAG_NOTES" \
+              | awk -v tag="$TAG" '
+                  BEGIN { started = 0 }
+                  !started && /^[[:space:]]*$/ { next }
+                  !started && ($0 == ("vdpi " tag) || $0 == tag || $0 == "### Changes") { next }
+                  { started = 1; lines[++n] = $0 }
+                  END {
+                    while (n > 0 && lines[n] ~ /^[[:space:]]*$/) n--
+                    for (i = 1; i <= n; i++) print lines[i]
+                  }
+                ' > release-changes.md
           else
             PREV_TAG="$(git describe --tags --abbrev=0 --match 'v*' "${TAG}^" 2>/dev/null || true)"
             if [ -n "$PREV_TAG" ]; then
-              git log --no-merges --pretty=tformat:'- %s' "${PREV_TAG}..${TAG}" > release-notes.md
+              git log --no-merges --pretty=tformat:'- %s' "${PREV_TAG}..${TAG}" > release-changes.md
             else
-              git log --no-merges -n 20 --pretty=tformat:'- %s' "$TAG" > release-notes.md
+              git log --no-merges -n 20 --pretty=tformat:'- %s' "$TAG" > release-changes.md
             fi
           fi
-          if [ ! -s release-notes.md ]; then
-            printf '%s\n' "- Release $TAG" > release-notes.md
+          if [ ! -s release-changes.md ]; then
+            printf '%s\n' "- Release $TAG" > release-changes.md
           fi
+
+          BASE_URL="https://github.com/${GH_REPO}/releases/download/${TAG}"
+          {
+            printf '### Changes\n\n'
+            cat release-changes.md
+            printf '\n'
+            sed "s|__BASE_URL__|${BASE_URL}|g" <<'EOF'
+          ### Downloads
+
+          **Desktop App (GUI)**
+          - **Windows (`x86_64`):** [Installer (.exe)](__BASE_URL__/vdpi-desktop-windows-x86_64-setup.exe) · [Portable (.zip)](__BASE_URL__/vdpi-desktop-windows-x86_64-portable.zip)
+          - **macOS (Universal):** [DMG (.dmg)](__BASE_URL__/vdpi-desktop-macos-universal.dmg)
+          - **Linux (`x86_64`):** [Debian/Ubuntu (.deb)](__BASE_URL__/vdpi-desktop-linux-x86_64.deb) · [AppImage](__BASE_URL__/vdpi-desktop-linux-x86_64.AppImage)
+
+          **CLI / Headless**
+          - **Windows (`x86_64`):** [vdpi-windows-x86_64.zip](__BASE_URL__/vdpi-windows-x86_64.zip)
+          - **macOS (Universal):** [vdpi-macos-universal.tar.gz](__BASE_URL__/vdpi-macos-universal.tar.gz)
+          - **Linux:** [x86_64 (.tar.gz)](__BASE_URL__/vdpi-linux-x86_64.tar.gz) · [arm64 (.tar.gz)](__BASE_URL__/vdpi-linux-arm64.tar.gz)
+
+          **Mobile**
+          - **Android:** [vdpi-android-universal.apk](__BASE_URL__/vdpi-android-universal.apk)
+          - **iOS (`16+`, unsigned):** [vdpi-ios-unsigned.ipa](__BASE_URL__/vdpi-ios-unsigned.ipa)
+
+          Verify downloads with [SHA256SUMS.txt](__BASE_URL__/SHA256SUMS.txt).
+          EOF
+          } > release-notes.md
 
           cd release-assets
           ASSETS=(

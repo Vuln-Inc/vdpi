@@ -97,6 +97,7 @@ import com.vulninc.vdpi.ui.components.PrecisionSwitch
 import com.vulninc.vdpi.ui.components.SectionFooter
 import com.vulninc.vdpi.ui.components.SegmentedControl
 import com.vulninc.vdpi.ui.components.springPress
+import com.vulninc.vdpi.ui.i18n.LocalVdpiStrings
 import com.vulninc.vdpi.ui.theme.VdpiTextStyles
 import com.vulninc.vdpi.ui.theme.VdpiThemeTokens
 import java.util.Locale
@@ -233,6 +234,7 @@ private fun AppsHeader(
     onToggleSystem: () -> Unit,
 ) {
     val palette = VdpiThemeTokens.palette
+    val strings = LocalVdpiStrings.current
     val resetButton: @Composable () -> Unit = {
         AppsResetButton(
             visible = selectedCount > 0,
@@ -277,7 +279,7 @@ private fun AppsHeader(
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 Text(
-                    text = "Apps",
+                    text = strings.appsTitle,
                     style = VdpiTextStyles.pageTitle.copy(
                         fontSize = 24.sp,
                         lineHeight = 28.sp,
@@ -313,7 +315,7 @@ private fun AppsHeader(
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
                 Text(
-                    text = "Apps",
+                    text = strings.appsTitle,
                     style = VdpiTextStyles.pageTitle,
                     color = palette.inkPrimary,
                     maxLines = 1,
@@ -334,10 +336,8 @@ private fun AppsHeader(
             ) { mode ->
                 SectionFooter(
                     text = when (mode) {
-                        SplitTunnelMode.BYPASS_SELECTED ->
-                            "Selected apps connect directly without DPI bypass."
-                        SplitTunnelMode.ONLY_SELECTED ->
-                            "Only selected apps route through vdpi."
+                        SplitTunnelMode.BYPASS_SELECTED -> strings.appsBypassSelectedFooter
+                        SplitTunnelMode.ONLY_SELECTED -> strings.appsOnlySelectedFooter
                     },
                 )
             }
@@ -358,6 +358,7 @@ private fun AppsResetButton(
     onClick: () -> Unit,
 ) {
     val palette = VdpiThemeTokens.palette
+    val strings = LocalVdpiStrings.current
     AnimatedVisibility(
         visible = visible,
         enter = fadeIn(tween(180)) + scaleIn(initialScale = 0.84f, animationSpec = tween(180)),
@@ -365,7 +366,7 @@ private fun AppsResetButton(
     ) {
         FloatingGlassIconButton(
             onClick = onClick,
-            contentDescription = "Reset selected apps",
+            contentDescription = strings.cdResetSelectedApps,
             size = 42.dp,
         ) {
             ResetSelectionGlyph(tint = palette.inkPrimary)
@@ -379,15 +380,11 @@ private fun AppsModeSegmentedControl(
     onSelect: (SplitTunnelMode) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val strings = LocalVdpiStrings.current
     SegmentedControl(
         options = SplitTunnelMode.entries,
         selected = selected,
-        labelFor = { mode ->
-            when (mode) {
-                SplitTunnelMode.BYPASS_SELECTED -> "Bypass Selected"
-                SplitTunnelMode.ONLY_SELECTED -> "Only Selected"
-            }
-        },
+        labelFor = { mode -> strings.splitTunnelModeLabel(mode) },
         onSelect = onSelect,
         modifier = modifier,
     )
@@ -402,23 +399,24 @@ private fun AppsFilterChipRow(
     onToggleSystem: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val strings = LocalVdpiStrings.current
     Row(
         modifier = modifier.horizontalScroll(rememberScrollState()),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         TonalFilterChip(
-            label = "All",
+            label = strings.filterAll,
             selected = activeFilter == AppFilter.ALL,
             onClick = { onSelectFilter(AppFilter.ALL) },
         )
         TonalFilterChip(
-            label = if (selectedCount > 0) "Selected ($selectedCount)" else "Selected",
+            label = if (selectedCount > 0) strings.filterSelectedCount(selectedCount) else strings.filterSelected,
             selected = activeFilter == AppFilter.SELECTED,
             onClick = { onSelectFilter(AppFilter.SELECTED) },
         )
         TonalFilterChip(
-            label = "System",
+            label = strings.filterSystem,
             selected = showSystem,
             onClick = onToggleSystem,
             isToggle = true,
@@ -520,6 +518,7 @@ private fun AppsLoadingState(
     modifier: Modifier = Modifier,
 ) {
     val palette = VdpiThemeTokens.palette
+    val strings = LocalVdpiStrings.current
     AppsStatusCard(
         bottomPadding = bottomPadding,
         verticalSpacing = 12.dp,
@@ -531,7 +530,7 @@ private fun AppsLoadingState(
             color = palette.inkSecondary,
         )
         Text(
-            text = "Loading installed apps",
+            text = strings.appsLoading,
             style = VdpiTextStyles.body,
             color = palette.inkSecondary,
         )
@@ -547,6 +546,7 @@ private fun AppsEmptyState(
     modifier: Modifier = Modifier,
 ) {
     val palette = VdpiThemeTokens.palette
+    val strings = LocalVdpiStrings.current
     AppsStatusCard(
         bottomPadding = bottomPadding,
         verticalSpacing = 6.dp,
@@ -554,9 +554,9 @@ private fun AppsEmptyState(
     ) {
         Text(
             text = when {
-                activeFilter == AppFilter.SELECTED -> "No Apps Selected"
-                query.isNotBlank() -> "No Matching Apps"
-                else -> "No Apps Available"
+                activeFilter == AppFilter.SELECTED -> strings.appsEmptySelectedTitle
+                query.isNotBlank() -> strings.appsEmptySearchTitle
+                else -> strings.appsEmptyAllTitle
             },
             style = VdpiTextStyles.rowTitle.copy(fontWeight = FontWeight.Medium),
             color = palette.inkPrimary,
@@ -564,12 +564,9 @@ private fun AppsEmptyState(
         )
         Text(
             text = when {
-                activeFilter == AppFilter.SELECTED ->
-                    "Switch to All and toggle any app to include it."
-                query.isNotBlank() ->
-                    "Try another app name or package identifier."
-                else ->
-                    "Enable System to inspect system packages."
+                activeFilter == AppFilter.SELECTED -> strings.appsEmptySelectedSubtitle
+                query.isNotBlank() -> strings.appsEmptySearchSubtitle
+                else -> strings.appsEmptyAllSubtitle
             },
             style = VdpiTextStyles.caption,
             color = palette.inkSecondary,
@@ -578,7 +575,7 @@ private fun AppsEmptyState(
         if (query.isNotBlank()) {
             Spacer(Modifier.height(6.dp))
             GhostActionButton(
-                label = "Clear Search",
+                label = strings.actionClearSearch,
                 onClick = onClearSearch,
             )
         }
@@ -624,6 +621,7 @@ private fun GroupedAppRow(
     modifier: Modifier = Modifier,
 ) {
     val palette = VdpiThemeTokens.palette
+    val strings = LocalVdpiStrings.current
     val haptic = LocalHapticFeedback.current
     val interaction = remember { MutableInteractionSource() }
     val isPressed by interaction.collectIsPressedAsState()
@@ -639,7 +637,7 @@ private fun GroupedAppRow(
     )
 
     val subtitle = if (item.isSystem) {
-        "${item.packageName} \u00B7 System"
+        "${item.packageName} \u00B7 ${strings.badgeSystem}"
     } else {
         item.packageName
     }
@@ -749,6 +747,7 @@ private fun AppleSearchField(
     modifier: Modifier = Modifier,
 ) {
     val palette = VdpiThemeTokens.palette
+    val strings = LocalVdpiStrings.current
     val haptic = LocalHapticFeedback.current
     val shape = RoundedCornerShape(12.dp)
 
@@ -788,7 +787,7 @@ private fun AppleSearchField(
                 ) {
                     if (query.isEmpty()) {
                         Text(
-                            text = "Search apps",
+                            text = strings.appsSearchPlaceholder,
                             style = VdpiTextStyles.body,
                             color = palette.inkSecondary,
                             maxLines = 1,
@@ -819,7 +818,7 @@ private fun AppleSearchField(
                                 haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                 onClear()
                             }
-                            .semantics { contentDescription = "Clear search" },
+                            .semantics { contentDescription = strings.cdClearSearch },
                         contentAlignment = Alignment.Center,
                     ) {
                         ClearFieldGlyph(

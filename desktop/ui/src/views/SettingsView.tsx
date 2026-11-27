@@ -1,4 +1,4 @@
-import { memo, useEffect, useId, useRef, useState } from "react";
+import { memo, useEffect, useId, useMemo, useRef, useState } from "react";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import {
   IconAlert,
@@ -17,6 +17,9 @@ import {
 } from "../components/SegmentedControl";
 import { Switch } from "../components/Switch";
 import type { ToastTone } from "../components/ToastStack";
+import { useLang, type ResolvedLanguage } from "../i18n/context";
+import { tSettings } from "../i18n/settings";
+import { LANGUAGE_STORAGE_KEY, localizeActionMessage } from "../i18n/shell";
 import { scrubUrlsInText } from "../lib/format";
 import {
   checkUpdates,
@@ -33,6 +36,7 @@ import type {
   DesktopSettingsPayload,
   DesktopStatusSnapshot,
   GuiPreferences,
+  LanguagePreference,
   ServiceState,
   ThemePreference,
   UpdateCheckPayload,
@@ -41,6 +45,7 @@ import type {
 export interface SettingsViewProps {
   status: DesktopStatusSnapshot | null;
   settings: DesktopSettingsPayload | null;
+  onPreferencesPreview?: (prefs: GuiPreferences) => void;
   onPreferencesChanged: (prefs: GuiPreferences) => void | Promise<void>;
   onRefreshSettings?: () => void | Promise<unknown>;
   onServiceChanged: () => void | Promise<void>;
@@ -49,17 +54,25 @@ export interface SettingsViewProps {
 
 const DEFAULT_GUI_PREFERENCES: GuiPreferences = {
   theme: "system",
+  language: "system",
   keepInTrayOnClose: false,
   minimizeToTray: false,
   startMinimizedToTray: false,
   showTaskbarIconWhenMinimized: false,
 };
 
-const THEME_OPTIONS: readonly SegmentedOption<ThemePreference>[] = [
-  { value: "system", label: "System" },
-  { value: "dark", label: "Dark" },
-  { value: "light", label: "Light" },
-];
+function readStoredLanguage(): LanguagePreference | undefined {
+  if (typeof window === "undefined") return undefined;
+  try {
+    const raw = window.localStorage.getItem(LANGUAGE_STORAGE_KEY);
+    if (raw === "system" || raw === "en" || raw === "tr") {
+      return raw;
+    }
+  } catch {
+    // Ignore storage access errors in restricted webviews.
+  }
+  return undefined;
+}
 
 const STYLE_ID = "vdpi-settings-view-styles";
 
@@ -394,9 +407,9 @@ function ensureStyles(): void {
 }
 
 function formatVersion(version: string | null | undefined): string {
-  if (!version) return "—";
+  if (!version) return "-";
   const trimmed = version.trim();
-  if (!trimmed) return "—";
+  if (!trimmed) return "-";
   return trimmed.startsWith("v") ? trimmed : `v${trimmed}`;
 }
 
@@ -434,10 +447,16 @@ function asActionResult(value: unknown): ActionResult | null {
 function isGuiPreferences(value: unknown): value is GuiPreferences {
   if (typeof value !== "object" || value === null) return false;
   const candidate = value as Partial<GuiPreferences>;
+  const validLang =
+    candidate.language === undefined ||
+    candidate.language === "system" ||
+    candidate.language === "en" ||
+    candidate.language === "tr";
   return (
     (candidate.theme === "system" ||
       candidate.theme === "dark" ||
       candidate.theme === "light") &&
+    validLang &&
     typeof candidate.keepInTrayOnClose === "boolean" &&
     typeof candidate.minimizeToTray === "boolean" &&
     typeof candidate.startMinimizedToTray === "boolean" &&
@@ -458,29 +477,32 @@ function sanitizeExternalUrl(raw: string | null | undefined): string | null {
   }
 }
 
-function formatServiceState(state: ServiceState | undefined): {
+function formatServiceState(
+  state: ServiceState | undefined,
+  lang: ResolvedLanguage,
+): {
   label: string;
   badgeClass: string;
 } {
   switch (state) {
     case "running":
       return {
-        label: "Running",
+        label: tSettings(lang, "serviceStateRunning"),
         badgeClass: "settings-badge settings-badge--active",
       };
     case "stopped":
       return {
-        label: "Stopped",
+        label: tSettings(lang, "serviceStateStopped"),
         badgeClass: "settings-badge",
       };
     case "not_installed":
       return {
-        label: "Not Installed",
+        label: tSettings(lang, "serviceStateNotInstalled"),
         badgeClass: "settings-badge",
       };
     default:
       return {
-        label: "Checking...",
+        label: tSettings(lang, "serviceStateChecking"),
         badgeClass: "settings-badge",
       };
   }
@@ -489,11 +511,13 @@ function formatServiceState(state: ServiceState | undefined): {
 function SettingsViewComponent({
   status,
   settings,
+  onPreferencesPreview,
   onPreferencesChanged,
   onRefreshSettings,
   onServiceChanged,
   onPushToast,
 }: SettingsViewProps) {
+  const { lang } = useLang();
   const mountedRef = useRef(true);
   const savingPrefsRef = useRef(false);
   const serviceBusyRef = useRef(false);
@@ -501,6 +525,26 @@ function SettingsViewComponent({
   const openingFolderRef = useRef(false);
   const openingExternalRef = useRef(false);
   const quittingRef = useRef(false);
+
+  const themeOptions = useMemo<readonly SegmentedOption<ThemePreference>[]>(
+    () => [
+      { value: "system", label: tSettings(lang, "themeSystem") },
+      { value: "dark", label: tSettings(lang, "themeDark") },
+      { value: "light", label: tSettings(lang, "themeLight") },
+    ],
+    [lang],
+  );
+
+  const languageOptions = useMemo<
+    readonly SegmentedOption<LanguagePreference>[]
+  >(
+    () => [
+      { value: "system", label: tSettings(lang, "languageSystem") },
+      { value: "en", label: tSettings(lang, "languageEn") },
+      { value: "tr", label: tSettings(lang, "languageTr") },
+    ],
+    [lang],
+  );
 
   useEffect(() => {
     ensureStyles();
@@ -511,12 +555,12 @@ function SettingsViewComponent({
   }, []);
 
   const idPrefix = useId();
-  const [prefs, setPrefs] = useState<GuiPreferences>(
-    () => settings?.gui ?? DEFAULT_GUI_PREFERENCES,
-  );
-  const confirmedPrefsRef = useRef<GuiPreferences>(
-    settings?.gui ?? DEFAULT_GUI_PREFERENCES,
-  );
+  const [prefs, setPrefs] = useState<GuiPreferences>(() => ({
+    ...DEFAULT_GUI_PREFERENCES,
+    ...(settings?.gui ?? {}),
+    language: settings?.gui?.language ?? readStoredLanguage() ?? "system",
+  }));
+  const confirmedPrefsRef = useRef<GuiPreferences>(prefs);
   const [savingPrefs, setSavingPrefs] = useState(false);
 
   const [serviceBusy, setServiceBusy] = useState<
@@ -538,8 +582,16 @@ function SettingsViewComponent({
 
   useEffect(() => {
     if (settings?.gui) {
-      setPrefs(settings.gui);
-      confirmedPrefsRef.current = settings.gui;
+      const merged: GuiPreferences = {
+        ...settings.gui,
+        language:
+          settings.gui.language ??
+          confirmedPrefsRef.current.language ??
+          readStoredLanguage() ??
+          "system",
+      };
+      setPrefs(merged);
+      confirmedPrefsRef.current = merged;
     }
   }, [settings?.gui]);
 
@@ -548,7 +600,6 @@ function SettingsViewComponent({
   const isLinux = status?.platform === "linux";
   const traySupported = status?.traySupported !== false;
   const showLinuxTrayNotice = isLinux && !traySupported;
-  const traySurfaceLabel = isMac ? "menu bar" : "system tray";
   const trayPresenceEnabled =
     prefs.keepInTrayOnClose ||
     prefs.minimizeToTray ||
@@ -559,7 +610,7 @@ function SettingsViewComponent({
     prefs.minimizeToTray || prefs.startMinimizedToTray;
 
   const serviceState = status?.serviceState;
-  const serviceInfo = formatServiceState(serviceState);
+  const serviceInfo = formatServiceState(serviceState, lang);
   const isUnixSystemServiceConfig =
     (isMac || isLinux) &&
     (serviceState === "running" ||
@@ -574,16 +625,16 @@ function SettingsViewComponent({
     (serviceState === "running" ? status?.live?.version : null);
   const installedVersionDisplay =
     serviceState === "not_installed"
-      ? "Not installed"
+      ? tSettings(lang, "serviceVersionNotInstalled")
       : installedVersionRaw
         ? formatVersion(installedVersionRaw)
         : status
-          ? "Unknown"
-          : "—";
+          ? tSettings(lang, "serviceVersionUnknown")
+          : "-";
 
   const appVersionDisplay = status?.appVersion
     ? formatVersion(status.appVersion)
-    : "v—";
+    : "v-";
 
   const commitPreferences = async (patch: Partial<GuiPreferences>) => {
     if (savingPrefsRef.current) return;
@@ -592,6 +643,7 @@ function SettingsViewComponent({
     const next: GuiPreferences = { ...previous, ...patch };
 
     setPrefs(next);
+    onPreferencesPreview?.(next);
     setSavingPrefs(true);
     try {
       const response: unknown = await saveGuiPreferences(next);
@@ -614,29 +666,41 @@ function SettingsViewComponent({
           isGuiPreferences((refreshed as { gui?: unknown }).gui)
         ) {
           const persistedGui = (refreshed as { gui: GuiPreferences }).gui;
-          confirmedPrefsRef.current = persistedGui;
-          setPrefs(persistedGui);
+          const mergedPersisted: GuiPreferences = {
+            ...persistedGui,
+            language: persistedGui.language ?? previous.language ?? "system",
+          };
+          confirmedPrefsRef.current = mergedPersisted;
+          setPrefs(mergedPersisted);
+          onPreferencesPreview?.(mergedPersisted);
         } else if (!refreshed) {
           setPrefs(previous);
+          onPreferencesPreview?.(previous);
         }
         onPushToast(
           "error",
-          scrubUrlsInText(
-            action.message?.trim() || "Failed to save GUI preferences.",
+          localizeActionMessage(
+            lang,
+            scrubUrlsInText(
+              action.message?.trim() || tSettings(lang, "savePrefsFailed"),
+            ),
           ),
         );
         return;
       }
-      const resolved = isGuiPreferences(response) ? response : next;
+      const resolved: GuiPreferences = isGuiPreferences(response)
+        ? { ...response, language: response.language ?? next.language }
+        : next;
       confirmedPrefsRef.current = resolved;
       setPrefs(resolved);
       await onPreferencesChanged(resolved);
     } catch (err) {
       if (mountedRef.current) {
         setPrefs(previous);
+        onPreferencesPreview?.(previous);
         onPushToast(
           "error",
-          getErrorMessage(err, "Failed to save GUI preferences."),
+          getErrorMessage(err, tSettings(lang, "savePrefsFailed")),
         );
       }
     } finally {
@@ -658,26 +722,33 @@ function SettingsViewComponent({
       if (action?.cancelled) {
         onPushToast(
           "info",
-          action.message?.trim() || "Service installation cancelled.",
+          localizeActionMessage(
+            lang,
+            action.message?.trim() || tSettings(lang, "installCancelled"),
+          ),
         );
         return;
       }
       if (action && !action.ok) {
-        throw new Error(
-          action.message || "Failed to install background service.",
-        );
+        throw new Error(action.message || tSettings(lang, "installFailed"));
       }
       await onServiceChanged();
       if (!mountedRef.current) return;
       onPushToast(
         "success",
-        action?.message?.trim() || "Background service installed.",
+        localizeActionMessage(
+          lang,
+          action?.message?.trim() || tSettings(lang, "installSuccess"),
+        ),
       );
     } catch (err) {
       if (mountedRef.current) {
         onPushToast(
           "error",
-          getErrorMessage(err, "Failed to install background service."),
+          localizeActionMessage(
+            lang,
+            getErrorMessage(err, tSettings(lang, "installFailed")),
+          ),
         );
       }
     } finally {
@@ -700,27 +771,34 @@ function SettingsViewComponent({
         setConfirmUninstallOpen(false);
         onPushToast(
           "info",
-          action.message?.trim() || "Service uninstall cancelled.",
+          localizeActionMessage(
+            lang,
+            action.message?.trim() || tSettings(lang, "uninstallCancelled"),
+          ),
         );
         return;
       }
       if (action && !action.ok) {
-        throw new Error(
-          action.message || "Failed to uninstall background service.",
-        );
+        throw new Error(action.message || tSettings(lang, "uninstallFailed"));
       }
       setConfirmUninstallOpen(false);
       await onServiceChanged();
       if (!mountedRef.current) return;
       onPushToast(
         "success",
-        action?.message?.trim() || "Background service uninstalled.",
+        localizeActionMessage(
+          lang,
+          action?.message?.trim() || tSettings(lang, "uninstallSuccess"),
+        ),
       );
     } catch (err) {
       if (mountedRef.current) {
         onPushToast(
           "error",
-          getErrorMessage(err, "Failed to uninstall background service."),
+          localizeActionMessage(
+            lang,
+            getErrorMessage(err, tSettings(lang, "uninstallFailed")),
+          ),
         );
       }
     } finally {
@@ -742,7 +820,10 @@ function SettingsViewComponent({
       setUpdateResult(result);
     } catch (err) {
       if (!mountedRef.current) return;
-      const message = getErrorMessage(err, "Could not check for updates.");
+      const message = getErrorMessage(
+        err,
+        tSettings(lang, "checkUpdatesFailed"),
+      );
       setUpdateResult(null);
       setUpdateError(message);
       onPushToast("error", message);
@@ -763,13 +844,13 @@ function SettingsViewComponent({
       if (!mountedRef.current) return;
       const action = asActionResult(response);
       if (action && !action.ok) {
-        throw new Error(action.message || "Failed to open release page.");
+        throw new Error(action.message || tSettings(lang, "openReleaseFailed"));
       }
     } catch (err) {
       if (mountedRef.current) {
         onPushToast(
           "error",
-          getErrorMessage(err, "Failed to open release page."),
+          getErrorMessage(err, tSettings(lang, "openReleaseFailed")),
         );
       }
     } finally {
@@ -784,25 +865,20 @@ function SettingsViewComponent({
     if (openingFolderRef.current) return;
     openingFolderRef.current = true;
     setOpeningFolder(kind);
+    const folderFailMsg =
+      kind === "config"
+        ? tSettings(lang, "openConfigFolderFailed")
+        : tSettings(lang, "openLogsFolderFailed");
     try {
       const response: unknown = await openAppFolder(kind);
       if (!mountedRef.current) return;
       const action = asActionResult(response);
       if (action && !action.ok) {
-        throw new Error(
-          action.message ||
-            `Failed to open ${kind === "config" ? "config" : "logs"} folder.`,
-        );
+        throw new Error(action.message || folderFailMsg);
       }
     } catch (err) {
       if (mountedRef.current) {
-        onPushToast(
-          "error",
-          getErrorMessage(
-            err,
-            `Failed to open ${kind === "config" ? "config" : "logs"} folder.`,
-          ),
-        );
+        onPushToast("error", getErrorMessage(err, folderFailMsg));
       }
     } finally {
       openingFolderRef.current = false;
@@ -823,7 +899,10 @@ function SettingsViewComponent({
       if (action && !action.ok) {
         onPushToast(
           isTauriRuntime() ? "error" : "info",
-          action.message?.trim() || "Failed to quit GUI.",
+          localizeActionMessage(
+            lang,
+            action.message?.trim() || tSettings(lang, "quitGuiFailed"),
+          ),
         );
         setQuitting(false);
         quittingRef.current = false;
@@ -831,14 +910,20 @@ function SettingsViewComponent({
       }
       if (!isTauriRuntime()) {
         if (action?.message?.trim()) {
-          onPushToast("info", action.message.trim());
+          onPushToast(
+            "info",
+            localizeActionMessage(lang, action.message.trim()),
+          );
         }
         setQuitting(false);
         quittingRef.current = false;
       }
     } catch (err) {
       if (mountedRef.current) {
-        onPushToast("error", getErrorMessage(err, "Failed to quit GUI."));
+        onPushToast(
+          "error",
+          getErrorMessage(err, tSettings(lang, "quitGuiFailed")),
+        );
         setQuitting(false);
       }
       quittingRef.current = false;
@@ -856,16 +941,17 @@ function SettingsViewComponent({
   const startMinimizedLabelId = `${idPrefix}-start-minimized-label`;
   const startMinimizedDescId = `${idPrefix}-start-minimized-desc`;
   const themeLabelId = `${idPrefix}-theme-label`;
+  const languageLabelId = `${idPrefix}-language-label`;
 
   return (
     <div className="view-stack view-settings">
       <header className="view-header">
         <div className="view-header-text">
-          <h1 className="view-title">Settings</h1>
+          <h1 className="view-title">{tSettings(lang, "title")}</h1>
           <p className="view-subtitle">
             {isMac
-              ? "Control menu bar presence, background service installation, appearance, and updates."
-              : "Control tray presence, background service installation, appearance, and updates."}
+              ? tSettings(lang, "subtitleMac")
+              : tSettings(lang, "subtitleDefault")}
           </p>
         </div>
       </header>
@@ -881,7 +967,9 @@ function SettingsViewComponent({
               <IconTray size={16} />
             </span>
             <h2 id={`${idPrefix}-tray-heading`} className="settings-card__title">
-              {isMac ? "Window & Menu Bar" : "Window & System Tray"}
+              {isMac
+                ? tSettings(lang, "trayHeadingMac")
+                : tSettings(lang, "trayHeadingDefault")}
             </h2>
           </div>
           <span
@@ -893,22 +981,20 @@ function SettingsViewComponent({
           >
             <span className="settings-badge__dot" aria-hidden="true" />
             {trayUnavailable
-              ? "Tray unavailable"
+              ? tSettings(lang, "trayBadgeUnavailable")
               : isMac
                 ? trayEffectivelyActive
-                  ? "Menu bar active"
-                  : "No menu bar icon"
+                  ? tSettings(lang, "trayBadgeMenuBarActive")
+                  : tSettings(lang, "trayBadgeNoMenuBarIcon")
                 : trayEffectivelyActive
-                  ? "Tray active"
-                  : "No tray icon"}
+                  ? tSettings(lang, "trayBadgeActive")
+                  : tSettings(lang, "trayBadgeNoIcon")}
           </span>
         </div>
 
         {showLinuxTrayNotice ? (
           <p className="settings-info-notice" role="status">
-            System tray support was not detected in this Linux desktop
-            environment (StatusNotifier / AppIndicator required). Tray options
-            may not display an icon.
+            {tSettings(lang, "linuxTrayNotice")}
           </p>
         ) : null}
 
@@ -917,15 +1003,17 @@ function SettingsViewComponent({
             <div className="settings-row__copy">
               <span id={keepInTrayLabelId} className="settings-row__label">
                 {isMac
-                  ? "Keep in menu bar when closed"
-                  : "Keep in system tray when closed"}
+                  ? tSettings(lang, "keepInTrayLabelMac")
+                  : tSettings(lang, "keepInTrayLabelDefault")}
               </span>
               <p id={keepInTrayDescId} className="settings-row__desc">
                 {prefs.keepInTrayOnClose
-                  ? `Closing the window hides it to the ${traySurfaceLabel} with a live status dot and quick menu.`
+                  ? isMac
+                    ? tSettings(lang, "keepInTrayDescOnMac")
+                    : tSettings(lang, "keepInTrayDescOnDefault")
                   : isMac
-                    ? "Closing the window completely exits the GUI app with zero Dock or menu bar icon."
-                    : "Closing the window completely exits the GUI app with zero taskbar or tray icon."}
+                    ? tSettings(lang, "keepInTrayDescOffMac")
+                    : tSettings(lang, "keepInTrayDescOffDefault")}
               </p>
             </div>
             <div className="settings-row__control">
@@ -945,12 +1033,14 @@ function SettingsViewComponent({
           <div className="settings-row">
             <div className="settings-row__copy">
               <span id={minimizeToTrayLabelId} className="settings-row__label">
-                {isMac ? "Minimize to menu bar" : "Minimize to system tray"}
+                {isMac
+                  ? tSettings(lang, "minimizeToTrayLabelMac")
+                  : tSettings(lang, "minimizeToTrayLabelDefault")}
               </span>
               <p id={minimizeToTrayDescId} className="settings-row__desc">
                 {isMac
-                  ? "Minimizing hides the window to the menu bar and automatically enables menu bar presence."
-                  : "Minimizing hides the window to the system tray and automatically enables tray presence."}
+                  ? tSettings(lang, "minimizeToTrayDescMac")
+                  : tSettings(lang, "minimizeToTrayDescDefault")}
               </p>
             </div>
             <div className="settings-row__control">
@@ -971,12 +1061,13 @@ function SettingsViewComponent({
             <div className="settings-row__copy">
               <span id={startMinimizedLabelId} className="settings-row__label">
                 {isMac
-                  ? "Start minimized to menu bar"
-                  : "Start minimized to tray"}
+                  ? tSettings(lang, "startMinimizedLabelMac")
+                  : tSettings(lang, "startMinimizedLabelDefault")}
               </span>
               <p id={startMinimizedDescId} className="settings-row__desc">
-                Launch the GUI hidden in the {traySurfaceLabel} instead of
-                opening the main window.
+                {isMac
+                  ? tSettings(lang, "startMinimizedDescMac")
+                  : tSettings(lang, "startMinimizedDescDefault")}
               </p>
             </div>
             <div className="settings-row__control">
@@ -998,13 +1089,13 @@ function SettingsViewComponent({
               <div className="settings-row__copy">
                 <span id={showTaskbarLabelId} className="settings-row__label">
                   {isMac
-                    ? "Show Dock icon when minimized"
-                    : "Show taskbar icon when minimized"}
+                    ? tSettings(lang, "showTaskbarLabelMac")
+                    : tSettings(lang, "showTaskbarLabelDefault")}
                 </span>
                 <p id={showTaskbarDescId} className="settings-row__desc">
                   {isMac
-                    ? "Keep the app icon visible in the Dock while minimized to the menu bar."
-                    : "Keep the window button visible in the taskbar while minimized to the system tray."}
+                    ? tSettings(lang, "showTaskbarDescMac")
+                    : tSettings(lang, "showTaskbarDescDefault")}
                 </p>
               </div>
               <div className="settings-row__control">
@@ -1025,10 +1116,7 @@ function SettingsViewComponent({
           ) : null}
         </div>
 
-        <p className="settings-note">
-          Closing or quitting the GUI does not stop the background vdpi service
-          if installed.
-        </p>
+        <p className="settings-note">{tSettings(lang, "trayFooterNote")}</p>
       </section>
 
       {/* 2. Background Service */}
@@ -1045,10 +1133,13 @@ function SettingsViewComponent({
               id={`${idPrefix}-service-heading`}
               className="settings-card__title"
             >
-              Background Service
+              {tSettings(lang, "serviceHeading")}
             </h2>
           </div>
-          <span className={serviceInfo.badgeClass} data-service-state={serviceState ?? "loading"}>
+          <span
+            className={serviceInfo.badgeClass}
+            data-service-state={serviceState ?? "loading"}
+          >
             <span className="settings-badge__dot" aria-hidden="true" />
             {serviceInfo.label}
           </span>
@@ -1057,9 +1148,11 @@ function SettingsViewComponent({
         <div className="settings-list">
           <div className="settings-row">
             <div className="settings-row__copy">
-              <span className="settings-row__label">vdpi system service</span>
+              <span className="settings-row__label">
+                {tSettings(lang, "serviceRowLabel")}
+              </span>
               <p className="settings-row__desc">
-                Binary:{" "}
+                {tSettings(lang, "serviceBinaryPrefix")}{" "}
                 <span className="mono tabular-nums">
                   {installedVersionDisplay}
                 </span>
@@ -1082,8 +1175,8 @@ function SettingsViewComponent({
                   ) : null}
                   <span>
                     {serviceBusy === "install"
-                      ? "Installing..."
-                      : "Install Background Service"}
+                      ? tSettings(lang, "btnInstalling")
+                      : tSettings(lang, "btnInstallService")}
                   </span>
                 </button>
               ) : (
@@ -1099,8 +1192,8 @@ function SettingsViewComponent({
                   ) : null}
                   <span>
                     {serviceBusy === "uninstall"
-                      ? "Uninstalling..."
-                      : "Uninstall Service"}
+                      ? tSettings(lang, "btnUninstalling")
+                      : tSettings(lang, "btnUninstallService")}
                   </span>
                 </button>
               )}
@@ -1123,7 +1216,7 @@ function SettingsViewComponent({
               id={`${idPrefix}-appearance-heading`}
               className="settings-card__title"
             >
-              Appearance
+              {tSettings(lang, "appearanceHeading")}
             </h2>
           </div>
         </div>
@@ -1132,21 +1225,44 @@ function SettingsViewComponent({
           <div className="settings-row">
             <div className="settings-row__copy">
               <span id={themeLabelId} className="settings-row__label">
-                Theme
+                {tSettings(lang, "themeLabel")}
               </span>
               <p className="settings-row__desc">
-                Match your operating system theme or lock to dark or light mode.
+                {tSettings(lang, "themeDesc")}
               </p>
             </div>
             <div className="settings-row__control">
               <SegmentedControl<ThemePreference>
                 id={`${idPrefix}-theme-control`}
-                options={THEME_OPTIONS}
+                options={themeOptions}
                 value={prefs.theme}
                 disabled={prefsDisabled}
                 ariaLabelledBy={themeLabelId}
                 onChange={(nextTheme) => {
                   void commitPreferences({ theme: nextTheme });
+                }}
+              />
+            </div>
+          </div>
+
+          <div className="settings-row">
+            <div className="settings-row__copy">
+              <span id={languageLabelId} className="settings-row__label">
+                {tSettings(lang, "languageLabel")}
+              </span>
+              <p className="settings-row__desc">
+                {tSettings(lang, "languageDesc")}
+              </p>
+            </div>
+            <div className="settings-row__control">
+              <SegmentedControl<LanguagePreference>
+                id={`${idPrefix}-language-control`}
+                options={languageOptions}
+                value={prefs.language ?? "system"}
+                disabled={prefsDisabled}
+                ariaLabelledBy={languageLabelId}
+                onChange={(nextLanguage) => {
+                  void commitPreferences({ language: nextLanguage });
                 }}
               />
             </div>
@@ -1168,7 +1284,7 @@ function SettingsViewComponent({
               id={`${idPrefix}-updates-heading`}
               className="settings-card__title"
             >
-              Updates &amp; Local Data
+              {tSettings(lang, "updatesHeading")}
             </h2>
           </div>
           <span className="settings-mono-value mono tabular-nums">
@@ -1179,9 +1295,11 @@ function SettingsViewComponent({
         <div className="settings-list">
           <div className="settings-row">
             <div className="settings-row__copy">
-              <span className="settings-row__label">Desktop application</span>
+              <span className="settings-row__label">
+                {tSettings(lang, "desktopAppLabel")}
+              </span>
               <p className="settings-row__desc">
-                Current version{" "}
+                {tSettings(lang, "currentVersionPrefix")}{" "}
                 <span className="mono tabular-nums">{appVersionDisplay}</span>
               </p>
             </div>
@@ -1201,7 +1319,9 @@ function SettingsViewComponent({
                   <IconRefresh size={14} />
                 )}
                 <span>
-                  {checkingUpdates ? "Checking..." : "Check for Updates"}
+                  {checkingUpdates
+                    ? tSettings(lang, "btnCheckingUpdates")
+                    : tSettings(lang, "btnCheckUpdates")}
                 </span>
               </button>
             </div>
@@ -1219,7 +1339,10 @@ function SettingsViewComponent({
             >
               <div className="settings-update-panel__top">
                 <div className="settings-update-panel__status">
-                  <span className="settings-update-panel__icon" aria-hidden="true">
+                  <span
+                    className="settings-update-panel__icon"
+                    aria-hidden="true"
+                  >
                     {updateResult.hasUpdate ? (
                       <IconRefresh size={15} />
                     ) : (
@@ -1228,13 +1351,13 @@ function SettingsViewComponent({
                   </span>
                   {updateResult.hasUpdate ? (
                     <span className="tabular-nums">
-                      Update available:{" "}
+                      {tSettings(lang, "updateAvailablePrefix")}{" "}
                       <span className="mono">
                         {formatVersion(updateResult.latestVersion)}
                       </span>
                     </span>
                   ) : (
-                    <span>Up to date</span>
+                    <span>{tSettings(lang, "upToDate")}</span>
                   )}
                 </div>
 
@@ -1248,7 +1371,7 @@ function SettingsViewComponent({
                       void handleOpenReleaseUrl(safeReleaseUrl);
                     }}
                   >
-                    <span>View release</span>
+                    <span>{tSettings(lang, "viewRelease")}</span>
                     <IconExternal size={13} />
                   </button>
                 ) : null}
@@ -1257,22 +1380,22 @@ function SettingsViewComponent({
               <p className="settings-update-panel__meta tabular-nums">
                 {updateResult.hasUpdate ? (
                   <>
-                    Installed{" "}
+                    {tSettings(lang, "installedPrefix")}{" "}
                     <span className="mono">
                       {formatVersion(updateResult.currentVersion)}
                     </span>{" "}
-                    -&gt; latest{" "}
+                    -&gt; {tSettings(lang, "latestPrefix")}{" "}
                     <span className="mono">
                       {formatVersion(updateResult.latestVersion)}
                     </span>
                   </>
                 ) : (
                   <>
-                    You are running the latest version (
+                    {tSettings(lang, "runningLatestBefore")}
                     <span className="mono">
                       {formatVersion(updateResult.currentVersion)}
                     </span>
-                    ).
+                    {tSettings(lang, "runningLatestAfter")}
                   </>
                 )}
               </p>
@@ -1296,7 +1419,7 @@ function SettingsViewComponent({
                 <span className="settings-update-panel__icon" aria-hidden="true">
                   <IconAlert size={15} />
                 </span>
-                <span>Update check failed</span>
+                <span>{tSettings(lang, "updateCheckFailed")}</span>
               </div>
               <p className="settings-update-panel__meta">{updateError}</p>
             </div>
@@ -1304,11 +1427,13 @@ function SettingsViewComponent({
 
           <div className="settings-row">
             <div className="settings-row__copy">
-              <span className="settings-row__label">Configuration folder</span>
+              <span className="settings-row__label">
+                {tSettings(lang, "configFolderLabel")}
+              </span>
               <p className="settings-row__desc">
                 {isUnixSystemServiceConfig
-                  ? "Contains config.toml for the background service (gui-prefs.json is stored separately in your user config folder)."
-                  : "Contains config.toml and gui-prefs.json."}
+                  ? tSettings(lang, "configFolderDescUnix")
+                  : tSettings(lang, "configFolderDescDefault")}
               </p>
               {status?.configPath ? (
                 <p
@@ -1330,16 +1455,18 @@ function SettingsViewComponent({
                 }}
               >
                 <IconFolder size={14} />
-                <span>Open Config Folder</span>
+                <span>{tSettings(lang, "btnOpenConfigFolder")}</span>
               </button>
             </div>
           </div>
 
           <div className="settings-row">
             <div className="settings-row__copy">
-              <span className="settings-row__label">Logs folder</span>
+              <span className="settings-row__label">
+                {tSettings(lang, "logsFolderLabel")}
+              </span>
               <p className="settings-row__desc">
-                Diagnostic logs written by the vdpi service and desktop app.
+                {tSettings(lang, "logsFolderDesc")}
               </p>
               {status?.logsDir ? (
                 <p className="settings-row__path" title={status.logsDir}>
@@ -1358,18 +1485,20 @@ function SettingsViewComponent({
                 }}
               >
                 <IconFolder size={14} />
-                <span>Open Logs Folder</span>
+                <span>{tSettings(lang, "btnOpenLogsFolder")}</span>
               </button>
             </div>
           </div>
 
           <div className="settings-row">
             <div className="settings-row__copy">
-              <span className="settings-row__label">Desktop GUI</span>
+              <span className="settings-row__label">
+                {tSettings(lang, "desktopGuiLabel")}
+              </span>
               <p className="settings-row__desc">
                 {isMac
-                  ? "Exit the desktop window and remove any menu bar icon immediately."
-                  : "Exit the desktop window and remove any tray icon immediately."}
+                  ? tSettings(lang, "desktopGuiDescMac")
+                  : tSettings(lang, "desktopGuiDescDefault")}
               </p>
             </div>
             <div className="settings-row__control">
@@ -1387,7 +1516,11 @@ function SettingsViewComponent({
                 ) : (
                   <IconPower size={14} />
                 )}
-                <span>{quitting ? "Quitting..." : "Quit GUI"}</span>
+                <span>
+                  {quitting
+                    ? tSettings(lang, "btnQuitting")
+                    : tSettings(lang, "btnQuitGui")}
+                </span>
               </button>
             </div>
           </div>
@@ -1396,12 +1529,14 @@ function SettingsViewComponent({
 
       <ConfirmDialog
         open={confirmUninstallOpen}
-        title="Uninstall background service?"
-        description="This removes the vdpi system service and stops background protection. Your configuration and GUI preferences will remain on disk."
+        title={tSettings(lang, "uninstallTitle")}
+        description={tSettings(lang, "uninstallDesc")}
         confirmLabel={
-          serviceBusy === "uninstall" ? "Uninstalling..." : "Uninstall Service"
+          serviceBusy === "uninstall"
+            ? tSettings(lang, "btnUninstalling")
+            : tSettings(lang, "btnUninstallService")
         }
-        cancelLabel="Cancel"
+        cancelLabel={tSettings(lang, "cancel")}
         danger
         busy={serviceBusy === "uninstall"}
         onConfirm={() => {
@@ -1423,6 +1558,7 @@ function areSettingsPropsEqual(
 ): boolean {
   if (
     prev.settings !== next.settings ||
+    prev.onPreferencesPreview !== next.onPreferencesPreview ||
     prev.onPreferencesChanged !== next.onPreferencesChanged ||
     prev.onRefreshSettings !== next.onRefreshSettings ||
     prev.onServiceChanged !== next.onServiceChanged ||

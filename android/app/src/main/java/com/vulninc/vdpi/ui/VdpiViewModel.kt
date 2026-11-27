@@ -13,6 +13,7 @@ import androidx.core.graphics.drawable.toBitmap
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.vulninc.vdpi.BuildConfig
+import com.vulninc.vdpi.data.AppLanguage
 import com.vulninc.vdpi.data.ReleaseUpdateInfo
 import com.vulninc.vdpi.data.SettingsRepository
 import com.vulninc.vdpi.data.SplitTunnelMode
@@ -22,6 +23,7 @@ import com.vulninc.vdpi.data.VdpiSettings
 import com.vulninc.vdpi.engine.DesyncMode
 import com.vulninc.vdpi.engine.DoctorReport
 import com.vulninc.vdpi.engine.NativeEngine
+import com.vulninc.vdpi.ui.i18n.VdpiStrings
 import com.vulninc.vdpi.ui.screens.isEffectiveDohTarget
 import com.vulninc.vdpi.util.formatStageLabel
 import com.vulninc.vdpi.util.formatUptime
@@ -29,6 +31,7 @@ import com.vulninc.vdpi.util.sanitizeDomainInput
 import com.vulninc.vdpi.vpn.TunnelPhase
 import com.vulninc.vdpi.vpn.TunnelRuntimeSnapshot
 import com.vulninc.vdpi.vpn.TunnelRuntimeState
+import com.vulninc.vdpi.vpn.VdpiVpnService
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -66,11 +69,18 @@ data class DoctorUiState(
     val report: DoctorReport? = null,
 )
 
+sealed interface UpdateStatus {
+    data object UpToDate : UpdateStatus
+    data class Available(val version: String) : UpdateStatus
+    data object CheckFailed : UpdateStatus
+}
+
 data class VdpiUiState(
     val throughputSamples: List<Long> = emptyList(),
     val currentRateBytesPerSec: Long = 0L,
     val availableUpdate: ReleaseUpdateInfo? = null,
     val isCheckingUpdate: Boolean = false,
+    val updateStatus: UpdateStatus? = null,
     val updateStatusMessage: String? = null,
     val appVersion: String = BuildConfig.VERSION_NAME,
 )
@@ -306,6 +316,11 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
         .distinctUntilChanged()
         .stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
+    val updateStatus: StateFlow<UpdateStatus?> = uiState
+        .map { it.updateStatus }
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
+
     val updateStatusMessage: StateFlow<String?> = uiState
         .map { it.updateStatusMessage }
         .distinctUntilChanged()
@@ -480,11 +495,13 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
                 _uiState.update { state ->
                     state.copy(
                         isCheckingUpdate = true,
+                        updateStatus = if (manual) null else state.updateStatus,
                         updateStatusMessage = if (manual) null else state.updateStatusMessage,
                     )
                 }
 
                 val result = UpdateChecker.fetchLatestReleaseResult(appVersion)
+                val strings = currentStrings()
                 result.onSuccess { release ->
                     repo.recordUpdateCheckResult(System.currentTimeMillis(), release)
                     if (release == null) {
@@ -492,7 +509,8 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
                             state.copy(
                                 availableUpdate = null,
                                 isCheckingUpdate = false,
-                                updateStatusMessage = if (manual) "Up to date" else state.updateStatusMessage,
+                                updateStatus = if (manual) UpdateStatus.UpToDate else state.updateStatus,
+                                updateStatusMessage = if (manual) strings.updateUpToDate else state.updateStatusMessage,
                             )
                         }
                     } else {
@@ -509,8 +527,13 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
                             state.copy(
                                 availableUpdate = visible,
                                 isCheckingUpdate = false,
+                                updateStatus = if (manual) {
+                                    UpdateStatus.Available(release.latestVersion)
+                                } else {
+                                    state.updateStatus
+                                },
                                 updateStatusMessage = if (manual) {
-                                    "Update v${release.latestVersion} available"
+                                    strings.updateVersionAvailable(release.latestVersion)
                                 } else {
                                     state.updateStatusMessage
                                 },
@@ -521,8 +544,9 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
                     _uiState.update { state ->
                         state.copy(
                             isCheckingUpdate = false,
+                            updateStatus = if (manual) UpdateStatus.CheckFailed else state.updateStatus,
                             updateStatusMessage = if (manual) {
-                                "Unable to check for updates"
+                                strings.updateCheckFailed
                             } else {
                                 state.updateStatusMessage
                             },
@@ -563,18 +587,21 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
                 SettingsRepository.parseSettingsJson(rawJson)
             }
             if (parsed.isFailure) {
+                val strings = currentStrings()
                 val reason = parsed.exceptionOrNull()?.message
                     ?.let(::redactUrlsForReport)
                     ?.takeIf { it.isNotBlank() }
-                    ?: "Invalid settings JSON"
-                emitStatusFeedback("Import failed: $reason")
+                    ?: strings.importInvalidJson
+                emitStatusFeedback(strings.importFailed(reason))
                 return@launch
             }
 
             val imported = parsed.getOrThrow()
             var needsReconnect = false
+            var languageChanged = false
             mutationMutex.withLock {
                 val previous = repo.current()
+                languageChanged = previous.language != imported.language
                 repo.applySettings(imported)
                 val updated = repo.current()
                 val phase = tunnelPhase.value
@@ -597,10 +624,15 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
 
+            if (languageChanged) {
+                VdpiVpnService.refreshLocalizedSurfaces(getApplication())
+            }
+
+            val strings = currentStrings()
             val message = if (needsReconnect) {
-                "Settings imported · reconnect to apply"
+                strings.importSuccessReconnect
             } else {
-                "Settings imported"
+                strings.importSuccess
             }
             emitStatusFeedback(message)
         }
@@ -814,6 +846,15 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
         if (repo.current().theme == theme) return@launch
         repo.setTheme(theme)
     }
+
+    fun setLanguage(language: AppLanguage) = viewModelScope.launch {
+        if (repo.current().language == language) return@launch
+        repo.setLanguage(language)
+        VdpiVpnService.refreshLocalizedSurfaces(getApplication())
+    }
+
+    private fun currentStrings(): VdpiStrings =
+        SettingsRepository.resolveStrings(getApplication())
 
     private fun queryLaunchableApps(app: Application): List<InstalledAppItem>? {
         val pm = app.packageManager

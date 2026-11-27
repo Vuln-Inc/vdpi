@@ -20,6 +20,18 @@ import {
 import { useDesktopStatus } from "./hooks/useDesktopStatus";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useTheme } from "./hooks/useTheme";
+import {
+  I18nProvider,
+  resolveLanguage,
+  useLang,
+  type ResolvedLanguage,
+} from "./i18n/context";
+import { localizeActivityMessage } from "./i18n/overview";
+import {
+  LANGUAGE_STORAGE_KEY,
+  localizeActionMessage,
+  tShell,
+} from "./i18n/shell";
 import { formatClockTime, scrubUrlsInText } from "./lib/format";
 import {
   installService,
@@ -35,6 +47,7 @@ import type {
   DesktopSettingsPayload,
   EngineMode,
   GuiPreferences,
+  LanguagePreference,
   NavTab,
   ThemePreference,
 } from "./types";
@@ -46,10 +59,47 @@ import { SplitTunnelView } from "./views/SplitTunnelView";
 
 const TRAY_ACTION_RESULT_EVENT = "vdpi://tray-action-result";
 
+function readStoredLanguage(): LanguagePreference | undefined {
+  if (typeof window === "undefined") {
+    return undefined;
+  }
+  try {
+    const raw = window.localStorage.getItem(LANGUAGE_STORAGE_KEY);
+    if (raw === "system" || raw === "en" || raw === "tr") {
+      return raw;
+    }
+  } catch {
+    // Ignore storage access errors in restricted webviews.
+  }
+  return undefined;
+}
+
+function writeStoredLanguage(language: LanguagePreference): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    window.localStorage.setItem(LANGUAGE_STORAGE_KEY, language);
+  } catch {
+    // Ignore storage access errors in restricted webviews.
+  }
+}
+
+function resolveBoundaryLang(explicit?: ResolvedLanguage): ResolvedLanguage {
+  if (explicit) return explicit;
+  if (typeof document !== "undefined") {
+    const docLang = document.documentElement.lang?.trim().toLowerCase();
+    if (docLang === "tr") return "tr";
+    if (docLang === "en") return "en";
+  }
+  return resolveLanguage(readStoredLanguage());
+}
+
 interface ErrorBoundaryProps {
   children: ReactNode;
   resetKey?: string;
   compact?: boolean;
+  lang?: ResolvedLanguage;
   onReset?: () => void;
 }
 
@@ -102,21 +152,21 @@ export class AppErrorBoundary extends Component<
       return this.props.children;
     }
 
+    const lang = resolveBoundaryLang(this.props.lang);
     const safeMessage = scrubUrlsInText(
-      error.message || "Unexpected render error",
+      error.message || tShell(lang, "errorBoundaryUnexpected"),
     );
 
     const content = (
       <section className="card" role="alert">
         <div className="card-header">
           <div className="card-title-group">
-            <h1 className="card-title">Something went wrong</h1>
+            <h1 className="card-title">
+              {tShell(lang, "errorBoundaryTitle")}
+            </h1>
           </div>
         </div>
-        <p className="text-secondary">
-          An unexpected interface error occurred. The background vdpi service is
-          unaffected.
-        </p>
+        <p className="text-secondary">{tShell(lang, "errorBoundaryDesc")}</p>
         <pre>
           <code>{safeMessage}</code>
         </pre>
@@ -127,14 +177,14 @@ export class AppErrorBoundary extends Component<
               className="btn btn-primary"
               onClick={this.handleReset}
             >
-              Try Again
+              {tShell(lang, "errorBoundaryTryAgain")}
             </button>
             <button
               type="button"
               className="btn btn-secondary"
               onClick={this.handleReload}
             >
-              Reload Window
+              {tShell(lang, "errorBoundaryReload")}
             </button>
           </div>
         </div>
@@ -164,14 +214,20 @@ function getErrorMessage(err: unknown, fallback: string): string {
 }
 
 function safeActionMessage(
+  lang: ResolvedLanguage,
   message: string | null | undefined,
   fallback: string,
 ): string {
   const trimmed = message?.trim();
-  return trimmed ? scrubUrlsInText(trimmed) : fallback;
+  return trimmed
+    ? localizeActionMessage(lang, scrubUrlsInText(trimmed))
+    : fallback;
 }
 
-async function copyTextToClipboard(text: string): Promise<void> {
+async function copyTextToClipboard(
+  text: string,
+  lang: ResolvedLanguage,
+): Promise<void> {
   if (
     typeof navigator !== "undefined" &&
     navigator.clipboard &&
@@ -187,7 +243,7 @@ async function copyTextToClipboard(text: string): Promise<void> {
   }
 
   if (typeof document === "undefined") {
-    throw new Error("Clipboard API unavailable.");
+    throw new Error(tShell(lang, "clipboardUnavailable"));
   }
 
   const textarea = document.createElement("textarea");
@@ -206,27 +262,47 @@ async function copyTextToClipboard(text: string): Promise<void> {
       typeof document.execCommand === "function" &&
       document.execCommand("copy");
     if (!ok) {
-      throw new Error("Copy command failed.");
+      throw new Error(tShell(lang, "copyCommandFailed"));
     }
   } finally {
     document.body.removeChild(textarea);
   }
 }
 
-function formatActivityForClipboard(events: readonly ActivityEvent[]): string {
+function formatActivityForClipboard(
+  events: readonly ActivityEvent[],
+  lang: ResolvedLanguage,
+): string {
   return events
     .map(
       (event) =>
-        `[${formatClockTime(event.tsMs)}] [${event.category.toUpperCase()}] [${event.level.toUpperCase()}] ${event.message}`,
+        `[${formatClockTime(event.tsMs)}] [${event.category.toUpperCase()}] [${event.level.toUpperCase()}] ${localizeActivityMessage(lang, event.message)}`,
     )
     .join("\n");
 }
 
-function AppShell() {
+interface AppShellContentProps {
+  desktop: ReturnType<typeof useDesktopStatus>;
+  effectiveSettings: DesktopSettingsPayload | null;
+  keepInTrayOnClose: boolean;
+  trayPrefsActive: boolean;
+  onPreferencesPreview: (nextPrefs: GuiPreferences) => void;
+  onPreferencesChanged: (nextPrefs: GuiPreferences) => Promise<void>;
+  onRefreshSettings: () => Promise<DesktopSettingsPayload | null>;
+}
+
+function AppShellContent({
+  desktop,
+  effectiveSettings,
+  keepInTrayOnClose,
+  trayPrefsActive,
+  onPreferencesPreview,
+  onPreferencesChanged,
+  onRefreshSettings,
+}: AppShellContentProps) {
+  const { lang } = useLang();
   const [activeTab, setActiveTab] = useState<NavTab>("overview");
   const [busyAction, setBusyAction] = useState<string | null>(null);
-  const [guiPrefsOverride, setGuiPrefsOverride] =
-    useState<GuiPreferences | null>(null);
   const [splitDirty, setSplitDirty] = useState(false);
   const [dnsDirty, setDnsDirty] = useState(false);
   const [pendingTab, setPendingTab] = useState<NavTab | null>(null);
@@ -238,10 +314,10 @@ function AppShell() {
   const platformRef = useRef<"windows" | "macos" | "linux" | undefined>(
     undefined,
   );
+  const langRef = useRef<ResolvedLanguage>(lang);
 
   const {
     status,
-    settings,
     loading,
     error,
     statusError,
@@ -249,15 +325,15 @@ function AppShell() {
     activity,
     toasts,
     refreshStatus,
-    refreshSettings,
     pushToast,
     dismissToast,
     pauseToastTimer,
     resumeToastTimer,
     clearActivity,
-  } = useDesktopStatus();
+  } = desktop;
 
   platformRef.current = status?.platform;
+  langRef.current = lang;
 
   useEffect(() => {
     mountedRef.current = true;
@@ -282,27 +358,40 @@ function AppShell() {
       if (!payload || typeof payload !== "object") {
         return;
       }
+      const currentLang = langRef.current;
       const surfaceLabel =
-        platformRef.current === "macos" ? "Menu bar" : "Tray";
+        platformRef.current === "macos"
+          ? tShell(currentLang, "surfaceMenuBar")
+          : tShell(currentLang, "surfaceTray");
       if (payload.cancelled) {
         pushToast(
           "info",
           safeActionMessage(
+            currentLang,
             payload.message,
-            `${surfaceLabel} action cancelled.`,
+            tShell(currentLang, "trayActionCancelled", {
+              surface: surfaceLabel,
+            }),
           ),
         );
       } else if (!payload.ok) {
         pushToast(
           "error",
-          safeActionMessage(payload.message, `${surfaceLabel} action failed.`),
+          safeActionMessage(
+            currentLang,
+            payload.message,
+            tShell(currentLang, "trayActionFailed", {
+              surface: surfaceLabel,
+            }),
+          ),
         );
       } else if (payload.needsRestart) {
         pushToast(
           "warn",
           safeActionMessage(
+            currentLang,
             payload.message,
-            "Action completed. Restart service to apply.",
+            tShell(currentLang, "actionNeedsRestart"),
           ),
         );
       }
@@ -327,35 +416,6 @@ function AppShell() {
     };
   }, [pushToast]);
 
-  useEffect(() => {
-    if (settings !== null) {
-      setGuiPrefsOverride(null);
-    }
-  }, [settings]);
-
-  const effectiveSettings = useMemo<DesktopSettingsPayload | null>(() => {
-    if (!settings) {
-      return null;
-    }
-    if (!guiPrefsOverride) {
-      return settings;
-    }
-    return {
-      ...settings,
-      gui: guiPrefsOverride,
-    };
-  }, [settings, guiPrefsOverride]);
-
-  const effectiveGuiPrefs = guiPrefsOverride ?? settings?.gui ?? null;
-  const themePreference: ThemePreference =
-    effectiveGuiPrefs?.theme ?? "system";
-  const keepInTrayOnClose = Boolean(effectiveGuiPrefs?.keepInTrayOnClose);
-  const trayPrefsActive = Boolean(
-    effectiveGuiPrefs?.keepInTrayOnClose ||
-      effectiveGuiPrefs?.minimizeToTray ||
-      effectiveGuiPrefs?.startMinimizedToTray,
-  );
-
   const activeEngine: EngineMode =
     status?.live?.engine ??
     effectiveSettings?.engine ??
@@ -371,8 +431,6 @@ function AppShell() {
       setConfirmSwitchToTunOpen(false);
     }
   }, [activeEngine, confirmSwitchToTunOpen, isProtectionActive]);
-
-  useTheme(themePreference);
 
   const navigateToTab = useCallback((tab: NavTab) => {
     setActiveTab(tab);
@@ -485,35 +543,48 @@ function AppShell() {
           }
         }
 
+        const currentLang = langRef.current;
         if (result.cancelled) {
           pushToast(
             "info",
-            safeActionMessage(result.message, "Protection change cancelled."),
+            safeActionMessage(
+              currentLang,
+              result.message,
+              tShell(currentLang, "protectionCancelled"),
+            ),
           );
         } else if (!result.ok) {
           pushToast(
             "error",
             safeActionMessage(
+              currentLang,
               result.message,
-              "Failed to update protection state.",
+              tShell(currentLang, "protectionUpdateFailed"),
             ),
           );
         } else if (result.needsRestart) {
           pushToast(
             "warn",
             safeActionMessage(
+              currentLang,
               result.message,
-              "Protection updated. Restart service to apply.",
+              tShell(currentLang, "protectionNeedsRestart"),
             ),
           );
         } else if (result.message?.trim()) {
-          pushToast("success", scrubUrlsInText(result.message.trim()));
+          pushToast(
+            "success",
+            localizeActionMessage(
+              currentLang,
+              scrubUrlsInText(result.message.trim()),
+            ),
+          );
         }
       } catch (err) {
         if (mountedRef.current) {
           pushToast(
             "error",
-            getErrorMessage(err, "Failed to toggle protection."),
+            getErrorMessage(err, tShell(langRef.current, "protectionToggleFailed")),
           );
         }
       } finally {
@@ -534,14 +605,6 @@ function AppShell() {
     [handleToggleProtection],
   );
 
-  const handleRefreshSettings = useCallback(async () => {
-    const refreshed = await refreshSettings();
-    if (mountedRef.current && refreshed) {
-      setGuiPrefsOverride(null);
-    }
-    return refreshed;
-  }, [refreshSettings]);
-
   const handleSwitchEngine = useCallback(
     async (engine: EngineMode) => {
       if (busyActionRef.current !== null) {
@@ -561,57 +624,70 @@ function AppShell() {
 
         // In Tauri runtime, switch_engine broadcasts vdpi://status directly.
         if (isTauriRuntime()) {
-          await handleRefreshSettings();
+          await onRefreshSettings();
         } else {
-          await Promise.all([refreshStatus(), handleRefreshSettings()]);
+          await Promise.all([refreshStatus(), onRefreshSettings()]);
         }
         if (!mountedRef.current) {
           return;
         }
 
+        const currentLang = langRef.current;
         const label = engine === "tun" ? "TUN" : "Proxy";
         if (result.cancelled) {
           pushToast(
             "info",
             safeActionMessage(
+              currentLang,
               result.message,
-              `Engine switch to ${label} cancelled.`,
+              tShell(currentLang, "engineSwitchCancelled", { engine: label }),
             ),
           );
         } else if (!result.ok) {
           pushToast(
             "error",
             safeActionMessage(
+              currentLang,
               result.message,
-              `Failed to switch engine to ${label}.`,
+              tShell(currentLang, "engineSwitchFailed", { engine: label }),
             ),
           );
         } else if (result.needsRestart) {
           pushToast(
             "warn",
             safeActionMessage(
+              currentLang,
               result.message,
-              `Switched engine to ${label}. Restart service to apply.`,
+              tShell(currentLang, "engineSwitchNeedsRestart", {
+                engine: label,
+              }),
             ),
           );
         } else {
           pushToast(
             "success",
-            safeActionMessage(result.message, `Switched engine to ${label}.`),
+            safeActionMessage(
+              currentLang,
+              result.message,
+              tShell(currentLang, "engineSwitchSuccess", { engine: label }),
+            ),
           );
         }
       } catch (err) {
         if (mountedRef.current) {
           pushToast(
             "error",
-            getErrorMessage(err, "Failed to switch protection engine."),
+            getErrorMessage(
+              err,
+              tShell(langRef.current, "engineSwitchGenericFailed"),
+            ),
           );
         }
       } finally {
         setBusy(null);
       }
     },
-    [activeEngine, handleRefreshSettings, pushToast, refreshStatus, setBusy],
+    [activeEngine, onRefreshSettings, pushToast, refreshStatus, setBusy],
   );
 
   const handleSwitchToTun = useCallback(() => {
@@ -647,55 +723,73 @@ function AppShell() {
 
       // In Tauri runtime, install_service broadcasts vdpi://status directly.
       if (isTauriRuntime()) {
-        await handleRefreshSettings();
+        await onRefreshSettings();
       } else {
-        await Promise.all([refreshStatus(), handleRefreshSettings()]);
+        await Promise.all([refreshStatus(), onRefreshSettings()]);
       }
       if (!mountedRef.current) {
         return;
       }
 
+      const currentLang = langRef.current;
       if (result.cancelled) {
         pushToast(
           "info",
-          safeActionMessage(result.message, "Service installation cancelled."),
+          safeActionMessage(
+            currentLang,
+            result.message,
+            tShell(currentLang, "installCancelled"),
+          ),
         );
       } else if (!result.ok) {
         pushToast(
           "error",
           safeActionMessage(
+            currentLang,
             result.message,
-            "Failed to install background service.",
+            tShell(currentLang, "installFailed"),
           ),
         );
       } else if (result.needsRestart) {
         pushToast(
           "warn",
           safeActionMessage(
+            currentLang,
             result.message,
-            "Background service installed. Restart to apply.",
+            tShell(currentLang, "installNeedsRestart"),
           ),
         );
       } else {
         pushToast(
           "success",
-          safeActionMessage(result.message, "Background service installed."),
+          safeActionMessage(
+            currentLang,
+            result.message,
+            tShell(currentLang, "installSuccess"),
+          ),
         );
       }
     } catch (err) {
       if (mountedRef.current) {
         pushToast(
           "error",
-          getErrorMessage(err, "Failed to install background service."),
+          getErrorMessage(err, tShell(langRef.current, "installFailed")),
         );
       }
     } finally {
       setBusy(null);
     }
-  }, [handleRefreshSettings, pushToast, refreshStatus, setBusy]);
+  }, [onRefreshSettings, pushToast, refreshStatus, setBusy]);
 
   const handleOpenAppFolder = useCallback(
     async (kind: AppFolderTarget = "app") => {
+      const currentLang = langRef.current;
+      const folderLabel =
+        kind === "config"
+          ? tShell(currentLang, "folderKindConfig")
+          : kind === "logs"
+            ? tShell(currentLang, "folderKindLogs")
+            : tShell(currentLang, "folderKindApp");
       try {
         const result = await openAppFolder(kind);
         if (!mountedRef.current) {
@@ -704,16 +798,29 @@ function AppShell() {
         if (!result.ok) {
           pushToast(
             "error",
-            safeActionMessage(result.message, `Failed to open ${kind} folder.`),
+            safeActionMessage(
+              currentLang,
+              result.message,
+              tShell(currentLang, "openFolderFailed", { kind: folderLabel }),
+            ),
           );
         } else if (!isTauriRuntime() && result.message?.trim()) {
-          pushToast("info", scrubUrlsInText(result.message.trim()));
+          pushToast(
+            "info",
+            localizeActionMessage(
+              currentLang,
+              scrubUrlsInText(result.message.trim()),
+            ),
+          );
         }
       } catch (err) {
         if (mountedRef.current) {
           pushToast(
             "error",
-            getErrorMessage(err, `Failed to open ${kind} folder.`),
+            getErrorMessage(
+              err,
+              tShell(currentLang, "openFolderFailed", { kind: folderLabel }),
+            ),
           );
         }
       }
@@ -729,30 +836,22 @@ function AppShell() {
   const handleRefreshStatus = useCallback(async () => {
     const next = await refreshStatus(true);
     if (!next) {
-      throw new Error("Could not refresh vdpi status.");
+      throw new Error(tShell(langRef.current, "refreshStatusFailed"));
     }
     return next;
   }, [refreshStatus]);
 
-  const handlePreferencesChanged = useCallback(
-    async (nextPrefs: GuiPreferences) => {
-      setGuiPrefsOverride(nextPrefs);
-      await handleRefreshSettings();
-    },
-    [handleRefreshSettings],
-  );
-
   const handleSyncAll = useCallback(async () => {
     if (isTauriRuntime()) {
-      await handleRefreshSettings();
+      await onRefreshSettings();
       return;
     }
-    await Promise.all([refreshStatus(), handleRefreshSettings()]);
-  }, [handleRefreshSettings, refreshStatus]);
+    await Promise.all([refreshStatus(), onRefreshSettings()]);
+  }, [onRefreshSettings, refreshStatus]);
 
   const handleRetrySync = useCallback(async () => {
-    await Promise.all([refreshStatus(true), handleRefreshSettings()]);
-  }, [handleRefreshSettings, refreshStatus]);
+    await Promise.all([refreshStatus(true), onRefreshSettings()]);
+  }, [onRefreshSettings, refreshStatus]);
 
   const handleBoundaryReset = useCallback(() => {
     setSplitDirty(false);
@@ -763,25 +862,29 @@ function AppShell() {
     if (mainContentRef.current) {
       mainContentRef.current.scrollTop = 0;
     }
-    void Promise.all([refreshStatus(true), handleRefreshSettings()]);
-  }, [handleRefreshSettings, refreshStatus]);
+    void Promise.all([refreshStatus(true), onRefreshSettings()]);
+  }, [onRefreshSettings, refreshStatus]);
 
   const handleCopyActivity = useCallback(async (): Promise<boolean> => {
     if (activity.length === 0) {
       return false;
     }
 
+    const currentLang = langRef.current;
     try {
-      await copyTextToClipboard(formatActivityForClipboard(activity));
+      await copyTextToClipboard(
+        formatActivityForClipboard(activity, currentLang),
+        currentLang,
+      );
       if (mountedRef.current) {
-        pushToast("success", "Activity log copied to clipboard.");
+        pushToast("success", tShell(currentLang, "activityCopied"));
       }
       return true;
     } catch (err) {
       if (mountedRef.current) {
         pushToast(
           "error",
-          getErrorMessage(err, "Failed to copy activity log."),
+          getErrorMessage(err, tShell(currentLang, "activityCopyFailed")),
         );
       }
       return false;
@@ -791,9 +894,9 @@ function AppShell() {
   const isLeavingDns = activeTab === "dns";
   const switchToTunAdminNote =
     status?.platform === "windows"
-      ? " A Windows administrator prompt may appear to restart the background service."
+      ? tShell(lang, "switchToTunAdminWindows")
       : status?.platform === "macos"
-        ? " A macOS administrator prompt may appear to restart the background service."
+        ? tShell(lang, "switchToTunAdminMac")
         : "";
 
   return (
@@ -805,7 +908,7 @@ function AppShell() {
           mainContentRef.current?.focus();
         }}
       >
-        Skip to main content
+        {tShell(lang, "skipToMain")}
       </a>
 
       <Sidebar
@@ -822,7 +925,7 @@ function AppShell() {
         ref={mainContentRef}
         className="main-content"
         tabIndex={-1}
-        aria-label="Workspace"
+        aria-label={tShell(lang, "workspaceAria")}
       >
         <div className="view-container">
           {error && !loading ? (
@@ -830,11 +933,11 @@ function AppShell() {
               tone="error"
               title={
                 statusError
-                  ? "Unable to reach vdpi desktop backend"
-                  : "Unable to load vdpi settings"
+                  ? tShell(lang, "backendUnreachableTitle")
+                  : tShell(lang, "settingsLoadErrorTitle")
               }
               description={scrubUrlsInText(error)}
-              actionLabel="Retry"
+              actionLabel={tShell(lang, "retryAction")}
               onAction={() => {
                 void handleRetrySync();
               }}
@@ -844,7 +947,7 @@ function AppShell() {
           {status?.configWarning ? (
             <InlineBanner
               tone="warn"
-              title="Configuration warning"
+              title={tShell(lang, "configWarningTitle")}
               description={scrubUrlsInText(status.configWarning)}
             />
           ) : null}
@@ -852,6 +955,7 @@ function AppShell() {
           <AppErrorBoundary
             resetKey={activeTab}
             compact
+            lang={lang}
             onReset={handleBoundaryReset}
           >
             {activeTab === "overview" ? (
@@ -911,8 +1015,9 @@ function AppShell() {
               <SettingsView
                 status={status}
                 settings={effectiveSettings}
-                onPreferencesChanged={handlePreferencesChanged}
-                onRefreshSettings={handleRefreshSettings}
+                onPreferencesPreview={onPreferencesPreview}
+                onPreferencesChanged={onPreferencesChanged}
+                onRefreshSettings={onRefreshSettings}
                 onServiceChanged={handleSyncAll}
                 onPushToast={handlePushToast}
               />
@@ -925,16 +1030,16 @@ function AppShell() {
         open={pendingTab !== null}
         title={
           isLeavingDns
-            ? "Discard unsaved DNS & Rules changes?"
-            : "Discard unsaved split tunnel changes?"
+            ? tShell(lang, "discardDnsTitle")
+            : tShell(lang, "discardSplitTitle")
         }
         description={
           isLeavingDns
-            ? "You have unsaved changes in DNS & Rules. Leaving this tab will discard your edits."
-            : "You have unsaved changes in Split Tunneling. Leaving this tab will discard your edits."
+            ? tShell(lang, "discardDnsDesc")
+            : tShell(lang, "discardSplitDesc")
         }
-        confirmLabel="Discard & Leave"
-        cancelLabel="Stay"
+        confirmLabel={tShell(lang, "discardConfirm")}
+        cancelLabel={tShell(lang, "discardCancel")}
         danger
         onConfirm={handleConfirmLeaveDirty}
         onCancel={handleCancelLeaveDirty}
@@ -942,10 +1047,12 @@ function AppShell() {
 
       <ConfirmDialog
         open={confirmSwitchToTunOpen}
-        title="Switch to Full-PC (TUN)?"
-        description={`Switching to Full-PC (TUN) mode restarts protection, so active connections will reconnect briefly while the virtual adapter starts.${switchToTunAdminNote}`}
-        confirmLabel="Switch to Full-PC (TUN)"
-        cancelLabel="Cancel"
+        title={tShell(lang, "switchToTunTitle")}
+        description={tShell(lang, "switchToTunDesc", {
+          adminNote: switchToTunAdminNote,
+        })}
+        confirmLabel={tShell(lang, "switchToTunConfirm")}
+        cancelLabel={tShell(lang, "cancel")}
         onConfirm={handleConfirmSwitchToTun}
         onCancel={handleCancelSwitchToTun}
       />
@@ -957,6 +1064,113 @@ function AppShell() {
         onResumeTimer={resumeToastTimer}
       />
     </div>
+  );
+}
+
+function AppShell() {
+  const desktop = useDesktopStatus();
+  const { settings, refreshSettings } = desktop;
+
+  const [guiPrefsOverride, setGuiPrefsOverride] =
+    useState<GuiPreferences | null>(null);
+  const [storedLanguage, setStoredLanguage] = useState<
+    LanguagePreference | undefined
+  >(() => readStoredLanguage());
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (settings !== null) {
+      setGuiPrefsOverride(null);
+      if (settings.gui.language !== undefined) {
+        setStoredLanguage(settings.gui.language);
+        writeStoredLanguage(settings.gui.language);
+      }
+    }
+  }, [settings]);
+
+  const effectiveSettings = useMemo<DesktopSettingsPayload | null>(() => {
+    if (!settings) {
+      return null;
+    }
+    const baseGui = guiPrefsOverride ?? settings.gui;
+    const resolvedPrefLang: LanguagePreference =
+      baseGui.language ?? storedLanguage ?? "system";
+    if (!guiPrefsOverride && baseGui.language === resolvedPrefLang) {
+      return settings;
+    }
+    return {
+      ...settings,
+      gui: {
+        ...baseGui,
+        language: resolvedPrefLang,
+      },
+    };
+  }, [settings, guiPrefsOverride, storedLanguage]);
+
+  const effectiveGuiPrefs = guiPrefsOverride ?? settings?.gui ?? null;
+  const themePreference: ThemePreference =
+    effectiveGuiPrefs?.theme ?? "system";
+  const languagePreference: LanguagePreference =
+    guiPrefsOverride?.language ??
+    settings?.gui?.language ??
+    storedLanguage ??
+    "system";
+  const keepInTrayOnClose = Boolean(effectiveGuiPrefs?.keepInTrayOnClose);
+  const trayPrefsActive = Boolean(
+    effectiveGuiPrefs?.keepInTrayOnClose ||
+      effectiveGuiPrefs?.minimizeToTray ||
+      effectiveGuiPrefs?.startMinimizedToTray,
+  );
+
+  useTheme(themePreference);
+
+  const handleRefreshSettings = useCallback(async () => {
+    const refreshed = await refreshSettings();
+    if (mountedRef.current && refreshed) {
+      setGuiPrefsOverride(null);
+    }
+    return refreshed;
+  }, [refreshSettings]);
+
+  const handlePreferencesPreview = useCallback((nextPrefs: GuiPreferences) => {
+    setGuiPrefsOverride(nextPrefs);
+    if (nextPrefs.language) {
+      setStoredLanguage(nextPrefs.language);
+      writeStoredLanguage(nextPrefs.language);
+    }
+  }, []);
+
+  const handlePreferencesChanged = useCallback(
+    async (nextPrefs: GuiPreferences) => {
+      setGuiPrefsOverride(nextPrefs);
+      if (nextPrefs.language) {
+        setStoredLanguage(nextPrefs.language);
+        writeStoredLanguage(nextPrefs.language);
+      }
+      await handleRefreshSettings();
+    },
+    [handleRefreshSettings],
+  );
+
+  return (
+    <I18nProvider preference={languagePreference}>
+      <AppShellContent
+        desktop={desktop}
+        effectiveSettings={effectiveSettings}
+        keepInTrayOnClose={keepInTrayOnClose}
+        trayPrefsActive={trayPrefsActive}
+        onPreferencesPreview={handlePreferencesPreview}
+        onPreferencesChanged={handlePreferencesChanged}
+        onRefreshSettings={handleRefreshSettings}
+      />
+    </I18nProvider>
   );
 }
 

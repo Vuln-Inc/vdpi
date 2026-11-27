@@ -11,6 +11,12 @@ import { SegmentedControl } from "../components/SegmentedControl";
 import type { SegmentedOption } from "../components/SegmentedControl";
 import { Switch } from "../components/Switch";
 import type { ToastTone } from "../components/ToastStack";
+import { useLang } from "../i18n/context";
+import {
+  tDns,
+  translateCustomDnsError,
+  type DnsStringKey,
+} from "../i18n/dns";
 import {
   isKnownPublicDohIp,
   redactDnsPreview,
@@ -48,8 +54,8 @@ interface ResolverPresetOption {
   id: Exclude<ResolverPresetId, "custom">;
   name: string;
   address: string;
-  summary: string;
-  badge: string;
+  summaryKey: DnsStringKey;
+  badgeKey: DnsStringKey;
 }
 
 interface SavedDnsBaseline {
@@ -68,36 +74,36 @@ const RESOLVER_PRESETS: readonly ResolverPresetOption[] = [
     id: "cloudflare",
     name: "Cloudflare",
     address: "1.1.1.1",
-    summary: "Low-latency public DNS with IP-SAN DoH support.",
-    badge: "Fast",
+    summaryKey: "presetCloudflareSummary",
+    badgeKey: "presetCloudflareBadge",
   },
   {
     id: "quad9",
     name: "Quad9",
     address: "9.9.9.9",
-    summary: "Security-focused DNS with malicious domain blocking.",
-    badge: "Security",
+    summaryKey: "presetQuad9Summary",
+    badgeKey: "presetQuad9Badge",
   },
   {
     id: "google",
     name: "Google",
     address: "8.8.8.8",
-    summary: "Global anycast public resolver with IP-SAN DoH.",
-    badge: "Global",
+    summaryKey: "presetGoogleSummary",
+    badgeKey: "presetGoogleBadge",
   },
   {
     id: "adguard",
     name: "AdGuard",
     address: "94.140.14.14",
-    summary: "Blocks ads, trackers, and phishing domains.",
-    badge: "Ad-block",
+    summaryKey: "presetAdguardSummary",
+    badgeKey: "presetAdguardBadge",
   },
   {
     id: "adguard_unfiltered",
     name: "AdGuard",
     address: "94.140.14.140",
-    summary: "AdGuard infrastructure without content filtering.",
-    badge: "Unfiltered",
+    summaryKey: "presetAdguardUnfilteredSummary",
+    badgeKey: "presetAdguardUnfilteredBadge",
   },
 ];
 
@@ -110,17 +116,10 @@ const RESOLVER_ORDER: readonly ResolverPresetId[] = [
   "custom",
 ];
 
-const VPN_COEXISTENCE_OPTIONS: readonly SegmentedOption<VpnCoexistence>[] = [
-  { value: "auto_yield", label: "Auto-yield" },
-  { value: "warn", label: "Warn" },
-  { value: "off", label: "Off" },
-];
-
-const VPN_COEXISTENCE_DESCRIPTIONS: Record<VpnCoexistence, string> = {
-  auto_yield:
-    "Automatically pauses vdpi when a full-tunnel VPN is detected and resumes once the VPN disconnects.",
-  warn: "Keeps vdpi running alongside full-tunnel VPNs and shows a conflict warning banner.",
-  off: "Disables VPN interface conflict checks. Use only if you manage routing tables manually.",
+const VPN_COEXISTENCE_DESC_KEYS: Record<VpnCoexistence, DnsStringKey> = {
+  auto_yield: "vpnDescAutoYield",
+  warn: "vpnDescWarn",
+  off: "vpnDescOff",
 };
 
 const MAX_DOMAIN_ENTRIES = 512;
@@ -1065,6 +1064,10 @@ function DnsRulesViewComponent({
   onPushToast,
   onDirtyChange,
 }: DnsRulesViewProps) {
+  const { lang } = useLang();
+  const langRef = useRef(lang);
+  langRef.current = lang;
+
   const customInputId = useId();
   const customHintId = useId();
   const dohLabelId = useId();
@@ -1227,6 +1230,17 @@ function DnsRulesViewComponent({
     [bypassDomains, includeDomains],
   );
 
+  const vpnCoexistenceOptions = useMemo<
+    readonly SegmentedOption<VpnCoexistence>[]
+  >(
+    () => [
+      { value: "auto_yield", label: tDns(lang, "vpnOptAutoYield") },
+      { value: "warn", label: tDns(lang, "vpnOptWarn") },
+      { value: "off", label: tDns(lang, "vpnOptOff") },
+    ],
+    [lang],
+  );
+
   const dirtyChanges = useMemo(() => {
     if (!saved) return [] as string[];
     const changes: string[] = [];
@@ -1236,29 +1250,29 @@ function DnsRulesViewComponent({
       ? savedValidation.normalized
       : saved.dnsAddr;
     if (activeDnsAddr !== savedNormalizedDns) {
-      changes.push("DNS resolver");
+      changes.push(tDns(lang, "dirtyDnsResolver"));
     }
 
     const savedIsUrl = savedValidation.kind === "doh_url";
     const savedEffectiveDoh = savedIsUrl ? true : saved.dohEnabled;
     if (effectiveDohChecked !== savedEffectiveDoh) {
-      changes.push("Encrypted DNS");
+      changes.push(tDns(lang, "dirtyEncryptedDns"));
     }
 
     if (blockQuic !== saved.blockQuic) {
-      changes.push("QUIC blocking");
+      changes.push(tDns(lang, "dirtyQuicBlocking"));
     }
     if (tunIpv6 !== saved.tunIpv6 || ipv4Only !== saved.ipv4Only) {
-      changes.push("IP stack");
+      changes.push(tDns(lang, "dirtyIpStack"));
     }
     if (vpnCoexistence !== saved.vpnCoexistence) {
-      changes.push("VPN coexistence");
+      changes.push(tDns(lang, "dirtyVpnCoexistence"));
     }
     if (!areDomainListsEqual(bypassDomains, saved.bypassDomains)) {
-      changes.push("Bypass domains");
+      changes.push(tDns(lang, "dirtyBypassDomains"));
     }
     if (!areDomainListsEqual(includeDomains, saved.includeDomains)) {
-      changes.push("Include domains");
+      changes.push(tDns(lang, "dirtyIncludeDomains"));
     }
 
     return changes;
@@ -1272,6 +1286,7 @@ function DnsRulesViewComponent({
     vpnCoexistence,
     bypassDomains,
     includeDomains,
+    lang,
   ]);
 
   const isDirty = dirtyChanges.length > 0;
@@ -1282,7 +1297,10 @@ function DnsRulesViewComponent({
   }, [isDirty, onDirtyChange]);
 
   const isLiveRunning = Boolean(status?.live?.running);
-  const livePillLabel = isLiveRunning ? "Active" : "Configured";
+  const livePillLabel = tDns(
+    lang,
+    isLiveRunning ? "liveActive" : "liveConfigured",
+  );
   const rawLiveDnsDisplay =
     (isLiveRunning ? status?.live?.dnsDisplay : null) ||
     settings?.dnsDisplay ||
@@ -1372,7 +1390,7 @@ function DnsRulesViewComponent({
       if (result.cancelled) {
         setRevealCustom(false);
         const cancelMessage = scrubUrlsInText(
-          result.message?.trim() || "DNS & rule changes were cancelled.",
+          result.message?.trim() || tDns(langRef.current, "saveCancelled"),
         );
         setErrorBanner(null);
         onPushToast?.("info", cancelMessage);
@@ -1391,7 +1409,7 @@ function DnsRulesViewComponent({
 
       if (!result.ok) {
         const message = scrubUrlsInText(
-          result.message?.trim() || "Failed to save DNS and rule settings.",
+          result.message?.trim() || tDns(langRef.current, "saveFailed"),
         );
         setErrorBanner(message);
         onPushToast?.("error", message);
@@ -1431,9 +1449,10 @@ function DnsRulesViewComponent({
 
       const successMessage = scrubUrlsInText(
         result.message?.trim() ||
-          (result.needsRestart
-            ? "DNS & rule settings saved (restart service to apply)."
-            : "DNS & rule settings saved and applied."),
+          tDns(
+            langRef.current,
+            result.needsRestart ? "saveSuccessRestart" : "saveSuccess",
+          ),
       );
       onPushToast?.(result.needsRestart ? "warn" : "success", successMessage);
 
@@ -1445,7 +1464,7 @@ function DnsRulesViewComponent({
     } catch (error) {
       if (!mountedRef.current) return;
       const message = scrubUrlsInText(
-        getErrorMessage(error, "Failed to save DNS and rule settings."),
+        getErrorMessage(error, tDns(langRef.current, "saveFailed")),
       );
       setErrorBanner(message);
       onPushToast?.("error", message);
@@ -1497,24 +1516,21 @@ function DnsRulesViewComponent({
 
   if (!settings) {
     return (
-      <section className="dns-view" aria-label="DNS & Rules">
+      <section className="dns-view" aria-label={tDns(lang, "title")}>
         <div className="dns-loading" role="status">
           <span className="dns-spinner" aria-hidden="true" />
-          <span>Loading DNS &amp; rule settings...</span>
+          <span>{tDns(lang, "loading")}</span>
         </div>
       </section>
     );
   }
 
   return (
-    <section className="dns-view" aria-label="DNS & Rules">
+    <section className="dns-view" aria-label={tDns(lang, "title")}>
       <header className="dns-view__header">
         <div className="dns-view__heading">
-          <h1 className="dns-view__title">DNS &amp; Rules</h1>
-          <p className="dns-view__subtitle">
-            Configure upstream DNS resolution, protocol guards, VPN coexistence,
-            and per-domain routing overrides.
-          </p>
+          <h1 className="dns-view__title">{tDns(lang, "title")}</h1>
+          <p className="dns-view__subtitle">{tDns(lang, "subtitle")}</p>
         </div>
 
         {liveDnsDisplay ? (
@@ -1551,7 +1567,7 @@ function DnsRulesViewComponent({
       {errorBanner ? (
         <InlineBanner
           tone="error"
-          title="Could not save DNS & rule settings"
+          title={tDns(lang, "errorBannerTitle")}
           description={errorBanner}
         />
       ) : null}
@@ -1559,8 +1575,10 @@ function DnsRulesViewComponent({
       {activeVpnConflict ? (
         <InlineBanner
           tone="warn"
-          title="Full-tunnel VPN detected"
-          description={`Active VPN interface (${activeVpnConflict}) detected. Adjust VPN Coexistence below to choose whether vdpi auto-yields or warns.`}
+          title={tDns(lang, "vpnConflictTitle")}
+          description={tDns(lang, "vpnConflictDesc", {
+            iface: activeVpnConflict,
+          })}
         />
       ) : null}
 
@@ -1571,13 +1589,10 @@ function DnsRulesViewComponent({
             <div className="dns-section__title-row">
               <IconDns size={16} className="dns-section__icon" />
               <h2 id="dns-resolver-heading" className="dns-section__title">
-                DNS Resolver
+                {tDns(lang, "resolverHeading")}
               </h2>
             </div>
-            <p className="dns-section__desc">
-              Choose a trusted public resolver or enter a custom IP / encrypted
-              DNS-over-HTTPS endpoint.
-            </p>
+            <p className="dns-section__desc">{tDns(lang, "resolverDesc")}</p>
           </div>
         </div>
 
@@ -1612,10 +1627,14 @@ function DnsRulesViewComponent({
                     </span>
                     <span className="dns-radio-card__name">{preset.name}</span>
                   </span>
-                  <span className="dns-badge">{preset.badge}</span>
+                  <span className="dns-badge">
+                    {tDns(lang, preset.badgeKey)}
+                  </span>
                 </div>
                 <span className="dns-radio-card__addr">{preset.address}</span>
-                <p className="dns-radio-card__summary">{preset.summary}</p>
+                <p className="dns-radio-card__summary">
+                  {tDns(lang, preset.summaryKey)}
+                </p>
               </button>
             );
           })}
@@ -1646,16 +1665,18 @@ function DnsRulesViewComponent({
                       ) : null}
                     </span>
                     <span className="dns-radio-card__name">
-                      Custom DNS
+                      {tDns(lang, "customDnsName")}
                     </span>
                   </span>
-                  <span className="dns-badge">IP / DoH</span>
+                  <span className="dns-badge">
+                    {tDns(lang, "customDnsBadge")}
+                  </span>
                 </div>
                 <span className="dns-radio-card__addr">
                   {customPreview || "IPv4 / IPv6 / https://"}
                 </span>
                 <p className="dns-radio-card__summary">
-                  NextDNS, ControlD, local LAN resolver, or custom IP.
+                  {tDns(lang, "customDnsSummary")}
                 </p>
               </button>
             );
@@ -1669,15 +1690,15 @@ function DnsRulesViewComponent({
                 htmlFor={customInputId}
                 className="dns-custom-panel__label"
               >
-                Custom IP Address or DoH Endpoint URL
+                {tDns(lang, "customInputLabel")}
               </label>
 
               {customPreview ? (
                 <span
                   className="dns-preview-pill"
-                  aria-label="Redacted DNS preview"
+                  aria-label={tDns(lang, "ariaRedactedPreview")}
                 >
-                  <span>Preview</span>
+                  <span>{tDns(lang, "previewLabel")}</span>
                   <span className="dns-preview-pill__addr">
                     {customPreview}
                   </span>
@@ -1696,7 +1717,7 @@ function DnsRulesViewComponent({
                 autoCorrect="off"
                 autoCapitalize="off"
                 spellCheck={false}
-                placeholder="e.g. 10.0.0.53, 2606:4700:4700::1111, or https://dns.nextdns.io/abc123"
+                placeholder={tDns(lang, "customInputPlaceholder")}
                 aria-invalid={
                   customDns.trim().length > 0 && !customAnalysis.valid
                 }
@@ -1716,9 +1737,10 @@ function DnsRulesViewComponent({
                   type="button"
                   className="dns-reveal-btn"
                   disabled={saving}
-                  aria-label={
-                    revealCustom ? "Hide DNS address" : "Reveal DNS address"
-                  }
+                  aria-label={tDns(
+                    lang,
+                    revealCustom ? "ariaHideDns" : "ariaRevealDns",
+                  )}
                   aria-pressed={revealCustom}
                   onClick={() => setRevealCustom((prev) => !prev)}
                 >
@@ -1727,7 +1749,7 @@ function DnsRulesViewComponent({
                   ) : (
                     <IconEye size={15} />
                   )}
-                  <span>{revealCustom ? "Hide" : "Reveal"}</span>
+                  <span>{tDns(lang, revealCustom ? "hide" : "reveal")}</span>
                 </button>
               ) : null}
             </div>
@@ -1735,36 +1757,39 @@ function DnsRulesViewComponent({
             <div id={customHintId}>
               {!customAnalysis.valid && customDns.trim().length > 0 ? (
                 <p className="dns-hint dns-hint--error" role="alert">
-                  {customAnalysis.error}
+                  {translateCustomDnsError(lang, customAnalysis.error)}
                 </p>
               ) : customAnalysis.kind === "doh_url" ? (
                 <p className="dns-hint dns-hint--ok">
-                  Valid <code>https://</code> DoH endpoint. Profile tokens in
-                  the path/query stay masked by default.
+                  {tDns(lang, "hintValidDohPrefix")}
+                  <code>https://</code>
+                  {tDns(lang, "hintValidDohSuffix")}
                 </p>
               ) : customAnalysis.kind === "known_doh_ip" ? (
                 <p className="dns-hint dns-hint--ok">
-                  Valid IPv{customAnalysis.ipVersion} address with known IP-SAN
-                  DoH support.
+                  {tDns(lang, "hintKnownDohIp", {
+                    version: customAnalysis.ipVersion ?? 4,
+                  })}
                 </p>
               ) : customAnalysis.kind === "bare_udp_ip" ? (
                 dohEnabled ? (
                   <p className="dns-hint dns-hint--warn">
-                    Valid bare IPv{customAnalysis.ipVersion} address. Custom
-                    bare IPs do not serve IP-SAN DoH certificates and will be
-                    queried over UDP first.
+                    {tDns(lang, "hintBareIpDohOn", {
+                      version: customAnalysis.ipVersion ?? 4,
+                    })}
                   </p>
                 ) : (
                   <p className="dns-hint">
-                    Valid IPv{customAnalysis.ipVersion} address. Queries will be
-                    sent over plain UDP.
+                    {tDns(lang, "hintBareIpDohOff", {
+                      version: customAnalysis.ipVersion ?? 4,
+                    })}
                   </p>
                 )
               ) : (
                 <p className="dns-hint">
-                  Accepts IPv4, IPv6, or <code>https://.../dns-query</code>.
-                  URLs containing paths or credentials are masked automatically
-                  to protect NextDNS / ControlD profile tokens.
+                  {tDns(lang, "hintDefaultPrefix")}
+                  <code>https://.../dns-query</code>
+                  {tDns(lang, "hintDefaultSuffix")}
                 </p>
               )}
             </div>
@@ -1779,13 +1804,10 @@ function DnsRulesViewComponent({
             <div className="dns-section__title-row">
               <IconShield size={16} className="dns-section__icon" />
               <h2 id="dns-protocol-heading" className="dns-section__title">
-                Protocol &amp; Coexistence
+                {tDns(lang, "protocolHeading")}
               </h2>
             </div>
-            <p className="dns-section__desc">
-              Control DNS encryption, QUIC handling, IP stack routing, and
-              behavior alongside third-party VPNs.
-            </p>
+            <p className="dns-section__desc">{tDns(lang, "protocolDesc")}</p>
           </div>
         </div>
 
@@ -1795,44 +1817,54 @@ function DnsRulesViewComponent({
             <div className="dns-row__info">
               <div className="dns-row__title-line">
                 <span id={dohLabelId} className="dns-row__label">
-                  Encrypted DNS (DoH)
+                  {tDns(lang, "dohLabel")}
                 </span>
                 {isCustomHttpsUrl ? (
-                  <span className="dns-badge dns-badge--accent">Locked ON</span>
+                  <span className="dns-badge dns-badge--accent">
+                    {tDns(lang, "badgeLockedOn")}
+                  </span>
                 ) : isBareNonDohIp ? (
                   dohEnabled ? (
-                    <span className="dns-badge dns-badge--warn">UDP-first</span>
+                    <span className="dns-badge dns-badge--warn">
+                      {tDns(lang, "badgeUdpFirst")}
+                    </span>
                   ) : (
-                    <span className="dns-badge">Plain UDP</span>
+                    <span className="dns-badge">
+                      {tDns(lang, "badgePlainUdp")}
+                    </span>
                   )
                 ) : !effectiveDohChecked ? (
-                  <span className="dns-badge">Plain UDP</span>
+                  <span className="dns-badge">
+                    {tDns(lang, "badgePlainUdp")}
+                  </span>
                 ) : null}
               </div>
 
               <p id={dohDescId} className="dns-row__desc">
                 {isCustomHttpsUrl ? (
                   <>
-                    Automatically locked ON because a custom{" "}
-                    <code>https://</code> DoH URL is configured. Switch to a
-                    bare IP resolver if you want plain UDP DNS.
+                    {tDns(lang, "dohDescCustomUrlPrefix")}
+                    <code>https://</code>
+                    {tDns(lang, "dohDescCustomUrlSuffix")}
                   </>
                 ) : isBareNonDohIp && dohEnabled ? (
                   <>
-                    Bare custom IPs (such as <code>10.0.0.53</code> or{" "}
-                    <code>76.76.2.0</code>) do not serve IP-SAN DoH
-                    certificates, so vdpi queries them over UDP first even while
-                    this toggle is ON. Enter an <code>https://</code> URL above
-                    for encrypted DoH with a custom provider.
+                    {tDns(lang, "dohDescBareIpOnPart1")}
+                    <code>10.0.0.53</code>
+                    {tDns(lang, "dohDescBareIpOnPart2")}
+                    <code>76.76.2.0</code>
+                    {tDns(lang, "dohDescBareIpOnPart3")}
+                    <code>https://</code>
+                    {tDns(lang, "dohDescBareIpOnPart4")}
                   </>
                 ) : isBareNonDohIp ? (
                   <>
-                    Encrypted DNS is OFF. Queries to this custom IP are sent
-                    over plain UDP. Enter an <code>https://</code> URL above if
-                    your provider supports DoH.
+                    {tDns(lang, "dohDescBareIpOffPrefix")}
+                    <code>https://</code>
+                    {tDns(lang, "dohDescBareIpOffSuffix")}
                   </>
                 ) : (
-                  "Encrypt DNS lookups over HTTPS (RFC 8484) to prevent ISP DNS hijacking and poisoning."
+                  tDns(lang, "dohDescDefault")
                 )}
               </p>
             </div>
@@ -1851,8 +1883,14 @@ function DnsRulesViewComponent({
           {isBareNonDohIp && dohEnabled ? (
             <InlineBanner
               tone="info"
-              title="UDP-first resolution active for bare custom IP"
-              description={`Because ${activeDnsAddr} is not a known IP-SAN DoH server, vdpi will send DNS queries over UDP instead of synthesizing https://${formatDohUrlHost(activeDnsAddr, activeDnsAnalysis.ipVersion)}/dns-query.`}
+              title={tDns(lang, "udpFirstBannerTitle")}
+              description={tDns(lang, "udpFirstBannerDesc", {
+                addr: activeDnsAddr,
+                host: formatDohUrlHost(
+                  activeDnsAddr,
+                  activeDnsAnalysis.ipVersion,
+                ),
+              })}
             />
           ) : null}
 
@@ -1861,13 +1899,11 @@ function DnsRulesViewComponent({
             <div className="dns-row__info">
               <div className="dns-row__title-line">
                 <span id={quicLabelId} className="dns-row__label">
-                  Block QUIC (UDP/443)
+                  {tDns(lang, "quicLabel")}
                 </span>
               </div>
               <p id={quicDescId} className="dns-row__desc">
-                Forces browsers to fall back from HTTP/3 (QUIC) to desynced TCP
-                TLS for reliable DPI bypass while preserving Discord and WebRTC
-                voice/video UDP traffic.
+                {tDns(lang, "quicDesc")}
               </p>
             </div>
 
@@ -1887,16 +1923,16 @@ function DnsRulesViewComponent({
             <div className="dns-row__info">
               <div className="dns-row__title-line">
                 <span id={ipv6LabelId} className="dns-row__label">
-                  IPv6 Support (TUN)
+                  {tDns(lang, "ipv6Label")}
                 </span>
                 {isProxyMode ? (
-                  <span className="dns-badge">TUN mode only</span>
+                  <span className="dns-badge">
+                    {tDns(lang, "badgeTunOnly")}
+                  </span>
                 ) : null}
               </div>
               <p id={ipv6DescId} className="dns-row__desc">
-                {isProxyMode
-                  ? "Unavailable in Proxy mode. Switch to the TUN engine to route IPv6 traffic through the virtual TUN adapter."
-                  : "Route IPv6 traffic through the virtual TUN adapter on dual-stack networks. When IPv4 Only is also enabled, AAAA DNS lookups are suppressed while IPv6 TUN routes remain active for literal IPv6 addresses."}
+                {tDns(lang, isProxyMode ? "ipv6DescProxy" : "ipv6DescTun")}
               </p>
             </div>
 
@@ -1916,14 +1952,11 @@ function DnsRulesViewComponent({
             <div className="dns-row__info">
               <div className="dns-row__title-line">
                 <span id={ipv4LabelId} className="dns-row__label">
-                  IPv4 Only
+                  {tDns(lang, "ipv4Label")}
                 </span>
               </div>
               <p id={ipv4DescId} className="dns-row__desc">
-                Suppress AAAA DNS lookups so hostnames resolve to IPv4 (A)
-                records only when IPv6 paths are broken or throttled by your
-                ISP. If IPv6 Support (TUN) is enabled, IPv6 TUN routes remain
-                active for literal IPv6 addresses.
+                {tDns(lang, "ipv4Desc")}
               </p>
             </div>
 
@@ -1941,16 +1974,16 @@ function DnsRulesViewComponent({
           {!isProxyMode && tunIpv6 && ipv4Only ? (
             <InlineBanner
               tone="warn"
-              title="IPv4 Only paired with IPv6 Support (TUN)"
-              description="Both IPv6 Support (TUN) and IPv4 Only are enabled. IPv4 Only suppresses AAAA DNS lookups so hostnames resolve to IPv4 (A) records only, while IPv6 TUN routes remain active for literal IPv6 addresses."
+              title={tDns(lang, "warnIpv4AndIpv6Title")}
+              description={tDns(lang, "warnIpv4AndIpv6Desc")}
             />
           ) : null}
 
           {ipv4Only && isIpv6CustomDns ? (
             <InlineBanner
               tone="warn"
-              title="IPv6 custom DNS paired with IPv4 Only"
-              description="Your custom DNS server uses an IPv6 address while IPv4 Only is enabled. Disable IPv4 Only or switch to an IPv4 / hostname resolver so DNS lookups stay reachable."
+              title={tDns(lang, "warnIpv4AndIpv6DnsTitle")}
+              description={tDns(lang, "warnIpv4AndIpv6DnsDesc")}
             />
           ) : null}
 
@@ -1959,17 +1992,17 @@ function DnsRulesViewComponent({
             <div className="dns-row__info">
               <div className="dns-row__title-line">
                 <span id={vpnLabelId} className="dns-row__label">
-                  VPN Coexistence
+                  {tDns(lang, "vpnLabel")}
                 </span>
               </div>
               <p className="dns-row__desc">
-                {VPN_COEXISTENCE_DESCRIPTIONS[vpnCoexistence]}
+                {tDns(lang, VPN_COEXISTENCE_DESC_KEYS[vpnCoexistence])}
               </p>
             </div>
 
             <div className="dns-row__control">
               <SegmentedControl<VpnCoexistence>
-                options={VPN_COEXISTENCE_OPTIONS}
+                options={vpnCoexistenceOptions}
                 value={vpnCoexistence}
                 disabled={saving}
                 ariaLabelledBy={vpnLabelId}
@@ -1985,35 +2018,35 @@ function DnsRulesViewComponent({
         <div className="dns-section__head">
           <div>
             <h2 id="dns-domains-heading" className="dns-section__title">
-              Domain Rules
+              {tDns(lang, "domainsHeading")}
             </h2>
-            <p className="dns-section__desc">
-              Configure hostnames that bypass vdpi directly or restrict
-              desyncing to an explicit allowlist. User Bypass rules always take
-              precedence over Include rules.
-            </p>
+            <p className="dns-section__desc">{tDns(lang, "domainsDesc")}</p>
           </div>
         </div>
 
         {overlappingDomains.length > 0 ? (
           <InlineBanner
             tone="warn"
-            title="Overlapping domain rules"
-            description={`${
-              overlappingDomains.length > 6
-                ? `${overlappingDomains.slice(0, 6).join(", ")} (+${overlappingDomains.length - 6} more)`
-                : overlappingDomains.join(", ")
-            }. User Bypass rules take precedence over Include rules for overlapping hostnames and subdomains.`}
+            title={tDns(lang, "overlapTitle")}
+            description={tDns(lang, "overlapDesc", {
+              items:
+                overlappingDomains.length > 6
+                  ? tDns(lang, "overlapMore", {
+                      list: overlappingDomains.slice(0, 6).join(", "),
+                      extra: overlappingDomains.length - 6,
+                    })
+                  : overlappingDomains.join(", "),
+            })}
           />
         ) : null}
 
         <div className="dns-domains-grid">
           <div className="dns-domain-card">
             <DomainListEditor
-              label="Bypass Domains"
-              description="Always connect directly without vdpi desyncing. User Bypass rules take precedence over Include rules."
-              placeholder="e.g. bank.com.tr or *.local.corp"
-              emptyText="No custom bypass domains configured."
+              label={tDns(lang, "bypassLabel")}
+              description={tDns(lang, "bypassDesc")}
+              placeholder={tDns(lang, "bypassPlaceholder")}
+              emptyText={tDns(lang, "bypassEmpty")}
               domains={bypassDomains}
               maxEntries={MAX_DOMAIN_ENTRIES}
               disabled={saving}
@@ -2024,10 +2057,10 @@ function DnsRulesViewComponent({
 
           <div className="dns-domain-card">
             <DomainListEditor
-              label="Include Domains"
-              description="Allowlist filter: adding entries restricts vdpi to only matching domains (overriding built-in default bypasses such as .gov.tr) while all other traffic connects directly. User Bypass rules still take precedence over Include rules."
-              placeholder="e.g. service.gov.tr or *.example.org"
-              emptyText="No allowlist include domains configured."
+              label={tDns(lang, "includeLabel")}
+              description={tDns(lang, "includeDesc")}
+              placeholder={tDns(lang, "includePlaceholder")}
+              emptyText={tDns(lang, "includeEmpty")}
               domains={includeDomains}
               maxEntries={MAX_DOMAIN_ENTRIES}
               disabled={saving}
@@ -2038,19 +2071,21 @@ function DnsRulesViewComponent({
         </div>
       </section>
 
-      {/* Sticky Save & Apply bar — rendered ONLY when dirty */}
+      {/* Sticky Save & Apply bar - rendered ONLY when dirty */}
       {isDirty ? (
         <div
           className="dns-sticky-bar"
           role="region"
-          aria-label="Unsaved DNS and rule changes"
+          aria-label={tDns(lang, "ariaUnsavedRegion")}
         >
           <div className="dns-sticky-bar__info">
-            <p className="dns-sticky-bar__title">Unsaved Changes</p>
+            <p className="dns-sticky-bar__title">
+              {tDns(lang, "unsavedTitle")}
+            </p>
             <div className="dns-sticky-bar__tags">
               {!activeDnsAnalysis.valid ? (
                 <span className="dns-badge dns-badge--warn">
-                  Fix custom DNS address before saving
+                  {tDns(lang, "fixCustomDnsBadge")}
                 </span>
               ) : (
                 dirtyChanges.map((change) => (
@@ -2069,7 +2104,7 @@ function DnsRulesViewComponent({
               disabled={saving}
               onClick={handleDiscard}
             >
-              Discard
+              {tDns(lang, "discard")}
             </button>
             <button
               type="button"
@@ -2080,7 +2115,7 @@ function DnsRulesViewComponent({
               {saving ? (
                 <span className="dns-spinner" aria-hidden="true" />
               ) : null}
-              <span>{saving ? "Saving..." : "Save & Apply"}</span>
+              <span>{tDns(lang, saving ? "saving" : "saveApply")}</span>
             </button>
           </div>
         </div>

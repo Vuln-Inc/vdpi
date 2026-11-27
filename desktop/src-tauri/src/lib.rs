@@ -373,6 +373,7 @@ pub fn run() {
             app.manage(setup_wake.clone());
 
             let app_handle = app.handle().clone();
+            tray::set_tray_language(&app_handle, prefs.language);
             if let Err(err) = tray::setup_or_sync_tray(&app_handle, &prefs, None) {
                 warn!(error = %err, "failed to initialize system tray during setup");
             }

@@ -1,6 +1,8 @@
 import { useEffect, useId, useRef } from "react";
 import type { MouseEvent, ReactNode } from "react";
 import { createPortal } from "react-dom";
+import { useLang } from "../i18n/context";
+import { tShell } from "../i18n/shell";
 
 export interface ConfirmDialogProps {
   open?: boolean;
@@ -210,13 +212,15 @@ export function ConfirmDialog({
   description,
   children,
   confirmLabel,
-  cancelLabel = "Cancel",
+  cancelLabel,
   danger = false,
   busy = false,
   onConfirm,
   onCancel,
   className,
 }: ConfirmDialogProps) {
+  const { lang } = useLang();
+  const effectiveCancelLabel = cancelLabel ?? tShell(lang, "cancel");
   const titleId = useId();
   const descriptionId = useId();
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -393,7 +397,7 @@ export function ConfirmDialog({
             disabled={busy}
             onClick={onCancel}
           >
-            {cancelLabel}
+            {effectiveCancelLabel}
           </button>
           <button
             ref={confirmBtnRef}

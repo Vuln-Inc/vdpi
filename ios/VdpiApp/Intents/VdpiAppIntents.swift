@@ -66,20 +66,22 @@ struct VdpiShortcutsProvider: AppShortcutsProvider {
 
 private enum VdpiTunnelIntentController {
     static func connect() async throws -> String {
+        let settings = VdpiAppGroup.loadSettings()
+        let l10n = L10n.catalog(for: settings.language)
+
         let existingManagers = try await NETunnelProviderManager.loadAllFromPreferences()
         let existing = findManager(in: existingManagers)
         if let existing {
             let existingStatus = existing.connection.status
             if existingStatus == .connected || existingStatus == .connecting || existingStatus == .reasserting {
-                return "vdpi is already connected."
+                return l10n.intentAlreadyConnected
             }
         }
 
-        let settings = VdpiAppGroup.loadSettings()
         let manager = try await loadOrCreateManager(settings: settings, existingManager: existing)
         let status = manager.connection.status
         if status == .connected || status == .connecting || status == .reasserting {
-            return "vdpi is already connected."
+            return l10n.intentAlreadyConnected
         }
 
         VdpiAppGroup.saveSettings(settings)
@@ -93,14 +95,15 @@ private enum VdpiTunnelIntentController {
             VdpiAppGroup.saveAppliedConfig(nil)
             throw error
         }
-        return "Connected vdpi."
+        return l10n.intentConnected
     }
 
     static func disconnect() async throws -> String {
+        let l10n = L10n.catalog(for: VdpiAppGroup.loadSettings().language)
         let managers = try await NETunnelProviderManager.loadAllFromPreferences()
         guard let manager = findManager(in: managers) else {
             VdpiAppGroup.saveAppliedConfig(nil)
-            return "vdpi is already disconnected."
+            return l10n.intentAlreadyDisconnected
         }
 
         let status = manager.connection.status
@@ -112,11 +115,11 @@ private enum VdpiTunnelIntentController {
             try await manager.loadFromPreferences()
         }
         if status == .disconnected || status == .invalid {
-            return "vdpi is already disconnected."
+            return l10n.intentAlreadyDisconnected
         }
 
         manager.connection.stopVPNTunnel()
-        return "Disconnected vdpi."
+        return l10n.intentDisconnected
     }
 
     static func toggle() async throws -> String {

@@ -102,6 +102,9 @@ import com.vulninc.vdpi.ui.components.LocalTopOverlayPadding
 import com.vulninc.vdpi.ui.components.SectionOverline
 import com.vulninc.vdpi.ui.components.sculptedDarkCardBorder
 import com.vulninc.vdpi.ui.components.springPress
+import com.vulninc.vdpi.ui.i18n.EnglishStrings
+import com.vulninc.vdpi.ui.i18n.LocalVdpiStrings
+import com.vulninc.vdpi.ui.i18n.VdpiStrings
 import com.vulninc.vdpi.ui.theme.GeistSans
 import com.vulninc.vdpi.ui.theme.VdpiTextStyles
 import com.vulninc.vdpi.ui.theme.VdpiThemeTokens
@@ -533,6 +536,7 @@ private fun TunnelHeaderRow(
     onOpenLogs: () -> Unit,
 ) {
     val palette = VdpiThemeTokens.palette
+    val strings = LocalVdpiStrings.current
     val buttonSize = if (compact) 38.dp else 42.dp
     val titleStyle = if (compact) {
         VdpiTextStyles.pageTitle.copy(
@@ -568,7 +572,7 @@ private fun TunnelHeaderRow(
         ) {
             FloatingGlassIconButton(
                 onClick = onOpenDiagnostics,
-                contentDescription = "Diagnostics",
+                contentDescription = strings.diagnosticsTitle,
                 size = buttonSize,
                 badgeColor = doctorBadgeColor,
             ) {
@@ -577,7 +581,7 @@ private fun TunnelHeaderRow(
 
             FloatingGlassIconButton(
                 onClick = onOpenLogs,
-                contentDescription = "Engine logs",
+                contentDescription = strings.logsTitle,
                 size = buttonSize,
                 badgeColor = if (hasLogAlert) palette.danger else null,
             ) {
@@ -718,6 +722,7 @@ private fun TunnelHeroCard(
     compact: Boolean = false,
 ) {
     val palette = VdpiThemeTokens.palette
+    val strings = LocalVdpiStrings.current
     val phase = runtime.phase
     val snap = runtime.telemetry
     val isError = phase == TunnelPhase.ERROR
@@ -760,20 +765,20 @@ private fun TunnelHeroCard(
     }
 
     val statusTitle = when (phase) {
-        TunnelPhase.CONNECTED -> "Connected"
-        TunnelPhase.CONNECTING -> "Connecting"
-        TunnelPhase.DISCONNECTED -> "Not Connected"
-        TunnelPhase.ERROR -> "Connection Error"
+        TunnelPhase.CONNECTED -> strings.statusConnected
+        TunnelPhase.CONNECTING -> strings.statusConnecting
+        TunnelPhase.DISCONNECTED -> strings.statusNotConnected
+        TunnelPhase.ERROR -> strings.statusConnectionError
     }
 
     val activeDnsAddr = snap.dnsAddr.trim().ifBlank { (appliedSettings ?: settings).dnsAddr }
     val activeDoh = isEffectiveDohTarget(activeDnsAddr, snap.dohEnabled)
-    val dnsCompact = "${formatDnsDisplayAddr(activeDnsAddr)} ${if (activeDoh) "DoH" else "UDP"}"
+    val dnsCompact = "${formatDnsDisplayAddr(activeDnsAddr, strings.customDohLabel)} ${if (activeDoh) "DoH" else "UDP"}"
     val subtitle = when (phase) {
         TunnelPhase.CONNECTED -> "$dnsCompact · ${formatHeroUptime(snap.uptimeSecs)}"
-        TunnelPhase.CONNECTING -> "Establishing local tunnel..."
-        TunnelPhase.DISCONNECTED -> "Local anti-DPI tunnel ready"
-        TunnelPhase.ERROR -> runtime.errorMessage?.takeIf { it.isNotBlank() } ?: "Tunnel stopped unexpectedly"
+        TunnelPhase.CONNECTING -> strings.heroEstablishingTunnel
+        TunnelPhase.DISCONNECTED -> strings.heroTunnelReady
+        TunnelPhase.ERROR -> runtime.errorMessage?.takeIf { it.isNotBlank() } ?: strings.heroTunnelStoppedUnexpectedly
     }
 
     InsetGroupedCard(
@@ -878,6 +883,7 @@ private fun PrimaryTunnelActionButton(
     compact: Boolean = false,
 ) {
     val palette = VdpiThemeTokens.palette
+    val strings = LocalVdpiStrings.current
     val interaction = remember { MutableInteractionSource() }
     val isPressed by interaction.collectIsPressedAsState()
     val isProminent = phase == TunnelPhase.DISCONNECTED || phase == TunnelPhase.ERROR
@@ -904,9 +910,9 @@ private fun PrimaryTunnelActionButton(
     )
 
     val label = when (phase) {
-        TunnelPhase.CONNECTED -> "Disconnect"
-        TunnelPhase.CONNECTING -> "Connecting..."
-        TunnelPhase.DISCONNECTED, TunnelPhase.ERROR -> "Connect"
+        TunnelPhase.CONNECTED -> strings.actionDisconnect
+        TunnelPhase.CONNECTING -> strings.statusConnectingEllipsis
+        TunnelPhase.DISCONNECTED, TunnelPhase.ERROR -> strings.actionConnect
     }
 
     Box(
@@ -960,6 +966,7 @@ private fun InlineReconnectRow(
     compact: Boolean = false,
 ) {
     val palette = VdpiThemeTokens.palette
+    val strings = LocalVdpiStrings.current
     val interaction = remember { MutableInteractionSource() }
     val isPressed by interaction.collectIsPressedAsState()
     val pillWash by animateColorAsState(
@@ -991,7 +998,7 @@ private fun InlineReconnectRow(
 
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = "Settings Changed",
+                    text = strings.reconnectSettingsChanged,
                     style = VdpiTextStyles.body.copy(fontWeight = FontWeight.SemiBold),
                     color = palette.inkPrimary,
                     maxLines = 1,
@@ -999,7 +1006,7 @@ private fun InlineReconnectRow(
                 )
                 Spacer(Modifier.height(1.dp))
                 Text(
-                    text = "Reconnect to apply",
+                    text = strings.reconnectToApply,
                     style = VdpiTextStyles.caption,
                     color = palette.inkSecondary,
                     maxLines = 1,
@@ -1033,7 +1040,7 @@ private fun InlineReconnectRow(
                     contentAlignment = Alignment.Center,
                 ) {
                     Text(
-                        text = "Reconnect",
+                        text = strings.actionReconnect,
                         fontFamily = GeistSans,
                         fontWeight = FontWeight.SemiBold,
                         fontSize = 14.sp,
@@ -1056,6 +1063,7 @@ private fun InlineUpdateRow(
     compact: Boolean = false,
 ) {
     val palette = VdpiThemeTokens.palette
+    val strings = LocalVdpiStrings.current
     val downloadInteraction = remember { MutableInteractionSource() }
     val downloadPressed by downloadInteraction.collectIsPressedAsState()
     val downloadColor by animateColorAsState(
@@ -1100,7 +1108,7 @@ private fun InlineUpdateRow(
 
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = "Update available",
+                    text = strings.updateAvailable,
                     style = VdpiTextStyles.body.copy(fontWeight = FontWeight.SemiBold),
                     color = palette.inkPrimary,
                     maxLines = 1,
@@ -1108,7 +1116,7 @@ private fun InlineUpdateRow(
                 )
                 Spacer(Modifier.height(1.dp))
                 Text(
-                    text = "$versionTag on GitHub",
+                    text = strings.updateVersionOnGitHub(versionTag),
                     style = VdpiTextStyles.caption,
                     color = palette.inkSecondary,
                     maxLines = 1,
@@ -1131,7 +1139,7 @@ private fun InlineUpdateRow(
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
-                    text = "Download",
+                    text = strings.actionDownload,
                     fontFamily = GeistSans,
                     fontWeight = FontWeight.SemiBold,
                     fontSize = 14.sp,
@@ -1149,7 +1157,7 @@ private fun InlineUpdateRow(
                         role = Role.Button,
                         onClick = onDismiss,
                     )
-                    .semantics { contentDescription = "Dismiss update notice" },
+                    .semantics { contentDescription = strings.cdDismissUpdate },
                 contentAlignment = Alignment.Center,
             ) {
                 Box(
@@ -1177,10 +1185,11 @@ private fun LiveTelemetrySection(
     appliedSettings: VdpiSettings?,
     reduceMotion: Boolean,
 ) {
+    val strings = LocalVdpiStrings.current
     val effectiveSettings = appliedSettings ?: settings
     val activeDnsAddr = telemetry.dnsAddr.trim().ifBlank { effectiveSettings.dnsAddr }
     Column(modifier = Modifier.fillMaxWidth()) {
-        SectionOverline(text = "Connection")
+        SectionOverline(text = strings.sectionConnection)
 
         InsetGroupedCard(
             modifier = Modifier
@@ -1189,7 +1198,7 @@ private fun LiveTelemetrySection(
             radius = 16.dp,
         ) {
             InsetGroupedRow(
-                title = "Download",
+                title = strings.metricDownload,
                 trailing = {
                     AnimatedTabularValue(
                         text = formatBytes(telemetry.bytesRx),
@@ -1199,7 +1208,7 @@ private fun LiveTelemetrySection(
             )
             HairlineRule(startIndent = 16.dp)
             InsetGroupedRow(
-                title = "Upload",
+                title = strings.metricUpload,
                 trailing = {
                     AnimatedTabularValue(
                         text = formatBytes(telemetry.bytesTx),
@@ -1209,7 +1218,7 @@ private fun LiveTelemetrySection(
             )
             HairlineRule(startIndent = 16.dp)
             InsetGroupedRow(
-                title = "Uptime",
+                title = strings.metricUptime,
                 trailing = {
                     AnimatedTabularValue(
                         text = formatUptime(telemetry.uptimeSecs),
@@ -1225,31 +1234,31 @@ private fun LiveTelemetrySection(
             )
             HairlineRule(startIndent = 16.dp)
             InsetGroupedRow(
-                title = "Strategy",
-                trailing = { TabularRowValue(text = formatStageLabel(telemetry.stageLabel)) },
+                title = strings.metricStrategy,
+                trailing = { TabularRowValue(text = formatStageLabel(telemetry.stageLabel, strings)) },
             )
             HairlineRule(startIndent = 16.dp)
             InsetGroupedRow(
-                title = "DNS",
+                title = strings.metricDns,
                 trailing = {
                     TabularRowValue(
-                        text = formatDnsDetail(activeDnsAddr, telemetry.dohEnabled),
+                        text = formatDnsDetail(activeDnsAddr, telemetry.dohEnabled, strings.customDohLabel),
                         textDirection = TextDirection.Ltr,
                     )
                 },
             )
             HairlineRule(startIndent = 16.dp)
             InsetGroupedRow(
-                title = "QUIC Blocked",
+                title = strings.metricQuicBlocked,
                 trailing = {
                     TabularRowValue(
-                        text = if (effectiveSettings.blockQuic) telemetry.quicBlocked.toString() else "Allowed",
+                        text = if (effectiveSettings.blockQuic) telemetry.quicBlocked.toString() else strings.valueAllowed,
                     )
                 },
             )
             HairlineRule(startIndent = 16.dp)
             InsetGroupedRow(
-                title = "Dropped Packets",
+                title = strings.metricDroppedPackets,
                 trailing = {
                     TabularRowValue(
                         text = telemetry.droppedPackets.coerceAtLeast(0L).toString(),
@@ -1268,6 +1277,7 @@ private fun ThroughputSparkline(
     modifier: Modifier = Modifier,
 ) {
     val palette = VdpiThemeTokens.palette
+    val strings = LocalVdpiStrings.current
     val lineColor = palette.signal
     val baselineColor = palette.border.copy(alpha = 0.55f)
     val rateLabel = formatRate(currentRateBytesPerSec)
@@ -1285,7 +1295,7 @@ private fun ThroughputSparkline(
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
             Text(
-                text = "Activity",
+                text = strings.metricActivity,
                 style = VdpiTextStyles.caption,
                 color = palette.inkMuted,
                 maxLines = 1,
@@ -1307,7 +1317,7 @@ private fun ThroughputSparkline(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(44.dp)
-                .semantics { contentDescription = "Live throughput $rateLabel" },
+                .semantics { contentDescription = strings.cdLiveThroughput(rateLabel) },
         ) {
             val w = size.width
             val h = size.height
@@ -1406,8 +1416,9 @@ private fun ThroughputSparkline(
 private fun StandbyProfileSection(
     settings: VdpiSettings,
 ) {
+    val strings = LocalVdpiStrings.current
     Column(modifier = Modifier.fillMaxWidth()) {
-        SectionOverline(text = "Profile")
+        SectionOverline(text = strings.sectionProfile)
 
         InsetGroupedCard(
             modifier = Modifier
@@ -1416,28 +1427,28 @@ private fun StandbyProfileSection(
             radius = 16.dp,
         ) {
             InsetGroupedRow(
-                title = "Mode",
-                trailing = { TabularRowValue(text = settings.desyncMode.label) },
+                title = strings.metricMode,
+                trailing = { TabularRowValue(text = strings.desyncModeLabel(settings.desyncMode)) },
             )
             HairlineRule(startIndent = 16.dp)
             InsetGroupedRow(
-                title = "DNS",
+                title = strings.metricDns,
                 trailing = {
                     TabularRowValue(
-                        text = formatDnsDetail(settings.dnsAddr, settings.enableDoh),
+                        text = formatDnsDetail(settings.dnsAddr, settings.enableDoh, strings.customDohLabel),
                         textDirection = TextDirection.Ltr,
                     )
                 },
             )
             HairlineRule(startIndent = 16.dp)
             InsetGroupedRow(
-                title = "QUIC Blocking",
-                trailing = { TabularRowValue(text = if (settings.blockQuic) "Enabled" else "Off") },
+                title = strings.metricQuicBlocking,
+                trailing = { TabularRowValue(text = if (settings.blockQuic) strings.valueEnabled else strings.valueOff) },
             )
             HairlineRule(startIndent = 16.dp)
             InsetGroupedRow(
-                title = "Split Tunnel",
-                trailing = { TabularRowValue(text = splitSummary(settings) ?: "All Apps") },
+                title = strings.metricSplitTunnel,
+                trailing = { TabularRowValue(text = splitSummary(settings, strings) ?: strings.valueAllApps) },
             )
         }
     }
@@ -1710,10 +1721,10 @@ private fun formatHeroUptime(totalSecs: Long): String {
     return String.format(Locale.US, "%02d:%02d", m, s)
 }
 
-private fun formatDnsDisplayAddr(rawAddr: String): String {
+private fun formatDnsDisplayAddr(rawAddr: String, customDohLabel: String): String {
     val addr = rawAddr.trim().ifBlank { "1.1.1.1" }
     return if (addr.startsWith("https://", ignoreCase = true)) {
-        runCatching { java.net.URI(addr).host }.getOrNull()?.takeIf { it.isNotBlank() } ?: "custom DoH"
+        runCatching { java.net.URI(addr).host }.getOrNull()?.takeIf { it.isNotBlank() } ?: customDohLabel
     } else {
         addr
     }
@@ -1788,16 +1799,16 @@ internal fun isEffectiveDohTarget(rawAddr: String, enableDoh: Boolean): Boolean 
     return isKnownPublicDohIp(trimmed)
 }
 
-private fun formatDnsDetail(rawAddr: String, enableDoh: Boolean): String {
-    val addr = formatDnsDisplayAddr(rawAddr)
+private fun formatDnsDetail(rawAddr: String, enableDoh: Boolean, customDohLabel: String): String {
+    val addr = formatDnsDisplayAddr(rawAddr, customDohLabel)
     val proto = if (isEffectiveDohTarget(rawAddr, enableDoh)) "DoH" else "UDP"
     return "$addr · $proto"
 }
 
-internal fun splitSummary(settings: VdpiSettings): String? {
+internal fun splitSummary(settings: VdpiSettings, strings: VdpiStrings = EnglishStrings): String? {
     val count = settings.splitPackages.size
     return when (settings.splitTunnelMode) {
-        SplitTunnelMode.BYPASS_SELECTED -> if (count == 0) null else "$count Bypassed"
-        SplitTunnelMode.ONLY_SELECTED -> if (count == 0) "0 apps (none protected)" else "$count Routed"
+        SplitTunnelMode.BYPASS_SELECTED -> if (count == 0) null else strings.splitBypassedCount(count)
+        SplitTunnelMode.ONLY_SELECTED -> if (count == 0) strings.splitNoneProtected else strings.splitRoutedCount(count)
     }
 }

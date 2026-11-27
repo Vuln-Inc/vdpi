@@ -10,20 +10,30 @@ public enum DesyncMode: String, CaseIterable, Codable, Identifiable, Sendable {
     public var id: String { rawValue }
 
     public var label: String {
+        label(in: .en)
+    }
+
+    public func label(in language: AppLanguage) -> String {
+        let l10n = L10n.catalog(for: language)
         switch self {
-        case .combo: return "Combo"
-        case .tlsRecord: return "TLS Record"
-        case .fragment: return "Fragment"
-        case .split: return "Split"
+        case .combo: return l10n.desyncModeComboLabel
+        case .tlsRecord: return l10n.desyncModeTlsRecordLabel
+        case .fragment: return l10n.desyncModeFragmentLabel
+        case .split: return l10n.desyncModeSplitLabel
         }
     }
 
     public var subtitle: String {
+        subtitle(in: .en)
+    }
+
+    public func subtitle(in language: AppLanguage) -> String {
+        let l10n = L10n.catalog(for: language)
         switch self {
-        case .combo: return "4-record TLS split + adaptive 7-stage auto-heal"
-        case .tlsRecord: return "Split ClientHello across two RFC TLS records"
-        case .fragment: return "Single outer TLS record sliced at SNI boundaries"
-        case .split: return "Initial chunk-byte TCP split on first flight"
+        case .combo: return l10n.desyncModeComboSubtitle
+        case .tlsRecord: return l10n.desyncModeTlsRecordSubtitle
+        case .fragment: return l10n.desyncModeFragmentSubtitle
+        case .split: return l10n.desyncModeSplitSubtitle
         }
     }
 }
@@ -36,10 +46,35 @@ public enum ThemePreference: String, CaseIterable, Codable, Identifiable, Sendab
     public var id: String { rawValue }
 
     public var label: String {
+        label(in: .en)
+    }
+
+    public func label(in language: AppLanguage) -> String {
+        let l10n = L10n.catalog(for: language)
         switch self {
-        case .system: return "System"
-        case .dark: return "Dark"
-        case .light: return "Light"
+        case .system: return l10n.themeSystem
+        case .dark: return l10n.themeDark
+        case .light: return l10n.themeLight
+        }
+    }
+}
+
+public enum AppLanguage: String, Codable, CaseIterable, Identifiable, Equatable, Sendable {
+    case system = "system"
+    case en = "en"
+    case tr = "tr"
+
+    public var id: String { rawValue }
+
+    public var label: String {
+        label(in: self)
+    }
+
+    public func label(in language: AppLanguage) -> String {
+        switch self {
+        case .system: return L10n.catalog(for: language).languageSystem
+        case .en: return "English"
+        case .tr: return "Türkçe"
         }
     }
 }
@@ -174,6 +209,7 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
     public var bypassDomains: [String]
     public var onDemandEnabled: Bool
     public var theme: ThemePreference
+    public var language: AppLanguage
     public var schemaVersion: Int?
 
     enum CodingKeys: String, CodingKey {
@@ -187,6 +223,7 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
         case bypassDomains
         case onDemandEnabled
         case theme
+        case language
         case schemaVersion
         case settingsSchemaVersion
     }
@@ -202,6 +239,7 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
         bypassDomains: [String] = [],
         onDemandEnabled: Bool = false,
         theme: ThemePreference = .system,
+        language: AppLanguage = .system,
         schemaVersion: Int? = VdpiSettings.currentSchemaVersion
     ) {
         self.desyncMode = desyncMode
@@ -214,6 +252,7 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
         self.bypassDomains = bypassDomains
         self.onDemandEnabled = onDemandEnabled
         self.theme = theme
+        self.language = language
         self.schemaVersion = schemaVersion
     }
 
@@ -246,6 +285,7 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
         self.bypassDomains = try c.decodeIfPresent([String].self, forKey: .bypassDomains) ?? []
         self.onDemandEnabled = try c.decodeIfPresent(Bool.self, forKey: .onDemandEnabled) ?? false
         self.theme = try c.decodeIfPresent(ThemePreference.self, forKey: .theme) ?? .system
+        self.language = try c.decodeIfPresent(AppLanguage.self, forKey: .language) ?? .system
         self.schemaVersion = max(decodedSchemaVersion ?? 0, Self.currentSchemaVersion)
     }
 
@@ -261,6 +301,7 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
         try c.encode(bypassDomains, forKey: .bypassDomains)
         try c.encode(onDemandEnabled, forKey: .onDemandEnabled)
         try c.encode(theme, forKey: .theme)
+        try c.encode(language, forKey: .language)
         try c.encode(schemaVersion ?? Self.currentSchemaVersion, forKey: .schemaVersion)
     }
 
@@ -281,50 +322,60 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
         !changedFieldLabels(comparedToApplied: config).isEmpty
     }
 
-    public func changedFieldLabels(comparedTo other: VdpiSettings) -> [String] {
-        changedFieldLabels(comparedToApplied: other.toNativeConfig())
+    public func changedFieldLabels(
+        comparedTo other: VdpiSettings,
+        language: AppLanguage = .en
+    ) -> [String] {
+        changedFieldLabels(comparedToApplied: other.toNativeConfig(), language: language)
     }
 
-    public func changedFieldLabels(comparedToApplied config: NativeEngineConfig) -> [String] {
+    public func changedFieldLabels(
+        comparedToApplied config: NativeEngineConfig,
+        language: AppLanguage = .en
+    ) -> [String] {
+        let l10n = L10n.catalog(for: language)
         let current = toNativeConfig()
         let applied = config.canonicalized()
         var labels: [String] = []
         if current.mode != applied.mode {
-            labels.append("Mode")
+            labels.append(l10n.fieldMode)
         }
         if current.chunkSize != applied.chunkSize {
-            labels.append("Chunk")
+            labels.append(l10n.fieldChunk)
         }
         if current.dnsAddr != applied.dnsAddr {
-            labels.append("DNS")
+            labels.append(l10n.fieldDns)
         }
         if current.enableDoh != applied.enableDoh {
-            labels.append("DoH")
+            labels.append(l10n.fieldDoh)
         }
         if current.ipv4Only != applied.ipv4Only {
-            labels.append("IPv4")
+            labels.append(l10n.fieldIpv4)
         }
         if current.blockQuic != applied.blockQuic {
-            labels.append("QUIC")
+            labels.append(l10n.fieldQuic)
         }
         if current.mtu != applied.mtu {
-            labels.append("MTU")
+            labels.append(l10n.fieldMtu)
         }
         if current.bypassDomains != applied.bypassDomains {
-            labels.append("Bypass")
+            labels.append(l10n.fieldBypass)
         }
         return labels
     }
 
     /// Concise summary for the floating reconnect banner and Home inline reconnect card.
-    public func pendingChangeSummary(comparedToApplied config: NativeEngineConfig) -> String {
-        let labels = changedFieldLabels(comparedToApplied: config)
+    public func pendingChangeSummary(
+        comparedToApplied config: NativeEngineConfig,
+        language: AppLanguage = .en
+    ) -> String {
+        let labels = changedFieldLabels(comparedToApplied: config, language: language)
         guard !labels.isEmpty else { return "" }
         if labels.count <= 3 {
             return labels.joined(separator: ", ")
         }
         let head = labels.prefix(2).joined(separator: ", ")
-        return "\(head) +\(labels.count - 2) more"
+        return L10n.catalog(for: language).pendingMoreSummary(head: head, remaining: labels.count - 2)
     }
 
     public func toNativeConfig(cachePath: String? = nil) -> NativeEngineConfig {

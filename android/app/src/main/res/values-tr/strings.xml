@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">vdpi</string>
+    <string name="notification_channel_name">Tünel Durumu</string>
+    <string name="notification_channel_desc">vdpi bağlıyken tünel durumunu gösterir</string>
+    <string name="notification_action_disconnect">Bağlantıyı Kes</string>
+    <string name="notification_action_reconnect">Yeniden Bağlan</string>
+    <string name="notification_title_connected">vdpi Bağlı</string>
+    <string name="notification_title_connecting">vdpi Bağlanıyor</string>
+    <string name="notification_subtitle_connecting">Yerel tünel başlatılıyor</string>
+    <string name="notification_permission_hint">Bağlıyken vdpi durumunu görmek için bildirimlere izin verin</string>
+    <string name="notification_settings_action">Ayarlar</string>
+    <string name="widget_description">vdpi tünelini ana ekrandan açıp kapatın</string>
+    <string name="widget_status_connected">Korunuyor</string>
+    <string name="widget_status_connecting">Bağlanıyor&#8230;</string>
+    <string name="widget_status_off">Kapalı</string>
+    <string name="widget_status_error">Dikkat gerekiyor</string>
+    <string name="widget_action_connect">Bağlan</string>
+    <string name="widget_action_disconnect">Kes</string>
+</resources>

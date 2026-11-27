@@ -501,6 +501,7 @@ function createInitialMockStore(): MockStore {
     splitTunnelApps: ["Discord.exe", "steam.exe"],
     gui: {
       theme: "system",
+      language: "system",
       keepInTrayOnClose: false,
       minimizeToTray: false,
       startMinimizedToTray: false,
@@ -992,10 +993,18 @@ export async function saveGuiPreferences(
       { prefs },
     );
   }
+  const nextLanguage =
+    prefs.language === "system" ||
+    prefs.language === "en" ||
+    prefs.language === "tr"
+      ? prefs.language
+      : (mockStore.settings.gui.language ?? "system");
+
   mockStore.settings = {
     ...mockStore.settings,
     gui: {
       theme: prefs.theme,
+      language: nextLanguage,
       keepInTrayOnClose: Boolean(prefs.keepInTrayOnClose),
       minimizeToTray: Boolean(prefs.minimizeToTray),
       startMinimizedToTray: Boolean(prefs.startMinimizedToTray),

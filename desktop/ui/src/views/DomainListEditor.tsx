@@ -1,5 +1,7 @@
 import { useEffect, useId, useRef, useState } from "react";
 import type { ChangeEvent, KeyboardEvent } from "react";
+import { useLang } from "../i18n/context";
+import { tDns, translateDomainRuleError } from "../i18n/dns";
 import { validateDomainRule } from "../lib/format";
 
 export interface DomainListEditorProps {
@@ -383,18 +385,23 @@ function RemoveIcon() {
 export function DomainListEditor({
   label,
   description,
-  placeholder = "example.com, *.example.com",
+  placeholder,
   domains,
   onChange,
   disabled = false,
-  emptyText = "No domains configured.",
+  emptyText,
   maxEntries = DEFAULT_MAX_ENTRIES,
   className,
   resetNonce,
 }: DomainListEditorProps) {
+  const { lang } = useLang();
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
   const prevResetNonceRef = useRef(resetNonce);
+
+  const resolvedPlaceholder =
+    placeholder ?? tDns(lang, "editorDefaultPlaceholder");
+  const resolvedEmptyText = emptyText ?? tDns(lang, "editorDefaultEmpty");
 
   const inputId = useId();
   const descriptionId = useId();
@@ -425,9 +432,7 @@ export function DomainListEditor({
     }
 
     if (domains.length >= effectiveMaxEntries) {
-      setError(
-        `Maximum of ${effectiveMaxEntries} domain entries reached. Remove an entry before adding more.`,
-      );
+      setError(tDns(lang, "editorMaxReached", { max: effectiveMaxEntries }));
       return;
     }
 
@@ -437,7 +442,7 @@ export function DomainListEditor({
     );
 
     if (nonEmptySegments.length === 0) {
-      setError(validateDomainRule(""));
+      setError(translateDomainRuleError(lang, validateDomainRule("")));
       return;
     }
 
@@ -451,10 +456,15 @@ export function DomainListEditor({
       const validationError = validateDomainRule(segment);
       if (validationError !== null) {
         // PRIV-04: Never echo raw rejected input verbatim in alert text (may contain pasted DoH URLs/tokens).
+        const localizedError =
+          translateDomainRuleError(lang, validationError) ?? validationError;
         setError(
           nonEmptySegments.length > 1
-            ? `Entry #${i + 1}: ${validationError}`
-            : validationError,
+            ? tDns(lang, "editorEntryPrefix", {
+                index: i + 1,
+                error: localizedError,
+              })
+            : localizedError,
         );
         return;
       }
@@ -465,8 +475,11 @@ export function DomainListEditor({
           const remaining = Math.max(0, effectiveMaxEntries - domains.length);
           setError(
             remaining === 0
-              ? `Maximum of ${effectiveMaxEntries} domain entries reached. Remove an entry before adding more.`
-              : `Domain list is limited to ${effectiveMaxEntries} entries (${remaining} remaining).`,
+              ? tDns(lang, "editorMaxReached", { max: effectiveMaxEntries })
+              : tDns(lang, "editorLimitedRemaining", {
+                  max: effectiveMaxEntries,
+                  remaining,
+                }),
           );
           return;
         }
@@ -540,7 +553,10 @@ export function DomainListEditor({
             {domains.length > 0 ? (
               <span
                 className="domain-editor__count"
-                title={`${domains.length} of ${effectiveMaxEntries} maximum entries`}
+                title={tDns(lang, "editorCountTitle", {
+                  count: domains.length,
+                  max: effectiveMaxEntries,
+                })}
               >
                 {domains.length >= effectiveMaxEntries
                   ? `${domains.length}/${effectiveMaxEntries}`
@@ -560,10 +576,15 @@ export function DomainListEditor({
             type="button"
             className="domain-editor__clear"
             disabled={disabled}
-            title={`Clear all ${label.toLowerCase()}`}
+            title={tDns(lang, "editorClearTitle", {
+              label:
+                lang === "tr"
+                  ? label.toLocaleLowerCase("tr-TR")
+                  : label.toLowerCase(),
+            })}
             onClick={handleClear}
           >
-            Clear
+            {tDns(lang, "editorClear")}
           </button>
         ) : null}
       </div>
@@ -574,7 +595,7 @@ export function DomainListEditor({
           type="text"
           className="domain-editor__input"
           value={draft}
-          placeholder={placeholder}
+          placeholder={resolvedPlaceholder}
           disabled={disabled}
           spellCheck={false}
           autoCapitalize="none"
@@ -591,7 +612,7 @@ export function DomainListEditor({
           disabled={!canAdd}
           onClick={commitDraft}
         >
-          Add
+          {tDns(lang, "editorAdd")}
         </button>
       </div>
 
@@ -601,12 +622,15 @@ export function DomainListEditor({
         </p>
       ) : showDraftHint ? (
         <p id={hintId} className="domain-editor__hint">
-          Press Enter or click Add to include this entry
+          {tDns(lang, "editorDraftHint")}
         </p>
       ) : null}
 
       {domains.length > 0 ? (
-        <ul className="domain-editor__list" aria-label={`${label} list`}>
+        <ul
+          className="domain-editor__list"
+          aria-label={tDns(lang, "editorListAria", { label })}
+        >
           {domains.map((domain, index) => (
             <li
               key={`${domain.toLowerCase()}-${index}`}
@@ -619,7 +643,7 @@ export function DomainListEditor({
                 type="button"
                 className="domain-editor__pill-remove"
                 disabled={disabled}
-                aria-label={`Remove ${domain}`}
+                aria-label={tDns(lang, "editorRemoveAria", { domain })}
                 onClick={() => handleRemove(index)}
               >
                 <RemoveIcon />
@@ -628,7 +652,7 @@ export function DomainListEditor({
           ))}
         </ul>
       ) : (
-        <p className="domain-editor__empty">{emptyText}</p>
+        <p className="domain-editor__empty">{resolvedEmptyText}</p>
       )}
     </div>
   );

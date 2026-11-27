@@ -11,6 +11,12 @@ import {
 } from "../components/Icons";
 import { InlineBanner } from "../components/InlineBanner";
 import type { ToastTone } from "../components/ToastStack";
+import { useLang, type ResolvedLanguage } from "../i18n/context";
+import {
+  localizeCheckName,
+  tDiagnostics,
+  type DiagnosticsStringKey,
+} from "../i18n/diagnostics";
 import { formatClockTime, formatLatency, scrubUrlsInText } from "../lib/format";
 import { runDiagnostics, type AppFolderTarget } from "../lib/ipc";
 import type {
@@ -34,49 +40,49 @@ export interface DiagnosticsViewProps {
 
 interface ProbeCatalogItem {
   id: string;
-  label: string;
-  description: string;
+  labelKey: DiagnosticsStringKey;
+  descKey: DiagnosticsStringKey;
 }
 
 const PROBE_CATALOG: readonly ProbeCatalogItem[] = [
   {
     id: "vpn",
-    label: "VPN coexistence",
-    description: "Detects active full-tunnel VPN adapters and routing conflicts.",
+    labelKey: "probeVpnLabel",
+    descKey: "probeVpnDesc",
   },
   {
     id: "wintun",
-    label: "Wintun driver",
-    description: "Verifies wintun.dll presence and SHA-256 integrity on disk.",
+    labelKey: "probeWintunLabel",
+    descKey: "probeWintunDesc",
   },
   {
     id: "dns",
-    label: "DNS / DoH",
-    description: "Probes configured resolver reachability and encrypted DNS responses.",
+    labelKey: "probeDnsLabel",
+    descKey: "probeDnsDesc",
   },
   {
     id: "discord",
-    label: "Discord",
-    description: "Checks Discord HTTPS gateway reachability and TLS latency.",
+    labelKey: "probeDiscordLabel",
+    descKey: "probeDiscordDesc",
   },
   {
     id: "roblox",
-    label: "Roblox",
-    description: "Tests Roblox client endpoints and connection latency.",
+    labelKey: "probeRobloxLabel",
+    descKey: "probeRobloxDesc",
   },
   {
     id: "runtime",
-    label: "Runtime hygiene",
-    description: "Inspects background service health, config state, and runtime files.",
+    labelKey: "probeRuntimeLabel",
+    descKey: "probeRuntimeDesc",
   },
 ];
 
-const STATUS_LABELS: Record<DiagStatus, string> = {
-  idle: "Idle",
-  running: "Running",
-  pass: "Pass",
-  warn: "Warn",
-  fail: "Fail",
+const STATUS_LABEL_KEYS: Record<DiagStatus, DiagnosticsStringKey> = {
+  idle: "statusIdle",
+  running: "statusRunning",
+  pass: "statusPass",
+  warn: "statusWarn",
+  fail: "statusFail",
 };
 
 const STYLE_ID = "vdpi-diagnostics-view-styles";
@@ -799,7 +805,10 @@ function ensureStyles(): void {
   document.head.appendChild(style);
 }
 
-async function copyTextToClipboard(text: string): Promise<void> {
+async function copyTextToClipboard(
+  text: string,
+  lang: ResolvedLanguage,
+): Promise<void> {
   if (
     typeof navigator !== "undefined" &&
     navigator.clipboard &&
@@ -815,7 +824,7 @@ async function copyTextToClipboard(text: string): Promise<void> {
   }
 
   if (typeof document === "undefined") {
-    throw new Error("Clipboard API unavailable.");
+    throw new Error(tDiagnostics(lang, "clipboardUnavailable"));
   }
 
   const textarea = document.createElement("textarea");
@@ -834,46 +843,49 @@ async function copyTextToClipboard(text: string): Promise<void> {
       typeof document.execCommand === "function" &&
       document.execCommand("copy");
     if (!ok) {
-      throw new Error("Copy command failed.");
+      throw new Error(tDiagnostics(lang, "copyCommandFailed"));
     }
   } finally {
     document.body.removeChild(textarea);
   }
 }
 
-function getErrorMessage(error: unknown): string {
+function getErrorMessage(error: unknown, lang: ResolvedLanguage): string {
   if (error instanceof Error && error.message.trim().length > 0) {
     return scrubUrlsInText(error.message.trim());
   }
   if (typeof error === "string" && error.trim().length > 0) {
     return scrubUrlsInText(error.trim());
   }
-  return "Unable to complete diagnostics. Try again in a moment.";
+  return tDiagnostics(lang, "errorFallback");
 }
 
-function formatContextSubtitle(status: DesktopStatusSnapshot | null): string {
+function formatContextSubtitle(
+  status: DesktopStatusSnapshot | null,
+  lang: ResolvedLanguage,
+): string {
   if (!status) {
-    return "Read-only network, DNS, and runtime health checks.";
+    return tDiagnostics(lang, "subtitleFallback");
   }
 
   const engineLabel =
     (status.live?.engine ?? status.configuredEngine) === "tun"
-      ? "TUN engine"
-      : "Proxy engine";
+      ? tDiagnostics(lang, "engineTun")
+      : tDiagnostics(lang, "engineProxy");
 
   const stateLabel =
     status.serviceState === "not_installed"
-      ? "Service not installed"
+      ? tDiagnostics(lang, "stateNotInstalled")
       : status.live?.running || status.serviceState === "running"
-        ? "Service running"
-        : "Service stopped";
+        ? tDiagnostics(lang, "stateRunning")
+        : tDiagnostics(lang, "stateStopped");
 
   const parts = [engineLabel, stateLabel];
   const vpnConflict = (status.live?.vpnConflict ?? status.vpnConflict)?.trim();
   if (vpnConflict) {
-    parts.push(`VPN detected (${vpnConflict})`);
+    parts.push(tDiagnostics(lang, "vpnDetected", { iface: vpnConflict }));
   }
-  parts.push("100% read-only");
+  parts.push(tDiagnostics(lang, "readOnlyShort"));
   return parts.join(" · ");
 }
 
@@ -886,7 +898,10 @@ interface ReportSummaryMetrics {
   issueBreakdown: string;
 }
 
-function summarizeReport(report: DiagnosticsReport): ReportSummaryMetrics {
+function summarizeReport(
+  report: DiagnosticsReport,
+  lang: ResolvedLanguage,
+): ReportSummaryMetrics {
   const totalCount =
     report.totalCount > 0 ? report.totalCount : report.checks.length;
   const passedCount = report.passedCount;
@@ -911,18 +926,20 @@ function summarizeReport(report: DiagnosticsReport): ReportSummaryMetrics {
 
   const issueParts: string[] = [];
   if (failCount > 0) {
-    issueParts.push(`${failCount} failed`);
+    issueParts.push(tDiagnostics(lang, "issueFailedCount", { count: failCount }));
   }
   if (warnCount > 0) {
     issueParts.push(
-      warnCount === 1 ? "1 warning" : `${warnCount} warnings`,
+      warnCount === 1
+        ? tDiagnostics(lang, "issueWarnOne")
+        : tDiagnostics(lang, "issueWarnMany", { count: warnCount }),
     );
   }
 
   const issueBreakdown =
     issueParts.length > 0
       ? issueParts.join(", ")
-      : "one or more checks need attention";
+      : tDiagnostics(lang, "issueFallback");
 
   return {
     allPassed,
@@ -934,7 +951,7 @@ function summarizeReport(report: DiagnosticsReport): ReportSummaryMetrics {
   };
 }
 
-function renderCheckRow(check: DiagnosticCheckItem) {
+function renderCheckRow(check: DiagnosticCheckItem, lang: ResolvedLanguage) {
   const summaryText = check.summary.trim();
   const detailText = check.detail?.trim() ?? "";
   const showDetail = detailText.length > 0 && detailText !== summaryText;
@@ -944,7 +961,9 @@ function renderCheckRow(check: DiagnosticCheckItem) {
     <tr key={check.id} data-check-id={check.id} data-status={check.status}>
       <td className="diag-col-check">
         <div className="diag-check-cell">
-          <span className="diag-check-name">{check.name}</span>
+          <span className="diag-check-name">
+            {localizeCheckName(lang, check)}
+          </span>
           {summaryText.length > 0 ? (
             <p className="diag-check-summary">{summaryText}</p>
           ) : null}
@@ -975,7 +994,7 @@ function renderCheckRow(check: DiagnosticCheckItem) {
             className={`diag-status-dot diag-status-dot--${check.status}`}
             aria-hidden="true"
           />
-          <span>{STATUS_LABELS[check.status]}</span>
+          <span>{tDiagnostics(lang, STATUS_LABEL_KEYS[check.status])}</span>
         </span>
       </td>
     </tr>
@@ -1000,6 +1019,10 @@ function DiagnosticsViewComponent({
   onStartProtection,
   onOpenAppFolder,
 }: DiagnosticsViewProps) {
+  const { lang } = useLang();
+  const langRef = useRef(lang);
+  langRef.current = lang;
+
   const [report, setReport] = useState<DiagnosticsReport | null>(null);
   const [reportStatusSnap, setReportStatusSnap] = useState<{
     ranAtMs: number;
@@ -1039,11 +1062,14 @@ function DiagnosticsViewComponent({
     [isWindows],
   );
 
-  const subtitle = useMemo(() => formatContextSubtitle(status), [status]);
+  const subtitle = useMemo(
+    () => formatContextSubtitle(status, lang),
+    [status, lang],
+  );
 
   const summary = useMemo(
-    () => (report ? summarizeReport(report) : null),
-    [report],
+    () => (report ? summarizeReport(report, lang) : null),
+    [report, lang],
   );
 
   const activeEngine: EngineMode =
@@ -1099,7 +1125,10 @@ function DiagnosticsViewComponent({
       if (onStartProtection) {
         actions.push({
           id: "start-protection",
-          label: isStartingProtection ? "Starting..." : "Start Protection",
+          label: tDiagnostics(
+            lang,
+            isStartingProtection ? "actionStarting" : "actionStartProtection",
+          ),
           icon: "shield",
           busy: isStartingProtection,
           disabled: running || isBusy,
@@ -1110,7 +1139,7 @@ function DiagnosticsViewComponent({
       } else if (onNavigate) {
         actions.push({
           id: "go-overview",
-          label: "Go to Overview",
+          label: tDiagnostics(lang, "actionGoOverview"),
           icon: "overview",
           onClick: () => {
             onNavigate("overview");
@@ -1120,7 +1149,7 @@ function DiagnosticsViewComponent({
     } else if (status?.serviceState === "not_installed" && onNavigate) {
       actions.push({
         id: "go-overview",
-        label: "Go to Overview",
+        label: tDiagnostics(lang, "actionGoOverview"),
         icon: "overview",
         onClick: () => {
           onNavigate("overview");
@@ -1135,7 +1164,10 @@ function DiagnosticsViewComponent({
     ) {
       actions.push({
         id: "switch-proxy",
-        label: isSwitchingProxy ? "Switching to Proxy..." : "Switch to Proxy",
+        label: tDiagnostics(
+          lang,
+          isSwitchingProxy ? "actionSwitchingProxy" : "actionSwitchProxy",
+        ),
         icon: "proxy",
         busy: isSwitchingProxy,
         disabled: running || isBusy,
@@ -1153,7 +1185,7 @@ function DiagnosticsViewComponent({
     ) {
       actions.push({
         id: "open-settings",
-        label: "Open Settings",
+        label: tDiagnostics(lang, "actionOpenSettings"),
         icon: "settings",
         onClick: () => {
           onNavigate("settings");
@@ -1164,7 +1196,7 @@ function DiagnosticsViewComponent({
     if (onOpenAppFolder && hasWintunIssue) {
       actions.push({
         id: "open-app-folder",
-        label: "Open App Folder",
+        label: tDiagnostics(lang, "actionOpenAppFolder"),
         icon: "folder",
         onClick: () => {
           void onOpenAppFolder("app");
@@ -1175,7 +1207,7 @@ function DiagnosticsViewComponent({
     if (onOpenAppFolder) {
       actions.push({
         id: "open-logs",
-        label: "Open Logs",
+        label: tDiagnostics(lang, "actionOpenLogs"),
         icon: "logs",
         onClick: () => {
           void onOpenAppFolder("logs");
@@ -1189,6 +1221,7 @@ function DiagnosticsViewComponent({
     isBusy,
     isStartingProtection,
     isSwitchingProxy,
+    lang,
     onNavigate,
     onOpenAppFolder,
     onStartProtection,
@@ -1222,7 +1255,7 @@ function DiagnosticsViewComponent({
       setCopied(false);
     } catch (error) {
       if (!mountedRef.current) return;
-      const message = getErrorMessage(error);
+      const message = getErrorMessage(error, langRef.current);
       // Clear stale report so an older summary cannot contradict the run error.
       setReport(null);
       setReportStatusSnap(null);
@@ -1247,7 +1280,7 @@ function DiagnosticsViewComponent({
     if (!report || !report.redactedText.trim()) return;
 
     try {
-      await copyTextToClipboard(report.redactedText);
+      await copyTextToClipboard(report.redactedText, langRef.current);
       if (!mountedRef.current) return;
       setCopied(true);
       if (copyTimerRef.current !== null) {
@@ -1259,11 +1292,14 @@ function DiagnosticsViewComponent({
         }
         copyTimerRef.current = null;
       }, 1800);
-      onPushToast?.("success", "Redacted diagnostics report copied to clipboard.");
+      onPushToast?.("success", tDiagnostics(langRef.current, "toastCopied"));
     } catch (error) {
       if (!mountedRef.current) return;
-      const message = getErrorMessage(error);
-      onPushToast?.("error", `Failed to copy report: ${message}`);
+      const message = getErrorMessage(error, langRef.current);
+      onPushToast?.(
+        "error",
+        tDiagnostics(langRef.current, "toastCopyFailed", { message }),
+      );
     }
   }, [onPushToast, report]);
 
@@ -1283,7 +1319,7 @@ function DiagnosticsViewComponent({
     <div className="view-stack diag-view" data-view="diagnostics">
       <header className="diag-header">
         <div className="diag-header__text">
-          <h1 className="diag-header__title">Diagnostics</h1>
+          <h1 className="diag-header__title">{tDiagnostics(lang, "title")}</h1>
           <p className="diag-header__subtitle tabular-nums">{subtitle}</p>
         </div>
 
@@ -1299,7 +1335,9 @@ function DiagnosticsViewComponent({
             }}
           >
             {copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
-            <span>{copied ? "Copied" : "Copy Redacted Report"}</span>
+            <span>
+              {tDiagnostics(lang, copied ? "copied" : "copyReport")}
+            </span>
           </button>
 
           <button
@@ -1314,7 +1352,12 @@ function DiagnosticsViewComponent({
             {running ? (
               <span className="spinner diag-spinner" aria-hidden="true" />
             ) : null}
-            <span>{running ? "Running..." : "Run Diagnostics"}</span>
+            <span>
+              {tDiagnostics(
+                lang,
+                running ? "runningDiagnostics" : "runDiagnostics",
+              )}
+            </span>
           </button>
         </div>
       </header>
@@ -1322,9 +1365,9 @@ function DiagnosticsViewComponent({
       {runError ? (
         <InlineBanner
           tone="error"
-          title="Diagnostics failed to run"
+          title={tDiagnostics(lang, "runErrorTitle")}
           description={runError}
-          actionLabel="Retry"
+          actionLabel={tDiagnostics(lang, "retry")}
           onAction={() => {
             void handleRunDiagnostics();
           }}
@@ -1344,12 +1387,17 @@ function DiagnosticsViewComponent({
             </span>
             <div className="diag-summary-banner__content">
               <p className="diag-summary-banner__title tabular-nums">
-                {`All checks passed (${summary.passedCount}/${summary.totalCount})`}
+                {tDiagnostics(lang, "allPassedTitle", {
+                  passed: summary.passedCount,
+                  total: summary.totalCount,
+                })}
               </p>
               <p className="diag-summary-banner__description tabular-nums">
-                {isWindows
-                  ? `Completed at ${ranAtClock} · All connectivity, driver, DNS, and runtime probes succeeded.`
-                  : `Completed at ${ranAtClock} · All connectivity, DNS, and runtime probes succeeded.`}
+                {tDiagnostics(
+                  lang,
+                  isWindows ? "allPassedDescWin" : "allPassedDescUnix",
+                  { time: ranAtClock ?? "--:--:--" },
+                )}
               </p>
             </div>
           </div>
@@ -1361,12 +1409,18 @@ function DiagnosticsViewComponent({
                 ? "diag-summary-banner--error"
                 : "diag-summary-banner--warn"
             }`}
-            title={
-              summary.failCount > 0
-                ? `Diagnostics failed (${summary.passedCount}/${summary.totalCount})`
-                : `Diagnostics finished with warnings (${summary.passedCount}/${summary.totalCount})`
-            }
-            description={`Completed at ${ranAtClock} · ${summary.issueBreakdown}. Review details below or copy the redacted report.`}
+            title={tDiagnostics(
+              lang,
+              summary.failCount > 0 ? "failedTitle" : "warnTitle",
+              {
+                passed: summary.passedCount,
+                total: summary.totalCount,
+              },
+            )}
+            description={tDiagnostics(lang, "summaryIssueDesc", {
+              time: ranAtClock ?? "--:--:--",
+              breakdown: summary.issueBreakdown,
+            })}
           />
         )
       ) : null}
@@ -1375,9 +1429,11 @@ function DiagnosticsViewComponent({
         <div
           className="diag-recovery-bar"
           role="group"
-          aria-label="Recovery actions"
+          aria-label={tDiagnostics(lang, "ariaRecoveryActions")}
         >
-          <span className="diag-recovery-bar__label">Suggested actions</span>
+          <span className="diag-recovery-bar__label">
+            {tDiagnostics(lang, "suggestedActions")}
+          </span>
           <div className="diag-recovery-bar__actions">
             {recoveryActions.map((action) => (
               <button
@@ -1414,11 +1470,14 @@ function DiagnosticsViewComponent({
         >
           <span className="spinner diag-spinner" aria-hidden="true" />
           <div>
-            <p className="diag-running-state__title">Running diagnostics...</p>
+            <p className="diag-running-state__title">
+              {tDiagnostics(lang, "runningCardTitle")}
+            </p>
             <p className="diag-running-state__desc">
-              {isWindows
-                ? "Probing VPN coexistence, Wintun driver, DNS/DoH, Discord, Roblox, and runtime hygiene. This is read-only and will not interrupt active connections."
-                : "Probing VPN coexistence, DNS/DoH, Discord, Roblox, and runtime hygiene. This is read-only and will not interrupt active connections."}
+              {tDiagnostics(
+                lang,
+                isWindows ? "runningCardDescWin" : "runningCardDescUnix",
+              )}
             </p>
           </div>
         </section>
@@ -1428,22 +1487,29 @@ function DiagnosticsViewComponent({
         <section
           className="card card-flush diag-card diag-results-card"
           data-running={running ? "true" : "false"}
-          aria-label="Diagnostic check results"
+          aria-label={tDiagnostics(lang, "ariaResultsCard")}
         >
           <div className="diag-results-head">
-            <h2 className="diag-results-title">Check Results</h2>
+            <h2 className="diag-results-title">
+              {tDiagnostics(lang, "resultsTitle")}
+            </h2>
             <div className="diag-results-head__meta">
               {statusChangedSinceRun ? (
                 <span className="diag-stale-note" role="status">
-                  Status changed since last run
+                  {tDiagnostics(lang, "statusChangedNote")}
                 </span>
               ) : null}
               <span className="diag-results-meta tabular-nums">
                 {running
-                  ? "Refreshing probes..."
-                  : `Ran at ${ranAtClock} · ${report.checks.length} ${
-                      report.checks.length === 1 ? "check" : "checks"
-                    }`}
+                  ? tDiagnostics(lang, "refreshingProbes")
+                  : tDiagnostics(
+                      lang,
+                      report.checks.length === 1 ? "ranAtOne" : "ranAtMany",
+                      {
+                        time: ranAtClock ?? "--:--:--",
+                        count: report.checks.length,
+                      },
+                    )}
               </span>
             </div>
           </div>
@@ -1453,20 +1519,22 @@ function DiagnosticsViewComponent({
               <thead>
                 <tr>
                   <th scope="col" className="diag-col-check">
-                    Check
+                    {tDiagnostics(lang, "colCheck")}
                   </th>
                   <th scope="col" className="diag-col-target">
-                    Target
+                    {tDiagnostics(lang, "colTarget")}
                   </th>
                   <th scope="col" className="diag-col-latency">
-                    Latency
+                    {tDiagnostics(lang, "colLatency")}
                   </th>
                   <th scope="col" className="diag-col-status">
-                    Status
+                    {tDiagnostics(lang, "colStatus")}
                   </th>
                 </tr>
               </thead>
-              <tbody>{report.checks.map(renderCheckRow)}</tbody>
+              <tbody>
+                {report.checks.map((check) => renderCheckRow(check, lang))}
+              </tbody>
             </table>
           </div>
 
@@ -1487,10 +1555,10 @@ function DiagnosticsViewComponent({
                       previewOpen ? " diag-preview__chevron--open" : ""
                     }`}
                   />
-                  <span>Preview redacted report</span>
+                  <span>{tDiagnostics(lang, "previewReport")}</span>
                 </span>
                 <span className="tabular-nums">
-                  {previewOpen ? "Hide" : "Show"}
+                  {tDiagnostics(lang, previewOpen ? "hide" : "show")}
                 </span>
               </button>
               {previewOpen ? (
@@ -1506,18 +1574,17 @@ function DiagnosticsViewComponent({
           <footer className="diag-results-foot">
             <span className="diag-results-foot__privacy">
               <IconShield size={13} />
-              <span>
-                Redacted report strips custom DoH tokens, credentials, private
-                LAN IPs, and user home paths.
-              </span>
+              <span>{tDiagnostics(lang, "privacyNote")}</span>
             </span>
-            <span className="tabular-nums">100% read-only</span>
+            <span className="tabular-nums">
+              {tDiagnostics(lang, "readOnlyShort")}
+            </span>
           </footer>
         </section>
       ) : !running ? (
         <section
           className="card card-flush diag-card diag-empty"
-          aria-label="Diagnostics overview"
+          aria-label={tDiagnostics(lang, "ariaEmptyCard")}
         >
           <div className="diag-empty__head">
             <div className="diag-empty__intro">
@@ -1525,27 +1592,32 @@ function DiagnosticsViewComponent({
                 <IconDiagnostics size={18} />
               </span>
               <div>
-                <h2 className="diag-empty__title">Ready to run diagnostics</h2>
+                <h2 className="diag-empty__title">
+                  {tDiagnostics(lang, "emptyTitle")}
+                </h2>
                 <p className="diag-empty__description">
-                  Run a quick end-to-end health check to verify your network
-                  environment and vdpi setup. Probes are strictly read-only and
-                  never alter configuration, routes, or running services.
+                  {tDiagnostics(lang, "emptyDesc")}
                 </p>
               </div>
             </div>
 
             <span className="diag-readonly-badge">
               <IconShield size={13} />
-              <span>100% read-only &amp; non-destructive</span>
+              <span>{tDiagnostics(lang, "readonlyBadge")}</span>
             </span>
           </div>
 
-          <ul className="diag-probe-grid" aria-label="Checks included">
+          <ul
+            className="diag-probe-grid"
+            aria-label={tDiagnostics(lang, "ariaChecksIncluded")}
+          >
             {visibleCatalog.map((item) => (
               <li key={item.id} className="diag-probe-item">
-                <span className="diag-probe-item__name">{item.label}</span>
+                <span className="diag-probe-item__name">
+                  {tDiagnostics(lang, item.labelKey)}
+                </span>
                 <span className="diag-probe-item__desc">
-                  {item.description}
+                  {tDiagnostics(lang, item.descKey)}
                 </span>
               </li>
             ))}

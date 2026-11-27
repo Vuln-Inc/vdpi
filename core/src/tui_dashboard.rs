@@ -29,6 +29,24 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
 use vdpi::config::{DesyncMode, RuntimeConfig};
 use vdpi::desync::{EngineContext, EngineTelemetrySnapshot};
+use vdpi::i18n::{self, Lang};
+
+#[cfg(test)]
+#[inline]
+fn active_lang() -> Lang {
+    i18n::active_lang_with_fallback(Lang::En)
+}
+
+#[cfg(not(test))]
+#[inline]
+fn active_lang() -> Lang {
+    i18n::active_lang()
+}
+
+#[inline]
+fn tr(en: &'static str, tr_text: &'static str) -> &'static str {
+    i18n::tr_for(active_lang(), en, tr_text)
+}
 
 pub const MAX_LOG_ENTRIES: usize = 150;
 pub const MAX_LOG_MESSAGE_CHARS: usize = 512;
@@ -1044,10 +1062,17 @@ impl AttachedActivityTracker {
         let mode = format_desync_mode(initial_info.mode);
         let (dns, _) =
             format_dashboard_dns_tag(initial_info.dns_addr.as_deref(), initial_info.enable_doh);
-        let mut startup =
-            format!("attached to live vdpi daemon · {engine_summary} · {mode} · {dns}");
+        let mut startup = match active_lang() {
+            Lang::En => {
+                format!("attached to live vdpi daemon · {engine_summary} · {mode} · {dns}")
+            }
+            Lang::Tr => {
+                format!("canlı vdpi servisine bağlanıldı · {engine_summary} · {mode} · {dns}")
+            }
+        };
         if let Some(stage) = initial_isp_stage.map(str::trim).filter(|s| !s.is_empty()) {
-            startup.push_str(&format!(" · stage {stage}"));
+            let stage_word = tr("stage", "aşama");
+            startup.push_str(&format!(" · {stage_word} {stage}"));
         }
         tracker.push(Level::INFO, startup);
 
@@ -1058,7 +1083,10 @@ impl AttachedActivityTracker {
         {
             let vpn = sanitize_single_line(vpn);
             if !vpn.is_empty() {
-                tracker.push(Level::WARN, format!("VPN conflict active: {vpn}"));
+                tracker.push(
+                    Level::WARN,
+                    format!("{}: {vpn}", tr("VPN conflict active", "VPN çakışması etkin")),
+                );
             }
         }
 
@@ -1078,7 +1106,13 @@ impl AttachedActivityTracker {
 
     fn on_offline(&self, prev: &DashboardState) {
         if !prev.reconnecting {
-            self.push(Level::WARN, "daemon unreachable; waiting to reconnect...");
+            self.push(
+                Level::WARN,
+                tr(
+                    "daemon unreachable; waiting to reconnect...",
+                    "servise erişilemiyor; yeniden bağlanılıyor...",
+                ),
+            );
         }
     }
 
@@ -1086,23 +1120,37 @@ impl AttachedActivityTracker {
         let counters_reset = prev.rate_initialized
             && (sample.snap.bytes_rx < prev.prev_rx || sample.snap.bytes_tx < prev.prev_tx);
         let new_summary = format_engine_summary(&sample.engine);
+        let is_tr = active_lang() == Lang::Tr;
 
         if prev.reconnecting {
             if counters_reset {
                 self.push(
                     Level::INFO,
-                    format!("reconnected to live vdpi daemon (restarted · {new_summary})"),
+                    if is_tr {
+                        format!(
+                            "canlı vdpi servisine yeniden bağlanıldı (yeniden başladı · {new_summary})"
+                        )
+                    } else {
+                        format!("reconnected to live vdpi daemon (restarted · {new_summary})")
+                    },
                 );
             } else {
                 self.push(
                     Level::INFO,
-                    format!("reconnected to live vdpi daemon ({new_summary})"),
+                    if is_tr {
+                        format!("canlı vdpi servisine yeniden bağlanıldı ({new_summary})")
+                    } else {
+                        format!("reconnected to live vdpi daemon ({new_summary})")
+                    },
                 );
             }
         } else if counters_reset {
             self.push(
                 Level::WARN,
-                "daemon telemetry counters reset (service restarted)",
+                tr(
+                    "daemon telemetry counters reset (service restarted)",
+                    "servis telemetri sayaçları sıfırlandı (servis yeniden başladı)",
+                ),
             );
         }
 
@@ -1131,18 +1179,23 @@ impl AttachedActivityTracker {
                 if old_iface != new_iface {
                     self.push(
                         Level::INFO,
-                        format!("TUN interface changed: {old_iface} -> {new_iface}"),
+                        format!(
+                            "{}: {old_iface} -> {new_iface}",
+                            tr("TUN interface changed", "TUN arayüzü değişti")
+                        ),
                     );
                 }
                 let old_nic_norm = normalize_opt_string(old_nic.clone());
                 let new_nic_norm = normalize_opt_string(new_nic.clone());
                 if old_nic_norm != new_nic_norm {
+                    let none_lbl = tr("none", "yok");
                     self.push(
                         Level::INFO,
                         format!(
-                            "TUN uplink changed: {} -> {}",
-                            old_nic_norm.as_deref().unwrap_or("none"),
-                            new_nic_norm.as_deref().unwrap_or("none")
+                            "{}: {} -> {}",
+                            tr("TUN uplink changed", "TUN üst bağlantısı değişti"),
+                            old_nic_norm.as_deref().unwrap_or(none_lbl),
+                            new_nic_norm.as_deref().unwrap_or(none_lbl)
                         ),
                     );
                 }
@@ -1151,13 +1204,32 @@ impl AttachedActivityTracker {
                 if old_vpn_norm != new_vpn_norm {
                     match (old_vpn_norm, new_vpn_norm) {
                         (None, Some(v)) => {
-                            self.push(Level::WARN, format!("VPN conflict detected: {v}"));
+                            self.push(
+                                Level::WARN,
+                                format!(
+                                    "{}: {v}",
+                                    tr("VPN conflict detected", "VPN çakışması algılandı")
+                                ),
+                            );
                         }
                         (Some(old), None) => {
-                            self.push(Level::INFO, format!("VPN conflict cleared (was {old})"));
+                            self.push(
+                                Level::INFO,
+                                if is_tr {
+                                    format!("VPN çakışması giderildi (önceki: {old})")
+                                } else {
+                                    format!("VPN conflict cleared (was {old})")
+                                },
+                            );
                         }
                         (Some(old), Some(new)) => {
-                            self.push(Level::WARN, format!("VPN conflict changed: {old} -> {new}"));
+                            self.push(
+                                Level::WARN,
+                                format!(
+                                    "{}: {old} -> {new}",
+                                    tr("VPN conflict changed", "VPN çakışması değişti")
+                                ),
+                            );
                         }
                         (None, None) => {}
                     }
@@ -1178,12 +1250,25 @@ impl AttachedActivityTracker {
                 if old_p != new_p || old_s != new_s || old_sys != new_sys {
                     self.push(
                         Level::INFO,
-                        format!("proxy configuration updated: {new_summary}"),
+                        format!(
+                            "{}: {new_summary}",
+                            tr(
+                                "proxy configuration updated",
+                                "proxy yapılandırması güncellendi"
+                            )
+                        ),
                     );
                 }
             }
             _ => {
-                self.push(Level::INFO, format!("engine switched to {new_summary}"));
+                self.push(
+                    Level::INFO,
+                    if is_tr {
+                        format!("motor değiştirildi: {new_summary}")
+                    } else {
+                        format!("engine switched to {new_summary}")
+                    },
+                );
                 if let DashboardEngine::Tun {
                     vpn_conflict: Some(vpn),
                     ..
@@ -1191,7 +1276,13 @@ impl AttachedActivityTracker {
                 {
                     let vpn = sanitize_single_line(vpn);
                     if !vpn.is_empty() {
-                        self.push(Level::WARN, format!("VPN conflict active: {vpn}"));
+                        self.push(
+                            Level::WARN,
+                            format!(
+                                "{}: {vpn}",
+                                tr("VPN conflict active", "VPN çakışması etkin")
+                            ),
+                        );
                     }
                 }
             }
@@ -1201,7 +1292,8 @@ impl AttachedActivityTracker {
             self.push(
                 Level::INFO,
                 format!(
-                    "desync mode changed: {} -> {}",
+                    "{}: {} -> {}",
+                    tr("desync mode changed", "desync modu değişti"),
                     format_desync_mode(prev.info.mode),
                     format_desync_mode(sample.mode)
                 ),
@@ -1219,7 +1311,10 @@ impl AttachedActivityTracker {
             let new_dns = if new_effective_doh { "DoH" } else { "UDP" };
             self.push(
                 Level::INFO,
-                format!("DNS transport changed: {old_dns} -> {new_dns}"),
+                format!(
+                    "{}: {old_dns} -> {new_dns}",
+                    tr("DNS transport changed", "DNS aktarımı değişti")
+                ),
             );
         }
 
@@ -1232,32 +1327,48 @@ impl AttachedActivityTracker {
                 (_, None) => {
                     self.push(
                         Level::INFO,
-                        format!("DNS server reset to default ({new_tag})"),
+                        if is_tr {
+                            format!("DNS sunucusu varsayılana sıfırlandı ({new_tag})")
+                        } else {
+                            format!("DNS server reset to default ({new_tag})")
+                        },
                     );
                 }
                 (None, Some(_)) => {
-                    self.push(Level::INFO, format!("DNS server set: {new_tag}"));
+                    self.push(
+                        Level::INFO,
+                        format!("{}: {new_tag}", tr("DNS server set", "DNS sunucusu ayarlandı")),
+                    );
                 }
                 (Some(_), Some(_)) if old_tag != new_tag => {
                     self.push(
                         Level::INFO,
-                        format!("DNS server changed: {old_tag} -> {new_tag}"),
+                        format!(
+                            "{}: {old_tag} -> {new_tag}",
+                            tr("DNS server changed", "DNS sunucusu değişti")
+                        ),
                     );
                 }
                 (Some(_), Some(_)) => {
-                    self.push(Level::INFO, format!("DNS server updated: {new_tag}"));
+                    self.push(
+                        Level::INFO,
+                        format!(
+                            "{}: {new_tag}",
+                            tr("DNS server updated", "DNS sunucusu güncellendi")
+                        ),
+                    );
                 }
             }
         }
 
         if let Some(prev_quic) = self.last_block_quic {
             if prev_quic != sample.block_quic {
-                let state_str = if sample.block_quic {
-                    "enabled"
+                let msg = if sample.block_quic {
+                    tr("QUIC blocking enabled", "QUIC engelleme etkinleştirildi")
                 } else {
-                    "disabled"
+                    tr("QUIC blocking disabled", "QUIC engelleme devre dışı bırakıldı")
                 };
-                self.push(Level::INFO, format!("QUIC blocking {state_str}"));
+                self.push(Level::INFO, msg);
             }
         }
         self.last_block_quic = Some(sample.block_quic);
@@ -1266,13 +1377,29 @@ impl AttachedActivityTracker {
         if prev.isp_stage != new_stage {
             match (&prev.isp_stage, &new_stage) {
                 (Some(old), Some(new)) => {
-                    self.push(Level::INFO, format!("ISP stage changed: {old} -> {new}"));
+                    self.push(
+                        Level::INFO,
+                        format!(
+                            "{}: {old} -> {new}",
+                            tr("ISP stage changed", "ISS aşaması değişti")
+                        ),
+                    );
                 }
                 (None, Some(new)) => {
-                    self.push(Level::INFO, format!("ISP stage active: {new}"));
+                    self.push(
+                        Level::INFO,
+                        format!("{}: {new}", tr("ISP stage active", "ISS aşaması etkin")),
+                    );
                 }
                 (Some(old), None) => {
-                    self.push(Level::INFO, format!("ISP stage cleared (was {old})"));
+                    self.push(
+                        Level::INFO,
+                        if is_tr {
+                            format!("ISS aşaması temizlendi (önceki: {old})")
+                        } else {
+                            format!("ISP stage cleared (was {old})")
+                        },
+                    );
                 }
                 (None, None) => {}
             }
@@ -1287,10 +1414,17 @@ impl AttachedActivityTracker {
                 let delta = sample.snap.auto_heal_escalations - self.last_auto_heal;
                 self.push(
                     Level::WARN,
-                    format!(
-                        "auto-heal escalated (+{delta}, total {})",
-                        sample.snap.auto_heal_escalations
-                    ),
+                    if is_tr {
+                        format!(
+                            "oto-onarım yükseldi (+{delta}, toplam {})",
+                            sample.snap.auto_heal_escalations
+                        )
+                    } else {
+                        format!(
+                            "auto-heal escalated (+{delta}, total {})",
+                            sample.snap.auto_heal_escalations
+                        )
+                    },
                 );
                 self.last_auto_heal = sample.snap.auto_heal_escalations;
                 self.last_auto_heal_log = Some(now);
@@ -1305,10 +1439,17 @@ impl AttachedActivityTracker {
                 {
                     self.push(
                         Level::INFO,
-                        format!(
-                            "adaptive strategy cache grew (+{delta}, total {} hosts)",
-                            sample.snap.learned_hosts
-                        ),
+                        if is_tr {
+                            format!(
+                                "uyarlanabilir strateji önbelleği büyüdü (+{delta}, toplam {} alan)",
+                                sample.snap.learned_hosts
+                            )
+                        } else {
+                            format!(
+                                "adaptive strategy cache grew (+{delta}, total {} hosts)",
+                                sample.snap.learned_hosts
+                            )
+                        },
                     );
                     self.last_learned_hosts = sample.snap.learned_hosts;
                     self.last_learned_hosts_log = Some(now);
@@ -1319,13 +1460,23 @@ impl AttachedActivityTracker {
             if total_bytes >= self.next_traffic_milestone {
                 self.push(
                     Level::INFO,
-                    format!(
-                        "traffic milestone: {} total ({} down / {} up, {} connections)",
-                        format_bytes(total_bytes),
-                        format_bytes(sample.snap.bytes_rx),
-                        format_bytes(sample.snap.bytes_tx),
-                        sample.snap.total_connections
-                    ),
+                    if is_tr {
+                        format!(
+                            "trafik eşiği: toplam {} ({} indirme / {} yükleme, {} bağlantı)",
+                            format_bytes(total_bytes),
+                            format_bytes(sample.snap.bytes_rx),
+                            format_bytes(sample.snap.bytes_tx),
+                            sample.snap.total_connections
+                        )
+                    } else {
+                        format!(
+                            "traffic milestone: {} total ({} down / {} up, {} connections)",
+                            format_bytes(total_bytes),
+                            format_bytes(sample.snap.bytes_rx),
+                            format_bytes(sample.snap.bytes_tx),
+                            sample.snap.total_connections
+                        )
+                    },
                 );
                 self.next_traffic_milestone = next_traffic_milestone_after(total_bytes);
             }
@@ -1382,7 +1533,7 @@ async fn probe_via_http_connect(proxy_addr: SocketAddr, host: &str) -> ProbeStat
             } else if status_line.is_empty() {
                 ProbeStatus::Fail {
                     latency_ms,
-                    reason: "empty proxy response".to_string(),
+                    reason: tr("empty proxy response", "boş proxy yanıtı").to_string(),
                 }
             } else {
                 ProbeStatus::Fail {
@@ -1397,7 +1548,7 @@ async fn probe_via_http_connect(proxy_addr: SocketAddr, host: &str) -> ProbeStat
         },
         Err(_) => ProbeStatus::Fail {
             latency_ms,
-            reason: "timed out".to_string(),
+            reason: tr("timed out", "zaman aşımı").to_string(),
         },
     }
 }
@@ -1570,7 +1721,7 @@ async fn probe_via_tun_direct(
             },
             Err(_) => ProbeStatus::Fail {
                 latency_ms,
-                reason: "timed out".to_string(),
+                reason: tr("timed out", "zaman aşımı").to_string(),
             },
         };
     }
@@ -1578,7 +1729,7 @@ async fn probe_via_tun_direct(
     let Some(client) = client else {
         return ProbeStatus::Fail {
             latency_ms: started.elapsed().as_millis(),
-            reason: "HTTP client unavailable".to_string(),
+            reason: tr("HTTP client unavailable", "HTTP istemcisi kullanılamıyor").to_string(),
         };
     };
 
@@ -1625,7 +1776,7 @@ async fn probe_via_tun_direct(
         },
         Err(_) => ProbeStatus::Fail {
             latency_ms,
-            reason: "timed out".to_string(),
+            reason: tr("timed out", "zaman aşımı").to_string(),
         },
     }
 }
@@ -1717,7 +1868,7 @@ fn spawn_diagnostics_probes(
                 },
                 Err(_) => ProbeStatus::Fail {
                     latency_ms,
-                    reason: "timed out".to_string(),
+                    reason: tr("timed out", "zaman aşımı").to_string(),
                 },
             };
 
@@ -1760,6 +1911,9 @@ pub async fn run_dashboard_with_tun_meta<F>(
 where
     F: Future<Output = ()>,
 {
+    #[cfg(not(test))]
+    i18n::init_from_config();
+
     let color = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
     let mut guard = DashboardGuard::enter()?;
 
@@ -1811,7 +1965,10 @@ where
                                     clear_ctx.dns.clear_cache().await;
                                     info!("adaptive strategy and DNS caches cleared");
                                 });
-                                state.set_notice("Cache cleared", Instant::now());
+                                state.set_notice(
+                                    tr("Cache cleared", "Önbellek temizlendi"),
+                                    Instant::now(),
+                                );
                                 dirty = true;
                             }
                             KeyAction::RunDiagnostics => {
@@ -1886,6 +2043,9 @@ where
     if !is_interactive_tty() {
         anyhow::bail!("live dashboard requires an interactive terminal (TTY)");
     }
+
+    #[cfg(not(test))]
+    i18n::init_from_config();
 
     let color = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
     let mut guard = DashboardGuard::enter()?;
@@ -1973,7 +2133,10 @@ where
                             KeyAction::Refresh => {
                                 manual_refresh_pending = true;
                                 let _ = refresh_tx.try_send(());
-                                state.set_notice("Refreshing...", Instant::now());
+                                state.set_notice(
+                                    tr("Refreshing...", "Yenileniyor..."),
+                                    Instant::now(),
+                                );
                                 dirty = true;
                             }
                             KeyAction::RunDiagnostics => {
@@ -1993,7 +2156,10 @@ where
                                 dirty = true;
                             }
                             KeyAction::DiagnosticsOffline => {
-                                state.set_notice_warn("Daemon unreachable", Instant::now());
+                                state.set_notice_warn(
+                                    tr("Daemon unreachable", "Servise erişilemiyor"),
+                                    Instant::now(),
+                                );
                                 dirty = true;
                             }
                             KeyAction::Redraw => {
@@ -2017,7 +2183,7 @@ where
                         state.apply_attached_sample(sample, sample_now);
                         if manual_refresh_pending {
                             manual_refresh_pending = false;
-                            state.set_notice("Refreshed", sample_now);
+                            state.set_notice(tr("Refreshed", "Yenilendi"), sample_now);
                         }
                         dirty = true;
                     }
@@ -2026,7 +2192,10 @@ where
                         state.mark_reconnecting(sample_now);
                         if manual_refresh_pending {
                             manual_refresh_pending = false;
-                            state.set_notice_warn("Daemon unreachable", sample_now);
+                            state.set_notice_warn(
+                                tr("Daemon unreachable", "Servise erişilemiyor"),
+                                sample_now,
+                            );
                         }
                         dirty = true;
                     }
@@ -2036,7 +2205,10 @@ where
                         state.mark_reconnecting(sample_now);
                         if manual_refresh_pending {
                             manual_refresh_pending = false;
-                            state.set_notice_warn("Daemon unreachable", sample_now);
+                            state.set_notice_warn(
+                                tr("Daemon unreachable", "Servise erişilemiyor"),
+                                sample_now,
+                            );
                         }
                         dirty = true;
                     }
@@ -2064,9 +2236,9 @@ fn render_dashboard(frame: &mut Frame<'_>, state: &mut DashboardState) {
     let area = frame.area();
     if area.width < 12 || area.height < 8 {
         let quit_hint = if state.is_attached {
-            "q back"
+            tr("q back", "q geri")
         } else {
-            "q quit"
+            tr("q quit", "q çık")
         };
         let version = state
             .remote_version
@@ -2210,9 +2382,9 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
 
     if state.is_attached && state.reconnecting {
         let reconnecting_text = if p.color {
-            "Reconnecting…"
+            tr("Reconnecting…", "Yeniden bağlanıyor…")
         } else {
-            "! Reconnecting…"
+            tr("! Reconnecting…", "! Yeniden bağlanıyor…")
         };
         let reconnecting_len = reconnecting_text.chars().count();
         let engine_tag = match &state.info.engine {
@@ -2248,6 +2420,9 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
         return;
     }
 
+    let uptime_label = tr("Uptime ", "Süre ");
+    let uptime_label_len = uptime_label.chars().count();
+
     match &state.info.engine {
         DashboardEngine::Proxy {
             primary_addr,
@@ -2269,7 +2444,7 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
                 + 3
                 + dns_full_len
                 + 3
-                + "Uptime ".len()
+                + uptime_label_len
                 + uptime.len();
             let med_len = head_len
                 + 3
@@ -2281,7 +2456,7 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
                 + 3
                 + dns_full_len
                 + 3
-                + "Uptime ".len()
+                + uptime_label_len
                 + uptime.len();
             let compact_dns_len =
                 head_len + 3 + primary.len() + 3 + mode.len() + 3 + dns_full_len + 3 + uptime.len();
@@ -2308,7 +2483,7 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
                 spans.push(sep.clone());
                 spans.push(Span::styled(format!("{mode} · {dns_full}"), p.text));
                 spans.push(sep);
-                spans.push(Span::styled("Uptime ", p.label));
+                spans.push(Span::styled(uptime_label, p.label));
                 spans.push(Span::styled(uptime, p.text));
             } else if w >= med_len {
                 spans.push(sep.clone());
@@ -2322,7 +2497,7 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
                 spans.push(sep.clone());
                 spans.push(Span::styled(format!("{mode} · {dns_full}"), p.text));
                 spans.push(sep);
-                spans.push(Span::styled("Uptime ", p.label));
+                spans.push(Span::styled(uptime_label, p.label));
                 spans.push(Span::styled(uptime, p.text));
             } else if has_custom_dns_tag && w >= compact_dns_len {
                 spans.push(sep.clone());
@@ -2402,7 +2577,7 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
                 + 3
                 + dns_full_len
                 + 3
-                + "Uptime ".len()
+                + uptime_label_len
                 + uptime.len();
             let med_len = head_len
                 + 3
@@ -2453,7 +2628,7 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
                 spans.push(sep.clone());
                 spans.push(Span::styled(format!("{mode} · {dns_full}"), p.text));
                 spans.push(sep);
-                spans.push(Span::styled("Uptime ", p.label));
+                spans.push(Span::styled(uptime_label, p.label));
                 spans.push(Span::styled(uptime, p.text));
             } else if w >= med_len {
                 spans.push(sep.clone());
@@ -2544,24 +2719,28 @@ fn format_isp_stage_bottom_title(
     p: Palette,
 ) -> Option<Line<'static>> {
     let stage = isp_stage.map(str::trim).filter(|s| !s.is_empty())?;
-    let full_len = " ISP Stage ".len() + stage.chars().count() + 1;
-    let short_len = " Stage ".len() + stage.chars().count() + 1;
+    let full_prefix = tr(" ISP Stage ", " ISS Aşaması ");
+    let short_prefix = tr(" Stage ", " Aşama ");
+    let full_prefix_len = full_prefix.chars().count();
+    let short_prefix_len = short_prefix.chars().count();
+    let full_len = full_prefix_len + stage.chars().count() + 1;
+    let short_len = short_prefix_len + stage.chars().count() + 1;
     if full_len <= avail {
         Some(Line::from(vec![
-            Span::styled(" ISP Stage ", p.label),
+            Span::styled(full_prefix, p.label),
             Span::styled(stage.to_string(), p.text),
             Span::raw(" "),
         ]))
     } else if short_len <= avail {
         Some(Line::from(vec![
-            Span::styled(" Stage ", p.label),
+            Span::styled(short_prefix, p.label),
             Span::styled(stage.to_string(), p.text),
             Span::raw(" "),
         ]))
-    } else if avail > " Stage ".len() + 2 {
-        let budget = avail - " Stage ".len() - 1;
+    } else if avail > short_prefix_len + 2 {
+        let budget = avail - short_prefix_len - 1;
         Some(Line::from(vec![
-            Span::styled(" Stage ", p.label),
+            Span::styled(short_prefix, p.label),
             Span::styled(truncate_chars(stage, budget), p.text),
             Span::raw(" "),
         ]))
@@ -2578,7 +2757,7 @@ fn render_stats_panel(
 ) {
     let p = state.palette;
     let avail = area.width.saturating_sub(2) as usize;
-    let left_title = " Traffic & Engine ";
+    let left_title = tr(" Traffic & Engine ", " Trafik ve Motor ");
     let left_len = left_title.chars().count();
     let rss_title = state.rss_kb.and_then(|kb| {
         let formatted = format_rss_kb(kb);
@@ -2640,7 +2819,11 @@ fn render_stats_panel(
 
     let rows: [(&str, String, Style); 7] = match &state.info.engine {
         DashboardEngine::Proxy { system_proxy, .. } => {
-            let proxy_val = if *system_proxy { "Active" } else { "Disabled" };
+            let proxy_val = if *system_proxy {
+                tr("Active", "Etkin")
+            } else {
+                tr("Disabled", "Kapalı")
+            };
             let proxy_style = if *system_proxy { p.emerald } else { p.label };
             let heal_val = if !p.color && snap.auto_heal_escalations > 0 {
                 format!("! {}", snap.auto_heal_escalations)
@@ -2648,16 +2831,24 @@ fn render_stats_panel(
                 snap.auto_heal_escalations.to_string()
             };
             [
-                ("Download", download_val, p.text),
-                ("Upload", upload_val, p.text),
+                (tr("Download", "İndirme"), download_val, p.text),
+                (tr("Upload", "Yükleme"), upload_val, p.text),
                 (
-                    "Connections",
+                    tr("Connections", "Bağlantılar"),
                     format!("{} / {}", snap.active_connections, snap.total_connections),
                     p.text,
                 ),
-                ("TLS Handshakes", snap.tls_handshakes.to_string(), p.text),
-                ("Auto-Heal", heal_val, heal_style),
-                ("Cached Hosts", snap.learned_hosts.to_string(), p.text),
+                (
+                    tr("TLS Handshakes", "TLS El Sıkışma"),
+                    snap.tls_handshakes.to_string(),
+                    p.text,
+                ),
+                (tr("Auto-Heal", "Oto-Onarım"), heal_val, heal_style),
+                (
+                    tr("Cached Hosts", "Önbellek Alan"),
+                    snap.learned_hosts.to_string(),
+                    p.text,
+                ),
                 ("Proxy", proxy_val.to_string(), proxy_style),
             ]
         }
@@ -2693,32 +2884,37 @@ fn render_stats_panel(
             } else {
                 format!("{} / {}", snap.tls_handshakes, snap.auto_heal_escalations)
             };
+            let active_word = tr("active", "etkin");
             [
-                ("Download", download_val, p.text),
-                ("Upload", upload_val, p.text),
+                (tr("Download", "İndirme"), download_val, p.text),
+                (tr("Upload", "Yükleme"), upload_val, p.text),
                 (
                     "TCP / UDP",
                     format!(
-                        "{} active · {} UDP",
+                        "{} {active_word} · {} UDP",
                         snap.active_connections, snap.udp_flows_active
                     ),
                     p.text,
                 ),
-                ("QUIC Blocked", snap.quic_blocked.to_string(), p.text),
+                (
+                    tr("QUIC Blocked", "Engellenen QUIC"),
+                    snap.quic_blocked.to_string(),
+                    p.text,
+                ),
                 (
                     if effective_dashboard_doh(
                         state.info.dns_addr.as_deref(),
                         state.info.enable_doh,
                     ) {
-                        "DoH Queries"
+                        tr("DoH Queries", "DoH Sorguları")
                     } else {
-                        "DNS Queries"
+                        tr("DNS Queries", "DNS Sorguları")
                     },
                     snap.dns_queries.to_string(),
                     p.text,
                 ),
-                ("TLS / Heal", tls_heal_val, heal_style),
-                ("Interface", iface_val, iface_style),
+                (tr("TLS / Heal", "TLS / Onarım"), tls_heal_val, heal_style),
+                (tr("Interface", "Arayüz"), iface_val, iface_style),
             ]
         }
     };
@@ -2743,22 +2939,26 @@ fn render_sparkline_panel(frame: &mut Frame<'_>, area: Rect, state: &DashboardSt
     let peak_str = format_rate(peak);
     let avail = area.width.saturating_sub(2) as usize;
 
+    let full_left = tr(" Throughput · 60s ", " Aktarım · 60s ");
+    let short_left = tr(" Throughput ", " Aktarım ");
     let left_title = if avail >= 50 {
-        Some(" Throughput · 60s ")
-    } else if avail >= " Throughput ".len() {
-        Some(" Throughput ")
+        Some(full_left)
+    } else if avail >= short_left.chars().count() {
+        Some(short_left)
     } else {
         None
     };
     let left_len = left_title.map_or(0, |t| t.chars().count());
     let min_gap = usize::from(left_len > 0);
 
+    let peak_word = tr("peak", "zirve");
+    let pk_word = tr("pk", "zrv");
     let right_title = {
-        let full = format!(" {cur} · peak {peak_str} ");
+        let full = format!(" {cur} · {peak_word} {peak_str} ");
         if left_len + min_gap + full.chars().count() <= avail {
             Some(full)
         } else {
-            let short = format!(" {cur} · pk {peak_str} ");
+            let short = format!(" {cur} · {pk_word} {peak_str} ");
             if left_len + min_gap + short.chars().count() <= avail {
                 Some(short)
             } else {
@@ -2823,10 +3023,12 @@ fn render_activity_log(frame: &mut Frame<'_>, area: Rect, state: &mut DashboardS
     };
 
     let avail = area.width.saturating_sub(2) as usize;
-    let left_title = if avail >= " Activity Log ".len() {
-        Some(" Activity Log ")
-    } else if avail >= " Logs ".len() {
-        Some(" Logs ")
+    let full_log_title = tr(" Activity Log ", " Etkinlik Günlüğü ");
+    let short_log_title = tr(" Logs ", " Günlük ");
+    let left_title = if avail >= full_log_title.chars().count() {
+        Some(full_log_title)
+    } else if avail >= short_log_title.chars().count() {
+        Some(short_log_title)
     } else {
         None
     };
@@ -2835,7 +3037,8 @@ fn render_activity_log(frame: &mut Frame<'_>, area: Rect, state: &mut DashboardS
 
     let status_badge = if !state.follow_logs && total > state.log_viewport_rows {
         let end_idx = (start + state.log_viewport_rows).min(total);
-        let full = format!(" paused · {end_idx}/{total} ");
+        let paused_word = tr("paused", "duraklatıldı");
+        let full = format!(" {paused_word} · {end_idx}/{total} ");
         let compact = format!(" {end_idx}/{total} ");
         if left_len + min_gap + full.chars().count() <= avail {
             Some(Line::from(full).style(p.amber).right_aligned())
@@ -2869,7 +3072,13 @@ fn render_activity_log(frame: &mut Frame<'_>, area: Rect, state: &mut DashboardS
 
     if visible_entries.is_empty() {
         let empty = Line::from(Span::styled(
-            truncate_chars("Waiting for engine activity...", inner.width as usize),
+            truncate_chars(
+                tr(
+                    "Waiting for engine activity...",
+                    "Motor etkinliği bekleniyor...",
+                ),
+                inner.width as usize,
+            ),
             p.dim,
         ));
         frame.render_widget(Paragraph::new(empty), inner);
@@ -2931,38 +3140,46 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) {
     };
 
     let w = usize::from(legend_area.width);
+    let diag_long = tr(" diagnostics", " tanılama");
+    let diag_short = tr(" diag", " tanı");
+    let refresh_lbl = tr(" refresh", " yenile");
+    let cache_long = tr(" clear cache", " önbelleği sil");
+    let cache_short = tr(" cache", " önbellek");
+    let scroll_lbl = tr(" scroll", " kaydır");
+    let back_lbl = tr(" back", " geri");
+    let quit_lbl = tr(" quit", " çık");
     let legend = if state.is_attached {
         if w >= 47 {
             let sep = Span::styled(" · ", p.dim);
             Line::from(vec![
                 Span::raw(" "),
                 Span::styled("d", p.key_hint),
-                Span::styled(" diagnostics", p.dim),
+                Span::styled(diag_long, p.dim),
                 sep.clone(),
                 Span::styled("r", p.key_hint),
-                Span::styled(" refresh", p.dim),
+                Span::styled(refresh_lbl, p.dim),
                 sep.clone(),
                 Span::styled("↑↓", p.key_hint),
-                Span::styled(" scroll", p.dim),
+                Span::styled(scroll_lbl, p.dim),
                 sep,
                 Span::styled("q", p.key_hint),
-                Span::styled(" back", p.dim),
+                Span::styled(back_lbl, p.dim),
             ])
         } else if w >= 40 {
             let sep = Span::styled(" · ", p.dim);
             Line::from(vec![
                 Span::raw(" "),
                 Span::styled("d", p.key_hint),
-                Span::styled(" diag", p.dim),
+                Span::styled(diag_short, p.dim),
                 sep.clone(),
                 Span::styled("r", p.key_hint),
-                Span::styled(" refresh", p.dim),
+                Span::styled(refresh_lbl, p.dim),
                 sep.clone(),
                 Span::styled("↑↓", p.key_hint),
-                Span::styled(" scroll", p.dim),
+                Span::styled(scroll_lbl, p.dim),
                 sep,
                 Span::styled("q", p.key_hint),
-                Span::styled(" back", p.dim),
+                Span::styled(back_lbl, p.dim),
             ])
         } else if w >= 20 {
             let sep = Span::styled(" · ", p.dim);
@@ -2975,13 +3192,13 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) {
                 Span::styled("↑↓", p.key_hint),
                 sep,
                 Span::styled("q", p.key_hint),
-                Span::styled(" back", p.dim),
+                Span::styled(back_lbl, p.dim),
             ])
         } else {
             Line::from(vec![
                 Span::raw(" "),
                 Span::styled("q", p.key_hint),
-                Span::styled(" back", p.dim),
+                Span::styled(back_lbl, p.dim),
             ])
         }
     } else if w >= 57 {
@@ -2989,32 +3206,32 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) {
         Line::from(vec![
             Span::raw(" "),
             Span::styled("d", p.key_hint),
-            Span::styled(" diagnostics", p.dim),
+            Span::styled(diag_long, p.dim),
             sep.clone(),
             Span::styled("c", p.key_hint),
-            Span::styled(" clear cache", p.dim),
+            Span::styled(cache_long, p.dim),
             sep.clone(),
             Span::styled("↑↓", p.key_hint),
-            Span::styled(" scroll", p.dim),
+            Span::styled(scroll_lbl, p.dim),
             sep,
             Span::styled("q", p.key_hint),
-            Span::styled(" quit", p.dim),
+            Span::styled(quit_lbl, p.dim),
         ])
-    } else if w >= 38 {
+    } else if w >= if active_lang() == Lang::Tr { 40 } else { 38 } {
         let sep = Span::styled(" · ", p.dim);
         Line::from(vec![
             Span::raw(" "),
             Span::styled("d", p.key_hint),
-            Span::styled(" diag", p.dim),
+            Span::styled(diag_short, p.dim),
             sep.clone(),
             Span::styled("c", p.key_hint),
-            Span::styled(" cache", p.dim),
+            Span::styled(cache_short, p.dim),
             sep.clone(),
             Span::styled("↑↓", p.key_hint),
-            Span::styled(" scroll", p.dim),
+            Span::styled(scroll_lbl, p.dim),
             sep,
             Span::styled("q", p.key_hint),
-            Span::styled(" quit", p.dim),
+            Span::styled(quit_lbl, p.dim),
         ])
     } else if w >= 20 {
         let sep = Span::styled(" · ", p.dim);
@@ -3027,13 +3244,13 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) {
             Span::styled("↑↓", p.key_hint),
             sep,
             Span::styled("q", p.key_hint),
-            Span::styled(" quit", p.dim),
+            Span::styled(quit_lbl, p.dim),
         ])
     } else {
         Line::from(vec![
             Span::raw(" "),
             Span::styled("q", p.key_hint),
-            Span::styled(" quit", p.dim),
+            Span::styled(quit_lbl, p.dim),
         ])
     };
 
@@ -3063,10 +3280,12 @@ fn render_diagnostics_modal(frame: &mut Frame<'_>, area: Rect, state: &Dashboard
     frame.render_widget(Clear, popup);
 
     let avail = popup.width.saturating_sub(2) as usize;
-    let left_title = if avail >= " Diagnostics ".len() {
-        Some(" Diagnostics ")
-    } else if avail >= " Diag ".len() {
-        Some(" Diag ")
+    let diag_title_full = tr(" Diagnostics ", " Tanılama ");
+    let diag_title_short = tr(" Diag ", " Tanı ");
+    let left_title = if avail >= diag_title_full.chars().count() {
+        Some(diag_title_full)
+    } else if avail >= diag_title_short.chars().count() {
+        Some(diag_title_short)
     } else {
         None
     };
@@ -3074,9 +3293,12 @@ fn render_diagnostics_modal(frame: &mut Frame<'_>, area: Rect, state: &Dashboard
     let min_gap = usize::from(left_len > 0);
     let running = state.diagnostics_running();
     let right_title = if running {
-        [" esc close ", " esc "]
+        [tr(" esc close ", " esc kapat "), " esc "]
     } else {
-        [" r re-run · esc close ", " r · esc "]
+        [
+            tr(" r re-run · esc close ", " r tekrar · esc kapat "),
+            " r · esc ",
+        ]
     }
     .into_iter()
     .find(|candidate| left_len + min_gap + candidate.chars().count() <= avail);
@@ -3114,16 +3336,14 @@ fn render_diagnostics_modal(frame: &mut Frame<'_>, area: Rect, state: &Dashboard
     };
 
     if inner.height >= 6 {
+        let col_target = tr("Target", "Hedef");
+        let col_status = tr("Status", "Durum");
+        let col_latency = tr("Latency", "Gecikme");
+        let col_detail = tr("Detail", "Detay");
         let header = if show_detail {
-            format!(
-                "{:<target_w$}  {:<10}  {:>7}  {}",
-                "Target", "Status", "Latency", "Detail"
-            )
+            format!("{col_target:<target_w$}  {col_status:<10}  {col_latency:>7}  {col_detail}")
         } else {
-            format!(
-                "{:<target_w$}  {:<10}  {:>7}",
-                "Target", "Status", "Latency"
-            )
+            format!("{col_target:<target_w$}  {col_status:<10}  {col_latency:>7}")
         };
         lines.push(Line::from(Span::styled(
             truncate_chars(&header, inner.width as usize),
@@ -3138,7 +3358,7 @@ fn render_diagnostics_modal(frame: &mut Frame<'_>, area: Rect, state: &Dashboard
         let label = format!("{:<target_w$}", truncate_chars(&row.label, target_w));
         let (status_text, status_style, latency_text, detail_text) = match &row.status {
             ProbeStatus::Running => (
-                "Running...".to_string(),
+                tr("Running...", "Sürüyor...").to_string(),
                 p.amber,
                 "--".to_string(),
                 String::new(),
@@ -3146,7 +3366,7 @@ fn render_diagnostics_modal(frame: &mut Frame<'_>, area: Rect, state: &Dashboard
             ProbeStatus::Pass { latency_ms, detail } => {
                 passed += 1;
                 (
-                    "PASS".to_string(),
+                    tr("PASS", "GEÇTİ").to_string(),
                     p.emerald,
                     format!("{latency_ms} ms"),
                     detail.clone(),
@@ -3155,7 +3375,7 @@ fn render_diagnostics_modal(frame: &mut Frame<'_>, area: Rect, state: &Dashboard
             ProbeStatus::Fail { latency_ms, reason } => {
                 failed += 1;
                 (
-                    "FAIL".to_string(),
+                    tr("FAIL", "HATA").to_string(),
                     p.red,
                     format!("{latency_ms} ms"),
                     reason.clone(),
@@ -3187,14 +3407,27 @@ fn render_diagnostics_modal(frame: &mut Frame<'_>, area: Rect, state: &Dashboard
         lines.push(Line::raw(""));
         let total = snapshot.rows.len();
         let done = passed + failed;
+        let is_tr = active_lang() == Lang::Tr;
         let summary = if done < total {
             if state.is_attached {
-                format!("Probing {done}/{total} targets via live daemon...")
+                if is_tr {
+                    format!("Canlı servis üzerinden {done}/{total} hedef test ediliyor...")
+                } else {
+                    format!("Probing {done}/{total} targets via live daemon...")
+                }
+            } else if is_tr {
+                format!("Motor DNS üzerinden {done}/{total} hedef test ediliyor...")
             } else {
                 format!("Probing {done}/{total} targets via engine DNS...")
             }
         } else if failed == 0 {
-            format!("All {total}/{total} probes passed")
+            if is_tr {
+                format!("{total}/{total} testin tamamı geçti")
+            } else {
+                format!("All {total}/{total} probes passed")
+            }
+        } else if is_tr {
+            format!("{passed}/{total} geçti · {failed} başarısız")
         } else {
             format!("{passed}/{total} passed · {failed} failed")
         };
@@ -3393,7 +3626,7 @@ fn diagnostics_dns_row_label(dns_addr: Option<&str>, enable_doh: bool) -> String
         }
     }
     if !effective_dashboard_doh(trimmed, enable_doh) {
-        return "UDP DNS Resolution".to_string();
+        return tr("UDP DNS Resolution", "UDP DNS Çözümleme").to_string();
     }
     if let Some(ip) = trimmed.and_then(parse_known_doh_ip) {
         if let Some(provider) = known_doh_ip_provider_name(ip) {
@@ -5851,5 +6084,89 @@ mod tests {
             );
             assert_eq!(compact_state.log_viewport_rows, 3);
         }
+    }
+
+    #[test]
+    fn renders_live_dashboard_and_diagnostics_modal_in_turkish() {
+        let _guard = i18n::push_thread_lang(Some(Lang::Tr));
+        let mut state = sample_state(true);
+        state.isp_stage = Some("Balanced".to_string());
+        let backend = TestBackend::new(100, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|frame| render_dashboard(frame, &mut state))
+            .unwrap();
+        let screen = buffer_to_string(term.backend());
+
+        assert!(screen.contains("Süre "), "missing TR uptime:\n{screen}");
+        assert!(
+            screen.contains("Trafik ve Motor"),
+            "missing TR stats title:\n{screen}"
+        );
+        assert!(
+            screen.contains("Aktarım · 60s"),
+            "missing TR sparkline title:\n{screen}"
+        );
+        assert!(screen.contains("İndirme"), "missing TR Download:\n{screen}");
+        assert!(screen.contains("Yükleme"), "missing TR Upload:\n{screen}");
+        assert!(
+            screen.contains("Bağlantılar"),
+            "missing TR Connections:\n{screen}"
+        );
+        assert!(
+            screen.contains("TLS El Sıkışma"),
+            "missing TR TLS Handshakes:\n{screen}"
+        );
+        assert!(
+            screen.contains("Oto-Onarım"),
+            "missing TR Auto-Heal:\n{screen}"
+        );
+        assert!(
+            screen.contains("Önbellek Alan"),
+            "missing TR Cached Hosts:\n{screen}"
+        );
+        assert!(screen.contains("Etkin"), "missing TR Active:\n{screen}");
+        assert!(
+            screen.contains("Etkinlik Günlüğü"),
+            "missing TR Activity Log:\n{screen}"
+        );
+        assert!(
+            screen.contains("ISS Aşaması Balanced"),
+            "missing TR ISP stage:\n{screen}"
+        );
+        assert!(
+            screen.contains("d tanılama") && screen.contains("q çık"),
+            "missing TR footer:\n{screen}"
+        );
+
+        // Open diagnostics modal and verify Turkish headers/status.
+        state.diagnostics_open = true;
+        {
+            let mut diag = state.diagnostics.lock().unwrap();
+            diag.rows[0].status = ProbeStatus::Pass {
+                latency_ms: 18,
+                detail: "1.1.1.1".to_string(),
+            };
+            diag.rows[1].status = ProbeStatus::Fail {
+                latency_ms: 4000,
+                reason: "zaman aşımı".to_string(),
+            };
+        }
+        term.draw(|frame| render_dashboard(frame, &mut state))
+            .unwrap();
+        let diag_screen = buffer_to_string(term.backend());
+        assert!(
+            diag_screen.contains("Tanılama"),
+            "missing TR modal title:\n{diag_screen}"
+        );
+        assert!(
+            diag_screen.contains("Hedef")
+                && diag_screen.contains("Durum")
+                && diag_screen.contains("Gecikme"),
+            "missing TR modal headers:\n{diag_screen}"
+        );
+        assert!(
+            diag_screen.contains("GEÇTİ") && diag_screen.contains("HATA"),
+            "missing TR probe status:\n{diag_screen}"
+        );
     }
 }

@@ -797,7 +797,7 @@ fn save_gui_preferences_to_path(path: &Path, prefs: &GuiPreferencesDto) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::ThemePreferenceDto;
+    use crate::models::{LanguagePreferenceDto, ThemePreferenceDto};
 
     static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -834,6 +834,7 @@ mod tests {
     fn default_gui_preferences_match_expected_values() {
         let defaults = GuiPreferencesDto::default();
         assert_eq!(defaults.theme, ThemePreferenceDto::System);
+        assert_eq!(defaults.language, LanguagePreferenceDto::System);
         assert!(!defaults.keep_in_tray_on_close);
         assert!(!defaults.minimize_to_tray);
         assert!(!defaults.start_minimized_to_tray);
@@ -871,6 +872,7 @@ mod tests {
 
         let initial = GuiPreferencesDto {
             theme: ThemePreferenceDto::Dark,
+            language: LanguagePreferenceDto::Tr,
             keep_in_tray_on_close: true,
             minimize_to_tray: true,
             start_minimized_to_tray: true,
@@ -884,6 +886,7 @@ mod tests {
         let raw = fs::read_to_string(&prefs_path).expect("read persisted JSON");
         let json: serde_json::Value = serde_json::from_str(&raw).expect("parse persisted JSON");
         assert_eq!(json["theme"], "dark");
+        assert_eq!(json["language"], "tr");
         assert_eq!(json["keepInTrayOnClose"], true);
         assert_eq!(json["minimizeToTray"], true);
         assert_eq!(json["startMinimizedToTray"], true);
@@ -891,6 +894,7 @@ mod tests {
 
         let updated = GuiPreferencesDto {
             theme: ThemePreferenceDto::Light,
+            language: LanguagePreferenceDto::En,
             keep_in_tray_on_close: false,
             minimize_to_tray: true,
             start_minimized_to_tray: false,
@@ -989,6 +993,7 @@ mod tests {
             loaded,
             GuiPreferencesDto {
                 theme: ThemePreferenceDto::Dark,
+                language: LanguagePreferenceDto::System,
                 keep_in_tray_on_close: false,
                 minimize_to_tray: true,
                 start_minimized_to_tray: false,

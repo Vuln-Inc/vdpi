@@ -7,6 +7,7 @@ struct TunnelView: View {
 
     @EnvironmentObject private var manager: TunnelManager
     @Environment(\.vdpiPalette) private var palette
+    @Environment(\.appLanguage) private var appLanguage
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.verticalSizeClass) private var verticalSizeClass
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
@@ -17,6 +18,10 @@ struct TunnelView: View {
     @State private var cacheFeedbackTask: Task<Void, Never>?
 
     // MARK: - Derived State
+
+    private var l10n: L10n.Catalog {
+        L10n.catalog(for: appLanguage)
+    }
 
     private var useTwoPaneLayout: Bool {
         verticalSizeClass == .compact || horizontalSizeClass == .regular
@@ -33,20 +38,20 @@ struct TunnelView: View {
 
     private var heroTitle: String {
         switch manager.phase {
-        case .connected: return "Connected"
-        case .connecting: return "Connecting"
-        case .disconnecting: return "Disconnecting"
-        case .disconnected: return "Not Connected"
-        case .error: return "Connection Error"
+        case .connected: return l10n.heroConnected
+        case .connecting: return l10n.heroConnecting
+        case .disconnecting: return l10n.heroDisconnecting
+        case .disconnected: return l10n.heroNotConnected
+        case .error: return l10n.heroConnectionError
         }
     }
 
     private var primaryButtonTitle: String {
         switch manager.phase {
-        case .disconnected, .error: return "Connect"
-        case .connecting: return "Cancel"
-        case .connected: return "Disconnect"
-        case .disconnecting: return "Disconnecting..."
+        case .disconnected, .error: return l10n.buttonConnect
+        case .connecting: return l10n.cancel
+        case .connected: return l10n.buttonDisconnect
+        case .disconnecting: return l10n.buttonDisconnecting
         }
     }
 
@@ -102,6 +107,8 @@ struct TunnelView: View {
             DiagnosticsSheet()
                 .environmentObject(manager)
                 .environment(\.vdpiPalette, palette)
+                .environment(\.appLanguage, appLanguage)
+                .environment(\.locale, l10n.locale)
                 .preferredColorScheme(palette.isDark ? .dark : .light)
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
@@ -110,6 +117,8 @@ struct TunnelView: View {
             EngineLogsSheet()
                 .environmentObject(manager)
                 .environment(\.vdpiPalette, palette)
+                .environment(\.appLanguage, appLanguage)
+                .environment(\.locale, l10n.locale)
                 .preferredColorScheme(palette.isDark ? .dark : .light)
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
@@ -214,7 +223,7 @@ struct TunnelView: View {
             HStack(spacing: 8) {
                 GlassCircleButton(
                     systemImage: "stethoscope",
-                    accessibilityLabel: "Diagnostics",
+                    accessibilityLabel: l10n.diagnosticsTitle,
                     badgeColor: diagnosticsBadgeColor
                 ) {
                     showDiagnosticsSheet = true
@@ -225,7 +234,7 @@ struct TunnelView: View {
 
                 GlassCircleButton(
                     systemImage: "terminal",
-                    accessibilityLabel: "Engine Logs",
+                    accessibilityLabel: l10n.engineLogsTitle,
                     badgeColor: logsBadgeColor
                 ) {
                     showLogsSheet = true
@@ -262,7 +271,7 @@ struct TunnelView: View {
                     ) {
                         manager.toggleTunnel()
                     }
-                    .accessibilityHint(isConnecting ? "Double tap to cancel connection" : "")
+                    .accessibilityHint(isConnecting ? l10n.accessibilityCancelConnectionHint : "")
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(16)
@@ -286,7 +295,7 @@ struct TunnelView: View {
                     ) {
                         manager.toggleTunnel()
                     }
-                    .accessibilityHint(isConnecting ? "Double tap to cancel connection" : "")
+                    .accessibilityHint(isConnecting ? l10n.accessibilityCancelConnectionHint : "")
                     .padding(.top, 20)
                 }
                 .frame(maxWidth: .infinity)
@@ -306,7 +315,12 @@ struct TunnelView: View {
                 .fixedSize(horizontal: false, vertical: true)
         } else if isConnected {
             let t = manager.telemetry
-            let resolver = Self.displayDnsLabel(t.dnsAddr, dohEnabled: t.dohEnabled, parenthesizedDoh: false)
+            let resolver = Self.displayDnsLabel(
+                t.dnsAddr,
+                dohEnabled: t.dohEnabled,
+                parenthesizedDoh: false,
+                customDohFallback: l10n.customDoh
+            )
             Text("\(resolver) · \(VdpiFormatters.formatUptime(t.uptimeSecs))")
                 .font(.subheadline)
                 .monospacedDigit()
@@ -317,21 +331,21 @@ struct TunnelView: View {
                 .lineLimit(1)
                 .minimumScaleFactor(0.85)
         } else if manager.phase == .connecting {
-            Text("Establishing local tunnel...")
+            Text(l10n.subtitleEstablishing)
                 .font(.subheadline)
                 .foregroundStyle(palette.inkSecondary)
                 .multilineTextAlignment(alignment)
                 .lineLimit(1)
                 .minimumScaleFactor(0.85)
         } else if manager.phase == .disconnecting {
-            Text("Closing local tunnel...")
+            Text(l10n.subtitleClosing)
                 .font(.subheadline)
                 .foregroundStyle(palette.inkSecondary)
                 .multilineTextAlignment(alignment)
                 .lineLimit(1)
                 .minimumScaleFactor(0.85)
         } else {
-            Text("Local anti-DPI tunnel ready")
+            Text(l10n.subtitleReady)
                 .font(.subheadline)
                 .foregroundStyle(palette.inkSecondary)
                 .multilineTextAlignment(alignment)
@@ -344,7 +358,7 @@ struct TunnelView: View {
 
     private var inlineReconnectCard: some View {
         let detail = manager.pendingChangeSummary.isEmpty
-            ? "Reconnect to apply"
+            ? l10n.reconnectToApply
             : manager.pendingChangeSummary
 
         return InsetGroupedCard(cornerRadius: 16) {
@@ -355,7 +369,7 @@ struct TunnelView: View {
                     .accessibilityHidden(true)
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Settings Changed")
+                    Text(l10n.settingsChangedTitle)
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(palette.inkPrimary)
 
@@ -372,7 +386,7 @@ struct TunnelView: View {
                     manager.applyChangesLive()
                 } label: {
                     ZStack {
-                        Text("Reconnect")
+                        Text(l10n.reconnectButton)
                             .font(.subheadline.weight(.semibold))
                             .lineLimit(1)
                             .opacity(manager.isReloading ? 0 : 1)
@@ -382,7 +396,7 @@ struct TunnelView: View {
                                 .progressViewStyle(.circular)
                                 .controlSize(.mini)
                                 .tint(palette.primaryButtonInk)
-                                .accessibilityLabel("Reconnecting tunnel")
+                                .accessibilityLabel(l10n.accessibilityReconnectingTunnel)
                         }
                     }
                     .foregroundStyle(palette.primaryButtonInk)
@@ -394,7 +408,7 @@ struct TunnelView: View {
                 }
                 .buttonStyle(VdpiPressButtonStyle(haptic: nil))
                 .disabled(manager.isReloading)
-                .accessibilityLabel(manager.isReloading ? "Reconnecting tunnel" : "Reconnect tunnel")
+                .accessibilityLabel(manager.isReloading ? l10n.accessibilityReconnectingTunnel : l10n.accessibilityReconnectTunnel)
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
@@ -415,7 +429,7 @@ struct TunnelView: View {
                     .frame(width: 6, height: 6)
                     .accessibilityHidden(true)
 
-                Text("Update available · \(versionLabel)")
+                Text(l10n.updateAvailableBanner(version: versionLabel))
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(palette.inkPrimary)
                     .lineLimit(1)
@@ -436,7 +450,7 @@ struct TunnelView: View {
                         .padding(.horizontal, 6)
                         .contentShape(Rectangle())
                     }
-                    .accessibilityLabel("Open \(versionLabel) release on GitHub")
+                    .accessibilityLabel(l10n.accessibilityOpenRelease(version: versionLabel))
                 }
 
                 Button {
@@ -457,7 +471,7 @@ struct TunnelView: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("Dismiss update notice")
+                .accessibilityLabel(l10n.accessibilityDismissUpdate)
             }
             .padding(.leading, 16)
             .padding(.trailing, 4)
@@ -469,31 +483,36 @@ struct TunnelView: View {
 
     private var connectionSection: some View {
         let t = manager.telemetry
-        let dnsValue = Self.displayDnsLabel(t.dnsAddr, dohEnabled: t.dohEnabled, parenthesizedDoh: true)
+        let dnsValue = Self.displayDnsLabel(
+            t.dnsAddr,
+            dohEnabled: t.dohEnabled,
+            parenthesizedDoh: true,
+            customDohFallback: l10n.customDoh
+        )
         let effectiveBlockQuic = manager.appliedConfig?.blockQuic ?? manager.settings.blockQuic
-        let quicValue = effectiveBlockQuic ? "\(t.quicBlocked)" : "Allowed"
+        let quicValue = effectiveBlockQuic ? "\(t.quicBlocked)" : l10n.quicAllowed
 
         return VStack(alignment: .leading, spacing: 8) {
-            SectionHeader(title: "Connection")
+            SectionHeader(title: l10n.sectionConnection)
 
             InsetGroupedCard(cornerRadius: 16) {
                 VStack(spacing: 0) {
-                    numericMetricRow("Download", value: VdpiFormatters.formatBytes(t.bytesRx), trigger: t.bytesRx)
+                    numericMetricRow(l10n.metricDownload, value: VdpiFormatters.formatBytes(t.bytesRx), trigger: t.bytesRx)
                     InsetDivider(leadingInset: 16)
-                    numericMetricRow("Upload", value: VdpiFormatters.formatBytes(t.bytesTx), trigger: t.bytesTx)
+                    numericMetricRow(l10n.metricUpload, value: VdpiFormatters.formatBytes(t.bytesTx), trigger: t.bytesTx)
                     InsetDivider(leadingInset: 16)
-                    numericMetricRow("Uptime", value: VdpiFormatters.formatUptime(t.uptimeSecs), trigger: t.uptimeSecs)
+                    numericMetricRow(l10n.metricUptime, value: VdpiFormatters.formatUptime(t.uptimeSecs), trigger: t.uptimeSecs)
                     InsetDivider(leadingInset: 16)
                     ThroughputSparkline(
                         samples: manager.throughputSamples,
                         currentRateBytesPerSec: manager.currentRateBytesPerSec
                     )
                     InsetDivider(leadingInset: 16)
-                    keyValueRow("Strategy", value: VdpiFormatters.formatStageLabel(t.stageLabel))
+                    keyValueRow(l10n.metricStrategy, value: VdpiFormatters.formatStageLabel(t.stageLabel, language: appLanguage))
                     InsetDivider(leadingInset: 16)
-                    keyValueRow("DNS", value: dnsValue)
+                    keyValueRow(l10n.metricDns, value: dnsValue)
                     InsetDivider(leadingInset: 16)
-                    keyValueRow("QUIC Blocked", value: quicValue)
+                    keyValueRow(l10n.metricQuicBlocked, value: quicValue)
                 }
             }
         }
@@ -504,20 +523,25 @@ struct TunnelView: View {
 
     private var profileSection: some View {
         let s = manager.settings
-        let dnsValue = Self.displayDnsLabel(s.dnsAddr, dohEnabled: s.enableDoh, parenthesizedDoh: true)
+        let dnsValue = Self.displayDnsLabel(
+            s.dnsAddr,
+            dohEnabled: s.enableDoh,
+            parenthesizedDoh: true,
+            customDohFallback: l10n.customDoh
+        )
 
         return VStack(alignment: .leading, spacing: 8) {
-            SectionHeader(title: "Profile")
+            SectionHeader(title: l10n.sectionProfile)
 
             InsetGroupedCard(cornerRadius: 16) {
                 VStack(spacing: 0) {
-                    keyValueRow("Mode", value: "\(s.desyncMode.label) (\(s.chunkSize) B)")
+                    keyValueRow(l10n.profileMode, value: "\(s.desyncMode.label(in: appLanguage)) (\(s.chunkSize) B)")
                     InsetDivider(leadingInset: 16)
-                    keyValueRow("DNS", value: dnsValue)
+                    keyValueRow(l10n.metricDns, value: dnsValue)
                     InsetDivider(leadingInset: 16)
-                    keyValueRow("QUIC Blocking", value: s.blockQuic ? "On" : "Off")
+                    keyValueRow(l10n.profileQuicBlocking, value: s.blockQuic ? l10n.on : l10n.off)
                     InsetDivider(leadingInset: 16)
-                    keyValueRow("On-Demand", value: s.onDemandEnabled ? "On" : "Off")
+                    keyValueRow(l10n.profileOnDemand, value: s.onDemandEnabled ? l10n.on : l10n.off)
                 }
             }
         }
@@ -528,7 +552,7 @@ struct TunnelView: View {
 
     private var actionsSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            SectionHeader(title: "Actions")
+            SectionHeader(title: l10n.sectionActions)
 
             clearCacheCard
         }
@@ -546,7 +570,7 @@ struct TunnelView: View {
                         .frame(width: 24)
                         .accessibilityHidden(true)
 
-                    Text("Clear Engine Cache")
+                    Text(l10n.clearEngineCache)
                         .font(.body)
                         .foregroundStyle(palette.inkPrimary)
                         .lineLimit(1)
@@ -558,7 +582,7 @@ struct TunnelView: View {
                         HStack(spacing: 4) {
                             Image(systemName: "checkmark")
                                 .font(.footnote.weight(.semibold))
-                            Text("Cleared")
+                            Text(l10n.cleared)
                                 .font(.subheadline)
                         }
                         .foregroundStyle(palette.inkSecondary)
@@ -579,7 +603,8 @@ struct TunnelView: View {
     private static func displayDnsLabel(
         _ raw: String,
         dohEnabled: Bool,
-        parenthesizedDoh: Bool
+        parenthesizedDoh: Bool,
+        customDohFallback: String
     ) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         let effective = trimmed.isEmpty ? "1.1.1.1" : trimmed
@@ -598,7 +623,7 @@ struct TunnelView: View {
                 let hostLabel = "\(formattedHost)\(portSuffix)"
                 return parenthesizedDoh ? "\(hostLabel) (DoH)" : "\(hostLabel) DoH"
             }
-            return "Custom DoH"
+            return customDohFallback
         }
         if dohEnabled {
             return parenthesizedDoh ? "\(effective) (DoH)" : "\(effective) DoH"
@@ -764,6 +789,7 @@ private struct StatusDisc: View {
 
 private struct ThroughputSparkline: View {
     @Environment(\.vdpiPalette) private var palette
+    @Environment(\.appLanguage) private var appLanguage
     @Environment(\.displayScale) private var displayScale
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -773,11 +799,12 @@ private struct ThroughputSparkline: View {
     private static let windowCapacity = 24
 
     var body: some View {
+        let l10n = L10n.catalog(for: appLanguage)
         let rateText = Self.formatRate(currentRateBytesPerSec)
 
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text("Activity")
+                Text(l10n.metricActivity)
                     .font(.footnote)
                     .foregroundStyle(palette.inkMuted)
 
@@ -835,7 +862,7 @@ private struct ThroughputSparkline: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Activity, \(rateText)")
+        .accessibilityLabel(l10n.accessibilityActivity(rate: rateText))
     }
 
     private func sparklinePoints(

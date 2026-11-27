@@ -6,6 +6,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-27
+
+### Added
+- **Full Turkish (`Türkçe`) and English language support across every platform**:
+  - **Desktop GUI & System Tray / Menu Bar**: added `System / English / Türkçe` language preference in Settings (`gui-prefs.json`), auto-detecting OS locale and updating all views, dialogs, toasts, and native system tray / menu bar labels live without restarting.
+  - **Core Control Center TUI, Live Dashboard & Split Tunnel TUI**: added `language = "auto" | "en" | "tr"` in `config.toml`, `VDPI_LANG` / OS locale auto-detection, and instant `g` hotkey language toggle in the Control Center TUI.
+  - **Android app**: added `values-tr/strings.xml`, Android 13+ per-app `locales_config.xml`, in-app `System / English / Türkçe` selector in Settings, and localized Compose UI, notifications, Quick Settings tile, and home screen widget.
+  - **iOS / iPadOS app**: added `CFBundleLocalizations` (`en`, `tr`), `AppLanguage` persistence, in-app `System / English / Türkçe` picker in Settings, and localized SwiftUI views, sheets, diagnostics, and App Intents.
+  - **Documentation**: added full Turkish `README.tr.md`, language switchers, and Desktop GUI screenshots/install guides in `README.md`.
+
+### Changed
+- Redesigned GitHub Release notes layout into clean `### Changes` bullets and grouped `### Downloads` links (Desktop App GUI, CLI, Mobile, and `SHA256SUMS.txt`).
+
 ## [0.6.0] - 2026-11-27
 
 ### Added
@@ -208,7 +221,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Configured `CODE_SIGN_ENTITLEMENTS` in iOS `project.yml` so XcodeGen preserves `.entitlements` files.
 - Fixed release workflow entitlement verification and restricted automatic release runs to version tags and manual dispatch.
 
-[Unreleased]: https://github.com/Vuln-Inc/vdpi/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/Vuln-Inc/vdpi/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/Vuln-Inc/vdpi/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.8...v0.6.0
 [0.5.8]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.7...v0.5.8
 [0.5.7]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.6...v0.5.7

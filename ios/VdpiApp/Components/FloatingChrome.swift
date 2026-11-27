@@ -12,9 +12,14 @@ enum VdpiTab: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 
     var title: String {
+        title(in: .en)
+    }
+
+    func title(in language: AppLanguage) -> String {
+        let l10n = L10n.catalog(for: language)
         switch self {
-        case .tunnel: return "Tunnel"
-        case .settings: return "Settings"
+        case .tunnel: return l10n.tabTunnel
+        case .settings: return l10n.tabSettings
         }
     }
 
@@ -34,6 +39,7 @@ enum VdpiTab: String, CaseIterable, Identifiable {
 
 struct TopReconnectPopup: View {
     @Environment(\.vdpiPalette) private var palette
+    @Environment(\.appLanguage) private var appLanguage
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorSchemeContrast) private var colorSchemeContrast
 
@@ -59,6 +65,10 @@ struct TopReconnectPopup: View {
         self.onDismiss = onDismiss
     }
 
+    private var l10n: L10n.Catalog {
+        L10n.catalog(for: appLanguage)
+    }
+
     private var popupAnimation: Animation {
         reduceMotion ? .easeInOut(duration: 0.15) : .spring(response: 0.36, dampingFraction: 0.82)
     }
@@ -69,8 +79,8 @@ struct TopReconnectPopup: View {
 
     var body: some View {
         let subtitle: String = pendingChangeSummary.isEmpty
-            ? "Reconnect to apply"
-            : "Reconnect to apply · \(pendingChangeSummary)"
+            ? l10n.reconnectToApply
+            : l10n.reconnectToApply(summary: pendingChangeSummary)
 
         HStack(spacing: 10) {
             Group {
@@ -89,7 +99,7 @@ struct TopReconnectPopup: View {
             .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text("Settings Changed")
+                Text(l10n.settingsChangedTitle)
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(palette.inkPrimary)
                     .lineLimit(1)
@@ -108,7 +118,7 @@ struct TopReconnectPopup: View {
                     onReconnect()
                 } label: {
                     ZStack {
-                        Text("Reconnect")
+                        Text(l10n.reconnectButton)
                             .font(.footnote.weight(.semibold))
                             .lineLimit(1)
                             .opacity(isReloading ? 0 : 1)
@@ -136,7 +146,7 @@ struct TopReconnectPopup: View {
                 }
                 .buttonStyle(VdpiPressButtonStyle(haptic: nil))
                 .disabled(isReloading)
-                .accessibilityLabel(isReloading ? "Reconnecting tunnel" : "Reconnect tunnel")
+                .accessibilityLabel(isReloading ? l10n.accessibilityReconnectingTunnel : l10n.accessibilityReconnectTunnel)
 
                 Button {
                     dismiss()
@@ -155,7 +165,7 @@ struct TopReconnectPopup: View {
                 .buttonStyle(VdpiPressButtonStyle(haptic: nil))
                 .disabled(isReloading)
                 .opacity(isReloading ? 0.35 : 1)
-                .accessibilityLabel("Dismiss")
+                .accessibilityLabel(l10n.dismiss)
             }
         }
         .padding(.leading, 14)
@@ -166,7 +176,7 @@ struct TopReconnectPopup: View {
         .vdpiGlass(in: Capsule(), tier: .elevated)
         .dynamicTypeSize(...DynamicTypeSize.xLarge)
         .offset(y: popupDragOffset)
-        .accessibilityAction(named: "Dismiss") {
+        .accessibilityAction(named: l10n.dismiss) {
             dismiss()
         }
         .gesture(
@@ -213,6 +223,7 @@ struct TopReconnectPopup: View {
 
 struct LiveTunnelAccessoryPill: View {
     @Environment(\.vdpiPalette) private var palette
+    @Environment(\.appLanguage) private var appLanguage
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     let phase: TunnelPhase
@@ -236,6 +247,10 @@ struct LiveTunnelAccessoryPill: View {
         self.isCompactHeight = isCompactHeight
         self.onTapPill = onTapPill
         self.onToggleTunnel = onToggleTunnel
+    }
+
+    private var l10n: L10n.Catalog {
+        L10n.catalog(for: appLanguage)
     }
 
     var body: some View {
@@ -276,7 +291,7 @@ struct LiveTunnelAccessoryPill: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("\(accessoryTitle), \(accessorySubtitle). Switch to Tunnel")
+            .accessibilityLabel(l10n.accessibilitySwitchToTunnel(title: accessoryTitle, subtitle: accessorySubtitle))
 
             Button {
                 onToggleTunnel()
@@ -302,7 +317,7 @@ struct LiveTunnelAccessoryPill: View {
             }
             .buttonStyle(AccessoryStopButtonStyle())
             .disabled(isStopping)
-            .accessibilityLabel(isError ? "Reconnect tunnel" : "Disconnect tunnel")
+            .accessibilityLabel(isError ? l10n.accessibilityReconnectTunnel : l10n.accessibilityDisconnectTunnel)
         }
         .padding(.leading, 14)
         .padding(.trailing, 3)
@@ -314,11 +329,11 @@ struct LiveTunnelAccessoryPill: View {
 
     private var accessoryTitle: String {
         switch phase {
-        case .connected: return "Connected"
-        case .connecting: return "Connecting..."
-        case .disconnecting: return "Disconnecting..."
-        case .error: return "Tunnel Error"
-        case .disconnected: return "Disconnected"
+        case .connected: return l10n.accessoryConnected
+        case .connecting: return l10n.accessoryConnecting
+        case .disconnecting: return l10n.accessoryDisconnecting
+        case .error: return l10n.accessoryTunnelError
+        case .disconnected: return l10n.accessoryDisconnected
         }
     }
 
@@ -329,13 +344,13 @@ struct LiveTunnelAccessoryPill: View {
             let rx = VdpiFormatters.formatBytes(telemetry.bytesRx)
             return "\(uptime) · ↓ \(rx)"
         case .connecting:
-            return "Starting TLS desync & DoH..."
+            return l10n.accessoryStartingSubtitle
         case .disconnecting:
-            return "Closing tunnel interface..."
+            return l10n.accessoryClosingSubtitle
         case .error:
-            return errorMessage ?? "Tap to inspect"
+            return errorMessage ?? l10n.tapToInspect
         case .disconnected:
-            return "Standby"
+            return l10n.phaseStandby
         }
     }
 
@@ -373,6 +388,7 @@ struct AccessoryStopButtonStyle: ButtonStyle {
 
 struct FloatingGlassTabBar: View {
     @Environment(\.vdpiPalette) private var palette
+    @Environment(\.appLanguage) private var appLanguage
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorSchemeContrast) private var colorSchemeContrast
@@ -504,7 +520,7 @@ struct FloatingGlassTabBar: View {
                         }
                     }
 
-                Text(tab.title)
+                Text(tab.title(in: appLanguage))
                     .font(.caption.weight(isSelected ? .semibold : .medium))
                     .dynamicTypeSize(...DynamicTypeSize.large)
                     .lineLimit(1)
@@ -523,7 +539,7 @@ struct FloatingGlassTabBar: View {
                         }
                     }
 
-                Text(tab.title)
+                Text(tab.title(in: appLanguage))
                     .font(.caption2.weight(isSelected ? .semibold : .medium))
                     .dynamicTypeSize(...DynamicTypeSize.large)
                     .lineLimit(1)
@@ -592,16 +608,17 @@ struct FloatingGlassTabBar: View {
     }
 
     private func tabAccessibilityLabel(for tab: VdpiTab) -> String {
-        guard tab == .tunnel else { return tab.title }
+        let l10n = L10n.catalog(for: appLanguage)
+        guard tab == .tunnel else { return tab.title(in: appLanguage) }
         switch phase {
         case .connected:
-            return pendingReconnect ? "Tunnel, connected, settings pending" : "Tunnel, connected"
+            return pendingReconnect ? l10n.tabTunnelConnectedPending : l10n.tabTunnelConnected
         case .connecting:
-            return "Tunnel, connecting"
+            return l10n.tabTunnelConnecting
         case .error:
-            return "Tunnel, error"
+            return l10n.tabTunnelError
         case .disconnected, .disconnecting:
-            return tab.title
+            return tab.title(in: appLanguage)
         }
     }
 }

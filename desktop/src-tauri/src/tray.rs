@@ -15,7 +15,10 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, Tray
 use tauri::{AppHandle, Manager, Wry};
 use tracing::{debug, error, warn};
 
-use crate::models::{DesktopStatusSnapshotDto, EngineModeDto, GuiPreferencesDto, ServiceStateDto};
+use crate::models::{
+    DesktopStatusSnapshotDto, EngineModeDto, GuiPreferencesDto, LanguagePreferenceDto,
+    ServiceStateDto,
+};
 use crate::state::DesktopAppState;
 
 /// Stable Tauri identifier for the vdpi system tray / menu bar icon.
@@ -95,6 +98,77 @@ fn is_on_main_thread() -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectiveLanguage {
+    En,
+    Tr,
+}
+
+/// Parses a POSIX/BCP-47 locale tag or colon-separated `LANGUAGE` list
+/// (e.g. `tr`, `tr_TR`, `tr-TR`, `tr_TR.UTF-8`, `en_US.UTF-8`) into an
+/// [`EffectiveLanguage`] when it matches a supported tray UI language.
+pub fn parse_locale_tag(tag: &str) -> Option<EffectiveLanguage> {
+    for entry in tag.split(':') {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let without_encoding = trimmed.split(['.', '@']).next().unwrap_or("");
+        let primary = without_encoding.split(['_', '-']).next().unwrap_or("");
+        if primary.eq_ignore_ascii_case("tr") {
+            return Some(EffectiveLanguage::Tr);
+        }
+        if primary.eq_ignore_ascii_case("en") {
+            return Some(EffectiveLanguage::En);
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetUserDefaultUILanguage() -> u16;
+}
+
+#[cfg(windows)]
+fn detect_system_language() -> EffectiveLanguage {
+    const PRIMARY_LANG_MASK: u16 = 0x03FF;
+    const PRIMARY_LANG_TURKISH: u16 = 0x1F;
+
+    // SAFETY: `GetUserDefaultUILanguage` takes no arguments, has no preconditions,
+    // and returns the current user's Win32 UI LANGID value.
+    let lang_id = unsafe { GetUserDefaultUILanguage() };
+    if (lang_id & PRIMARY_LANG_MASK) == PRIMARY_LANG_TURKISH {
+        EffectiveLanguage::Tr
+    } else {
+        EffectiveLanguage::En
+    }
+}
+
+#[cfg(not(windows))]
+fn detect_system_language() -> EffectiveLanguage {
+    for var in ["VDPI_LANG", "LC_ALL", "LC_MESSAGES", "LANG", "LANGUAGE"] {
+        if let Some(lang) = std::env::var(var)
+            .ok()
+            .as_deref()
+            .and_then(parse_locale_tag)
+        {
+            return lang;
+        }
+    }
+    EffectiveLanguage::En
+}
+
+/// Resolves the active tray UI language from the user's persisted preference.
+pub fn resolve_effective_language(pref: LanguagePreferenceDto) -> EffectiveLanguage {
+    match pref {
+        LanguagePreferenceDto::System => detect_system_language(),
+        LanguagePreferenceDto::En => EffectiveLanguage::En,
+        LanguagePreferenceDto::Tr => EffectiveLanguage::Tr,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrayIconKind {
     Protected,
     Warning,
@@ -108,35 +182,18 @@ enum ProtectionToggleAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TrayVisualSpec {
-    icon: TrayIconKind,
-    status_label: &'static str,
-    toggle_label: &'static str,
-    toggle_enabled: bool,
-    toggle_action: ProtectionToggleAction,
-    tooltip: &'static str,
+enum TrayVisualState {
+    Checking,
+    Protected(EngineModeDto),
+    VpnConflict(EngineModeDto),
+    WintunRequiredTun,
+    Degraded(EngineModeDto),
+    NotInstalled,
+    PausedVpnActive,
+    Paused,
 }
 
-impl TrayVisualSpec {
-    const fn checking() -> Self {
-        Self {
-            icon: TrayIconKind::Paused,
-            status_label: "Status: Checking...",
-            toggle_label: "Pause Protection",
-            toggle_enabled: false,
-            toggle_action: ProtectionToggleAction::Pause,
-            tooltip: "vdpi - Checking status...",
-        }
-    }
-
-    #[cfg(test)]
-    fn from_option(status: Option<&DesktopStatusSnapshotDto>) -> Self {
-        match status {
-            Some(snapshot) => Self::from_snapshot(snapshot),
-            None => Self::checking(),
-        }
-    }
-
+impl TrayVisualState {
     fn from_snapshot(status: &DesktopStatusSnapshotDto) -> Self {
         let is_live_running = status.live.as_ref().is_some_and(|live| live.running);
         let is_running = status.service_state == ServiceStateDto::Running || is_live_running;
@@ -145,8 +202,7 @@ impl TrayVisualSpec {
             .live
             .as_ref()
             .filter(|live| live.running)
-            .map(|live| live.engine)
-            .unwrap_or(status.configured_engine);
+            .map_or(status.configured_engine, |live| live.engine);
 
         let has_vpn_conflict = status
             .vpn_conflict
@@ -162,113 +218,298 @@ impl TrayVisualSpec {
 
         if is_running {
             if has_vpn_conflict {
-                let (status_label, tooltip) = match active_engine {
-                    EngineModeDto::Tun => (
-                        "Status: VPN Conflict (TUN)",
-                        "vdpi - VPN conflict detected (TUN)",
-                    ),
-                    EngineModeDto::Proxy => (
-                        "Status: VPN Conflict (Proxy)",
-                        "vdpi - VPN conflict detected (Proxy)",
-                    ),
-                };
-                return Self {
-                    icon: TrayIconKind::Warning,
-                    status_label,
-                    toggle_label: "Pause Protection",
-                    toggle_enabled: true,
-                    toggle_action: ProtectionToggleAction::Pause,
-                    tooltip,
-                };
+                return Self::VpnConflict(active_engine);
             }
-
             if has_wintun_issue && active_engine == EngineModeDto::Tun {
-                return Self {
-                    icon: TrayIconKind::Warning,
-                    status_label: "Status: Wintun Required (TUN)",
-                    toggle_label: "Pause Protection",
-                    toggle_enabled: true,
-                    toggle_action: ProtectionToggleAction::Pause,
-                    tooltip: "vdpi - Wintun driver required (TUN)",
-                };
+                return Self::WintunRequiredTun;
             }
-
             if !is_live_running {
-                let (status_label, tooltip) = match active_engine {
-                    EngineModeDto::Tun => (
-                        "Status: Degraded (TUN)",
-                        "vdpi - Service starting or degraded (TUN)",
-                    ),
-                    EngineModeDto::Proxy => (
-                        "Status: Degraded (Proxy)",
-                        "vdpi - Service starting or degraded (Proxy)",
-                    ),
-                };
-                return Self {
-                    icon: TrayIconKind::Warning,
-                    status_label,
-                    toggle_label: "Pause Protection",
-                    toggle_enabled: true,
-                    toggle_action: ProtectionToggleAction::Pause,
-                    tooltip,
-                };
+                return Self::Degraded(active_engine);
             }
-
-            let (status_label, tooltip) = match active_engine {
-                EngineModeDto::Tun => ("Status: Protected (TUN)", "vdpi - Protected (TUN)"),
-                EngineModeDto::Proxy => ("Status: Protected (Proxy)", "vdpi - Protected (Proxy)"),
-            };
-            return Self {
-                icon: TrayIconKind::Protected,
-                status_label,
-                toggle_label: "Pause Protection",
-                toggle_enabled: true,
-                toggle_action: ProtectionToggleAction::Pause,
-                tooltip,
-            };
+            return Self::Protected(active_engine);
         }
 
         match status.service_state {
-            ServiceStateDto::NotInstalled => Self {
-                icon: TrayIconKind::Paused,
-                status_label: "Status: Not Installed",
-                toggle_label: "Resume Protection",
-                toggle_enabled: false,
-                toggle_action: ProtectionToggleAction::Resume,
-                tooltip: "vdpi - Service not installed",
-            },
+            ServiceStateDto::NotInstalled => Self::NotInstalled,
             ServiceStateDto::Stopped | ServiceStateDto::Running => {
                 if has_vpn_conflict {
-                    Self {
-                        icon: TrayIconKind::Warning,
-                        status_label: "Status: Paused (VPN Active)",
-                        toggle_label: "Resume Protection",
-                        toggle_enabled: true,
-                        toggle_action: ProtectionToggleAction::Resume,
-                        tooltip: "vdpi - Paused while VPN is active",
-                    }
+                    Self::PausedVpnActive
                 } else {
-                    Self {
-                        icon: TrayIconKind::Paused,
-                        status_label: "Status: Paused",
-                        toggle_label: "Resume Protection",
-                        toggle_enabled: true,
-                        toggle_action: ProtectionToggleAction::Resume,
-                        tooltip: "vdpi - Protection paused",
+                    Self::Paused
+                }
+            }
+        }
+    }
+}
+
+const fn open_label(language: EffectiveLanguage) -> &'static str {
+    match language {
+        EffectiveLanguage::En => "Open vdpi",
+        EffectiveLanguage::Tr => "vdpi'ı Aç",
+    }
+}
+
+const fn quit_label(language: EffectiveLanguage) -> &'static str {
+    match language {
+        EffectiveLanguage::En => "Quit vdpi Desktop",
+        EffectiveLanguage::Tr => "vdpi Masaüstünden Çık",
+    }
+}
+
+const fn toggle_label(action: ProtectionToggleAction, language: EffectiveLanguage) -> &'static str {
+    match (action, language) {
+        (ProtectionToggleAction::Pause, EffectiveLanguage::En) => "Pause Protection",
+        (ProtectionToggleAction::Pause, EffectiveLanguage::Tr) => "Korumayı Duraklat",
+        (ProtectionToggleAction::Resume, EffectiveLanguage::En) => "Resume Protection",
+        (ProtectionToggleAction::Resume, EffectiveLanguage::Tr) => "Korumayı Sürdür",
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrayVisualSpec {
+    icon: TrayIconKind,
+    show_label: &'static str,
+    status_label: &'static str,
+    toggle_label: &'static str,
+    toggle_enabled: bool,
+    toggle_action: ProtectionToggleAction,
+    quit_label: &'static str,
+    tooltip: &'static str,
+}
+
+impl TrayVisualSpec {
+    #[cfg(test)]
+    const fn checking(language: EffectiveLanguage) -> Self {
+        Self::from_state(TrayVisualState::Checking, language)
+    }
+
+    #[cfg(test)]
+    fn from_option(status: Option<&DesktopStatusSnapshotDto>, language: EffectiveLanguage) -> Self {
+        match status {
+            Some(snapshot) => Self::from_snapshot(snapshot, language),
+            None => Self::checking(language),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_snapshot(status: &DesktopStatusSnapshotDto, language: EffectiveLanguage) -> Self {
+        Self::from_state(TrayVisualState::from_snapshot(status), language)
+    }
+
+    const fn from_state(state: TrayVisualState, language: EffectiveLanguage) -> Self {
+        let show_label = open_label(language);
+        let quit_label = quit_label(language);
+
+        match state {
+            TrayVisualState::Checking => {
+                let (status_label, tooltip) = match language {
+                    EffectiveLanguage::En => ("Status: Checking...", "vdpi - Checking status..."),
+                    EffectiveLanguage::Tr => (
+                        "Durum: Kontrol ediliyor...",
+                        "vdpi - Durum kontrol ediliyor...",
+                    ),
+                };
+                Self {
+                    icon: TrayIconKind::Paused,
+                    show_label,
+                    status_label,
+                    toggle_label: toggle_label(ProtectionToggleAction::Pause, language),
+                    toggle_enabled: false,
+                    toggle_action: ProtectionToggleAction::Pause,
+                    quit_label,
+                    tooltip,
+                }
+            }
+            TrayVisualState::VpnConflict(engine) => {
+                let (status_label, tooltip) = match (engine, language) {
+                    (EngineModeDto::Tun, EffectiveLanguage::En) => (
+                        "Status: VPN Conflict (TUN)",
+                        "vdpi - VPN conflict detected (TUN)",
+                    ),
+                    (EngineModeDto::Tun, EffectiveLanguage::Tr) => (
+                        "Durum: VPN Çakışması (TUN)",
+                        "vdpi - VPN çakışması algılandı (TUN)",
+                    ),
+                    (EngineModeDto::Proxy, EffectiveLanguage::En) => (
+                        "Status: VPN Conflict (Proxy)",
+                        "vdpi - VPN conflict detected (Proxy)",
+                    ),
+                    (EngineModeDto::Proxy, EffectiveLanguage::Tr) => (
+                        "Durum: VPN Çakışması (Proxy)",
+                        "vdpi - VPN çakışması algılandı (Proxy)",
+                    ),
+                };
+                Self {
+                    icon: TrayIconKind::Warning,
+                    show_label,
+                    status_label,
+                    toggle_label: toggle_label(ProtectionToggleAction::Pause, language),
+                    toggle_enabled: true,
+                    toggle_action: ProtectionToggleAction::Pause,
+                    quit_label,
+                    tooltip,
+                }
+            }
+            TrayVisualState::WintunRequiredTun => {
+                let (status_label, tooltip) = match language {
+                    EffectiveLanguage::En => (
+                        "Status: Wintun Required (TUN)",
+                        "vdpi - Wintun driver required (TUN)",
+                    ),
+                    EffectiveLanguage::Tr => (
+                        "Durum: Wintun Gerekli (TUN)",
+                        "vdpi - Wintun sürücüsü gerekli (TUN)",
+                    ),
+                };
+                Self {
+                    icon: TrayIconKind::Warning,
+                    show_label,
+                    status_label,
+                    toggle_label: toggle_label(ProtectionToggleAction::Pause, language),
+                    toggle_enabled: true,
+                    toggle_action: ProtectionToggleAction::Pause,
+                    quit_label,
+                    tooltip,
+                }
+            }
+            TrayVisualState::Degraded(engine) => {
+                let (status_label, tooltip) = match (engine, language) {
+                    (EngineModeDto::Tun, EffectiveLanguage::En) => (
+                        "Status: Degraded (TUN)",
+                        "vdpi - Service starting or degraded (TUN)",
+                    ),
+                    (EngineModeDto::Tun, EffectiveLanguage::Tr) => (
+                        "Durum: Sorunlu (TUN)",
+                        "vdpi - Hizmet başlatılıyor veya sorunlu (TUN)",
+                    ),
+                    (EngineModeDto::Proxy, EffectiveLanguage::En) => (
+                        "Status: Degraded (Proxy)",
+                        "vdpi - Service starting or degraded (Proxy)",
+                    ),
+                    (EngineModeDto::Proxy, EffectiveLanguage::Tr) => (
+                        "Durum: Sorunlu (Proxy)",
+                        "vdpi - Hizmet başlatılıyor veya sorunlu (Proxy)",
+                    ),
+                };
+                Self {
+                    icon: TrayIconKind::Warning,
+                    show_label,
+                    status_label,
+                    toggle_label: toggle_label(ProtectionToggleAction::Pause, language),
+                    toggle_enabled: true,
+                    toggle_action: ProtectionToggleAction::Pause,
+                    quit_label,
+                    tooltip,
+                }
+            }
+            TrayVisualState::Protected(engine) => {
+                let (status_label, tooltip) = match (engine, language) {
+                    (EngineModeDto::Tun, EffectiveLanguage::En) => {
+                        ("Status: Protected (TUN)", "vdpi - Protected (TUN)")
                     }
+                    (EngineModeDto::Tun, EffectiveLanguage::Tr) => {
+                        ("Durum: Korunuyor (TUN)", "vdpi - Korunuyor (TUN)")
+                    }
+                    (EngineModeDto::Proxy, EffectiveLanguage::En) => {
+                        ("Status: Protected (Proxy)", "vdpi - Protected (Proxy)")
+                    }
+                    (EngineModeDto::Proxy, EffectiveLanguage::Tr) => {
+                        ("Durum: Korunuyor (Proxy)", "vdpi - Korunuyor (Proxy)")
+                    }
+                };
+                Self {
+                    icon: TrayIconKind::Protected,
+                    show_label,
+                    status_label,
+                    toggle_label: toggle_label(ProtectionToggleAction::Pause, language),
+                    toggle_enabled: true,
+                    toggle_action: ProtectionToggleAction::Pause,
+                    quit_label,
+                    tooltip,
+                }
+            }
+            TrayVisualState::NotInstalled => {
+                let (status_label, tooltip) = match language {
+                    EffectiveLanguage::En => {
+                        ("Status: Not Installed", "vdpi - Service not installed")
+                    }
+                    EffectiveLanguage::Tr => {
+                        ("Durum: Kurulu Değil", "vdpi - Hizmet kurulu değil")
+                    }
+                };
+                Self {
+                    icon: TrayIconKind::Paused,
+                    show_label,
+                    status_label,
+                    toggle_label: toggle_label(ProtectionToggleAction::Resume, language),
+                    toggle_enabled: false,
+                    toggle_action: ProtectionToggleAction::Resume,
+                    quit_label,
+                    tooltip,
+                }
+            }
+            TrayVisualState::PausedVpnActive => {
+                let (status_label, tooltip) = match language {
+                    EffectiveLanguage::En => (
+                        "Status: VPN Active - Yielded",
+                        "vdpi - VPN active, protection yielded",
+                    ),
+                    EffectiveLanguage::Tr => (
+                        "Durum: VPN Aktif - Beklemede",
+                        "vdpi - VPN aktif, koruma beklemede",
+                    ),
+                };
+                Self {
+                    icon: TrayIconKind::Warning,
+                    show_label,
+                    status_label,
+                    toggle_label: toggle_label(ProtectionToggleAction::Resume, language),
+                    toggle_enabled: true,
+                    toggle_action: ProtectionToggleAction::Resume,
+                    quit_label,
+                    tooltip,
+                }
+            }
+            TrayVisualState::Paused => {
+                let (status_label, tooltip) = match language {
+                    EffectiveLanguage::En => ("Status: Paused", "vdpi - Protection paused"),
+                    EffectiveLanguage::Tr => ("Durum: Duraklatıldı", "vdpi - Koruma duraklatıldı"),
+                };
+                Self {
+                    icon: TrayIconKind::Paused,
+                    show_label,
+                    status_label,
+                    toggle_label: toggle_label(ProtectionToggleAction::Resume, language),
+                    toggle_enabled: true,
+                    toggle_action: ProtectionToggleAction::Resume,
+                    quit_label,
+                    tooltip,
                 }
             }
         }
     }
 
-    const fn with_toggle_busy(mut self, busy: bool) -> Self {
+    const fn with_toggle_busy(mut self, busy: bool, language: EffectiveLanguage) -> Self {
         if busy {
             self.toggle_label = if !self.toggle_enabled {
-                "Updating Protection..."
+                match language {
+                    EffectiveLanguage::En => "Updating Protection...",
+                    EffectiveLanguage::Tr => "Koruma Güncelleniyor...",
+                }
             } else {
-                match self.toggle_action {
-                    ProtectionToggleAction::Pause => "Pausing Protection...",
-                    ProtectionToggleAction::Resume => "Resuming Protection...",
+                match (self.toggle_action, language) {
+                    (ProtectionToggleAction::Pause, EffectiveLanguage::En) => {
+                        "Pausing Protection..."
+                    }
+                    (ProtectionToggleAction::Pause, EffectiveLanguage::Tr) => {
+                        "Koruma Duraklatılıyor..."
+                    }
+                    (ProtectionToggleAction::Resume, EffectiveLanguage::En) => {
+                        "Resuming Protection..."
+                    }
+                    (ProtectionToggleAction::Resume, EffectiveLanguage::Tr) => {
+                        "Koruma Sürdürülüyor..."
+                    }
                 }
             };
             self.toggle_enabled = false;
@@ -283,9 +524,11 @@ impl TrayVisualSpec {
 struct AppliedTrayVisual {
     icon: Option<TrayIconKind>,
     tooltip: Option<&'static str>,
+    show_label: Option<&'static str>,
     status_label: Option<&'static str>,
     toggle_label: Option<&'static str>,
     toggle_enabled: Option<bool>,
+    quit_label: Option<&'static str>,
 }
 
 impl AppliedTrayVisual {
@@ -293,9 +536,11 @@ impl AppliedTrayVisual {
         Self {
             icon: None,
             tooltip: None,
+            show_label: None,
             status_label: None,
             toggle_label: None,
             toggle_enabled: None,
+            quit_label: None,
         }
     }
 
@@ -303,25 +548,32 @@ impl AppliedTrayVisual {
         Self {
             icon: if has_icon { Some(spec.icon) } else { None },
             tooltip: Some(spec.tooltip),
+            show_label: Some(spec.show_label),
             status_label: Some(spec.status_label),
             toggle_label: Some(spec.toggle_label),
             toggle_enabled: Some(spec.toggle_enabled),
+            quit_label: Some(spec.quit_label),
         }
     }
 
     fn matches(&self, spec: TrayVisualSpec) -> bool {
         self.icon == Some(spec.icon)
             && self.tooltip == Some(spec.tooltip)
+            && self.show_label == Some(spec.show_label)
             && self.status_label == Some(spec.status_label)
             && self.toggle_label == Some(spec.toggle_label)
             && self.toggle_enabled == Some(spec.toggle_enabled)
+            && self.quit_label == Some(spec.quit_label)
     }
 }
 
 struct TrayRuntimeState {
+    show_item: Option<MenuItem<Wry>>,
     status_item: Option<MenuItem<Wry>>,
     toggle_item: Option<MenuItem<Wry>>,
-    base_visual: Option<TrayVisualSpec>,
+    quit_item: Option<MenuItem<Wry>>,
+    language: EffectiveLanguage,
+    base_state: Option<TrayVisualState>,
     last_visual: AppliedTrayVisual,
     last_snapshot_seq: u64,
     tray_generation: u64,
@@ -331,9 +583,12 @@ struct TrayRuntimeState {
 impl TrayRuntimeState {
     const fn new() -> Self {
         Self {
+            show_item: None,
             status_item: None,
             toggle_item: None,
-            base_visual: None,
+            quit_item: None,
+            language: EffectiveLanguage::En,
+            base_state: None,
             last_visual: AppliedTrayVisual::empty(),
             last_snapshot_seq: 0,
             tray_generation: 0,
@@ -341,24 +596,33 @@ impl TrayRuntimeState {
         }
     }
 
-    fn accept_snapshot(&mut self, snapshot_seq: u64, base_spec: TrayVisualSpec) -> bool {
+    fn accept_snapshot(&mut self, snapshot_seq: u64, base_state: TrayVisualState) -> bool {
         if snapshot_seq > 0 && snapshot_seq < self.last_snapshot_seq {
             return false;
         }
         if snapshot_seq > self.last_snapshot_seq {
             self.last_snapshot_seq = snapshot_seq;
         }
-        self.base_visual = Some(base_spec);
+        self.base_state = Some(base_state);
         true
     }
 
-    fn should_dispatch_snapshot(&mut self, snapshot_seq: u64, base_spec: TrayVisualSpec) -> bool {
-        if !self.accept_snapshot(snapshot_seq, base_spec) {
+    fn effective_spec(&self) -> TrayVisualSpec {
+        let state = self.base_state.unwrap_or(TrayVisualState::Checking);
+        TrayVisualSpec::from_state(state, self.language)
+            .with_toggle_busy(self.toggle_busy, self.language)
+    }
+
+    fn should_dispatch_snapshot(&mut self, snapshot_seq: u64, base_state: TrayVisualState) -> bool {
+        if !self.accept_snapshot(snapshot_seq, base_state) {
             return false;
         }
-        !self
-            .last_visual
-            .matches(base_spec.with_toggle_busy(self.toggle_busy))
+        !self.last_visual.matches(self.effective_spec())
+    }
+
+    fn set_language(&mut self, language: EffectiveLanguage) -> bool {
+        self.language = language;
+        !self.last_visual.matches(self.effective_spec())
     }
 
     fn try_claim_toggle_busy(&mut self) -> bool {
@@ -373,15 +637,19 @@ impl TrayRuntimeState {
 trait TrayVisualSink {
     fn set_icon(&mut self, kind: TrayIconKind) -> bool;
     fn set_tooltip(&mut self, tooltip: &'static str) -> bool;
+    fn set_show_label(&mut self, label: &'static str) -> bool;
     fn set_status_label(&mut self, label: &'static str) -> bool;
     fn set_toggle_label(&mut self, label: &'static str) -> bool;
     fn set_toggle_enabled(&mut self, enabled: bool) -> bool;
+    fn set_quit_label(&mut self, label: &'static str) -> bool;
 }
 
 struct TauriTraySink<'a> {
     tray: &'a TrayIcon<Wry>,
+    show_item: Option<&'a MenuItem<Wry>>,
     status_item: Option<&'a MenuItem<Wry>>,
     toggle_item: Option<&'a MenuItem<Wry>>,
+    quit_item: Option<&'a MenuItem<Wry>>,
 }
 
 impl TrayVisualSink for TauriTraySink<'_> {
@@ -403,6 +671,19 @@ impl TrayVisualSink for TauriTraySink<'_> {
             Ok(()) => true,
             Err(err) => {
                 debug!(error = %err, "failed to update tray tooltip");
+                false
+            }
+        }
+    }
+
+    fn set_show_label(&mut self, label: &'static str) -> bool {
+        let Some(item) = self.show_item else {
+            return false;
+        };
+        match item.set_text(label) {
+            Ok(()) => true,
+            Err(err) => {
+                warn!(error = %err, "failed to update tray open menu label");
                 false
             }
         }
@@ -446,6 +727,19 @@ impl TrayVisualSink for TauriTraySink<'_> {
             }
         }
     }
+
+    fn set_quit_label(&mut self, label: &'static str) -> bool {
+        let Some(item) = self.quit_item else {
+            return false;
+        };
+        match item.set_text(label) {
+            Ok(()) => true,
+            Err(err) => {
+                warn!(error = %err, "failed to update tray quit menu label");
+                false
+            }
+        }
+    }
 }
 
 fn sync_visual_fields<S: TrayVisualSink>(
@@ -465,6 +759,10 @@ fn sync_visual_fields<S: TrayVisualSink>(
         committed.tooltip = Some(spec.tooltip);
     }
 
+    if committed.show_label != Some(spec.show_label) && sink.set_show_label(spec.show_label) {
+        committed.show_label = Some(spec.show_label);
+    }
+
     if committed.status_label != Some(spec.status_label) && sink.set_status_label(spec.status_label)
     {
         committed.status_label = Some(spec.status_label);
@@ -479,6 +777,10 @@ fn sync_visual_fields<S: TrayVisualSink>(
         && sink.set_toggle_enabled(spec.toggle_enabled)
     {
         committed.toggle_enabled = Some(spec.toggle_enabled);
+    }
+
+    if committed.quit_label != Some(spec.quit_label) && sink.set_quit_label(spec.quit_label) {
+        committed.quit_label = Some(spec.quit_label);
     }
 }
 
@@ -745,24 +1047,32 @@ pub fn setup_or_sync_tray(
     status: Option<&DesktopStatusSnapshotDto>,
 ) -> tauri::Result<()> {
     let enabled = tray_enabled(prefs);
-    let host_available = if enabled {
-        is_tray_host_available()
-    } else {
-        false
-    };
+    let language = resolve_effective_language(prefs.language);
+    let host_available = enabled && is_tray_host_available();
     let incoming =
-        status.map(|snapshot| (snapshot.snapshot_seq, TrayVisualSpec::from_snapshot(snapshot)));
+        status.map(|snapshot| (snapshot.snapshot_seq, TrayVisualState::from_snapshot(snapshot)));
 
     if is_on_main_thread() {
-        return setup_or_sync_tray_on_main_thread(app, enabled, host_available, incoming);
+        return setup_or_sync_tray_on_main_thread(
+            app,
+            enabled,
+            host_available,
+            language,
+            incoming,
+        );
     }
 
     let (tx, rx) = mpsc::sync_channel::<tauri::Result<()>>(1);
     let app_handle = app.clone();
     app.run_on_main_thread(move || {
         record_main_thread();
-        let result =
-            setup_or_sync_tray_on_main_thread(&app_handle, enabled, host_available, incoming);
+        let result = setup_or_sync_tray_on_main_thread(
+            &app_handle,
+            enabled,
+            host_available,
+            language,
+            incoming,
+        );
         let _ = tx.send(result);
     })?;
 
@@ -783,9 +1093,16 @@ fn setup_or_sync_tray_on_main_thread(
     app: &AppHandle,
     enabled: bool,
     host_available: bool,
-    incoming: Option<(u64, TrayVisualSpec)>,
+    language: EffectiveLanguage,
+    incoming: Option<(u64, TrayVisualState)>,
 ) -> tauri::Result<()> {
     if !enabled || !host_available {
+        {
+            let mut guard = TRAY_STATE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.language = language;
+        }
         if enabled {
             debug!("system tray host is unavailable; skipping tray icon creation");
         }
@@ -802,17 +1119,18 @@ fn setup_or_sync_tray_on_main_thread(
         let mut guard = TRAY_STATE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let base = match incoming {
-            Some((seq, spec)) => {
-                if guard.accept_snapshot(seq, spec) {
-                    spec
+        guard.language = language;
+        let state = match incoming {
+            Some((seq, incoming_state)) => {
+                if guard.accept_snapshot(seq, incoming_state) {
+                    incoming_state
                 } else {
-                    *guard.base_visual.get_or_insert(spec)
+                    *guard.base_state.get_or_insert(incoming_state)
                 }
             }
-            None => *guard.base_visual.get_or_insert_with(TrayVisualSpec::checking),
+            None => *guard.base_state.get_or_insert(TrayVisualState::Checking),
         };
-        base.with_toggle_busy(guard.toggle_busy)
+        TrayVisualSpec::from_state(state, language).with_toggle_busy(guard.toggle_busy, language)
     };
 
     if let Some(existing) = app.tray_by_id(TRAY_ID) {
@@ -823,7 +1141,7 @@ fn setup_or_sync_tray_on_main_thread(
         return Ok(());
     }
 
-    let show_item = MenuItem::with_id(app, MENU_SHOW_ID, "Show vdpi", true, None::<&str>)?;
+    let show_item = MenuItem::with_id(app, MENU_SHOW_ID, effective.show_label, true, None::<&str>)?;
     let sep_top = PredefinedMenuItem::separator(app)?;
     let status_item = MenuItem::with_id(
         app,
@@ -840,7 +1158,7 @@ fn setup_or_sync_tray_on_main_thread(
         None::<&str>,
     )?;
     let sep_bottom = PredefinedMenuItem::separator(app)?;
-    let quit_item = MenuItem::with_id(app, MENU_QUIT_ID, "Quit vdpi GUI", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, MENU_QUIT_ID, effective.quit_label, true, None::<&str>)?;
 
     let menu = Menu::with_items(
         app,
@@ -895,18 +1213,22 @@ fn setup_or_sync_tray_on_main_thread(
     // Store handles for in-place menu updates (required on Linux where replacing
     // an attached tray menu is unsupported) and avoid dropping previous handles
     // while holding the mutex.
-    let (old_status, old_toggle) = {
+    let (old_show, old_status, old_toggle, old_quit) = {
         let mut guard = TRAY_STATE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.tray_generation = guard.tray_generation.wrapping_add(1);
+        let prev_show = guard.show_item.replace(show_item);
         let prev_status = guard.status_item.replace(status_item);
         let prev_toggle = guard.toggle_item.replace(toggle_item);
+        let prev_quit = guard.quit_item.replace(quit_item);
         guard.last_visual = AppliedTrayVisual::from_build(effective, has_icon);
-        (prev_status, prev_toggle)
+        (prev_show, prev_status, prev_toggle, prev_quit)
     };
+    drop(old_show);
     drop(old_status);
     drop(old_toggle);
+    drop(old_quit);
 
     // Reconcile if a newer snapshot or toggle_busy transition updated TRAY_STATE
     // while the tray icon was being constructed.
@@ -914,16 +1236,33 @@ fn setup_or_sync_tray_on_main_thread(
     Ok(())
 }
 
+/// Updates the active tray UI language and immediately refreshes all tray menu
+/// item texts (`Open`, `Status`, `Toggle`, `Quit`) and tooltip when a tray icon
+/// is present.
+pub fn set_tray_language(app: &AppHandle, pref: LanguagePreferenceDto) {
+    let language = resolve_effective_language(pref);
+    let needs_refresh = {
+        let mut guard = TRAY_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.set_language(language)
+    };
+
+    if needs_refresh && app.tray_by_id(TRAY_ID).is_some() {
+        dispatch_apply_tray_visuals(app);
+    }
+}
+
 /// Swaps the embedded tray icon PNG, tooltip text, and status/toggle menu labels
 /// when the visual state changes, enforcing monotonic `snapshot_seq` ordering
 /// and dispatching OS mutations onto the main thread.
 pub fn update_tray_visuals(app: &AppHandle, status: &DesktopStatusSnapshotDto) {
-    let base_spec = TrayVisualSpec::from_snapshot(status);
+    let base_state = TrayVisualState::from_snapshot(status);
     {
         let mut guard = TRAY_STATE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !guard.should_dispatch_snapshot(status.snapshot_seq, base_spec) {
+        if !guard.should_dispatch_snapshot(status.snapshot_seq, base_state) {
             return;
         }
     }
@@ -995,38 +1334,56 @@ fn apply_current_tray_visuals_on_main_thread(app: &AppHandle) {
         return;
     };
 
-    let (base_spec, toggle_busy, mut committed, status_item, toggle_item, generation) = {
+    let (
+        base_state,
+        language,
+        toggle_busy,
+        mut committed,
+        show_item,
+        status_item,
+        toggle_item,
+        quit_item,
+        generation,
+    ) = {
         let guard = TRAY_STATE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         (
-            guard.base_visual,
+            guard.base_state,
+            guard.language,
             guard.toggle_busy,
             guard.last_visual,
+            guard.show_item.clone(),
             guard.status_item.clone(),
             guard.toggle_item.clone(),
+            guard.quit_item.clone(),
             guard.tray_generation,
         )
     };
 
-    let base = base_spec.unwrap_or_else(|| {
+    let state = base_state.unwrap_or_else(|| {
         app.try_state::<DesktopAppState>()
-            .and_then(|state| state.last_snapshot())
-            .map(|snapshot| TrayVisualSpec::from_snapshot(&snapshot))
-            .unwrap_or_else(TrayVisualSpec::checking)
+            .and_then(|app_state| app_state.last_snapshot())
+            .map_or(TrayVisualState::Checking, |snapshot| {
+                TrayVisualState::from_snapshot(&snapshot)
+            })
     });
-    let spec = base.with_toggle_busy(toggle_busy);
+    let spec = TrayVisualSpec::from_state(state, language).with_toggle_busy(toggle_busy, language);
 
     if committed.matches(spec) {
+        drop(show_item);
         drop(status_item);
         drop(toggle_item);
+        drop(quit_item);
         return;
     }
 
     let mut sink = TauriTraySink {
         tray: &tray,
+        show_item: show_item.as_ref(),
         status_item: status_item.as_ref(),
         toggle_item: toggle_item.as_ref(),
+        quit_item: quit_item.as_ref(),
     };
     sync_visual_fields(&mut committed, spec, &mut sink);
 
@@ -1039,8 +1396,10 @@ fn apply_current_tray_visuals_on_main_thread(app: &AppHandle) {
         }
     }
 
+    drop(show_item);
     drop(status_item);
     drop(toggle_item);
+    drop(quit_item);
 }
 
 fn remove_tray_cleanly_on_main_thread(app: &AppHandle) {
@@ -1051,17 +1410,24 @@ fn remove_tray_cleanly_on_main_thread(app: &AppHandle) {
         drop(tray);
     }
 
-    let (old_status, old_toggle) = {
+    let (old_show, old_status, old_toggle, old_quit) = {
         let mut guard = TRAY_STATE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.tray_generation = guard.tray_generation.wrapping_add(1);
-        guard.base_visual = None;
+        guard.base_state = None;
         guard.last_visual = AppliedTrayVisual::empty();
-        (guard.status_item.take(), guard.toggle_item.take())
+        (
+            guard.show_item.take(),
+            guard.status_item.take(),
+            guard.toggle_item.take(),
+            guard.quit_item.take(),
+        )
     };
+    drop(old_show);
     drop(old_status);
     drop(old_toggle);
+    drop(old_quit);
 }
 
 /// Cleanly hides and removes the native system tray icon and clears cached
@@ -1202,14 +1568,18 @@ mod tests {
     struct MockTrayVisualSink {
         fail_icon: bool,
         fail_tooltip: bool,
+        fail_show_label: bool,
         fail_status_label: bool,
         fail_toggle_label: bool,
         fail_toggle_enabled: bool,
+        fail_quit_label: bool,
         icon_calls: usize,
         tooltip_calls: usize,
+        show_label_calls: usize,
         status_label_calls: usize,
         toggle_label_calls: usize,
         toggle_enabled_calls: usize,
+        quit_label_calls: usize,
     }
 
     impl TrayVisualSink for MockTrayVisualSink {
@@ -1221,6 +1591,11 @@ mod tests {
         fn set_tooltip(&mut self, _tooltip: &'static str) -> bool {
             self.tooltip_calls += 1;
             !self.fail_tooltip
+        }
+
+        fn set_show_label(&mut self, _label: &'static str) -> bool {
+            self.show_label_calls += 1;
+            !self.fail_show_label
         }
 
         fn set_status_label(&mut self, _label: &'static str) -> bool {
@@ -1236,6 +1611,11 @@ mod tests {
         fn set_toggle_enabled(&mut self, _enabled: bool) -> bool {
             self.toggle_enabled_calls += 1;
             !self.fail_toggle_enabled
+        }
+
+        fn set_quit_label(&mut self, _label: &'static str) -> bool {
+            self.quit_label_calls += 1;
+            !self.fail_quit_label
         }
     }
 
@@ -1341,28 +1721,103 @@ mod tests {
     }
 
     #[test]
+    fn language_preference_dto_default_and_serde_roundtrip() {
+        assert_eq!(
+            LanguagePreferenceDto::default(),
+            LanguagePreferenceDto::System
+        );
+
+        for (variant, expected_json) in [
+            (LanguagePreferenceDto::System, "\"system\""),
+            (LanguagePreferenceDto::En, "\"en\""),
+            (LanguagePreferenceDto::Tr, "\"tr\""),
+        ] {
+            let serialized = serde_json::to_string(&variant).expect("serialize language pref");
+            assert_eq!(serialized, expected_json);
+            let parsed: LanguagePreferenceDto =
+                serde_json::from_str(&serialized).expect("deserialize language pref");
+            assert_eq!(parsed, variant);
+        }
+
+        let legacy_prefs: GuiPreferencesDto =
+            serde_json::from_str(r#"{"theme":"dark","keepInTrayOnClose":true}"#)
+                .expect("deserialize legacy GuiPreferencesDto without language");
+        assert_eq!(legacy_prefs.language, LanguagePreferenceDto::System);
+        assert!(legacy_prefs.keep_in_tray_on_close);
+    }
+
+    #[test]
+    fn parse_locale_tag_detects_turkish_and_english_tags() {
+        assert_eq!(
+            parse_locale_tag("tr_TR.UTF-8"),
+            Some(EffectiveLanguage::Tr)
+        );
+        assert_eq!(
+            parse_locale_tag("en_US.UTF-8"),
+            Some(EffectiveLanguage::En)
+        );
+        assert_eq!(parse_locale_tag("tr"), Some(EffectiveLanguage::Tr));
+        assert_eq!(parse_locale_tag("tr-TR"), Some(EffectiveLanguage::Tr));
+        assert_eq!(parse_locale_tag("TR_tr.utf8"), Some(EffectiveLanguage::Tr));
+        assert_eq!(parse_locale_tag("en"), Some(EffectiveLanguage::En));
+        assert_eq!(parse_locale_tag("en-GB"), Some(EffectiveLanguage::En));
+        assert_eq!(
+            parse_locale_tag("tr_TR:en_US"),
+            Some(EffectiveLanguage::Tr)
+        );
+        assert_eq!(
+            parse_locale_tag("en_US:tr_TR"),
+            Some(EffectiveLanguage::En)
+        );
+        assert_eq!(
+            parse_locale_tag("fr_FR:tr_TR"),
+            Some(EffectiveLanguage::Tr)
+        );
+        assert_eq!(parse_locale_tag(""), None);
+        assert_eq!(parse_locale_tag("de_DE.UTF-8"), None);
+        assert_eq!(parse_locale_tag("true"), None);
+
+        assert_eq!(
+            resolve_effective_language(LanguagePreferenceDto::En),
+            EffectiveLanguage::En
+        );
+        assert_eq!(
+            resolve_effective_language(LanguagePreferenceDto::Tr),
+            EffectiveLanguage::Tr
+        );
+    }
+
+    #[test]
     fn visual_spec_maps_protected_warning_and_paused_states() {
-        let checking = TrayVisualSpec::from_option(None);
+        let checking = TrayVisualSpec::from_option(None, EffectiveLanguage::En);
         assert_eq!(checking.icon, TrayIconKind::Paused);
+        assert_eq!(checking.show_label, "Open vdpi");
         assert_eq!(checking.status_label, "Status: Checking...");
+        assert_eq!(checking.quit_label, "Quit vdpi Desktop");
         assert!(!checking.toggle_enabled);
 
-        let tun_protected = TrayVisualSpec::from_snapshot(&sample_snapshot(
-            ServiceStateDto::Running,
-            EngineModeDto::Tun,
-            Some(sample_live(EngineModeDto::Tun, None)),
-        ));
+        let tun_protected = TrayVisualSpec::from_snapshot(
+            &sample_snapshot(
+                ServiceStateDto::Running,
+                EngineModeDto::Tun,
+                Some(sample_live(EngineModeDto::Tun, None)),
+            ),
+            EffectiveLanguage::En,
+        );
         assert_eq!(tun_protected.icon, TrayIconKind::Protected);
         assert_eq!(tun_protected.status_label, "Status: Protected (TUN)");
         assert_eq!(tun_protected.toggle_label, "Pause Protection");
         assert!(tun_protected.toggle_enabled);
         assert_eq!(tun_protected.toggle_action, ProtectionToggleAction::Pause);
 
-        let proxy_protected = TrayVisualSpec::from_snapshot(&sample_snapshot(
-            ServiceStateDto::Running,
-            EngineModeDto::Tun,
-            Some(sample_live(EngineModeDto::Proxy, None)),
-        ));
+        let proxy_protected = TrayVisualSpec::from_snapshot(
+            &sample_snapshot(
+                ServiceStateDto::Running,
+                EngineModeDto::Tun,
+                Some(sample_live(EngineModeDto::Proxy, None)),
+            ),
+            EffectiveLanguage::En,
+        );
         assert_eq!(proxy_protected.icon, TrayIconKind::Protected);
         assert_eq!(proxy_protected.status_label, "Status: Protected (Proxy)");
 
@@ -1371,49 +1826,46 @@ mod tests {
             EngineModeDto::Tun,
             Some(sample_live(EngineModeDto::Tun, Some("WireGuard"))),
         );
-        let vpn_warning = TrayVisualSpec::from_snapshot(&vpn_conflict_snap);
+        let vpn_warning = TrayVisualSpec::from_snapshot(&vpn_conflict_snap, EffectiveLanguage::En);
         assert_eq!(vpn_warning.icon, TrayIconKind::Warning);
         assert_eq!(vpn_warning.status_label, "Status: VPN Conflict (TUN)");
 
         vpn_conflict_snap.live = None;
         vpn_conflict_snap.service_state = ServiceStateDto::Stopped;
         vpn_conflict_snap.vpn_conflict = Some("WireGuard".to_string());
-        let paused_vpn = TrayVisualSpec::from_snapshot(&vpn_conflict_snap);
+        let paused_vpn = TrayVisualSpec::from_snapshot(&vpn_conflict_snap, EffectiveLanguage::En);
         assert_eq!(paused_vpn.icon, TrayIconKind::Warning);
-        assert_eq!(paused_vpn.status_label, "Status: Paused (VPN Active)");
+        assert_eq!(paused_vpn.status_label, "Status: VPN Active - Yielded");
         assert_eq!(paused_vpn.toggle_label, "Resume Protection");
         assert!(paused_vpn.toggle_enabled);
         assert_eq!(paused_vpn.toggle_action, ProtectionToggleAction::Resume);
 
         let mut wintun_missing = sample_snapshot(ServiceStateDto::Running, EngineModeDto::Tun, None);
         wintun_missing.wintun.ready = false;
-        let wintun_spec = TrayVisualSpec::from_snapshot(&wintun_missing);
+        let wintun_spec = TrayVisualSpec::from_snapshot(&wintun_missing, EffectiveLanguage::En);
         assert_eq!(wintun_spec.icon, TrayIconKind::Warning);
         assert_eq!(wintun_spec.status_label, "Status: Wintun Required (TUN)");
 
-        let degraded = TrayVisualSpec::from_snapshot(&sample_snapshot(
-            ServiceStateDto::Running,
-            EngineModeDto::Proxy,
-            None,
-        ));
+        let degraded = TrayVisualSpec::from_snapshot(
+            &sample_snapshot(ServiceStateDto::Running, EngineModeDto::Proxy, None),
+            EffectiveLanguage::En,
+        );
         assert_eq!(degraded.icon, TrayIconKind::Warning);
         assert_eq!(degraded.status_label, "Status: Degraded (Proxy)");
 
-        let paused = TrayVisualSpec::from_snapshot(&sample_snapshot(
-            ServiceStateDto::Stopped,
-            EngineModeDto::Tun,
-            None,
-        ));
+        let paused = TrayVisualSpec::from_snapshot(
+            &sample_snapshot(ServiceStateDto::Stopped, EngineModeDto::Tun, None),
+            EffectiveLanguage::En,
+        );
         assert_eq!(paused.icon, TrayIconKind::Paused);
         assert_eq!(paused.status_label, "Status: Paused");
         assert_eq!(paused.toggle_label, "Resume Protection");
         assert!(paused.toggle_enabled);
 
-        let not_installed = TrayVisualSpec::from_snapshot(&sample_snapshot(
-            ServiceStateDto::NotInstalled,
-            EngineModeDto::Tun,
-            None,
-        ));
+        let not_installed = TrayVisualSpec::from_snapshot(
+            &sample_snapshot(ServiceStateDto::NotInstalled, EngineModeDto::Tun, None),
+            EffectiveLanguage::En,
+        );
         assert_eq!(not_installed.icon, TrayIconKind::Paused);
         assert_eq!(not_installed.status_label, "Status: Not Installed");
         assert_eq!(not_installed.toggle_label, "Resume Protection");
@@ -1421,41 +1873,127 @@ mod tests {
     }
 
     #[test]
+    fn visual_spec_localizes_turkish_and_english_labels_cleanly() {
+        let checking_tr = TrayVisualSpec::from_option(None, EffectiveLanguage::Tr);
+        assert_eq!(checking_tr.show_label, "vdpi'ı Aç");
+        assert_eq!(checking_tr.status_label, "Durum: Kontrol ediliyor...");
+        assert_eq!(checking_tr.toggle_label, "Korumayı Duraklat");
+        assert_eq!(checking_tr.quit_label, "vdpi Masaüstünden Çık");
+        assert_eq!(checking_tr.tooltip, "vdpi - Durum kontrol ediliyor...");
+
+        let tun_tr = TrayVisualSpec::from_snapshot(
+            &sample_snapshot(
+                ServiceStateDto::Running,
+                EngineModeDto::Tun,
+                Some(sample_live(EngineModeDto::Tun, None)),
+            ),
+            EffectiveLanguage::Tr,
+        );
+        assert_eq!(tun_tr.status_label, "Durum: Korunuyor (TUN)");
+        assert_eq!(tun_tr.tooltip, "vdpi - Korunuyor (TUN)");
+        assert_eq!(tun_tr.toggle_label, "Korumayı Duraklat");
+
+        let proxy_tr = TrayVisualSpec::from_snapshot(
+            &sample_snapshot(
+                ServiceStateDto::Running,
+                EngineModeDto::Tun,
+                Some(sample_live(EngineModeDto::Proxy, None)),
+            ),
+            EffectiveLanguage::Tr,
+        );
+        assert_eq!(proxy_tr.status_label, "Durum: Korunuyor (Proxy)");
+        assert_eq!(proxy_tr.tooltip, "vdpi - Korunuyor (Proxy)");
+
+        let paused_tr = TrayVisualSpec::from_snapshot(
+            &sample_snapshot(ServiceStateDto::Stopped, EngineModeDto::Tun, None),
+            EffectiveLanguage::Tr,
+        );
+        assert_eq!(paused_tr.status_label, "Durum: Duraklatıldı");
+        assert_eq!(paused_tr.toggle_label, "Korumayı Sürdür");
+        assert_eq!(paused_tr.tooltip, "vdpi - Koruma duraklatıldı");
+
+        let not_installed_tr = TrayVisualSpec::from_snapshot(
+            &sample_snapshot(ServiceStateDto::NotInstalled, EngineModeDto::Tun, None),
+            EffectiveLanguage::Tr,
+        );
+        assert_eq!(not_installed_tr.status_label, "Durum: Kurulu Değil");
+        assert_eq!(not_installed_tr.tooltip, "vdpi - Hizmet kurulu değil");
+
+        let mut vpn_yielded = sample_snapshot(ServiceStateDto::Stopped, EngineModeDto::Tun, None);
+        vpn_yielded.vpn_conflict = Some("WireGuard".to_string());
+        let vpn_yielded_tr = TrayVisualSpec::from_snapshot(&vpn_yielded, EffectiveLanguage::Tr);
+        assert_eq!(vpn_yielded_tr.status_label, "Durum: VPN Aktif - Beklemede");
+        assert_eq!(
+            vpn_yielded_tr.tooltip,
+            "vdpi - VPN aktif, koruma beklemede"
+        );
+
+        let mut wintun_missing = sample_snapshot(ServiceStateDto::Running, EngineModeDto::Tun, None);
+        wintun_missing.wintun.ready = false;
+        let wintun_tr = TrayVisualSpec::from_snapshot(&wintun_missing, EffectiveLanguage::Tr);
+        assert_eq!(wintun_tr.status_label, "Durum: Wintun Gerekli (TUN)");
+        assert_eq!(
+            wintun_tr.tooltip,
+            "vdpi - Wintun sürücüsü gerekli (TUN)"
+        );
+    }
+
+    #[test]
     fn visual_spec_with_toggle_busy_disables_and_relabels_cleanly() {
-        let protected = TrayVisualSpec::from_snapshot(&sample_snapshot(
+        let protected_snap = sample_snapshot(
             ServiceStateDto::Running,
             EngineModeDto::Tun,
             Some(sample_live(EngineModeDto::Tun, None)),
-        ));
-        assert_eq!(protected.with_toggle_busy(false), protected);
-        let busy_pause = protected.with_toggle_busy(true);
+        );
+        let protected = TrayVisualSpec::from_snapshot(&protected_snap, EffectiveLanguage::En);
+        assert_eq!(
+            protected.with_toggle_busy(false, EffectiveLanguage::En),
+            protected
+        );
+        let busy_pause = protected.with_toggle_busy(true, EffectiveLanguage::En);
         assert_eq!(busy_pause.toggle_label, "Pausing Protection...");
         assert!(!busy_pause.toggle_enabled);
         assert_eq!(busy_pause.icon, protected.icon);
         assert_eq!(busy_pause.status_label, protected.status_label);
         assert_eq!(busy_pause.tooltip, protected.tooltip);
 
-        let paused = TrayVisualSpec::from_snapshot(&sample_snapshot(
-            ServiceStateDto::Stopped,
-            EngineModeDto::Tun,
-            None,
-        ));
-        let busy_resume = paused.with_toggle_busy(true);
+        let busy_pause_tr = TrayVisualSpec::from_snapshot(&protected_snap, EffectiveLanguage::Tr)
+            .with_toggle_busy(true, EffectiveLanguage::Tr);
+        assert_eq!(busy_pause_tr.toggle_label, "Koruma Duraklatılıyor...");
+        assert!(!busy_pause_tr.toggle_enabled);
+
+        let paused_snap = sample_snapshot(ServiceStateDto::Stopped, EngineModeDto::Tun, None);
+        let busy_resume = TrayVisualSpec::from_snapshot(&paused_snap, EffectiveLanguage::En)
+            .with_toggle_busy(true, EffectiveLanguage::En);
         assert_eq!(busy_resume.toggle_label, "Resuming Protection...");
         assert!(!busy_resume.toggle_enabled);
 
-        let checking_busy = TrayVisualSpec::checking().with_toggle_busy(true);
+        let busy_resume_tr = TrayVisualSpec::from_snapshot(&paused_snap, EffectiveLanguage::Tr)
+            .with_toggle_busy(true, EffectiveLanguage::Tr);
+        assert_eq!(busy_resume_tr.toggle_label, "Koruma Sürdürülüyor...");
+        assert!(!busy_resume_tr.toggle_enabled);
+
+        let checking_busy =
+            TrayVisualSpec::checking(EffectiveLanguage::En).with_toggle_busy(true, EffectiveLanguage::En);
         assert_eq!(checking_busy.toggle_label, "Updating Protection...");
         assert!(!checking_busy.toggle_enabled);
+
+        let checking_busy_tr =
+            TrayVisualSpec::checking(EffectiveLanguage::Tr).with_toggle_busy(true, EffectiveLanguage::Tr);
+        assert_eq!(checking_busy_tr.toggle_label, "Koruma Güncelleniyor...");
+        assert!(!checking_busy_tr.toggle_enabled);
     }
 
     #[test]
     fn sync_visual_fields_commits_only_successful_os_updates_and_retries_failures() {
-        let spec = TrayVisualSpec::from_snapshot(&sample_snapshot(
-            ServiceStateDto::Running,
-            EngineModeDto::Tun,
-            Some(sample_live(EngineModeDto::Tun, None)),
-        ));
+        let spec = TrayVisualSpec::from_snapshot(
+            &sample_snapshot(
+                ServiceStateDto::Running,
+                EngineModeDto::Tun,
+                Some(sample_live(EngineModeDto::Tun, None)),
+            ),
+            EffectiveLanguage::En,
+        );
 
         let mut committed = AppliedTrayVisual::empty();
         let mut sink = MockTrayVisualSink {
@@ -1467,15 +2005,19 @@ mod tests {
         sync_visual_fields(&mut committed, spec, &mut sink);
         assert_eq!(committed.icon, None);
         assert_eq!(committed.tooltip, Some(spec.tooltip));
+        assert_eq!(committed.show_label, Some(spec.show_label));
         assert_eq!(committed.status_label, Some(spec.status_label));
         assert_eq!(committed.toggle_label, Some(spec.toggle_label));
         assert_eq!(committed.toggle_enabled, None);
+        assert_eq!(committed.quit_label, Some(spec.quit_label));
         assert!(!committed.matches(spec));
         assert_eq!(sink.icon_calls, 1);
         assert_eq!(sink.tooltip_calls, 1);
+        assert_eq!(sink.show_label_calls, 1);
         assert_eq!(sink.status_label_calls, 1);
         assert_eq!(sink.toggle_label_calls, 1);
         assert_eq!(sink.toggle_enabled_calls, 1);
+        assert_eq!(sink.quit_label_calls, 1);
 
         // Retry after transient OS failure resolves: only previously failed fields run.
         sink.fail_icon = false;
@@ -1484,62 +2026,118 @@ mod tests {
         assert!(committed.matches(spec));
         assert_eq!(sink.icon_calls, 2);
         assert_eq!(sink.tooltip_calls, 1);
+        assert_eq!(sink.show_label_calls, 1);
         assert_eq!(sink.status_label_calls, 1);
         assert_eq!(sink.toggle_label_calls, 1);
         assert_eq!(sink.toggle_enabled_calls, 2);
+        assert_eq!(sink.quit_label_calls, 1);
 
         // Fully matched spec performs zero OS calls.
         sync_visual_fields(&mut committed, spec, &mut sink);
         assert_eq!(sink.icon_calls, 2);
         assert_eq!(sink.tooltip_calls, 1);
+        assert_eq!(sink.show_label_calls, 1);
         assert_eq!(sink.status_label_calls, 1);
         assert_eq!(sink.toggle_label_calls, 1);
         assert_eq!(sink.toggle_enabled_calls, 2);
+        assert_eq!(sink.quit_label_calls, 1);
     }
 
     #[test]
     fn sync_visual_fields_busy_toggle_only_touches_toggle_item() {
-        let base = TrayVisualSpec::from_snapshot(&sample_snapshot(
-            ServiceStateDto::Running,
-            EngineModeDto::Tun,
-            Some(sample_live(EngineModeDto::Tun, None)),
-        ));
+        let base = TrayVisualSpec::from_snapshot(
+            &sample_snapshot(
+                ServiceStateDto::Running,
+                EngineModeDto::Tun,
+                Some(sample_live(EngineModeDto::Tun, None)),
+            ),
+            EffectiveLanguage::En,
+        );
         let mut committed = AppliedTrayVisual::from_build(base, true);
         let mut sink = MockTrayVisualSink::default();
 
-        sync_visual_fields(&mut committed, base.with_toggle_busy(true), &mut sink);
+        sync_visual_fields(
+            &mut committed,
+            base.with_toggle_busy(true, EffectiveLanguage::En),
+            &mut sink,
+        );
         assert_eq!(sink.icon_calls, 0);
         assert_eq!(sink.tooltip_calls, 0);
+        assert_eq!(sink.show_label_calls, 0);
         assert_eq!(sink.status_label_calls, 0);
         assert_eq!(sink.toggle_label_calls, 1);
         assert_eq!(sink.toggle_enabled_calls, 1);
+        assert_eq!(sink.quit_label_calls, 0);
         assert_eq!(committed.toggle_label, Some("Pausing Protection..."));
         assert_eq!(committed.toggle_enabled, Some(false));
 
-        sync_visual_fields(&mut committed, base.with_toggle_busy(false), &mut sink);
+        sync_visual_fields(
+            &mut committed,
+            base.with_toggle_busy(false, EffectiveLanguage::En),
+            &mut sink,
+        );
         assert_eq!(sink.icon_calls, 0);
         assert_eq!(sink.tooltip_calls, 0);
+        assert_eq!(sink.show_label_calls, 0);
         assert_eq!(sink.status_label_calls, 0);
         assert_eq!(sink.toggle_label_calls, 2);
         assert_eq!(sink.toggle_enabled_calls, 2);
+        assert_eq!(sink.quit_label_calls, 0);
         assert_eq!(committed.toggle_label, Some("Pause Protection"));
         assert_eq!(committed.toggle_enabled, Some(true));
     }
 
     #[test]
-    fn runtime_state_enforces_monotonic_snapshot_seq() {
+    fn switching_language_refreshes_all_tray_labels_and_tooltip() {
         let mut state = TrayRuntimeState::new();
-        let protected = TrayVisualSpec::from_snapshot(&sample_snapshot(
+        let protected_state = TrayVisualState::from_snapshot(&sample_snapshot(
             ServiceStateDto::Running,
             EngineModeDto::Tun,
             Some(sample_live(EngineModeDto::Tun, None)),
         ));
-        let paused = TrayVisualSpec::from_snapshot(&sample_snapshot(
+        assert!(state.accept_snapshot(1, protected_state));
+        state.last_visual = AppliedTrayVisual::from_build(state.effective_spec(), true);
+
+        // Switching to Turkish marks all localized text fields dirty.
+        assert!(state.set_language(EffectiveLanguage::Tr));
+        let mut sink = MockTrayVisualSink::default();
+        let tr_spec = state.effective_spec();
+        sync_visual_fields(&mut state.last_visual, tr_spec, &mut sink);
+
+        assert_eq!(sink.icon_calls, 0);
+        assert_eq!(sink.toggle_enabled_calls, 0);
+        assert_eq!(sink.tooltip_calls, 1);
+        assert_eq!(sink.show_label_calls, 1);
+        assert_eq!(sink.status_label_calls, 1);
+        assert_eq!(sink.toggle_label_calls, 1);
+        assert_eq!(sink.quit_label_calls, 1);
+        assert_eq!(state.last_visual.show_label, Some("vdpi'ı Aç"));
+        assert_eq!(
+            state.last_visual.status_label,
+            Some("Durum: Korunuyor (TUN)")
+        );
+        assert_eq!(state.last_visual.toggle_label, Some("Korumayı Duraklat"));
+        assert_eq!(state.last_visual.quit_label, Some("vdpi Masaüstünden Çık"));
+        assert_eq!(state.last_visual.tooltip, Some("vdpi - Korunuyor (TUN)"));
+
+        // Setting the same language again does not trigger redundant updates.
+        assert!(!state.set_language(EffectiveLanguage::Tr));
+    }
+
+    #[test]
+    fn runtime_state_enforces_monotonic_snapshot_seq() {
+        let mut state = TrayRuntimeState::new();
+        let protected = TrayVisualState::from_snapshot(&sample_snapshot(
+            ServiceStateDto::Running,
+            EngineModeDto::Tun,
+            Some(sample_live(EngineModeDto::Tun, None)),
+        ));
+        let paused = TrayVisualState::from_snapshot(&sample_snapshot(
             ServiceStateDto::Stopped,
             EngineModeDto::Tun,
             None,
         ));
-        let degraded = TrayVisualSpec::from_snapshot(&sample_snapshot(
+        let degraded = TrayVisualState::from_snapshot(&sample_snapshot(
             ServiceStateDto::Running,
             EngineModeDto::Proxy,
             None,
@@ -1547,12 +2145,12 @@ mod tests {
 
         assert!(state.accept_snapshot(5, protected));
         assert_eq!(state.last_snapshot_seq, 5);
-        assert_eq!(state.base_visual, Some(protected));
+        assert_eq!(state.base_state, Some(protected));
 
         // Strictly older non-zero sequence must be ignored.
         assert!(!state.accept_snapshot(4, paused));
         assert_eq!(state.last_snapshot_seq, 5);
-        assert_eq!(state.base_visual, Some(protected));
+        assert_eq!(state.base_state, Some(protected));
 
         // Equal sequence is accepted so transient OS failures can retry.
         assert!(state.accept_snapshot(5, protected));
@@ -1561,54 +2159,58 @@ mod tests {
         // Strictly newer sequence advances high-water mark and replaces visual.
         assert!(state.accept_snapshot(6, paused));
         assert_eq!(state.last_snapshot_seq, 6);
-        assert_eq!(state.base_visual, Some(paused));
+        assert_eq!(state.base_state, Some(paused));
 
         // Unsequenced (0) snapshots are allowed without lowering high-water mark.
         assert!(state.accept_snapshot(0, degraded));
         assert_eq!(state.last_snapshot_seq, 6);
-        assert_eq!(state.base_visual, Some(degraded));
+        assert_eq!(state.base_state, Some(degraded));
     }
 
     #[test]
     fn runtime_state_short_circuits_steady_state_visual_dispatch() {
         let mut state = TrayRuntimeState::new();
-        let protected = TrayVisualSpec::from_snapshot(&sample_snapshot(
+        let protected_state = TrayVisualState::from_snapshot(&sample_snapshot(
             ServiceStateDto::Running,
             EngineModeDto::Tun,
             Some(sample_live(EngineModeDto::Tun, None)),
         ));
-        let paused = TrayVisualSpec::from_snapshot(&sample_snapshot(
+        let paused_state = TrayVisualState::from_snapshot(&sample_snapshot(
             ServiceStateDto::Stopped,
             EngineModeDto::Tun,
             None,
         ));
+        let protected_spec = TrayVisualSpec::from_state(protected_state, EffectiveLanguage::En);
 
         // Initial snapshot with uncommitted OS visuals must dispatch.
-        assert!(state.should_dispatch_snapshot(1, protected));
+        assert!(state.should_dispatch_snapshot(1, protected_state));
         assert_eq!(state.last_snapshot_seq, 1);
 
         // Once committed, identical steady-state ticks advance seq without dispatching.
-        state.last_visual = AppliedTrayVisual::from_build(protected, true);
-        assert!(!state.should_dispatch_snapshot(2, protected));
+        state.last_visual = AppliedTrayVisual::from_build(protected_spec, true);
+        assert!(!state.should_dispatch_snapshot(2, protected_state));
         assert_eq!(state.last_snapshot_seq, 2);
 
         // Stale sequence is still rejected without dispatching.
-        assert!(!state.should_dispatch_snapshot(1, paused));
+        assert!(!state.should_dispatch_snapshot(1, paused_state));
         assert_eq!(state.last_snapshot_seq, 2);
 
         // Partial OS failure (uncommitted icon) forces retry on next tick.
         state.last_visual.icon = None;
-        assert!(state.should_dispatch_snapshot(3, protected));
+        assert!(state.should_dispatch_snapshot(3, protected_state));
         assert_eq!(state.last_snapshot_seq, 3);
 
         // Toggle-busy visuals are also short-circuited when already committed.
         state.toggle_busy = true;
-        state.last_visual = AppliedTrayVisual::from_build(protected.with_toggle_busy(true), true);
-        assert!(!state.should_dispatch_snapshot(4, protected));
+        state.last_visual = AppliedTrayVisual::from_build(
+            protected_spec.with_toggle_busy(true, EffectiveLanguage::En),
+            true,
+        );
+        assert!(!state.should_dispatch_snapshot(4, protected_state));
         assert_eq!(state.last_snapshot_seq, 4);
 
         // Underlying state change during toggle_busy still dispatches.
-        assert!(state.should_dispatch_snapshot(5, paused));
+        assert!(state.should_dispatch_snapshot(5, paused_state));
         assert_eq!(state.last_snapshot_seq, 5);
     }
 

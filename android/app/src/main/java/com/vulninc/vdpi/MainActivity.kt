@@ -71,6 +71,8 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
+import com.vulninc.vdpi.data.SettingsRepository
+import com.vulninc.vdpi.ui.UpdateStatus
 import com.vulninc.vdpi.ui.VdpiViewModel
 import com.vulninc.vdpi.ui.chrome.FloatingLiquidGlassTabBar
 import com.vulninc.vdpi.ui.chrome.FloatingLiveTunnelAccessoryPill
@@ -86,6 +88,8 @@ import com.vulninc.vdpi.ui.components.LocalTopOverlayPadding
 import com.vulninc.vdpi.ui.components.MinimalSnackbarHost
 import com.vulninc.vdpi.ui.components.ScrollEdgeFadeScrim
 import com.vulninc.vdpi.ui.components.VdpiMotion
+import com.vulninc.vdpi.ui.i18n.LocalVdpiStrings
+import com.vulninc.vdpi.ui.i18n.VdpiStrings
 import com.vulninc.vdpi.ui.screens.AppsScreen
 import com.vulninc.vdpi.ui.screens.SettingsScreen
 import com.vulninc.vdpi.ui.screens.TunnelScreen
@@ -101,6 +105,7 @@ import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
+import java.util.Locale
 
 private class SettingsFileTooLargeException : Exception()
 
@@ -118,24 +123,27 @@ class MainActivity : ComponentActivity() {
     private val uiFeedbackEvents: Flow<UiFeedbackEvent> = uiFeedback.receiveAsFlow()
     private var notificationPermissionRequestedThisSession = false
 
+    private fun localizedStrings(): VdpiStrings = SettingsRepository.resolveStrings(this)
+
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
             startVpnServiceWithPermissions()
         } else {
-            uiFeedback.trySend(UiFeedbackEvent(message = "VPN permission was denied"))
+            uiFeedback.trySend(UiFeedbackEvent(message = localizedStrings().feedbackVpnPermissionDenied))
         }
     }
 
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
+        val strings = localizedStrings()
         if (!granted) {
             uiFeedback.trySend(
                 UiFeedbackEvent(
-                    message = getString(R.string.notification_permission_hint),
-                    actionLabel = getString(R.string.notification_settings_action),
+                    message = strings.notificationPermissionHint,
+                    actionLabel = strings.notificationSettingsAction,
                     duration = SnackbarDuration.Long,
                     onAction = ::openAppNotificationSettings,
                 ),
@@ -145,7 +153,7 @@ class MainActivity : ComponentActivity() {
         if (VpnService.prepare(this) == null) {
             VdpiVpnService.start(this)
         } else {
-            uiFeedback.trySend(UiFeedbackEvent(message = "VPN permission required"))
+            uiFeedback.trySend(UiFeedbackEvent(message = strings.feedbackVpnPermissionRequired))
         }
     }
 
@@ -154,8 +162,9 @@ class MainActivity : ComponentActivity() {
     ) { uri ->
         if (uri == null) return@registerForActivityResult
         lifecycleScope.launch(Dispatchers.IO) {
+            val strings = localizedStrings()
             val payload = runCatching { viewModel.exportSettingsJsonSnapshot() }.getOrElse {
-                uiFeedback.trySend(UiFeedbackEvent(message = "Failed to serialize settings"))
+                uiFeedback.trySend(UiFeedbackEvent(message = strings.feedbackExportSerializeFailed))
                 return@launch
             }
             val written = runCatching {
@@ -172,7 +181,11 @@ class MainActivity : ComponentActivity() {
             }.getOrDefault(false)
             uiFeedback.trySend(
                 UiFeedbackEvent(
-                    message = if (written) "Settings exported" else "Failed to export settings",
+                    message = if (written) {
+                        strings.feedbackSettingsExported
+                    } else {
+                        strings.feedbackSettingsExportFailed
+                    },
                 ),
             )
         }
@@ -183,6 +196,7 @@ class MainActivity : ComponentActivity() {
     ) { uri ->
         if (uri == null) return@registerForActivityResult
         lifecycleScope.launch(Dispatchers.IO) {
+            val strings = localizedStrings()
             val readResult = runCatching {
                 contentResolver.openInputStream(uri)?.use { stream ->
                     val buffer = ByteArray(8192)
@@ -205,8 +219,8 @@ class MainActivity : ComponentActivity() {
 
             if (readResult.isFailure) {
                 val message = when (readResult.exceptionOrNull()) {
-                    is SettingsFileTooLargeException -> "Settings file too large (max 256 KB)"
-                    else -> "Could not read settings file"
+                    is SettingsFileTooLargeException -> strings.feedbackImportFileTooLarge
+                    else -> strings.feedbackImportReadFailed
                 }
                 uiFeedback.trySend(UiFeedbackEvent(message = message))
                 return@launch
@@ -214,7 +228,7 @@ class MainActivity : ComponentActivity() {
 
             val rawJson = readResult.getOrThrow()
             if (rawJson.isBlank()) {
-                uiFeedback.trySend(UiFeedbackEvent(message = "Settings file is empty"))
+                uiFeedback.trySend(UiFeedbackEvent(message = strings.feedbackImportFileEmpty))
                 return@launch
             }
 
@@ -338,7 +352,7 @@ class MainActivity : ComponentActivity() {
         runCatching {
             exportSettingsLauncher.launch(SETTINGS_EXPORT_FILENAME)
         }.onFailure {
-            uiFeedback.trySend(UiFeedbackEvent(message = "File picker unavailable"))
+            uiFeedback.trySend(UiFeedbackEvent(message = localizedStrings().feedbackFilePickerUnavailable))
         }
     }
 
@@ -348,7 +362,7 @@ class MainActivity : ComponentActivity() {
                 arrayOf("application/json", "text/plain", "application/octet-stream"),
             )
         }.onFailure {
-            uiFeedback.trySend(UiFeedbackEvent(message = "File picker unavailable"))
+            uiFeedback.trySend(UiFeedbackEvent(message = localizedStrings().feedbackFilePickerUnavailable))
         }
     }
 
@@ -376,6 +390,7 @@ private fun VdpiAppRoot(
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val availableUpdate by viewModel.availableUpdate.collectAsStateWithLifecycle()
     val isCheckingUpdate by viewModel.isCheckingUpdate.collectAsStateWithLifecycle()
+    val updateStatus by viewModel.updateStatus.collectAsStateWithLifecycle()
     val updateStatusMessage by viewModel.updateStatusMessage.collectAsStateWithLifecycle()
     val apps by viewModel.installedApps.collectAsStateWithLifecycle()
     val appsLoading by viewModel.appsLoading.collectAsStateWithLifecycle()
@@ -384,6 +399,19 @@ private fun VdpiAppRoot(
     val pendingReconnect by viewModel.pendingReconnect.collectAsStateWithLifecycle()
     val reconnectPopupVisible by viewModel.reconnectPopupVisible.collectAsStateWithLifecycle()
     val pendingChangeSummary by viewModel.pendingChangeSummary.collectAsStateWithLifecycle()
+
+    val configuration = LocalConfiguration.current
+    val systemLocale = configuration.locales.takeIf { !it.isEmpty }?.get(0) ?: Locale.getDefault()
+    val strings = remember(settings.language, systemLocale) {
+        VdpiStrings.resolve(settings.language, systemLocale)
+    }
+
+    val localizedUpdateStatus = when (val status = updateStatus) {
+        UpdateStatus.UpToDate -> strings.updateUpToDate
+        is UpdateStatus.Available -> strings.updateVersionAvailable(status.version)
+        UpdateStatus.CheckFailed -> strings.updateCheckFailed
+        null -> updateStatusMessage
+    }
 
     val availableUpdateInfo = availableUpdate?.let { update ->
         UpdateBannerInfo(
@@ -438,11 +466,12 @@ private fun VdpiAppRoot(
         }
 
         fun showUndoNotice(message: String, onUndo: () -> Unit) {
+            val undoLabel = strings.actionUndo
             uiScope.launch {
                 snackbarHostState.currentSnackbarData?.dismiss()
                 val res = snackbarHostState.showSnackbar(
                     message = message,
-                    actionLabel = "Undo",
+                    actionLabel = undoLabel,
                     duration = SnackbarDuration.Short,
                 )
                 if (res == SnackbarResult.ActionPerformed) {
@@ -458,7 +487,6 @@ private fun VdpiAppRoot(
             (tunnelPhase == TunnelPhase.CONNECTED || tunnelPhase == TunnelPhase.CONNECTING)
         val showLiveAccessoryPill = activeTab != MainTab.TUNNEL && tunnelPhase != TunnelPhase.DISCONNECTED
 
-        val configuration = LocalConfiguration.current
         val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE &&
             configuration.screenWidthDp >= 560
 
@@ -530,6 +558,7 @@ private fun VdpiAppRoot(
         }
 
         CompositionLocalProvider(
+            LocalVdpiStrings provides strings,
             LocalGlassBackdropLayer provides sharedBackdropLayer,
             LocalBottomChromePadding provides bottomChromePadding,
             LocalTopOverlayPadding provides topOverlayPadding,
@@ -594,7 +623,7 @@ private fun VdpiAppRoot(
                                                 val previous = settings.splitPackages
                                                 if (previous.isNotEmpty()) {
                                                     viewModel.clearSplitPackages()
-                                                    showUndoNotice("Cleared ${previous.size} selected apps") {
+                                                    showUndoNotice(strings.clearedSelectedApps(previous.size)) {
                                                         viewModel.restoreSplitPackages(previous)
                                                     }
                                                 }
@@ -608,41 +637,46 @@ private fun VdpiAppRoot(
                                             onSetChunkSize = viewModel::setChunkSize,
                                             onSetDnsAddr = { addr ->
                                                 viewModel.setDnsAddr(addr)
-                                                showNotice("DNS updated to ${formatDnsDisplayAddr(addr)}")
+                                                showNotice(
+                                                    strings.dnsUpdatedTo(
+                                                        formatDnsDisplayAddr(addr, strings.customDohLabel),
+                                                    ),
+                                                )
                                             },
                                             onSetEnableDoh = viewModel::setEnableDoh,
                                             onSetIpv4Only = viewModel::setIpv4Only,
                                             onSetBlockQuic = viewModel::setBlockQuic,
                                             onAddBypassDomain = { domain ->
                                                 viewModel.addBypassDomain(domain)
-                                                showNotice("Added $domain to bypass list")
+                                                showNotice(strings.addedBypassDomain(domain))
                                             },
                                             onRemoveBypassDomain = { domain ->
                                                 viewModel.removeBypassDomain(domain)
-                                                showUndoNotice("Removed $domain") {
+                                                showUndoNotice(strings.removedBypassDomain(domain)) {
                                                     viewModel.addBypassDomain(domain)
                                                 }
                                             },
                                             onSetTheme = viewModel::setTheme,
+                                            onSetLanguage = viewModel::setLanguage,
                                             onOpenAlwaysOnVpn = {
                                                 if (!onOpenAlwaysOnVpn()) {
-                                                    showNotice("System VPN settings unavailable on this device")
+                                                    showNotice(strings.feedbackSystemVpnUnavailable)
                                                 }
                                             },
                                             onClearCache = {
                                                 viewModel.clearNativeCache { cleared ->
                                                     showNotice(
                                                         if (cleared) {
-                                                            "Adaptive cache cleared"
+                                                            strings.feedbackCacheCleared
                                                         } else {
-                                                            "Failed to clear adaptive cache"
+                                                            strings.feedbackCacheClearFailed
                                                         },
                                                     )
                                                 }
                                             },
                                             availableUpdate = availableUpdateInfo,
                                             isCheckingUpdate = isCheckingUpdate,
-                                            updateStatusMessage = updateStatusMessage,
+                                            updateStatusMessage = localizedUpdateStatus,
                                             onCheckForUpdates = { viewModel.checkForUpdates(manual = true) },
                                             onExportSettings = onExportSettings,
                                             onImportSettings = onImportSettings,
@@ -800,10 +834,10 @@ private fun VdpiAppRoot(
     }
 }
 
-private fun formatDnsDisplayAddr(rawAddr: String): String {
+private fun formatDnsDisplayAddr(rawAddr: String, customDohLabel: String): String {
     val addr = rawAddr.trim().ifBlank { "1.1.1.1" }
     return if (addr.startsWith("https://", ignoreCase = true)) {
-        runCatching { java.net.URI(addr).host }.getOrNull()?.takeIf { it.isNotBlank() } ?: "custom DoH"
+        runCatching { java.net.URI(addr).host }.getOrNull()?.takeIf { it.isNotBlank() } ?: customDohLabel
     } else {
         addr
     }

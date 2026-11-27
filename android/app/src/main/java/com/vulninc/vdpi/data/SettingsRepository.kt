@@ -14,6 +14,7 @@ import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.vulninc.vdpi.engine.DesyncMode
 import com.vulninc.vdpi.engine.NativeEngineConfig
+import com.vulninc.vdpi.ui.i18n.VdpiStrings
 import com.vulninc.vdpi.util.isValidBypassDomain
 import com.vulninc.vdpi.util.isValidDnsInput
 import com.vulninc.vdpi.util.sanitizeDomainInput
@@ -61,6 +62,22 @@ enum class ThemePreference(val wireName: String, val label: String) {
     }
 }
 
+enum class AppLanguage(val code: String) {
+    SYSTEM("system"),
+    EN("en"),
+    TR("tr");
+
+    companion object {
+        fun fromCode(raw: String?): AppLanguage {
+            if (raw == null) return SYSTEM
+            val normalized = raw.trim().lowercase(Locale.ROOT)
+            return entries.firstOrNull {
+                it.code == normalized || it.name.equals(normalized, ignoreCase = true)
+            } ?: SYSTEM
+        }
+    }
+}
+
 data class VdpiSettings(
     val desyncMode: DesyncMode = DesyncMode.COMBO,
     val chunkSize: Int = 10,
@@ -72,6 +89,7 @@ data class VdpiSettings(
     val splitTunnelMode: SplitTunnelMode = SplitTunnelMode.BYPASS_SELECTED,
     val splitPackages: Set<String> = emptySet(),
     val theme: ThemePreference = ThemePreference.SYSTEM,
+    val language: AppLanguage = AppLanguage.SYSTEM,
 ) {
     fun toNativeConfig(): NativeEngineConfig {
         val cleanedDns = dnsAddr.trim().ifEmpty { "1.1.1.1" }
@@ -106,6 +124,7 @@ private data class SettingsBackupPayload(
     @SerialName("split_tunnel_mode") val splitTunnelMode: String = SplitTunnelMode.BYPASS_SELECTED.wireName,
     @SerialName("split_packages") val splitPackages: List<String> = emptyList(),
     val theme: String = ThemePreference.SYSTEM.wireName,
+    val language: String = AppLanguage.SYSTEM.code,
 )
 
 private const val BACKUP_SCHEMA_VERSION = 1
@@ -122,6 +141,7 @@ private val KNOWN_BACKUP_KEYS = setOf(
     "split_tunnel_mode",
     "split_packages",
     "theme",
+    "language",
 )
 
 class SettingsRepository(private val context: Context) {
@@ -136,6 +156,7 @@ class SettingsRepository(private val context: Context) {
         val SPLIT_MODE = stringPreferencesKey("split_mode")
         val SPLIT_PACKAGES = stringSetPreferencesKey("split_packages")
         val THEME = stringPreferencesKey("theme")
+        val LANGUAGE = stringPreferencesKey("language")
         val DISMISSED_UPDATE_VERSION = stringPreferencesKey("dismissed_update_version")
         val LAST_UPDATE_CHECK_EPOCH_MS = longPreferencesKey("last_update_check_epoch_ms")
         val CACHED_UPDATE_JSON = stringPreferencesKey("cached_update_json")
@@ -152,6 +173,10 @@ class SettingsRepository(private val context: Context) {
 
             val splitMode = SplitTunnelMode.fromWire(prefs[Keys.SPLIT_MODE])
             val theme = ThemePreference.fromWire(prefs[Keys.THEME])
+            val language = AppLanguage.fromCode(prefs[Keys.LANGUAGE])
+            if (cachedLanguage != language) {
+                writeLanguageMirror(context, language)
+            }
             val dnsAddr = prefs[Keys.DNS_ADDR]?.takeIf { it.isNotBlank() } ?: "1.1.1.1"
             val enableDoh = (prefs[Keys.ENABLE_DOH] ?: true) ||
                 dnsAddr.trim().startsWith("https://", ignoreCase = true)
@@ -167,6 +192,7 @@ class SettingsRepository(private val context: Context) {
                 splitTunnelMode = splitMode,
                 splitPackages = prefs[Keys.SPLIT_PACKAGES] ?: emptySet(),
                 theme = theme,
+                language = language,
             )
         }
 
@@ -248,6 +274,11 @@ class SettingsRepository(private val context: Context) {
         context.vdpiDataStore.edit { it[Keys.THEME] = theme.wireName }
     }
 
+    suspend fun setLanguage(language: AppLanguage) {
+        writeLanguageMirror(context, language)
+        context.vdpiDataStore.edit { it[Keys.LANGUAGE] = language.code }
+    }
+
     suspend fun applySettings(settings: VdpiSettings) {
         val cleanedDns = settings.dnsAddr.trim().ifEmpty { "1.1.1.1" }
         val normalizedEnableDoh = settings.enableDoh ||
@@ -256,6 +287,7 @@ class SettingsRepository(private val context: Context) {
             .map { sanitizeDomainInput(it) }
             .filter { isValidBypassDomain(it) }
             .toSet()
+        writeLanguageMirror(context, settings.language)
         context.vdpiDataStore.edit { prefs ->
             prefs[Keys.DESYNC_MODE] = settings.desyncMode.wireName
             prefs[Keys.CHUNK_SIZE] = settings.chunkSize.coerceIn(1, 64)
@@ -267,6 +299,7 @@ class SettingsRepository(private val context: Context) {
             prefs[Keys.SPLIT_MODE] = settings.splitTunnelMode.wireName
             prefs[Keys.SPLIT_PACKAGES] = settings.splitPackages
             prefs[Keys.THEME] = settings.theme.wireName
+            prefs[Keys.LANGUAGE] = settings.language.code
         }
     }
 
@@ -313,6 +346,41 @@ class SettingsRepository(private val context: Context) {
         Companion.parseSettingsJson(raw)
 
     companion object {
+        private const val LANGUAGE_MIRROR_PREFS = "vdpi_language_mirror"
+        private const val LANGUAGE_MIRROR_KEY = "language"
+
+        @Volatile
+        private var cachedLanguage: AppLanguage? = null
+
+        fun readLanguageSync(context: Context): AppLanguage {
+            cachedLanguage?.let { return it }
+            val appContext = context.applicationContext ?: context
+            val raw = runCatching {
+                appContext.getSharedPreferences(LANGUAGE_MIRROR_PREFS, Context.MODE_PRIVATE)
+                    .getString(LANGUAGE_MIRROR_KEY, null)
+            }.getOrNull()
+            return AppLanguage.fromCode(raw).also { cachedLanguage = it }
+        }
+
+        internal fun writeLanguageMirror(context: Context, language: AppLanguage) {
+            cachedLanguage = language
+            val appContext = context.applicationContext ?: context
+            runCatching {
+                appContext.getSharedPreferences(LANGUAGE_MIRROR_PREFS, Context.MODE_PRIVATE)
+                    .edit()
+                    .putString(LANGUAGE_MIRROR_KEY, language.code)
+                    .apply()
+            }
+        }
+
+        fun resolveStrings(context: Context): VdpiStrings {
+            val locale = context.resources?.configuration?.locales
+                ?.takeIf { !it.isEmpty }
+                ?.get(0)
+                ?: Locale.getDefault()
+            return VdpiStrings.resolve(readLanguageSync(context), locale)
+        }
+
         private val backupJson = Json {
             ignoreUnknownKeys = true
             encodeDefaults = true
@@ -372,6 +440,7 @@ class SettingsRepository(private val context: Context) {
                 splitTunnelMode = settings.splitTunnelMode.wireName,
                 splitPackages = cleanedPackages,
                 theme = settings.theme.wireName,
+                language = settings.language.code,
             )
             return backupJson.encodeToString(SettingsBackupPayload.serializer(), payload)
         }
@@ -432,6 +501,12 @@ class SettingsRepository(private val context: Context) {
                     it.name.equals(themeKey, ignoreCase = true)
             } ?: throw IllegalArgumentException("Unsupported theme preference: $themeKey")
 
+            val langKey = payload.language.trim()
+            val language = AppLanguage.entries.firstOrNull {
+                it.code.equals(langKey, ignoreCase = true) ||
+                    it.name.equals(langKey, ignoreCase = true)
+            } ?: throw IllegalArgumentException("Unsupported language preference: $langKey")
+
             VdpiSettings(
                 desyncMode = desyncMode,
                 chunkSize = payload.chunkSize.coerceIn(1, 64),
@@ -443,6 +518,7 @@ class SettingsRepository(private val context: Context) {
                 splitTunnelMode = splitMode,
                 splitPackages = sanitizedPackages,
                 theme = theme,
+                language = language,
             )
         }
     }

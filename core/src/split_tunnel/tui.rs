@@ -6,6 +6,7 @@ use super::{
     popular_app_display_name, AppCategory, DiscoveredApp,
 };
 use crate::config_file::MAX_SPLIT_TUNNEL_APPS;
+use crate::i18n::{self, tr, Lang};
 use anyhow::Result;
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
@@ -439,17 +440,20 @@ enum NoticeKind {
 }
 
 impl NoticeKind {
-    const fn default_text(self) -> &'static str {
+    fn default_text(self) -> &'static str {
         match self {
-            Self::EmptyIncludeConfirm => {
-                "Empty Include protects no apps - press s/Enter again to save"
-            }
-            Self::AllModeConfirm => {
-                "All mode ignores checked apps (2/3) - press s/Enter again to save"
-            }
-            Self::DiscardConfirm => {
-                "Unsaved changes - Esc again to discard, or s/Enter to save"
-            }
+            Self::EmptyIncludeConfirm => tr(
+                "Empty Include protects no apps - press s/Enter again to save",
+                "Boş Dahil Et hiçbir uygulamayı korumaz - kaydetmek için tekrar s/Enter",
+            ),
+            Self::AllModeConfirm => tr(
+                "All mode ignores checked apps (2/3) - press s/Enter again to save",
+                "Tümü modu seçili uygulamaları yok sayar (2/3) - tekrar s/Enter ile kaydet",
+            ),
+            Self::DiscardConfirm => tr(
+                "Unsaved changes - Esc again to discard, or s/Enter to save",
+                "Kaydedilmemiş değişiklikler - vazgeçmek için tekrar Esc, kaydetmek için s/Enter",
+            ),
         }
     }
 
@@ -457,18 +461,36 @@ impl NoticeKind {
         let variants: [&'static str; 3] = match self {
             Self::EmptyIncludeConfirm => [
                 Self::EmptyIncludeConfirm.default_text(),
-                "Empty Include protects none - s/Enter again to save",
-                "Empty Include (none) - s/Enter to save",
+                tr(
+                    "Empty Include protects none - s/Enter again to save",
+                    "Boş Dahil Et korumaz - tekrar s/Enter ile kaydet",
+                ),
+                tr(
+                    "Empty Include (none) - s/Enter to save",
+                    "Boş Dahil Et - kaydetmek için s/Enter",
+                ),
             ],
             Self::AllModeConfirm => [
                 Self::AllModeConfirm.default_text(),
-                "All mode ignores checked - s/Enter again to save",
-                "All ignores checked - s/Enter to save",
+                tr(
+                    "All mode ignores checked - s/Enter again to save",
+                    "Tümü seçilileri yok sayar - tekrar s/Enter ile kaydet",
+                ),
+                tr(
+                    "All ignores checked - s/Enter to save",
+                    "Tümü yok sayar - s/Enter ile kaydet",
+                ),
             ],
             Self::DiscardConfirm => [
                 Self::DiscardConfirm.default_text(),
-                "Unsaved - Esc again to discard, s/Enter to save",
-                "Unsaved: Esc discard, s/Enter to save",
+                tr(
+                    "Unsaved - Esc again to discard, s/Enter to save",
+                    "Kaydedilmedi - Esc ile vazgeç, s/Enter ile kaydet",
+                ),
+                tr(
+                    "Unsaved: Esc discard, s/Enter to save",
+                    "Kaydedilmedi: Esc vazgeç, s/Enter kaydet",
+                ),
             ],
         };
         variants
@@ -598,9 +620,14 @@ impl PickerState {
             Entry::Vacant(entry) => {
                 if !can_insert {
                     self.notice_kind = None;
-                    self.notice = Some(format!(
-                        "Maximum {MAX_SPLIT_TUNNEL_APPS} apps reached - uncheck one first"
-                    ));
+                    self.notice = Some(match i18n::active_lang() {
+                        Lang::En => format!(
+                            "Maximum {MAX_SPLIT_TUNNEL_APPS} apps reached - uncheck one first"
+                        ),
+                        Lang::Tr => format!(
+                            "En fazla {MAX_SPLIT_TUNNEL_APPS} uygulama seçilebilir - önce birinin işaretini kaldırın"
+                        ),
+                    });
                     return true;
                 }
                 entry.insert(exe_name);
@@ -847,7 +874,13 @@ impl PickerState {
         };
         let Some(canonical) = canonical_exe_entry(&raw) else {
             if let Some(modal) = self.add_modal.as_mut() {
-                modal.error = Some("Enter an executable name (e.g. discord.exe)".to_string());
+                modal.error = Some(
+                    tr(
+                        "Enter an executable name (e.g. discord.exe)",
+                        "Bir uygulama dosya adı girin (örn. discord.exe)",
+                    )
+                    .to_string(),
+                );
             }
             return;
         };
@@ -855,7 +888,13 @@ impl PickerState {
         let key = normalize_exe(&canonical);
         if key.is_empty() {
             if let Some(modal) = self.add_modal.as_mut() {
-                modal.error = Some("Enter a valid executable name".to_string());
+                modal.error = Some(
+                    tr(
+                        "Enter a valid executable name",
+                        "Geçerli bir uygulama dosya adı girin",
+                    )
+                    .to_string(),
+                );
             }
             return;
         }
@@ -864,9 +903,14 @@ impl PickerState {
             && self.selected_entries.len() >= MAX_SPLIT_TUNNEL_APPS
         {
             if let Some(modal) = self.add_modal.as_mut() {
-                modal.error = Some(format!(
-                    "Maximum {MAX_SPLIT_TUNNEL_APPS} apps reached - uncheck one first"
-                ));
+                modal.error = Some(match i18n::active_lang() {
+                    Lang::En => {
+                        format!("Maximum {MAX_SPLIT_TUNNEL_APPS} apps reached - uncheck one first")
+                    }
+                    Lang::Tr => format!(
+                        "En fazla {MAX_SPLIT_TUNNEL_APPS} uygulama seçilebilir - önce birinin işaretini kaldırın"
+                    ),
+                });
             }
             return;
         }
@@ -941,6 +985,8 @@ pub fn run_split_tunnel_picker(initial: SplitTunnelConfig) -> Result<Option<Spli
             "interactive split-tunnel picker requires a TTY; use 'vdpi split status|list|mode|add|remove'"
         );
     }
+
+    i18n::init_from_config();
 
     let color = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
     let all_apps = discover_apps(&initial.apps);
@@ -1722,7 +1768,10 @@ fn render_notice(frame: &mut Frame<'_>, area: Rect, state: &PickerState, palette
 
 fn render_minimal(frame: &mut Frame<'_>, area: Rect, state: &PickerState, palette: Palette) {
     let width = usize::from(area.width);
-    let text = format!("vdpi Split ({} sel)", state.selected_count());
+    let text = match i18n::active_lang() {
+        Lang::En => format!("vdpi Split ({} sel)", state.selected_count()),
+        Lang::Tr => format!("vdpi Böl ({} seç)", state.selected_count()),
+    };
     let line = Line::from(Span::styled(truncate_text(&text, width), palette.brand));
     frame.render_widget(line, Rect::new(area.x, area.y, area.width, 1));
 
@@ -1735,12 +1784,13 @@ fn render_minimal(frame: &mut Frame<'_>, area: Rect, state: &PickerState, palett
                 .char_indices()
                 .nth(cursor_char)
                 .map_or(sanitized.len(), |(idx, _)| idx);
+            let add_prefix = tr("Add: ", "Ekle: ");
             let prompt = format!(
-                "Add: {}▏{}",
+                "{add_prefix}{}▏{}",
                 &sanitized[..split_byte],
                 &sanitized[split_byte..]
             );
-            let prompt_cursor = "Add: ".chars().count() + cursor_char + 1;
+            let prompt_cursor = add_prefix.chars().count() + cursor_char + 1;
             let (before, after) = window_around_cursor(&prompt, prompt_cursor, width);
             let visible = format!("{before}{after}");
             frame.render_widget(
@@ -1820,10 +1870,11 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &PickerState, palette
     }
     let width = usize::from(area.width);
     let count = state.selected_count();
-    let pill = if state.only_selected {
-        format!("{count} selected [filter]")
-    } else {
-        format!("{count} selected")
+    let pill = match (i18n::active_lang(), state.only_selected) {
+        (Lang::En, true) => format!("{count} selected [filter]"),
+        (Lang::En, false) => format!("{count} selected"),
+        (Lang::Tr, true) => format!("{count} seçili [filtre]"),
+        (Lang::Tr, false) => format!("{count} seçili"),
     };
     let pill_len = display_width(&pill);
     let pill_style = if state.only_selected || count > 0 {
@@ -1833,20 +1884,21 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &PickerState, palette
     };
 
     const BRAND: &str = "vdpi";
-    const SUBTITLE: &str = " Split Tunneling";
-    let full_left_len = BRAND.len() + SUBTITLE.len();
+    let subtitle = tr(" Split Tunneling", " Bölünmüş Tünelleme");
+    let full_title = tr("vdpi Split Tunneling", "vdpi Bölünmüş Tünelleme");
+    let full_left_len = display_width(BRAND) + display_width(subtitle);
 
     let line = if width >= full_left_len + 2 + pill_len {
         let gap = width - full_left_len - pill_len;
         Line::from(vec![
             Span::styled(BRAND, palette.brand),
-            Span::styled(SUBTITLE, palette.title),
+            Span::styled(subtitle, palette.title),
             Span::raw(" ".repeat(gap)),
             Span::styled(pill, pill_style),
         ])
     } else if width >= pill_len + 6 {
         let left_budget = width - pill_len - 1;
-        let left_text = truncate_text("vdpi Split Tunneling", left_budget);
+        let left_text = truncate_text(full_title, left_budget);
         let left_len = display_width(&left_text);
         let gap = width.saturating_sub(left_len + pill_len);
         Line::from(vec![
@@ -1856,7 +1908,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &PickerState, palette
         ])
     } else {
         Line::from(Span::styled(
-            truncate_text("vdpi Split Tunneling", width),
+            truncate_text(full_title, width),
             palette.brand,
         ))
     };
@@ -1870,17 +1922,35 @@ fn render_mode_bar(frame: &mut Frame<'_>, area: Rect, active: SplitTunnelMode, p
     }
     let width = usize::from(area.width);
 
-    let (all_label, inc_label, exc_label, gap_str) = if width >= 66 {
-        (
-            "1 All apps",
-            "2 Only selected (Include)",
-            "3 Exclude selected",
-            "  ",
-        )
-    } else if width >= 46 {
-        ("1 All apps", "2 Only selected", "3 Exclude", "  ")
-    } else {
-        ("1 All", "2 Include", "3 Exclude", " ")
+    let (all_label, inc_label, exc_label, gap_str) = match i18n::active_lang() {
+        Lang::En => {
+            if width >= 66 {
+                (
+                    "1 All apps",
+                    "2 Only selected (Include)",
+                    "3 Exclude selected",
+                    "  ",
+                )
+            } else if width >= 46 {
+                ("1 All apps", "2 Only selected", "3 Exclude", "  ")
+            } else {
+                ("1 All", "2 Include", "3 Exclude", " ")
+            }
+        }
+        Lang::Tr => {
+            if width >= 66 {
+                (
+                    "1 Tüm uygulamalar",
+                    "2 Yalnızca seçililer",
+                    "3 Seçilileri hariç tut",
+                    "  ",
+                )
+            } else if width >= 46 {
+                ("1 Tümü", "2 Yalnızca seçililer", "3 Hariç tut", "  ")
+            } else {
+                ("1 Tümü", "2 Dahil", "3 Hariç", " ")
+            }
+        }
     };
 
     let modes = [
@@ -1942,15 +2012,26 @@ fn render_mode_hint(frame: &mut Frame<'_>, area: Rect, state: &PickerState, pale
         return;
     }
     let hint = match state.mode {
-        SplitTunnelMode::All if state.selected_count() > 0 => {
-            "All mode protects every app (checked apps ignored; press 2 or 3)."
-        }
-        SplitTunnelMode::All => "Every app is protected through DPI desync.",
-        SplitTunnelMode::Include if state.selected_count() == 0 => {
-            "Empty Include protects no apps (check apps below to enable)."
-        }
-        SplitTunnelMode::Include => "DPI desync applies ONLY to checked apps.",
-        SplitTunnelMode::Exclude => "Checked apps bypass DPI desync; all others stay protected.",
+        SplitTunnelMode::All if state.selected_count() > 0 => tr(
+            "All mode protects every app (checked apps ignored; press 2 or 3).",
+            "Tümü modu her uygulamayı korur (seçililer yok sayılır; 2 veya 3'e basın).",
+        ),
+        SplitTunnelMode::All => tr(
+            "Every app is protected through DPI desync.",
+            "Tüm uygulamalar DPI desync ile korunur.",
+        ),
+        SplitTunnelMode::Include if state.selected_count() == 0 => tr(
+            "Empty Include protects no apps (check apps below to enable).",
+            "Boş Dahil Et hiçbir uygulamayı korumaz (etkinleştirmek için aşağıdan seçin).",
+        ),
+        SplitTunnelMode::Include => tr(
+            "DPI desync applies ONLY to checked apps.",
+            "DPI desync YALNIZCA işaretli uygulamalara uygulanır.",
+        ),
+        SplitTunnelMode::Exclude => tr(
+            "Checked apps bypass DPI desync; all others stay protected.",
+            "İşaretli uygulamalar DPI desync'i atlar; diğerleri korunur.",
+        ),
     };
     let line = Line::from(Span::styled(
         truncate_text(hint, usize::from(area.width)),
@@ -1966,15 +2047,16 @@ fn render_search_bar(frame: &mut Frame<'_>, area: Rect, state: &PickerState, pal
     let width = usize::from(area.width);
     let filtered = state.filtered_indices.len();
     let total = state.all_apps.len();
-    let count_badge = if state.only_selected {
-        format!("{filtered} / {total} (selected)")
-    } else {
-        format!("{filtered} / {total} apps")
+    let count_badge = match (i18n::active_lang(), state.only_selected) {
+        (Lang::En, true) => format!("{filtered} / {total} (selected)"),
+        (Lang::En, false) => format!("{filtered} / {total} apps"),
+        (Lang::Tr, true) => format!("{filtered} / {total} (seçili)"),
+        (Lang::Tr, false) => format!("{filtered} / {total} uygulama"),
     };
     let count_len = display_width(&count_badge);
 
     let line = if state.search_focused {
-        let prompt = "Search: ";
+        let prompt = tr("Search: ", "Ara: ");
         let cursor_glyph = "▏";
         let prompt_len = display_width(prompt);
         let cursor_len = display_width(cursor_glyph);
@@ -2004,18 +2086,19 @@ fn render_search_bar(frame: &mut Frame<'_>, area: Rect, state: &PickerState, pal
         }
         Line::from(spans)
     } else if state.search_query.is_empty() {
-        let full_left = "/ search";
+        let search_word = tr(" search", " ara");
+        let full_left = tr("/ search", "/ ara");
         let sep = " · ";
         let full_len = display_width(full_left) + display_width(sep) + count_len;
         if width >= full_len {
             Line::from(vec![
                 Span::styled("/", palette.search_slash),
-                Span::styled(" search", palette.search_placeholder),
+                Span::styled(search_word, palette.search_placeholder),
                 Span::styled(sep, palette.search_placeholder),
                 Span::styled(count_badge, palette.search_count),
             ])
         } else {
-            let compact = format!("/ search · {filtered}/{total}");
+            let compact = format!("{full_left} · {filtered}/{total}");
             Line::from(Span::styled(
                 truncate_text(&compact, width).into_owned(),
                 palette.search_placeholder,
@@ -2059,25 +2142,42 @@ fn render_app_list(frame: &mut Frame<'_>, area: Rect, state: &mut PickerState, p
     if total_filtered == 0 {
         let msg = if state.search_query.is_empty() {
             if state.only_selected {
-                "No selected apps. Press 'f' to show all apps.".to_string()
+                tr(
+                    "No selected apps. Press 'f' to show all apps.",
+                    "Seçili uygulama yok. Tümünü görmek için 'f' tuşuna basın.",
+                )
+                .to_string()
             } else {
-                "No apps found. Press 'a' to add a custom executable.".to_string()
+                tr(
+                    "No apps found. Press 'a' to add a custom executable.",
+                    "Uygulama bulunamadı. Özel uygulama eklemek için 'a' tuşuna basın.",
+                )
+                .to_string()
             }
         } else {
             let sanitized_q = sanitize_inline(&state.search_query);
             let suffix = if state.search_focused {
-                "Press Esc then 'a' to add custom."
+                tr(
+                    "Press Esc then 'a' to add custom.",
+                    "Özel eklemek için Esc sonra 'a' basın.",
+                )
             } else if state.only_selected {
-                "Press 'f' for all apps or 'a' to add."
+                tr(
+                    "Press 'f' for all apps or 'a' to add.",
+                    "Tümü için 'f', eklemek için 'a' basın.",
+                )
             } else {
-                "Press 'a' to add custom."
+                tr("Press 'a' to add custom.", "Özel eklemek için 'a' basın.")
             };
             let overhead = 18 + display_width(suffix);
             let q = truncate_text(
                 &sanitized_q,
                 usize::from(area.width).saturating_sub(overhead).max(4),
             );
-            format!("No matches for \"{q}\". {suffix}")
+            match i18n::active_lang() {
+                Lang::En => format!("No matches for \"{q}\". {suffix}"),
+                Lang::Tr => format!("\"{q}\" için eşleşme yok. {suffix}"),
+            }
         };
         let line = Line::from(Span::styled(
             truncate_text(&msg, usize::from(area.width)).into_owned(),
@@ -2144,19 +2244,19 @@ fn render_app_list(frame: &mut Frame<'_>, area: Rect, state: &mut PickerState, p
 
         let (badge_text, badge_base_style) = if content_width >= 34 {
             if app.is_running {
-                ("● Running", palette.badge_running)
+                (tr("● Running", "● Çalışıyor"), palette.badge_running)
             } else if app.category == AppCategory::Custom {
-                ("Custom", palette.badge_custom)
+                (tr("Custom", "Özel"), palette.badge_custom)
             } else {
-                ("Installed", palette.badge_installed)
+                (tr("Installed", "Kurulu"), palette.badge_installed)
             }
         } else if content_width >= 26 {
             if app.is_running {
-                ("● Run", palette.badge_running)
+                (tr("● Run", "● Açık"), palette.badge_running)
             } else if app.category == AppCategory::Custom {
-                ("Custom", palette.badge_custom)
+                (tr("Custom", "Özel"), palette.badge_custom)
             } else {
-                ("Inst", palette.badge_installed)
+                (tr("Inst", "Krl"), palette.badge_installed)
             }
         } else {
             ("", palette.badge_installed)
@@ -2261,10 +2361,59 @@ fn render_footer(
     let width = usize::from(area.width);
     let key = palette.footer_key;
     let text = palette.footer_text;
-    let filter_label = if only_selected { " all · " } else { " sel · " };
+    let is_tr = i18n::active_lang() == Lang::Tr;
+    let filter_label = match (is_tr, only_selected) {
+        (false, true) => " all · ",
+        (false, false) => " sel · ",
+        (true, true) => " tüm · ",
+        (true, false) => " seç · ",
+    };
 
     let line = if search_focused {
-        if width >= 66 {
+        if is_tr {
+            if width >= 66 {
+                Line::from(vec![
+                    Span::styled("filtrele · ", text),
+                    Span::styled("↑↓", key),
+                    Span::styled(" gez · ", text),
+                    Span::styled("tab", key),
+                    Span::styled(" seç · ", text),
+                    Span::styled("enter/esc", key),
+                    Span::styled(" bitti · ", text),
+                    Span::styled("^u", key),
+                    Span::styled(" temizle", text),
+                ])
+            } else if width >= 50 {
+                Line::from(vec![
+                    Span::styled("↑↓", key),
+                    Span::styled(" gez · ", text),
+                    Span::styled("tab", key),
+                    Span::styled(" seç · ", text),
+                    Span::styled("enter/esc", key),
+                    Span::styled(" bitti · ", text),
+                    Span::styled("^u", key),
+                    Span::styled(" temizle", text),
+                ])
+            } else if width >= 37 {
+                Line::from(vec![
+                    Span::styled("↑↓", key),
+                    Span::styled(" · ", text),
+                    Span::styled("tab", key),
+                    Span::styled(" seç · ", text),
+                    Span::styled("esc", key),
+                    Span::styled(" bitti · ", text),
+                    Span::styled("^u", key),
+                    Span::styled(" temizle", text),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled("tab", key),
+                    Span::styled(" seç · ", text),
+                    Span::styled("esc", key),
+                    Span::styled(" bitti", text),
+                ])
+            }
+        } else if width >= 66 {
             Line::from(vec![
                 Span::styled("type to filter · ", text),
                 Span::styled("↑↓", key),
@@ -2304,6 +2453,66 @@ fn render_footer(
                 Span::styled(" toggle · ", text),
                 Span::styled("esc", key),
                 Span::styled(" done", text),
+            ])
+        }
+    } else if is_tr {
+        if width >= 71 {
+            Line::from(vec![
+                Span::styled("space", key),
+                Span::styled(" seç · ", text),
+                Span::styled("/", key),
+                Span::styled(" · ", text),
+                Span::styled("f", key),
+                Span::styled(filter_label, text),
+                Span::styled("tab", key),
+                Span::styled(" mod · ", text),
+                Span::styled("a", key),
+                Span::styled(" ekle · ", text),
+                Span::styled("x", key),
+                Span::styled(" sil · ", text),
+                Span::styled("enter", key),
+                Span::styled(" kaydet · ", text),
+                Span::styled("esc", key),
+            ])
+        } else if width >= 56 {
+            Line::from(vec![
+                Span::styled("spc", key),
+                Span::styled(" seç · ", text),
+                Span::styled("/", key),
+                Span::styled(" ara · ", text),
+                Span::styled("f", key),
+                Span::styled(filter_label, text),
+                Span::styled("tab", key),
+                Span::styled(" mod · ", text),
+                Span::styled("a", key),
+                Span::styled(" · ", text),
+                Span::styled("enter", key),
+                Span::styled(" · ", text),
+                Span::styled("esc", key),
+            ])
+        } else if width >= 42 {
+            Line::from(vec![
+                Span::styled("spc", key),
+                Span::styled(" seç · ", text),
+                Span::styled("/", key),
+                Span::styled(" · ", text),
+                Span::styled("f", key),
+                Span::styled(" · ", text),
+                Span::styled("tab", key),
+                Span::styled(" · ", text),
+                Span::styled("a", key),
+                Span::styled(" · ", text),
+                Span::styled("enter", key),
+                Span::styled(" · ", text),
+                Span::styled("esc", key),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("spc", key),
+                Span::styled(" · ", text),
+                Span::styled("enter", key),
+                Span::styled(" · ", text),
+                Span::styled("esc", key),
             ])
         }
     } else if width >= 71 {
@@ -2396,7 +2605,10 @@ fn render_add_modal(
             BorderType::Plain
         })
         .border_style(palette.border_accent)
-        .title(Span::styled(" Add custom app ", palette.brand))
+        .title(Span::styled(
+            tr(" Add custom app ", " Özel uygulama ekle "),
+            palette.brand,
+        ))
         .padding(if modal_w >= 24 {
             Padding::horizontal(1)
         } else {
@@ -2416,7 +2628,7 @@ fn render_add_modal(
 
     // Hint line
     if y < bottom {
-        let prompt = "e.g. discord.exe or firefox";
+        let prompt = tr("e.g. discord.exe or firefox", "örn. discord.exe veya firefox");
         frame.render_widget(
             Line::from(Span::styled(
                 truncate_text(prompt, width),
@@ -2477,21 +2689,27 @@ fn render_add_modal(
     // Footer at bottom of modal
     if bottom > inner.y {
         let footer_y = bottom - 1;
-        let line = if width >= 33 {
+        let is_tr = i18n::active_lang() == Lang::Tr;
+        let add_lbl = tr(" add · ", " ekle · ");
+        let clear_lbl = tr(" clear · ", " temizle · ");
+        let cancel_lbl = tr(" cancel", " iptal");
+        let full_w = if is_tr { 35 } else { 33 };
+        let med_w = if is_tr { 24 } else { 22 };
+        let line = if width >= full_w {
             Line::from(vec![
                 Span::styled("enter", palette.footer_key),
-                Span::styled(" add · ", palette.footer_text),
+                Span::styled(add_lbl, palette.footer_text),
                 Span::styled("^u", palette.footer_key),
-                Span::styled(" clear · ", palette.footer_text),
+                Span::styled(clear_lbl, palette.footer_text),
                 Span::styled("esc", palette.footer_key),
-                Span::styled(" cancel", palette.footer_text),
+                Span::styled(cancel_lbl, palette.footer_text),
             ])
-        } else if width >= 22 {
+        } else if width >= med_w {
             Line::from(vec![
                 Span::styled("enter", palette.footer_key),
-                Span::styled(" add · ", palette.footer_text),
+                Span::styled(add_lbl, palette.footer_text),
                 Span::styled("esc", palette.footer_key),
-                Span::styled(" cancel", palette.footer_text),
+                Span::styled(cancel_lbl, palette.footer_text),
             ])
         } else {
             Line::from(vec![
@@ -3773,6 +3991,58 @@ mod tests {
         assert!(
             min_text.contains("/日 ▏語") && min_text.contains('…'),
             "expected visible cursor and ellipsis on wide CJK minimal search render:\n{min_text}"
+        );
+    }
+
+    #[test]
+    fn renders_split_tunnel_picker_and_add_modal_in_turkish() {
+        let _guard = i18n::push_thread_lang(Some(Lang::Tr));
+        let mut state = PickerState::new(
+            SplitTunnelConfig {
+                mode: SplitTunnelMode::Exclude,
+                apps: vec!["discord.exe".to_string()],
+            },
+            sample_apps(),
+        );
+        let buf = render_to_buffer(&mut state, 80, 24, true);
+        let text = buffer_text(&buf);
+        assert!(
+            text.contains("vdpi Bölünmüş Tünelleme"),
+            "missing TR header:\n{text}"
+        );
+        assert!(text.contains("1 seçili"), "missing TR count pill:\n{text}");
+        assert!(
+            text.contains("1 Tüm uygulamalar")
+                && text.contains("2 Yalnızca seçililer")
+                && text.contains("3 Seçilileri hariç tut"),
+            "missing TR mode tabs:\n{text}"
+        );
+        assert!(text.contains("/ ara"), "missing TR search placeholder:\n{text}");
+        assert!(text.contains("uygulama"), "missing TR app count:\n{text}");
+        assert!(
+            text.contains("● Çalışıyor") && text.contains("Kurulu"),
+            "missing TR badges:\n{text}"
+        );
+        assert!(
+            text.contains("enter kaydet"),
+            "missing TR footer:\n{text}"
+        );
+
+        // Open custom add modal in Turkish.
+        state.add_modal = Some(AddModalState::default());
+        let modal_buf = render_to_buffer(&mut state, 80, 24, true);
+        let modal_text = buffer_text(&modal_buf);
+        assert!(
+            modal_text.contains("Özel uygulama ekle"),
+            "missing TR add modal title:\n{modal_text}"
+        );
+        assert!(
+            modal_text.contains("örn. discord.exe veya firefox"),
+            "missing TR add modal hint:\n{modal_text}"
+        );
+        assert!(
+            modal_text.contains("enter ekle") && modal_text.contains("esc iptal"),
+            "missing TR add modal footer:\n{modal_text}"
         );
     }
 }

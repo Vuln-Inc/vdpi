@@ -209,6 +209,7 @@ pub async fn save_gui_preferences(
 
     state.set_preferences(prefs.clone());
     let snapshot = state.last_snapshot();
+    let tray_language = prefs.language;
 
     let app_clone = app.clone();
     let prefs_for_tray = prefs;
@@ -238,6 +239,7 @@ pub async fn save_gui_preferences(
         });
     }
 
+    tray::set_tray_language(&app, tray_language);
     crate::wake_status_poller(&app);
 
     Ok(ActionResultDto {

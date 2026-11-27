@@ -10,6 +10,7 @@ export type ServiceState = "running" | "stopped" | "not_installed";
 export type SplitTunnelMode = "all" | "exclude" | "include";
 export type VpnCoexistence = "auto_yield" | "warn" | "off";
 export type ThemePreference = "system" | "dark" | "light";
+export type LanguagePreference = "system" | "en" | "tr";
 export type DiagStatus = "idle" | "running" | "pass" | "warn" | "fail";
 export type AppCategory = "popular" | "running" | "installed" | "custom";
 
@@ -83,6 +84,7 @@ export interface ActivityEvent {
 
 export interface GuiPreferences {
   theme: ThemePreference;
+  language?: LanguagePreference;
   keepInTrayOnClose: boolean;
   minimizeToTray: boolean;
   startMinimizedToTray: boolean;

@@ -1,5 +1,6 @@
 package com.vulninc.vdpi.util
 
+import com.vulninc.vdpi.ui.i18n.VdpiStrings
 import java.net.URI
 import java.time.Instant
 import java.time.ZoneId
@@ -45,9 +46,15 @@ fun formatStageLabel(stageLabel: String): String = when (stageLabel) {
     else -> stageLabel
 }
 
+fun formatStageLabel(stageLabel: String, strings: VdpiStrings): String =
+    strings.stageLabel(stageLabel)
+
 fun formatStageShort(stageNumber: Int, stageLabel: String): String {
     return "Stage $stageNumber · ${formatStageLabel(stageLabel)}"
 }
+
+fun formatStageShort(stageNumber: Int, stageLabel: String, strings: VdpiStrings): String =
+    strings.stageShort(stageNumber, stageLabel)
 
 fun formatEventTime(tsMs: Long): String {
     if (tsMs <= 0L) return "--:--:--"

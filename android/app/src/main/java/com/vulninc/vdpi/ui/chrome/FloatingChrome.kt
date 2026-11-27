@@ -103,6 +103,8 @@ import com.vulninc.vdpi.ui.components.TabIconKind
 import com.vulninc.vdpi.ui.components.VdpiMotion
 import com.vulninc.vdpi.ui.components.liquidGlass
 import com.vulninc.vdpi.ui.components.springPress
+import com.vulninc.vdpi.ui.i18n.LocalVdpiStrings
+import com.vulninc.vdpi.ui.i18n.VdpiStrings
 import com.vulninc.vdpi.ui.theme.GeistSans
 import com.vulninc.vdpi.ui.theme.VdpiTextStyles
 import com.vulninc.vdpi.ui.theme.VdpiThemeTokens
@@ -117,10 +119,16 @@ import kotlin.math.cos
 import kotlin.math.roundToInt
 import kotlin.math.sin
 
-internal enum class MainTab(val label: String, val icon: TabIconKind) {
-    TUNNEL("Tunnel", TabIconKind.TUNNEL),
-    APPS("Apps", TabIconKind.APPS),
-    SETTINGS("Settings", TabIconKind.SETTINGS),
+internal enum class MainTab(val icon: TabIconKind) {
+    TUNNEL(TabIconKind.TUNNEL),
+    APPS(TabIconKind.APPS),
+    SETTINGS(TabIconKind.SETTINGS);
+
+    fun label(strings: VdpiStrings): String = when (this) {
+        TUNNEL -> strings.tabTunnel
+        APPS -> strings.tabApps
+        SETTINGS -> strings.tabSettings
+    }
 }
 
 // ── Accessibility ──
@@ -218,6 +226,7 @@ internal fun TopReconnectGlassPopup(
     modifier: Modifier = Modifier,
 ) {
     val palette = VdpiThemeTokens.palette
+    val strings = LocalVdpiStrings.current
     val haptic = LocalHapticFeedback.current
     val density = LocalDensity.current
 
@@ -246,7 +255,7 @@ internal fun TopReconnectGlassPopup(
             .heightIn(min = if (isLandscape) 48.dp else 56.dp)
             .semantics {
                 customActions = listOf(
-                    CustomAccessibilityAction(label = "Dismiss") {
+                    CustomAccessibilityAction(label = strings.actionDismiss) {
                         currentOnDismiss()
                         true
                     },
@@ -312,7 +321,7 @@ internal fun TopReconnectGlassPopup(
 
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = "Settings Changed",
+                    text = strings.reconnectSettingsChanged,
                     fontFamily = GeistSans,
                     fontWeight = FontWeight.SemiBold,
                     fontSize = 14.sp,
@@ -322,11 +331,7 @@ internal fun TopReconnectGlassPopup(
                     overflow = TextOverflow.Ellipsis,
                 )
                 Text(
-                    text = if (pendingChangeSummary.isNotBlank()) {
-                        "Reconnect to apply · $pendingChangeSummary"
-                    } else {
-                        "Reconnect to apply"
-                    },
+                    text = strings.reconnectToApplyWithSummary(pendingChangeSummary),
                     fontFamily = GeistSans,
                     fontWeight = FontWeight.Normal,
                     fontSize = 12.sp,
@@ -370,7 +375,7 @@ internal fun TopReconnectGlassPopup(
                     contentAlignment = Alignment.Center,
                 ) {
                     Text(
-                        text = "Reconnect",
+                        text = strings.actionReconnect,
                         fontFamily = GeistSans,
                         fontWeight = FontWeight.SemiBold,
                         fontSize = 13.sp,
@@ -402,7 +407,7 @@ internal fun TopReconnectGlassPopup(
                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         onDismiss()
                     }
-                    .semantics { contentDescription = "Dismiss" },
+                    .semantics { contentDescription = strings.actionDismiss },
                 contentAlignment = Alignment.Center,
             ) {
                 Box(
@@ -446,6 +451,7 @@ internal fun FloatingLiveTunnelAccessoryPill(
     // Scoped locally so 1Hz telemetry ticks never recompose MainActivity, AppsScreen, or SettingsScreen.
     val runtime by tunnelState.collectAsStateWithLifecycle()
     val palette = VdpiThemeTokens.palette
+    val strings = LocalVdpiStrings.current
     val haptic = LocalHapticFeedback.current
     val pillInteraction = remember { MutableInteractionSource() }
     val actionInteraction = remember { MutableInteractionSource() }
@@ -466,17 +472,17 @@ internal fun FloatingLiveTunnelAccessoryPill(
     )
 
     val title = when (phase) {
-        TunnelPhase.CONNECTED -> "Connected"
-        TunnelPhase.CONNECTING -> "Connecting..."
-        TunnelPhase.ERROR -> "Tunnel Error"
-        TunnelPhase.DISCONNECTED -> "Disconnected"
+        TunnelPhase.CONNECTED -> strings.statusConnected
+        TunnelPhase.CONNECTING -> strings.statusConnectingEllipsis
+        TunnelPhase.ERROR -> strings.statusTunnelError
+        TunnelPhase.DISCONNECTED -> strings.statusDisconnected
     }
 
     val nonConnectedMetric = when (phase) {
         TunnelPhase.CONNECTED -> ""
-        TunnelPhase.CONNECTING -> "Establishing tunnel"
-        TunnelPhase.ERROR -> runtime.errorMessage?.takeIf { it.isNotBlank() } ?: "Connection interrupted"
-        TunnelPhase.DISCONNECTED -> "Tap to open tunnel"
+        TunnelPhase.CONNECTING -> strings.accessoryEstablishingTunnel
+        TunnelPhase.ERROR -> runtime.errorMessage?.takeIf { it.isNotBlank() } ?: strings.accessoryConnectionInterrupted
+        TunnelPhase.DISCONNECTED -> strings.accessoryTapToOpen
     }
 
     val metricStyle = remember {
@@ -597,7 +603,7 @@ internal fun FloatingLiveTunnelAccessoryPill(
                         }
                     }
                     .semantics {
-                        contentDescription = if (isError) "Reconnect tunnel" else "Disconnect tunnel"
+                        contentDescription = if (isError) strings.cdReconnectTunnel else strings.cdDisconnectTunnel
                     },
                 contentAlignment = Alignment.Center,
             ) {
@@ -879,6 +885,8 @@ private fun RowScope.FloatingTabBarItem(
     onSelect: () -> Unit,
 ) {
     val palette = VdpiThemeTokens.palette
+    val strings = LocalVdpiStrings.current
+    val tabLabel = tab.label(strings)
     val interactionSource = remember { MutableInteractionSource() }
     val tint by animateColorAsState(
         targetValue = if (selected) palette.accent else palette.inkSecondary,
@@ -945,7 +953,7 @@ private fun RowScope.FloatingTabBarItem(
                     }
                 }
                 Text(
-                    text = tab.label,
+                    text = tabLabel,
                     style = VdpiTextStyles.tabLabel.copy(
                         fontSize = 12.sp,
                         fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
@@ -985,7 +993,7 @@ private fun RowScope.FloatingTabBarItem(
                 }
                 Spacer(Modifier.height(2.dp))
                 Text(
-                    text = tab.label,
+                    text = tabLabel,
                     style = VdpiTextStyles.tabLabel.copy(
                         fontSize = 11.sp,
                         fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,

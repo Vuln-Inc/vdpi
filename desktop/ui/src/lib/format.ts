@@ -1,3 +1,5 @@
+import type { ResolvedLanguage } from "../i18n/context";
+
 const KB = 1024;
 const MB = KB * 1024;
 const GB = MB * 1024;
@@ -212,26 +214,40 @@ function formatIpv6Canonical(segments: readonly number[]): string {
 
 function validateDnsIpv4Octets(
   octets: readonly [number, number, number, number],
+  lang: ResolvedLanguage = "en",
 ): string | null {
   const [a, b, c, d] = octets;
   if (a === 0 && b === 0 && c === 0 && d === 0) {
-    return "DNS IP cannot be 0.0.0.0.";
+    return lang === "tr"
+      ? "DNS IP adresi 0.0.0.0 olamaz."
+      : "DNS IP cannot be 0.0.0.0.";
   }
   if (a >= 224 && a <= 239) {
-    return "DNS IP cannot be a multicast address.";
+    return lang === "tr"
+      ? "DNS IP adresi çoklu yayın (multicast) adresi olamaz."
+      : "DNS IP cannot be a multicast address.";
   }
   if (a === 255 && b === 255 && c === 255 && d === 255) {
-    return "DNS IP cannot be a broadcast address.";
+    return lang === "tr"
+      ? "DNS IP adresi yayın (broadcast) adresi olamaz."
+      : "DNS IP cannot be a broadcast address.";
   }
   return null;
 }
 
-function validateDnsIpv6Segments(segments: readonly number[]): string | null {
+function validateDnsIpv6Segments(
+  segments: readonly number[],
+  lang: ResolvedLanguage = "en",
+): string | null {
   if (segments.every((s) => s === 0)) {
-    return "DNS IP cannot be ::.";
+    return lang === "tr"
+      ? "DNS IP adresi :: olamaz."
+      : "DNS IP cannot be ::.";
   }
   if ((segments[0] & 0xff00) === 0xff00) {
-    return "DNS IP cannot be a multicast address.";
+    return lang === "tr"
+      ? "DNS IP adresi çoklu yayın (multicast) adresi olamaz."
+      : "DNS IP cannot be a multicast address.";
   }
   if (
     segments[0] === 0 &&
@@ -241,12 +257,15 @@ function validateDnsIpv6Segments(segments: readonly number[]): string | null {
     segments[4] === 0 &&
     segments[5] === 0xffff
   ) {
-    return validateDnsIpv4Octets([
-      (segments[6] >> 8) & 0xff,
-      segments[6] & 0xff,
-      (segments[7] >> 8) & 0xff,
-      segments[7] & 0xff,
-    ]);
+    return validateDnsIpv4Octets(
+      [
+        (segments[6] >> 8) & 0xff,
+        segments[6] & 0xff,
+        (segments[7] >> 8) & 0xff,
+        segments[7] & 0xff,
+      ],
+      lang,
+    );
   }
   return null;
 }
@@ -382,7 +401,10 @@ function isAsciiHexDigit(ch: string): boolean {
   );
 }
 
-function validateDohPathAndQuery(suffix: string): string | null {
+function validateDohPathAndQuery(
+  suffix: string,
+  lang: ResolvedLanguage = "en",
+): string | null {
   for (let i = 0; i < suffix.length; ) {
     const ch = suffix[i];
     if (ch === "%") {
@@ -391,13 +413,17 @@ function validateDohPathAndQuery(suffix: string): string | null {
         !isAsciiHexDigit(suffix[i + 1]) ||
         !isAsciiHexDigit(suffix[i + 2])
       ) {
-        return "Invalid percent-encoding in DoH URL path.";
+        return lang === "tr"
+          ? "DoH URL yolunda geçersiz yüzde kodlaması."
+          : "Invalid percent-encoding in DoH URL path.";
       }
       i += 3;
       continue;
     }
     if (!/^[A-Za-z0-9\-._~/?:@!$&'()*+,;=]$/.test(ch)) {
-      return "Invalid character in DoH URL path or query.";
+      return lang === "tr"
+        ? "DoH URL yolunda veya sorgusunda geçersiz karakter."
+        : "Invalid character in DoH URL path or query.";
     }
     i += 1;
   }
@@ -969,15 +995,20 @@ export function isKnownPublicDohIp(ip: string): boolean {
  * `ff00::/8`), IPv4-mapped invalid ranges, leading-zero IPv4, userinfo, fragments,
  * and invalid percent-encoding (`%ZZ`).
  */
-export function validateCustomDnsClient(raw: string): CustomDnsValidation {
+export function validateCustomDnsClient(
+  raw: string,
+  lang: ResolvedLanguage = "en",
+): CustomDnsValidation {
+  const tr = lang === "tr";
   const trimmed = raw.trim();
   if (trimmed.length === 0) {
     return {
       valid: false,
       kind: "empty",
       normalized: "",
-      error:
-        "Enter an IPv4 address, IPv6 address, or https://.../dns-query URL.",
+      error: tr
+        ? "Bir IPv4 adresi, IPv6 adresi veya https://.../dns-query URL'si girin."
+        : "Enter an IPv4 address, IPv6 address, or https://.../dns-query URL.",
     };
   }
 
@@ -986,7 +1017,9 @@ export function validateCustomDnsClient(raw: string): CustomDnsValidation {
       valid: false,
       kind: "invalid",
       normalized: trimmed,
-      error: "DNS server cannot contain control characters or newlines.",
+      error: tr
+        ? "DNS sunucusu denetim karakteri veya yeni satır içeremez."
+        : "DNS server cannot contain control characters or newlines.",
     };
   }
 
@@ -995,7 +1028,9 @@ export function validateCustomDnsClient(raw: string): CustomDnsValidation {
       valid: false,
       kind: "invalid",
       normalized: trimmed,
-      error: "DNS server cannot contain spaces.",
+      error: tr
+        ? "DNS sunucusu boşluk içeremez."
+        : "DNS server cannot contain spaces.",
     };
   }
 
@@ -1007,8 +1042,9 @@ export function validateCustomDnsClient(raw: string): CustomDnsValidation {
         valid: false,
         kind: "invalid",
         normalized: trimmed,
-        error:
-          "Plain http:// is not supported for DoH. Use https:// instead.",
+        error: tr
+          ? "DoH için düz http:// desteklenmez. Bunun yerine https:// kullanın."
+          : "Plain http:// is not supported for DoH. Use https:// instead.",
       };
     }
     if (scheme !== "https") {
@@ -1016,7 +1052,9 @@ export function validateCustomDnsClient(raw: string): CustomDnsValidation {
         valid: false,
         kind: "invalid",
         normalized: trimmed,
-        error: "Only https:// URLs are supported for DNS-over-HTTPS.",
+        error: tr
+          ? "DNS-over-HTTPS için yalnızca https:// URL'leri desteklenir."
+          : "Only https:// URLs are supported for DNS-over-HTTPS.",
       };
     }
 
@@ -1026,8 +1064,9 @@ export function validateCustomDnsClient(raw: string): CustomDnsValidation {
         valid: false,
         kind: "invalid",
         normalized: trimmed,
-        error:
-          "Enter a hostname or IP after https:// (e.g. https://dns.nextdns.io/profile).",
+        error: tr
+          ? "https:// sonrasında bir ana bilgisayar adı veya IP girin (ör. https://dns.nextdns.io/profil)."
+          : "Enter a hostname or IP after https:// (e.g. https://dns.nextdns.io/profile).",
       };
     }
     if (rest.includes("#")) {
@@ -1035,7 +1074,9 @@ export function validateCustomDnsClient(raw: string): CustomDnsValidation {
         valid: false,
         kind: "invalid",
         normalized: trimmed,
-        error: "DoH URL cannot contain a '#' fragment.",
+        error: tr
+          ? "DoH URL'si '#' parçası içeremez."
+          : "DoH URL cannot contain a '#' fragment.",
       };
     }
     if (rest.includes("\\")) {
@@ -1043,7 +1084,9 @@ export function validateCustomDnsClient(raw: string): CustomDnsValidation {
         valid: false,
         kind: "invalid",
         normalized: trimmed,
-        error: "DoH URL cannot contain backslashes.",
+        error: tr
+          ? "DoH URL'si ters eğik çizgi içeremez."
+          : "DoH URL cannot contain backslashes.",
       };
     }
 
@@ -1056,7 +1099,9 @@ export function validateCustomDnsClient(raw: string): CustomDnsValidation {
         valid: false,
         kind: "invalid",
         normalized: trimmed,
-        error: "DoH URL is missing a hostname or IP before the path.",
+        error: tr
+          ? "DoH URL'sinde yoldan önce ana bilgisayar adı veya IP eksik."
+          : "DoH URL is missing a hostname or IP before the path.",
       };
     }
     if (authority.includes("@")) {
@@ -1064,7 +1109,9 @@ export function validateCustomDnsClient(raw: string): CustomDnsValidation {
         valid: false,
         kind: "invalid",
         normalized: trimmed,
-        error: "DoH URL cannot contain username or password credentials (@).",
+        error: tr
+          ? "DoH URL'si kullanıcı adı veya parola bilgisi (@) içeremez."
+          : "DoH URL cannot contain username or password credentials (@).",
       };
     }
 
@@ -1078,7 +1125,9 @@ export function validateCustomDnsClient(raw: string): CustomDnsValidation {
           valid: false,
           kind: "invalid",
           normalized: trimmed,
-          error: "Unclosed IPv6 bracket in DoH URL.",
+          error: tr
+            ? "DoH URL'sinde kapatılmamış IPv6 köşeli ayracı."
+            : "Unclosed IPv6 bracket in DoH URL.",
         };
       }
       const ipv6Inner = authority.slice(1, closeIdx);
@@ -1088,10 +1137,12 @@ export function validateCustomDnsClient(raw: string): CustomDnsValidation {
           valid: false,
           kind: "invalid",
           normalized: trimmed,
-          error: "Invalid IPv6 host inside DoH URL.",
+          error: tr
+            ? "DoH URL'sinde geçersiz IPv6 ana bilgisayarı."
+            : "Invalid IPv6 host inside DoH URL.",
         };
       }
-      const v6Err = validateDnsIpv6Segments(v6);
+      const v6Err = validateDnsIpv6Segments(v6, lang);
       if (v6Err) {
         return {
           valid: false,
@@ -1107,7 +1158,9 @@ export function validateCustomDnsClient(raw: string): CustomDnsValidation {
             valid: false,
             kind: "invalid",
             normalized: trimmed,
-            error: "Invalid port number in DoH URL (must be 1-65535).",
+            error: tr
+              ? "DoH URL'sinde geçersiz port numarası (1-65535 aralığında olmalı)."
+              : "Invalid port number in DoH URL (must be 1-65535).",
           };
         }
         explicitPort = Number(tail.slice(1));
@@ -1119,7 +1172,9 @@ export function validateCustomDnsClient(raw: string): CustomDnsValidation {
           valid: false,
           kind: "invalid",
           normalized: trimmed,
-          error: "Malformed brackets in DoH URL authority.",
+          error: tr
+            ? "DoH URL yetkisinde hatalı köşeli ayraçlar."
+            : "Malformed brackets in DoH URL authority.",
         };
       }
       const colonIdx = authority.indexOf(":");
@@ -1128,8 +1183,9 @@ export function validateCustomDnsClient(raw: string): CustomDnsValidation {
           valid: false,
           kind: "invalid",
           normalized: trimmed,
-          error:
-            "Wrap IPv6 addresses in brackets inside DoH URLs (e.g. https://[2606:4700:4700::1111]/dns-query).",
+          error: tr
+            ? "DoH URL'lerindeki IPv6 adreslerini köşeli ayraç içine alın (ör. https://[2606:4700:4700::1111]/dns-query)."
+            : "Wrap IPv6 addresses in brackets inside DoH URLs (e.g. https://[2606:4700:4700::1111]/dns-query).",
         };
       }
       const hostRaw = colonIdx >= 0 ? authority.slice(0, colonIdx) : authority;
@@ -1140,7 +1196,9 @@ export function validateCustomDnsClient(raw: string): CustomDnsValidation {
             valid: false,
             kind: "invalid",
             normalized: trimmed,
-            error: "Invalid port number in DoH URL (must be 1-65535).",
+            error: tr
+              ? "DoH URL'sinde geçersiz port numarası (1-65535 aralığında olmalı)."
+              : "Invalid port number in DoH URL (must be 1-65535).",
           };
         }
         explicitPort = Number(portStr);
@@ -1150,12 +1208,14 @@ export function validateCustomDnsClient(raw: string): CustomDnsValidation {
           valid: false,
           kind: "invalid",
           normalized: trimmed,
-          error: "DoH URL is missing a hostname or IP.",
+          error: tr
+            ? "DoH URL'sinde ana bilgisayar adı veya IP eksik."
+            : "DoH URL is missing a hostname or IP.",
         };
       }
       const v4 = parseIpv4Octets(hostRaw);
       if (v4) {
-        const v4Err = validateDnsIpv4Octets(v4);
+        const v4Err = validateDnsIpv4Octets(v4, lang);
         if (v4Err) {
           return {
             valid: false,
@@ -1175,14 +1235,15 @@ export function validateCustomDnsClient(raw: string): CustomDnsValidation {
           valid: false,
           kind: "invalid",
           normalized: trimmed,
-          error:
-            "Enter a valid hostname or IP address in the https:// DoH URL.",
+          error: tr
+            ? "https:// DoH URL'sinde geçerli bir ana bilgisayar adı veya IP adresi girin."
+            : "Enter a valid hostname or IP address in the https:// DoH URL.",
         };
       }
     }
 
     if (rawSuffix.length > 0) {
-      const pathErr = validateDohPathAndQuery(rawSuffix);
+      const pathErr = validateDohPathAndQuery(rawSuffix, lang);
       if (pathErr) {
         return {
           valid: false,
@@ -1217,7 +1278,7 @@ export function validateCustomDnsClient(raw: string): CustomDnsValidation {
         valid: false,
         kind: "invalid",
         normalized: trimmed,
-        error: "Unmatched IPv6 brackets.",
+        error: tr ? "Eşleşmeyen IPv6 köşeli ayraçları." : "Unmatched IPv6 brackets.",
       };
     }
     const inner = trimmed.slice(1, -1);
@@ -1227,10 +1288,12 @@ export function validateCustomDnsClient(raw: string): CustomDnsValidation {
         valid: false,
         kind: "invalid",
         normalized: trimmed,
-        error: "Enter a valid IPv6 address inside brackets.",
+        error: tr
+          ? "Köşeli ayraç içinde geçerli bir IPv6 adresi girin."
+          : "Enter a valid IPv6 address inside brackets.",
       };
     }
-    const v6Err = validateDnsIpv6Segments(v6);
+    const v6Err = validateDnsIpv6Segments(v6, lang);
     if (v6Err) {
       return {
         valid: false,
@@ -1250,7 +1313,7 @@ export function validateCustomDnsClient(raw: string): CustomDnsValidation {
 
   const v4 = parseIpv4Octets(trimmed);
   if (v4) {
-    const v4Err = validateDnsIpv4Octets(v4);
+    const v4Err = validateDnsIpv4Octets(v4, lang);
     if (v4Err) {
       return {
         valid: false,
@@ -1270,7 +1333,7 @@ export function validateCustomDnsClient(raw: string): CustomDnsValidation {
 
   const v6 = parseIpv6Segments(trimmed);
   if (v6) {
-    const v6Err = validateDnsIpv6Segments(v6);
+    const v6Err = validateDnsIpv6Segments(v6, lang);
     if (v6Err) {
       return {
         valid: false,
@@ -1294,8 +1357,9 @@ export function validateCustomDnsClient(raw: string): CustomDnsValidation {
       valid: false,
       kind: "invalid",
       normalized: trimmed,
-      error:
-        "For a DoH hostname, include the https:// prefix (e.g. https://dns.nextdns.io/profile-id).",
+      error: tr
+        ? "DoH ana bilgisayar adı için https:// önekini ekleyin (ör. https://dns.nextdns.io/profil-id)."
+        : "For a DoH hostname, include the https:// prefix (e.g. https://dns.nextdns.io/profile-id).",
     };
   }
 
@@ -1303,8 +1367,9 @@ export function validateCustomDnsClient(raw: string): CustomDnsValidation {
     valid: false,
     kind: "invalid",
     normalized: trimmed,
-    error:
-      "Enter a valid IPv4 address (e.g. 1.1.1.1), IPv6 address, or https://.../dns-query URL.",
+    error: tr
+      ? "Geçerli bir IPv4 adresi (ör. 1.1.1.1), IPv6 adresi veya https://.../dns-query URL'si girin."
+      : "Enter a valid IPv4 address (e.g. 1.1.1.1), IPv6 address, or https://.../dns-query URL.",
   };
 }
 
@@ -1324,77 +1389,111 @@ export function extractExecutableName(raw: string): string {
  * domains, subdomains, multi-label wildcards, reserved local wildcards, and "localhost".
  * Returns null when valid, or a short user-facing error message when invalid.
  */
-export function validateDomainRule(raw: string): string | null {
+export function validateDomainRule(
+  raw: string,
+  lang: ResolvedLanguage = "en",
+): string | null {
+  const tr = lang === "tr";
   if (CONTROL_CHAR_RE.test(raw)) {
-    return "Domain rule cannot contain control characters or newlines.";
+    return tr
+      ? "Alan adı kuralı denetim karakteri veya yeni satır içeremez."
+      : "Domain rule cannot contain control characters or newlines.";
   }
 
   const trimmed = raw.trim();
   if (trimmed.length === 0) {
-    return "Domain rule cannot be empty.";
+    return tr ? "Alan adı kuralı boş olamaz." : "Domain rule cannot be empty.";
   }
 
   if (/\s/.test(trimmed)) {
-    return "Domain rule cannot contain spaces.";
+    return tr
+      ? "Alan adı kuralı boşluk içeremez."
+      : "Domain rule cannot contain spaces.";
   }
 
   if (trimmed.includes("://")) {
-    return "Enter a domain name without a URL scheme (e.g. example.com or *.example.com).";
+    return tr
+      ? "URL şeması olmadan bir alan adı girin (ör. example.com veya *.example.com)."
+      : "Enter a domain name without a URL scheme (e.g. example.com or *.example.com).";
   }
 
   if (/[/?#]/.test(trimmed)) {
-    return "Enter a domain name without paths or query strings.";
+    return tr
+      ? "Yol veya sorgu dizesi olmadan bir alan adı girin."
+      : "Enter a domain name without paths or query strings.";
   }
 
   if (trimmed.includes(":")) {
-    return "Enter a domain name without a port number.";
+    return tr
+      ? "Port numarası olmadan bir alan adı girin."
+      : "Enter a domain name without a port number.";
   }
 
   const isWildcard = trimmed.startsWith("*.");
   const host = isWildcard ? trimmed.slice(2) : trimmed;
 
   if (isWildcard && host.length === 0) {
-    return "Enter a domain name after '*.'.";
+    return tr
+      ? "'*.' sonrasında bir alan adı girin."
+      : "Enter a domain name after '*.'.";
   }
 
   if (host.includes("*")) {
-    return "Wildcards are only supported as a leading '*.' prefix (e.g. *.example.com).";
+    return tr
+      ? "Joker karakterler yalnızca başta '*.' öneki olarak desteklenir (ör. *.example.com)."
+      : "Wildcards are only supported as a leading '*.' prefix (e.g. *.example.com).";
   }
 
   if (host.startsWith(".") || host.endsWith(".")) {
-    return "Domain name cannot start or end with a dot.";
+    return tr
+      ? "Alan adı nokta ile başlayamaz veya bitemez."
+      : "Domain name cannot start or end with a dot.";
   }
 
   if (host.includes("..")) {
-    return "Domain name cannot contain consecutive dots.";
+    return tr
+      ? "Alan adı ardışık nokta içeremez."
+      : "Domain name cannot contain consecutive dots.";
   }
 
   if (host.length > MAX_DOMAIN_LENGTH) {
-    return `Domain name is too long (maximum ${MAX_DOMAIN_LENGTH} characters).`;
+    return tr
+      ? `Alan adı çok uzun (en fazla ${MAX_DOMAIN_LENGTH} karakter).`
+      : `Domain name is too long (maximum ${MAX_DOMAIN_LENGTH} characters).`;
   }
 
   const labels = host.split(".");
   const lowerHost = toAsciiLower(host);
   if (isWildcard && labels.length < 2) {
     if (!LOCAL_WILDCARD_TLDS.has(lowerHost)) {
-      return "Wildcard rules cannot target a bare top-level domain (e.g. use *.example.com).";
+      return tr
+        ? "Joker kurallar tek başına bir üst düzey alan adını hedefleyemez (ör. *.example.com kullanın)."
+        : "Wildcard rules cannot target a bare top-level domain (e.g. use *.example.com).";
     }
   } else if (!isWildcard && labels.length < 2 && lowerHost !== "localhost") {
-    return "Enter a full domain name (e.g. example.com or *.example.com).";
+    return tr
+      ? "Tam bir alan adı girin (ör. example.com veya *.example.com)."
+      : "Enter a full domain name (e.g. example.com or *.example.com).";
   }
 
   for (const label of labels) {
     if (label.length === 0 || label.length > MAX_LABEL_LENGTH) {
-      return `Each domain label must be between 1 and ${MAX_LABEL_LENGTH} characters.`;
+      return tr
+        ? `Her alan adı etiketi 1 ile ${MAX_LABEL_LENGTH} karakter arasında olmalıdır.`
+        : `Each domain label must be between 1 and ${MAX_LABEL_LENGTH} characters.`;
     }
     if (!DNS_LABEL_RE.test(label)) {
-      return "Domain labels may only use letters, digits, and interior hyphens.";
+      return tr
+        ? "Alan adı etiketleri yalnızca harf, rakam ve iç tire içerebilir."
+        : "Domain labels may only use letters, digits, and interior hyphens.";
     }
   }
 
   const tld = labels[labels.length - 1];
   if (tld.length < 2 || !/[a-z]/i.test(tld)) {
-    return "Domain must end with a valid top-level domain (not an IP address).";
+    return tr
+      ? "Alan adı geçerli bir üst düzey alan adıyla bitmelidir (IP adresi değil)."
+      : "Domain must end with a valid top-level domain (not an IP address).";
   }
 
   return null;

@@ -993,7 +993,8 @@ mod tests {
 
     use super::*;
     use crate::models::{
-        EngineModeDto, ServiceStateDto, SplitTunnelModeDto, ThemePreferenceDto, VpnCoexistenceDto,
+        EngineModeDto, LanguagePreferenceDto, ServiceStateDto, SplitTunnelModeDto,
+        ThemePreferenceDto, VpnCoexistenceDto,
     };
     use crate::state::STATIC_PROBE_CACHE_TTL;
 
@@ -1229,6 +1230,7 @@ mod tests {
     fn settings_payload_maps_defaults_cleanly() {
         let prefs = GuiPreferencesDto {
             theme: ThemePreferenceDto::Dark,
+            language: LanguagePreferenceDto::System,
             keep_in_tray_on_close: true,
             minimize_to_tray: false,
             start_minimized_to_tray: true,

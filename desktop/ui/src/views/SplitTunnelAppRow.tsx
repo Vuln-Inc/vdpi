@@ -2,6 +2,8 @@ import { memo, useEffect, useId, useState } from "react";
 import type { KeyboardEvent, MouseEvent } from "react";
 import { IconChevron } from "../components/Icons";
 import { Switch } from "../components/Switch";
+import { useLang, type ResolvedLanguage } from "../i18n/context";
+import { tSplit } from "../i18n/split";
 import type { DiscoveredAppItem, SplitTunnelMode } from "../types";
 
 export interface SplitTunnelAppRowProps {
@@ -371,14 +373,19 @@ export function getMonogramToneIndex(key: string): number {
   return (hash >>> 0) % MONOGRAM_TONE_COUNT;
 }
 
-function buildSwitchLabel(app: DiscoveredAppItem, mode: SplitTunnelMode): string {
+function buildSwitchLabel(
+  app: DiscoveredAppItem,
+  mode: SplitTunnelMode,
+  lang: ResolvedLanguage,
+): string {
+  const vars = { name: app.displayName, exe: app.exeName };
   if (mode === "exclude") {
-    return `Exclude ${app.displayName} (${app.exeName})`;
+    return tSplit(lang, "switchExclude", vars);
   }
   if (mode === "include") {
-    return `Include ${app.displayName} (${app.exeName})`;
+    return tSplit(lang, "switchInclude", vars);
   }
-  return `${app.displayName} (${app.exeName}) - switches to Exclude Selected`;
+  return tSplit(lang, "switchAll", vars);
 }
 
 export const SplitTunnelAppRow = memo(function SplitTunnelAppRow({
@@ -389,6 +396,7 @@ export const SplitTunnelAppRow = memo(function SplitTunnelAppRow({
   onToggle,
   className,
 }: SplitTunnelAppRowProps) {
+  const { lang } = useLang();
   const [companionsOpen, setCompanionsOpen] = useState(false);
   const companionsPanelId = useId();
 
@@ -406,9 +414,19 @@ export const SplitTunnelAppRow = memo(function SplitTunnelAppRow({
     companionCount > 0 ? app.companions.join(", ") : undefined;
   const companionsAriaLabel =
     companionCount > 0
-      ? `${companionsOpen ? "Hide" : "Show"} ${companionCount} companion ${companionCount === 1 ? "process" : "processes"} matched with ${app.displayName}`
+      ? tSplit(
+          lang,
+          companionsOpen
+            ? companionCount === 1
+              ? "companionAriaHideOne"
+              : "companionAriaHideMany"
+            : companionCount === 1
+              ? "companionAriaShowOne"
+              : "companionAriaShowMany",
+          { count: companionCount, name: app.displayName },
+        )
       : undefined;
-  const switchLabel = buildSwitchLabel(app, mode);
+  const switchLabel = buildSwitchLabel(app, mode, lang);
 
   const handleRowClick = (event: MouseEvent<HTMLDivElement>) => {
     if (isDisabled) return;
@@ -481,7 +499,7 @@ export const SplitTunnelAppRow = memo(function SplitTunnelAppRow({
                 className="split-app-row__running-dot"
                 aria-hidden="true"
               />
-              Running
+              {tSplit(lang, "badgeRunning")}
             </span>
           ) : null}
 
@@ -497,8 +515,13 @@ export const SplitTunnelAppRow = memo(function SplitTunnelAppRow({
               onKeyDown={handleCompanionsKeyDown}
             >
               <span>
-                +{companionCount}{" "}
-                {companionCount === 1 ? "companion" : "companions"}
+                {tSplit(
+                  lang,
+                  companionCount === 1
+                    ? "companionBadgeOne"
+                    : "companionBadgeMany",
+                  { count: companionCount },
+                )}
               </span>
               <IconChevron
                 size={10}
@@ -523,11 +546,13 @@ export const SplitTunnelAppRow = memo(function SplitTunnelAppRow({
           id={companionsPanelId}
           className="split-app-row__companions-details"
           role="region"
-          aria-label={`${app.displayName} companion processes`}
+          aria-label={tSplit(lang, "companionRegionAria", {
+            name: app.displayName,
+          })}
           onClick={(event) => event.stopPropagation()}
         >
           <span className="split-app-row__companions-note">
-            Matched together with {app.displayName}:
+            {tSplit(lang, "companionNote", { name: app.displayName })}
           </span>
           <span className="split-app-row__companions-list">
             {app.companions.join(", ")}

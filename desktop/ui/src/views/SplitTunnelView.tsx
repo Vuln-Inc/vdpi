@@ -11,6 +11,8 @@ import type { FormEvent, KeyboardEvent } from "react";
 import { IconPlus, IconRefresh, IconSearch } from "../components/Icons";
 import { InlineBanner } from "../components/InlineBanner";
 import type { ToastTone } from "../components/ToastStack";
+import { useLang, type ResolvedLanguage } from "../i18n/context";
+import { localizePresetLabel, tSplit } from "../i18n/split";
 import { extractExecutableName, foldTurkish } from "../lib/format";
 import {
   getSplitTunnel,
@@ -60,25 +62,27 @@ const APP_NAME_COLLATOR = new Intl.Collator(undefined, {
   sensitivity: "base",
 });
 
-const MODE_OPTIONS: readonly ModeOption[] = [
-  {
-    value: "all",
-    label: "Protect All Apps",
-    description: "Protect every application with vdpi.",
-  },
-  {
-    value: "exclude",
-    label: "Exclude Selected",
-    description:
-      "Selected apps connect directly (skip vdpi); protect everything else with vdpi.",
-  },
-  {
-    value: "include",
-    label: "Include Only",
-    description:
-      "Protect only selected apps with vdpi; all other apps connect directly (skip vdpi).",
-  },
-];
+const MODE_VALUES: readonly SplitTunnelMode[] = ["all", "exclude", "include"];
+
+function getModeOptions(lang: ResolvedLanguage): readonly ModeOption[] {
+  return [
+    {
+      value: "all",
+      label: tSplit(lang, "modeAllLabel"),
+      description: tSplit(lang, "modeAllDesc"),
+    },
+    {
+      value: "exclude",
+      label: tSplit(lang, "modeExcludeLabel"),
+      description: tSplit(lang, "modeExcludeDesc"),
+    },
+    {
+      value: "include",
+      label: tSplit(lang, "modeIncludeLabel"),
+      description: tSplit(lang, "modeIncludeDesc"),
+    },
+  ];
+}
 
 const FALLBACK_PRESETS: readonly SplitTunnelPreset[] = [
   {
@@ -824,13 +828,16 @@ function normalizeAppKey(raw: string): string {
   return stripped.trim();
 }
 
-function deriveDisplayName(exeName: string): string {
+function deriveDisplayName(
+  exeName: string,
+  fallbackName = "Custom App",
+): string {
   const stem = exeName
     .trim()
     .replace(/\.(exe|app|bin)$/i, "")
     .replace(/[_-]+/g, " ")
     .trim();
-  if (!stem) return exeName.trim() || "Custom App";
+  if (!stem) return exeName.trim() || fallbackName;
   return stem
     .split(/\s+/)
     .map((part) => (part ? part[0].toUpperCase() + part.slice(1) : ""))
@@ -925,8 +932,10 @@ function isWindowsShortcutInput(raw: string): boolean {
   return /\.lnk(?:["']?(?:\s|$))/i.test(raw.trim());
 }
 
-function getModeLabel(mode: SplitTunnelMode): string {
-  return MODE_OPTIONS.find((opt) => opt.value === mode)?.label ?? mode;
+function getModeLabel(mode: SplitTunnelMode, lang: ResolvedLanguage): string {
+  if (mode === "all") return tSplit(lang, "modeAllLabel");
+  if (mode === "exclude") return tSplit(lang, "modeExcludeLabel");
+  return tSplit(lang, "modeIncludeLabel");
 }
 
 function getErrorMessage(error: unknown, fallback: string): string {
@@ -948,6 +957,10 @@ export const SplitTunnelView = memo(function SplitTunnelView({
   onDirtyChange,
   onSwitchToTun,
 }: SplitTunnelViewProps) {
+  const { lang } = useLang();
+  const langRef = useRef(lang);
+  langRef.current = lang;
+
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -1070,14 +1083,14 @@ export const SplitTunnelView = memo(function SplitTunnelView({
           ).length;
           onPushToast?.(
             "info",
-            `Refreshed running apps (${runningCount} running)`,
+            tSplit(langRef.current, "refreshedToast", { count: runningCount }),
           );
         }
       } catch (error) {
         if (!mountedRef.current) return;
         const message = getErrorMessage(
           error,
-          "Failed to load split tunneling configuration.",
+          tSplit(langRef.current, "loadFailed"),
         );
         setErrorBanner(message);
         if (preserveDraft) {
@@ -1403,7 +1416,9 @@ export const SplitTunnelView = memo(function SplitTunnelView({
       ) {
         onPushToastRef.current?.(
           "warn",
-          `Maximum ${MAX_SPLIT_TUNNEL_APPS} apps allowed - remove one before adding another.`,
+          tSplit(langRef.current, "maxAppsLimit", {
+            max: MAX_SPLIT_TUNNEL_APPS,
+          }),
         );
         return;
       }
@@ -1426,9 +1441,13 @@ export const SplitTunnelView = memo(function SplitTunnelView({
           appByKeyRef.current.get(key)?.displayName || canonicalExe;
         onPushToastRef.current?.(
           "info",
-          isCurrentlySelected
-            ? `Switched to Exclude Selected and updated ${displayName}`
-            : `Switched to Exclude Selected - ${displayName} will connect directly (skip vdpi)`,
+          tSplit(
+            langRef.current,
+            isCurrentlySelected
+              ? "toastSwitchExcludeUpdated"
+              : "toastSwitchExcludeSkip",
+            { name: displayName },
+          ),
         );
       }
     },
@@ -1484,7 +1503,10 @@ export const SplitTunnelView = memo(function SplitTunnelView({
         if (addedCount === 0 && skippedCount > 0) {
           onPushToastRef.current?.(
             "warn",
-            `Maximum ${MAX_SPLIT_TUNNEL_APPS} apps allowed - remove an app before adding ${preset.label}.`,
+            tSplit(langRef.current, "maxAppsLimitPreset", {
+              max: MAX_SPLIT_TUNNEL_APPS,
+              label: localizePresetLabel(langRef.current, preset),
+            }),
           );
           return;
         }
@@ -1516,21 +1538,32 @@ export const SplitTunnelView = memo(function SplitTunnelView({
       draftSelectedRef.current = next;
       setDraftSelected(next);
 
+      const localizedPresetLabel = localizePresetLabel(langRef.current, preset);
+
       if (wasAllMode) {
         draftModeRef.current = "exclude";
         setDraftMode("exclude");
         onPushToastRef.current?.(
           "info",
           shouldAdd
-            ? `Switched to Exclude Selected - ${preset.label} will connect directly (skip vdpi)`
-            : `Switched to Exclude Selected and removed ${preset.label} from exclusions`,
+            ? tSplit(langRef.current, "toastSwitchExcludeSkip", {
+                name: localizedPresetLabel,
+              })
+            : tSplit(langRef.current, "toastSwitchExcludePresetRemoved", {
+                label: localizedPresetLabel,
+              }),
         );
       }
 
       if (skippedCount > 0) {
         onPushToastRef.current?.(
           "warn",
-          `Maximum ${MAX_SPLIT_TUNNEL_APPS} apps reached - added ${addedCount} of ${addedCount + skippedCount} apps from ${preset.label}.`,
+          tSplit(langRef.current, "maxAppsPartialPreset", {
+            max: MAX_SPLIT_TUNNEL_APPS,
+            added: addedCount,
+            total: addedCount + skippedCount,
+            label: localizedPresetLabel,
+          }),
         );
       }
     },
@@ -1543,14 +1576,13 @@ export const SplitTunnelView = memo(function SplitTunnelView({
       const key = normalizeAppKey(extracted || rawInput);
       if (!extracted || !key) {
         if (isWindowsShortcutInput(rawInput)) {
-          setCustomError(
-            "Windows shortcut (.lnk) files are not supported directly - select the target .exe file or enter its executable name (e.g. valorant.exe).",
-          );
+          setCustomError(tSplit(langRef.current, "customErrorShortcut"));
         } else {
           setCustomError(
-            isWindows
-              ? "Enter a valid executable name or path (e.g. valorant.exe)."
-              : "Enter a valid executable name or path (e.g. firefox).",
+            tSplit(
+              langRef.current,
+              isWindows ? "customErrorInvalidWin" : "customErrorInvalidUnix",
+            ),
           );
         }
         return false;
@@ -1559,7 +1591,9 @@ export const SplitTunnelView = memo(function SplitTunnelView({
       const currentSelected = draftSelectedRef.current;
       const alreadySelected = currentSelected.has(key);
       if (!alreadySelected && currentSelected.size >= MAX_SPLIT_TUNNEL_APPS) {
-        const limitMessage = `Maximum ${MAX_SPLIT_TUNNEL_APPS} apps allowed - remove one before adding another.`;
+        const limitMessage = tSplit(langRef.current, "maxAppsLimit", {
+          max: MAX_SPLIT_TUNNEL_APPS,
+        });
         setCustomError(limitMessage);
         onPushToastRef.current?.("warn", limitMessage);
         return false;
@@ -1577,7 +1611,10 @@ export const SplitTunnelView = memo(function SplitTunnelView({
           return [
             ...prev,
             {
-              displayName: deriveDisplayName(canonicalExe),
+              displayName: deriveDisplayName(
+                canonicalExe,
+                tSplit(langRef.current, "customAppFallbackName"),
+              ),
               exeName: canonicalExe,
               normalizedKey: key,
               path: cleanPath,
@@ -1609,16 +1646,25 @@ export const SplitTunnelView = memo(function SplitTunnelView({
         onPushToastRef.current?.(
           "info",
           alreadySelected
-            ? `Switched to Exclude Selected (${canonicalExe} is already selected)`
-            : `Switched to Exclude Selected - ${canonicalExe} will connect directly (skip vdpi)`,
+            ? tSplit(langRef.current, "toastSwitchExcludeAlready", {
+                exe: canonicalExe,
+              })
+            : tSplit(langRef.current, "toastSwitchExcludeSkip", {
+                name: canonicalExe,
+              }),
         );
       } else if (alreadySelected) {
         onPushToastRef.current?.(
           "info",
-          `${canonicalExe} is already in your selection`,
+          tSplit(langRef.current, "toastAlreadySelected", {
+            exe: canonicalExe,
+          }),
         );
       } else {
-        onPushToastRef.current?.("info", `Added ${canonicalExe}`);
+        onPushToastRef.current?.(
+          "info",
+          tSplit(langRef.current, "toastAddedCustom", { exe: canonicalExe }),
+        );
       }
 
       return true;
@@ -1645,7 +1691,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
       if (!mountedRef.current) return;
       const message = getErrorMessage(
         error,
-        "Could not open executable file picker.",
+        tSplit(langRef.current, "pickerError"),
       );
       setCustomError(message);
       onPushToast?.("error", message);
@@ -1678,7 +1724,10 @@ export const SplitTunnelView = memo(function SplitTunnelView({
     const currentSelected = draftSelectedRef.current;
 
     if (currentSelected.size > MAX_SPLIT_TUNNEL_APPS) {
-      const msg = `Maximum ${MAX_SPLIT_TUNNEL_APPS} apps allowed - remove ${currentSelected.size - MAX_SPLIT_TUNNEL_APPS} before saving.`;
+      const msg = tSplit(langRef.current, "maxAppsSaveLimit", {
+        max: MAX_SPLIT_TUNNEL_APPS,
+        excess: currentSelected.size - MAX_SPLIT_TUNNEL_APPS,
+      });
       setErrorBanner(msg);
       onPushToast?.("warn", msg);
       return;
@@ -1701,13 +1750,16 @@ export const SplitTunnelView = memo(function SplitTunnelView({
       if (!mountedRef.current) return;
 
       if (result.cancelled) {
-        onPushToast?.("info", result.message || "Save cancelled.");
+        onPushToast?.(
+          "info",
+          result.message || tSplit(langRef.current, "saveCancelled"),
+        );
         return;
       }
 
       if (!result.ok) {
         const message =
-          result.message || "Failed to save split tunneling settings.";
+          result.message || tSplit(langRef.current, "saveFailed");
         setErrorBanner(message);
         onPushToast?.("error", message);
         return;
@@ -1724,16 +1776,18 @@ export const SplitTunnelView = memo(function SplitTunnelView({
       if (isEmptyInclude) {
         onPushToast?.(
           "warn",
-          result.needsRestart
-            ? "Saved Include Only with 0 apps selected - no apps will be protected (restart service to apply)."
-            : "Saved Include Only with 0 apps selected - no apps will be protected until you add at least one.",
+          tSplit(
+            langRef.current,
+            result.needsRestart ? "saveEmptyIncludeRestart" : "saveEmptyInclude",
+          ),
         );
       } else {
         const successMessage =
           result.message ||
-          (result.needsRestart
-            ? "Split tunnel settings saved (restart service to apply)."
-            : "Split tunnel settings saved and applied.");
+          tSplit(
+            langRef.current,
+            result.needsRestart ? "saveSuccessRestart" : "saveSuccess",
+          );
         onPushToast?.(result.needsRestart ? "warn" : "success", successMessage);
       }
 
@@ -1757,7 +1811,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
       if (!mountedRef.current) return;
       const message = getErrorMessage(
         error,
-        "Failed to save split tunneling settings.",
+        tSplit(langRef.current, "saveFailed"),
       );
       setErrorBanner(message);
       onPushToast?.("error", message);
@@ -1805,6 +1859,8 @@ export const SplitTunnelView = memo(function SplitTunnelView({
     };
   }, []);
 
+  const modeOptions = useMemo(() => getModeOptions(lang), [lang]);
+
   const handleModeKeyDown = (
     event: KeyboardEvent<HTMLButtonElement>,
     index: number,
@@ -1812,17 +1868,17 @@ export const SplitTunnelView = memo(function SplitTunnelView({
     if (saving) return;
     let nextIndex: number | null = null;
     if (event.key === "ArrowRight" || event.key === "ArrowDown") {
-      nextIndex = (index + 1) % MODE_OPTIONS.length;
+      nextIndex = (index + 1) % MODE_VALUES.length;
     } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
-      nextIndex = (index - 1 + MODE_OPTIONS.length) % MODE_OPTIONS.length;
+      nextIndex = (index - 1 + MODE_VALUES.length) % MODE_VALUES.length;
     } else if (event.key === "Home") {
       nextIndex = 0;
     } else if (event.key === "End") {
-      nextIndex = MODE_OPTIONS.length - 1;
+      nextIndex = MODE_VALUES.length - 1;
     }
     if (nextIndex === null) return;
     event.preventDefault();
-    const nextMode = MODE_OPTIONS[nextIndex].value;
+    const nextMode = MODE_VALUES[nextIndex];
     draftModeRef.current = nextMode;
     setDraftMode(nextMode);
     modeRadioRefs.current[nextIndex]?.focus();
@@ -1831,26 +1887,38 @@ export const SplitTunnelView = memo(function SplitTunnelView({
   const subtitle = useMemo(() => {
     const count = draftSelectedKeys.size;
     if (draftMode === "all") {
-      return "All applications are protected with vdpi. Pick a preset or toggle any app to connect directly (skip vdpi).";
+      return tSplit(lang, "subtitleAll");
     }
     if (draftMode === "exclude") {
-      return count === 0
-        ? "All applications are protected with vdpi. Select apps below to connect directly (skip vdpi)."
-        : `${count} ${count === 1 ? "app" : "apps"} will connect directly (skip vdpi); all other apps are protected with vdpi.`;
+      if (count === 0) return tSplit(lang, "subtitleExcludeEmpty");
+      return tSplit(
+        lang,
+        count === 1 ? "subtitleExcludeOne" : "subtitleExcludeMany",
+        { count },
+      );
     }
-    return count === 0
-      ? "Only selected applications will be protected with vdpi."
-      : `Only ${count} selected ${count === 1 ? "app" : "apps"} will be protected with vdpi; everything else connects directly.`;
-  }, [draftMode, draftSelectedKeys.size]);
+    if (count === 0) return tSplit(lang, "subtitleIncludeEmpty");
+    return tSplit(
+      lang,
+      count === 1 ? "subtitleIncludeOne" : "subtitleIncludeMany",
+      { count },
+    );
+  }, [draftMode, draftSelectedKeys.size, lang]);
 
   const filterPills: ReadonlyArray<{ id: FilterPillId; label: string }> = [
-    { id: "all", label: "All" },
-    { id: "selected", label: `Selected (${counts.selected})` },
-    { id: "running", label: `Running (${counts.running})` },
-    { id: "games", label: "Games" },
-    { id: "browsers", label: "Browsers" },
-    { id: "communication", label: "Communication" },
-    { id: "media", label: "Media" },
+    { id: "all", label: tSplit(lang, "filterAll") },
+    {
+      id: "selected",
+      label: tSplit(lang, "filterSelected", { count: counts.selected }),
+    },
+    {
+      id: "running",
+      label: tSplit(lang, "filterRunning", { count: counts.running }),
+    },
+    { id: "games", label: tSplit(lang, "filterGames") },
+    { id: "browsers", label: tSplit(lang, "filterBrowsers") },
+    { id: "communication", label: tSplit(lang, "filterCommunication") },
+    { id: "media", label: tSplit(lang, "filterMedia") },
   ];
 
   const showIncludeEmptyWarning =
@@ -1864,26 +1932,28 @@ export const SplitTunnelView = memo(function SplitTunnelView({
   const atAppLimit =
     draftMode !== "all" && counts.selected >= MAX_SPLIT_TUNNEL_APPS;
 
-  const customPlaceholder = isWindows
-    ? "Add custom app (e.g. valorant.exe)"
-    : "Add custom app (e.g. firefox)";
+  const customPlaceholder = tSplit(
+    lang,
+    isWindows ? "customPlaceholderWin" : "customPlaceholderUnix",
+  );
 
-  const searchPlaceholder = isWindows
-    ? "Search apps or executables (e.g. Discord, chrome.exe)..."
-    : "Search apps or executables (e.g. Discord, firefox)...";
+  const searchPlaceholder = tSplit(
+    lang,
+    isWindows ? "searchPlaceholderWin" : "searchPlaceholderUnix",
+  );
 
   return (
-    <section className="split-view" aria-label="Split Tunneling">
+    <section className="split-view" aria-label={tSplit(lang, "title")}>
       <header className="split-view__header">
-        <h1 className="split-view__title">Split Tunneling</h1>
+        <h1 className="split-view__title">{tSplit(lang, "title")}</h1>
         <p className="split-view__subtitle">{subtitle}</p>
       </header>
 
       {activeEngine === "proxy" ? (
         <InlineBanner
           tone="warn"
-          title="Per-app split tunneling requires Full-PC (TUN) mode"
-          description="You are currently in Proxy mode. You can still edit your app list here, and rules will apply once you switch to Full-PC (TUN) mode."
+          title={tSplit(lang, "proxyBannerTitle")}
+          description={tSplit(lang, "proxyBannerDesc")}
           action={
             onSwitchToTun ? (
               <button
@@ -1897,7 +1967,12 @@ export const SplitTunnelView = memo(function SplitTunnelView({
                   }
                 }}
               >
-                {isSwitchingToTun ? "Switching..." : "Switch to Full-PC (TUN)"}
+                {tSplit(
+                  lang,
+                  isSwitchingToTun
+                    ? "proxyBannerSwitching"
+                    : "proxyBannerSwitch",
+                )}
               </button>
             ) : undefined
           }
@@ -1907,9 +1982,9 @@ export const SplitTunnelView = memo(function SplitTunnelView({
       {errorBanner ? (
         <InlineBanner
           tone="error"
-          title="Split tunneling error"
+          title={tSplit(lang, "errorBannerTitle")}
           description={errorBanner}
-          actionLabel={!loadedOnce ? "Retry" : undefined}
+          actionLabel={!loadedOnce ? tSplit(lang, "retry") : undefined}
           onAction={
             !loadedOnce
               ? () => void loadSplitTunnel({ preserveDraft: false })
@@ -1919,13 +1994,15 @@ export const SplitTunnelView = memo(function SplitTunnelView({
       ) : null}
 
       <div className="split-view__section">
-        <span className="split-view__section-label">Routing Mode</span>
+        <span className="split-view__section-label">
+          {tSplit(lang, "sectionRoutingMode")}
+        </span>
         <div
           className="split-mode-grid"
           role="radiogroup"
-          aria-label="Split tunneling mode"
+          aria-label={tSplit(lang, "ariaModeGroup")}
         >
-          {MODE_OPTIONS.map((option, index) => {
+          {modeOptions.map((option, index) => {
             const active = draftMode === option.value;
             return (
               <button
@@ -1966,18 +2043,20 @@ export const SplitTunnelView = memo(function SplitTunnelView({
         {showIncludeEmptyWarning ? (
           <InlineBanner
             tone="warn"
-            title="0 apps selected - no apps will be protected until you add at least one"
-            description="Choose a quick preset below, toggle apps from the list, or add a custom app to protect with vdpi."
+            title={tSplit(lang, "emptyIncludeTitle")}
+            description={tSplit(lang, "emptyIncludeDesc")}
           />
         ) : null}
       </div>
 
       <div className="split-view__section">
         <div className="split-view__section-head">
-          <span className="split-view__section-label">Quick Presets</span>
+          <span className="split-view__section-label">
+            {tSplit(lang, "sectionQuickPresets")}
+          </span>
           {draftMode === "all" ? (
             <span className="split-view__section-hint">
-              Clicking a preset switches to Exclude Selected automatically
+              {tSplit(lang, "presetsAutoSwitchHint")}
             </span>
           ) : null}
         </div>
@@ -1991,7 +2070,9 @@ export const SplitTunnelView = memo(function SplitTunnelView({
       </div>
 
       <div className="split-view__section">
-        <span className="split-view__section-label">Applications</span>
+        <span className="split-view__section-label">
+          {tSplit(lang, "sectionApplications")}
+        </span>
 
         <div className="split-toolbar">
           <div className="split-toolbar__row">
@@ -2005,7 +2086,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
                 role="searchbox"
                 className="split-search__input"
                 data-shortcut="search"
-                aria-label="Search applications"
+                aria-label={tSplit(lang, "ariaSearchApps")}
                 placeholder={searchPlaceholder}
                 value={searchQuery}
                 onChange={(event) => setSearchQuery(event.target.value)}
@@ -2020,13 +2101,13 @@ export const SplitTunnelView = memo(function SplitTunnelView({
                 <button
                   type="button"
                   className="split-search__clear"
-                  aria-label="Clear search"
+                  aria-label={tSplit(lang, "ariaClearSearch")}
                   onClick={() => {
                     setSearchQuery("");
                     searchInputRef.current?.focus();
                   }}
                 >
-                  Clear
+                  {tSplit(lang, "clear")}
                 </button>
               ) : null}
             </div>
@@ -2048,13 +2129,13 @@ export const SplitTunnelView = memo(function SplitTunnelView({
               }}
             >
               <IconPlus size={14} />
-              <span>Add custom app</span>
+              <span>{tSplit(lang, "addCustomApp")}</span>
             </button>
 
             <button
               type="button"
               className="split-btn"
-              title="Refresh running apps"
+              title={tSplit(lang, "refreshTitle")}
               disabled={refreshing || loading || saving}
               onClick={() =>
                 void loadSplitTunnel({
@@ -2068,7 +2149,9 @@ export const SplitTunnelView = memo(function SplitTunnelView({
               ) : (
                 <IconRefresh size={14} />
               )}
-              <span>{refreshing ? "Refreshing..." : "Refresh"}</span>
+              <span>
+                {tSplit(lang, refreshing ? "refreshing" : "refresh")}
+              </span>
             </button>
           </div>
 
@@ -2083,7 +2166,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
                   ref={customInputRef}
                   type="text"
                   className="split-custom-row__input"
-                  aria-label="Add custom app executable or shortcut command"
+                  aria-label={tSplit(lang, "ariaCustomAppInput")}
                   placeholder={customPlaceholder}
                   value={customInput}
                   disabled={saving}
@@ -2097,7 +2180,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
                   className="split-btn"
                   disabled={saving || !customInput.trim()}
                 >
-                  Add
+                  {tSplit(lang, "add")}
                 </button>
                 <button
                   type="button"
@@ -2105,7 +2188,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
                   disabled={saving || browsing}
                   onClick={() => void handleBrowseFile()}
                 >
-                  {browsing ? "Browsing..." : "Browse..."}
+                  {tSplit(lang, browsing ? "browsing" : "browse")}
                 </button>
               </div>
               {customError ? (
@@ -2120,7 +2203,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
             <div
               className="split-filters__pills"
               role="group"
-              aria-label="Filter applications"
+              aria-label={tSplit(lang, "ariaFilterApps")}
             >
               {filterPills.map((pill) => (
                 <button
@@ -2148,7 +2231,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
                   setPresetSyntheticEntries([]);
                 }}
               >
-                Clear selected
+                {tSplit(lang, "clearSelected")}
               </button>
             ) : null}
           </div>
@@ -2157,8 +2240,11 @@ export const SplitTunnelView = memo(function SplitTunnelView({
         <div className="split-list-card">
           <div className="split-list-meta">
             <span>
-              Showing {visibleApps.length} of {counts.all}{" "}
-              {counts.all === 1 ? "app" : "apps"}
+              {tSplit(
+                lang,
+                counts.all === 1 ? "showingAppsOne" : "showingAppsMany",
+                { visible: visibleApps.length, total: counts.all },
+              )}
             </span>
             <span
               className={
@@ -2169,35 +2255,42 @@ export const SplitTunnelView = memo(function SplitTunnelView({
               data-at-limit={atAppLimit ? "true" : undefined}
             >
               {draftMode === "all"
-                ? "Toggle any app to switch to Exclude Selected"
+                ? tSplit(lang, "metaToggleSwitchHint")
                 : counts.selected >= 200
-                  ? `${counts.selected} / ${MAX_SPLIT_TUNNEL_APPS} selected`
-                  : `${counts.selected} selected`}
+                  ? tSplit(lang, "metaSelectedOfMax", {
+                      count: counts.selected,
+                      max: MAX_SPLIT_TUNNEL_APPS,
+                    })
+                  : tSplit(lang, "metaSelected", { count: counts.selected })}
             </span>
           </div>
 
           {loading && !loadedOnce ? (
             <div className="split-list-empty" role="status">
               <span className="split-spinner" aria-hidden="true" />
-              <p className="split-list-empty__title">Loading applications...</p>
+              <p className="split-list-empty__title">
+                {tSplit(lang, "loadingApps")}
+              </p>
             </div>
           ) : visibleApps.length === 0 ? (
             <div className="split-list-empty">
               <p className="split-list-empty__title">
                 {searchQuery.trim()
-                  ? `No apps matching "${searchQuery.trim()}"`
+                  ? tSplit(lang, "emptySearchTitle", {
+                      query: searchQuery.trim(),
+                    })
                   : activeFilter === "selected"
-                    ? "No apps selected yet"
+                    ? tSplit(lang, "emptySelectedTitle")
                     : activeFilter === "running"
-                      ? "No running apps detected"
-                      : "No apps found in this category"}
+                      ? tSplit(lang, "emptyRunningTitle")
+                      : tSplit(lang, "emptyCategoryTitle")}
               </p>
               <p className="split-list-empty__desc">
                 {searchQuery.trim()
-                  ? "Try a different search term or use Add custom app above."
+                  ? tSplit(lang, "emptySearchDesc")
                   : activeFilter === "selected"
-                    ? "Use a quick preset or toggle apps from the All list."
-                    : "Click Refresh or switch back to All."}
+                    ? tSplit(lang, "emptySelectedDesc")
+                    : tSplit(lang, "emptyDefaultDesc")}
               </p>
               {searchQuery.trim() ? (
                 <button
@@ -2205,7 +2298,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
                   className="split-btn"
                   onClick={() => setSearchQuery("")}
                 >
-                  Clear search
+                  {tSplit(lang, "emptyClearSearch")}
                 </button>
               ) : activeFilter !== "all" ? (
                 <button
@@ -2213,12 +2306,12 @@ export const SplitTunnelView = memo(function SplitTunnelView({
                   className="split-btn"
                   onClick={() => handleSelectFilter("all")}
                 >
-                  Show all apps
+                  {tSplit(lang, "emptyShowAll")}
                 </button>
               ) : null}
             </div>
           ) : (
-            <div role="list" aria-label="Split tunneling applications">
+            <div role="list" aria-label={tSplit(lang, "ariaAppList")}>
               {visibleApps.map((app) => (
                 <SplitTunnelAppRow
                   key={app.normalizedKey}
@@ -2238,29 +2331,33 @@ export const SplitTunnelView = memo(function SplitTunnelView({
         <div
           className="split-unsaved-bar"
           role="region"
-          aria-label="Unsaved Changes"
+          aria-label={tSplit(lang, "unsavedTitle")}
         >
           <div className="split-unsaved-bar__info">
-            <p className="split-unsaved-bar__title">Unsaved Changes</p>
+            <p className="split-unsaved-bar__title">
+              {tSplit(lang, "unsavedTitle")}
+            </p>
             <div className="split-unsaved-bar__summary">
               {diff.modeChanged ? (
                 <span className="split-diff-badge split-diff-badge--mode">
-                  Mode: {getModeLabel(draftMode)}
+                  {tSplit(lang, "diffMode", {
+                    mode: getModeLabel(draftMode, lang),
+                  })}
                 </span>
               ) : null}
               {diff.addedCount > 0 ? (
                 <span className="split-diff-badge split-diff-badge--added">
-                  +{diff.addedCount} added
+                  {tSplit(lang, "diffAdded", { count: diff.addedCount })}
                 </span>
               ) : null}
               {diff.removedCount > 0 ? (
                 <span className="split-diff-badge split-diff-badge--removed">
-                  -{diff.removedCount} removed
+                  {tSplit(lang, "diffRemoved", { count: diff.removedCount })}
                 </span>
               ) : null}
               {showIncludeEmptyWarning ? (
                 <span className="split-diff-badge split-diff-badge--warn">
-                  0 apps selected - nothing protected
+                  {tSplit(lang, "diffEmptyInclude")}
                 </span>
               ) : null}
             </div>
@@ -2273,7 +2370,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
               disabled={saving}
               onClick={handleDiscard}
             >
-              Discard
+              {tSplit(lang, "discard")}
             </button>
             <button
               type="button"
@@ -2284,7 +2381,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
               {saving ? (
                 <span className="split-spinner" aria-hidden="true" />
               ) : null}
-              <span>{saving ? "Saving..." : "Save & Apply"}</span>
+              <span>{tSplit(lang, saving ? "saving" : "saveApply")}</span>
             </button>
           </div>
         </div>
