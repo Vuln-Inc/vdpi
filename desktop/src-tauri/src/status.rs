@@ -275,10 +275,15 @@ fn query_windows_known_folder(folder_id: &windows_sys::core::GUID) -> Option<Pat
 #[cfg(any(target_os = "windows", test))]
 fn sanitize_known_windows_dir(dir: PathBuf) -> Option<PathBuf> {
     let clean = vdpi::update::strip_windows_verbatim_prefix(&dir);
+    let has_parent_segment = clean.components().any(|c| matches!(c, Component::ParentDir))
+        || clean
+            .to_string_lossy()
+            .split(['\\', '/'])
+            .any(|seg| seg == "..");
     if clean.as_os_str().is_empty()
         || is_unc_or_device_path(&clean)
         || !is_local_drive_absolute(&clean)
-        || clean.components().any(|c| matches!(c, Component::ParentDir))
+        || has_parent_segment
     {
         return None;
     }
