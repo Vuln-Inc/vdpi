@@ -619,20 +619,16 @@ fn parse_lsof_output(stdout: &str, local_ip: IpAddr, local_port: u16) -> Option<
             }
             match ep_ip {
                 Some(ip) if ip == target_ip => return Some(cmd.clone()),
-                None => {
-                    if wildcard_match.is_none() {
-                        wildcard_match = Some(cmd.clone());
-                    }
+                None if wildcard_match.is_none() => {
+                    wildcard_match = Some(cmd.clone());
                 }
-                Some(IpAddr::V4(v4)) if v4.is_unspecified() && target_ip.is_ipv4() => {
-                    if wildcard_match.is_none() {
-                        wildcard_match = Some(cmd.clone());
-                    }
+                Some(IpAddr::V4(v4))
+                    if v4.is_unspecified() && target_ip.is_ipv4() && wildcard_match.is_none() =>
+                {
+                    wildcard_match = Some(cmd.clone());
                 }
-                Some(IpAddr::V6(v6)) if v6.is_unspecified() => {
-                    if wildcard_match.is_none() {
-                        wildcard_match = Some(cmd.clone());
-                    }
+                Some(IpAddr::V6(v6)) if v6.is_unspecified() && wildcard_match.is_none() => {
+                    wildcard_match = Some(cmd.clone());
                 }
                 _ => {}
             }
