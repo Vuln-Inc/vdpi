@@ -1,0 +1,55 @@
+[package]
+name = "vdpi-desktop"
+version = "0.6.0"
+edition = "2021"
+authors = ["Vuln-Inc"]
+description = "Native desktop GUI for vdpi anti-DPI engine"
+license = "MIT"
+repository = "https://github.com/Vuln-Inc/vdpi"
+publish = false
+
+[workspace]
+
+[lib]
+name = "vdpi_desktop_lib"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "vdpi-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow = "1.0"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2"
+tokio = { version = "1.50", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+vdpi = { path = "../../core" }
+vdpi-core = { path = "../../core/engine", features = ["cli"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

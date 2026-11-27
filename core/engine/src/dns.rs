@@ -6,7 +6,7 @@ use rustls::pki_types::{CertificateDer, ServerName};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -31,6 +31,7 @@ const MAX_BOUND_DOH_RAW_BYTES: usize = MAX_DNS_MESSAGE_BYTES + MAX_BOUND_DOH_HEA
 const MAX_DOH_FAILOVER_CONCURRENCY: usize = 2;
 const DOH_FAILURE_THRESHOLD: usize = 3;
 const DOH_BACKOFF_SECS: u64 = 5;
+const UDP_DPI_RACE_GRACE_MS: u64 = 120;
 const FIREFOX_CANARY_DOMAIN: &str = "use-application-dns.net";
 
 static PROCESS_EPOCH: OnceLock<Instant> = OnceLock::new();
@@ -94,14 +95,31 @@ enum DohError {
     ProtocolError { endpoint: String, rcode: u16 },
 }
 
+impl std::fmt::Display for DohError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(err) => {
+                let redacted = redact_urls_in_text(&err.to_string());
+                write!(f, "DoH transport error: {redacted}")
+            }
+            Self::ProtocolError { endpoint, rcode } => write!(
+                f,
+                "DoH returned DNS protocol error (RCODE {rcode}) from {}",
+                redact_dns_for_display(endpoint)
+            ),
+        }
+    }
+}
+
 type DohAttemptResult = (usize, String, std::result::Result<DnsOutcome, DohError>);
 
 fn doh_http_client_builder() -> reqwest::ClientBuilder {
     // `.no_proxy()` prevents vdpi from routing its own DoH traffic through itself
     // when HTTP_PROXY / HTTPS_PROXY environment variables are active.
-    // HTTP/2 + TCP keepalives detect half-open mobile/NAT sockets promptly instead of
-    // hanging multiplexed DoH streams for repeated 2s timeouts.
-    Client::builder()
+    // HTTP/2 + TCP keepalives detect half-open desktop/NAT sockets promptly instead of
+    // hanging multiplexed DoH streams for repeated 2s timeouts. On mobile (Android/iOS),
+    // disable idle HTTP/2 keepalive pings so cellular modems can return to RRC_IDLE.
+    let builder = Client::builder()
         .no_proxy()
         .timeout(Duration::from_millis(2000))
         .connect_timeout(Duration::from_millis(1200))
@@ -110,8 +128,12 @@ fn doh_http_client_builder() -> reqwest::ClientBuilder {
         .tcp_nodelay(true)
         .tcp_keepalive(Some(Duration::from_secs(30)))
         .http2_keep_alive_interval(Some(Duration::from_secs(20)))
-        .http2_keep_alive_timeout(Duration::from_secs(5))
-        .http2_keep_alive_while_idle(true)
+        .http2_keep_alive_timeout(Duration::from_secs(5));
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let builder = builder.http2_keep_alive_while_idle(false);
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let builder = builder.http2_keep_alive_while_idle(true);
+    builder
 }
 
 fn build_doh_http_client() -> Result<Client> {
@@ -203,11 +225,14 @@ impl CustomHostnameDoh {
 #[derive(Clone)]
 pub struct DnsResolver {
     enable_doh: bool,
-    ipv4_only: bool,
+    ipv4_only: Arc<AtomicBool>,
     disable_system_dns_fallback: bool,
     udp_dns_servers: Vec<SocketAddr>,
     doh_endpoints: Vec<String>,
+    custom_primary_doh_endpoint: Option<String>,
     custom_doh: Option<Arc<CustomHostnameDoh>>,
+    custom_udp_primary: Option<SocketAddr>,
+    user_custom_udp_server: Option<SocketAddr>,
     preferred_doh_idx: Arc<AtomicUsize>,
     preferred_udp_idx: Arc<AtomicUsize>,
     doh_backoff_until_ms: Arc<AtomicU64>,
@@ -219,6 +244,10 @@ pub struct DnsResolver {
     cache: Arc<RwLock<HashMap<String, CacheEntry>>>,
     #[cfg(test)]
     test_root_cert_der: Option<Vec<u8>>,
+    #[cfg(test)]
+    test_port53_servers: Vec<SocketAddr>,
+    #[cfg(test)]
+    test_force_system_dns_error: bool,
 }
 
 impl DnsResolver {
@@ -262,34 +291,66 @@ impl DnsResolver {
         };
 
         let dns_addr = dns_addr.as_ref();
-        let udp_dns_servers = build_udp_dns_servers(dns_addr, dns_port);
+        let trimmed_dns = dns_addr.trim();
+        let parsed_explicit_doh = parse_doh_url_validated(trimmed_dns).ok();
+        let effective_doh = effective_enable_doh(trimmed_dns, enable_doh);
+        let effective_port = if dns_port == 0 { 53 } else { dns_port };
+        let bare_custom_ip = if parsed_explicit_doh.is_none() {
+            parse_bare_dns_ip(trimmed_dns)
+        } else {
+            None
+        };
+        let custom_udp_primary = bare_custom_ip
+            .filter(|ip| !is_known_public_doh_ip(*ip))
+            .map(|ip| SocketAddr::new(ip, effective_port));
+        let user_custom_udp_server = bare_custom_ip
+            .filter(|ip| !is_unfiltered_default_dns_ip(*ip))
+            .map(|ip| SocketAddr::new(ip, effective_port));
+
+        // Always build the full dual-stack UDP and DoH endpoint lists so `set_ipv4_only(false)`
+        // can dynamically enable IPv6 endpoints after uplink detection without rebuilding the resolver.
+        let udp_dns_servers = build_udp_dns_servers(dns_addr, dns_port, false);
         let require_ip_literal = disable_system_dns_fallback || outbound_binder.is_some();
         let doh_endpoints = build_doh_endpoints(
             dns_addr,
             outbound_binder.is_some(),
             require_ip_literal,
-            ipv4_only,
+            false,
         );
-        let custom_doh = parse_doh_url_validated(dns_addr.trim())
-            .ok()
-            .and_then(|parsed| match parsed.host {
-                DohHost::Domain(host) => Some(Arc::new(CustomHostnameDoh::new(
-                    parsed.request_url,
-                    host,
-                    parsed.port,
-                    parsed.host_header,
-                    parsed.path_and_query,
-                ))),
-                DohHost::Ip(_) => None,
-            });
+        let custom_primary_doh_endpoint = if let Some(ref parsed) = parsed_explicit_doh {
+            match parsed.host {
+                DohHost::Ip(_) => Some(parsed.request_url.clone()),
+                DohHost::Domain(_) => None,
+            }
+        } else {
+            bare_custom_ip
+                .filter(|ip| is_known_public_doh_ip(*ip) && !is_unfiltered_default_dns_ip(*ip))
+                .map(|ip| match ip {
+                    IpAddr::V4(v4) => format!("https://{v4}/dns-query"),
+                    IpAddr::V6(v6) => format!("https://[{v6}]/dns-query"),
+                })
+        };
+        let custom_doh = parsed_explicit_doh.and_then(|parsed| match parsed.host {
+            DohHost::Domain(host) => Some(Arc::new(CustomHostnameDoh::new(
+                parsed.request_url,
+                host,
+                parsed.port,
+                parsed.host_header,
+                parsed.path_and_query,
+            ))),
+            DohHost::Ip(_) => None,
+        });
 
         Ok(Self {
-            enable_doh,
-            ipv4_only,
+            enable_doh: effective_doh,
+            ipv4_only: Arc::new(AtomicBool::new(ipv4_only)),
             disable_system_dns_fallback,
             udp_dns_servers,
             doh_endpoints,
+            custom_primary_doh_endpoint,
             custom_doh,
+            custom_udp_primary,
+            user_custom_udp_server,
             preferred_doh_idx: Arc::new(AtomicUsize::new(0)),
             preferred_udp_idx: Arc::new(AtomicUsize::new(0)),
             doh_backoff_until_ms: Arc::new(AtomicU64::new(0)),
@@ -301,11 +362,107 @@ impl DnsResolver {
             cache: Arc::new(RwLock::new(HashMap::new())),
             #[cfg(test)]
             test_root_cert_der: None,
+            #[cfg(test)]
+            test_port53_servers: Vec::new(),
+            #[cfg(test)]
+            test_force_system_dns_error: false,
         })
+    }
+
+    pub fn set_ipv4_only(&self, ipv4_only: bool) {
+        self.ipv4_only.store(ipv4_only, Ordering::Release);
+    }
+
+    pub fn is_ipv4_only(&self) -> bool {
+        self.ipv4_only.load(Ordering::Acquire)
+    }
+
+    fn endpoint_allows_sinkhole(&self, endpoint: &str) -> bool {
+        self.custom_primary_doh_endpoint
+            .as_deref()
+            .is_some_and(|primary| primary == endpoint)
+            || is_filtering_doh_endpoint(endpoint)
+    }
+
+    fn udp_server_allows_sinkhole_and_loopback(&self, server: SocketAddr) -> bool {
+        self.user_custom_udp_server
+            .is_some_and(|custom| custom == server)
+            || is_filtering_dns_ip(server.ip())
+    }
+
+    fn active_custom_udp_primary(&self) -> Option<SocketAddr> {
+        let primary = self.custom_udp_primary?;
+        if self.is_ipv4_only() && primary.is_ipv6() {
+            return None;
+        }
+        if !self.udp_dns_servers.contains(&primary) {
+            return None;
+        }
+        Some(primary)
+    }
+
+    fn eligible_doh_indices(&self, ip_literal_only: bool) -> Vec<usize> {
+        let v4_only = self.is_ipv4_only();
+        self.doh_endpoints
+            .iter()
+            .enumerate()
+            .filter(|(_, ep)| {
+                (!ip_literal_only || is_ip_literal_doh_endpoint(ep))
+                    && (!v4_only || !is_ipv6_doh_endpoint(ep))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn eligible_udp_indices(&self) -> Vec<usize> {
+        let v4_only = self.is_ipv4_only();
+        self.udp_dns_servers
+            .iter()
+            .enumerate()
+            .filter(|(_, sa)| !v4_only || sa.is_ipv4())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn is_udp_port53(&self, server: SocketAddr) -> bool {
+        if server.port() == 53 {
+            return true;
+        }
+        #[cfg(test)]
+        if self.test_port53_servers.contains(&server) {
+            return true;
+        }
+        false
+    }
+
+    fn maybe_promote_udp_server(&self, idx: usize) {
+        let Some(candidate) = self.udp_dns_servers.get(idx) else {
+            return;
+        };
+        if self.is_udp_port53(*candidate) {
+            let is_user_primary = idx == 0;
+            let has_same_family_non53 = self
+                .udp_dns_servers
+                .iter()
+                .any(|sa| sa.is_ipv6() == candidate.is_ipv6() && !self.is_udp_port53(*sa));
+            if !is_user_primary && has_same_family_non53 {
+                return;
+            }
+        }
+        self.preferred_udp_idx.store(idx, Ordering::Relaxed);
     }
 
     fn is_system_dns_disabled(&self) -> bool {
         self.disable_system_dns_fallback || self.outbound_binder.is_some()
+    }
+
+    fn should_route_to_system_resolver(
+        &self,
+        normalized: &str,
+        disable_system_fallback: bool,
+    ) -> bool {
+        !(disable_system_fallback || self.is_system_dns_disabled())
+            && is_lan_or_private_hostname(normalized)
     }
 
     pub fn query_count(&self) -> u64 {
@@ -356,6 +513,7 @@ impl DnsResolver {
     pub async fn clear_cache(&self) {
         self.cache.write().await.clear();
         self.clear_doh_backoff();
+        self.preferred_udp_idx.store(0, Ordering::Relaxed);
         if let Some(custom) = &self.custom_doh {
             custom.clear().await;
         }
@@ -409,9 +567,9 @@ impl DnsResolver {
             return Ok(DnsOutcome::Records(vec![ip], Duration::from_secs(300)));
         }
 
-        // 2. Localhost fast-path
-        if normalized == "localhost" {
-            let ips = if self.ipv4_only {
+        // 2. Localhost fast-path (RFC 6761 §6.3: localhost and *.localhost)
+        if normalized == "localhost" || normalized.ends_with(".localhost") {
+            let ips = if self.is_ipv4_only() {
                 vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]
             } else {
                 vec![
@@ -422,115 +580,169 @@ impl DnsResolver {
             return Ok(DnsOutcome::Records(ips, Duration::from_secs(300)));
         }
 
-        // 3. mDNS (.local) via OS resolver (unfiltered because LAN IPs are expected).
-        //    Disabled in TUN mode / when system DNS fallback is disabled to prevent recursion.
+        // 3. mDNS / Corporate Active Directory (.local):
+        //    - Check the TTL cache first so subsequent connections to corporate AD `.local`
+        //      hostnames cached from `active_custom_udp_primary()` never re-pay OS mDNS timeouts.
+        //    - In TUN mode / when system DNS fallback is disabled: if an explicit custom bare-IP
+        //      UDP server (e.g. corporate --dns 10.0.0.53) is configured, query it directly and
+        //      cache the answer; otherwise return synthetic NXDOMAIN to prevent OS DNS recursion.
+        //    - In Proxy mode: try the OS resolver first (unfiltered because LAN IPs are expected);
+        //      if OS resolution fails and `active_custom_udp_primary()` is configured, fall back
+        //      to querying that server directly (never public DoH) and cache successful answers.
         if normalized.ends_with(".local") {
+            if let Some(cached) = self.lookup_cache_outcome(&normalized).await {
+                return Ok(cached);
+            }
             if self.is_system_dns_disabled() {
+                if let Some(custom_udp) = self.active_custom_udp_primary() {
+                    debug!(
+                        domain = %normalized,
+                        server = %custom_udp,
+                        "TUN mode .local hostname; querying custom bare-IP UDP server directly"
+                    );
+                    let resolved = self
+                        .resolve_via_single_udp_server(custom_udp, &normalized)
+                        .await?;
+                    self.store_cache_resolved(normalized, &resolved).await;
+                    return Ok(resolved.outcome);
+                }
                 return Ok(DnsOutcome::NxDomain(Duration::from_secs(30)));
             }
-            let ips = self.resolve_via_system(&normalized, false).await?;
-            return Ok(DnsOutcome::Records(ips, Duration::from_secs(60)));
-        }
-
-        // 4. In-memory TTL cache lookup (including negative NXDOMAIN cache)
-        {
-            let guard = self.cache.read().await;
-            if let Some(entry) = guard.get(&normalized) {
-                let now = Instant::now();
-                if now < entry.expires_at {
-                    let rem = entry.expires_at.saturating_duration_since(now);
-                    if entry.nxdomain {
-                        return Ok(DnsOutcome::NxDomain(rem));
+            match self.resolve_via_system(&normalized, false).await {
+                Ok(ips) => return Ok(DnsOutcome::Records(ips, Duration::from_secs(60))),
+                Err(sys_err) => {
+                    if let Some(custom_udp) = self.active_custom_udp_primary() {
+                        debug!(
+                            domain = %normalized,
+                            server = %custom_udp,
+                            error = %sys_err,
+                            "system DNS failed for .local hostname; falling back to custom bare-IP UDP server"
+                        );
+                        let resolved = self
+                            .resolve_via_single_udp_server(custom_udp, &normalized)
+                            .await?;
+                        if matches!(
+                            resolved.outcome,
+                            DnsOutcome::Records(ref ips, _) if !ips.is_empty()
+                        ) {
+                            self.store_cache_resolved(normalized, &resolved).await;
+                        }
+                        return Ok(resolved.outcome);
                     }
-                    if entry.has_a_lookup
-                        && (self.ipv4_only || entry.has_aaaa_lookup)
-                        && !entry.ips.is_empty()
-                    {
-                        return Ok(DnsOutcome::Records(entry.ips.clone(), rem));
-                    }
+                    return Err(sys_err);
                 }
             }
         }
 
+        // 3b. Single-label LAN hostnames and private/local suffixes (*.lan, *.home.arpa,
+        //     *.internal, *.localdomain, *.ts.net) route to the OS resolver in Proxy mode
+        //     instead of leaking internal names to public DoH. When OS resolution fails and
+        //     an explicit custom bare-IP UDP server (e.g. corporate --dns 10.0.0.53) is
+        //     configured, fall back to querying that server directly (never public DoH).
+        if self.should_route_to_system_resolver(&normalized, false) {
+            match self.resolve_via_system(&normalized, false).await {
+                Ok(ips) => return Ok(DnsOutcome::Records(ips, Duration::from_secs(60))),
+                Err(sys_err) => {
+                    if let Some(custom_udp) = self.active_custom_udp_primary() {
+                        debug!(
+                            domain = %normalized,
+                            server = %custom_udp,
+                            error = %sys_err,
+                            "system DNS failed for LAN/private hostname; falling back to custom bare-IP UDP server"
+                        );
+                        let resolved = self
+                            .resolve_via_single_udp_server(custom_udp, &normalized)
+                            .await?;
+                        return Ok(resolved.outcome);
+                    }
+                    return Err(sys_err);
+                }
+            }
+        }
+
+        // 4. In-memory TTL cache lookup (including negative NXDOMAIN cache)
+        if let Some(cached) = self.lookup_cache_outcome(&normalized).await {
+            return Ok(cached);
+        }
+
         // 5. Multi-tier unpoisoned resolution:
+        //    Tier 0 (when user configured a custom/corporate bare IP without known IP-SAN DoH,
+        //            e.g. 76.76.2.0 or 10.0.0.53): query that server over UDP first.
         //    Tier A: RFC 8484 DNS-over-HTTPS (only consecutive full-ring transport failures trip
         //            the short 5s circuit-breaker; single-provider failover and protocol
         //            NXDOMAIN/NODATA/SERVFAIL replies never trip DoH backoff!)
         //    Tier B: Non-standard port 1253 / 443 / 5353 + backup UDP DNS
         //    Tier C: System resolver fallback (with sinkhole IP filtering; skipped in TUN mode)
-        let resolved = if self.enable_doh && !self.is_doh_in_backoff() {
-            match self.resolve_via_doh(&normalized).await {
-                Ok(resolved) => {
-                    self.record_doh_success();
-                    resolved
-                }
-                Err(err) => {
-                    match &err {
-                        DohError::Transport(cause) => {
-                            if self.record_doh_transport_failure() {
-                                debug!(
-                                    domain = %normalized,
-                                    error = %cause,
-                                    backoff_secs = DOH_BACKOFF_SECS,
-                                    "all DoH endpoints failed transport consecutively; tripping short backoff"
-                                );
-                            } else {
-                                debug!(
-                                    domain = %normalized,
-                                    error = %cause,
-                                    "transient DoH transport failure; keeping DoH active"
-                                );
-                            }
-                        }
-                        DohError::ProtocolError { endpoint, rcode } => {
-                            debug!(
-                                domain = %normalized,
-                                endpoint = %endpoint,
-                                rcode = rcode,
-                                "DoH returned DNS protocol error; falling back without tripping backoff"
-                            );
-                        }
-                    }
-                    self.resolve_udp_or_system(&normalized).await?
+        let resolved = if let Some(primary) = self.active_custom_udp_primary() {
+            match self.resolve_via_single_udp_server(primary, &normalized).await {
+                Ok(resolved) => resolved,
+                Err(cause) => {
+                    debug!(
+                        domain = %normalized,
+                        server = %primary,
+                        error = %cause,
+                        "custom bare-IP UDP DNS failed; falling back to DoH/backup ring"
+                    );
+                    self.resolve_doh_or_udp_or_system(&normalized, Some(primary))
+                        .await?
                 }
             }
         } else {
-            self.resolve_udp_or_system(&normalized).await?
+            self.resolve_doh_or_udp_or_system(&normalized, None).await?
         };
 
-        match &resolved.outcome {
-            DnsOutcome::NxDomain(ttl) => {
-                let mut guard = self.cache.write().await;
-                insert_cache_entry(
-                    &mut guard,
-                    normalized,
-                    CacheEntry {
-                        ips: Vec::new(),
-                        nxdomain: true,
-                        has_a_lookup: true,
-                        has_aaaa_lookup: true,
-                        expires_at: Instant::now() + (*ttl).min(Duration::from_secs(60)),
-                    },
-                );
-            }
-            DnsOutcome::Records(ips, ttl) if !ips.is_empty() && ips.len() <= MAX_CACHED_IPS => {
-                let mut guard = self.cache.write().await;
-                insert_cache_entry(
-                    &mut guard,
-                    normalized,
-                    CacheEntry {
-                        ips: ips.clone(),
-                        nxdomain: false,
-                        has_a_lookup: resolved.has_a_lookup,
-                        has_aaaa_lookup: resolved.has_aaaa_lookup,
-                        expires_at: Instant::now() + *ttl,
-                    },
-                );
-            }
-            _ => {}
-        }
+        self.store_cache_resolved(normalized, &resolved).await;
 
         Ok(resolved.outcome)
+    }
+
+    async fn resolve_doh_or_udp_or_system(
+        &self,
+        normalized: &str,
+        skip_udp_server: Option<SocketAddr>,
+    ) -> Result<ResolvedOutcome> {
+        if self.enable_doh && !self.is_doh_in_backoff() {
+            match self.resolve_via_doh(normalized).await {
+                Ok(resolved) => {
+                    self.record_doh_success();
+                    Ok(resolved)
+                }
+                Err(err @ DohError::ProtocolError { .. }) => {
+                    if let DohError::ProtocolError { endpoint, rcode } = &err {
+                        let redacted = redact_dns_for_display(endpoint);
+                        debug!(
+                            domain = %normalized,
+                            endpoint = %redacted,
+                            rcode = *rcode,
+                            "DoH returned DNS protocol error; failing without plaintext UDP fallback"
+                        );
+                    }
+                    bail!("{err} for {normalized}");
+                }
+                Err(DohError::Transport(cause)) => {
+                    let redacted_cause = redact_urls_in_text(&cause.to_string());
+                    if self.record_doh_transport_failure() {
+                        debug!(
+                            domain = %normalized,
+                            error = %redacted_cause,
+                            backoff_secs = DOH_BACKOFF_SECS,
+                            "all DoH endpoints failed transport consecutively; tripping short backoff"
+                        );
+                    } else {
+                        debug!(
+                            domain = %normalized,
+                            error = %redacted_cause,
+                            "transient DoH transport failure; keeping DoH active"
+                        );
+                    }
+                    self.resolve_udp_or_system_excluding(normalized, skip_udp_server)
+                        .await
+                }
+            }
+        } else {
+            self.resolve_udp_or_system_excluding(normalized, skip_udp_server)
+                .await
+        }
     }
 
     async fn resolve_single_qtype(
@@ -565,117 +777,247 @@ impl DnsResolver {
             return Ok(DnsOutcome::Records(ips, Duration::from_secs(300)));
         }
 
-        // 2. Localhost fast-path
-        if normalized == "localhost" {
+        // 2. Localhost fast-path (RFC 6761 §6.3: localhost and *.localhost)
+        if normalized == "localhost" || normalized.ends_with(".localhost") {
             let ips = match qtype {
                 QTYPE_A => vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
-                QTYPE_AAAA if !self.ipv4_only => vec![IpAddr::V6(Ipv6Addr::LOCALHOST)],
+                QTYPE_AAAA if !self.is_ipv4_only() => vec![IpAddr::V6(Ipv6Addr::LOCALHOST)],
                 _ => Vec::new(),
             };
             return Ok(DnsOutcome::Records(ips, Duration::from_secs(300)));
         }
 
-        // 3. mDNS (.local) via OS resolver (disabled in TUN mode to prevent system DNS recursion)
+        // 3. mDNS / Corporate Active Directory (.local):
+        //    - Check the TTL cache first so subsequent connections to corporate AD `.local`
+        //      hostnames cached from `active_custom_udp_primary()` never re-pay OS mDNS timeouts.
+        //    - In TUN mode / when system DNS fallback is disabled: if an explicit custom bare-IP
+        //      UDP server (e.g. corporate --dns 10.0.0.53) is configured, query it directly and
+        //      cache the answer; otherwise return synthetic NXDOMAIN to prevent OS DNS recursion.
+        //    - In Proxy mode: try the OS resolver first; if OS resolution fails and
+        //      `active_custom_udp_primary()` is configured, fall back to querying that server
+        //      directly (never public DoH) and cache successful answers.
         if normalized.ends_with(".local") {
+            if let Some(cached) = self.lookup_cache_qtype(&normalized, qtype).await {
+                return Ok(cached);
+            }
             if no_system_fallback {
+                if let Some(custom_udp) = self.active_custom_udp_primary() {
+                    debug!(
+                        domain = %normalized,
+                        qtype = qtype,
+                        server = %custom_udp,
+                        "TUN mode .local hostname; querying custom bare-IP UDP server directly"
+                    );
+                    let outcome = self
+                        .query_single_udp_server_type(custom_udp, &normalized, qtype)
+                        .await?;
+                    self.store_cache_qtype(normalized, qtype, &outcome).await;
+                    return Ok(outcome);
+                }
                 return Ok(DnsOutcome::NxDomain(Duration::from_secs(30)));
             }
-            let ips: Vec<IpAddr> = self
-                .resolve_via_system(&normalized, false)
+            match self.resolve_via_system(&normalized, false).await {
+                Ok(sys_ips) => {
+                    let ips: Vec<IpAddr> = sys_ips
+                        .into_iter()
+                        .filter(|ip| match qtype {
+                            QTYPE_A => ip.is_ipv4(),
+                            QTYPE_AAAA => ip.is_ipv6(),
+                            _ => false,
+                        })
+                        .collect();
+                    return Ok(DnsOutcome::Records(ips, Duration::from_secs(60)));
+                }
+                Err(sys_err) => {
+                    if let Some(custom_udp) = self.active_custom_udp_primary() {
+                        debug!(
+                            domain = %normalized,
+                            qtype = qtype,
+                            server = %custom_udp,
+                            error = %sys_err,
+                            "system DNS failed for .local hostname; falling back to custom bare-IP UDP server"
+                        );
+                        let outcome = self
+                            .query_single_udp_server_type(custom_udp, &normalized, qtype)
+                            .await?;
+                        if matches!(outcome, DnsOutcome::Records(_, _)) {
+                            self.store_cache_qtype(normalized, qtype, &outcome).await;
+                        }
+                        return Ok(outcome);
+                    }
+                    return Err(sys_err);
+                }
+            }
+        }
+
+        // 3b. Single-label LAN hostnames and private/local suffixes via OS resolver in Proxy mode.
+        //     When OS resolution fails and an explicit custom bare-IP UDP server (e.g. corporate
+        //     --dns 10.0.0.53) is configured, fall back to querying that server directly.
+        if self.should_route_to_system_resolver(&normalized, disable_system_fallback) {
+            match self.resolve_via_system(&normalized, false).await {
+                Ok(sys_ips) => {
+                    let ips: Vec<IpAddr> = sys_ips
+                        .into_iter()
+                        .filter(|ip| match qtype {
+                            QTYPE_A => ip.is_ipv4(),
+                            QTYPE_AAAA => ip.is_ipv6(),
+                            _ => false,
+                        })
+                        .collect();
+                    return Ok(DnsOutcome::Records(ips, Duration::from_secs(60)));
+                }
+                Err(sys_err) => {
+                    if let Some(custom_udp) = self.active_custom_udp_primary() {
+                        debug!(
+                            domain = %normalized,
+                            qtype = qtype,
+                            server = %custom_udp,
+                            error = %sys_err,
+                            "system DNS failed for LAN/private hostname; falling back to custom bare-IP UDP server"
+                        );
+                        return self
+                            .query_single_udp_server_type(custom_udp, &normalized, qtype)
+                            .await;
+                    }
+                    return Err(sys_err);
+                }
+            }
+        }
+
+        // 4. In-memory TTL cache lookup respecting per-family coverage
+        if let Some(cached) = self.lookup_cache_qtype(&normalized, qtype).await {
+            return Ok(cached);
+        }
+
+        // 5. Query ONLY the requested qtype so `QTYPE_A` never stalls waiting on `QTYPE_AAAA`.
+        let outcome = if let Some(primary) = self.active_custom_udp_primary() {
+            match self
+                .query_single_udp_server_type(primary, &normalized, qtype)
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(cause) => {
+                    debug!(
+                        domain = %normalized,
+                        qtype = qtype,
+                        server = %primary,
+                        error = %cause,
+                        "custom bare-IP UDP DNS failed; falling back to DoH/backup ring"
+                    );
+                    self.resolve_doh_or_udp_or_system_type(
+                        &normalized,
+                        qtype,
+                        no_system_fallback,
+                        Some(primary),
+                    )
+                    .await?
+                }
+            }
+        } else {
+            self.resolve_doh_or_udp_or_system_type(&normalized, qtype, no_system_fallback, None)
                 .await?
-                .into_iter()
+        };
+
+        // 6. Merge result into shared TTL cache while preserving IPv4-first ordering
+        self.store_cache_qtype(normalized, qtype, &outcome).await;
+
+        Ok(outcome)
+    }
+
+    async fn lookup_cache_outcome(&self, normalized: &str) -> Option<DnsOutcome> {
+        let guard = self.cache.read().await;
+        let entry = guard.get(normalized)?;
+        let now = Instant::now();
+        if now >= entry.expires_at {
+            return None;
+        }
+        let rem = entry.expires_at.saturating_duration_since(now);
+        if entry.nxdomain {
+            return Some(DnsOutcome::NxDomain(rem));
+        }
+        let ipv4_only = self.is_ipv4_only();
+        if entry.has_a_lookup && (ipv4_only || entry.has_aaaa_lookup) && !entry.ips.is_empty() {
+            let ips: Vec<IpAddr> = if ipv4_only {
+                entry.ips.iter().copied().filter(IpAddr::is_ipv4).collect()
+            } else {
+                entry.ips.clone()
+            };
+            if !ips.is_empty() {
+                return Some(DnsOutcome::Records(ips, rem));
+            }
+        }
+        None
+    }
+
+    async fn store_cache_resolved(&self, normalized: String, resolved: &ResolvedOutcome) {
+        match &resolved.outcome {
+            DnsOutcome::NxDomain(ttl) if !ttl.is_zero() => {
+                let mut guard = self.cache.write().await;
+                insert_cache_entry(
+                    &mut guard,
+                    normalized,
+                    CacheEntry {
+                        ips: Vec::new(),
+                        nxdomain: true,
+                        has_a_lookup: true,
+                        has_aaaa_lookup: true,
+                        expires_at: Instant::now() + (*ttl).min(Duration::from_secs(60)),
+                    },
+                );
+            }
+            DnsOutcome::Records(ips, ttl) if !ips.is_empty() && ips.len() <= MAX_CACHED_IPS => {
+                let mut guard = self.cache.write().await;
+                insert_cache_entry(
+                    &mut guard,
+                    normalized,
+                    CacheEntry {
+                        ips: ips.clone(),
+                        nxdomain: false,
+                        has_a_lookup: resolved.has_a_lookup,
+                        has_aaaa_lookup: resolved.has_aaaa_lookup,
+                        expires_at: Instant::now() + *ttl,
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+
+    async fn lookup_cache_qtype(&self, normalized: &str, qtype: u16) -> Option<DnsOutcome> {
+        let guard = self.cache.read().await;
+        let entry = guard.get(normalized)?;
+        let now = Instant::now();
+        if now >= entry.expires_at {
+            return None;
+        }
+        let rem = entry.expires_at.saturating_duration_since(now);
+        if entry.nxdomain {
+            return Some(DnsOutcome::NxDomain(rem));
+        }
+        let family_cached = match qtype {
+            QTYPE_A => entry.has_a_lookup,
+            QTYPE_AAAA => entry.has_aaaa_lookup,
+            _ => false,
+        };
+        if family_cached {
+            let matching: Vec<IpAddr> = entry
+                .ips
+                .iter()
+                .copied()
                 .filter(|ip| match qtype {
                     QTYPE_A => ip.is_ipv4(),
                     QTYPE_AAAA => ip.is_ipv6(),
                     _ => false,
                 })
                 .collect();
-            return Ok(DnsOutcome::Records(ips, Duration::from_secs(60)));
+            return Some(DnsOutcome::Records(matching, rem));
         }
+        None
+    }
 
-        // 4. In-memory TTL cache lookup respecting per-family coverage
-        {
-            let guard = self.cache.read().await;
-            if let Some(entry) = guard.get(&normalized) {
-                let now = Instant::now();
-                if now < entry.expires_at {
-                    let rem = entry.expires_at.saturating_duration_since(now);
-                    if entry.nxdomain {
-                        return Ok(DnsOutcome::NxDomain(rem));
-                    }
-                    let family_cached = match qtype {
-                        QTYPE_A => entry.has_a_lookup,
-                        QTYPE_AAAA => entry.has_aaaa_lookup,
-                        _ => false,
-                    };
-                    if family_cached {
-                        let matching: Vec<IpAddr> = entry
-                            .ips
-                            .iter()
-                            .copied()
-                            .filter(|ip| match qtype {
-                                QTYPE_A => ip.is_ipv4(),
-                                QTYPE_AAAA => ip.is_ipv6(),
-                                _ => false,
-                            })
-                            .collect();
-                        if !matching.is_empty() || qtype == QTYPE_AAAA {
-                            return Ok(DnsOutcome::Records(matching, rem));
-                        }
-                    }
-                }
-            }
-        }
-
-        // 5. Query ONLY the requested qtype so `QTYPE_A` never stalls waiting on `QTYPE_AAAA`.
-        let outcome = if self.enable_doh && !self.is_doh_in_backoff() {
-            match self.query_doh_type(&normalized, qtype).await {
-                Ok(outcome) => {
-                    self.record_doh_success();
-                    outcome
-                }
-                Err(err) => {
-                    match &err {
-                        DohError::Transport(cause) => {
-                            if self.record_doh_transport_failure() {
-                                debug!(
-                                    domain = %normalized,
-                                    qtype = qtype,
-                                    error = %cause,
-                                    backoff_secs = DOH_BACKOFF_SECS,
-                                    "all DoH endpoints failed transport consecutively; tripping short backoff"
-                                );
-                            } else {
-                                debug!(
-                                    domain = %normalized,
-                                    qtype = qtype,
-                                    error = %cause,
-                                    "transient DoH transport failure; keeping DoH active"
-                                );
-                            }
-                        }
-                        DohError::ProtocolError { endpoint, rcode } => {
-                            debug!(
-                                domain = %normalized,
-                                qtype = qtype,
-                                endpoint = %endpoint,
-                                rcode = rcode,
-                                "DoH returned DNS protocol error; falling back without tripping backoff"
-                            );
-                        }
-                    }
-                    self.resolve_udp_or_system_type(&normalized, qtype, no_system_fallback)
-                        .await?
-                }
-            }
-        } else {
-            self.resolve_udp_or_system_type(&normalized, qtype, no_system_fallback)
-                .await?
-        };
-
-        // 6. Merge result into shared TTL cache while preserving IPv4-first ordering
-        match &outcome {
-            DnsOutcome::NxDomain(ttl) => {
+    async fn store_cache_qtype(&self, normalized: String, qtype: u16, outcome: &DnsOutcome) {
+        match outcome {
+            DnsOutcome::NxDomain(ttl) if !ttl.is_zero() => {
                 let mut guard = self.cache.write().await;
                 insert_cache_entry(
                     &mut guard,
@@ -690,7 +1032,7 @@ impl DnsResolver {
                 );
             }
             DnsOutcome::Records(ips, ttl)
-                if ips.len() <= MAX_CACHED_IPS && (!ips.is_empty() || qtype == QTYPE_AAAA) =>
+                if !(ips.is_empty() && ttl.is_zero()) && ips.len() <= MAX_CACHED_IPS =>
             {
                 let now = Instant::now();
                 let effective_ttl = if ips.is_empty() {
@@ -707,9 +1049,7 @@ impl DnsResolver {
                             ips: combined,
                             nxdomain: false,
                             has_a_lookup: existing.has_a_lookup || qtype == QTYPE_A,
-                            has_aaaa_lookup: existing.has_aaaa_lookup
-                                || qtype == QTYPE_AAAA
-                                || self.ipv4_only,
+                            has_aaaa_lookup: existing.has_aaaa_lookup || qtype == QTYPE_AAAA,
                             expires_at: existing.expires_at.min(now + effective_ttl),
                         })
                     } else {
@@ -722,19 +1062,90 @@ impl DnsResolver {
                     ips: ips.clone(),
                     nxdomain: false,
                     has_a_lookup: qtype == QTYPE_A,
-                    has_aaaa_lookup: qtype == QTYPE_AAAA || self.ipv4_only,
+                    has_aaaa_lookup: qtype == QTYPE_AAAA,
                     expires_at: now + effective_ttl,
                 });
                 insert_cache_entry(&mut guard, normalized, entry);
             }
             _ => {}
         }
-
-        Ok(outcome)
     }
 
+    async fn resolve_doh_or_udp_or_system_type(
+        &self,
+        normalized: &str,
+        qtype: u16,
+        no_system_fallback: bool,
+        skip_udp_server: Option<SocketAddr>,
+    ) -> Result<DnsOutcome> {
+        if self.enable_doh && !self.is_doh_in_backoff() {
+            match self.query_doh_type(normalized, qtype).await {
+                Ok(outcome) => {
+                    self.record_doh_success();
+                    Ok(outcome)
+                }
+                Err(err @ DohError::ProtocolError { .. }) => {
+                    if let DohError::ProtocolError { endpoint, rcode } = &err {
+                        let redacted = redact_dns_for_display(endpoint);
+                        debug!(
+                            domain = %normalized,
+                            qtype = qtype,
+                            endpoint = %redacted,
+                            rcode = *rcode,
+                            "DoH returned DNS protocol error; failing without plaintext UDP fallback"
+                        );
+                    }
+                    bail!("{err} for {normalized}");
+                }
+                Err(DohError::Transport(cause)) => {
+                    let redacted_cause = redact_urls_in_text(&cause.to_string());
+                    if self.record_doh_transport_failure() {
+                        debug!(
+                            domain = %normalized,
+                            qtype = qtype,
+                            error = %redacted_cause,
+                            backoff_secs = DOH_BACKOFF_SECS,
+                            "all DoH endpoints failed transport consecutively; tripping short backoff"
+                        );
+                    } else {
+                        debug!(
+                            domain = %normalized,
+                            qtype = qtype,
+                            error = %redacted_cause,
+                            "transient DoH transport failure; keeping DoH active"
+                        );
+                    }
+                    self.resolve_udp_or_system_type_excluding(
+                        normalized,
+                        qtype,
+                        no_system_fallback,
+                        skip_udp_server,
+                    )
+                    .await
+                }
+            }
+        } else {
+            self.resolve_udp_or_system_type_excluding(
+                normalized,
+                qtype,
+                no_system_fallback,
+                skip_udp_server,
+            )
+            .await
+        }
+    }
+
+    #[cfg(test)]
     async fn resolve_udp_or_system(&self, domain: &str) -> Result<ResolvedOutcome> {
-        match self.resolve_via_udp(domain).await {
+        self.resolve_udp_or_system_excluding(domain, None).await
+    }
+
+    async fn resolve_udp_or_system_excluding(
+        &self,
+        domain: &str,
+        skip_udp_server: Option<SocketAddr>,
+    ) -> Result<ResolvedOutcome> {
+        match self.resolve_via_udp_excluding(domain, skip_udp_server).await {
             Ok(resolved) => match &resolved.outcome {
                 DnsOutcome::NxDomain(_) => Ok(resolved),
                 DnsOutcome::Records(ips, _) if !ips.is_empty() => Ok(resolved),
@@ -746,7 +1157,7 @@ impl DnsResolver {
                     Ok(ResolvedOutcome {
                         outcome: DnsOutcome::Records(sys, Duration::from_secs(60)),
                         has_a_lookup: true,
-                        has_aaaa_lookup: !self.ipv4_only,
+                        has_aaaa_lookup: !self.is_ipv4_only(),
                     })
                 }
             },
@@ -756,20 +1167,24 @@ impl DnsResolver {
                 Ok(ResolvedOutcome {
                     outcome: DnsOutcome::Records(sys, Duration::from_secs(60)),
                     has_a_lookup: true,
-                    has_aaaa_lookup: !self.ipv4_only,
+                    has_aaaa_lookup: !self.is_ipv4_only(),
                 })
             }
         }
     }
 
-    async fn resolve_udp_or_system_type(
+    async fn resolve_udp_or_system_type_excluding(
         &self,
         domain: &str,
         qtype: u16,
         disable_system_fallback: bool,
+        skip_udp_server: Option<SocketAddr>,
     ) -> Result<DnsOutcome> {
         let no_system = disable_system_fallback || self.is_system_dns_disabled();
-        match self.query_udp_type(domain, qtype).await {
+        match self
+            .query_udp_type_excluding(domain, qtype, skip_udp_server)
+            .await
+        {
             Ok(DnsOutcome::NxDomain(ttl)) => Ok(DnsOutcome::NxDomain(ttl)),
             Ok(DnsOutcome::Records(ips, ttl))
                 if !ips.is_empty() || qtype == QTYPE_AAAA || no_system =>
@@ -797,7 +1212,7 @@ impl DnsResolver {
         &self,
         domain: &str,
     ) -> std::result::Result<ResolvedOutcome, DohError> {
-        if self.ipv4_only {
+        if self.is_ipv4_only() {
             let outcome = self.query_doh_type(domain, QTYPE_A).await?;
             let is_nx = matches!(outcome, DnsOutcome::NxDomain(_));
             return Ok(ResolvedOutcome {
@@ -807,13 +1222,13 @@ impl DnsResolver {
             });
         }
 
-        let (v4_res, v6_res) = tokio::join!(
-            self.query_doh_type(domain, QTYPE_A),
-            tokio::time::timeout(
-                Duration::from_millis(700),
-                self.query_doh_type(domain, QTYPE_AAAA)
-            )
-        );
+        let (v4_res, v6_res) = join_a_and_aaaa(
+            Box::pin(self.query_doh_type(domain, QTYPE_A)),
+            Box::pin(self.query_doh_type(domain, QTYPE_AAAA)),
+            Duration::from_millis(700),
+            |res| matches!(res, Ok(DnsOutcome::Records(ips, _)) if !ips.is_empty()),
+        )
+        .await;
 
         let mut ips = Vec::new();
         let mut min_ttl = Duration::from_secs(300);
@@ -844,11 +1259,11 @@ impl DnsResolver {
         // CNAME-only empty AAAA responses (such as www.roblox.com) are normal and must never
         // discard valid IPv4 A records — and an empty AAAA response must never mask an A failure.
         match v6_res {
-            Ok(Ok(DnsOutcome::NxDomain(ttl))) => {
+            Some(Ok(DnsOutcome::NxDomain(ttl))) => {
                 has_aaaa_lookup = true;
                 min_ttl = min_ttl.min(ttl);
             }
-            Ok(Ok(DnsOutcome::Records(v6, ttl))) => {
+            Some(Ok(DnsOutcome::Records(v6, ttl))) => {
                 has_aaaa_lookup = true;
                 if !v6.is_empty() {
                     min_ttl = min_ttl.min(ttl);
@@ -859,7 +1274,7 @@ impl DnsResolver {
                     }
                 }
             }
-            Ok(Err(err @ DohError::ProtocolError { .. })) if protocol_err.is_none() => {
+            Some(Err(err @ DohError::ProtocolError { .. })) if protocol_err.is_none() => {
                 protocol_err = Some(err);
             }
             _ => {}
@@ -900,13 +1315,14 @@ impl DnsResolver {
         idx: usize,
         wire_query: &[u8],
         qtype: u16,
+        require_ip_literal: bool,
     ) {
         let http = self.http_client();
         let outbound_binder = self.outbound_binder.clone();
         let bound_tls = self.bound_tls_connector.clone();
         let endpoint = self.doh_endpoints[idx].clone();
+        let allow_sinkhole = self.endpoint_allows_sinkhole(&endpoint);
         let query = wire_query.to_vec();
-        let require_ip_literal = self.is_system_dns_disabled();
         join_set.spawn(async move {
             let res = send_doh_request(
                 &http,
@@ -916,6 +1332,7 @@ impl DnsResolver {
                 &query,
                 qtype,
                 require_ip_literal,
+                allow_sinkhole,
             )
             .await;
             (idx, endpoint, res)
@@ -932,7 +1349,7 @@ impl DnsResolver {
         // Tier 1: Bootstrap via IP-literal DoH endpoints ONLY (never via custom_doh itself
         // and never via OS DNS) so hostname-based DoH cannot deadlock on itself.
         if let Ok(wire_a) = encode_dns_query(&custom.host, QTYPE_A) {
-            if self.ipv4_only {
+            if self.is_ipv4_only() {
                 if let Ok(DnsOutcome::Records(v4, ttl)) = self
                     .query_doh_ring_type(&custom.host, &wire_a, QTYPE_A, true)
                     .await
@@ -943,20 +1360,20 @@ impl DnsResolver {
                     }
                 }
             } else if let Ok(wire_aaaa) = encode_dns_query(&custom.host, QTYPE_AAAA) {
-                let (v4_res, v6_res) = tokio::join!(
-                    self.query_doh_ring_type(&custom.host, &wire_a, QTYPE_A, true),
-                    tokio::time::timeout(
-                        Duration::from_millis(700),
-                        self.query_doh_ring_type(&custom.host, &wire_aaaa, QTYPE_AAAA, true)
-                    )
-                );
+                let (v4_res, v6_res) = join_a_and_aaaa(
+                    Box::pin(self.query_doh_ring_type(&custom.host, &wire_a, QTYPE_A, true)),
+                    Box::pin(self.query_doh_ring_type(&custom.host, &wire_aaaa, QTYPE_AAAA, true)),
+                    Duration::from_millis(700),
+                    |res| matches!(res, Ok(DnsOutcome::Records(v4, _)) if !v4.is_empty()),
+                )
+                .await;
                 if let Ok(DnsOutcome::Records(v4, ttl)) = v4_res {
                     if !v4.is_empty() {
                         min_ttl = min_ttl.min(ttl);
                         ips.extend(v4);
                     }
                 }
-                if let Ok(Ok(DnsOutcome::Records(v6, ttl))) = v6_res {
+                if let Some(Ok(DnsOutcome::Records(v6, ttl))) = v6_res {
                     if !v6.is_empty() {
                         min_ttl = min_ttl.min(ttl);
                         for ip in v6 {
@@ -991,7 +1408,7 @@ impl DnsResolver {
             }
         }
 
-        if self.ipv4_only {
+        if self.is_ipv4_only() {
             ips.retain(IpAddr::is_ipv4);
         }
         ips.retain(|ip| validate_dns_ip_addr(*ip).is_ok());
@@ -1093,9 +1510,19 @@ impl DnsResolver {
                 .map_err(|_| anyhow!("invalid TLS SNI hostname '{}'", custom.host))?;
             let mut last_err = None;
             let mut ok_bytes = None;
-            for ip in ips.iter().take(2) {
+            let v4_filtered: Vec<IpAddr> = if self.is_ipv4_only() {
+                ips.iter().copied().filter(IpAddr::is_ipv4).collect()
+            } else {
+                Vec::new()
+            };
+            let candidates = select_dual_stack_candidates(if v4_filtered.is_empty() {
+                &ips
+            } else {
+                &v4_filtered
+            });
+            for ip in candidates {
                 let target = BoundDohTarget {
-                    addr: SocketAddr::new(*ip, custom.port),
+                    addr: SocketAddr::new(ip, custom.port),
                     host_header: custom.host_header.clone(),
                     path: custom.path_and_query.clone(),
                     server_name: server_name.clone(),
@@ -1155,11 +1582,12 @@ impl DnsResolver {
             .send_custom_doh_wire(custom, wire_query)
             .await
             .map_err(DohError::Transport)?;
-        let outcome = classify_doh_wire_reply(&bytes, qtype, &custom.request_url)?;
+        let outcome = classify_doh_wire_reply(&bytes, qtype, &custom.request_url, true)?;
+        let redacted = redact_dns_for_display(&custom.request_url);
         debug!(
             domain = %domain,
             qtype = qtype,
-            endpoint = %custom.request_url,
+            endpoint = %redacted,
             "custom bootstrapped DoH query succeeded"
         );
         Ok(outcome)
@@ -1171,7 +1599,6 @@ impl DnsResolver {
         qtype: u16,
     ) -> std::result::Result<DnsOutcome, DohError> {
         let wire_query = encode_dns_query(domain, qtype).map_err(DohError::Transport)?;
-        let mut custom_protocol_err: Option<DohError> = None;
 
         // When a custom hostname DoH URL is configured (e.g. https://dns.nextdns.io/abc123),
         // resolve its host via our IP-literal bootstrap ring first and connect over a pinned or
@@ -1184,14 +1611,16 @@ impl DnsResolver {
                 {
                     Ok(outcome) => return Ok(outcome),
                     Err(err @ DohError::ProtocolError { .. }) => {
-                        custom_protocol_err = Some(err);
+                        return Err(err);
                     }
                     Err(DohError::Transport(cause)) => {
+                        let redacted = redact_dns_for_display(&custom.request_url);
+                        let redacted_cause = redact_urls_in_text(&cause.to_string());
                         debug!(
                             domain = %domain,
                             qtype = qtype,
-                            endpoint = %custom.request_url,
-                            error = %cause,
+                            endpoint = %redacted,
+                            error = %redacted_cause,
                             "custom hostname DoH failed; falling back to IP-literal DoH ring"
                         );
                     }
@@ -1199,16 +1628,8 @@ impl DnsResolver {
             }
         }
 
-        match self
-            .query_doh_ring_type(domain, &wire_query, qtype, self.custom_doh.is_some())
+        self.query_doh_ring_type(domain, &wire_query, qtype, self.custom_doh.is_some())
             .await
-        {
-            Ok(outcome) => Ok(outcome),
-            Err(DohError::Transport(_)) if custom_protocol_err.is_some() => {
-                Err(custom_protocol_err.unwrap())
-            }
-            Err(err) => Err(err),
-        }
     }
 
     async fn query_doh_ring_type(
@@ -1218,13 +1639,7 @@ impl DnsResolver {
         qtype: u16,
         ip_literal_only: bool,
     ) -> std::result::Result<DnsOutcome, DohError> {
-        let eligible: Vec<usize> = self
-            .doh_endpoints
-            .iter()
-            .enumerate()
-            .filter(|(_, ep)| !ip_literal_only || is_ip_literal_doh_endpoint(ep))
-            .map(|(i, _)| i)
-            .collect();
+        let eligible = self.eligible_doh_indices(ip_literal_only);
         let count = eligible.len();
         if count == 0 {
             return Err(DohError::Transport(anyhow!("no DoH endpoints configured")));
@@ -1238,6 +1653,7 @@ impl DnsResolver {
         let pref = self.preferred_doh_idx.load(Ordering::Relaxed);
         let start_pos = eligible.iter().position(|&idx| idx == pref).unwrap_or(0);
         let start_idx = eligible[start_pos];
+        let start_allow_sinkhole = self.endpoint_allows_sinkhole(&self.doh_endpoints[start_idx]);
         let http = self.http_client();
         match send_doh_request(
             &http,
@@ -1247,19 +1663,24 @@ impl DnsResolver {
             wire_query,
             qtype,
             require_ip_literal,
+            start_allow_sinkhole,
         )
         .await
         {
             Ok(parsed) => {
+                let redacted = redact_dns_for_display(&self.doh_endpoints[start_idx]);
                 debug!(
                     domain = %domain,
                     qtype = qtype,
-                    endpoint = %self.doh_endpoints[start_idx],
+                    endpoint = %redacted,
                     "DoH query succeeded"
                 );
                 return Ok(parsed);
             }
             Err(err @ DohError::ProtocolError { .. }) => {
+                if start_allow_sinkhole {
+                    return Err(err);
+                }
                 protocol_err = Some(err);
             }
             Err(DohError::Transport(err)) => {
@@ -1276,7 +1697,7 @@ impl DnsResolver {
             let Some(idx) = remaining_indices.next() else {
                 break;
             };
-            self.spawn_doh_attempt(&mut join_set, idx, wire_query, qtype);
+            self.spawn_doh_attempt(&mut join_set, idx, wire_query, qtype, require_ip_literal);
         }
 
         while let Some(joined) = join_set.join_next().await {
@@ -1285,10 +1706,11 @@ impl DnsResolver {
                     Ok(parsed) => {
                         self.preferred_doh_idx.store(idx, Ordering::Relaxed);
                         join_set.abort_all();
+                        let redacted = redact_dns_for_display(&endpoint);
                         debug!(
                             domain = %domain,
                             qtype = qtype,
-                            endpoint = %endpoint,
+                            endpoint = %redacted,
                             "DoH failover succeeded and promoted endpoint"
                         );
                         return Ok(parsed);
@@ -1302,7 +1724,13 @@ impl DnsResolver {
                 }
             }
             if let Some(next_idx) = remaining_indices.next() {
-                self.spawn_doh_attempt(&mut join_set, next_idx, wire_query, qtype);
+                self.spawn_doh_attempt(
+                    &mut join_set,
+                    next_idx,
+                    wire_query,
+                    qtype,
+                    require_ip_literal,
+                );
             }
         }
 
@@ -1315,9 +1743,15 @@ impl DnsResolver {
         ))
     }
 
-    async fn resolve_via_udp(&self, domain: &str) -> Result<ResolvedOutcome> {
-        if self.ipv4_only {
-            let outcome = self.query_udp_type(domain, QTYPE_A).await?;
+    async fn resolve_via_single_udp_server(
+        &self,
+        server: SocketAddr,
+        domain: &str,
+    ) -> Result<ResolvedOutcome> {
+        if self.is_ipv4_only() {
+            let outcome = self
+                .query_single_udp_server_type(server, domain, QTYPE_A)
+                .await?;
             let is_nx = matches!(outcome, DnsOutcome::NxDomain(_));
             return Ok(ResolvedOutcome {
                 outcome,
@@ -1325,112 +1759,232 @@ impl DnsResolver {
                 has_aaaa_lookup: is_nx,
             });
         }
-        let (v4_res, v6_res) = tokio::join!(
-            self.query_udp_type(domain, QTYPE_A),
-            tokio::time::timeout(
-                Duration::from_millis(800),
-                self.query_udp_type(domain, QTYPE_AAAA)
-            )
-        );
-        let mut ips = Vec::new();
-        let mut min_ttl = Duration::from_secs(300);
-        let mut has_a_lookup = false;
-        let mut has_aaaa_lookup = false;
-        let mut nxdomain = false;
+        let (v4_res, v6_res) = join_a_and_aaaa(
+            Box::pin(self.query_single_udp_server_type(server, domain, QTYPE_A)),
+            Box::pin(self.query_single_udp_server_type(server, domain, QTYPE_AAAA)),
+            Duration::from_millis(800),
+            |res| matches!(res, Ok(DnsOutcome::Records(ips, _)) if !ips.is_empty()),
+        )
+        .await;
+        combine_udp_v4_v6_results(domain, v4_res, v6_res)
+    }
 
-        if let Ok(outcome) = v4_res {
-            has_a_lookup = true;
-            match outcome {
-                DnsOutcome::NxDomain(ttl) => {
-                    nxdomain = true;
-                    min_ttl = min_ttl.min(ttl);
-                }
-                DnsOutcome::Records(v4, ttl) => {
-                    if !v4.is_empty() {
-                        min_ttl = min_ttl.min(ttl);
-                        ips.extend(v4);
-                    }
-                }
-            }
-        }
-        if let Ok(Ok(outcome)) = v6_res {
-            has_aaaa_lookup = true;
-            match outcome {
-                DnsOutcome::NxDomain(ttl) => {
-                    min_ttl = min_ttl.min(ttl);
-                }
-                DnsOutcome::Records(v6, ttl) => {
-                    if !v6.is_empty() {
-                        min_ttl = min_ttl.min(ttl);
-                        for ip in v6 {
-                            if !ips.contains(&ip) {
-                                ips.push(ip);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if !ips.is_empty() {
-            Ok(ResolvedOutcome {
-                outcome: DnsOutcome::Records(ips, min_ttl),
-                has_a_lookup,
-                has_aaaa_lookup,
-            })
-        } else if nxdomain {
-            Ok(ResolvedOutcome {
-                outcome: DnsOutcome::NxDomain(min_ttl.min(Duration::from_secs(30))),
+    async fn resolve_via_udp(&self, domain: &str) -> Result<ResolvedOutcome> {
+        self.resolve_via_udp_excluding(domain, None).await
+    }
+
+    async fn resolve_via_udp_excluding(
+        &self,
+        domain: &str,
+        skip_server: Option<SocketAddr>,
+    ) -> Result<ResolvedOutcome> {
+        if self.is_ipv4_only() {
+            let outcome = self
+                .query_udp_type_excluding(domain, QTYPE_A, skip_server)
+                .await?;
+            let is_nx = matches!(outcome, DnsOutcome::NxDomain(_));
+            return Ok(ResolvedOutcome {
+                outcome,
                 has_a_lookup: true,
-                has_aaaa_lookup: true,
-            })
-        } else {
-            bail!("UDP DNS resolution failed for {domain}")
+                has_aaaa_lookup: is_nx,
+            });
+        }
+        let (v4_res, v6_res) = join_a_and_aaaa(
+            Box::pin(self.query_udp_type_excluding(domain, QTYPE_A, skip_server)),
+            Box::pin(self.query_udp_type_excluding(domain, QTYPE_AAAA, skip_server)),
+            Duration::from_millis(800),
+            |res| matches!(res, Ok(DnsOutcome::Records(ips, _)) if !ips.is_empty()),
+        )
+        .await;
+        combine_udp_v4_v6_results(domain, v4_res, v6_res)
+    }
+
+    async fn query_single_udp_server_type(
+        &self,
+        server: SocketAddr,
+        domain: &str,
+        qtype: u16,
+    ) -> Result<DnsOutcome> {
+        let wire_query = encode_dns_query(domain, qtype)?;
+        match self
+            .query_udp_server_once(server, &wire_query, qtype, false)
+            .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(UdpServerError::UntrustedNegative { outcome, .. }) => Ok(outcome),
+            Err(err) => Err(err.into_anyhow()),
         }
     }
 
+    async fn query_udp_server_once(
+        &self,
+        server: SocketAddr,
+        wire_query: &[u8],
+        qtype: u16,
+        prior_poisoned: bool,
+    ) -> std::result::Result<DnsOutcome, UdpServerError> {
+        let trust_filtering = self.udp_server_allows_sinkhole_and_loopback(server);
+        let untrusted_port53 = self.is_udp_port53(server) && !trust_filtering;
+        let mut suspect_negative: Option<DnsOutcome> = None;
+        let mut saw_poisoned_ip = false;
+
+        let res = send_udp_dns_matching(
+            server,
+            wire_query,
+            self.outbound_binder.as_deref(),
+            |resp, saw_poisoned_on_socket| {
+                let saw_poisoned = prior_poisoned || saw_poisoned_on_socket;
+                match decode_dns_outcome(resp, qtype) {
+                    Ok(DnsOutcome::NxDomain(ttl)) => {
+                        if untrusted_port53 {
+                            if !saw_poisoned_ip && suspect_negative.is_none() {
+                                suspect_negative = Some(DnsOutcome::NxDomain(Duration::ZERO));
+                            }
+                            UdpReplyDecision::PoisonedWaitForRace(anyhow!(
+                                "untrusted port-53 UDP DNS {server} returned immediate NXDOMAIN"
+                            ))
+                        } else {
+                            let effective_ttl = if should_cache_udp_negative(
+                                server,
+                                trust_filtering,
+                                saw_poisoned,
+                            ) {
+                                ttl
+                            } else {
+                                Duration::ZERO
+                            };
+                            UdpReplyDecision::Accept(DnsOutcome::NxDomain(effective_ttl))
+                        }
+                    }
+                    Ok(DnsOutcome::Records(ips, ttl)) => {
+                        let had_ips = !ips.is_empty();
+                        let clean = filter_poisoned_udp_ips(ips, trust_filtering);
+                        let is_tc =
+                            resp.len() >= 4 && (u16::from_be_bytes([resp[2], resp[3]]) & 0x0200) != 0;
+                        if had_ips && clean.is_empty() {
+                            saw_poisoned_ip = true;
+                            suspect_negative = None;
+                            UdpReplyDecision::PoisonedWaitForRace(anyhow!(
+                                "UDP DNS {server} returned only poisoned/sinkhole IPs"
+                            ))
+                        } else if !clean.is_empty() {
+                            UdpReplyDecision::Accept(DnsOutcome::Records(clean, ttl))
+                        } else if !is_tc {
+                            if untrusted_port53 {
+                                if !saw_poisoned_ip && suspect_negative.is_none() {
+                                    suspect_negative =
+                                        Some(DnsOutcome::Records(Vec::new(), Duration::ZERO));
+                                }
+                                UdpReplyDecision::PoisonedWaitForRace(anyhow!(
+                                    "untrusted port-53 UDP DNS {server} returned empty NODATA"
+                                ))
+                            } else {
+                                let effective_ttl = if should_cache_udp_negative(
+                                    server,
+                                    trust_filtering,
+                                    saw_poisoned,
+                                ) {
+                                    ttl
+                                } else {
+                                    Duration::ZERO
+                                };
+                                UdpReplyDecision::Accept(DnsOutcome::Records(clean, effective_ttl))
+                            }
+                        } else {
+                            UdpReplyDecision::Reject(anyhow!(
+                                "UDP DNS {server} returned truncated reply"
+                            ))
+                        }
+                    }
+                    Err(e) => UdpReplyDecision::Reject(e),
+                }
+            },
+        )
+        .await;
+
+        match res {
+            Ok(outcome) => Ok(outcome),
+            Err(UdpServerError::Poisoned(err)) => {
+                if let Some(outcome) = suspect_negative {
+                    Err(UdpServerError::UntrustedNegative { outcome, err })
+                } else {
+                    Err(UdpServerError::Poisoned(err))
+                }
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    #[cfg(test)]
     async fn query_udp_type(&self, domain: &str, qtype: u16) -> Result<DnsOutcome> {
+        self.query_udp_type_excluding(domain, qtype, None).await
+    }
+
+    async fn query_udp_type_excluding(
+        &self,
+        domain: &str,
+        qtype: u16,
+        skip_server: Option<SocketAddr>,
+    ) -> Result<DnsOutcome> {
         let wire_query = encode_dns_query(domain, qtype)?;
-        let count = self.udp_dns_servers.len();
+        let eligible: Vec<usize> = self
+            .eligible_udp_indices()
+            .into_iter()
+            .filter(|&idx| skip_server != Some(self.udp_dns_servers[idx]))
+            .collect();
+        let count = eligible.len();
         if count == 0 {
             bail!("no UDP DNS servers configured");
         }
 
-        let start = self.preferred_udp_idx.load(Ordering::Relaxed) % count;
+        let pref = self.preferred_udp_idx.load(Ordering::Relaxed);
+        let start_pos = eligible.iter().position(|&idx| idx == pref).unwrap_or(0);
         let mut last_err = None;
+        let mut saw_poisoned = false;
+        let mut pending_untrusted_negative: Option<DnsOutcome> = None;
 
         for offset in 0..count {
-            let idx = (start + offset) % count;
+            let idx = eligible[(start_pos + offset) % count];
             let server = self.udp_dns_servers[idx];
-            match send_udp_dns_raw(server, &wire_query, self.outbound_binder.as_deref()).await {
-                Ok(buf) => match decode_dns_outcome(&buf, qtype) {
-                    Ok(DnsOutcome::NxDomain(ttl)) => {
-                        if offset > 0 {
-                            self.preferred_udp_idx.store(idx, Ordering::Relaxed);
-                        }
-                        return Ok(DnsOutcome::NxDomain(ttl));
+            match self
+                .query_udp_server_once(server, &wire_query, qtype, saw_poisoned)
+                .await
+            {
+                Ok(DnsOutcome::NxDomain(ttl)) => {
+                    if offset > 0 && !ttl.is_zero() {
+                        self.maybe_promote_udp_server(idx);
                     }
-                    Ok(DnsOutcome::Records(ips, ttl)) => {
-                        let had_ips = !ips.is_empty();
-                        let clean = filter_poisoned_ips(ips);
-                        let is_tc =
-                            buf.len() >= 4 && (u16::from_be_bytes([buf[2], buf[3]]) & 0x0200) != 0;
-                        if had_ips && clean.is_empty() {
-                            last_err = Some(anyhow!(
-                                "UDP DNS {server} returned only poisoned/sinkhole IPs"
-                            ));
-                        } else if !clean.is_empty() || !is_tc {
-                            if offset > 0 && !clean.is_empty() {
-                                self.preferred_udp_idx.store(idx, Ordering::Relaxed);
-                            }
-                            return Ok(DnsOutcome::Records(clean, ttl));
-                        } else {
-                            last_err = Some(anyhow!("UDP DNS {server} returned truncated reply"));
-                        }
+                    return Ok(DnsOutcome::NxDomain(ttl));
+                }
+                Ok(DnsOutcome::Records(ips, ttl)) => {
+                    if offset > 0 && !ips.is_empty() {
+                        self.maybe_promote_udp_server(idx);
                     }
-                    Err(e) => last_err = Some(e),
-                },
-                Err(e) => last_err = Some(e),
+                    return Ok(DnsOutcome::Records(ips, ttl));
+                }
+                Err(UdpServerError::UntrustedNegative { outcome, err }) => {
+                    saw_poisoned = true;
+                    let has_remaining_non53 = ((offset + 1)..count).any(|next_offset| {
+                        let next_idx = eligible[(start_pos + next_offset) % count];
+                        !self.is_udp_port53(self.udp_dns_servers[next_idx])
+                    });
+                    if !has_remaining_non53 {
+                        return Ok(outcome);
+                    }
+                    pending_untrusted_negative.get_or_insert(outcome);
+                    last_err = Some(err);
+                }
+                Err(err) => {
+                    if err.is_poisoned() {
+                        saw_poisoned = true;
+                    }
+                    last_err = Some(err.into_anyhow());
+                }
             }
+        }
+
+        if let Some(outcome) = pending_untrusted_negative {
+            return Ok(outcome);
         }
 
         Err(last_err.unwrap_or_else(|| anyhow!("UDP DNS resolution failed for {domain}")))
@@ -1440,12 +1994,17 @@ impl DnsResolver {
         if self.is_system_dns_disabled() {
             bail!("system DNS lookup disabled (TUN recursion guard)");
         }
+        #[cfg(test)]
+        if self.test_force_system_dns_error {
+            bail!("simulated system DNS lookup failure for {domain}");
+        }
         let addrs = lookup_host((domain, 443u16))
             .await
             .with_context(|| format!("system DNS lookup failed for {domain}"))?;
 
         let mut v4 = Vec::new();
         let mut v6 = Vec::new();
+        let ipv4_only = self.is_ipv4_only();
         for sa in addrs {
             match sa.ip() {
                 IpAddr::V4(ip) => {
@@ -1454,7 +2013,7 @@ impl DnsResolver {
                         v4.push(addr);
                     }
                 }
-                IpAddr::V6(ip) if !self.ipv4_only => {
+                IpAddr::V6(ip) if !ipv4_only => {
                     let addr = IpAddr::V6(ip);
                     if (!filter_poison || !is_poisoned_public_ip(addr)) && !v6.contains(&addr) {
                         v6.push(addr);
@@ -1507,7 +2066,7 @@ impl DnsResolver {
         }
 
         if parsed.qclass == QCLASS_IN && matches!(parsed.qtype, QTYPE_A | QTYPE_AAAA) {
-            if parsed.qtype == QTYPE_AAAA && self.ipv4_only {
+            if parsed.qtype == QTYPE_AAAA && self.is_ipv4_only() {
                 self.query_count.fetch_add(1, Ordering::Relaxed);
                 return Ok((
                     build_dns_wire_response(parsed.tx_id, parsed.flags, question_slice, 0, &[], 60),
@@ -1521,7 +2080,8 @@ impl DnsResolver {
                 .resolve_single_qtype(&parsed.qname, parsed.qtype, true, true)
                 .await
             {
-                Ok(DnsOutcome::NxDomain(_)) => {
+                Ok(DnsOutcome::NxDomain(ttl)) => {
+                    let neg_ttl = if ttl.is_zero() { 0 } else { 30 };
                     return Ok((
                         build_dns_wire_response(
                             parsed.tx_id,
@@ -1529,7 +2089,7 @@ impl DnsResolver {
                             question_slice,
                             3,
                             &[],
-                            30,
+                            neg_ttl,
                         ),
                         None,
                     ));
@@ -1543,7 +2103,11 @@ impl DnsResolver {
                             _ => false,
                         })
                         .collect();
-                    let ttl_secs = ttl.as_secs().clamp(15, 3600) as u32;
+                    let ttl_secs = if matching.is_empty() && ttl.is_zero() {
+                        0
+                    } else {
+                        ttl.as_secs().clamp(15, 3600) as u32
+                    };
                     let resp = build_dns_wire_response(
                         parsed.tx_id,
                         parsed.flags,
@@ -1552,10 +2116,14 @@ impl DnsResolver {
                         &matching,
                         ttl_secs,
                     );
-                    let meta = if matching.is_empty() {
+                    let non_unspec: Vec<IpAddr> = matching
+                        .into_iter()
+                        .filter(|ip| !ip.is_unspecified())
+                        .collect();
+                    let meta = if non_unspec.is_empty() {
                         None
                     } else {
-                        Some((parsed.qname, matching))
+                        Some((parsed.qname, non_unspec))
                     };
                     return Ok((resp, meta));
                 }
@@ -1575,8 +2143,19 @@ impl DnsResolver {
             }
         }
 
-        // Forward other RR types (SRV, TXT, MX, PTR, etc.) over DoH (respecting backoff) or UDP fallback.
+        // Forward other RR types (SRV, TXT, MX, PTR, etc.) via custom bare-IP UDP first (if
+        // configured), then DoH (respecting backoff), then UDP fallback.
         self.query_count.fetch_add(1, Ordering::Relaxed);
+        if let Some(primary) = self.active_custom_udp_primary() {
+            if let Ok(mut raw) =
+                send_udp_dns_raw(primary, query, self.outbound_binder.as_deref()).await
+            {
+                if is_valid_raw_dns_reply(&raw, true) && raw.len() >= 12 {
+                    raw[0..2].copy_from_slice(&parsed.tx_id.to_be_bytes());
+                    return Ok((raw, None));
+                }
+            }
+        }
         if self.enable_doh && !self.is_doh_in_backoff() {
             if let Ok(mut raw) = self.query_doh_raw(query).await {
                 self.record_doh_success();
@@ -1623,13 +2202,7 @@ impl DnsResolver {
         }
 
         let ip_literal_only = self.custom_doh.is_some();
-        let eligible: Vec<usize> = self
-            .doh_endpoints
-            .iter()
-            .enumerate()
-            .filter(|(_, ep)| !ip_literal_only || is_ip_literal_doh_endpoint(ep))
-            .map(|(i, _)| i)
-            .collect();
+        let eligible = self.eligible_doh_indices(ip_literal_only);
         let count = eligible.len();
         if count == 0 {
             bail!("no DoH endpoints configured");
@@ -1663,13 +2236,15 @@ impl DnsResolver {
     }
 
     async fn query_udp_raw(&self, wire_query: &[u8]) -> Result<Vec<u8>> {
-        let count = self.udp_dns_servers.len();
+        let eligible = self.eligible_udp_indices();
+        let count = eligible.len();
         if count == 0 {
             bail!("no UDP DNS servers configured");
         }
-        let start = self.preferred_udp_idx.load(Ordering::Relaxed) % count;
+        let pref = self.preferred_udp_idx.load(Ordering::Relaxed);
+        let start_pos = eligible.iter().position(|&idx| idx == pref).unwrap_or(0);
         for offset in 0..count {
-            let idx = (start + offset) % count;
+            let idx = eligible[(start_pos + offset) % count];
             let Ok(bytes) = send_udp_dns_raw(
                 self.udp_dns_servers[idx],
                 wire_query,
@@ -1681,13 +2256,132 @@ impl DnsResolver {
             };
             if is_valid_raw_dns_reply(&bytes, true) {
                 if offset > 0 {
-                    self.preferred_udp_idx.store(idx, Ordering::Relaxed);
+                    self.maybe_promote_udp_server(idx);
                 }
                 return Ok(bytes);
             }
         }
         bail!("raw UDP DNS query failed")
     }
+}
+
+fn combine_udp_v4_v6_results(
+    domain: &str,
+    v4_res: Result<DnsOutcome>,
+    v6_res: Option<Result<DnsOutcome>>,
+) -> Result<ResolvedOutcome> {
+    let mut ips = Vec::new();
+    let mut min_ttl = Duration::from_secs(300);
+    let mut nx_ttl = Duration::from_secs(300);
+    let mut has_a_lookup = false;
+    let mut has_aaaa_lookup = false;
+    let mut nxdomain = false;
+
+    if let Ok(outcome) = v4_res {
+        has_a_lookup = true;
+        match outcome {
+            DnsOutcome::NxDomain(ttl) => {
+                nxdomain = true;
+                nx_ttl = nx_ttl.min(ttl);
+                if !ttl.is_zero() {
+                    min_ttl = min_ttl.min(ttl);
+                }
+            }
+            DnsOutcome::Records(v4, ttl) => {
+                if !v4.is_empty() {
+                    min_ttl = min_ttl.min(ttl);
+                    ips.extend(v4);
+                }
+            }
+        }
+    }
+    if let Some(Ok(outcome)) = v6_res {
+        has_aaaa_lookup = true;
+        match outcome {
+            DnsOutcome::NxDomain(ttl) => {
+                nx_ttl = nx_ttl.min(ttl);
+                if !ttl.is_zero() {
+                    min_ttl = min_ttl.min(ttl);
+                }
+            }
+            DnsOutcome::Records(v6, ttl) => {
+                if !v6.is_empty() {
+                    min_ttl = min_ttl.min(ttl);
+                    for ip in v6 {
+                        if !ips.contains(&ip) {
+                            ips.push(ip);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !ips.is_empty() {
+        Ok(ResolvedOutcome {
+            outcome: DnsOutcome::Records(ips, min_ttl),
+            has_a_lookup,
+            has_aaaa_lookup,
+        })
+    } else if nxdomain {
+        Ok(ResolvedOutcome {
+            outcome: DnsOutcome::NxDomain(nx_ttl.min(Duration::from_secs(30))),
+            has_a_lookup: true,
+            has_aaaa_lookup: true,
+        })
+    } else {
+        bail!("UDP DNS resolution failed for {domain}")
+    }
+}
+
+async fn join_a_and_aaaa<FA, FV6, TA, TV6>(
+    v4_fut: FA,
+    v6_fut: FV6,
+    v6_grace: Duration,
+    has_ipv4: impl Fn(&TA) -> bool,
+) -> (TA, Option<TV6>)
+where
+    FA: std::future::Future<Output = TA>,
+    FV6: std::future::Future<Output = TV6>,
+{
+    let started = Instant::now();
+    tokio::pin!(v4_fut);
+    tokio::pin!(v6_fut);
+
+    tokio::select! {
+        v4 = &mut v4_fut => {
+            if has_ipv4(&v4) {
+                let remaining = v6_grace.saturating_sub(started.elapsed());
+                let v6 = tokio::time::timeout(remaining, &mut v6_fut).await.ok();
+                (v4, v6)
+            } else {
+                let v6 = v6_fut.await;
+                (v4, Some(v6))
+            }
+        }
+        v6 = &mut v6_fut => {
+            let v4 = v4_fut.await;
+            (v4, Some(v6))
+        }
+    }
+}
+
+fn select_dual_stack_candidates(ips: &[IpAddr]) -> Vec<IpAddr> {
+    let mut selected = Vec::with_capacity(2);
+    if let Some(&v4) = ips.iter().find(|ip| ip.is_ipv4()) {
+        selected.push(v4);
+    }
+    if let Some(&v6) = ips.iter().find(|ip| ip.is_ipv6()) {
+        selected.push(v6);
+    }
+    for &ip in ips {
+        if selected.len() >= 2 {
+            break;
+        }
+        if !selected.contains(&ip) {
+            selected.push(ip);
+        }
+    }
+    selected
 }
 
 fn is_valid_raw_dns_reply(bytes: &[u8], reject_truncated: bool) -> bool {
@@ -1701,20 +2395,98 @@ fn is_valid_raw_dns_reply(bytes: &[u8], reject_truncated: bool) -> bool {
     is_response && !(reject_truncated && is_tc) && !matches!(rcode, 2 | 5)
 }
 
-async fn send_udp_dns_raw(
+fn is_loopback_dns_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
+}
+
+fn should_cache_udp_negative(
+    server: SocketAddr,
+    allow_sinkhole_and_loopback: bool,
+    saw_poisoned: bool,
+) -> bool {
+    if saw_poisoned {
+        return false;
+    }
+    server.port() != 53 || allow_sinkhole_and_loopback
+}
+
+fn dns_reply_matches_question(
+    resp: &[u8],
+    expected_qname: &str,
+    expected_qtype: u16,
+    expected_qclass: u16,
+) -> bool {
+    if resp.len() < 12 {
+        return false;
+    }
+    let qdcount = u16::from_be_bytes([resp[4], resp[5]]);
+    if qdcount == 0 {
+        return false;
+    }
+    let Ok((qname, pos)) = read_dns_name(resp, 12) else {
+        return false;
+    };
+    if pos + 4 > resp.len() {
+        return false;
+    }
+    let qtype = u16::from_be_bytes([resp[pos], resp[pos + 1]]);
+    let qclass = u16::from_be_bytes([resp[pos + 2], resp[pos + 3]]);
+    qname.eq_ignore_ascii_case(expected_qname)
+        && qtype == expected_qtype
+        && qclass == expected_qclass
+}
+
+enum UdpReplyDecision<T> {
+    Accept(T),
+    PoisonedWaitForRace(anyhow::Error),
+    Reject(anyhow::Error),
+}
+
+enum UdpServerError {
+    Poisoned(anyhow::Error),
+    UntrustedNegative {
+        outcome: DnsOutcome,
+        err: anyhow::Error,
+    },
+    Other(anyhow::Error),
+}
+
+impl UdpServerError {
+    fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::Poisoned(e) | Self::UntrustedNegative { err: e, .. } | Self::Other(e) => e,
+        }
+    }
+
+    fn is_poisoned(&self) -> bool {
+        matches!(self, Self::Poisoned(_) | Self::UntrustedNegative { .. })
+    }
+}
+
+async fn send_udp_dns_matching<T, F>(
     server: SocketAddr,
     wire_query: &[u8],
     outbound_binder: Option<&dyn OutboundBinder>,
-) -> Result<Vec<u8>> {
-    if wire_query.len() < 12 {
-        bail!("UDP DNS query shorter than 12-byte header");
-    }
+    mut classify: F,
+) -> std::result::Result<T, UdpServerError>
+where
+    F: FnMut(&[u8], bool) -> UdpReplyDecision<T>,
+{
+    let expected_q = parse_dns_question(wire_query).map_err(UdpServerError::Other)?;
     let tx_id = next_udp_tx_id();
     let tx_bytes = tx_id.to_be_bytes();
     let mut outbound_query = wire_query.to_vec();
     outbound_query[0..2].copy_from_slice(&tx_bytes);
 
-    let sock = if let Some(binder) = outbound_binder {
+    // Skip outbound interface binding when targeting loopback (127.0.0.0/8 or ::1) so
+    // local resolvers like dnsmasq, Unbound, and systemd-resolved work in TUN mode.
+    let effective_binder = outbound_binder.filter(|_| !is_loopback_dns_ip(server.ip()));
+    let sock = if let Some(binder) = effective_binder {
         let (domain, bind_addr) = if server.is_ipv4() {
             (
                 socket2::Domain::IPV4,
@@ -1726,37 +2498,62 @@ async fn send_udp_dns_raw(
                 SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
             )
         };
-        let raw = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+        let raw = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
+            .map_err(|e| UdpServerError::Other(e.into()))?;
         if !server.is_ipv4() {
             let _ = raw.set_only_v6(true);
         }
-        binder.bind_socket(socket2::SockRef::from(&raw), server.is_ipv4())?;
-        raw.bind(&bind_addr.into())?;
-        raw.set_nonblocking(true)?;
+        binder
+            .bind_socket(socket2::SockRef::from(&raw), server.is_ipv4())
+            .map_err(|e| UdpServerError::Other(e.into()))?;
+        raw.bind(&bind_addr.into())
+            .map_err(|e| UdpServerError::Other(e.into()))?;
+        raw.set_nonblocking(true)
+            .map_err(|e| UdpServerError::Other(e.into()))?;
         let std_sock: std::net::UdpSocket = raw.into();
-        UdpSocket::from_std(std_sock)?
+        UdpSocket::from_std(std_sock).map_err(|e| UdpServerError::Other(e.into()))?
     } else {
         let bind_addr = if server.is_ipv4() {
             "0.0.0.0:0"
         } else {
             "[::]:0"
         };
-        UdpSocket::bind(bind_addr).await?
+        UdpSocket::bind(bind_addr)
+            .await
+            .map_err(|e| UdpServerError::Other(e.into()))?
     };
-    sock.connect(server).await?;
-    sock.send(&outbound_query).await?;
+    sock.connect(server)
+        .await
+        .map_err(|e| UdpServerError::Other(e.into()))?;
+    sock.send(&outbound_query)
+        .await
+        .map_err(|e| UdpServerError::Other(e.into()))?;
     let mut buf = [0u8; 4096];
-    let deadline = Instant::now() + Duration::from_millis(1000);
+    let mut deadline = Instant::now() + Duration::from_millis(1000);
+    let mut poisoned_err: Option<anyhow::Error> = None;
     loop {
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            bail!("UDP DNS timeout from {server}");
+            return Err(match poisoned_err {
+                Some(err) => UdpServerError::Poisoned(err),
+                None => UdpServerError::Other(anyhow!("UDP DNS timeout from {server}")),
+            });
         };
         if remaining.is_zero() {
-            bail!("UDP DNS timeout from {server}");
+            return Err(match poisoned_err {
+                Some(err) => UdpServerError::Poisoned(err),
+                None => UdpServerError::Other(anyhow!("UDP DNS timeout from {server}")),
+            });
         }
-        let n = tokio::time::timeout(remaining, sock.recv(&mut buf))
-            .await
-            .map_err(|_| anyhow!("UDP DNS timeout from {server}"))??;
+        let n = match tokio::time::timeout(remaining, sock.recv(&mut buf)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(UdpServerError::Other(e.into())),
+            Err(_) => {
+                return Err(match poisoned_err {
+                    Some(err) => UdpServerError::Poisoned(err),
+                    None => UdpServerError::Other(anyhow!("UDP DNS timeout from {server}")),
+                });
+            }
+        };
         let resp = &buf[..n];
         if resp.len() < 12 || resp[0..2] != tx_bytes {
             continue;
@@ -1765,8 +2562,34 @@ async fn send_udp_dns_raw(
         if (flags & 0x8000) == 0 {
             continue;
         }
-        return Ok(resp.to_vec());
+        if !dns_reply_matches_question(resp, &expected_q.qname, expected_q.qtype, expected_q.qclass)
+        {
+            continue;
+        }
+        match classify(resp, poisoned_err.is_some()) {
+            UdpReplyDecision::Accept(val) => return Ok(val),
+            UdpReplyDecision::Reject(err) => return Err(UdpServerError::Other(err)),
+            UdpReplyDecision::PoisonedWaitForRace(err) => {
+                if poisoned_err.is_none() {
+                    poisoned_err = Some(err);
+                    deadline =
+                        deadline.min(Instant::now() + Duration::from_millis(UDP_DPI_RACE_GRACE_MS));
+                }
+            }
+        }
     }
+}
+
+async fn send_udp_dns_raw(
+    server: SocketAddr,
+    wire_query: &[u8],
+    outbound_binder: Option<&dyn OutboundBinder>,
+) -> Result<Vec<u8>> {
+    send_udp_dns_matching(server, wire_query, outbound_binder, |resp, _| {
+        UdpReplyDecision::Accept(resp.to_vec())
+    })
+    .await
+    .map_err(UdpServerError::into_anyhow)
 }
 
 struct ParsedDnsQuestion {
@@ -2219,19 +3042,18 @@ fn parse_doh_url_validated(raw: &str) -> std::result::Result<ParsedDohUrl, Strin
         Some(p) => format!("{host_for_url}:{p}"),
         None => host_for_url,
     };
-    let normalized_suffix = if raw_suffix.starts_with('?') {
-        format!("/{raw_suffix}")
+    let (normalized_suffix, path_and_query) = if raw_suffix.is_empty() {
+        (String::new(), "/dns-query".to_string())
+    } else if raw_suffix.starts_with('?') {
+        let pq = format!("/dns-query{raw_suffix}");
+        (pq.clone(), pq)
+    } else if let Some(query) = raw_suffix.strip_prefix("/?") {
+        let pq = format!("/dns-query?{query}");
+        (pq.clone(), pq)
     } else {
-        raw_suffix.to_string()
+        (raw_suffix.to_string(), raw_suffix.to_string())
     };
     let normalized_url = format!("https://{authority_normalized}{normalized_suffix}");
-    let path_and_query = if raw_suffix.is_empty() {
-        "/dns-query".to_string()
-    } else if raw_suffix.starts_with('?') {
-        format!("/dns-query{raw_suffix}")
-    } else {
-        raw_suffix.to_string()
-    };
     let request_url = format!("https://{authority_normalized}{path_and_query}");
 
     Ok(ParsedDohUrl {
@@ -2242,6 +3064,276 @@ fn parse_doh_url_validated(raw: &str) -> std::result::Result<ParsedDohUrl, Strin
         host_header,
         path_and_query,
     })
+}
+
+/// Returns whether DoH is effectively active for `dns_addr` and `enable_doh`.
+///
+/// Explicit valid `https://` DoH URLs always enable DoH even when `enable_doh` is `false`.
+pub fn effective_enable_doh(dns_addr: &str, enable_doh: bool) -> bool {
+    enable_doh || parse_doh_url_validated(dns_addr.trim()).is_ok()
+}
+
+/// Returns whether `dns_addr` is actively targeted via DoH as the primary resolver.
+///
+/// Returns `true` if `dns_addr` is a valid `https://` DoH URL (regardless of `enable_doh`),
+/// or if `enable_doh` is `true` and `dns_addr` parses as a known public DoH IP
+/// (`is_known_public_doh_ip`). Returns `false` for bare custom non-DoH IPs (e.g. `76.76.2.0`
+/// or `10.0.0.53`) so banners and dashboards never mislabel UDP-first custom IPs as DoH.
+pub fn is_effective_doh_target(dns_addr: &str, enable_doh: bool) -> bool {
+    let trimmed = dns_addr.trim();
+    if parse_doh_url_validated(trimmed).is_ok() {
+        return true;
+    }
+    enable_doh && parse_bare_dns_ip(trimmed).is_some_and(is_known_public_doh_ip)
+}
+
+fn starts_with_ignore_ascii_case(s: &str, prefix: &[u8]) -> bool {
+    s.as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+fn redact_authority_for_display(rest: &str, allow_single_label: bool) -> Option<String> {
+    // Split at the first path, query, fragment, backslash, whitespace, or control delimiter.
+    let (authority, remainder) = match rest.find(|c: char| {
+        matches!(c, '/' | '?' | '#' | '\\') || c.is_whitespace() || c.is_control()
+    }) {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, ""),
+    };
+
+    // If `@` appears anywhere after the first delimiter (e.g.
+    // `https://secretuser?p@dns.nextdns.io/a1b2c3` or
+    // `https://secretuser/pass@dns.nextdns.io/a1b2c3`), `authority` may actually be a
+    // credential/username whose password contained `?`/`/`/`#`/`\`/whitespace. Fail closed
+    // so userinfo can never leak as a hostname.
+    if remainder.contains('@') {
+        return None;
+    }
+
+    if authority.is_empty() {
+        return None;
+    }
+
+    // Strip any userinfo (`user:pass@`), using `rsplit_once` so passwords containing `@` cannot leak.
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, hp)| hp);
+    if host_port.is_empty() {
+        return None;
+    }
+
+    if let Some(after_open) = host_port.strip_prefix('[') {
+        let close = after_open.find(']')?;
+        let ip_str = &after_open[..close];
+        let v6 = ip_str.parse::<Ipv6Addr>().ok()?;
+        let tail = &after_open[close + 1..];
+        if tail.is_empty() {
+            Some(format!("[{v6}]"))
+        } else if let Some(port_str) = tail.strip_prefix(':') {
+            let port = parse_doh_port(port_str).ok()?;
+            Some(format!("[{v6}]:{port}"))
+        } else {
+            None
+        }
+    } else {
+        if host_port.contains('[')
+            || host_port.contains(']')
+            || host_port.matches(':').count() > 1
+        {
+            return None;
+        }
+        let (host_raw, port_opt) = match host_port.split_once(':') {
+            Some((h, p)) => (h, Some(parse_doh_port(p).ok()?)),
+            None => (host_port, None),
+        };
+        if host_raw.is_empty() {
+            return None;
+        }
+        let host_norm = if let Ok(v4) = host_raw.parse::<Ipv4Addr>() {
+            v4.to_string()
+        } else {
+            let lower = host_raw.trim_end_matches('.').to_ascii_lowercase();
+            if lower.is_empty()
+                || lower.len() > MAX_DNS_NAME_BYTES
+                || !lower
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+                || lower.starts_with('.')
+                || lower.starts_with('-')
+                || lower.ends_with('-')
+                || lower.contains("..")
+                || (!allow_single_label && !lower.contains('.'))
+            {
+                return None;
+            }
+            lower
+        };
+        Some(match port_opt {
+            Some(port) => format!("{host_norm}:{port}"),
+            None => host_norm,
+        })
+    }
+}
+
+/// Redacts sensitive userinfo, path, query, and fragment tokens from a DNS server string for
+/// safe display, logging, and error messages.
+///
+/// - Valid or malformed `https://` / `http://` URLs retain only `scheme://host[:port]`
+///   (preserving IPv6 brackets, e.g. `https://[2606:4700:4700::1111]/secret` ->
+///   `https://[2606:4700:4700::1111]`) and return `https://<redacted>` (never leaking raw
+///   secrets) when the host portion is missing or malformed.
+/// - Scheme-without-slashes inputs (`https:dns.nextdns.io/a1b2c3`, `http:host/secret`) return
+///   `https://<redacted>` / `http://<redacted>`.
+/// - Scheme-less URL-like inputs containing `/`, `?`, `@`, `#`, or `\` strip secrets and return
+///   only a validated IP or multi-label host[:port], or `<redacted>` when malformed.
+/// - Bare IP addresses or non-URL strings are returned trimmed.
+pub fn redact_dns_for_display(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if starts_with_ignore_ascii_case(trimmed, b"https:")
+        && !starts_with_ignore_ascii_case(trimmed, b"https://")
+    {
+        return "https://<redacted>".to_string();
+    }
+    if starts_with_ignore_ascii_case(trimmed, b"http:")
+        && !starts_with_ignore_ascii_case(trimmed, b"http://")
+    {
+        return "http://<redacted>".to_string();
+    }
+
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        if trimmed.contains(['/', '?', '@', '#', '\\']) {
+            return redact_authority_for_display(trimmed, false)
+                .unwrap_or_else(|| "<redacted>".to_string());
+        }
+        return trimmed.to_string();
+    };
+    let scheme_lower = scheme.to_ascii_lowercase();
+    let valid_scheme = !scheme_lower.is_empty()
+        && scheme_lower
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'));
+    let redacted_fallback = if scheme_lower == "https" {
+        "https://<redacted>".to_string()
+    } else if valid_scheme {
+        format!("{scheme_lower}://<redacted>")
+    } else {
+        "<redacted>".to_string()
+    };
+
+    if !valid_scheme {
+        return redacted_fallback;
+    }
+
+    let Some(normalized_host_port) = redact_authority_for_display(rest, true) else {
+        return redacted_fallback;
+    };
+
+    if scheme_lower == "https" {
+        format!("https://{normalized_host_port}")
+    } else {
+        format!("{scheme_lower}://{normalized_host_port}")
+    }
+}
+
+/// Redacts embedded `https://`, `http://`, and malformed `https:` / `http:` URLs inside
+/// free-form text (logs, errors, status messages) using [`redact_dns_for_display`] so path
+/// tokens, queries, fragments, and userinfo credentials never leak into UI or logs.
+pub fn redact_urls_in_text(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut cursor = 0usize;
+    while cursor < input.len() {
+        let rest = &input[cursor..];
+        let mut found: Option<(usize, usize, bool)> = None;
+        for (idx, _) in rest.char_indices() {
+            let tail = &rest[idx..];
+            if starts_with_ignore_ascii_case(tail, b"https://") {
+                found = Some((idx, 8, true));
+                break;
+            }
+            if starts_with_ignore_ascii_case(tail, b"http://") {
+                found = Some((idx, 7, true));
+                break;
+            }
+            let scheme_colon_len = if starts_with_ignore_ascii_case(tail, b"https:") {
+                Some(6usize)
+            } else if starts_with_ignore_ascii_case(tail, b"http:") {
+                Some(5usize)
+            } else {
+                None
+            };
+            if let Some(prefix_len) = scheme_colon_len {
+                let prev_is_alnum = input[..cursor + idx]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_ascii_alphanumeric());
+                if !prev_is_alnum {
+                    found = Some((idx, prefix_len, false));
+                    break;
+                }
+            }
+        }
+        let Some((rel_start, prefix_len, has_slashes)) = found else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..rel_start]);
+        let url_slice = &rest[rel_start..];
+        let mut rel_end = url_slice.len();
+        for (idx, ch) in url_slice.char_indices() {
+            if ch.is_whitespace() || ch.is_control() || matches!(ch, '"' | '<' | '>') {
+                rel_end = idx;
+                break;
+            }
+        }
+        let mut token = &url_slice[..rel_end];
+        let mut trailing_start = rel_end;
+        while trailing_start > prefix_len {
+            let Some(last) = token.chars().next_back() else {
+                break;
+            };
+            let strip = match last {
+                '.' | ':' | ',' | ';' | '\'' => true,
+                ')' => {
+                    token.bytes().filter(|&b| b == b')').count()
+                        > token.bytes().filter(|&b| b == b'(').count()
+                }
+                ']' => {
+                    token.bytes().filter(|&b| b == b']').count()
+                        > token.bytes().filter(|&b| b == b'[').count()
+                }
+                _ => false,
+            };
+            if strip {
+                trailing_start -= last.len_utf8();
+                token = &url_slice[..trailing_start];
+            } else {
+                break;
+            }
+        }
+        if !has_slashes && trailing_start <= prefix_len {
+            out.push_str(&url_slice[..prefix_len]);
+            cursor += rel_start + prefix_len;
+            continue;
+        }
+        out.push_str(&redact_dns_for_display(token));
+        cursor += rel_start + trailing_start;
+    }
+    out
+}
+
+fn is_lan_or_private_hostname(normalized: &str) -> bool {
+    !normalized.contains('.')
+        || normalized.ends_with(".lan")
+        || normalized == "home.arpa"
+        || normalized.ends_with(".home.arpa")
+        || normalized.ends_with(".internal")
+        || normalized.ends_with(".localdomain")
+        || normalized.ends_with(".ts.net")
 }
 
 /// Validates and normalizes a custom DNS server input (IPv4, IPv6, or `https://` DoH URL).
@@ -2291,9 +3383,10 @@ struct BoundDohTarget {
 }
 
 fn parse_bound_doh_endpoint(endpoint: &str) -> Result<BoundDohTarget> {
-    let parsed = parse_doh_url_validated(endpoint).map_err(|msg| anyhow!("{msg}: {endpoint}"))?;
+    let redacted = redact_dns_for_display(endpoint);
+    let parsed = parse_doh_url_validated(endpoint).map_err(|msg| anyhow!("{msg}: {redacted}"))?;
     let DohHost::Ip(ip) = parsed.host else {
-        bail!("bound DoH requires IP-literal endpoint: {endpoint}");
+        bail!("bound DoH requires IP-literal endpoint: {redacted}");
     };
     Ok(BoundDohTarget {
         addr: SocketAddr::new(ip, parsed.port),
@@ -2310,33 +3403,34 @@ struct HttpDohHead {
 }
 
 fn parse_http_doh_head(raw: &[u8], endpoint: &str) -> Result<Option<HttpDohHead>> {
+    let redacted = redact_dns_for_display(endpoint);
     let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
         if raw.len() > MAX_BOUND_DOH_HEADER_BYTES {
-            bail!("DoH HTTP headers exceeded {MAX_BOUND_DOH_HEADER_BYTES} bytes from {endpoint}");
+            bail!("DoH HTTP headers exceeded {MAX_BOUND_DOH_HEADER_BYTES} bytes from {redacted}");
         }
         return Ok(None);
     };
     if pos > MAX_BOUND_DOH_HEADER_BYTES {
-        bail!("DoH HTTP headers exceeded {MAX_BOUND_DOH_HEADER_BYTES} bytes from {endpoint}");
+        bail!("DoH HTTP headers exceeded {MAX_BOUND_DOH_HEADER_BYTES} bytes from {redacted}");
     }
     let head_str = std::str::from_utf8(&raw[..pos])
-        .with_context(|| format!("non-UTF8 DoH HTTP response headers from {endpoint}"))?;
+        .with_context(|| format!("non-UTF8 DoH HTTP response headers from {redacted}"))?;
     let mut lines = head_str.split("\r\n");
     let status_line = lines
         .next()
-        .ok_or_else(|| anyhow!("empty DoH HTTP response from {endpoint}"))?;
+        .ok_or_else(|| anyhow!("empty DoH HTTP response from {redacted}"))?;
     let mut parts = status_line.split_ascii_whitespace();
     let version = parts
         .next()
-        .ok_or_else(|| anyhow!("malformed DoH HTTP status line from {endpoint}"))?;
+        .ok_or_else(|| anyhow!("malformed DoH HTTP status line from {redacted}"))?;
     if !version.starts_with("HTTP/") {
-        bail!("malformed DoH HTTP status line from {endpoint}");
+        bail!("malformed DoH HTTP status line from {redacted}");
     }
     let status_code = parts
         .next()
-        .ok_or_else(|| anyhow!("missing DoH HTTP status code from {endpoint}"))?;
+        .ok_or_else(|| anyhow!("missing DoH HTTP status code from {redacted}"))?;
     if status_code != "200" {
-        bail!("DoH HTTP status {status_code} from {endpoint}");
+        bail!("DoH HTTP status {status_code} from {redacted}");
     }
 
     let mut content_length = None;
@@ -2347,13 +3441,13 @@ fn parse_http_doh_head(raw: &[u8], endpoint: &str) -> Result<Option<HttpDohHead>
             let val = val.trim();
             if name.eq_ignore_ascii_case("content-length") {
                 let cl = val.parse::<usize>().with_context(|| {
-                    format!("invalid DoH Content-Length '{val}' from {endpoint}")
+                    format!("invalid DoH Content-Length '{val}' from {redacted}")
                 })?;
                 if cl > MAX_DNS_MESSAGE_BYTES {
                     bail!("DoH response exceeded {MAX_DNS_MESSAGE_BYTES} bytes");
                 }
                 if content_length.is_some_and(|prev| prev != cl) {
-                    bail!("conflicting DoH Content-Length headers from {endpoint}");
+                    bail!("conflicting DoH Content-Length headers from {redacted}");
                 }
                 content_length = Some(cl);
             } else if name.eq_ignore_ascii_case("transfer-encoding")
@@ -2425,12 +3519,13 @@ fn parse_http_doh_response(
     endpoint: &str,
     eof: bool,
 ) -> Result<Option<Vec<u8>>> {
+    let redacted = redact_dns_for_display(endpoint);
     if parsed_head.is_none() {
         *parsed_head = parse_http_doh_head(raw, endpoint)?;
     }
     let Some(head) = parsed_head.as_ref() else {
         if eof {
-            bail!("incomplete DoH HTTP response headers from {endpoint}");
+            bail!("incomplete DoH HTTP response headers from {redacted}");
         }
         return Ok(None);
     };
@@ -2439,7 +3534,7 @@ fn parse_http_doh_response(
     if head.chunked {
         match decode_http_chunked_body(body, MAX_DNS_MESSAGE_BYTES)? {
             Some(decoded) => Ok(Some(decoded)),
-            None if eof => bail!("truncated chunked DoH response from {endpoint}"),
+            None if eof => bail!("truncated chunked DoH response from {redacted}"),
             None => Ok(None),
         }
     } else if let Some(cl) = head.content_length {
@@ -2447,7 +3542,7 @@ fn parse_http_doh_response(
             Ok(Some(body[..cl].to_vec()))
         } else if eof {
             bail!(
-                "truncated DoH response from {endpoint} (got {} of {cl} bytes)",
+                "truncated DoH response from {redacted} (got {} of {cl} bytes)",
                 body.len()
             );
         } else {
@@ -2479,12 +3574,15 @@ async fn send_doh_bound_tls_target(
     endpoint: &str,
     wire_query: &[u8],
 ) -> Result<Vec<u8>> {
+    let redacted = redact_dns_for_display(endpoint);
     let sock = if target.addr.is_ipv4() {
         TcpSocket::new_v4()?
     } else {
         TcpSocket::new_v6()?
     };
-    binder.bind_socket(socket2::SockRef::from(&sock), target.addr.is_ipv4())?;
+    if !is_loopback_dns_ip(target.addr.ip()) {
+        binder.bind_socket(socket2::SockRef::from(&sock), target.addr.is_ipv4())?;
+    }
 
     let tcp = tokio::time::timeout(Duration::from_millis(1200), sock.connect(target.addr))
         .await
@@ -2499,11 +3597,12 @@ async fn send_doh_bound_tls_target(
         wire_query.len()
     );
 
+    let redacted_inner = redacted.clone();
     tokio::time::timeout(Duration::from_millis(2000), async move {
         let mut tls = connector
             .connect(server_name, tcp)
             .await
-            .with_context(|| format!("bound DoH TLS handshake failed to {endpoint}"))?;
+            .with_context(|| format!("bound DoH TLS handshake failed to {redacted_inner}"))?;
 
         tls.write_all(req_head.as_bytes()).await?;
         tls.write_all(wire_query).await?;
@@ -2523,7 +3622,7 @@ async fn send_doh_bound_tls_target(
                     raw.extend_from_slice(&buf[..n]);
 
                     if let Some(body) =
-                        parse_http_doh_response(&raw, &mut parsed_head, endpoint, false)?
+                        parse_http_doh_response(&raw, &mut parsed_head, &redacted_inner, false)?
                     {
                         return Ok(body);
                     }
@@ -2536,11 +3635,11 @@ async fn send_doh_bound_tls_target(
             }
         }
 
-        parse_http_doh_response(&raw, &mut parsed_head, endpoint, true)?
-            .ok_or_else(|| anyhow!("incomplete DoH HTTP response from {endpoint}"))
+        parse_http_doh_response(&raw, &mut parsed_head, &redacted_inner, true)?
+            .ok_or_else(|| anyhow!("incomplete DoH HTTP response from {redacted_inner}"))
     })
     .await
-    .map_err(|_| anyhow!("bound DoH exchange timeout to {endpoint}"))?
+    .map_err(|_| anyhow!("bound DoH exchange timeout to {redacted}"))?
 }
 
 async fn send_doh_wire(
@@ -2573,23 +3672,26 @@ async fn send_doh_request_raw(
     require_ip_literal: bool,
 ) -> Result<Vec<u8>> {
     if require_ip_literal && !is_ip_literal_doh_endpoint(endpoint) {
+        let redacted = redact_dns_for_display(endpoint);
         bail!(
-            "hostname-based DoH endpoint rejected when system DNS fallback is disabled: {endpoint}"
+            "hostname-based DoH endpoint rejected when system DNS fallback is disabled: {redacted}"
         );
     }
     send_doh_http_post(http, endpoint, wire_query).await
 }
 
 async fn send_doh_http_post(http: &Client, endpoint: &str, wire_query: &[u8]) -> Result<Vec<u8>> {
+    let redacted = redact_dns_for_display(endpoint);
     let mut resp = http
         .post(endpoint)
         .header("content-type", "application/dns-message")
         .header("accept", "application/dns-message")
         .body(wire_query.to_vec())
         .send()
-        .await?;
+        .await
+        .map_err(|e| anyhow!("DoH HTTP request failed to {redacted}: {}", e.without_url()))?;
     if !resp.status().is_success() {
-        bail!("DoH HTTP status {} from {}", resp.status(), endpoint);
+        bail!("DoH HTTP status {} from {redacted}", resp.status());
     }
     if resp
         .content_length()
@@ -2598,7 +3700,11 @@ async fn send_doh_http_post(http: &Client, endpoint: &str, wire_query: &[u8]) ->
         bail!("DoH response exceeded {MAX_DNS_MESSAGE_BYTES} bytes");
     }
     let mut bytes = Vec::new();
-    while let Some(chunk) = resp.chunk().await? {
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| anyhow!("DoH HTTP body read failed from {redacted}: {}", e.without_url()))?
+    {
         if chunk.len() > MAX_DNS_MESSAGE_BYTES - bytes.len() {
             bail!("DoH response exceeded {MAX_DNS_MESSAGE_BYTES} bytes");
         }
@@ -2611,18 +3717,20 @@ fn classify_doh_wire_reply(
     bytes: &[u8],
     qtype: u16,
     endpoint: &str,
+    allow_sinkhole: bool,
 ) -> std::result::Result<DnsOutcome, DohError> {
+    let redacted = redact_dns_for_display(endpoint);
     match decode_dns_outcome_classified(bytes, qtype) {
         Ok(DnsOutcome::NxDomain(ttl)) => Ok(DnsOutcome::NxDomain(ttl)),
         Ok(DnsOutcome::Records(ips, ttl)) => {
             let had_ips = !ips.is_empty();
-            let clean = filter_poisoned_ips(ips);
+            let clean = filter_poisoned_doh_ips(ips, allow_sinkhole);
             if had_ips && clean.is_empty() {
-                // Treat sinkholed/filtered answers (e.g. ad/telemetry hosts returning 0.0.0.0)
-                // as a DNS-level error rather than a transport outage so a single sinkholed
-                // domain can NEVER trip the global DoH backoff and drop all DNS onto UDP/53.
+                // Treat sinkholed/poisoned answers on unfiltered resolvers as a DNS-level error
+                // rather than a transport outage so a single sinkholed domain can NEVER trip the
+                // global DoH backoff and drop all DNS onto UDP/53.
                 Err(DohError::ProtocolError {
-                    endpoint: endpoint.to_string(),
+                    endpoint: redacted,
                     rcode: 0,
                 })
             } else {
@@ -2630,13 +3738,14 @@ fn classify_doh_wire_reply(
             }
         }
         Err(DnsDecodeError::ProtocolError(rcode)) => Err(DohError::ProtocolError {
-            endpoint: endpoint.to_string(),
+            endpoint: redacted,
             rcode,
         }),
         Err(DnsDecodeError::Malformed(err)) => Err(DohError::Transport(err)),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_doh_request(
     http: &Client,
     outbound_binder: Option<&dyn OutboundBinder>,
@@ -2645,6 +3754,7 @@ async fn send_doh_request(
     wire_query: &[u8],
     qtype: u16,
     require_ip_literal: bool,
+    allow_sinkhole: bool,
 ) -> std::result::Result<DnsOutcome, DohError> {
     let bytes = send_doh_wire(
         http,
@@ -2656,11 +3766,130 @@ async fn send_doh_request(
     )
     .await
     .map_err(DohError::Transport)?;
-    classify_doh_wire_reply(&bytes, qtype, endpoint)
+    classify_doh_wire_reply(&bytes, qtype, endpoint, allow_sinkhole)
+}
+
+fn parse_bare_dns_ip(raw: &str) -> Option<IpAddr> {
+    let trimmed = raw.trim();
+    let ip_opt = if trimmed.starts_with('[') || trimmed.ends_with(']') {
+        trimmed
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .and_then(|inner| inner.parse::<Ipv6Addr>().ok())
+            .map(IpAddr::V6)
+    } else {
+        trimmed.parse::<IpAddr>().ok()
+    };
+    ip_opt.filter(|ip| validate_dns_ip_addr(*ip).is_ok())
+}
+
+fn is_unfiltered_default_dns_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => matches!(
+            v4.octets(),
+            [1, 1, 1, 1]
+                | [1, 0, 0, 1]
+                | [8, 8, 8, 8]
+                | [8, 8, 4, 4]
+                | [94, 140, 14, 140 | 141]
+        ),
+        IpAddr::V6(v6) => matches!(
+            v6.segments(),
+            [0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111 | 0x1001]
+                | [0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888 | 0x8844]
+        ),
+    }
+}
+
+/// Returns `true` only for known public DNS IP addresses whose TLS certificates include an IP
+/// Subject Alternative Name (IP-SAN) and serve RFC 8484 DoH at `https://<ip>/dns-query`.
+///
+/// Arbitrary custom/corporate bare IPs (e.g. `76.76.2.0`, `10.0.0.53`, `192.168.1.1`) do not
+/// serve IP-SAN DoH and must be queried over UDP instead of synthesizing a broken `https://IP/dns-query`.
+fn is_known_public_doh_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => matches!(
+            v4.octets(),
+            // Cloudflare (Standard, Security, Family)
+            [1, 1, 1, 1..=3]
+                | [1, 0, 0, 1..=3]
+                // Google Public DNS
+                | [8, 8, 8, 8]
+                | [8, 8, 4, 4]
+                // Quad9
+                | [9, 9, 9, 9]
+                | [149, 112, 112, 112]
+                // AdGuard DNS (Default, Family, Unfiltered)
+                | [94, 140, 14, 14 | 15 | 140 | 141]
+                | [94, 140, 15, 15 | 16]
+        ),
+        IpAddr::V6(v6) => matches!(
+            v6.segments(),
+            // Cloudflare IPv6 (Standard, Security, Family, DNS64)
+            [
+                0x2606,
+                0x4700,
+                0x4700,
+                0,
+                0,
+                0,
+                0,
+                0x1111 | 0x1001 | 0x1112 | 0x1002 | 0x1113 | 0x1003 | 0x0064 | 0x6400
+            ]
+                // Google IPv6 (Standard, DNS64)
+                | [
+                    0x2001,
+                    0x4860,
+                    0x4860,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0x8888 | 0x8844 | 0x6464 | 0x0064
+                ]
+                // Quad9 IPv6
+                | [0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x00fe | 0x0009]
+                // AdGuard IPv6 (Default, Family, Unfiltered)
+                | [0x2a10, 0x50c0, 0, 0, 0, 0, 0x0ad1 | 0x0ad2 | 0xbad1 | 0xbad2 | 0x0001 | 0x0002, 0x00ff]
+        ),
+    }
+}
+
+fn is_filtering_dns_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => matches!(
+            v4.octets(),
+            // Cloudflare Security & Family (1.1.1.2, 1.0.0.2, 1.1.1.3, 1.0.0.3)
+            [1, 1, 1, 2 | 3]
+                | [1, 0, 0, 2 | 3]
+                // AdGuard DNS Default & Family
+                | [94, 140, 14, 14 | 15]
+                | [94, 140, 15, 15 | 16]
+                // Control D filtering resolvers
+                | [76, 76, 2 | 10, 1..=5]
+        ),
+        IpAddr::V6(v6) => matches!(
+            v6.segments(),
+            [0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1112 | 0x1002 | 0x1113 | 0x1003]
+                | [0x2a10, 0x50c0, 0, 0, 0, 0, 0x0ad1 | 0x0ad2 | 0xbad1 | 0xbad2, 0x00ff]
+        ),
+    }
+}
+
+fn is_filtering_doh_endpoint(endpoint: &str) -> bool {
+    let Ok(target) = parse_bound_doh_endpoint(endpoint) else {
+        return false;
+    };
+    is_filtering_dns_ip(target.addr.ip())
 }
 
 fn is_ip_literal_doh_endpoint(endpoint: &str) -> bool {
     parse_bound_doh_endpoint(endpoint).is_ok()
+}
+
+fn is_ipv6_doh_endpoint(endpoint: &str) -> bool {
+    parse_doh_url_validated(endpoint)
+        .is_ok_and(|parsed| matches!(parsed.host, DohHost::Ip(IpAddr::V6(_))))
 }
 
 fn is_http2_only_doh_endpoint(endpoint: &str) -> bool {
@@ -2688,8 +3917,10 @@ fn build_doh_endpoints(
     let trimmed = dns_addr.trim();
     if let Ok(parsed) = parse_doh_url_validated(trimmed) {
         match parsed.host {
-            DohHost::Ip(_) => {
-                list.push(parsed.request_url);
+            DohHost::Ip(ip) => {
+                if !ipv4_only || ip.is_ipv4() {
+                    list.push(parsed.request_url);
+                }
             }
             DohHost::Domain(_) => {
                 if !require_ip_literal {
@@ -2697,17 +3928,8 @@ fn build_doh_endpoints(
                 }
             }
         }
-    } else if !trimmed.is_empty() {
-        let ip_opt = if trimmed.starts_with('[') || trimmed.ends_with(']') {
-            trimmed
-                .strip_prefix('[')
-                .and_then(|s| s.strip_suffix(']'))
-                .and_then(|inner| inner.parse::<Ipv6Addr>().ok())
-                .map(IpAddr::V6)
-        } else {
-            trimmed.parse::<IpAddr>().ok()
-        };
-        if let Some(ip) = ip_opt.filter(|ip| validate_dns_ip_addr(*ip).is_ok()) {
+    } else if let Some(ip) = parse_bare_dns_ip(trimmed) {
+        if is_known_public_doh_ip(ip) && (!ipv4_only || ip.is_ipv4()) {
             let primary = match ip {
                 IpAddr::V4(v4) => format!("https://{v4}/dns-query"),
                 IpAddr::V6(v6) => format!("https://[{v6}]/dns-query"),
@@ -2717,31 +3939,37 @@ fn build_doh_endpoints(
     }
 
     // Multi-provider IP-literal DoH ring interleaved across independent networks
-    // (Cloudflare, Google, AdGuard Unfiltered, Quad9 — no SNI required, resilient to ISP IP blocks)
-    for fallback in [
-        "https://1.1.1.1/dns-query",
-        "https://8.8.8.8/dns-query",
-        "https://94.140.14.140/dns-query",
-        "https://9.9.9.9/dns-query",
-        "https://1.0.0.1/dns-query",
-        "https://94.140.14.141/dns-query",
-        "https://149.112.112.112/dns-query",
-        "https://8.8.4.4/dns-query",
-    ] {
-        if !list.iter().any(|x| x == fallback) {
-            list.push(fallback.to_string());
-        }
-    }
-
-    if !ipv4_only {
-        // IPv6 IP-literal DoH fallbacks so IPv6-only cellular networks (NAT64/DNS64) remain reachable.
-        for fallback_v6 in [
+    // (Cloudflare, Google, AdGuard Unfiltered, Quad9 — no SNI required, resilient to ISP IP blocks).
+    // When IPv6 is enabled, interleave IPv6 IP-literal endpoints early so IPv6-only cellular
+    // networks (NAT64/DNS64) succeed on the first failover wave instead of timing out all IPv4s.
+    let fallbacks: &[&str] = if ipv4_only {
+        &[
+            "https://1.1.1.1/dns-query",
+            "https://8.8.8.8/dns-query",
+            "https://94.140.14.140/dns-query",
+            "https://9.9.9.9/dns-query",
+            "https://1.0.0.1/dns-query",
+            "https://94.140.14.141/dns-query",
+            "https://149.112.112.112/dns-query",
+            "https://8.8.4.4/dns-query",
+        ]
+    } else {
+        &[
+            "https://1.1.1.1/dns-query",
             "https://[2606:4700:4700::1111]/dns-query",
+            "https://8.8.8.8/dns-query",
             "https://[2001:4860:4860::8888]/dns-query",
-        ] {
-            if !list.iter().any(|x| x == fallback_v6) {
-                list.push(fallback_v6.to_string());
-            }
+            "https://94.140.14.140/dns-query",
+            "https://9.9.9.9/dns-query",
+            "https://1.0.0.1/dns-query",
+            "https://94.140.14.141/dns-query",
+            "https://149.112.112.112/dns-query",
+            "https://8.8.4.4/dns-query",
+        ]
+    };
+    for fallback in fallbacks {
+        if !list.iter().any(|x| x == fallback) {
+            list.push((*fallback).to_string());
         }
     }
 
@@ -2755,54 +3983,73 @@ fn build_doh_endpoints(
     list
 }
 
-fn build_udp_dns_servers(dns_addr: &str, dns_port: u16) -> Vec<SocketAddr> {
+fn build_udp_dns_servers(dns_addr: &str, dns_port: u16, ipv4_only: bool) -> Vec<SocketAddr> {
     let mut servers = Vec::new();
     let effective_port = if dns_port == 0 { 53 } else { dns_port };
-    let trimmed_dns = dns_addr.trim();
-    let custom_ip = if trimmed_dns.starts_with('[') || trimmed_dns.ends_with(']') {
-        trimmed_dns
-            .strip_prefix('[')
-            .and_then(|s| s.strip_suffix(']'))
-            .and_then(|inner| inner.parse::<Ipv6Addr>().ok())
-            .map(IpAddr::V6)
-    } else {
-        trimmed_dns.parse::<IpAddr>().ok()
-    }
-    .filter(|ip| validate_dns_ip_addr(*ip).is_ok());
+    let custom_ip = parse_bare_dns_ip(dns_addr).filter(|ip| !ipv4_only || ip.is_ipv4());
 
-    // Non-standard ports (1253, 443, 5353) bypass transparent ISP port-53 DNS interceptors
-    // on strict fiber and broadband networks worldwide.
+    let push_unique = |list: &mut Vec<SocketAddr>, sa: SocketAddr| {
+        if !list.contains(&sa) {
+            list.push(sa);
+        }
+    };
+
+    // Put user-configured non-default custom bare IPs (e.g. 76.76.2.0 or corporate 10.0.0.53)
+    // FIRST even on port 53, and always put any custom non-53 server first.
     if let Some(ip) = custom_ip {
-        if effective_port != 53 {
-            servers.push(SocketAddr::new(ip, effective_port));
+        if effective_port != 53 || !is_unfiltered_default_dns_ip(ip) {
+            push_unique(&mut servers, SocketAddr::new(ip, effective_port));
         }
     }
+
+    // Non-standard ports (1253, 443, 5353) bypass transparent ISP port-53 DNS interceptors
+    // on strict fiber and broadband networks worldwide. When IPv6 is enabled, interleave
+    // IPv6 UDP servers early so IPv6-only networks under `--no-doh` succeed well within 5s
+    // instead of timing out behind 7 IPv4 servers.
+    push_unique(
+        &mut servers,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(77, 88, 8, 8)), 1253),
+    );
+    push_unique(
+        &mut servers,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(208, 67, 222, 222)), 443),
+    );
+    if !ipv4_only {
+        push_unique(
+            &mut servers,
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+                53,
+            ),
+        );
+    }
+    push_unique(
+        &mut servers,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(77, 88, 8, 1)), 1253),
+    );
+    if !ipv4_only {
+        push_unique(
+            &mut servers,
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888)),
+                53,
+            ),
+        );
+    }
     for (ip, port) in [
-        (Ipv4Addr::new(77, 88, 8, 8), 1253),
-        (Ipv4Addr::new(208, 67, 222, 222), 443),
-        (Ipv4Addr::new(77, 88, 8, 1), 1253),
         (Ipv4Addr::new(208, 67, 220, 220), 443),
         (Ipv4Addr::new(208, 67, 222, 222), 5353),
     ] {
-        let sa = SocketAddr::new(IpAddr::V4(ip), port);
-        if !servers.contains(&sa) {
-            servers.push(sa);
-        }
+        push_unique(&mut servers, SocketAddr::new(IpAddr::V4(ip), port));
     }
     if let Some(ip) = custom_ip {
-        let sa = SocketAddr::new(ip, effective_port);
-        if !servers.contains(&sa) {
-            servers.push(sa);
-        }
+        push_unique(&mut servers, SocketAddr::new(ip, effective_port));
     }
     for (ip, port) in [
         (Ipv4Addr::new(1, 1, 1, 1), 53),
         (Ipv4Addr::new(8, 8, 8, 8), 53),
     ] {
-        let sa = SocketAddr::new(IpAddr::V4(ip), port);
-        if !servers.contains(&sa) {
-            servers.push(sa);
-        }
+        push_unique(&mut servers, SocketAddr::new(IpAddr::V4(ip), port));
     }
     servers
 }
@@ -2822,14 +4069,57 @@ pub fn is_poisoned_public_ip(ip: IpAddr) -> bool {
                         | [195, 175, 39, 40]
                         | [195, 175, 39, 49]
                         | [195, 175, 39, 50]
+                        | [195, 175, 254, 2]
                 )
         }
         IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_poisoned_public_ip(IpAddr::V4(v4));
+            }
+            let segs = v6.segments();
+            // Well-known NAT64 prefix 64:ff9b::/96 (RFC 6052): inspect embedded IPv4.
+            if segs[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
+                let octets = v6.octets();
+                let embedded_v4 = Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]);
+                return is_poisoned_public_ip(IpAddr::V4(embedded_v4));
+            }
             v6.is_unspecified()
                 || v6.is_loopback()
-                || v6
-                    .to_ipv4_mapped()
-                    .is_some_and(|v4| is_poisoned_public_ip(IpAddr::V4(v4)))
+                // RFC 6666 discard-only prefix 100::/64
+                || segs[..4] == [0x0100, 0, 0, 0]
+        }
+    }
+}
+
+/// DoH-specific poisoning check: authenticated DoH replies legitimately return loopback
+/// (`127.0.0.0/8`, `::1` for `lvh.me`, `nip.io`, `sslip.io`, `localtest.me`), and custom or
+/// filtering DoH endpoints intentionally return `0.0.0.0` / `::` to block ads/trackers.
+fn is_poisoned_doh_ip(ip: IpAddr, allow_sinkhole: bool) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            (!allow_sinkhole && v4.is_unspecified())
+                || v4.is_broadcast()
+                || matches!(
+                    v4.octets(),
+                    [198, 18 | 19, ..]
+                        | [195, 175, 39, 39]
+                        | [195, 175, 39, 40]
+                        | [195, 175, 39, 49]
+                        | [195, 175, 39, 50]
+                        | [195, 175, 254, 2]
+                )
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_poisoned_doh_ip(IpAddr::V4(v4), allow_sinkhole);
+            }
+            let segs = v6.segments();
+            if segs[..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
+                let octets = v6.octets();
+                let embedded_v4 = Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]);
+                return is_poisoned_doh_ip(IpAddr::V4(embedded_v4), allow_sinkhole);
+            }
+            (!allow_sinkhole && v6.is_unspecified()) || segs[..4] == [0x0100, 0, 0, 0]
         }
     }
 }
@@ -2838,6 +4128,20 @@ fn filter_poisoned_ips(ips: Vec<IpAddr>) -> Vec<IpAddr> {
     ips.into_iter()
         .filter(|ip| !is_poisoned_public_ip(*ip))
         .collect()
+}
+
+fn filter_poisoned_doh_ips(ips: Vec<IpAddr>, allow_sinkhole: bool) -> Vec<IpAddr> {
+    ips.into_iter()
+        .filter(|ip| !is_poisoned_doh_ip(*ip, allow_sinkhole))
+        .collect()
+}
+
+fn filter_poisoned_udp_ips(ips: Vec<IpAddr>, allow_sinkhole_and_loopback: bool) -> Vec<IpAddr> {
+    if allow_sinkhole_and_loopback {
+        filter_poisoned_doh_ips(ips, true)
+    } else {
+        filter_poisoned_ips(ips)
+    }
 }
 
 /// Encodes an RFC 1035 / RFC 8484 DNS wire query (ID = 0 per RFC 8484 section 4.1 recommendation).
@@ -3139,8 +4443,16 @@ mod tests {
         assert!(is_poisoned_public_ip("::".parse().unwrap()));
         assert!(is_poisoned_public_ip("::1".parse().unwrap()));
         assert!(is_poisoned_public_ip("195.175.39.39".parse().unwrap()));
+        assert!(is_poisoned_public_ip("195.175.254.2".parse().unwrap()));
         assert!(is_poisoned_public_ip("198.18.0.1".parse().unwrap()));
         assert!(is_poisoned_public_ip("198.19.255.254".parse().unwrap()));
+        assert!(is_poisoned_public_ip("100::".parse().unwrap()));
+        assert!(is_poisoned_public_ip("100::1".parse().unwrap()));
+        assert!(!is_poisoned_public_ip("100:0:0:1::1".parse().unwrap()));
+        assert!(is_poisoned_public_ip("64:ff9b::195.175.254.2".parse().unwrap()));
+        assert!(is_poisoned_public_ip("64:ff9b::0.0.0.0".parse().unwrap()));
+        assert!(is_poisoned_public_ip("64:ff9b::127.0.0.1".parse().unwrap()));
+        assert!(!is_poisoned_public_ip("64:ff9b::1.1.1.1".parse().unwrap()));
         assert!(is_poisoned_public_ip("::ffff:0.0.0.0".parse().unwrap()));
         assert!(is_poisoned_public_ip("::ffff:127.0.0.1".parse().unwrap()));
         assert!(is_poisoned_public_ip(
@@ -3398,7 +4710,8 @@ mod tests {
             elapsed < Duration::from_millis(400),
             "QTYPE_A wire query stalled for {elapsed:?} waiting on AAAA"
         );
-        assert_eq!(counter.calls.load(Ordering::Relaxed), 1);
+        // Loopback targets (127.0.0.0/8) skip outbound_binder so local dnsmasq/Unbound works in TUN mode.
+        assert_eq!(counter.calls.load(Ordering::Relaxed), 0);
         let (ips, _) = decode_dns_response(&resp, QTYPE_A).unwrap();
         assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
         assert_eq!(
@@ -3742,7 +5055,8 @@ mod tests {
             .unwrap();
         server_task.await.unwrap();
 
-        assert_eq!(binder.calls.load(Ordering::Relaxed), 1);
+        // Loopback targets skip outbound_binder so local DNS servers work in TUN mode.
+        assert_eq!(binder.calls.load(Ordering::Relaxed), 0);
         let (ips, _) = decode_dns_response(&raw_resp, QTYPE_A).unwrap();
         assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
     }
@@ -4397,13 +5711,14 @@ mod tests {
 
         // When system DNS fallback is disabled (e.g. iOS TUN with outbound_binder == None),
         // hostname-based custom DoH URLs are stripped to prevent GaiResolver -> utun deadlocks,
-        // pooled HTTP/2 Quad9 remains enabled, and IPv6 IP-literal fallbacks are appended.
+        // pooled HTTP/2 Quad9 remains enabled, and IPv6 IP-literal fallbacks are interleaved early.
         let strict = build_doh_endpoints("https://dns.google/dns-query", false, true, false);
         assert!(!strict.iter().any(|ep| ep.contains("dns.google")));
         assert!(strict.iter().all(|ep| is_ip_literal_doh_endpoint(ep)));
         assert!(strict.iter().any(|ep| ep == "https://9.9.9.9/dns-query"));
-        assert_eq!(strict[strict.len() - 2], v6_cf);
-        assert_eq!(strict[strict.len() - 1], v6_google);
+        assert_eq!(strict[0], "https://1.1.1.1/dns-query");
+        assert_eq!(strict[1], v6_cf);
+        assert_eq!(strict[3], v6_google);
 
         // When system DNS fallback is enabled (proxy mode), custom hostname DoH URLs are kept.
         let permissive = build_doh_endpoints("https://dns.google/dns-query", false, false, false);
@@ -4630,13 +5945,20 @@ mod tests {
 
     #[test]
     fn custom_ip_and_custom_doh_resolver_configuration() {
-        // Arbitrary custom IPv4 (e.g. Control D 76.76.2.0)
+        // Arbitrary custom IPv4 (e.g. Control D 76.76.2.0) does NOT synthesize a broken
+        // IP-SAN DoH URL; instead it queries UDP/53 first and falls back to public DoH.
         let r_v4 = DnsResolver::new("76.76.2.0", 53, true, false).unwrap();
         assert!(r_v4.custom_doh.is_none());
-        assert_eq!(r_v4.doh_endpoints[0], "https://76.76.2.0/dns-query");
-        assert!(r_v4
-            .udp_dns_servers
-            .contains(&"76.76.2.0:53".parse::<SocketAddr>().unwrap()));
+        assert!(!r_v4.doh_endpoints.iter().any(|ep| ep.contains("76.76.2.0")));
+        assert_eq!(r_v4.doh_endpoints[0], "https://1.1.1.1/dns-query");
+        assert_eq!(
+            r_v4.custom_udp_primary,
+            Some("76.76.2.0:53".parse::<SocketAddr>().unwrap())
+        );
+        assert_eq!(
+            r_v4.udp_dns_servers[0],
+            "76.76.2.0:53".parse::<SocketAddr>().unwrap()
+        );
 
         // Arbitrary custom IPv6 with brackets and custom UDP port
         let r_v6 = DnsResolver::new("[2606:4700:4700:0::1111]", 5353, true, false).unwrap();
@@ -4865,7 +6187,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bound_ips, vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
-        assert_eq!(counter.calls.load(Ordering::Relaxed), 1);
+        // Loopback target skips outbound_binder.
+        assert_eq!(counter.calls.load(Ordering::Relaxed), 0);
 
         // 2. Unbound TUN mode (disable_system_dns_fallback = true): uses reqwest resolve_to_addrs
         //    pinned to the bootstrapped IP so zero OS DNS lookup occurs.
@@ -4952,5 +6275,1969 @@ mod tests {
         fb_task.await.unwrap();
         assert_eq!(fb_ips, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
         assert!(!failover_resolver.is_doh_in_backoff());
+    }
+
+    #[tokio::test]
+    async fn custom_and_filtering_doh_preserves_sinkhole_loopback_and_blocks_udp_protocol_fallback() {
+        // 1. DoH replies allow 127.0.0.0/8 and ::1 (fixes lvh.me, nip.io, sslip.io, localtest.me)
+        //    even on unfiltered resolvers, while still blocking Turkish ISP block-page IPs.
+        assert!(!is_poisoned_doh_ip("127.0.0.1".parse().unwrap(), false));
+        assert!(!is_poisoned_doh_ip("127.0.0.42".parse().unwrap(), false));
+        assert!(!is_poisoned_doh_ip("::1".parse().unwrap(), false));
+        assert!(is_poisoned_doh_ip("0.0.0.0".parse().unwrap(), false));
+        assert!(is_poisoned_doh_ip("::".parse().unwrap(), false));
+        assert!(!is_poisoned_doh_ip("0.0.0.0".parse().unwrap(), true));
+        assert!(!is_poisoned_doh_ip("::".parse().unwrap(), true));
+        assert!(is_poisoned_doh_ip("195.175.254.2".parse().unwrap(), true));
+        assert!(is_poisoned_doh_ip("100::1".parse().unwrap(), true));
+        assert!(is_poisoned_doh_ip(
+            "64:ff9b::195.175.254.2".parse().unwrap(),
+            true
+        ));
+
+        // Filtering DoH presets are recognized for sinkhole preservation.
+        assert!(is_filtering_doh_endpoint("https://94.140.14.14/dns-query"));
+        assert!(is_filtering_doh_endpoint("https://1.1.1.3/dns-query"));
+        assert!(!is_filtering_doh_endpoint("https://1.1.1.1/dns-query"));
+        assert!(!is_filtering_doh_endpoint("https://94.140.14.140/dns-query"));
+
+        // 2. Custom hostname DoH returning 0.0.0.0 (NextDNS/ControlD ad-blocking) stands without
+        //    failing over to the unfiltered IP-literal DoH ring.
+        let hostname = "adblock-doh.example";
+        let (custom_server_cfg, custom_connector, _) = make_hostname_doh_tls_pair(hostname);
+        let custom_acceptor = tokio_rustls::TlsAcceptor::from(custom_server_cfg);
+        let custom_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let custom_addr = custom_listener.local_addr().unwrap();
+        let custom_url = format!("https://{hostname}:{}/abc123", custom_addr.port());
+
+        let custom_task = tokio::spawn(async move {
+            for reply_ip in [
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ] {
+                let (tcp, _) = custom_listener.accept().await.unwrap();
+                let mut tls = custom_acceptor.accept(tcp).await.unwrap();
+                let query = read_doh_test_request(&mut tls).await;
+                let parsed = parse_dns_question(&query).unwrap();
+                let wire_resp = build_dns_wire_response(
+                    parsed.tx_id,
+                    parsed.flags,
+                    &query[12..parsed.question_end],
+                    0,
+                    &[reply_ip],
+                    60,
+                );
+                write_doh_test_response(&mut tls, &wire_resp).await;
+            }
+        });
+
+        let fallback_hits = Arc::new(AtomicUsize::new(0));
+        let fallback_hits_srv = Arc::clone(&fallback_hits);
+        let (fb_cfg, _) = make_local_doh_tls_pair();
+        let fb_acceptor = tokio_rustls::TlsAcceptor::from(fb_cfg);
+        let fb_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fb_addr = fb_listener.local_addr().unwrap();
+        let fb_task = tokio::spawn(async move {
+            if let Ok((tcp, _)) = fb_listener.accept().await {
+                fallback_hits_srv.fetch_add(1, Ordering::SeqCst);
+                let _ = fb_acceptor.accept(tcp).await;
+            }
+        });
+
+        let binder: Arc<dyn OutboundBinder> = Arc::new(NoopBinder);
+        let mut resolver =
+            DnsResolver::new_with_binder(&custom_url, 53, true, true, Some(binder)).unwrap();
+        resolver.bound_tls_connector = Some(custom_connector);
+        resolver.doh_endpoints = vec![format!("https://127.0.0.1:{}/dns-query", fb_addr.port())];
+        resolver.udp_dns_servers = Vec::new();
+        {
+            let custom = resolver.custom_doh.as_ref().unwrap();
+            let mut state = custom.state.write().await;
+            state.ips = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
+            state.expires_at = Instant::now() + Duration::from_secs(300);
+        }
+
+        // Ad-blocked domain returns 0.0.0.0 directly without touching the fallback DoH ring.
+        let blocked = resolver.resolve("ads.tracker.example").await.unwrap();
+        assert_eq!(blocked, vec![IpAddr::V4(Ipv4Addr::UNSPECIFIED)]);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
+
+        // Local dev domain returning 127.0.0.1 over DoH is preserved intact.
+        let local_dev = resolver.resolve("app.lvh.me").await.unwrap();
+        assert_eq!(local_dev, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
+
+        custom_task.await.unwrap();
+        fb_task.abort();
+
+        // 3. DoH ProtocolError (e.g. SERVFAIL) must NEVER fall back to plaintext UDP.
+        let (sf_cfg, sf_connector) = make_local_doh_tls_pair();
+        let sf_acceptor = tokio_rustls::TlsAcceptor::from(sf_cfg);
+        let sf_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sf_addr = sf_listener.local_addr().unwrap();
+        let sf_task = tokio::spawn(async move {
+            let (tcp, _) = sf_listener.accept().await.unwrap();
+            let mut tls = sf_acceptor.accept(tcp).await.unwrap();
+            let query = read_doh_test_request(&mut tls).await;
+            let parsed = parse_dns_question(&query).unwrap();
+            let wire_resp = build_dns_wire_response(
+                parsed.tx_id,
+                parsed.flags,
+                &query[12..parsed.question_end],
+                2, // SERVFAIL
+                &[],
+                0,
+            );
+            write_doh_test_response(&mut tls, &wire_resp).await;
+        });
+
+        let udp_hits = Arc::new(AtomicUsize::new(0));
+        let udp_hits_srv = Arc::clone(&udp_hits);
+        let udp_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_addr = udp_sock.local_addr().unwrap();
+        let udp_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            if udp_sock.recv_from(&mut buf).await.is_ok() {
+                udp_hits_srv.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let binder2: Arc<dyn OutboundBinder> = Arc::new(NoopBinder);
+        let mut sf_resolver =
+            DnsResolver::new_with_binder("127.0.0.1", 53, true, true, Some(binder2)).unwrap();
+        sf_resolver.bound_tls_connector = Some(sf_connector);
+        sf_resolver.doh_endpoints = vec![format!("https://127.0.0.1:{}/dns-query", sf_addr.port())];
+        sf_resolver.udp_dns_servers = vec![udp_addr];
+
+        assert!(sf_resolver.resolve("dnssec-broken.example").await.is_err());
+        sf_task.await.unwrap();
+        udp_task.abort();
+        assert_eq!(
+            udp_hits.load(Ordering::SeqCst),
+            0,
+            "DoH ProtocolError must not fall back to plaintext UDP"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_doh_normalization_no_doh_override_udp_order_and_localhost_subdomains() {
+        // 1. Round-trip normalization for https://host?no-ecs=1 and https://host/?no-ecs=1
+        let norm1 = validate_custom_dns_input("https://doh.example.com?no-ecs=1").unwrap();
+        assert_eq!(norm1, "https://doh.example.com/dns-query?no-ecs=1");
+        let norm2 = validate_custom_dns_input(&norm1).unwrap();
+        assert_eq!(norm2, norm1);
+        let norm3 = validate_custom_dns_input("https://doh.example.com/?no-ecs=1").unwrap();
+        assert_eq!(norm3, "https://doh.example.com/dns-query?no-ecs=1");
+        let parsed = parse_doh_url_validated(&norm3).unwrap();
+        assert_eq!(parsed.path_and_query, "/dns-query?no-ecs=1");
+
+        // 2. Explicit https:// DoH URL keeps DoH active even when enable_doh == false.
+        let r_explicit = DnsResolver::new("https://dns.nextdns.io/abc123", 53, false, false).unwrap();
+        assert!(r_explicit.enable_doh);
+        assert!(r_explicit.custom_doh.is_some());
+
+        // 3. Non-default bare custom IP goes FIRST in build_udp_dns_servers even on port 53;
+        //    default 1.1.1.1:53 stays behind non-standard ports; IPv6 UDP fallbacks appended when !ipv4_only.
+        let custom_udp = build_udp_dns_servers("76.76.2.0", 53, false);
+        assert_eq!(custom_udp[0], "76.76.2.0:53".parse::<SocketAddr>().unwrap());
+        assert!(custom_udp.contains(&"[2606:4700:4700::1111]:53".parse().unwrap()));
+        assert!(custom_udp.contains(&"[2001:4860:4860::8888]:53".parse().unwrap()));
+
+        let corp_udp = build_udp_dns_servers("10.0.0.53", 53, true);
+        assert_eq!(corp_udp[0], "10.0.0.53:53".parse::<SocketAddr>().unwrap());
+        assert!(!corp_udp.iter().any(|sa| sa.is_ipv6()));
+
+        let default_udp = build_udp_dns_servers("1.1.1.1", 53, false);
+        assert_ne!(default_udp[0].port(), 53);
+
+        // 4. Port-53 UDP servers must never be promoted into preferred_udp_idx over non-53 servers.
+        let mut promo_resolver = DnsResolver::new("1.1.1.1", 53, false, true).unwrap();
+        promo_resolver.udp_dns_servers = vec![
+            "77.88.8.8:1253".parse().unwrap(),
+            "1.1.1.1:53".parse().unwrap(),
+            "208.67.222.222:443".parse().unwrap(),
+        ];
+        promo_resolver.maybe_promote_udp_server(1);
+        assert_eq!(promo_resolver.preferred_udp_idx.load(Ordering::Relaxed), 0);
+        promo_resolver.maybe_promote_udp_server(2);
+        assert_eq!(promo_resolver.preferred_udp_idx.load(Ordering::Relaxed), 2);
+
+        // 5. *.localhost fast-path resolves to loopback without network calls.
+        let local_ips = promo_resolver.resolve("app.dev.localhost").await.unwrap();
+        assert_eq!(local_ips, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+        let q = encode_dns_query("api.localhost", QTYPE_A).unwrap();
+        let (resp, _) = promo_resolver.resolve_wire_query(&q, true).await.unwrap();
+        let (wire_ips, _) = decode_dns_response(&resp, QTYPE_A).unwrap();
+        assert_eq!(wire_ips, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+
+        // 6. select_dual_stack_candidates picks at least one IPv4 + one IPv6 when both exist.
+        let mixed = vec![
+            "45.90.28.10".parse().unwrap(),
+            "45.90.30.10".parse().unwrap(),
+            "2a07:a8c0::".parse().unwrap(),
+            "2a07:a8c1::".parse().unwrap(),
+        ];
+        let picked = select_dual_stack_candidates(&mixed);
+        assert_eq!(picked.len(), 2);
+        assert!(picked.iter().any(IpAddr::is_ipv4));
+        assert!(picked.iter().any(IpAddr::is_ipv6));
+    }
+
+    #[tokio::test]
+    async fn ipv6_only_host_waits_for_aaaa_past_700ms_and_caches_empty_a_nodata() {
+        // 1. join_a_and_aaaa does NOT cut off AAAA at 50ms when QTYPE_A returned 0 IPv4 records,
+        //    but DOES cut off AAAA when QTYPE_A returned >= 1 IPv4 record.
+        let (a_empty, v6_full) = join_a_and_aaaa(
+            async { Vec::<IpAddr>::new() },
+            async {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                vec![IpAddr::V6("2001:db8::1".parse().unwrap())]
+            },
+            Duration::from_millis(25),
+            |ips| !ips.is_empty(),
+        )
+        .await;
+        assert!(a_empty.is_empty());
+        assert_eq!(
+            v6_full,
+            Some(vec![IpAddr::V6("2001:db8::1".parse().unwrap())])
+        );
+
+        let (a_hit, v6_cutoff) = join_a_and_aaaa(
+            async { vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))] },
+            async {
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                vec![IpAddr::V6("2001:db8::1".parse().unwrap())]
+            },
+            Duration::from_millis(25),
+            |ips| !ips.is_empty(),
+        )
+        .await;
+        assert_eq!(a_hit.len(), 1);
+        assert!(v6_cutoff.is_none());
+
+        // 2. Empty QTYPE_A NODATA is cached briefly (<= 60s) so repeated QTYPE_A wire queries
+        //    for an IPv6-only host hit cache instead of re-querying upstream every time.
+        let udp_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_addr = udp_server.local_addr().unwrap();
+        let queries_seen = Arc::new(AtomicUsize::new(0));
+        let queries_srv = Arc::clone(&queries_seen);
+        let server_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = udp_server.recv_from(&mut buf).await.unwrap();
+            queries_srv.fetch_add(1, Ordering::SeqCst);
+            let parsed = parse_dns_question(&buf[..n]).unwrap();
+            let resp = build_dns_wire_response(
+                parsed.tx_id,
+                parsed.flags,
+                &buf[12..parsed.question_end],
+                0,
+                &[],
+                300,
+            );
+            udp_server.send_to(&resp, peer).await.unwrap();
+        });
+
+        let mut resolver = DnsResolver::new("127.0.0.1", 53, false, false).unwrap();
+        resolver.udp_dns_servers = vec![udp_addr];
+        let q = encode_dns_query("v6only-cached.example", QTYPE_A).unwrap();
+        let (resp1, meta1) = resolver.resolve_wire_query(&q, true).await.unwrap();
+        assert!(meta1.is_none());
+        assert!(decode_dns_response(&resp1, QTYPE_A).unwrap().0.is_empty());
+
+        // Second query hits cache without hitting UDP server again.
+        let (resp2, meta2) = resolver.resolve_wire_query(&q, true).await.unwrap();
+        assert!(meta2.is_none());
+        assert!(decode_dns_response(&resp2, QTYPE_A).unwrap().0.is_empty());
+        server_task.await.unwrap();
+        assert_eq!(queries_seen.load(Ordering::SeqCst), 1);
+
+        let guard = resolver.cache.read().await;
+        let entry = guard.get("v6only-cached.example").unwrap();
+        assert!(entry.has_a_lookup);
+        assert!(entry.expires_at.saturating_duration_since(Instant::now()) <= Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn dynamic_ipv4_only_flip_toggles_ipv6_endpoints_and_resolution() {
+        let resolver = DnsResolver::new("1.1.1.1", 53, true, true).unwrap();
+        let cloned = resolver.clone();
+        assert!(resolver.is_ipv4_only());
+        assert!(cloned.is_ipv4_only());
+
+        // Initially ipv4_only=true: DoH and UDP eligible sets exclude IPv6 endpoints.
+        assert!(resolver
+            .eligible_doh_indices(false)
+            .iter()
+            .all(|&idx| !is_ipv6_doh_endpoint(&resolver.doh_endpoints[idx])));
+        assert!(resolver
+            .eligible_udp_indices()
+            .iter()
+            .all(|&idx| resolver.udp_dns_servers[idx].is_ipv4()));
+        assert_eq!(
+            resolver.resolve("localhost").await.unwrap(),
+            vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]
+        );
+
+        // Flip IPv6 on dynamically via set_ipv4_only(false); cloned handles see it immediately.
+        resolver.set_ipv4_only(false);
+        assert!(!resolver.is_ipv4_only());
+        assert!(!cloned.is_ipv4_only());
+        assert!(resolver
+            .eligible_doh_indices(false)
+            .iter()
+            .any(|&idx| resolver.doh_endpoints[idx] == "https://[2606:4700:4700::1111]/dns-query"));
+        assert!(resolver
+            .eligible_udp_indices()
+            .iter()
+            .any(|&idx| resolver.udp_dns_servers[idx].is_ipv6()));
+        assert_eq!(
+            cloned.resolve("localhost").await.unwrap(),
+            vec![
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V6(Ipv6Addr::LOCALHOST),
+            ]
+        );
+
+        // Flip back to ipv4_only=true hides IPv6 endpoints again.
+        cloned.set_ipv4_only(true);
+        assert!(resolver.is_ipv4_only());
+        assert!(resolver
+            .eligible_doh_indices(false)
+            .iter()
+            .all(|&idx| !is_ipv6_doh_endpoint(&resolver.doh_endpoints[idx])));
+        assert!(resolver
+            .eligible_udp_indices()
+            .iter()
+            .all(|&idx| resolver.udp_dns_servers[idx].is_ipv4()));
+
+        // Caching a QTYPE_A lookup while ipv4_only=true must NOT mark has_aaaa_lookup=true,
+        // so flipping ipv4_only=false afterwards can still query AAAA without waiting for TTL expiry.
+        let udp_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_addr = udp_server.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            for expected_qtype in [QTYPE_A, QTYPE_AAAA] {
+                let (n, peer) = udp_server.recv_from(&mut buf).await.unwrap();
+                let parsed = parse_dns_question(&buf[..n]).unwrap();
+                assert_eq!(parsed.qtype, expected_qtype);
+                let answer = if expected_qtype == QTYPE_A {
+                    IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))
+                } else {
+                    IpAddr::V6("2606:2800:220:1:248:1893:25c8:1946".parse().unwrap())
+                };
+                let resp = build_dns_wire_response(
+                    parsed.tx_id,
+                    parsed.flags,
+                    &buf[12..parsed.question_end],
+                    0,
+                    &[answer],
+                    300,
+                );
+                udp_server.send_to(&resp, peer).await.unwrap();
+            }
+        });
+
+        let mut dyn_res = DnsResolver::new("1.1.1.1", 53, false, true).unwrap();
+        dyn_res.udp_dns_servers = vec![udp_addr];
+        let q_a = encode_dns_query("dyn-v6.example", QTYPE_A).unwrap();
+        let (resp_a, _) = dyn_res.resolve_wire_query(&q_a, true).await.unwrap();
+        assert_eq!(
+            decode_dns_response(&resp_a, QTYPE_A).unwrap().0,
+            vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]
+        );
+        {
+            let guard = dyn_res.cache.read().await;
+            let entry = guard.get("dyn-v6.example").unwrap();
+            assert!(entry.has_a_lookup);
+            assert!(!entry.has_aaaa_lookup);
+        }
+
+        dyn_res.set_ipv4_only(false);
+        let q_aaaa = encode_dns_query("dyn-v6.example", QTYPE_AAAA).unwrap();
+        let (resp_aaaa, _) = dyn_res.resolve_wire_query(&q_aaaa, true).await.unwrap();
+        srv.await.unwrap();
+        assert_eq!(
+            decode_dns_response(&resp_aaaa, QTYPE_AAAA).unwrap().0,
+            vec![IpAddr::V6(
+                "2606:2800:220:1:248:1893:25c8:1946".parse().unwrap()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_custom_ip_queries_udp_first_without_synthesizing_broken_doh_url() {
+        // Known public DoH IPs synthesize https://<ip>/dns-query; arbitrary bare IPs do not.
+        for known in [
+            "1.1.1.1",
+            "1.0.0.1",
+            "8.8.8.8",
+            "8.8.4.4",
+            "9.9.9.9",
+            "149.112.112.112",
+            "94.140.14.14",
+            "94.140.15.15",
+            "1.1.1.2",
+            "1.1.1.3",
+            "2606:4700:4700::1111",
+            "2001:4860:4860::8888",
+            "2620:fe::fe",
+            "2a10:50c0::ad1:ff",
+        ] {
+            let ip: IpAddr = known.parse().unwrap();
+            assert!(
+                is_known_public_doh_ip(ip),
+                "expected known public DoH IP: {known}"
+            );
+            let eps = build_doh_endpoints(known, false, false, false);
+            let expected = match ip {
+                IpAddr::V4(v4) => format!("https://{v4}/dns-query"),
+                IpAddr::V6(v6) => format!("https://[{v6}]/dns-query"),
+            };
+            assert_eq!(eps[0], expected, "expected primary DoH for {known}");
+        }
+
+        for custom_bare in ["76.76.2.0", "10.0.0.53", "192.168.1.1", "127.0.0.1"] {
+            let ip: IpAddr = custom_bare.parse().unwrap();
+            assert!(!is_known_public_doh_ip(ip));
+            let eps = build_doh_endpoints(custom_bare, false, false, false);
+            assert!(
+                !eps.iter().any(|ep| ep.contains(custom_bare)),
+                "must not synthesize DoH URL for arbitrary bare IP {custom_bare}: {eps:?}"
+            );
+            assert_eq!(eps[0], "https://1.1.1.1/dns-query");
+        }
+
+        // Under default enable_doh=true, a custom bare IP is queried over UDP first; if it
+        // fails, resolution falls back cleanly to DoH.
+        let udp_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_addr = udp_server.local_addr().unwrap();
+        let udp_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            // 1. First query succeeds over UDP.
+            let (n, peer) = udp_server.recv_from(&mut buf).await.unwrap();
+            let p1 = parse_dns_question(&buf[..n]).unwrap();
+            let resp1 = build_dns_wire_response(
+                p1.tx_id,
+                p1.flags,
+                &buf[12..p1.question_end],
+                0,
+                &[IpAddr::V4(Ipv4Addr::new(10, 20, 30, 40))],
+                120,
+            );
+            udp_server.send_to(&resp1, peer).await.unwrap();
+
+            // 2. Second query returns SERVFAIL on custom UDP, triggering DoH fallback.
+            let (n, peer) = udp_server.recv_from(&mut buf).await.unwrap();
+            let p2 = parse_dns_question(&buf[..n]).unwrap();
+            let resp2 = build_dns_wire_response(
+                p2.tx_id,
+                p2.flags,
+                &buf[12..p2.question_end],
+                2, // SERVFAIL
+                &[],
+                0,
+            );
+            udp_server.send_to(&resp2, peer).await.unwrap();
+        });
+
+        let (server_cfg, connector) = make_local_doh_tls_pair();
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_cfg);
+        let doh_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let doh_addr = doh_listener.local_addr().unwrap();
+        let doh_hits = Arc::new(AtomicUsize::new(0));
+        let doh_hits_srv = Arc::clone(&doh_hits);
+        let doh_task = tokio::spawn(async move {
+            let (tcp, _) = doh_listener.accept().await.unwrap();
+            doh_hits_srv.fetch_add(1, Ordering::SeqCst);
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+            let query = read_doh_test_request(&mut tls).await;
+            let parsed = parse_dns_question(&query).unwrap();
+            let wire_resp = build_dns_wire_response(
+                parsed.tx_id,
+                parsed.flags,
+                &query[12..parsed.question_end],
+                0,
+                &[IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+                120,
+            );
+            write_doh_test_response(&mut tls, &wire_resp).await;
+        });
+
+        let binder: Arc<dyn OutboundBinder> = Arc::new(NoopBinder);
+        let mut resolver = DnsResolver::new_with_binder(
+            "127.0.0.1",
+            udp_addr.port(),
+            true,
+            true,
+            Some(binder),
+        )
+        .unwrap();
+        resolver.bound_tls_connector = Some(connector);
+        resolver.doh_endpoints = vec![format!("https://127.0.0.1:{}/dns-query", doh_addr.port())];
+        resolver.udp_dns_servers = vec![udp_addr];
+
+        let ips1 = resolver.resolve("corp-app.example").await.unwrap();
+        assert_eq!(ips1, vec![IpAddr::V4(Ipv4Addr::new(10, 20, 30, 40))]);
+        assert_eq!(
+            doh_hits.load(Ordering::SeqCst),
+            0,
+            "custom bare IP must be queried via UDP before DoH"
+        );
+
+        let ips2 = resolver.resolve("fallback-doh.example").await.unwrap();
+        assert_eq!(ips2, vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
+        assert_eq!(doh_hits.load(Ordering::SeqCst), 1);
+
+        udp_task.await.unwrap();
+        doh_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_port53_demotion_recovery_clear_cache_and_early_ipv6_interleaving() {
+        // 1. IPv6 UDP servers are interleaved early (not stuck behind 7 IPv4 servers).
+        let default_udp = build_udp_dns_servers("1.1.1.1", 53, false);
+        let cf_v6: SocketAddr = "[2606:4700:4700::1111]:53".parse().unwrap();
+        let google_v6: SocketAddr = "[2001:4860:4860::8888]:53".parse().unwrap();
+        let cf_v6_pos = default_udp
+            .iter()
+            .position(|&sa| sa == cf_v6)
+            .expect("Cloudflare IPv6 UDP server missing");
+        let google_v6_pos = default_udp
+            .iter()
+            .position(|&sa| sa == google_v6)
+            .expect("Google IPv6 UDP server missing");
+        assert!(
+            cf_v6_pos <= 2,
+            "first IPv6 UDP server should be interleaved early (<= index 2), got {cf_v6_pos}"
+        );
+        assert!(
+            google_v6_pos <= 4,
+            "second IPv6 UDP server should be interleaved early (<= index 4), got {google_v6_pos}"
+        );
+
+        // 2. User custom index-0 port-53 server can be promoted back after transient failover.
+        let custom_resolver = DnsResolver::new("76.76.2.0", 53, false, false).unwrap();
+        assert_eq!(
+            custom_resolver.udp_dns_servers[0],
+            "76.76.2.0:53".parse::<SocketAddr>().unwrap()
+        );
+        custom_resolver.maybe_promote_udp_server(1);
+        assert_eq!(custom_resolver.preferred_udp_idx.load(Ordering::Relaxed), 1);
+        custom_resolver.maybe_promote_udp_server(0);
+        assert_eq!(
+            custom_resolver.preferred_udp_idx.load(Ordering::Relaxed),
+            0,
+            "user custom index-0 port-53 server must be promotable back"
+        );
+
+        // 3. IPv6 UDP server can be promoted when IPv4 fails, and clear_cache resets preferred_udp_idx to 0.
+        let v6_idx = custom_resolver
+            .udp_dns_servers
+            .iter()
+            .position(|&sa| sa == cf_v6)
+            .unwrap();
+        custom_resolver.maybe_promote_udp_server(v6_idx);
+        assert_eq!(
+            custom_resolver.preferred_udp_idx.load(Ordering::Relaxed),
+            v6_idx,
+            "IPv6 UDP server must be promotable when IPv4 fails"
+        );
+        custom_resolver.clear_cache().await;
+        assert_eq!(
+            custom_resolver.preferred_udp_idx.load(Ordering::Relaxed),
+            0,
+            "clear_cache must reset preferred_udp_idx to 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_and_filtering_udp_servers_preserve_sinkhole_and_loopback_replies() {
+        for addr in [
+            "76.76.2.2",
+            "94.140.14.14",
+            "1.1.1.3",
+            "10.0.0.53",
+            "192.168.1.1",
+        ] {
+            let r = DnsResolver::new(addr, 53, false, true).unwrap();
+            let sa: SocketAddr = format!("{addr}:53").parse().unwrap();
+            assert!(
+                r.udp_server_allows_sinkhole_and_loopback(sa),
+                "expected sinkhole/loopback preservation for custom/filtering UDP {sa}"
+            );
+        }
+        let default_r = DnsResolver::new("1.1.1.1", 53, false, true).unwrap();
+        assert!(!default_r.udp_server_allows_sinkhole_and_loopback("1.1.1.1:53".parse().unwrap()));
+        assert!(!default_r
+            .udp_server_allows_sinkhole_and_loopback("77.88.8.8:1253".parse().unwrap()));
+
+        let udp_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_addr = udp_server.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            for reply_ip in [
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),        // ad-block 0.0.0.0 -> preserved
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 42)), // loopback -> preserved
+                IpAddr::V4(Ipv4Addr::new(195, 175, 39, 39)), // ISP poison -> still rejected
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),        // on default unfiltered -> rejected
+            ] {
+                let (n, peer) = udp_server.recv_from(&mut buf).await.unwrap();
+                let p = parse_dns_question(&buf[..n]).unwrap();
+                let resp = build_dns_wire_response(
+                    p.tx_id,
+                    p.flags,
+                    &buf[12..p.question_end],
+                    0,
+                    &[reply_ip],
+                    60,
+                );
+                udp_server.send_to(&resp, peer).await.unwrap();
+            }
+        });
+
+        let mut custom_resolver =
+            DnsResolver::new_with_options("127.0.0.1", udp_addr.port(), false, true, true, None)
+                .unwrap();
+        custom_resolver.udp_dns_servers = vec![udp_addr];
+
+        assert_eq!(
+            custom_resolver.resolve("ads.blocked.example").await.unwrap(),
+            vec![IpAddr::V4(Ipv4Addr::UNSPECIFIED)]
+        );
+        assert_eq!(
+            custom_resolver.resolve("local.dev.example").await.unwrap(),
+            vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 42))]
+        );
+        assert!(
+            custom_resolver.resolve("isp-poison.example").await.is_err(),
+            "known ISP block-page IPs must still be rejected on custom UDP"
+        );
+
+        let mut default_resolver =
+            DnsResolver::new_with_options("1.1.1.1", 53, false, true, true, None).unwrap();
+        default_resolver.udp_dns_servers = vec![udp_addr];
+        assert!(
+            default_resolver
+                .resolve("unfiltered-sinkhole.example")
+                .await
+                .is_err(),
+            "0.0.0.0 on default unfiltered UDP server must still be rejected as poisoning"
+        );
+
+        srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_dpi_race_validates_qname_waits_for_clean_reply_and_skips_caching_poisoned_negatives() {
+        // 1. send_udp_dns_raw rejects packets whose echoed QNAME does not match the query.
+        let qname_srv = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let qname_addr = qname_srv.local_addr().unwrap();
+        let qname_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = qname_srv.recv_from(&mut buf).await.unwrap();
+            let p = parse_dns_question(&buf[..n]).unwrap();
+            let wrong_q = encode_dns_query("spoofed-other.example", QTYPE_A).unwrap();
+            let wrong_resp = build_dns_wire_response(
+                p.tx_id,
+                p.flags,
+                &wrong_q[12..],
+                0,
+                &[IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99))],
+                60,
+            );
+            qname_srv.send_to(&wrong_resp, peer).await.unwrap();
+
+            let right_resp = build_dns_wire_response(
+                p.tx_id,
+                p.flags,
+                &buf[12..p.question_end],
+                0,
+                &[IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+                60,
+            );
+            qname_srv.send_to(&right_resp, peer).await.unwrap();
+        });
+
+        let q = encode_dns_query("expected-qname.example", QTYPE_A).unwrap();
+        let raw = send_udp_dns_raw(qname_addr, &q, None).await.unwrap();
+        qname_task.await.unwrap();
+        assert_eq!(
+            decode_dns_response(&raw, QTYPE_A).unwrap().0,
+            vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]
+        );
+
+        // 2. When a poisoned IP arrives first (DPI race), keep reading the same socket briefly
+        //    (~120ms) and accept the legitimate reply arriving right behind it.
+        let race_srv = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let race_addr = race_srv.local_addr().unwrap();
+        let race_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = race_srv.recv_from(&mut buf).await.unwrap();
+            let p = parse_dns_question(&buf[..n]).unwrap();
+            let poisoned = build_dns_wire_response(
+                p.tx_id,
+                p.flags,
+                &buf[12..p.question_end],
+                0,
+                &[IpAddr::V4(Ipv4Addr::new(195, 175, 39, 39))],
+                60,
+            );
+            race_srv.send_to(&poisoned, peer).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let legit = build_dns_wire_response(
+                p.tx_id,
+                p.flags,
+                &buf[12..p.question_end],
+                0,
+                &[IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+                120,
+            );
+            race_srv.send_to(&legit, peer).await.unwrap();
+        });
+
+        let mut race_resolver =
+            DnsResolver::new_with_options("1.1.1.1", 53, false, true, true, None).unwrap();
+        race_resolver.udp_dns_servers = vec![race_addr];
+        let raced_ips = race_resolver.resolve("dpi-race.example").await.unwrap();
+        race_task.await.unwrap();
+        assert_eq!(raced_ips, vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
+
+        // 3. Port-53 / poisoned-server NXDOMAIN and NODATA replies are NOT cached.
+        assert!(!should_cache_udp_negative(
+            "1.1.1.1:53".parse().unwrap(),
+            false,
+            false
+        ));
+        assert!(!should_cache_udp_negative(
+            "77.88.8.8:1253".parse().unwrap(),
+            false,
+            true
+        ));
+        assert!(should_cache_udp_negative(
+            "77.88.8.8:1253".parse().unwrap(),
+            false,
+            false
+        ));
+        assert!(should_cache_udp_negative(
+            "10.0.0.53:53".parse().unwrap(),
+            true,
+            false
+        ));
+
+        let poison_srv = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let poison_addr = poison_srv.local_addr().unwrap();
+        let neg_srv = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let neg_addr = neg_srv.local_addr().unwrap();
+
+        let poison_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            for _ in 0..2 {
+                let (n, peer) = poison_srv.recv_from(&mut buf).await.unwrap();
+                let p = parse_dns_question(&buf[..n]).unwrap();
+                let poisoned = build_dns_wire_response(
+                    p.tx_id,
+                    p.flags,
+                    &buf[12..p.question_end],
+                    0,
+                    &[IpAddr::V4(Ipv4Addr::new(195, 175, 39, 39))],
+                    60,
+                );
+                poison_srv.send_to(&poisoned, peer).await.unwrap();
+            }
+        });
+        let neg_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            // First query: NXDOMAIN; second query: empty NODATA
+            for rcode in [3u8, 0u8] {
+                let (n, peer) = neg_srv.recv_from(&mut buf).await.unwrap();
+                let p = parse_dns_question(&buf[..n]).unwrap();
+                let resp = build_dns_wire_response(
+                    p.tx_id,
+                    p.flags,
+                    &buf[12..p.question_end],
+                    rcode,
+                    &[],
+                    60,
+                );
+                neg_srv.send_to(&resp, peer).await.unwrap();
+            }
+        });
+
+        let mut neg_resolver =
+            DnsResolver::new_with_options("1.1.1.1", 53, false, true, true, None).unwrap();
+        neg_resolver.udp_dns_servers = vec![poison_addr, neg_addr];
+
+        let nx_res = neg_resolver
+            .resolve_single_qtype("poisoned-nx.example", QTYPE_A, false, true)
+            .await
+            .unwrap();
+        assert!(matches!(nx_res, DnsOutcome::NxDomain(ttl) if ttl.is_zero()));
+        let nodata_res = neg_resolver
+            .resolve_single_qtype("poisoned-nodata.example", QTYPE_A, false, true)
+            .await
+            .unwrap();
+        assert!(matches!(nodata_res, DnsOutcome::Records(ref ips, ttl) if ips.is_empty() && ttl.is_zero()));
+
+        poison_task.await.unwrap();
+        neg_task.await.unwrap();
+
+        let cache = neg_resolver.cache.read().await;
+        assert!(!cache.contains_key("poisoned-nx.example"));
+        assert!(!cache.contains_key("poisoned-nodata.example"));
+    }
+
+    #[tokio::test]
+    async fn outbound_binder_skipped_for_loopback_and_called_for_non_loopback() {
+        #[derive(Debug, Default)]
+        struct FailingCountingBinder {
+            calls: AtomicUsize,
+        }
+
+        impl OutboundBinder for FailingCountingBinder {
+            fn bind_socket(
+                &self,
+                _sock: socket2::SockRef<'_>,
+                _is_ipv4: bool,
+            ) -> std::io::Result<()> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "intercepted non-loopback bind",
+                ))
+            }
+        }
+
+        assert!(is_loopback_dns_ip("127.0.0.1".parse().unwrap()));
+        assert!(is_loopback_dns_ip("127.0.0.53".parse().unwrap()));
+        assert!(is_loopback_dns_ip("127.255.255.254".parse().unwrap()));
+        assert!(is_loopback_dns_ip("::1".parse().unwrap()));
+        assert!(is_loopback_dns_ip("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(!is_loopback_dns_ip("1.1.1.1".parse().unwrap()));
+        assert!(!is_loopback_dns_ip("10.0.0.53".parse().unwrap()));
+        assert!(!is_loopback_dns_ip("2606:4700:4700::1111".parse().unwrap()));
+
+        // 1. Loopback UDP succeeds without calling outbound_binder (even if binder always fails).
+        let udp_srv = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_addr = udp_srv.local_addr().unwrap();
+        let udp_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = udp_srv.recv_from(&mut buf).await.unwrap();
+            let p = parse_dns_question(&buf[..n]).unwrap();
+            let resp = build_dns_wire_response(
+                p.tx_id,
+                p.flags,
+                &buf[12..p.question_end],
+                0,
+                &[IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+                60,
+            );
+            udp_srv.send_to(&resp, peer).await.unwrap();
+        });
+
+        let failing_binder = FailingCountingBinder::default();
+        let q = encode_dns_query("local-dnsmasq.example", QTYPE_A).unwrap();
+        let raw = send_udp_dns_raw(udp_addr, &q, Some(&failing_binder))
+            .await
+            .unwrap();
+        udp_task.await.unwrap();
+        assert_eq!(failing_binder.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            decode_dns_response(&raw, QTYPE_A).unwrap().0,
+            vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]
+        );
+
+        // 2. Non-loopback UDP and non-loopback bound DoH DO call outbound_binder (aborted inside
+        //    the test binder before any network traffic occurs).
+        let err_udp = send_udp_dns_raw(
+            "192.0.2.1:53".parse().unwrap(),
+            &q,
+            Some(&failing_binder),
+        )
+        .await
+        .expect_err("non-loopback UDP must invoke outbound_binder");
+        assert!(err_udp.to_string().contains("intercepted non-loopback bind"));
+        assert_eq!(failing_binder.calls.load(Ordering::Relaxed), 1);
+
+        let (_, connector) = make_local_doh_tls_pair();
+        let err_doh = send_doh_bound_tls(
+            &failing_binder,
+            &connector,
+            "https://192.0.2.1/dns-query",
+            &q,
+        )
+        .await
+        .expect_err("non-loopback bound DoH must invoke outbound_binder");
+        assert!(err_doh.to_string().contains("intercepted non-loopback bind"));
+        assert_eq!(failing_binder.calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn lan_and_private_hostnames_route_to_system_in_proxy_mode_not_tun() {
+        for lan_host in [
+            "nas",
+            "router",
+            "box.lan",
+            "sub.box.lan",
+            "home.arpa",
+            "printer.home.arpa",
+            "api.corp.internal",
+            "workstation.localdomain",
+            "laptop.tail1234.ts.net",
+        ] {
+            assert!(
+                is_lan_or_private_hostname(lan_host),
+                "expected LAN/private hostname: {lan_host}"
+            );
+        }
+        for public_host in [
+            "example.com",
+            "myplan.com",
+            "ts.net",
+            "notts.net",
+            "cloudflare.com",
+        ] {
+            assert!(
+                !is_lan_or_private_hostname(public_host),
+                "unexpected LAN/private classification: {public_host}"
+            );
+        }
+
+        // Proxy mode routes LAN/private names to OS resolver; TUN mode & wire queries do not.
+        let proxy_resolver = DnsResolver::new("1.1.1.1", 53, true, false).unwrap();
+        assert!(proxy_resolver.should_route_to_system_resolver("nas", false));
+        assert!(proxy_resolver.should_route_to_system_resolver("box.lan", false));
+        assert!(proxy_resolver.should_route_to_system_resolver("printer.home.arpa", false));
+        assert!(proxy_resolver.should_route_to_system_resolver("api.corp.internal", false));
+        assert!(proxy_resolver.should_route_to_system_resolver("host.localdomain", false));
+        assert!(proxy_resolver.should_route_to_system_resolver("node.tail123.ts.net", false));
+        assert!(!proxy_resolver.should_route_to_system_resolver("example.com", false));
+        assert!(!proxy_resolver.should_route_to_system_resolver("box.lan", true));
+
+        let tun_resolver =
+            DnsResolver::new_with_options("1.1.1.1", 53, false, true, true, None).unwrap();
+        assert!(!tun_resolver.should_route_to_system_resolver("nas", false));
+        assert!(!tun_resolver.should_route_to_system_resolver("node.tail123.ts.net", false));
+
+        // In TUN mode with a custom local/corporate UDP server, LAN & *.ts.net names resolve
+        // through the configured upstream instead of returning synthetic NXDOMAIN.
+        let udp_srv = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_addr = udp_srv.local_addr().unwrap();
+        let srv_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            for _ in 0..2 {
+                let (n, peer) = udp_srv.recv_from(&mut buf).await.unwrap();
+                let p = parse_dns_question(&buf[..n]).unwrap();
+                let resp = build_dns_wire_response(
+                    p.tx_id,
+                    p.flags,
+                    &buf[12..p.question_end],
+                    0,
+                    &[IpAddr::V4(Ipv4Addr::new(10, 0, 0, 42))],
+                    60,
+                );
+                udp_srv.send_to(&resp, peer).await.unwrap();
+            }
+        });
+
+        let mut custom_tun =
+            DnsResolver::new_with_options("127.0.0.1", udp_addr.port(), false, true, true, None)
+                .unwrap();
+        custom_tun.udp_dns_servers = vec![udp_addr];
+        assert_eq!(
+            custom_tun.resolve("nas").await.unwrap(),
+            vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 42))]
+        );
+        assert_eq!(
+            custom_tun.resolve("node.tail123.ts.net").await.unwrap(),
+            vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 42))]
+        );
+        srv_task.await.unwrap();
+    }
+
+    #[test]
+    fn effective_enable_doh_redact_dns_for_display_and_doh_error_redaction() {
+        // 1. effective_enable_doh
+        assert!(effective_enable_doh("https://dns.nextdns.io/abc123", false));
+        assert!(effective_enable_doh(
+            "  HTTPS://freedns.controld.com/p2  ",
+            false
+        ));
+        assert!(!effective_enable_doh("1.1.1.1", false));
+        assert!(effective_enable_doh("1.1.1.1", true));
+        assert!(effective_enable_doh("76.76.2.0", true));
+        assert!(!effective_enable_doh("http://1.1.1.1/dns-query", false));
+
+        // 2. redact_dns_for_display: valid IPv4, IPv6, hostname DoH URLs, and bare IPs
+        assert_eq!(
+            redact_dns_for_display("https://[2606:4700:4700::1111]/secret"),
+            "https://[2606:4700:4700::1111]"
+        );
+        assert_eq!(
+            redact_dns_for_display("https://[2606:4700:4700:0::1111]:8443/secret?a=1#frag"),
+            "https://[2606:4700:4700::1111]:8443"
+        );
+        assert_eq!(
+            redact_dns_for_display("https://dns.nextdns.io/abc123secret"),
+            "https://dns.nextdns.io"
+        );
+        assert_eq!(
+            redact_dns_for_display("https://user:p@ssword@dns.nextdns.io/abc123?tok=1#f"),
+            "https://dns.nextdns.io"
+        );
+        assert_eq!(
+            redact_dns_for_display("https://user:secret@[2606:4700:4700::1111]/secret"),
+            "https://[2606:4700:4700::1111]"
+        );
+        assert_eq!(redact_dns_for_display("1.1.1.1"), "1.1.1.1");
+        assert_eq!(
+            redact_dns_for_display("2606:4700:4700::1111"),
+            "2606:4700:4700::1111"
+        );
+
+        // 3. Malformed https:// URLs must NEVER leak raw secret tokens.
+        for malformed in [
+            "https://",
+            "https:///topsecret123",
+            "https://?token=topsecret123",
+            "https://#topsecret123",
+            "https://user:topsecret123@",
+            "https://user:topsecret123@/path",
+            "https://[2606:4700:4700::1111/topsecret123",
+            "https://2606:4700:4700::1111/topsecret123",
+            "https://dns.nextdns.io:notaport/topsecret123",
+            "https://dns.nextdns.io\\topsecret123",
+            "https://bad_host/topsecret123",
+        ] {
+            let redacted = redact_dns_for_display(malformed);
+            assert!(
+                !redacted.contains("topsecret123"),
+                "secret leaked for {malformed:?} -> {redacted:?}"
+            );
+        }
+
+        // 4. DohError Display redacts both ProtocolError endpoints and embedded Transport URLs.
+        let proto_err = DohError::ProtocolError {
+            endpoint: "https://dns.nextdns.io/my-nextdns-token".to_string(),
+            rcode: 2,
+        };
+        let proto_msg = proto_err.to_string();
+        assert!(proto_msg.contains("https://dns.nextdns.io"));
+        assert!(proto_msg.contains("RCODE 2"));
+        assert!(!proto_msg.contains("my-nextdns-token"));
+
+        let transport_err = DohError::Transport(anyhow!(
+            "error sending request for url (https://freedns.controld.com/my-controld-token?foo=bar)"
+        ));
+        let transport_msg = transport_err.to_string();
+        assert!(transport_msg.contains("https://freedns.controld.com"));
+        assert!(!transport_msg.contains("my-controld-token"));
+        assert!(!transport_msg.contains("foo=bar"));
+    }
+
+    #[test]
+    fn is_effective_doh_target_and_redact_urls_in_text() {
+        // Explicit valid https:// DoH URLs are always DoH targets regardless of enable_doh.
+        assert!(is_effective_doh_target(
+            "https://dns.nextdns.io/abc123",
+            false
+        ));
+        assert!(is_effective_doh_target(
+            "  HTTPS://freedns.controld.com/p2  ",
+            false
+        ));
+        assert!(is_effective_doh_target(
+            "https://1.1.1.1/dns-query",
+            false
+        ));
+        assert!(is_effective_doh_target(
+            "https://[2606:4700:4700::1111]/dns-query",
+            true
+        ));
+
+        // Known public IP-SAN DoH IPs are DoH targets only when enable_doh == true.
+        for known in [
+            "1.1.1.1",
+            "1.0.0.1",
+            "8.8.8.8",
+            "9.9.9.9",
+            "94.140.14.14",
+            "2606:4700:4700::1111",
+            "[2606:4700:4700::1111]",
+            "2001:4860:4860::8888",
+        ] {
+            assert!(
+                is_effective_doh_target(known, true),
+                "expected DoH target when enable_doh=true: {known}"
+            );
+            assert!(
+                !is_effective_doh_target(known, false),
+                "expected non-DoH target when enable_doh=false: {known}"
+            );
+        }
+
+        // Bare custom non-DoH IPs (UDP-first) must NEVER be mislabeled as DoH targets.
+        for custom_udp in ["76.76.2.0", "10.0.0.53", "192.168.1.1", "127.0.0.1"] {
+            assert!(
+                !is_effective_doh_target(custom_udp, true),
+                "bare custom non-DoH IP must not be labeled DoH: {custom_udp}"
+            );
+            assert!(!is_effective_doh_target(custom_udp, false));
+        }
+
+        // Invalid / non-https / empty inputs are never DoH targets.
+        for invalid in [
+            "",
+            "   ",
+            "0.0.0.0",
+            "http://1.1.1.1/dns-query",
+            "https://garbage",
+            "not-a-dns",
+        ] {
+            assert!(!is_effective_doh_target(invalid, true));
+            assert!(!is_effective_doh_target(invalid, false));
+        }
+
+        // Public redact_urls_in_text scrubs embedded URLs while preserving surrounding text.
+        let scrubbed = redact_urls_in_text(
+            "failed https://dns.nextdns.io/secret-profile?foo=bar and http://user:pw@example.com/tok.",
+        );
+        assert!(scrubbed.contains("https://dns.nextdns.io"));
+        assert!(scrubbed.contains("http://example.com."));
+        assert!(!scrubbed.contains("secret-profile"));
+        assert!(!scrubbed.contains("foo=bar"));
+        assert!(!scrubbed.contains("user:pw"));
+        assert!(!scrubbed.contains("/tok"));
+    }
+
+    #[test]
+    fn redact_privacy_audit_round1_findings() {
+        // PRIV-01: scheme-without-slashes (`https:`, `http:`) and scheme-less URL-like inputs
+        // containing `/`, `?`, `@`, `#`, or `\` must never return raw secret tokens.
+        assert_eq!(
+            redact_dns_for_display("https:dns.nextdns.io/a1b2c3"),
+            "https://<redacted>"
+        );
+        assert_eq!(
+            redact_dns_for_display("HTTPS:user:pass@dns.nextdns.io/a1b2c3"),
+            "https://<redacted>"
+        );
+        assert_eq!(
+            redact_dns_for_display("http:host/secret"),
+            "http://<redacted>"
+        );
+        assert_eq!(
+            redact_dns_for_display("HTTP:/secret?tok=1"),
+            "http://<redacted>"
+        );
+        assert_eq!(
+            redact_dns_for_display("dns.nextdns.io/a1b2c3"),
+            "dns.nextdns.io"
+        );
+        assert_eq!(
+            redact_dns_for_display("dns.nextdns.io?token=a1b2c3"),
+            "dns.nextdns.io"
+        );
+        assert_eq!(
+            redact_dns_for_display("user:pass@dns.nextdns.io/secret"),
+            "dns.nextdns.io"
+        );
+        assert_eq!(
+            redact_dns_for_display("user:pass@host/secret"),
+            "<redacted>"
+        );
+        assert_eq!(redact_dns_for_display("a1b2c3/MyDevice"), "<redacted>");
+        assert_eq!(redact_dns_for_display("1.1.1.1/secret"), "1.1.1.1");
+        assert_eq!(
+            redact_dns_for_display("[2606:4700:4700::1111]/secret"),
+            "[2606:4700:4700::1111]"
+        );
+        assert_eq!(redact_dns_for_display("1.1.1.1"), "1.1.1.1");
+        assert_eq!(redact_dns_for_display("9.9.9.9:53"), "9.9.9.9:53");
+        assert_eq!(
+            redact_dns_for_display("2606:4700:4700::1111"),
+            "2606:4700:4700::1111"
+        );
+
+        // PRIV-02: `@` appearing after `?`, `/`, `#`, `\`, or whitespace must never leak the
+        // preceding credential/username segment as a hostname.
+        for sneaky in [
+            "https://secretuser?p@dns.nextdns.io/a1b2c3",
+            "https://secret.user?p@dns.nextdns.io/a1b2c3",
+            "https://secretuser/pass@dns.nextdns.io/a1b2c3",
+            "https://secretuser#frag@dns.nextdns.io/a1b2c3",
+            "https://secretuser\\pass@dns.nextdns.io/a1b2c3",
+            "https://secretuser pass@dns.nextdns.io/a1b2c3",
+        ] {
+            let redacted = redact_dns_for_display(sneaky);
+            assert_eq!(
+                redacted, "https://<redacted>",
+                "userinfo before delimiter leaked for {sneaky:?}"
+            );
+            assert!(!redacted.contains("secret"));
+            assert!(!redacted.contains("a1b2c3"));
+        }
+        assert_eq!(
+            redact_dns_for_display("secretuser?p@dns.nextdns.io/a1b2c3"),
+            "<redacted>"
+        );
+        assert_eq!(
+            redact_dns_for_display("https://user:secret@host with space/token"),
+            "https://host"
+        );
+
+        // PRIV-03: redact_urls_in_text must not prematurely stop at valid DoH URL characters
+        // `(`, `)`, `'`, `,`, `;` inside a URL, while safely preserving trailing sentence
+        // punctuation, and must also scrub `https:` / `http:` tokens missing `//`.
+        assert_eq!(
+            redact_urls_in_text("failed https://dns.nextdns.io/a1b2c3/My(PC)"),
+            "failed https://dns.nextdns.io"
+        );
+        assert_eq!(
+            redact_urls_in_text(
+                "error sending request for url (https://dns.nextdns.io/a1b2c3/My(PC)): timed out"
+            ),
+            "error sending request for url (https://dns.nextdns.io): timed out"
+        );
+        assert_eq!(
+            redact_urls_in_text(
+                "failed https://dns.nextdns.io/a1b2c3?tags=a,secret_token, retrying"
+            ),
+            "failed https://dns.nextdns.io, retrying"
+        );
+        assert_eq!(
+            redact_urls_in_text(
+                "failed https://dns.nextdns.io/a1b2c3/Arda's-PC;k=secret_val; next"
+            ),
+            "failed https://dns.nextdns.io; next"
+        );
+        assert_eq!(
+            redact_urls_in_text(
+                "DoH failed for 'HTTPS://user:pass@dns.nextdns.io/prof1?a=1', fallback <https://[2606:4700:4700::1111]/prof2>."
+            ),
+            "DoH failed for 'https://dns.nextdns.io', fallback <https://[2606:4700:4700::1111]>."
+        );
+        assert_eq!(
+            redact_urls_in_text("bad https:dns.nextdns.io/a1b2c3/My(PC) and (http:host/secret), ok"),
+            "bad https://<redacted> and (http://<redacted>), ok"
+        );
+        assert_eq!(
+            redact_urls_in_text("http: timeout while checking 'https:'"),
+            "http: timeout while checking 'https:'"
+        );
+        assert_eq!(
+            redact_urls_in_text("bad https://secretuser?p@dns.nextdns.io/a1b2c3 done"),
+            "bad https://<redacted> done"
+        );
+    }
+
+    #[tokio::test]
+    async fn port53_forged_nxdomain_and_nodata_race_and_failover() {
+        // 1. Untrusted port-53 forged NXDOMAIN and empty NODATA wait UDP_DPI_RACE_GRACE_MS
+        //    on the same socket and accept the legitimate trailing reply.
+        let race_srv = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let race_addr = race_srv.local_addr().unwrap();
+        let race_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            for (forged_rcode, legit_ip) in [
+                (3u8, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))),
+                (0u8, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 35))),
+            ] {
+                let (n, peer) = race_srv.recv_from(&mut buf).await.unwrap();
+                let p = parse_dns_question(&buf[..n]).unwrap();
+                let forged = build_dns_wire_response(
+                    p.tx_id,
+                    p.flags,
+                    &buf[12..p.question_end],
+                    forged_rcode,
+                    &[],
+                    60,
+                );
+                race_srv.send_to(&forged, peer).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                let legit = build_dns_wire_response(
+                    p.tx_id,
+                    p.flags,
+                    &buf[12..p.question_end],
+                    0,
+                    &[legit_ip],
+                    120,
+                );
+                race_srv.send_to(&legit, peer).await.unwrap();
+            }
+        });
+
+        let mut race_resolver =
+            DnsResolver::new_with_options("1.1.1.1", 53, false, true, true, None).unwrap();
+        race_resolver.udp_dns_servers = vec![race_addr];
+        race_resolver.test_port53_servers = vec![race_addr];
+
+        assert_eq!(
+            race_resolver
+                .resolve("forged-nx-race.example")
+                .await
+                .unwrap(),
+            vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]
+        );
+        assert_eq!(
+            race_resolver
+                .resolve("forged-nodata-race.example")
+                .await
+                .unwrap(),
+            vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 35))]
+        );
+        race_task.await.unwrap();
+
+        // 2. When no trailing reply arrives on an untrusted port-53 server and a non-53 UDP
+        //    server remains, fail over to the non-53 server for both forged NXDOMAIN and NODATA.
+        let forged_p53 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let forged_p53_addr = forged_p53.local_addr().unwrap();
+        let clean_non53 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let clean_non53_addr = clean_non53.local_addr().unwrap();
+
+        let forged_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            for rcode in [3u8, 0u8] {
+                let (n, peer) = forged_p53.recv_from(&mut buf).await.unwrap();
+                let p = parse_dns_question(&buf[..n]).unwrap();
+                let resp = build_dns_wire_response(
+                    p.tx_id,
+                    p.flags,
+                    &buf[12..p.question_end],
+                    rcode,
+                    &[],
+                    60,
+                );
+                forged_p53.send_to(&resp, peer).await.unwrap();
+            }
+        });
+        let clean_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            for ip in [
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)),
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 11)),
+            ] {
+                let (n, peer) = clean_non53.recv_from(&mut buf).await.unwrap();
+                let p = parse_dns_question(&buf[..n]).unwrap();
+                let resp = build_dns_wire_response(
+                    p.tx_id,
+                    p.flags,
+                    &buf[12..p.question_end],
+                    0,
+                    &[ip],
+                    120,
+                );
+                clean_non53.send_to(&resp, peer).await.unwrap();
+            }
+        });
+
+        let mut failover_resolver =
+            DnsResolver::new_with_options("1.1.1.1", 53, false, true, true, None).unwrap();
+        failover_resolver.udp_dns_servers = vec![forged_p53_addr, clean_non53_addr];
+        failover_resolver.test_port53_servers = vec![forged_p53_addr];
+
+        assert_eq!(
+            failover_resolver
+                .resolve("forged-nx-failover.example")
+                .await
+                .unwrap(),
+            vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10))]
+        );
+        assert_eq!(
+            failover_resolver.preferred_udp_idx.load(Ordering::Relaxed),
+            1,
+            "clean non-53 server should be promoted after untrusted port-53 failover"
+        );
+        failover_resolver
+            .preferred_udp_idx
+            .store(0, Ordering::Relaxed);
+        assert_eq!(
+            failover_resolver
+                .resolve("forged-nodata-failover.example")
+                .await
+                .unwrap(),
+            vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 11))]
+        );
+        forged_task.await.unwrap();
+        clean_task.await.unwrap();
+
+        // 3. When NO non-53 servers remain, untrusted port-53 NXDOMAIN resolves to an
+        //    uncached NxDomain(0) after the race grace instead of failing with SERVFAIL.
+        let solo_p53 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let solo_p53_addr = solo_p53.local_addr().unwrap();
+        let solo_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = solo_p53.recv_from(&mut buf).await.unwrap();
+            let p = parse_dns_question(&buf[..n]).unwrap();
+            let resp = build_dns_wire_response(
+                p.tx_id,
+                p.flags,
+                &buf[12..p.question_end],
+                3,
+                &[],
+                60,
+            );
+            solo_p53.send_to(&resp, peer).await.unwrap();
+        });
+
+        let mut solo_resolver =
+            DnsResolver::new_with_options("1.1.1.1", 53, false, true, true, None).unwrap();
+        solo_resolver.udp_dns_servers = vec![solo_p53_addr];
+        solo_resolver.test_port53_servers = vec![solo_p53_addr];
+
+        let solo_outcome = solo_resolver
+            .resolve_single_qtype("real-nx-solo-p53.example", QTYPE_A, false, true)
+            .await
+            .unwrap();
+        solo_task.await.unwrap();
+        assert!(matches!(solo_outcome, DnsOutcome::NxDomain(ttl) if ttl.is_zero()));
+        assert!(!solo_resolver
+            .cache
+            .read()
+            .await
+            .contains_key("real-nx-solo-p53.example"));
+
+        // 4. Trusted custom/filtering port-53 server accepts NXDOMAIN immediately without
+        //    failing over to the backup non-53 server.
+        let trusted_p53 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let trusted_p53_addr = trusted_p53.local_addr().unwrap();
+        let backup_non53 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backup_non53_addr = backup_non53.local_addr().unwrap();
+        let backup_hits = Arc::new(AtomicUsize::new(0));
+        let backup_hits_srv = Arc::clone(&backup_hits);
+
+        let trusted_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = trusted_p53.recv_from(&mut buf).await.unwrap();
+            let p = parse_dns_question(&buf[..n]).unwrap();
+            let resp = build_dns_wire_response(
+                p.tx_id,
+                p.flags,
+                &buf[12..p.question_end],
+                3,
+                &[],
+                60,
+            );
+            trusted_p53.send_to(&resp, peer).await.unwrap();
+        });
+        let backup_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            if backup_non53.recv_from(&mut buf).await.is_ok() {
+                backup_hits_srv.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let mut trusted_resolver = DnsResolver::new_with_options(
+            "127.0.0.1",
+            trusted_p53_addr.port(),
+            false,
+            true,
+            true,
+            None,
+        )
+        .unwrap();
+        trusted_resolver.udp_dns_servers = vec![trusted_p53_addr, backup_non53_addr];
+        trusted_resolver.test_port53_servers = vec![trusted_p53_addr];
+        assert!(trusted_resolver.udp_server_allows_sinkhole_and_loopback(trusted_p53_addr));
+
+        let trusted_outcome = trusted_resolver
+            .query_udp_type("adblock-nx.example", QTYPE_A)
+            .await
+            .unwrap();
+        trusted_task.await.unwrap();
+        backup_task.abort();
+        assert!(matches!(trusted_outcome, DnsOutcome::NxDomain(ttl) if !ttl.is_zero()));
+        assert_eq!(
+            backup_hits.load(Ordering::SeqCst),
+            0,
+            "trusted custom port-53 NXDOMAIN must not fail over"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_mode_lan_and_single_label_falls_back_to_custom_udp_primary() {
+        let corp_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let corp_udp_addr = corp_udp.local_addr().unwrap();
+        let corp_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            for (expected_name, reply_ip) in [
+                ("intranet", IpAddr::V4(Ipv4Addr::new(10, 0, 0, 42))),
+                ("git.corp.internal", IpAddr::V4(Ipv4Addr::new(10, 0, 0, 43))),
+                ("nas.lan", IpAddr::V4(Ipv4Addr::new(10, 0, 0, 44))),
+            ] {
+                let (n, peer) = corp_udp.recv_from(&mut buf).await.unwrap();
+                let p = parse_dns_question(&buf[..n]).unwrap();
+                assert_eq!(p.qname, expected_name);
+                let resp = build_dns_wire_response(
+                    p.tx_id,
+                    p.flags,
+                    &buf[12..p.question_end],
+                    0,
+                    &[reply_ip],
+                    60,
+                );
+                corp_udp.send_to(&resp, peer).await.unwrap();
+            }
+        });
+
+        let doh_hits = Arc::new(AtomicUsize::new(0));
+        let doh_hits_srv = Arc::clone(&doh_hits);
+        let doh_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let doh_addr = doh_listener.local_addr().unwrap();
+        let doh_task = tokio::spawn(async move {
+            if doh_listener.accept().await.is_ok() {
+                doh_hits_srv.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        // 1. Proxy mode with explicit custom bare-IP UDP server (e.g. corporate --dns 10.0.0.53):
+        //    when OS DNS fails for single-label / private suffixes, falls back to custom_udp
+        //    without leaking to public DoH.
+        let mut proxy_corp =
+            DnsResolver::new("127.0.0.1", corp_udp_addr.port(), true, true).unwrap();
+        proxy_corp.udp_dns_servers = vec![corp_udp_addr];
+        proxy_corp.doh_endpoints =
+            vec![format!("https://127.0.0.1:{}/dns-query", doh_addr.port())];
+        proxy_corp.test_force_system_dns_error = true;
+
+        assert!(proxy_corp.should_route_to_system_resolver("intranet", false));
+        assert!(proxy_corp.should_route_to_system_resolver("git.corp.internal", false));
+        assert!(proxy_corp.should_route_to_system_resolver("nas.lan", false));
+        assert_eq!(proxy_corp.active_custom_udp_primary(), Some(corp_udp_addr));
+
+        assert_eq!(
+            proxy_corp.resolve("intranet").await.unwrap(),
+            vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 42))]
+        );
+        assert_eq!(
+            proxy_corp.resolve("git.corp.internal").await.unwrap(),
+            vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 43))]
+        );
+        let single_qtype = proxy_corp
+            .resolve_single_qtype("nas.lan", QTYPE_A, false, false)
+            .await
+            .unwrap();
+        assert!(matches!(
+            single_qtype,
+            DnsOutcome::Records(ref ips, _)
+                if ips.as_slice() == [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 44))]
+        ));
+        corp_task.await.unwrap();
+        assert_eq!(
+            doh_hits.load(Ordering::SeqCst),
+            0,
+            "LAN/private fallback must never leak to DoH"
+        );
+
+        // 2. Proxy mode with default public DoH IP (1.1.1.1 -> no custom_udp_primary):
+        //    still returns the system DNS error without leaking internal names to DoH/UDP.
+        let mut proxy_default = DnsResolver::new("1.1.1.1", 53, true, true).unwrap();
+        proxy_default.doh_endpoints =
+            vec![format!("https://127.0.0.1:{}/dns-query", doh_addr.port())];
+        proxy_default.udp_dns_servers = Vec::new();
+        proxy_default.test_force_system_dns_error = true;
+
+        assert_eq!(proxy_default.active_custom_udp_primary(), None);
+        assert!(proxy_default.resolve("intranet").await.is_err());
+        assert!(proxy_default
+            .resolve_single_qtype("git.corp.internal", QTYPE_A, false, false)
+            .await
+            .is_err());
+        doh_task.abort();
+        assert_eq!(doh_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn combine_udp_v4_v6_results_preserves_valid_ttl_on_zero_nxdomain() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        let v6 = IpAddr::V6("2606:2800:220:1:248:1893:25c8:1946".parse().unwrap());
+
+        // 1. Valid A records + uncached AAAA NxDomain(Duration::ZERO) from a solo untrusted
+        //    port-53 server must keep A's positive cache TTL instead of clamping it to zero.
+        let res = combine_udp_v4_v6_results(
+            "v4-only.example",
+            Ok(DnsOutcome::Records(vec![v4], Duration::from_secs(120))),
+            Some(Ok(DnsOutcome::NxDomain(Duration::ZERO))),
+        )
+        .unwrap();
+        assert!(res.has_a_lookup);
+        assert!(res.has_aaaa_lookup);
+        assert!(matches!(
+            res.outcome,
+            DnsOutcome::Records(ref ips, ttl)
+                if ips.as_slice() == [v4] && ttl == Duration::from_secs(120)
+        ));
+
+        // 2. Positive AAAA NxDomain TTL still clamps the combined record TTL normally.
+        let clamped = combine_udp_v4_v6_results(
+            "v4-only-clamped.example",
+            Ok(DnsOutcome::Records(vec![v4], Duration::from_secs(120))),
+            Some(Ok(DnsOutcome::NxDomain(Duration::from_secs(30)))),
+        )
+        .unwrap();
+        assert!(matches!(
+            clamped.outcome,
+            DnsOutcome::Records(ref ips, ttl)
+                if ips.as_slice() == [v4] && ttl == Duration::from_secs(30)
+        ));
+
+        // 3. Symmetric case: uncached A NxDomain(Duration::ZERO) + valid AAAA records keeps
+        //    AAAA's positive cache TTL.
+        let v6_only = combine_udp_v4_v6_results(
+            "v6-only.example",
+            Ok(DnsOutcome::NxDomain(Duration::ZERO)),
+            Some(Ok(DnsOutcome::Records(vec![v6], Duration::from_secs(90)))),
+        )
+        .unwrap();
+        assert!(matches!(
+            v6_only.outcome,
+            DnsOutcome::Records(ref ips, ttl)
+                if ips.as_slice() == [v6] && ttl == Duration::from_secs(90)
+        ));
+
+        // 4. When both families return no records and either returned an uncached zero-TTL
+        //    NxDomain, the combined NxDomain stays uncached (Duration::ZERO).
+        let nx_zero_v6 = combine_udp_v4_v6_results(
+            "missing-a.example",
+            Ok(DnsOutcome::NxDomain(Duration::from_secs(30))),
+            Some(Ok(DnsOutcome::NxDomain(Duration::ZERO))),
+        )
+        .unwrap();
+        assert!(matches!(
+            nx_zero_v6.outcome,
+            DnsOutcome::NxDomain(ttl) if ttl.is_zero()
+        ));
+
+        let nx_zero_v4 = combine_udp_v4_v6_results(
+            "missing-b.example",
+            Ok(DnsOutcome::NxDomain(Duration::ZERO)),
+            Some(Ok(DnsOutcome::NxDomain(Duration::from_secs(30)))),
+        )
+        .unwrap();
+        assert!(matches!(
+            nx_zero_v4.outcome,
+            DnsOutcome::NxDomain(ttl) if ttl.is_zero()
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolve_outcome_ipv4_only_cache_hit_filters_v6_and_misses_on_v6_only() {
+        let udp_server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_addr = udp_server.local_addr().unwrap();
+        let queries_seen = Arc::new(AtomicUsize::new(0));
+        let queries_seen_srv = Arc::clone(&queries_seen);
+        let fresh_v4 = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 77));
+        let srv_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = udp_server.recv_from(&mut buf).await.unwrap();
+            queries_seen_srv.fetch_add(1, Ordering::SeqCst);
+            let parsed = parse_dns_question(&buf[..n]).unwrap();
+            assert_eq!(parsed.qname, "v6only-cached-flip.example");
+            assert_eq!(parsed.qtype, QTYPE_A);
+            let resp = build_dns_wire_response(
+                parsed.tx_id,
+                parsed.flags,
+                &buf[12..parsed.question_end],
+                0,
+                &[fresh_v4],
+                120,
+            );
+            udp_server.send_to(&resp, peer).await.unwrap();
+        });
+
+        let mut resolver =
+            DnsResolver::new_with_options("1.1.1.1", 53, false, false, true, None).unwrap();
+        resolver.udp_dns_servers = vec![udp_addr];
+
+        let cached_v4 = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        let cached_v6 = IpAddr::V6("2606:2800:220:1:248:1893:25c8:1946".parse().unwrap());
+        {
+            let mut guard = resolver.cache.write().await;
+            guard.insert(
+                "dual-cached-flip.example".to_string(),
+                CacheEntry {
+                    ips: vec![cached_v4, cached_v6],
+                    nxdomain: false,
+                    has_a_lookup: true,
+                    has_aaaa_lookup: true,
+                    expires_at: Instant::now() + Duration::from_secs(120),
+                },
+            );
+            guard.insert(
+                "v6only-cached-flip.example".to_string(),
+                CacheEntry {
+                    ips: vec![cached_v6],
+                    nxdomain: false,
+                    has_a_lookup: true,
+                    has_aaaa_lookup: true,
+                    expires_at: Instant::now() + Duration::from_secs(120),
+                },
+            );
+        }
+
+        // Before switching to ipv4_only=true, both dual-stack and IPv6-only entries hit cache.
+        assert_eq!(
+            resolver.resolve("dual-cached-flip.example").await.unwrap(),
+            vec![cached_v4, cached_v6]
+        );
+        assert_eq!(
+            resolver
+                .resolve("v6only-cached-flip.example")
+                .await
+                .unwrap(),
+            vec![cached_v6]
+        );
+        assert_eq!(queries_seen.load(Ordering::SeqCst), 0);
+
+        // After switching to ipv4_only=true:
+        // - dual-stack cache hit filters out IPv6 and returns only IPv4 without hitting network.
+        // - IPv6-only cache entry becomes empty after filtering -> treated as cache miss so a
+        //   fresh QTYPE_A lookup runs instead of returning stale IPv6-only cached IPs.
+        resolver.set_ipv4_only(true);
+        assert_eq!(
+            resolver.resolve("dual-cached-flip.example").await.unwrap(),
+            vec![cached_v4]
+        );
+        assert_eq!(queries_seen.load(Ordering::SeqCst), 0);
+
+        assert_eq!(
+            resolver
+                .resolve("v6only-cached-flip.example")
+                .await
+                .unwrap(),
+            vec![fresh_v4]
+        );
+        srv_task.await.unwrap();
+        assert_eq!(queries_seen.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn proxy_mode_corporate_ad_dot_local_falls_back_to_custom_udp_primary() {
+        let corp_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let corp_udp_addr = corp_udp.local_addr().unwrap();
+        let udp_hits = Arc::new(AtomicUsize::new(0));
+        let udp_hits_srv = Arc::clone(&udp_hits);
+        let corp_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let Ok((n, peer)) = corp_udp.recv_from(&mut buf).await else {
+                    break;
+                };
+                udp_hits_srv.fetch_add(1, Ordering::SeqCst);
+                let p = parse_dns_question(&buf[..n]).unwrap();
+                let reply_ip = match p.qname.as_str() {
+                    "dc01.corp.local" => IpAddr::V4(Ipv4Addr::new(10, 0, 0, 54)),
+                    "files.ad.local" => IpAddr::V4(Ipv4Addr::new(10, 0, 0, 55)),
+                    "intranet.corp.local" => IpAddr::V4(Ipv4Addr::new(10, 0, 0, 56)),
+                    "erp.corp.local" => IpAddr::V4(Ipv4Addr::new(10, 0, 0, 57)),
+                    other => panic!("unexpected .local query: {other}"),
+                };
+                let resp = build_dns_wire_response(
+                    p.tx_id,
+                    p.flags,
+                    &buf[12..p.question_end],
+                    0,
+                    &[reply_ip],
+                    60,
+                );
+                corp_udp.send_to(&resp, peer).await.unwrap();
+            }
+        });
+
+        let doh_hits = Arc::new(AtomicUsize::new(0));
+        let doh_hits_srv = Arc::clone(&doh_hits);
+        let doh_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let doh_addr = doh_listener.local_addr().unwrap();
+        let doh_task = tokio::spawn(async move {
+            if doh_listener.accept().await.is_ok() {
+                doh_hits_srv.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        // 1. Proxy mode with explicit custom bare-IP UDP server (e.g. corporate --dns 10.0.0.53):
+        //    when OS DNS fails for Active Directory `.local`, fall back to custom_udp without
+        //    leaking to public DoH, and cache successful answers so subsequent lookups hit the
+        //    DNS TTL cache without re-paying OS mDNS timeouts or re-querying UDP.
+        let mut proxy_corp =
+            DnsResolver::new("127.0.0.1", corp_udp_addr.port(), true, true).unwrap();
+        proxy_corp.udp_dns_servers = vec![corp_udp_addr];
+        proxy_corp.doh_endpoints =
+            vec![format!("https://127.0.0.1:{}/dns-query", doh_addr.port())];
+        proxy_corp.test_force_system_dns_error = true;
+
+        assert_eq!(proxy_corp.active_custom_udp_primary(), Some(corp_udp_addr));
+        assert_eq!(
+            proxy_corp.resolve("dc01.corp.local").await.unwrap(),
+            vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 54))]
+        );
+        assert_eq!(udp_hits.load(Ordering::SeqCst), 1);
+        assert!(proxy_corp
+            .cache
+            .read()
+            .await
+            .contains_key("dc01.corp.local"));
+        // Second resolve hits cache directly without calling OS DNS or custom_udp again.
+        assert_eq!(
+            proxy_corp.resolve("dc01.corp.local").await.unwrap(),
+            vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 54))]
+        );
+        assert_eq!(udp_hits.load(Ordering::SeqCst), 1);
+
+        let single_qtype = proxy_corp
+            .resolve_single_qtype("files.ad.local", QTYPE_A, false, false)
+            .await
+            .unwrap();
+        assert!(matches!(
+            single_qtype,
+            DnsOutcome::Records(ref ips, _)
+                if ips.as_slice() == [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 55))]
+        ));
+        assert_eq!(udp_hits.load(Ordering::SeqCst), 2);
+        assert!(proxy_corp
+            .cache
+            .read()
+            .await
+            .contains_key("files.ad.local"));
+        // Second single-qtype lookup hits cache directly.
+        let single_qtype_cached = proxy_corp
+            .resolve_single_qtype("files.ad.local", QTYPE_A, false, false)
+            .await
+            .unwrap();
+        assert!(matches!(
+            single_qtype_cached,
+            DnsOutcome::Records(ref ips, _)
+                if ips.as_slice() == [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 55))]
+        ));
+        assert_eq!(udp_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            doh_hits.load(Ordering::SeqCst),
+            0,
+            ".local fallback must never leak to DoH"
+        );
+
+        // 2. Proxy mode with default public DoH IP (1.1.1.1 -> no custom_udp_primary):
+        //    returns the system DNS error without leaking `.local` to DoH/UDP.
+        let mut proxy_default = DnsResolver::new("1.1.1.1", 53, true, true).unwrap();
+        proxy_default.doh_endpoints =
+            vec![format!("https://127.0.0.1:{}/dns-query", doh_addr.port())];
+        proxy_default.udp_dns_servers = Vec::new();
+        proxy_default.test_force_system_dns_error = true;
+
+        assert_eq!(proxy_default.active_custom_udp_primary(), None);
+        assert!(proxy_default.resolve("dc01.corp.local").await.is_err());
+        assert!(proxy_default
+            .resolve_single_qtype("files.ad.local", QTYPE_A, false, false)
+            .await
+            .is_err());
+
+        // 3. TUN mode (disable_system_dns_fallback=true) with explicit custom corporate bare-IP
+        //    UDP server queries custom_udp directly for `.local` hostnames and caches the answer.
+        let mut tun_corp = DnsResolver::new_with_options(
+            "127.0.0.1",
+            corp_udp_addr.port(),
+            true,
+            true,
+            true,
+            None,
+        )
+        .unwrap();
+        tun_corp.udp_dns_servers = vec![corp_udp_addr];
+        tun_corp.doh_endpoints =
+            vec![format!("https://127.0.0.1:{}/dns-query", doh_addr.port())];
+        assert!(tun_corp.is_system_dns_disabled());
+        assert_eq!(tun_corp.active_custom_udp_primary(), Some(corp_udp_addr));
+
+        assert_eq!(
+            tun_corp.resolve("intranet.corp.local").await.unwrap(),
+            vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 56))]
+        );
+        assert_eq!(udp_hits.load(Ordering::SeqCst), 3);
+        // Cached hit in TUN mode does not re-query custom_udp.
+        assert_eq!(
+            tun_corp.resolve("intranet.corp.local").await.unwrap(),
+            vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 56))]
+        );
+        assert_eq!(udp_hits.load(Ordering::SeqCst), 3);
+
+        let tun_single = tun_corp
+            .resolve_single_qtype("erp.corp.local", QTYPE_A, false, false)
+            .await
+            .unwrap();
+        assert!(matches!(
+            tun_single,
+            DnsOutcome::Records(ref ips, _)
+                if ips.as_slice() == [IpAddr::V4(Ipv4Addr::new(10, 0, 0, 57))]
+        ));
+        assert_eq!(udp_hits.load(Ordering::SeqCst), 4);
+        let wire_q = encode_dns_query("erp.corp.local", QTYPE_A).unwrap();
+        let (wire_resp, wire_meta) = tun_corp.resolve_wire_query(&wire_q, true).await.unwrap();
+        assert_eq!(
+            u16::from_be_bytes([wire_resp[2], wire_resp[3]]) & 0x000f,
+            0
+        );
+        assert_eq!(
+            wire_meta,
+            Some((
+                "erp.corp.local".to_string(),
+                vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 57))],
+            ))
+        );
+        assert_eq!(udp_hits.load(Ordering::SeqCst), 4);
+
+        // 4. TUN mode WITHOUT custom corporate bare-IP UDP server (e.g. default 1.1.1.1)
+        //    still returns synthetic NXDOMAIN for `.local`.
+        let tun_default =
+            DnsResolver::new_with_options("1.1.1.1", 53, true, true, true, None).unwrap();
+        assert_eq!(tun_default.active_custom_udp_primary(), None);
+        assert!(matches!(
+            tun_default
+                .resolve_outcome("printer.local", false)
+                .await
+                .unwrap(),
+            DnsOutcome::NxDomain(_)
+        ));
+        assert!(matches!(
+            tun_default
+                .resolve_single_qtype("printer.local", QTYPE_A, false, false)
+                .await
+                .unwrap(),
+            DnsOutcome::NxDomain(_)
+        ));
+
+        corp_task.abort();
+        doh_task.abort();
+        assert_eq!(doh_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn dns64_ipv6_addresses_are_known_public_doh_ips() {
+        for dns64 in [
+            "2606:4700:4700::64",
+            "2606:4700:4700::6400",
+            "2001:4860:4860::6464",
+            "2001:4860:4860::64",
+        ] {
+            let ip: IpAddr = dns64.parse().unwrap();
+            assert!(
+                is_known_public_doh_ip(ip),
+                "expected DNS64 IPv6 to be recognized as known public DoH IP: {dns64}"
+            );
+            assert!(is_effective_doh_target(dns64, true));
+            assert!(!is_effective_doh_target(dns64, false));
+
+            let expected = format!("https://[{ip}]/dns-query");
+            let eps = build_doh_endpoints(dns64, false, false, false);
+            assert_eq!(eps[0], expected);
+
+            let resolver = DnsResolver::new(dns64, 53, true, false).unwrap();
+            assert!(resolver.enable_doh);
+            assert_eq!(resolver.active_custom_udp_primary(), None);
+            assert_eq!(resolver.doh_endpoints[0], expected);
+        }
+
+        for non_dns64 in ["2606:4700:4700::65", "2001:4860:4860::65"] {
+            let ip: IpAddr = non_dns64.parse().unwrap();
+            assert!(!is_known_public_doh_ip(ip));
+        }
     }
 }

@@ -16,19 +16,19 @@ pub enum Command {
     Start,
     /// Open the interactive Control Center TUI, even if a preference was saved
     Launcher,
-    /// Install vdpi and enable automatic background startup (Windows Service / LaunchAgent / systemd)
+    /// Install vdpi and enable automatic background startup (Windows Service / LaunchAgent or LaunchDaemon / systemd) for Proxy or TUN mode
     Install {
         /// Internal flag used during in-place upgrades to preserve existing service state
         #[arg(long, hide = true, default_value_t = false)]
         upgrade: bool,
     },
-    /// Stop vdpi, remove startup registration, and restore system proxy settings
+    /// Stop vdpi, remove startup registration, and restore OS proxy, TUN routing, and DNS settings
     Uninstall {
         /// Also remove persisted configuration, logs, and adaptive cache files
         #[arg(long, default_value_t = false)]
         purge: bool,
     },
-    /// Temporarily stop the installed background service and restore system proxies
+    /// Temporarily stop the installed background service and restore OS proxy, TUN routing, and DNS settings
     #[command(visible_alias = "stop")]
     Pause,
     /// Start a paused background service and re-enable anti-DPI protection
@@ -60,8 +60,12 @@ pub enum Command {
         action: Option<ConfigCommand>,
     },
     /// Display service state, live Anti-DPI engine telemetry, ports, and system proxy status
-    Status,
-    /// Run live end-to-end DPI bypass diagnostics (HTTP CONNECT + SOCKS5h + DoH)
+    Status {
+        /// Emit status as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Run live end-to-end DPI bypass diagnostics tailored to the active mode (TUN direct HTTPS/UDP DNS/QUIC or Proxy HTTP CONNECT + SOCKS5h + DoH)
     Doctor,
     /// Check GitHub Releases for a newer vdpi version and update in place
     Update {
@@ -105,17 +109,32 @@ pub enum ConfigCommand {
     Validate,
     /// Reset `config.toml` back to built-in defaults
     Reset,
+    /// Atomically validate and apply a complete `config.toml` file (used by desktop GUI)
+    ApplyFile {
+        /// Path to the validated temporary configuration file
+        path: PathBuf,
+        /// Restart the running background service after applying
+        #[arg(long, default_value_t = false)]
+        restart: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum SplitCommand {
     /// Print the current split-tunneling mode and configured applications
-    Status,
+    Status {
+        /// Emit split-tunnel status as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Discover and list installed and running applications, optionally filtered by query
     List {
         /// Optional fuzzy search filter query
-        #[arg(short = 'f', long, alias = "filter")]
+        #[arg(value_name = "QUERY", conflicts_with = "filter")]
         query: Option<String>,
+        /// Optional fuzzy search filter query (flag form)
+        #[arg(short = 'f', long = "query", alias = "filter", value_name = "QUERY")]
+        filter: Option<String>,
     },
     /// Set the split-tunneling mode (`all`, `exclude`, or `include`)
     Mode {
@@ -155,7 +174,7 @@ pub enum SplitCommand {
         )]
         mode: SplitTunnelMode,
         /// Application executable names to set (repeatable)
-        #[arg(long = "app", value_name = "APP")]
+        #[arg(long = "app", value_name = "APP", allow_hyphen_values = true)]
         apps: Vec<String>,
     },
 }
@@ -347,7 +366,7 @@ pub struct CliArgs {
     )]
     pub no_system_proxy: bool,
 
-    /// Configure OS SOCKS5 system proxy alongside HTTP/HTTPS when supported
+    /// Legacy compatibility flag (desktop Proxy mode uses fail-open `/vdpi.pac` instead of OS SOCKS5 system proxy settings)
     #[arg(
         long = "socks-system-proxy",
         default_value_t = true,
@@ -357,7 +376,7 @@ pub struct CliArgs {
     )]
     pub socks_system_proxy: bool,
 
-    /// Do not configure OS SOCKS5 system proxy (keeps SOCKS5 listener running)
+    /// Legacy compatibility flag (desktop Proxy mode uses fail-open `/vdpi.pac` rather than OS SOCKS5 system proxy settings; keeps the local SOCKS5 listener active)
     #[arg(
         long = "no-socks-proxy",
         alias = "no-socks-system-proxy",
@@ -367,7 +386,7 @@ pub struct CliArgs {
     )]
     pub no_socks_proxy: bool,
 
-    /// Export HTTP_PROXY/HTTPS_PROXY/NO_PROXY to user session environment for desktop apps
+    /// Export HTTP_PROXY/HTTPS_PROXY/NO_PROXY into the Linux `systemd --user` session environment (ignored on Windows and macOS, which use fail-open `/vdpi.pac`)
     #[arg(
         long = "env-proxy",
         alias = "launchd-env",
@@ -378,7 +397,7 @@ pub struct CliArgs {
     )]
     pub env_proxy: bool,
 
-    /// Do not export proxy variables into the user session environment
+    /// Do not export HTTP_PROXY/HTTPS_PROXY/NO_PROXY into the Linux `systemd --user` session environment (Windows and macOS use fail-open `/vdpi.pac` without proxy env vars)
     #[arg(
         long = "no-env-proxy",
         alias = "no-launchd-env",
@@ -388,7 +407,7 @@ pub struct CliArgs {
     )]
     pub no_env_proxy: bool,
 
-    /// Allow QUIC (UDP/443) packets over SOCKS5 UDP relay instead of forcing TCP TLS fallback
+    /// Allow QUIC (UDP/443) packets in both TUN mode and SOCKS5 UDP relay instead of dropping them to force TCP TLS fallback
     #[arg(
         long = "allow-quic",
         alias = "no-block-quic",
@@ -1502,16 +1521,42 @@ mod tests {
         assert_eq!(
             status.command,
             Some(Command::Split {
-                action: Some(SplitCommand::Status)
+                action: Some(SplitCommand::Status { json: false })
+            })
+        );
+        let status_json = CliArgs::parse_from_iter(["vdpi", "split", "status", "--json"]).unwrap();
+        assert_eq!(
+            status_json.command,
+            Some(Command::Split {
+                action: Some(SplitCommand::Status { json: true })
             })
         );
 
+        let top_status = CliArgs::parse_from_iter(["vdpi", "status"]).unwrap();
+        assert_eq!(top_status.command, Some(Command::Status { json: false }));
+        let top_status_json = CliArgs::parse_from_iter(["vdpi", "status", "--json"]).unwrap();
+        assert_eq!(
+            top_status_json.command,
+            Some(Command::Status { json: true })
+        );
+
+        let list_pos = CliArgs::parse_from_iter(["vdpi", "split", "list", "discord"]).unwrap();
+        assert_eq!(
+            list_pos.command,
+            Some(Command::Split {
+                action: Some(SplitCommand::List {
+                    query: Some("discord".to_string()),
+                    filter: None,
+                })
+            })
+        );
         let list = CliArgs::parse_from_iter(["vdpi", "split", "list", "--query", "disc"]).unwrap();
         assert_eq!(
             list.command,
             Some(Command::Split {
                 action: Some(SplitCommand::List {
-                    query: Some("disc".to_string())
+                    query: None,
+                    filter: Some("disc".to_string()),
                 })
             })
         );
@@ -1520,7 +1565,19 @@ mod tests {
             list_short.command,
             Some(Command::Split {
                 action: Some(SplitCommand::List {
-                    query: Some("disc".to_string())
+                    query: None,
+                    filter: Some("disc".to_string()),
+                })
+            })
+        );
+        let list_filter =
+            CliArgs::parse_from_iter(["vdpi", "split", "list", "--filter", "disc"]).unwrap();
+        assert_eq!(
+            list_filter.command,
+            Some(Command::Split {
+                action: Some(SplitCommand::List {
+                    query: None,
+                    filter: Some("disc".to_string()),
                 })
             })
         );
@@ -1599,6 +1656,26 @@ mod tests {
                 action: Some(SplitCommand::Apply {
                     mode: SplitTunnelMode::All,
                     apps: Vec::new(),
+                })
+            })
+        );
+
+        let apply_hyphen = CliArgs::parse_from_iter([
+            "vdpi",
+            "split",
+            "apply",
+            "--mode",
+            "exclude",
+            "--app",
+            "-hyphen-app.exe",
+        ])
+        .expect("split apply must accept app names starting with a hyphen");
+        assert_eq!(
+            apply_hyphen.command,
+            Some(Command::Split {
+                action: Some(SplitCommand::Apply {
+                    mode: SplitTunnelMode::Exclude,
+                    apps: vec!["-hyphen-app.exe".to_string()],
                 })
             })
         );

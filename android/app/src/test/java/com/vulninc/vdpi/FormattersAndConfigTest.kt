@@ -559,6 +559,8 @@ class FormattersAndConfigTest {
                 uptimeSecs = 95,
                 stageNumber = 2,
                 stageLabel = "OobSniDesync",
+                dnsAddr = settings.dnsAddr,
+                dohEnabled = settings.enableDoh,
             ),
         )
         val report = DoctorReport(

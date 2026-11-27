@@ -198,6 +198,21 @@ pub fn classify_vpn_adapter_name(name: &str, description: &str) -> Option<&'stat
     if has_any(&["zerotier"]) || is_zerotier_iface_name(&name_lower) {
         return Some("ZeroTier");
     }
+    if has_any(&["amnezia", "awg-quick"]) || is_amneziawg_iface_name(&name_lower) {
+        return Some("AmneziaVPN");
+    }
+    if has_any(&["adguard"]) {
+        return Some("AdGuard VPN");
+    }
+    if has_any(&["outline"]) {
+        return Some("Outline VPN");
+    }
+    if has_any(&["sing-box", "singbox"]) {
+        return Some("sing-box");
+    }
+    if has_any(&["mihomo"]) {
+        return Some("Mihomo");
+    }
     if has_any(&["wireguard", "wg-quick"]) || is_wireguard_iface_name(&name_lower) {
         return Some("WireGuard");
     }
@@ -274,8 +289,18 @@ fn is_linux_container_or_bridge_iface(name_lower: &str) -> bool {
         || name_lower.starts_with("calico")
 }
 
+fn is_amneziawg_iface_name(name_lower: &str) -> bool {
+    if name_lower == "awg" {
+        return true;
+    }
+    name_lower
+        .strip_prefix("awg")
+        .and_then(|rest| rest.bytes().next())
+        .is_some_and(|first| first.is_ascii_digit() || first == b'-' || first == b'_')
+}
+
 fn is_wireguard_iface_name(name_lower: &str) -> bool {
-    if name_lower == "wg" {
+    if name_lower == "wg" || is_amneziawg_iface_name(name_lower) {
         return true;
     }
     name_lower
@@ -396,9 +421,31 @@ impl GlobalRouteFlags {
 #[cfg(any(target_os = "windows", test))]
 const WIN_IF_TYPE_PPP: u32 = 23;
 #[cfg(any(target_os = "windows", test))]
+const WIN_IF_TYPE_LOOPBACK: u32 = 24;
+#[cfg(any(target_os = "windows", test))]
 const WIN_IF_TYPE_PROP_VIRTUAL: u32 = 53;
 #[cfg(any(target_os = "windows", test))]
 const WIN_IF_TYPE_TUNNEL: u32 = 131;
+
+#[cfg(any(target_os = "windows", test))]
+fn is_windows_loopback_or_transition_tunnel(adapter: &WindowsAdapter) -> bool {
+    if adapter.if_type == WIN_IF_TYPE_LOOPBACK {
+        return true;
+    }
+    let name_lower = adapter.friendly_name.trim().to_ascii_lowercase();
+    let desc_lower = adapter.description.trim().to_ascii_lowercase();
+    if name_lower == "lo"
+        || name_lower == "lo0"
+        || name_lower.contains("loopback")
+        || desc_lower.contains("loopback")
+    {
+        return true;
+    }
+    const TRANSITION_TUNNELS: &[&str] = &["teredo", "isatap", "6to4", "iphttps", "ip-https"];
+    TRANSITION_TUNNELS
+        .iter()
+        .any(|needle| name_lower.contains(needle) || desc_lower.contains(needle))
+}
 
 #[cfg(any(target_os = "windows", test))]
 #[derive(Debug, Clone)]
@@ -467,8 +514,11 @@ fn windows_winning_effective_metric(
         let eff = adapter
             .ipv6_metric
             .saturating_add(flags.best_v6_metric.unwrap_or(0));
+        // On IPv4-only hosts (other_best_v6_metric == None && other_best_v4_metric.is_some()),
+        // an adapter carrying only an IPv6 `::/0` route must not false-positive as a full-tunnel
+        // VPN when it does not also capture IPv4 traffic.
         let wins = match other_best_v6_metric {
-            None => true,
+            None => other_best_v4_metric.is_none(),
             Some(phys) if allow_tie => eff <= phys,
             Some(phys) => eff < phys,
         };
@@ -542,6 +592,48 @@ pub(crate) fn evaluate_windows_vpn_scope(
                 Some(cur) => cur.min(eff),
                 None => eff,
             });
+        }
+    }
+
+    // Fallback for VM guests (Hyper-V, VMware, VirtualBox) where the primary internet
+    // adapter is matched by `is_excluded_non_vpn_adapter`: if Pass 1 found zero physical
+    // defaults, scan non-VPN host/VM adapters so standby VPN `/0` routes do not
+    // false-positive as sole-default / kill-switch full tunnels.
+    if other_best_v4_metric.is_none() && other_best_v6_metric.is_none() {
+        for adapter in adapters {
+            if is_self_interface(&adapter.friendly_name, self_tun_name)
+                || is_windows_loopback_or_transition_tunnel(adapter)
+            {
+                continue;
+            }
+            if classify_vpn_adapter_name(&adapter.friendly_name, &adapter.description).is_some() {
+                continue;
+            }
+            let is_excluded_vm_nic =
+                is_excluded_non_vpn_adapter(&adapter.friendly_name, &adapter.description);
+            if !is_excluded_vm_nic && is_windows_virtual_tunnel_if_type(adapter.if_type) {
+                continue;
+            }
+
+            let flags = lookup_flags(adapter);
+            if flags.v4_default {
+                let eff = adapter
+                    .ipv4_metric
+                    .saturating_add(flags.best_v4_metric.unwrap_or(0));
+                other_best_v4_metric = Some(match other_best_v4_metric {
+                    Some(cur) => cur.min(eff),
+                    None => eff,
+                });
+            }
+            if flags.v6_default {
+                let eff = adapter
+                    .ipv6_metric
+                    .saturating_add(flags.best_v6_metric.unwrap_or(0));
+                other_best_v6_metric = Some(match other_best_v6_metric {
+                    Some(cur) => cur.min(eff),
+                    None => eff,
+                });
+            }
         }
     }
 
@@ -1026,6 +1118,20 @@ fn parse_macos_netstat_routes_detailed(
 
     let mut other_has_v4_default = false;
     let mut other_has_v6_default = false;
+    for (iface, &flags) in &parsed.routes {
+        if is_self_interface(iface, self_tun_name) || is_excluded_non_vpn_adapter(iface, "") {
+            continue;
+        }
+        if !is_macos_vpn_iface(iface) {
+            if flags.v4_default {
+                other_has_v4_default = true;
+            }
+            if flags.v6_default {
+                other_has_v6_default = true;
+            }
+        }
+    }
+
     let mut full_tunnels: Vec<(&'static str, String, GlobalRouteFlags, bool)> = Vec::new();
 
     for (iface, &flags) in &parsed.routes {
@@ -1036,19 +1142,13 @@ fn parse_macos_netstat_routes_detailed(
         if is_macos_vpn_iface(iface) {
             let wins_v4_default =
                 flags.v4_default && primary_v4_default.is_some_and(|primary| primary == iface);
-            let wins_v6_default =
-                flags.v6_default && primary_v6_default.is_some_and(|primary| primary == iface);
+            let wins_v6_default = flags.v6_default
+                && (other_has_v6_default || !other_has_v4_default)
+                && primary_v6_default.is_some_and(|primary| primary == iface);
             if flags.has_split_default() || wins_v4_default || wins_v6_default {
                 let is_ts = parsed.tailscale_ifaces.contains_key(iface);
                 let provider = infer_macos_provider(iface, is_ts);
                 full_tunnels.push((provider, iface.clone(), flags, is_ts));
-            }
-        } else {
-            if flags.v4_default {
-                other_has_v4_default = true;
-            }
-            if flags.v6_default {
-                other_has_v6_default = true;
             }
         }
     }
@@ -1148,7 +1248,7 @@ fn parse_macos_scutil_connected_service(text: &str, is_tailscale_overlay: bool) 
 fn detect_macos(self_tun_name: Option<&str>) -> VpnScope {
     use std::process::Command;
 
-    let inet_out = Command::new("netstat")
+    let inet_out = Command::new("/usr/sbin/netstat")
         .args(["-rn", "-f", "inet"])
         .output()
         .ok()
@@ -1156,7 +1256,7 @@ fn detect_macos(self_tun_name: Option<&str>) -> VpnScope {
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default();
 
-    let inet6_out = Command::new("netstat")
+    let inet6_out = Command::new("/usr/sbin/netstat")
         .args(["-rn", "-f", "inet6"])
         .output()
         .ok()
@@ -1188,7 +1288,7 @@ fn detect_macos(self_tun_name: Option<&str>) -> VpnScope {
 fn query_macos_connected_vpn_service(is_tailscale_overlay: bool) -> Option<String> {
     use std::process::Command;
 
-    let output = Command::new("scutil")
+    let output = Command::new("/usr/sbin/scutil")
         .args(["--nc", "list"])
         .output()
         .ok()?;
@@ -1248,9 +1348,11 @@ impl LinuxUpIface {
 
 #[cfg(any(target_os = "linux", test))]
 fn parse_linux_uevent_is_wireguard(uevent: &str) -> bool {
-    uevent
-        .lines()
-        .any(|line| line.trim().eq_ignore_ascii_case("DEVTYPE=wireguard"))
+    uevent.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.eq_ignore_ascii_case("DEVTYPE=wireguard")
+            || trimmed.eq_ignore_ascii_case("DEVTYPE=amneziawg")
+    })
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1626,7 +1728,7 @@ fn evaluate_linux_vpn_scope(
                 };
             let v6_wins = flags.v6_default
                 && match other_best_v6_metric {
-                    None => true,
+                    None => other_best_v4_metric.is_none(),
                     Some(phys) => flags.best_v6_metric.unwrap_or(0) <= phys,
                 };
             if !v4_wins && !v6_wins {
@@ -1773,6 +1875,19 @@ fn enumerate_linux_up_ifaces(self_tun_name: Option<&str>) -> Vec<LinuxUpIface> {
     up
 }
 
+#[cfg(any(target_os = "linux", test))]
+const LINUX_IP_BIN_CANDIDATES: [&str; 4] = ["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"];
+
+#[cfg(target_os = "linux")]
+fn resolve_linux_ip_bin() -> &'static str {
+    for candidate in LINUX_IP_BIN_CANDIDATES {
+        if std::path::Path::new(candidate).is_file() {
+            return candidate;
+        }
+    }
+    "/usr/sbin/ip"
+}
+
 #[cfg(target_os = "linux")]
 fn detect_linux(self_tun_name: Option<&str>) -> VpnScope {
     use std::process::Command;
@@ -1786,14 +1901,15 @@ fn detect_linux(self_tun_name: Option<&str>) -> VpnScope {
         parse_linux_proc_ipv6_route(&v6, &mut main_routes);
     }
 
-    let ip4_rule_out = Command::new("ip")
+    let ip_bin = resolve_linux_ip_bin();
+    let ip4_rule_out = Command::new(ip_bin)
         .args(["-4", "rule", "show"])
         .output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default();
-    let ip6_rule_out = Command::new("ip")
+    let ip6_rule_out = Command::new(ip_bin)
         .args(["-6", "rule", "show"])
         .output()
         .ok()
@@ -1809,7 +1925,7 @@ fn detect_linux(self_tun_name: Option<&str>) -> VpnScope {
 
     let mut policy_routes: BTreeMap<String, GlobalRouteFlags> = BTreeMap::new();
     for table in rules.custom_tables.iter().take(8) {
-        if let Some(out) = Command::new("ip")
+        if let Some(out) = Command::new(ip_bin)
             .args(["route", "show", "table", table])
             .output()
             .ok()
@@ -1818,7 +1934,7 @@ fn detect_linux(self_tun_name: Option<&str>) -> VpnScope {
             let text = String::from_utf8_lossy(&out.stdout);
             parse_linux_ip_route_table(&text, false, &mut policy_routes);
         }
-        if let Some(out) = Command::new("ip")
+        if let Some(out) = Command::new(ip_bin)
             .args(["-6", "route", "show", "table", table])
             .output()
             .ok()
@@ -1930,6 +2046,11 @@ mod tests {
                 Some("ZeroTier"),
             ),
             ("zt3jn4x8ab", "", Some("ZeroTier")),
+            ("AmneziaWG", "AmneziaWG Tunnel", Some("AmneziaVPN")),
+            ("AdGuard VPN", "AdGuard Wintun Adapter", Some("AdGuard VPN")),
+            ("Outline", "TAP-Windows Adapter V9", Some("Outline VPN")),
+            ("sing-box", "Wintun Userspace Tunnel", Some("sing-box")),
+            ("Mihomo", "Mihomo Meta Tunnel", Some("Mihomo")),
             ("Work VPN", "WAN Miniport (IKEv2)", Some("IKEv2 VPN")),
             ("Corp SSTP", "WAN Miniport (SSTP)", Some("SSTP VPN")),
             ("Home L2TP", "WAN Miniport (L2TP)", Some("L2TP VPN")),
@@ -2731,7 +2852,7 @@ default            192.168.1.1        UGScIg                en0
             Case {
                 name: "fallback route lookup by if_index when luid is zero",
                 adapters: vec![
-                    eth,
+                    eth.clone(),
                     adapter(
                         "Mullvad",
                         "WireGuard Tunnel",
@@ -2744,6 +2865,87 @@ default            192.168.1.1        UGScIg                en0
                 ],
                 luid_routes: vec![(1, v4_default(0))],
                 index_routes: vec![(25, v4_default(0))],
+                self_tun: Some("vdpi0"),
+                expected: VpnScope::FullTunnel {
+                    provider: "Mullvad".to_string(),
+                    iface: "Mullvad".to_string(),
+                    kill_switch: false,
+                },
+            },
+            Case {
+                name: "ipv6-only ::/0 on ipv4-only host does not false-positive as full tunnel",
+                adapters: vec![
+                    eth.clone(),
+                    adapter(
+                        "Tailscale",
+                        "Tailscale Tunnel",
+                        30,
+                        300,
+                        WIN_IF_TYPE_PROP_VIRTUAL,
+                        50,
+                        5,
+                    ),
+                ],
+                luid_routes: vec![(1, v4_default(0)), (30, v6_default(0))],
+                index_routes: vec![],
+                self_tun: Some("vdpi0"),
+                expected: VpnScope::SplitOverlay {
+                    providers: vec!["Tailscale".to_string()],
+                },
+            },
+            Case {
+                name: "vm guest hyper-v nic falls back in pass 1 so standby vpn does not false-positive",
+                adapters: vec![
+                    adapter(
+                        "Ethernet",
+                        "Microsoft Hyper-V Network Adapter",
+                        40,
+                        400,
+                        WIN_IF_TYPE_ETHERNET,
+                        25,
+                        25,
+                    ),
+                    adapter(
+                        "Mullvad",
+                        "WireGuard Tunnel",
+                        41,
+                        401,
+                        WIN_IF_TYPE_PROP_VIRTUAL,
+                        200,
+                        200,
+                    ),
+                ],
+                luid_routes: vec![(40, v4_default(0)), (41, v4_default(50))],
+                index_routes: vec![],
+                self_tun: Some("vdpi0"),
+                expected: VpnScope::SplitOverlay {
+                    providers: vec!["Mullvad".to_string()],
+                },
+            },
+            Case {
+                name: "vm guest hyper-v nic still yields when active vpn beats its metric",
+                adapters: vec![
+                    adapter(
+                        "Ethernet",
+                        "Microsoft Hyper-V Network Adapter",
+                        40,
+                        400,
+                        WIN_IF_TYPE_ETHERNET,
+                        25,
+                        25,
+                    ),
+                    adapter(
+                        "Mullvad",
+                        "WireGuard Tunnel",
+                        41,
+                        401,
+                        WIN_IF_TYPE_PROP_VIRTUAL,
+                        5,
+                        5,
+                    ),
+                ],
+                luid_routes: vec![(40, v4_default(0)), (41, v4_default(0))],
+                index_routes: vec![],
                 self_tun: Some("vdpi0"),
                 expected: VpnScope::FullTunnel {
                     provider: "Mullvad".to_string(),
@@ -2954,5 +3156,123 @@ Available network connection services in the current set (*=enabled):
                 providers: vec!["WireGuard".to_string()],
             }
         );
+    }
+
+    #[test]
+    fn linux_amneziawg_iface_and_devtype_detection() {
+        assert!(is_wireguard_iface_name("awg"));
+        assert!(is_wireguard_iface_name("awg0"));
+        assert!(is_wireguard_iface_name("awg-home"));
+        assert!(is_wireguard_iface_name("awg_1"));
+        assert!(!is_wireguard_iface_name("awdl0"));
+        assert!(!is_wireguard_iface_name("awgn"));
+
+        assert!(is_linux_generic_vpn_iface("awg0"));
+        assert!(!is_linux_generic_vpn_iface("awdl0"));
+
+        assert_eq!(classify_vpn_adapter_name("awg0", ""), Some("AmneziaVPN"));
+        assert_eq!(
+            classify_vpn_adapter_name("awg-home", ""),
+            Some("AmneziaVPN")
+        );
+        assert_eq!(classify_vpn_adapter_name("awg", ""), Some("AmneziaVPN"));
+        assert_eq!(classify_vpn_adapter_name("awdl0", ""), None);
+
+        assert!(parse_linux_uevent_is_wireguard(
+            "DEVTYPE=amneziawg\nINTERFACE=awg0\nIFINDEX=15\n"
+        ));
+        assert!(parse_linux_uevent_is_wireguard(
+            "DEVTYPE=amneziawg\nINTERFACE=de-fra-01\nIFINDEX=16\n"
+        ));
+
+        let z = hex_ipv4_host_order([0, 0, 0, 0]);
+        let gw_eth = hex_ipv4_host_order([192, 168, 1, 1]);
+        let main_proc = format!(
+            "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
+             eth0\t{z}\t{gw_eth}\t0003\t0\t0\t100\t{z}\t0\t0\t0\n"
+        );
+        let main_routes = parse_linux_proc_route(&main_proc);
+
+        let awg_rules = parse_linux_ip_rules(
+            "0:\tfrom all lookup local\n\
+             32764:\tfrom all lookup main suppress_prefixlength 0\n\
+             32765:\tnot from all fwmark 0xca6c lookup 51820\n",
+        );
+
+        // Named `awg0` with policy-table default route -> FullTunnel as AmneziaVPN.
+        let mut awg_policy = BTreeMap::new();
+        parse_linux_ip_route_table("default dev awg0\n", false, &mut awg_policy);
+        assert_eq!(
+            evaluate_linux_vpn_scope(
+                &[
+                    LinuxUpIface::other("eth0"),
+                    LinuxUpIface::with_kind("awg0", LinuxIfaceKind::WireGuard),
+                ],
+                &main_routes,
+                &awg_policy,
+                &awg_rules,
+                Some("vdpi0"),
+            ),
+            VpnScope::FullTunnel {
+                provider: "AmneziaVPN".to_string(),
+                iface: "awg0".to_string(),
+                kill_switch: true,
+            }
+        );
+
+        // Active `awg0` without a winning global default route -> SplitOverlay as AmneziaVPN.
+        assert_eq!(
+            evaluate_linux_vpn_scope(
+                &[
+                    LinuxUpIface::other("eth0"),
+                    LinuxUpIface::with_kind("awg0", LinuxIfaceKind::WireGuard),
+                ],
+                &main_routes,
+                &BTreeMap::new(),
+                &LinuxIpRuleSummary::default(),
+                Some("vdpi0"),
+            ),
+            VpnScope::SplitOverlay {
+                providers: vec!["AmneziaVPN".to_string()],
+            }
+        );
+
+        // Arbitrary-named interface classified via `DEVTYPE=amneziawg` -> FullTunnel as WireGuard.
+        let mut custom_policy = BTreeMap::new();
+        parse_linux_ip_route_table("default dev de-fra-01\n", false, &mut custom_policy);
+        assert_eq!(
+            evaluate_linux_vpn_scope(
+                &[
+                    LinuxUpIface::other("eth0"),
+                    LinuxUpIface::with_kind("de-fra-01", LinuxIfaceKind::WireGuard),
+                ],
+                &main_routes,
+                &custom_policy,
+                &awg_rules,
+                Some("vdpi0"),
+            ),
+            VpnScope::FullTunnel {
+                provider: "WireGuard".to_string(),
+                iface: "de-fra-01".to_string(),
+                kill_switch: true,
+            }
+        );
+    }
+
+    #[test]
+    fn linux_ip_bin_candidates_match_trusted_bin_prefixes() {
+        assert_eq!(
+            LINUX_IP_BIN_CANDIDATES,
+            ["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"]
+        );
+        let expected: Vec<String> = crate::platform::linux_tun::TRUSTED_BIN_PREFIXES
+            .iter()
+            .map(|prefix| format!("{prefix}/ip"))
+            .collect();
+        let actual: Vec<String> = LINUX_IP_BIN_CANDIDATES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(actual, expected);
     }
 }

@@ -70,6 +70,8 @@ pub struct TelemetrySnapshot {
     pub dns_queries: u64,
     pub quic_blocked: u64,
     pub udp_flows_active: u64,
+    #[serde(default)]
+    pub dropped_packets: u64,
     pub learned_hosts: usize,
     pub stage_number: u8,
     pub stage_label: String,
@@ -92,6 +94,7 @@ impl TelemetrySnapshot {
             dns_queries: 0,
             quic_blocked: 0,
             udp_flows_active: 0,
+            dropped_packets: 0,
             learned_hosts: 0,
             stage_number: 1,
             stage_label: "ComboMultiRecord".to_string(),
@@ -126,11 +129,15 @@ impl TelemetrySnapshot {
             dns_queries: ctx.dns.query_count(),
             quic_blocked: tun_stats.quic_blocked.load(Ordering::Relaxed),
             udp_flows_active: tun_stats.udp_flows_active.load(Ordering::Relaxed),
+            dropped_packets: tun_stats.dropped_packets.load(Ordering::Relaxed),
             learned_hosts: core.learned_hosts,
             stage_number: stage.stage_number(),
             stage_label: stage.label().to_string(),
-            dns_addr: ctx.config.dns_addr.clone(),
-            doh_enabled: ctx.config.enable_doh,
+            dns_addr: vdpi_core::dns::redact_dns_for_display(&ctx.config.dns_addr),
+            doh_enabled: vdpi_core::dns::is_effective_doh_target(
+                &ctx.config.dns_addr,
+                ctx.config.enable_doh,
+            ),
             events,
         }
     }
@@ -201,5 +208,132 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn telemetry_snapshot_exposes_dropped_packets_and_effective_doh() {
+        let idle = TelemetrySnapshot::idle(Vec::new());
+        assert_eq!(idle.dropped_packets, 0);
+
+        let doh_url_cfg = TunnelConfig {
+            dns_addr: "https://dns.nextdns.io/abc123".to_string(),
+            enable_doh: false,
+            ..Default::default()
+        };
+        let ctx_doh = build_engine_context(doh_url_cfg).await.unwrap();
+        let tun_stats = TunStats::default();
+        tun_stats.dropped_packets.store(7, Ordering::Relaxed);
+
+        let snap_doh = TelemetrySnapshot::from_live(
+            &ctx_doh,
+            &tun_stats,
+            Instant::now(),
+            true,
+            Vec::new(),
+        );
+        assert_eq!(snap_doh.dropped_packets, 7);
+        assert!(snap_doh.doh_enabled);
+        assert_eq!(snap_doh.dns_addr, "https://dns.nextdns.io");
+        assert!(!snap_doh.dns_addr.contains("abc123"));
+        let json = serde_json::to_value(&snap_doh).unwrap();
+        assert_eq!(json["dropped_packets"].as_u64(), Some(7));
+        assert_eq!(json["doh_enabled"].as_bool(), Some(true));
+        assert_eq!(json["dns_addr"].as_str(), Some("https://dns.nextdns.io"));
+        assert!(!json.to_string().contains("abc123"));
+
+        let controld_cfg = TunnelConfig {
+            dns_addr: "https://dns.controld.com/ctrld-secret-profile?client=phone".to_string(),
+            enable_doh: false,
+            ..Default::default()
+        };
+        let ctx_controld = build_engine_context(controld_cfg).await.unwrap();
+        let snap_controld = TelemetrySnapshot::from_live(
+            &ctx_controld,
+            &tun_stats,
+            Instant::now(),
+            true,
+            Vec::new(),
+        );
+        assert!(snap_controld.doh_enabled);
+        assert_eq!(snap_controld.dns_addr, "https://dns.controld.com");
+        assert!(!snap_controld.dns_addr.contains("ctrld-secret-profile"));
+        assert!(!snap_controld.dns_addr.contains("client=phone"));
+        let json_controld = serde_json::to_value(&snap_controld).unwrap();
+        assert_eq!(
+            json_controld["dns_addr"].as_str(),
+            Some("https://dns.controld.com")
+        );
+        assert!(!json_controld.to_string().contains("ctrld-secret-profile"));
+
+        let plain_cfg = TunnelConfig {
+            dns_addr: "1.1.1.1".to_string(),
+            enable_doh: false,
+            ..Default::default()
+        };
+        let ctx_plain = build_engine_context(plain_cfg).await.unwrap();
+        let snap_plain = TelemetrySnapshot::from_live(
+            &ctx_plain,
+            &tun_stats,
+            Instant::now(),
+            true,
+            Vec::new(),
+        );
+        assert!(!snap_plain.doh_enabled);
+        assert_eq!(snap_plain.dns_addr, "1.1.1.1");
+
+        // Bare custom non-DoH IPs (e.g. ControlD bare IP 76.76.2.0) report doh_enabled: false
+        // even when enable_doh=true, matching is_effective_doh_target.
+        let bare_custom_cfg = TunnelConfig {
+            dns_addr: "76.76.2.0".to_string(),
+            enable_doh: true,
+            ..Default::default()
+        };
+        let ctx_bare_custom = build_engine_context(bare_custom_cfg).await.unwrap();
+        let snap_bare_custom = TelemetrySnapshot::from_live(
+            &ctx_bare_custom,
+            &tun_stats,
+            Instant::now(),
+            true,
+            Vec::new(),
+        );
+        assert!(!snap_bare_custom.doh_enabled);
+        assert_eq!(snap_bare_custom.dns_addr, "76.76.2.0");
+        let json_bare_custom = serde_json::to_value(&snap_bare_custom).unwrap();
+        assert_eq!(json_bare_custom["doh_enabled"].as_bool(), Some(false));
+        assert_eq!(json_bare_custom["dns_addr"].as_str(), Some("76.76.2.0"));
+
+        // Known public DoH IPs (e.g. Quad9 9.9.9.9) report doh_enabled: true when enable_doh=true.
+        let quad9_cfg = TunnelConfig {
+            dns_addr: "9.9.9.9".to_string(),
+            enable_doh: true,
+            ..Default::default()
+        };
+        let ctx_quad9 = build_engine_context(quad9_cfg).await.unwrap();
+        let snap_quad9 = TelemetrySnapshot::from_live(
+            &ctx_quad9,
+            &tun_stats,
+            Instant::now(),
+            true,
+            Vec::new(),
+        );
+        assert!(snap_quad9.doh_enabled);
+        assert_eq!(snap_quad9.dns_addr, "9.9.9.9");
+
+        // Malformed https:// URLs report doh_enabled: false and redact safely.
+        let malformed_cfg = TunnelConfig {
+            dns_addr: "https://".to_string(),
+            enable_doh: true,
+            ..Default::default()
+        };
+        let ctx_malformed = build_engine_context(malformed_cfg).await.unwrap();
+        let snap_malformed = TelemetrySnapshot::from_live(
+            &ctx_malformed,
+            &tun_stats,
+            Instant::now(),
+            true,
+            Vec::new(),
+        );
+        assert!(!snap_malformed.doh_enabled);
+        assert_eq!(snap_malformed.dns_addr, "https://<redacted>");
     }
 }

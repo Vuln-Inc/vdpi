@@ -55,6 +55,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -345,6 +346,15 @@ private fun DesyncSettingsSection(
     }
 }
 
+private fun isSameDnsEndpoint(a: String, b: String): Boolean {
+    val left = a.trim()
+    val right = b.trim()
+    if (left.startsWith("https://", ignoreCase = true) || right.startsWith("https://", ignoreCase = true)) {
+        return left == right
+    }
+    return left.equals(right, ignoreCase = true)
+}
+
 @Composable
 private fun DnsSettingsSection(
     dnsAddr: String,
@@ -360,14 +370,18 @@ private fun DnsSettingsSection(
     val focusManager = LocalFocusManager.current
 
     val isPresetDns = DNS_PRESETS.any { it.address.equals(dnsAddr, ignoreCase = true) }
-    var customDnsInput by remember(dnsAddr) {
+    var customDnsInput by rememberSaveable(dnsAddr) {
         mutableStateOf(if (isPresetDns) "" else dnsAddr)
     }
     var dnsError by remember(dnsAddr) { mutableStateOf<String?>(null) }
 
+    val isActiveHttpsDns = dnsAddr.trim().startsWith("https://", ignoreCase = true)
+    val effectiveEnableDoh = enableDoh || isActiveHttpsDns
     val dnsTrimmed = customDnsInput.trim()
-    val dnsDirty = dnsTrimmed.isNotEmpty() && !dnsTrimmed.equals(dnsAddr, ignoreCase = true)
-    val customDnsActive = !isPresetDns && !dnsDirty && dnsTrimmed.equals(dnsAddr, ignoreCase = true)
+    val isHttpsCandidate = dnsTrimmed.startsWith("https://", ignoreCase = true)
+    val dnsDirty = dnsTrimmed.isNotEmpty() &&
+        (!isSameDnsEndpoint(dnsTrimmed, dnsAddr) || (isHttpsCandidate && !enableDoh))
+    val customDnsActive = !isPresetDns && !dnsDirty && isSameDnsEndpoint(dnsTrimmed, dnsAddr)
 
     fun submitDns() {
         val candidate = customDnsInput.trim()
@@ -377,9 +391,16 @@ private fun DnsSettingsSection(
         }
         dnsError = null
         focusManager.clearFocus()
-        if (!candidate.equals(dnsAddr, ignoreCase = true)) {
+        val addrChanged = !isSameDnsEndpoint(candidate, dnsAddr)
+        val shouldEnableDoh = candidate.startsWith("https://", ignoreCase = true) && !enableDoh
+        if (addrChanged || shouldEnableDoh) {
             haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-            onSetDnsAddr(candidate)
+            if (addrChanged) {
+                onSetDnsAddr(candidate)
+            }
+            if (shouldEnableDoh) {
+                onSetEnableDoh(true)
+            }
         }
     }
 
@@ -437,9 +458,18 @@ private fun DnsSettingsSection(
 
             ToggleSettingRow(
                 title = "DNS over HTTPS",
-                subtitle = "Encrypt DNS queries with automatic failover",
-                checked = enableDoh,
-                onCheckedChange = onSetEnableDoh,
+                subtitle = if (isActiveHttpsDns) {
+                    "Required for HTTPS DoH URL"
+                } else {
+                    "Encrypt DNS queries with automatic failover"
+                },
+                checked = effectiveEnableDoh,
+                enabled = !isActiveHttpsDns,
+                onCheckedChange = { next ->
+                    if (!isActiveHttpsDns) {
+                        onSetEnableDoh(next)
+                    }
+                },
             )
 
             HairlineRule(startIndent = 16.dp)
@@ -473,7 +503,7 @@ private fun BypassDomainsSection(
     val haptic = LocalHapticFeedback.current
     val focusManager = LocalFocusManager.current
 
-    var bypassInput by remember { mutableStateOf("") }
+    var bypassInput by rememberSaveable { mutableStateOf("") }
     var bypassError by remember { mutableStateOf<String?>(null) }
 
     fun submitBypass() {
@@ -1121,6 +1151,7 @@ private fun ToggleSettingRow(
     title: String,
     subtitle: String,
     checked: Boolean,
+    enabled: Boolean = true,
     onCheckedChange: (Boolean) -> Unit,
 ) {
     val palette = VdpiThemeTokens.palette
@@ -1128,7 +1159,7 @@ private fun ToggleSettingRow(
     val interaction = remember { MutableInteractionSource() }
     val isPressed by interaction.collectIsPressedAsState()
     val pressWash by animateColorAsState(
-        targetValue = if (isPressed) palette.inkPrimary.copy(alpha = 0.06f) else Color.Transparent,
+        targetValue = if (enabled && isPressed) palette.inkPrimary.copy(alpha = 0.06f) else Color.Transparent,
         animationSpec = tween(durationMillis = if (isPressed) 60 else 180),
         label = "toggleRowPressWash",
     )
@@ -1140,6 +1171,7 @@ private fun ToggleSettingRow(
             .background(pressWash)
             .toggleable(
                 value = checked,
+                enabled = enabled,
                 interactionSource = interaction,
                 indication = null,
                 role = Role.Switch,
@@ -1172,6 +1204,7 @@ private fun ToggleSettingRow(
         Spacer(Modifier.width(12.dp))
         PrecisionSwitch(
             checked = checked,
+            modifier = Modifier.alpha(if (enabled) 1f else 0.55f),
             onCheckedChange = null,
         )
     }

@@ -64,7 +64,7 @@ struct DiagnosticsSheet: View {
             .navigationTitle("Diagnostics")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItemGroup(placement: .topBarLeading) {
+                ToolbarItemGroup(placement: .navigationBarLeading) {
                     Button("Re-run") {
                         VdpiHaptics.trigger(.light)
                         manager.runDiagnostics()
@@ -80,7 +80,7 @@ struct DiagnosticsSheet: View {
                     .accessibilityLabel("Share diagnostics report")
                 }
 
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItem(placement: .navigationBarTrailing) {
                     Button("Done") {
                         dismiss()
                     }
@@ -300,7 +300,7 @@ struct EngineLogsSheet: View {
             .navigationTitle("Engine Logs")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItemGroup(placement: .topBarLeading) {
+                ToolbarItemGroup(placement: .navigationBarLeading) {
                     Button {
                         copyLogsToClipboard()
                     } label: {
@@ -322,7 +322,7 @@ struct EngineLogsSheet: View {
                     .accessibilityLabel("Share logs")
                 }
 
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItem(placement: .navigationBarTrailing) {
                     Button("Done") {
                         dismiss()
                     }

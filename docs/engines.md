@@ -11,11 +11,11 @@
 
 | Capability | TUN Mode | Proxy Mode |
 | :--- | :--- | :--- |
-| **Traffic capture** | Layer 3 virtual NIC (`Wintun` / `utun` / `/dev/net/tun`) + userspace TCP/UDP stack (`netstack-smoltcp`) | Local loopback listeners (`127.0.0.1:8080` HTTP/HTTPS/SOCKS5/4a + `127.0.0.1:1080` SOCKS5 TCP/UDP) |
-| **Application coverage** | System-wide: browsers, Discord, Roblox, Electron, games, CLI tools, `libcurl`, and apps that ignore OS proxies | Apps honoring WinINET / WinHTTP / `networksetup` / GNOME / KDE or `HTTP_PROXY` / `HTTPS_PROXY` |
-| **OS proxy / env changes** | None (zero `HTTP_PROXY`, `HTTPS_PROXY`, WinINET, or WinHTTP edits) | Configures OS proxy settings and user environment variables |
-| **Browser restart on install** | Not required | Open browsers must restart once so child processes inherit `HTTPS_PROXY` |
-| **Privileges required** | Windows Administrator (service) / macOS root (`LaunchDaemon`) / Linux `CAP_NET_ADMIN` | Windows Service (Admin) or unprivileged foreground; unprivileged on macOS (`LaunchAgent`) and Linux (`systemd --user`) |
+| **Traffic capture** | Layer 3 virtual NIC (`Wintun` / `utun` / `/dev/net/tun`) + in-tree userspace TCP/UDP stack (`smoltcp` 0.14) | Local loopback listeners (`127.0.0.1:8080` HTTP/HTTPS/SOCKS5/4a + `127.0.0.1:1080` SOCKS5 TCP/UDP) |
+| **Application coverage** | System-wide: browsers, Discord, Roblox, Electron, games, CLI tools, `libcurl`, and apps that ignore OS proxies | Apps honoring OS fail-open `/vdpi.pac` auto-config (Windows `AutoConfigURL`, macOS `AutoProxyURL`, Linux GNOME/KDE PAC) or explicit local proxy listeners |
+| **OS proxy / env changes** | None (zero `HTTP_PROXY`, `HTTPS_PROXY`, WinINET, or PAC edits) | Windows & macOS: fail-open `/vdpi.pac` only (zero proxy env vars); Linux: GNOME/KDE PAC plus optional `systemd --user` `HTTP_PROXY`/`HTTPS_PROXY` env vars (disabled via `--no-env-proxy`) |
+| **Browser restart on install** | Not required | Not required (browsers pick up `/vdpi.pac` dynamically) |
+| **Privileges required** | Windows Administrator / UAC (service & foreground) / macOS root (`LaunchDaemon` / `sudo`) / Linux root (`systemd` / `sudo`) or `CAP_NET_ADMIN` | Windows Service (Admin) or unprivileged foreground; unprivileged on macOS (`LaunchAgent`) and Linux (`systemd --user`) |
 | **Memory footprint** | ~16-22 MB RAM (`TunProfile::DESKTOP`) | ~8-14 MB RAM |
 | **DNS protection** | Intercepts UDP/53 and TCP/53 at the virtual interface via DoH ring | Resolves hostnames inside the proxy via DoH ring |
 | **QUIC handling** | Drops UDP/443 QUIC for desync-eligible hosts with ICMP reject for instant TCP/TLS fallback | Drops UDP/443 QUIC over SOCKS5 UDP relay (unless `--allow-quic`) |
@@ -26,14 +26,14 @@
 
 ## TUN Mode Architecture by Platform
 
-All desktop TUN backends share `vdpi-tun` with `TunProfile::DESKTOP` (MTU `1500`, up to `256` concurrent TCP sessions, `512` Cone-NAT UDP flows, `128` inflight DNS queries, `64 KB` TCP receive / `128 KB` TCP send buffers, `1 MB` UDP socket buffers, and ICMP-backed QUIC rejection for immediate HTTP/2 TCP fallback).
+All desktop TUN backends share `vdpi-tun` (built on an in-tree `smoltcp` 0.14 userspace stack) with `TunProfile::DESKTOP` (MTU `16384`, up to `512` concurrent TCP sessions, `512` Cone-NAT UDP flows, `256` inflight DNS queries, `448 KiB` TCP receive/send buffers — sized below Windows NT Heap's 508 KiB `VirtualAlloc` threshold for glitch-free real-time audio, `256 KiB` UDP socket buffers, and ICMP-backed QUIC rejection for immediate HTTP/2 TCP fallback).
 
 To prevent routing loops, every outbound socket opened by `vdpi` (TCP upstream, UDP Cone-NAT relay, UDP DNS, and DoH) is bound directly to the physical uplink through `DynamicOutboundBinder` before `connect()` or `bind()`. When you switch between Wi-Fi and Ethernet, the binder hot-swaps the active physical interface without restarting `vdpi`.
 
 ### Windows
 
 - **WHQL-signed Wintun `0.14.1`:** `vdpi-windows-x86_64.zip` ships the pinned, official WireGuard LLC WHQL-signed `wintun.dll` (`0.14.1`) and `WINTUN-LICENSE.txt` alongside `vdpi.exe`. Release CI verifies the archive SHA-256, `wintun.dll` SHA-256, and `WireGuard LLC` Authenticode signature on every build.
-- **51-CIDR crash-proof routing:** Instead of installing a single `0.0.0.0/0` default route that can shadow local networks or leave connectivity stranded on failure, `vdpi` routes public unicast IPv4 space using 51 non-overlapping public IPv4 complement CIDRs attached directly to the Wintun interface LUID. Private LANs, loopback, link-local, CGNAT/Tailscale, Docker/WSL bridges, and multicast stay on native kernel routes. Because all 51 routes are owned by the Wintun adapter object, Windows automatically removes them the instant the adapter handle closes on normal exit, service stop, or crash.
+- **65-CIDR crash-proof routing:** Instead of installing a single `0.0.0.0/0` default route that can shadow local networks or leave connectivity stranded on failure, `vdpi` routes public unicast IPv4 space using 65 non-overlapping public IPv4 complement CIDRs attached directly to the Wintun interface LUID. Private LANs, loopback, link-local, `192.0.0.0/24` (DS-Lite/IETF), CGNAT/Tailscale, Docker/WSL bridges, and multicast stay on native kernel routes. Because all 65 routes are owned by the Wintun adapter object (and `vdpi` also cleans up phantom/orphaned `vdpi0` nodes via SetupAPI on recovery/pause/uninstall), connectivity stays safe even after an abrupt crash or kill.
 - **Uplink socket binding (`IP_UNICAST_IF`):** Outbound IPv4 sockets use `IP_UNICAST_IF` (network byte order, `htonl(if_index)`) and IPv6 sockets use `IPV6_UNICAST_IF` (host byte order) to exit directly through the physical NIC. If no physical uplink is available, sockets fail closed with `WSAENETUNREACH` instead of looping into Wintun.
 - **Zero `HTTP_PROXY` or browser restart bugs:** TUN mode never writes WinINET registry keys, WinHTTP rules, or `HKCU\Environment` variables. Browsers, Electron apps, `libcurl` clients (such as `RobloxPlayerBeta.exe`), and CLI tools work immediately without restarting open windows.
 - **UDP fast-path & footprint:** Runs at ~16-22 MB RAM with Windows `SIO_UDP_CONNRESET` handling on Cone-NAT UDP sockets so unreachable peers never tear down voice or game relays.
@@ -46,13 +46,14 @@ To prevent routing loops, every outbound socket opened by `vdpi` (TCP upstream, 
 - **`LaunchDaemon` vs `LaunchAgent`:**
   - **TUN mode** requires root privileges to create `utun` interfaces, install routes, and manage DNS, so `vdpi install --tun` registers a system `LaunchDaemon` (`/Library/LaunchDaemons/com.vdpi.daemon.plist`).
   - **Proxy mode** runs unprivileged as a per-user `LaunchAgent` (`~/Library/LaunchAgents/com.vdpi.plist`).
-- **Snapshot-backed DNS & crash-cleanup guard:** On TUN startup, `vdpi` snapshots each active physical network service's DNS configuration via `networksetup -getdnsservers` (preserving DHCP/automatic vs custom servers), points service DNS to the virtual DNS endpoint (`198.18.0.2`), installs LAN exclusion routes and split default routes (`0.0.0.0/1`, `128.0.0.0/1`), persists the rollback state, and spawns a detached `setsid()` crash-cleanup guard (`--internal-macos-tun-guard`). On normal exit, `SIGKILL`, crash, or post-crash recovery from persistent state, `vdpi` and `--internal-macos-tun-guard` delete the managed routes in reverse order and restore the original DNS servers via `networksetup -setdnsservers`.
+- **8-CIDR non-zero-anchor routing:** Installs 8 non-overlapping IPv4 split routes (`1.0.0.0/8`, `2.0.0.0/7`, `4.0.0.0/6`, `8.0.0.0/5`, `16.0.0.0/4`, `32.0.0.0/3`, `64.0.0.0/2`, `128.0.0.0/1`) covering `1.0.0.0..=255.255.255.255` while leaving `0.0.0.0/8` untouched so `IP_BOUND_IF` never hits `ENETUNREACH` on modern macOS, paired with `-ifscope` physical default routes and explicit LAN/CGNAT/link-local exclusion routes (`10.0.0.0/8`, `100.64.0.0/10`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `224.0.0.0/4`, `240.0.0.0/4`).
+- **Session-scoped `SCDynamicStore` DNS & crash-cleanup guard:** On TUN startup, `vdpi` publishes virtual DNS (`198.18.0.2`, plus `fd00:7664:7069::2` when `--tun-ipv6` is enabled) via native `SCDynamicStore` session keys (`kSCDynamicStoreUseSessionKeys = true`) under `State:/Network/Service/com.vdpi.tun/*`, so macOS automatically reclaims DNS settings when the process exits or crashes without mutating permanent `networksetup` service DNS. Managed route rollback state is persisted to `/Library/Application Support/vdpi/macos-tun-state.json`, and a detached `setsid()` crash-cleanup guard (`--internal-macos-tun-guard`) deletes managed routes in reverse order on abrupt exit or `SIGKILL`.
 
 ### Linux
 
 - **Native `/dev/net/tun`:** Uses the standard Linux kernel TUN character device with no out-of-tree modules.
 - **Policy routing (`SO_MARK 0x5644`):** Every outbound socket opened by `vdpi` is tagged with `SO_MARK` fwmark `0x5644` (ASCII `"VD"`). Policy routing rules (`ip rule`) direct locally originated (`iif lo`) default-route traffic into routing table `202` (`vdpi0`) while routing `0x5644`-marked packets through the physical `main` routing table (with a fail-closed unreachable guard and `suppress_prefixlength 0` preserving LAN, Docker, and split-tunnel routes).
-- **`CAP_NET_ADMIN` privilege model:** TUN mode only needs `CAP_NET_ADMIN` to open `/dev/net/tun` and configure link routes and fwmark rules. It does not require unrestricted root access across the process lifetime (`systemd` service capability bounding or `setcap cap_net_admin+eip`).
+- **Privilege model (root / `CAP_NET_ADMIN`):** TUN mode requires root privileges (via the `systemd` system unit `/etc/systemd/system/vdpi.service` or `sudo` for foreground sessions) or `CAP_NET_ADMIN` (`setcap cap_net_admin+eip`) to open `/dev/net/tun` and configure link routes and fwmark rules.
 - **3-backend DNS management & `ExecStopPost` cleanup:** When `systemd-resolved` is active, DNS settings are attached directly to the `vdpi0` link and withdraw automatically when the `/dev/net/tun` descriptor closes. On systems without `systemd-resolved`, `vdpi` falls back to an ephemeral **NetworkManager** drop-in (`/run/NetworkManager/conf.d/99-vdpi-dns.conf`) or a marker-guarded `/etc/resolv.conf` (`# Managed by vdpi TUN mode`) backed up under `/var/lib/vdpi/` (restored only if the marker is still present so external edits are never clobbered). The installed `systemd` system unit (`/etc/systemd/system/vdpi.service`) also configures `ExecStopPost=+/usr/local/bin/vdpi --internal-linux-tun-cleanup` to remove `ip rule` policy rules, table `202` routes, and DNS state even after an abrupt crash or `SIGKILL`.
 
 ---
@@ -82,14 +83,14 @@ vdpi start --proxy
 
 Switching with `vdpi engine tun` or `vdpi engine proxy` handles cleanup automatically:
 
-- Moving **Proxy -> TUN** disables OS proxy settings (`WinINET` / `WinHTTP` / `networksetup` / GNOME / KDE / env vars) and migrates the background service (for example, `LaunchAgent` -> `LaunchDaemon` on macOS).
-- Moving **TUN -> Proxy** tears down the virtual adapter, routes, and TUN DNS state, migrates back to the Proxy service, and re-applies system proxy settings.
+- Moving **Proxy -> TUN** disables OS fail-open PAC proxy settings (`AutoConfigURL` / `AutoProxyURL` / GNOME & KDE PAC) and migrates the background service (for example, `LaunchAgent` -> `LaunchDaemon` on macOS).
+- Moving **TUN -> Proxy** tears down the virtual adapter, routes, and TUN DNS state, migrates back to the Proxy service, and re-applies fail-open `/vdpi.pac` proxy settings.
 
-### Control Center (`[2]`)
+### Control Center (`[3]` when running)
 
 Run `vdpi` (or `vdpi launcher`) to open the interactive `ratatui` Control Center:
 
-- Press **`2`** (or select menu item **`[2]`**) to toggle between **TUN Mode** and **Proxy Mode**.
+- Press **`3`** (menu item **`[3]`**) when the background service is running (or **`[2]`** when stopped/not installed) to toggle between **TUN Mode** and **Proxy Mode**.
 - The live status panel at the top immediately reflects the active engine, service state, physical uplink / proxy listeners, and Anti-DPI telemetry.
 
 ---
@@ -98,35 +99,33 @@ Run `vdpi` (or `vdpi launcher`) to open the interactive `ratatui` Control Center
 
 Proxy mode runs a single-process userspace server with up to 256 concurrent client sessions (15-second handshake negotiation timeout):
 
-- **Primary listener (`127.0.0.1:8080`, `-p`):** Protocol-autodetecting listener handling HTTP/1.1, HTTPS `CONNECT`, SOCKS5, and SOCKS4a.
+- **Primary listener (`127.0.0.1:8080`, `-p`):** Protocol-autodetecting listener handling HTTP/1.1, HTTPS `CONNECT`, SOCKS5, SOCKS4a, `/vdpi-health`, and `/vdpi.pac`.
 - **Dedicated SOCKS5 listener (`127.0.0.1:1080`, `-s`, set `0` to disable):** Supports both TCP `CONNECT` and UDP `ASSOCIATE`.
 
-### OS Proxy Integration
+### OS Proxy Integration (Fail-Open `/vdpi.pac`)
+
+Every desktop platform uses `vdpi`'s local fail-open PAC script (`http://127.0.0.1:<port>/vdpi.pac`), which returns `DIRECT` for localhost, private LAN/CGNAT/IPv6 ULA ranges, and captive-portal probes, and `PROXY 127.0.0.1:<port>; DIRECT` for public traffic. Because the PAC falls back to `DIRECT` whenever the local proxy is unreachable, force-killing or crashing `vdpi` on Windows or macOS never bricks direct internet access. On Windows and macOS, `vdpi` does **not** write fail-closed `HTTP_PROXY`/`HTTPS_PROXY` environment variables or `netsh winhttp` manual proxies (and auto-cleans legacy ones left by older versions); on Linux, `vdpi` configures GNOME/KDE PAC and also exports `systemd --user` `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` unless `--no-env-proxy` (`env_proxy = false`) is set.
 
 | Platform | Mechanisms Configured | Foreground Cleanup |
 | :--- | :--- | :--- |
-| **Windows** | **WinINET** (`HKCU` or active interactive `HKU\<SID>` hives + `WTS_SESSION_LOGON` / `WTS_SESSION_UNLOCK` instant reconciliation), **`HKCU\Environment`** (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` broadcast via `WM_SETTINGCHANGE`), and **WinHTTP** (`netsh winhttp set proxy` in service mode when no unrelated external proxy is configured) | Detached lease guard process (`--internal-foreground-proxy-guard`) restores WinINET and `HKCU\Environment` automatically even if the console window is force-closed |
-| **macOS** | `networksetup` (HTTP, HTTPS, and SOCKS5 on physical interfaces, skipping VPN/bridge services) + `launchctl setenv` (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`) | Restores only `vdpi`-owned proxy entries on exit |
-| **Linux** | GNOME `gsettings` (`org.gnome.system.proxy`) + KDE `kioslaverc` + `systemctl --user set-environment` | Restores only `vdpi`-owned proxy entries on exit |
+| **Windows** | **WinINET fail-open PAC** (`AutoConfigURL = http://127.0.0.1:<port>/vdpi.pac`, `ProxyEnable = 0`) across `HKCU` or active interactive `HKU\<SID>` hives + `WTS_SESSION_LOGON` / `WTS_SESSION_UNLOCK` reconciliation; auto-cleans legacy `HKCU\Environment` proxy vars and `vdpi`-owned WinHTTP proxies | Detached lease guard process (`--internal-foreground-proxy-guard`) restores prior WinINET state automatically even if the console window is force-closed |
+| **macOS** | `networksetup -setautoproxyurl` / `-setautoproxystate on` (`AutoProxyURL = http://127.0.0.1:<port>/vdpi.pac`) on physical network services (skipping VPN/bridge services); auto-cleans legacy loopback `launchctl` env vars | Restores prior `AutoProxyURL` state (or turns off `vdpi` PAC) on exit |
+| **Linux** | Fail-open PAC (`http://127.0.0.1:<port>/vdpi.pac`) via GNOME `gsettings` (`org.gnome.system.proxy` `mode='auto'`, `autoconfig-url`) and KDE `kioslaverc` (`ProxyType=2`, `Proxy Config Script`), plus optional `systemd --user` `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` (disable with `--no-env-proxy`) | Restores only `vdpi`-owned PAC and env settings on exit |
 
-Pass `--no-system-proxy`, `--no-socks-proxy`, or `--no-env-proxy` to selectively opt out of OS proxy configuration while keeping the local listeners active.
+Pass `--no-system-proxy` to disable OS PAC integration while keeping the local HTTP/SOCKS5 listeners active.
 
 ### Seamless Windows Service Updates (`SERVICE_CONTROL_UPGRADE_STOP`)
 
 When you run `vdpi update` while Windows Proxy Mode is installed as a background service, the updater sends a custom `SERVICE_CONTROL_UPGRADE_STOP` control code instead of a standard `SERVICE_CONTROL_STOP`:
 
-- On `SERVICE_CONTROL_UPGRADE_STOP`, the outgoing service stops accepting connections and exits **without** wiping WinINET, WinHTTP, or `HKCU\Environment` proxy entries.
+- On `SERVICE_CONTROL_UPGRADE_STOP`, the outgoing service stops accepting connections and exits **without** wiping the WinINET `AutoConfigURL` PAC entry.
 - The updater swaps `%ProgramFiles%\vdpi\bin\vdpi.exe` (after SHA-256 verification) and starts the new service immediately.
-- Active browsers and desktop apps avoid a proxy configuration flap during the brief binary handoff.
-- Normal `vdpi pause`, `vdpi stop`, and `vdpi uninstall` still issue standard `SERVICE_CONTROL_STOP` and remove all proxy settings cleanly.
+- Active browsers and desktop apps avoid a proxy configuration flap during the brief binary handoff, and `/vdpi.pac` fails open to `DIRECT` for any request landing in the sub-second restart window.
+- Normal `vdpi pause`, `vdpi stop`, and `vdpi uninstall` still issue standard `SERVICE_CONTROL_STOP` and restore prior WinINET settings cleanly.
 
-### Restarting Open Browsers Once on First Proxy Install
+### Apps Ignoring System PAC (When to Use TUN Mode)
 
-On Windows and macOS, processes inherit environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`) only at process launch:
-
-- Browsers (Chrome, Edge) use WinINET / `networksetup` immediately, so normal browsing works without restarting.
-- Native game clients and `libcurl`-based apps (such as `RobloxPlayerBeta.exe`) ignore WinINET and rely on `HTTPS_PROXY`. If a browser was **already open** before your first `vdpi install --proxy` or `vdpi start --proxy`, restart that browser **once** so child apps launched via protocol handlers (`roblox-player://`) inherit `HTTPS_PROXY`.
-- Once installed as a background service, `HTTPS_PROXY` is present from login on every subsequent boot. Switching to **TUN mode** removes this requirement entirely.
+Browsers (Chrome, Edge, Firefox) and Electron apps such as Discord pick up `/vdpi.pac` dynamically with no browser restart required. Native game clients and `libcurl`-based apps that ignore OS PAC auto-config (such as `RobloxPlayerBeta.exe`) are not captured by Proxy mode unless configured to use `127.0.0.1:8080` / `:1080` directly; switch to **TUN mode** (`vdpi engine tun`) for transparent system-wide coverage of all TCP/UDP traffic.
 
 ---
 
@@ -134,16 +133,16 @@ On Windows and macOS, processes inherit environment variables (`HTTP_PROXY`, `HT
 
 Both TUN mode and Proxy mode (as well as Android and iOS) execute the same adaptive TLS desync engine in `vdpi-core`.
 
-For every outbound TLS connection to a non-bypassed host, `vdpi` validates the upstream `ServerHello` (`0x16 0x03`). If the connection encounters a TCP reset (`RST`), premature EOF, handshake timeout, TLS Alert (`0x15`), or an injected non-TLS ISP block page (such as an HTTP `302`/`403` redirect), `vdpi` automatically escalates to the next stage without dropping the client session:
+For every outbound TLS connection to a non-bypassed host, `vdpi` validates the upstream `ServerHello` (`0x16 0x03`). If the connection encounters a TCP reset (`RST`), premature EOF, handshake timeout, TLS Alert (`0x15`), or an injected non-TLS ISP block page (such as an HTTP `302`/`403` redirect), `vdpi` automatically escalates through `ALL_STAGES` without dropping the client session:
 
 | Stage | Strategy | Mechanism |
 | :---: | :--- | :--- |
-| **1** | `ComboMultiRecord` | Splits the TLS `ClientHello` into 4 wire-paced RFC-compliant `0x16` records across the handshake header and SNI midpoint (defeats OS TCP coalescing and shallow DPI). |
-| **2** | `OobSniDesync` | Injects 1 TCP Out-of-Band (`MSG_OOB`, `URG=1`) decoy byte at the SNI midpoint. Real server TCP stacks (`SO_OOBINLINE=0`) strip the urgent byte cleanly while stateful DPI boxes see a corrupted hostname and pass the flow through. |
-| **3** | `MultiRecordOob` | Combines 4-record TLS splitting with a `MSG_OOB` urgent decoy byte at the TLS record boundary inside SNI, shifting subsequent TLS record framing for stateful DPI state machines. |
-| **4** | `FineFragment` | Keeps a single intact outer TLS record split across 4 wire-paced TCP segments (for strict servers or firewalls that reject multi-record `ClientHello`s or strip `URG`). |
-| **5** | `DeepRecordStorm` | Emits 12+ wire-paced `0x16` records (up to 10 tiny 2-byte lead records exhausting hardware DPI per-flow packet caps before SNI hits the wire, followed by SNI-split records). |
-| **6** | `SlowSniSlice` | Single intact outer TLS record with 2-byte paced SNI slicing and a 20ms midpoint gap for strict servers behind stateful burst-reassembling DPI. |
+| **1** | `Primary` (`ComboMultiRecord`) | Configured primary mode (default `combo`: splits the TLS `ClientHello` into 4 wire-paced RFC-compliant `0x16` records across the handshake header and SNI midpoint to defeat OS TCP coalescing and shallow DPI). |
+| **2** | `FineFragment` | Keeps a single intact outer TLS record split across 4 wire-paced TCP segments (for strict servers or firewalls that reject multi-record `ClientHello`s). |
+| **3** | `DeepRecordStorm` | Emits 12+ wire-paced `0x16` records (up to 10 tiny 2-byte lead records exhausting hardware DPI per-flow packet caps before SNI hits the wire, followed by SNI-split records). |
+| **4** | `SlowSniSlice` | Single intact outer TLS record with 2-byte paced SNI slicing and a 20ms midpoint gap for strict servers behind stateful burst-reassembling DPI. |
+| **5** | `OobSniDesync` | Injects 1 TCP Out-of-Band (`MSG_OOB`, `URG=1`) decoy byte at the SNI midpoint. Real server TCP stacks (`SO_OOBINLINE=0`) strip the urgent byte cleanly while stateful DPI boxes see a corrupted hostname and pass the flow through. |
+| **6** | `MultiRecordOob` | Combines 4-record TLS splitting with a `MSG_OOB` urgent decoy byte at the TLS record boundary inside SNI, shifting subsequent TLS record framing for stateful DPI state machines. |
 | **7** | `DirectPassthrough` | Falls back cleanly to an unmodified single-write handshake for unblocked strict WAFs/CDNs and caches the winning strategy per host. |
 
 For plaintext HTTP/1.1 requests, `vdpi` applies 3-segment wire-paced `Host` header splitting.
@@ -163,7 +162,7 @@ Learned per-host winning strategies and the promoted `global_isp_stage` are pers
 
 | Platform | Default `adaptive-cache.json` Path |
 | :--- | :--- |
-| **Windows** | `%LOCALAPPDATA%\vdpi\adaptive-cache.json` |
+| **Windows** | `%LOCALAPPDATA%\vdpi\adaptive-cache.json` (interactive/foreground); `%ProgramData%\vdpi\adaptive-cache.json` (Windows Service) |
 | **macOS** | `~/Library/Caches/vdpi/adaptive-cache.json` |
 | **Linux** | `$XDG_CACHE_HOME/vdpi/adaptive-cache.json` (fallback: `~/.cache/vdpi/adaptive-cache.json`) |
 | **Android / iOS** | Managed automatically inside the app cache / iOS App Group container |

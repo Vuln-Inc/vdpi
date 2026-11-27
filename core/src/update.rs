@@ -20,8 +20,382 @@ const MAX_SUMS_BODY_BYTES: usize = 256 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 const SHA256_READ_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_EXTRACT_SEARCH_DEPTH: usize = 3;
+const GITHUB_API_HOST: &str = "api.github.com";
+const GITHUB_RELEASE_DOWNLOAD_PATH_PREFIX: &str = "/Vuln-Inc/vdpi/releases/download/";
+const MAX_REDIRECT_HOPS: usize = 5;
+const ALLOWED_GITHUB_DOWNLOAD_HOSTS: &[&str] = &[
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+    "codeload.github.com",
+];
 #[cfg(any(target_os = "windows", test))]
 const WINDOWS_OPTIONAL_ARCHIVE_MEMBERS: &[&str] = &["wintun.dll", "WINTUN-LICENSE.txt"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedirectTargetPolicy {
+    GitHubApi,
+    GitHubDownload,
+}
+
+fn is_allowed_github_download_host(host: &str) -> bool {
+    ALLOWED_GITHUB_DOWNLOAD_HOSTS
+        .iter()
+        .any(|allowed| host.eq_ignore_ascii_case(allowed))
+}
+
+fn validate_github_api_parsed_url(parsed: &reqwest::Url, label: &str) -> Result<()> {
+    if parsed.scheme() != "https" {
+        bail!("refusing non-HTTPS URL for {label}: {parsed}");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!("refusing URL with embedded credentials for {label}: {parsed}");
+    }
+    if parsed.port_or_known_default() != Some(443) {
+        bail!("refusing non-standard HTTPS port for {label}: {parsed}");
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("URL for {label} is missing a host: {parsed}"))?;
+    if !host.eq_ignore_ascii_case(GITHUB_API_HOST) {
+        bail!(
+            "refusing untrusted API host '{host}' for {label} (only {GITHUB_API_HOST} is allowed)"
+        );
+    }
+    Ok(())
+}
+
+fn validate_github_download_parsed_url(parsed: &reqwest::Url, label: &str) -> Result<()> {
+    if parsed.scheme() != "https" {
+        bail!("refusing non-HTTPS download URL for {label}: {parsed}");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!("refusing download URL with embedded credentials for {label}: {parsed}");
+    }
+    if parsed.port_or_known_default() != Some(443) {
+        bail!("refusing non-standard HTTPS port for {label}: {parsed}");
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("download URL for {label} is missing a host: {parsed}"))?;
+    if !is_allowed_github_download_host(host) {
+        bail!(
+            "refusing untrusted download host '{host}' for {label} (only GitHub release domains are allowed)"
+        );
+    }
+    if host.eq_ignore_ascii_case("github.com") {
+        let path = parsed.path();
+        let lower_path = path.to_ascii_lowercase();
+        if !path.starts_with(GITHUB_RELEASE_DOWNLOAD_PATH_PREFIX)
+            || path.len() <= GITHUB_RELEASE_DOWNLOAD_PATH_PREFIX.len()
+            || path.contains("..")
+            || lower_path.contains("%2e")
+            || lower_path.contains("%2f")
+            || lower_path.contains("%5c")
+            || path.contains('\\')
+        {
+            bail!(
+                "refusing untrusted github.com download path '{path}' for {label} (must be under {GITHUB_RELEASE_DOWNLOAD_PATH_PREFIX})"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_github_download_url(raw_url: &str, label: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(raw_url)
+        .with_context(|| format!("invalid download URL for {label}: {raw_url}"))?;
+    validate_github_download_parsed_url(&parsed, label)
+}
+
+fn validate_redirect_hop(
+    target: RedirectTargetPolicy,
+    next_url: &reqwest::Url,
+    previous_hops: usize,
+) -> Result<()> {
+    if previous_hops > MAX_REDIRECT_HOPS {
+        bail!("too many redirects (exceeded {MAX_REDIRECT_HOPS}-hop limit)");
+    }
+    match target {
+        RedirectTargetPolicy::GitHubApi => {
+            validate_github_api_parsed_url(next_url, "GitHub Releases API redirect")
+        }
+        RedirectTargetPolicy::GitHubDownload => {
+            validate_github_download_parsed_url(next_url, "release download redirect")
+        }
+    }
+}
+
+fn build_redirect_policy(target: RedirectTargetPolicy) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        match validate_redirect_hop(target, attempt.url(), attempt.previous().len()) {
+            Ok(()) => attempt.follow(),
+            Err(err) => attempt.error(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                err.to_string(),
+            )),
+        }
+    })
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackageManager {
+    Scoop,
+    WinGet,
+    Homebrew,
+}
+
+impl PackageManager {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Scoop => "Scoop",
+            Self::WinGet => "WinGet",
+            Self::Homebrew => "Homebrew",
+        }
+    }
+
+    fn upgrade_command(self) -> &'static str {
+        match self {
+            Self::Scoop => "scoop update vdpi",
+            Self::WinGet => "winget upgrade Vuln-Inc.vdpi",
+            Self::Homebrew => "brew upgrade vdpi",
+        }
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn normalize_windows_match_path(path: &Path) -> String {
+    strip_windows_verbatim_prefix(path)
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn path_is_under_scoop_root(normalized_exe: &str, root: &OsStr) -> bool {
+    let root_str = root.to_string_lossy();
+    let trimmed = root_str.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let norm_root = normalize_windows_match_path(Path::new(trimmed));
+    let norm_root = norm_root.trim_end_matches('\\');
+    if norm_root.is_empty() {
+        return false;
+    }
+    let apps_prefix = format!("{norm_root}\\apps\\vdpi\\");
+    let shim_path = format!("{norm_root}\\shims\\vdpi.exe");
+    normalized_exe.starts_with(&apps_prefix) || normalized_exe == shim_path
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn detect_windows_package_manager_path_with_env(
+    path: &Path,
+    scoop_env: Option<&OsStr>,
+    scoop_global_env: Option<&OsStr>,
+) -> Option<PackageManager> {
+    let normalized = normalize_windows_match_path(path);
+    if normalized.contains("\\scoop\\apps\\vdpi\\")
+        || normalized.ends_with("\\scoop\\shims\\vdpi.exe")
+        || scoop_env.is_some_and(|root| path_is_under_scoop_root(&normalized, root))
+        || scoop_global_env.is_some_and(|root| path_is_under_scoop_root(&normalized, root))
+    {
+        Some(PackageManager::Scoop)
+    } else if normalized.contains("\\winget\\packages\\") {
+        Some(PackageManager::WinGet)
+    } else {
+        None
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn path_is_under_homebrew_prefix(
+    normalized_path: &str,
+    prefix: &str,
+    case_insensitive: bool,
+) -> bool {
+    let trimmed = prefix.trim();
+    if !trimmed.starts_with('/') {
+        return false;
+    }
+    let clean_prefix = trimmed.trim_end_matches('/');
+    if clean_prefix.is_empty() {
+        return false;
+    }
+    if case_insensitive {
+        let lower_prefix = clean_prefix.to_ascii_lowercase();
+        normalized_path.starts_with(&format!("{lower_prefix}/cellar/vdpi/"))
+            || normalized_path.starts_with(&format!("{lower_prefix}/opt/vdpi/"))
+    } else {
+        normalized_path.starts_with(&format!("{clean_prefix}/Cellar/vdpi/"))
+            || normalized_path.starts_with(&format!("{clean_prefix}/opt/vdpi/"))
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn detect_macos_package_manager_path_with_env(
+    path: &Path,
+    homebrew_prefix: Option<&OsStr>,
+) -> Option<PackageManager> {
+    let normalized = path.to_string_lossy().to_ascii_lowercase();
+    let custom_match = homebrew_prefix.is_some_and(|prefix| {
+        let prefix_str = prefix.to_string_lossy();
+        path_is_under_homebrew_prefix(&normalized, &prefix_str, true)
+    });
+    if path_is_under_homebrew_prefix(&normalized, "/opt/homebrew", true)
+        || path_is_under_homebrew_prefix(&normalized, "/usr/local", true)
+        || custom_match
+    {
+        Some(PackageManager::Homebrew)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+fn detect_macos_package_manager_path(path: &Path) -> Option<PackageManager> {
+    detect_macos_package_manager_path_with_env(path, None)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn detect_linux_package_manager_path_with_env(
+    path: &Path,
+    homebrew_prefix: Option<&OsStr>,
+    home_env: Option<&OsStr>,
+) -> Option<PackageManager> {
+    let normalized = path.to_string_lossy();
+    let custom_prefix_match = homebrew_prefix.is_some_and(|prefix| {
+        let prefix_str = prefix.to_string_lossy();
+        path_is_under_homebrew_prefix(&normalized, &prefix_str, false)
+    });
+    let home_linuxbrew_match = home_env.is_some_and(|home| {
+        let home_str = home.to_string_lossy();
+        let trimmed = home_str.trim();
+        if !trimmed.starts_with('/') {
+            return false;
+        }
+        let clean_home = trimmed.trim_end_matches('/');
+        if clean_home.is_empty() {
+            return false;
+        }
+        let prefix = format!("{clean_home}/.linuxbrew");
+        path_is_under_homebrew_prefix(&normalized, &prefix, false)
+    });
+    if path_is_under_homebrew_prefix(&normalized, "/home/linuxbrew/.linuxbrew", false)
+        || custom_prefix_match
+        || home_linuxbrew_match
+    {
+        Some(PackageManager::Homebrew)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+fn detect_linux_package_manager_path(path: &Path) -> Option<PackageManager> {
+    detect_linux_package_manager_path_with_env(path, None, None)
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn detect_current_exe_package_manager() -> Option<(PackageManager, PathBuf)> {
+    let exe_raw = std::env::current_exe().ok()?;
+    #[cfg(target_os = "windows")]
+    {
+        let scoop_env = std::env::var_os("SCOOP");
+        let scoop_global_env = std::env::var_os("SCOOP_GLOBAL");
+        let clean_raw = strip_windows_verbatim_prefix(&exe_raw);
+        if let Some(pm) = detect_windows_package_manager_path_with_env(
+            &clean_raw,
+            scoop_env.as_deref(),
+            scoop_global_env.as_deref(),
+        ) {
+            return Some((pm, clean_raw));
+        }
+        if let Ok(canonical) = fs::canonicalize(&exe_raw) {
+            let clean_canonical = strip_windows_verbatim_prefix(&canonical);
+            if let Some(pm) = detect_windows_package_manager_path_with_env(
+                &clean_canonical,
+                scoop_env.as_deref(),
+                scoop_global_env.as_deref(),
+            ) {
+                return Some((pm, clean_canonical));
+            }
+        }
+        None
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let homebrew_prefix = std::env::var_os("HOMEBREW_PREFIX");
+        if let Some(pm) =
+            detect_macos_package_manager_path_with_env(&exe_raw, homebrew_prefix.as_deref())
+        {
+            return Some((pm, exe_raw));
+        }
+        if let Ok(canonical) = fs::canonicalize(&exe_raw) {
+            if let Some(pm) =
+                detect_macos_package_manager_path_with_env(&canonical, homebrew_prefix.as_deref())
+            {
+                return Some((pm, canonical));
+            }
+        }
+        None
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let homebrew_prefix = std::env::var_os("HOMEBREW_PREFIX");
+        let home_env = std::env::var_os("HOME");
+        if let Some(pm) = detect_linux_package_manager_path_with_env(
+            &exe_raw,
+            homebrew_prefix.as_deref(),
+            home_env.as_deref(),
+        ) {
+            return Some((pm, exe_raw));
+        }
+        if let Ok(canonical) = fs::canonicalize(&exe_raw) {
+            if let Some(pm) = detect_linux_package_manager_path_with_env(
+                &canonical,
+                homebrew_prefix.as_deref(),
+                home_env.as_deref(),
+            ) {
+                return Some((pm, canonical));
+            }
+        }
+        None
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+fn detect_current_exe_package_manager() -> Option<(PackageManager, PathBuf)> {
+    None
+}
+
+fn format_check_update_available_message(
+    current_version: &str,
+    latest_version: &str,
+    managed_pm: Option<(PackageManager, &Path)>,
+) -> String {
+    match managed_pm {
+        Some((pm, exe_path)) => format!(
+            "Update available: v{current_version} -> {latest_version}. vdpi is managed by {} ({}); run '{}' to update.",
+            pm.name(),
+            exe_path.display(),
+            pm.upgrade_command()
+        ),
+        None => format!(
+            "Update available: v{current_version} -> {latest_version}. Run 'vdpi update' to install."
+        ),
+    }
+}
+
+fn package_manager_self_update_refusal_error(pm: PackageManager, exe_path: &Path) -> anyhow::Error {
+    anyhow!(
+        "refusing self-update: vdpi appears to be managed by {} ({}); run '{}' to update cleanly, or re-run 'vdpi update --force' to bypass this check",
+        pm.name(),
+        exe_path.display(),
+        pm.upgrade_command()
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VersionRelation {
@@ -507,10 +881,16 @@ impl StagingDir {
             let create_res = {
                 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
                 fs::DirBuilder::new()
-                    .mode(0o755)
+                    .mode(0o700)
                     .create(&candidate)
-                    .map(|()| {
-                        let _ = fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755));
+                    .and_then(|()| {
+                        if let Err(err) =
+                            fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700))
+                        {
+                            let _ = fs::remove_dir(&candidate);
+                            return Err(err);
+                        }
+                        Ok(())
                     })
             };
             #[cfg(not(unix))]
@@ -582,6 +962,7 @@ async fn read_response_text_bounded(
 }
 
 async fn download_to_file(client: &Client, url: &str, dest: &Path, max_bytes: u64) -> Result<()> {
+    validate_github_download_url(url, "release archive")?;
     let mut resp = client
         .get(url)
         .timeout(DOWNLOAD_TIMEOUT)
@@ -592,9 +973,7 @@ async fn download_to_file(client: &Client, url: &str, dest: &Path, max_bytes: u6
     if !resp.status().is_success() {
         bail!("failed to download {url} (HTTP {})", resp.status().as_u16());
     }
-    if resp.url().scheme() != "https" {
-        bail!("refusing non-HTTPS redirect destination: {}", resp.url());
-    }
+    validate_github_download_url(resp.url().as_str(), "release archive redirect")?;
     if let Some(len) = resp.content_length().filter(|&len| len > max_bytes) {
         bail!(
             "refusing oversized download from {url} ({len} bytes exceeds {max_bytes}-byte limit)"
@@ -626,33 +1005,64 @@ async fn download_to_file(client: &Client, url: &str, dest: &Path, max_bytes: u6
 }
 
 #[cfg(target_os = "windows")]
-fn resolve_tar_command() -> PathBuf {
-    let sys_root = std::env::var_os("SystemRoot")
-        .or_else(|| std::env::var_os("WINDIR"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-    let system32_tar = sys_root.join("System32").join("tar.exe");
-    if system32_tar.is_file() {
-        system32_tar
-    } else {
-        PathBuf::from("tar")
+fn windows_system_directory() -> Result<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetSystemDirectoryW(lp_buffer: *mut u16, u_size: u32) -> u32;
     }
+
+    let mut buf = vec![0u16; 260];
+    loop {
+        // SAFETY: `buf` is a writable UTF-16 buffer of length `buf.len()`.
+        let len = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
+        if len == 0 {
+            bail!("GetSystemDirectoryW failed while locating Windows System32 directory");
+        }
+        if (len as usize) < buf.len() {
+            let dir = OsString::from_wide(&buf[..len as usize]);
+            if dir.is_empty() {
+                bail!("GetSystemDirectoryW returned an empty System32 directory path");
+            }
+            return Ok(PathBuf::from(dir));
+        }
+        buf.resize(len as usize + 1, 0);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_tar_command() -> Result<PathBuf> {
+    let sys_dir = windows_system_directory()?;
+    let system32_tar = sys_dir.join("tar.exe");
+    if !system32_tar.is_file() {
+        bail!(
+            "Windows system tar.exe not found at {}; refusing to search PATH",
+            system32_tar.display()
+        );
+    }
+    Ok(system32_tar)
 }
 
 #[cfg(target_os = "macos")]
-fn resolve_tar_command() -> PathBuf {
-    PathBuf::from("/usr/bin/tar")
+fn resolve_tar_command() -> Result<PathBuf> {
+    let path = Path::new("/usr/bin/tar");
+    if !path.is_file() {
+        bail!("system tar not found at /usr/bin/tar; refusing to search PATH");
+    }
+    Ok(path.to_path_buf())
 }
 
 #[cfg(target_os = "linux")]
-fn resolve_tar_command() -> PathBuf {
+fn resolve_tar_command() -> Result<PathBuf> {
     for candidate in ["/usr/bin/tar", "/bin/tar"] {
         let path = Path::new(candidate);
         if path.is_file() {
-            return path.to_path_buf();
+            return Ok(path.to_path_buf());
         }
     }
-    PathBuf::from("tar")
+    bail!("system tar not found at /usr/bin/tar or /bin/tar; refusing to search PATH")
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
@@ -778,10 +1188,11 @@ fn select_archive_binary_member(listing: &str, bin_name: &str) -> Result<String>
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn verify_extracted_windows_companions(
+fn verify_extracted_windows_companions_against(
     extract_dir: &Path,
     companion_members: &[String],
     sums_text: Option<&str>,
+    pinned_wintun_sha: Option<&str>,
 ) -> Result<()> {
     if companion_members.is_empty() {
         return Ok(());
@@ -820,19 +1231,56 @@ fn verify_extracted_windows_companions(
                 let _ = fs::remove_file(&verified_path);
                 bail!("extracted wintun.dll is empty: {}", verified_path.display());
             }
-            if let Some(expected_sha) = expected_wintun_sha.as_deref() {
-                let actual_sha = sha256_file(&verified_path)?;
-                if !actual_sha.eq_ignore_ascii_case(expected_sha) {
+            let Some(expected_sums_sha) = expected_wintun_sha.as_deref() else {
+                let _ = fs::remove_file(&verified_path);
+                bail!(
+                    "refusing extracted wintun.dll: SHA256SUMS.txt does not contain a SHA-256 entry for wintun.dll"
+                );
+            };
+            let expected_pinned_sha = match pinned_wintun_sha {
+                Some(sha) => sha,
+                None => match crate::platform::windows_tun::expected_wintun_dll_sha256() {
+                    Ok(sha) => sha,
+                    Err(err) => {
+                        let _ = fs::remove_file(&verified_path);
+                        return Err(err).context(
+                            "refusing extracted wintun.dll: unable to resolve pinned WINTUN_DLL_SHA256",
+                        );
+                    }
+                },
+            };
+            let actual_sha = match sha256_file(&verified_path) {
+                Ok(sha) => sha,
+                Err(err) => {
                     let _ = fs::remove_file(&verified_path);
-                    bail!(
-                        "extracted wintun.dll SHA-256 mismatch: expected {expected_sha}, got {actual_sha}"
-                    );
+                    return Err(err);
                 }
+            };
+            if !actual_sha.eq_ignore_ascii_case(expected_sums_sha) {
+                let _ = fs::remove_file(&verified_path);
+                bail!(
+                    "extracted wintun.dll SHA-256 mismatch against SHA256SUMS.txt: expected {expected_sums_sha}, got {actual_sha}"
+                );
+            }
+            if !actual_sha.eq_ignore_ascii_case(expected_pinned_sha) {
+                let _ = fs::remove_file(&verified_path);
+                bail!(
+                    "extracted wintun.dll SHA-256 mismatch against pinned WINTUN_DLL_SHA256: expected {expected_pinned_sha}, got {actual_sha}"
+                );
             }
         }
     }
 
     Ok(())
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn verify_extracted_windows_companions(
+    extract_dir: &Path,
+    companion_members: &[String],
+    sums_text: Option<&str>,
+) -> Result<()> {
+    verify_extracted_windows_companions_against(extract_dir, companion_members, sums_text, None)
 }
 
 fn extract_archive(
@@ -843,7 +1291,7 @@ fn extract_archive(
 ) -> Result<()> {
     #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     {
-        let tar_cmd = resolve_tar_command();
+        let tar_cmd = resolve_tar_command()?;
         let list_flag = if cfg!(target_os = "windows") {
             "-tf"
         } else {
@@ -1083,31 +1531,48 @@ fn ensure_unix_executable_tree_permissions(
 ) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    let mode = fs::Permissions::from_mode(0o755);
-    let canonical_root =
-        fs::canonicalize(staging_root).unwrap_or_else(|_| staging_root.to_path_buf());
-    let mut dirs_to_chmod = Vec::new();
-    let mut cursor = extracted_bin.parent();
-    while let Some(dir) = cursor {
-        dirs_to_chmod.push(dir.to_path_buf());
-        if dir == staging_root || dir == canonical_root {
-            break;
-        }
-        cursor = dir.parent();
-    }
-    if !dirs_to_chmod
-        .iter()
-        .any(|d| d == staging_root || d == &canonical_root)
-    {
-        dirs_to_chmod.push(staging_root.to_path_buf());
+    let canonical_root = fs::canonicalize(staging_root).with_context(|| {
+        format!(
+            "failed to canonicalize staging root {}",
+            staging_root.display()
+        )
+    })?;
+    let canonical_bin = fs::canonicalize(extracted_bin).with_context(|| {
+        format!(
+            "failed to canonicalize extracted binary {}",
+            extracted_bin.display()
+        )
+    })?;
+    if !canonical_bin.starts_with(&canonical_root) {
+        bail!(
+            "extracted binary {} escapes staging directory {}",
+            canonical_bin.display(),
+            canonical_root.display()
+        );
     }
 
-    for dir in dirs_to_chmod.into_iter().rev() {
-        fs::set_permissions(&dir, mode.clone())
-            .with_context(|| format!("failed to chmod 0755 {}", dir.display()))?;
+    // Keep StagingDir strictly owner-only (0o700); root reads/traverses 0o700 directly
+    // under sudo without exposing the staging tree in /tmp to other local users.
+    fs::set_permissions(&canonical_root, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to enforce 0700 on {}", canonical_root.display()))?;
+
+    let mut subdirs_to_chmod = Vec::new();
+    let mut cursor = canonical_bin.parent();
+    while let Some(dir) = cursor {
+        if dir == canonical_root || dir == staging_root {
+            break;
+        }
+        subdirs_to_chmod.push(dir.to_path_buf());
+        cursor = dir.parent();
     }
-    fs::set_permissions(extracted_bin, mode)
-        .with_context(|| format!("failed to chmod 0755 {}", extracted_bin.display()))?;
+
+    let subdir_mode = fs::Permissions::from_mode(0o700);
+    for dir in subdirs_to_chmod.into_iter().rev() {
+        fs::set_permissions(&dir, subdir_mode.clone())
+            .with_context(|| format!("failed to chmod 0700 {}", dir.display()))?;
+    }
+    fs::set_permissions(&canonical_bin, fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("failed to chmod 0755 {}", canonical_bin.display()))?;
     Ok(())
 }
 
@@ -1138,6 +1603,23 @@ fn unix_service_upgrade_needs_sudo(installed_service_path: Option<&Path>) -> boo
         == Some(crate::config::EngineMode::Tun)
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+const TRUSTED_UNIX_SUDO_PATHS: &[&str] = &["/usr/bin/sudo", "/bin/sudo"];
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn resolve_unix_sudo_command() -> Result<PathBuf> {
+    TRUSTED_UNIX_SUDO_PATHS
+        .iter()
+        .map(Path::new)
+        .find(|p| p.is_file())
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            anyhow!(
+                "trusted sudo binary not found at /usr/bin/sudo or /bin/sudo; refusing to search PATH"
+            )
+        })
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn run_unix_sudo_os_args(bin: &Path, args: &[&OsStr], action_description: &str) -> Result<()> {
     use std::io::IsTerminal;
@@ -1146,12 +1628,9 @@ fn run_unix_sudo_os_args(bin: &Path, args: &[&OsStr], action_description: &str) 
         bail!("Root required to {action_description} - run: sudo vdpi update");
     }
 
-    let sudo_bin = ["/usr/bin/sudo", "/bin/sudo", "/usr/local/bin/sudo"]
-        .into_iter()
-        .find(|p| Path::new(p).is_file())
-        .unwrap_or("sudo");
+    let sudo_bin = resolve_unix_sudo_command()?;
 
-    let status = Command::new(sudo_bin)
+    let status = Command::new(&sudo_bin)
         .args(["-p", "  Password: ", "--"])
         .arg(bin)
         .args(args)
@@ -1190,8 +1669,15 @@ fn error_is_permission_denied(err: &anyhow::Error) -> bool {
 #[cfg(target_os = "windows")]
 fn run_windows_elevated_binary(bin: &Path, args: &[&str]) -> Result<()> {
     use std::ffi::c_void;
+    use std::io::IsTerminal;
     use std::os::windows::ffi::OsStrExt;
     use std::ptr;
+
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        bail!(
+            "Administrator privileges are required to update the vdpi Windows service in non-interactive mode. Re-run 'vdpi update' from an elevated Administrator terminal."
+        );
+    }
 
     type Bool = i32;
     type Dword = u32;
@@ -1588,6 +2074,7 @@ fn replace_portable_binary_in_dir(
     extracted_bin: &Path,
     current_exe: &Path,
     exe_dir: &Path,
+    expected_wintun_sha256: Option<&str>,
 ) -> Result<()> {
     let staged_wintun_src = extracted_bin
         .parent()
@@ -1598,13 +2085,31 @@ fn replace_portable_binary_in_dir(
     let staged_new_exe = stage_windows_file_unique(extracted_bin, exe_dir, "vdpi.new", ".exe")?;
     let staged_new_wintun = match staged_wintun_src.as_deref() {
         Some(src_wintun) => {
-            match stage_windows_file_unique(src_wintun, exe_dir, "wintun.new", ".dll") {
-                Ok(path) => Some(path),
-                Err(err) => {
-                    let _ = fs::remove_file(&staged_new_exe);
-                    return Err(err);
-                }
+            let Some(expected_sha) = expected_wintun_sha256 else {
+                let _ = fs::remove_file(&staged_new_exe);
+                bail!("refusing to stage wintun.dll without a pinned expected SHA-256 digest");
+            };
+            let staged_path =
+                match stage_windows_file_unique(src_wintun, exe_dir, "wintun.new", ".dll") {
+                    Ok(path) => path,
+                    Err(err) => {
+                        let _ = fs::remove_file(&staged_new_exe);
+                        return Err(err);
+                    }
+                };
+            if let Err(err) =
+                crate::platform::windows_tun::verify_wintun_dll_sha256(&staged_path, expected_sha)
+            {
+                let _ = fs::remove_file(&staged_path);
+                let _ = fs::remove_file(&staged_new_exe);
+                return Err(err).with_context(|| {
+                    format!(
+                        "staged wintun.dll failed pinned SHA-256 re-verification: {}",
+                        staged_path.display()
+                    )
+                });
             }
+            Some(staged_path)
         }
         None => None,
     };
@@ -1764,6 +2269,25 @@ fn stage_unix_executable_unique(src: &Path, dir: &Path) -> Result<PathBuf> {
     Ok(tmp_path)
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn portable_sudo_install_args<'a>(
+    extracted_bin: &'a Path,
+    current_exe: &'a Path,
+    bsd_safe_copy: bool,
+) -> Vec<&'a OsStr> {
+    let mut args = Vec::with_capacity(if bsd_safe_copy { 6 } else { 5 });
+    if bsd_safe_copy {
+        // macOS BSD `/usr/bin/install -S` performs an atomic safe copy (temp file + rename).
+        args.push(OsStr::new("-S"));
+    }
+    args.push(OsStr::new("-m"));
+    args.push(OsStr::new("0755"));
+    args.push(OsStr::new("--"));
+    args.push(extracted_bin.as_os_str());
+    args.push(current_exe.as_os_str());
+    args
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn replace_portable_binary_with_sudo(
     extracted_bin: &Path,
@@ -1777,18 +2301,36 @@ fn replace_portable_binary_with_sudo(
     let install_bin = ["/usr/bin/install", "/bin/install"]
         .into_iter()
         .find(|p| Path::new(p).is_file())
-        .unwrap_or("install");
+        .ok_or_else(|| {
+            anyhow!(
+                "trusted install binary not found at /usr/bin/install or /bin/install; refusing to search PATH"
+            )
+        })?;
 
-    let args = [
-        OsStr::new("-m"),
-        OsStr::new("0755"),
-        OsStr::new("--"),
-        extracted_bin.as_os_str(),
-        current_exe.as_os_str(),
-    ];
+    let args = portable_sudo_install_args(extracted_bin, current_exe, cfg!(target_os = "macos"));
     let action = format!("update {}", current_exe.display());
     run_unix_sudo_os_args(Path::new(install_bin), &args, &action)?;
     Ok(current_exe.to_path_buf())
+}
+
+#[cfg(target_os = "windows")]
+fn verify_portable_wintun_if_present(extracted_bin: &Path) -> Result<Option<&'static str>> {
+    let Some(staged_wintun) = extracted_bin
+        .parent()
+        .map(|dir| dir.join("wintun.dll"))
+        .filter(|path| fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file()))
+    else {
+        return Ok(None);
+    };
+    let expected_sha256 = crate::platform::windows_tun::expected_wintun_dll_sha256()?;
+    crate::platform::windows_tun::verify_wintun_dll_sha256(&staged_wintun, expected_sha256)
+        .with_context(|| {
+            format!(
+                "refusing to install unverified wintun.dll during portable update: {}",
+                staged_wintun.display()
+            )
+        })?;
+    Ok(Some(expected_sha256))
 }
 
 fn replace_portable_binary(extracted_bin: &Path, staging_root: &Path) -> Result<PathBuf> {
@@ -1824,7 +2366,13 @@ fn replace_portable_binary(extracted_bin: &Path, staging_root: &Path) -> Result<
     #[cfg(target_os = "windows")]
     {
         let _ = staging_root;
-        replace_portable_binary_in_dir(extracted_bin, &current_exe, exe_dir)?;
+        let expected_wintun_sha = verify_portable_wintun_if_present(extracted_bin)?;
+        replace_portable_binary_in_dir(
+            extracted_bin,
+            &current_exe,
+            exe_dir,
+            expected_wintun_sha,
+        )?;
         Ok(current_exe)
     }
 
@@ -1836,7 +2384,7 @@ fn replace_portable_binary(extracted_bin: &Path, staging_root: &Path) -> Result<
         match stage_unix_executable_unique(extracted_bin, exe_dir) {
             Ok(tmp_path) => {
                 #[cfg(target_os = "macos")]
-                if let Err(err) = ad_hoc_codesign_macos(&tmp_path) {
+                if let Err(err) = ensure_macos_codesigned(&tmp_path) {
                     let _ = fs::remove_file(&tmp_path);
                     return Err(err);
                 }
@@ -1889,14 +2437,14 @@ fn replace_portable_binary(extracted_bin: &Path, staging_root: &Path) -> Result<
     }
 }
 
-fn build_updater_client() -> Result<Client> {
+fn build_updater_client(target: RedirectTargetPolicy) -> Result<Client> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let user_agent = format!("vdpi/{}", env!("CARGO_PKG_VERSION"));
     Client::builder()
         .user_agent(&user_agent)
         .https_only(true)
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .redirect(build_redirect_policy(target))
         .timeout(API_TIMEOUT)
         .build()
         .context("failed to build HTTP client for updater")
@@ -1918,7 +2466,7 @@ fn extract_release_notes(body: Option<&str>) -> Vec<String> {
 /// Queries GitHub Releases for the latest `vdpi` release and compares it against
 /// the installed (or currently running) version without printing to stdout.
 pub async fn check_latest_release() -> Result<ReleaseCheckResult> {
-    let client = build_updater_client()?;
+    let client = build_updater_client(RedirectTargetPolicy::GitHubApi)?;
 
     debug!(
         url = GITHUB_LATEST_RELEASE_URL,
@@ -1937,12 +2485,7 @@ pub async fn check_latest_release() -> Result<ReleaseCheckResult> {
             resp.status().as_u16()
         );
     }
-    if resp.url().scheme() != "https" {
-        bail!(
-            "refusing non-HTTPS redirect for GitHub Releases API: {}",
-            resp.url()
-        );
-    }
+    validate_github_api_parsed_url(resp.url(), "GitHub Releases API redirect")?;
 
     let body_text =
         read_response_text_bounded(resp, MAX_API_BODY_BYTES, "GitHub Releases API").await?;
@@ -2037,14 +2580,10 @@ where
         )
     })?;
 
-    if !asset_url.starts_with("https://") {
-        bail!("refusing non-HTTPS download URL for {asset_name}: {asset_url}");
-    }
-    if !sums_url.starts_with("https://") {
-        bail!("refusing non-HTTPS download URL for SHA256SUMS.txt: {sums_url}");
-    }
+    validate_github_download_url(asset_url, asset_name)?;
+    validate_github_download_url(sums_url, "SHA256SUMS.txt")?;
 
-    let client = build_updater_client()?;
+    let client = build_updater_client(RedirectTargetPolicy::GitHubDownload)?;
     let staging = StagingDir::new()?;
     debug!(dir = %staging.path().display(), "created update staging directory");
 
@@ -2060,12 +2599,7 @@ where
             sums_resp.status().as_u16()
         );
     }
-    if sums_resp.url().scheme() != "https" {
-        bail!(
-            "refusing non-HTTPS redirect for SHA256SUMS.txt: {}",
-            sums_resp.url()
-        );
-    }
+    validate_github_download_url(sums_resp.url().as_str(), "SHA256SUMS.txt redirect")?;
     let sums_text =
         read_response_text_bounded(sums_resp, MAX_SUMS_BODY_BYTES, "SHA256SUMS.txt").await?;
 
@@ -2146,12 +2680,24 @@ pub async fn run_update(check_only: bool, force: bool, _cfg: &RuntimeConfig) -> 
         );
     }
 
+    let managed_pm = detect_current_exe_package_manager();
+
     if check_only {
         println!(
-            "Update available: v{} -> {}. Run 'vdpi update' to install.",
-            check.current_version, check.latest_version
+            "{}",
+            format_check_update_available_message(
+                &check.current_version,
+                &check.latest_version,
+                managed_pm.as_ref().map(|(pm, p)| (*pm, p.as_path())),
+            )
         );
         return Ok(());
+    }
+
+    if !force {
+        if let Some((pm, exe_path)) = managed_pm {
+            return Err(package_manager_self_update_refusal_error(pm, &exe_path));
+        }
     }
 
     let summary = apply_release_update(&check, force, |step| {
@@ -2561,47 +3107,108 @@ vdpi-windows-x86_64/WINTUN-LICENSE.txt
     }
 
     #[test]
-    fn windows_companion_verification_future_proofs_wintun_bumps_and_honors_sums() {
+    fn windows_companion_verification_fails_closed_and_enforces_pinned_wintun_sha() {
         let staging = StagingDir::new().expect("staging dir");
         let extract_dir = staging.path().join("extract");
         fs::create_dir(&extract_dir).expect("create extract dir");
 
         let wintun_path = extract_dir.join("wintun.dll");
-        let future_bytes = b"future-wintun-0.15.0-payload";
-        fs::write(&wintun_path, future_bytes).expect("write future wintun");
-
+        let payload = b"unpinned-wintun-payload";
+        let payload_sha = sha256_hex(payload);
         let members = vec!["wintun.dll".to_string()];
 
-        // When SHA256SUMS.txt has no standalone wintun.dll entry, any non-empty regular file passes.
+        // 1. Missing SHA256SUMS.txt altogether must fail closed and delete extracted wintun.dll.
+        fs::write(&wintun_path, payload).expect("write wintun");
+        let err = verify_extracted_windows_companions(&extract_dir, &members, None)
+            .expect_err("wintun.dll without SHA256SUMS.txt must fail closed");
+        assert!(
+            err.to_string().contains("no entry for wintun.dll")
+                || err
+                    .to_string()
+                    .contains("does not contain a SHA-256 entry for wintun.dll"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !wintun_path.exists(),
+            "wintun.dll must be removed when SHA256SUMS.txt is absent"
+        );
+
+        // 2. SHA256SUMS.txt present without a wintun.dll entry must fail closed and delete file.
+        fs::write(&wintun_path, payload).expect("write wintun");
         let archive_only_sums = format!(
             "{}  vdpi-windows-x86_64.zip\n",
             sha256_hex(b"archive-bytes")
         );
-        verify_extracted_windows_companions(&extract_dir, &members, Some(&archive_only_sums))
-            .expect("future wintun.dll must not fail when not explicitly pinned in SHA256SUMS.txt");
-
-        // When SHA256SUMS.txt explicitly includes wintun.dll, matching digest passes.
-        let matching_sums = format!("{} *wintun.dll\n", sha256_hex(future_bytes));
-        verify_extracted_windows_companions(&extract_dir, &members, Some(&matching_sums))
-            .expect("explicit matching wintun.dll hash in SHA256SUMS.txt must pass");
-
-        // Mismatched explicit wintun.dll hash must fail and remove the extracted file.
-        let bad_sums = format!("{} *wintun.dll\n", sha256_hex(b"different-wintun"));
+        let err =
+            verify_extracted_windows_companions(&extract_dir, &members, Some(&archive_only_sums))
+                .expect_err("wintun.dll missing from SHA256SUMS.txt must fail closed");
         assert!(
-            verify_extracted_windows_companions(&extract_dir, &members, Some(&bad_sums)).is_err()
+            err.to_string().contains("wintun.dll"),
+            "unexpected error: {err}"
         );
+        assert!(
+            !wintun_path.exists(),
+            "wintun.dll must be removed when missing from SHA256SUMS.txt"
+        );
+
+        // 3. Even when SHA256SUMS.txt matches extracted bytes, mismatch against pinned
+        //    WINTUN_DLL_SHA256 must fail closed and delete extracted wintun.dll.
+        fs::write(&wintun_path, payload).expect("write wintun");
+        let forged_sums = format!("{payload_sha} *wintun.dll\n");
+        let err = verify_extracted_windows_companions(&extract_dir, &members, Some(&forged_sums))
+            .expect_err("wintun.dll not matching pinned WINTUN_DLL_SHA256 must fail closed");
+        assert!(
+            err.to_string().contains("pinned WINTUN_DLL_SHA256"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !wintun_path.exists(),
+            "unpinned wintun.dll must be removed on verification failure"
+        );
+
+        // 4. Mismatched SHA256SUMS.txt entry must fail and delete extracted wintun.dll.
+        fs::write(&wintun_path, payload).expect("write wintun");
+        let bad_sums = format!("{} *wintun.dll\n", sha256_hex(b"different-wintun"));
+        assert!(verify_extracted_windows_companions_against(
+            &extract_dir,
+            &members,
+            Some(&bad_sums),
+            Some(&payload_sha)
+        )
+        .is_err());
         assert!(
             !wintun_path.exists(),
             "mismatched wintun.dll must be removed on verification failure"
         );
 
-        // Empty (0-byte) wintun.dll must fail and be removed even without a SHA256SUMS entry.
+        // 5. Empty (0-byte) wintun.dll must fail and be removed.
         fs::write(&wintun_path, b"").expect("write empty wintun");
         assert!(verify_extracted_windows_companions(&extract_dir, &members, None).is_err());
         assert!(
             !wintun_path.exists(),
             "empty wintun.dll must be removed on verification failure"
         );
+
+        // 6. Matching BOTH SHA256SUMS.txt and pinned WINTUN_DLL_SHA256 succeeds.
+        fs::write(&wintun_path, payload).expect("write valid wintun");
+        verify_extracted_windows_companions_against(
+            &extract_dir,
+            &members,
+            Some(&forged_sums),
+            Some(&payload_sha),
+        )
+        .expect("wintun.dll matching both SHA256SUMS.txt and pinned hash must pass");
+        assert!(wintun_path.exists());
+
+        // 7. Non-wintun companion (e.g. WINTUN-LICENSE.txt only) succeeds without wintun entry.
+        let license_path = extract_dir.join("WINTUN-LICENSE.txt");
+        fs::write(&license_path, b"GPL-2.0").expect("write license");
+        verify_extracted_windows_companions(
+            &extract_dir,
+            &["WINTUN-LICENSE.txt".to_string()],
+            Some(&archive_only_sums),
+        )
+        .expect("license-only companion should pass without wintun.dll entry");
     }
 
     #[cfg(target_os = "windows")]
@@ -2650,7 +3257,21 @@ vdpi-windows-x86_64/WINTUN-LICENSE.txt
         fs::write(&live_exe, b"vdpi-v1").expect("write old exe");
         fs::write(&live_wintun, b"wintun-v1").expect("write old wintun");
 
-        replace_portable_binary_in_dir(&src_exe, &live_exe, &exe_dir)
+        // Fail closed if expected wintun SHA-256 is absent or mismatched.
+        assert!(replace_portable_binary_in_dir(&src_exe, &live_exe, &exe_dir, None).is_err());
+        let wrong_sha = sha256_hex(b"wrong-wintun");
+        assert!(
+            replace_portable_binary_in_dir(&src_exe, &live_exe, &exe_dir, Some(&wrong_sha))
+                .is_err()
+        );
+        assert_eq!(fs::read(&live_exe).expect("live exe untouched"), b"vdpi-v1");
+        assert_eq!(
+            fs::read(&live_wintun).expect("live wintun untouched"),
+            b"wintun-v1"
+        );
+
+        let v2_sha = sha256_hex(b"wintun-v2");
+        replace_portable_binary_in_dir(&src_exe, &live_exe, &exe_dir, Some(&v2_sha))
             .expect("multi-member portable swap must succeed");
         assert_eq!(fs::read(&live_exe).expect("read new live exe"), b"vdpi-v2");
         assert_eq!(
@@ -2664,8 +3285,12 @@ vdpi-windows-x86_64/WINTUN-LICENSE.txt
 
         // Rollback check: when vdpi.exe move fails (missing current_exe), wintun.dll is rolled back.
         fs::write(&src_wintun, b"wintun-v3").expect("write v3 wintun");
+        let v3_sha = sha256_hex(b"wintun-v3");
         let missing_exe = exe_dir.join("missing-vdpi.exe");
-        assert!(replace_portable_binary_in_dir(&src_exe, &missing_exe, &exe_dir).is_err());
+        assert!(
+            replace_portable_binary_in_dir(&src_exe, &missing_exe, &exe_dir, Some(&v3_sha))
+                .is_err()
+        );
         assert_eq!(
             fs::read(&live_wintun).expect("wintun must be restored after exe rename failure"),
             b"wintun-v2"
@@ -2700,7 +3325,62 @@ vdpi-windows-x86_64/WINTUN-LICENSE.txt
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(staging_mode, 0o755);
+        assert_eq!(staging_mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_executable_tree_permissions_keeps_staging_dir_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let staging = StagingDir::new().expect("staging dir");
+        let nested = staging.path().join("extract").join("pkg");
+        fs::create_dir_all(&nested).expect("create nested extract dir");
+        let bin = nested.join("vdpi");
+        fs::write(&bin, b"unix-bin").expect("write dummy bin");
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o600)).expect("chmod 0600 bin");
+
+        ensure_unix_executable_tree_permissions(staging.path(), &bin)
+            .expect("set executable tree permissions");
+
+        let root_mode = fs::metadata(staging.path())
+            .expect("stat staging root")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            root_mode, 0o700,
+            "StagingDir must remain 0o700 (never widened to 0o755)"
+        );
+        let nested_mode = fs::metadata(&nested)
+            .expect("stat nested dir")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(nested_mode, 0o700);
+        let bin_mode = fs::metadata(&bin)
+            .expect("stat extracted bin")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(bin_mode, 0o755);
+    }
+
+    #[test]
+    fn trusted_unix_sudo_paths_exclude_user_writable_locations() {
+        assert_eq!(TRUSTED_UNIX_SUDO_PATHS, &["/usr/bin/sudo", "/bin/sudo"]);
+        assert!(!TRUSTED_UNIX_SUDO_PATHS.contains(&"/usr/local/bin/sudo"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_resolve_tar_uses_system_directory() {
+        let sys_dir = windows_system_directory().expect("GetSystemDirectoryW");
+        assert!(sys_dir.is_absolute(), "System32 path must be absolute");
+        if sys_dir.join("tar.exe").is_file() {
+            let resolved = resolve_tar_command().expect("resolve System32 tar.exe");
+            assert_eq!(resolved, sys_dir.join("tar.exe"));
+        }
     }
 
     #[test]
@@ -2774,12 +3454,512 @@ Plain paragraph ignored
             .expect_err("unknown relation without force must fail");
         assert!(err.to_string().contains("--force"));
 
-        let mut insecure_check = base_check;
+        let mut insecure_check = base_check.clone();
         insecure_check.relation = VersionRelation::Newer;
-        insecure_check.asset_url = Some("http://example.com/vdpi.zip".to_string());
+        insecure_check.asset_url = Some("http://github.com/Vuln-Inc/vdpi/releases/download/v0.5.6/vdpi.zip".to_string());
         let err = apply_release_update(&insecure_check, false, |_| {})
             .await
             .expect_err("non-HTTPS asset URL must fail");
         assert!(err.to_string().contains("non-HTTPS"));
+
+        let mut untrusted_check = base_check;
+        untrusted_check.relation = VersionRelation::Newer;
+        untrusted_check.asset_url = Some("https://example.com/vdpi.zip".to_string());
+        let err = apply_release_update(&untrusted_check, false, |_| {})
+            .await
+            .expect_err("untrusted host URL must fail");
+        assert!(err.to_string().contains("untrusted download host"));
+    }
+
+    #[test]
+    fn validates_github_release_download_hosts_strictly() {
+        for ok_url in [
+            "https://github.com/Vuln-Inc/vdpi/releases/download/v0.5.6/vdpi.zip",
+            "https://objects.githubusercontent.com/github-production-release-asset/123",
+            "https://release-assets.githubusercontent.com/github-production-release-asset/123",
+            "https://codeload.github.com/Vuln-Inc/vdpi/zip/refs/tags/v0.5.6",
+        ] {
+            validate_github_download_url(ok_url, "asset")
+                .unwrap_or_else(|e| panic!("expected allowed GitHub URL {ok_url}: {e:#}"));
+        }
+        for bad_url in [
+            "http://github.com/Vuln-Inc/vdpi/releases/download/v0.5.6/vdpi.zip",
+            "https://example.com/vdpi.zip",
+            "https://evil-github.com/vdpi.zip",
+            "https://github.com.evil.test/vdpi.zip",
+            "https://github.com/OtherOrg/vdpi/releases/download/v0.5.6/vdpi.zip",
+            "https://github.com/Vuln-Inc/other-repo/releases/download/v0.5.6/vdpi.zip",
+            "https://github.com/Vuln-Inc/vdpi/raw/main/vdpi.zip",
+            "https://github.com/Vuln-Inc/vdpi/releases/download/",
+            "https://github.com/Vuln-Inc/vdpi/releases/download/../tag/v0.5.6",
+            "https://github.com/Vuln-Inc/vdpi/releases/download/%2e%2e/evil.zip",
+            "https://github.com:8443/Vuln-Inc/vdpi/releases/download/v0.5.6/vdpi.zip",
+            "https://user@github.com/Vuln-Inc/vdpi/releases/download/v0.5.6/vdpi.zip",
+        ] {
+            assert!(
+                validate_github_download_url(bad_url, "asset").is_err(),
+                "expected rejected URL: {bad_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_redirect_policy_validates_every_hop_for_api_and_downloads() {
+        // GitHubDownload redirect hops: valid hosts & restricted github.com path allowed up to MAX_REDIRECT_HOPS.
+        for (hop, url_str) in [
+            (
+                1,
+                "https://github.com/Vuln-Inc/vdpi/releases/download/v0.5.6/vdpi-windows-x86_64.zip",
+            ),
+            (
+                2,
+                "https://objects.githubusercontent.com/github-production-release-asset-2e65be/123",
+            ),
+            (
+                3,
+                "https://release-assets.githubusercontent.com/github-production-release-asset/456",
+            ),
+            (
+                MAX_REDIRECT_HOPS,
+                "https://codeload.github.com/Vuln-Inc/vdpi/zip/refs/tags/v0.5.6",
+            ),
+        ] {
+            let parsed = reqwest::Url::parse(url_str).expect("parse valid download hop");
+            validate_redirect_hop(RedirectTargetPolicy::GitHubDownload, &parsed, hop)
+                .unwrap_or_else(|e| panic!("hop {hop} to {url_str} must be allowed: {e:#}"));
+        }
+
+        // GitHubDownload redirect hops: untrusted hosts, HTTP downgrades, wrong github.com paths, or >5 hops rejected.
+        for (hop, url_str) in [
+            (1, "https://attacker.example/vdpi.zip"),
+            (1, "http://objects.githubusercontent.com/asset/123"),
+            (
+                1,
+                "https://github.com/attacker/vdpi/releases/download/v1.0.0/vdpi.zip",
+            ),
+            (
+                1,
+                "https://github.com/Vuln-Inc/vdpi/archive/refs/heads/main.zip",
+            ),
+            (
+                1,
+                "https://github.com/Vuln-Inc/vdpi/releases/download/%2e%2e/evil.zip",
+            ),
+            (
+                MAX_REDIRECT_HOPS + 1,
+                "https://objects.githubusercontent.com/github-production-release-asset/999",
+            ),
+        ] {
+            let parsed = reqwest::Url::parse(url_str).expect("parse rejected download hop");
+            assert!(
+                validate_redirect_hop(RedirectTargetPolicy::GitHubDownload, &parsed, hop).is_err(),
+                "expected rejected download redirect hop {hop} -> {url_str}"
+            );
+        }
+
+        // GitHubApi redirect hops: strictly pinned to https://api.github.com on every hop.
+        for (hop, url_str) in [
+            (
+                1,
+                "https://api.github.com/repos/Vuln-Inc/vdpi/releases/latest",
+            ),
+            (
+                MAX_REDIRECT_HOPS,
+                "https://api.github.com/repositories/123456/releases/latest",
+            ),
+        ] {
+            let parsed = reqwest::Url::parse(url_str).expect("parse valid api hop");
+            validate_redirect_hop(RedirectTargetPolicy::GitHubApi, &parsed, hop)
+                .unwrap_or_else(|e| panic!("api hop {hop} to {url_str} must be allowed: {e:#}"));
+        }
+
+        for (hop, url_str) in [
+            (1, "http://api.github.com/repos/Vuln-Inc/vdpi/releases/latest"),
+            (
+                1,
+                "https://github.com/Vuln-Inc/vdpi/releases/download/v0.5.6/vdpi.zip",
+            ),
+            (1, "https://objects.githubusercontent.com/latest"),
+            (1, "https://api.github.com.evil.test/repos/Vuln-Inc/vdpi/releases/latest"),
+            (1, "https://api.github.com:8443/repos/Vuln-Inc/vdpi/releases/latest"),
+            (1, "https://token@api.github.com/repos/Vuln-Inc/vdpi/releases/latest"),
+            (
+                MAX_REDIRECT_HOPS + 1,
+                "https://api.github.com/repos/Vuln-Inc/vdpi/releases/latest",
+            ),
+        ] {
+            let parsed = reqwest::Url::parse(url_str).expect("parse rejected api hop");
+            assert!(
+                validate_redirect_hop(RedirectTargetPolicy::GitHubApi, &parsed, hop).is_err(),
+                "expected rejected API redirect hop {hop} -> {url_str}"
+            );
+        }
+
+        // Verify both custom-redirect HTTP clients construct cleanly without touching the network.
+        build_updater_client(RedirectTargetPolicy::GitHubApi)
+            .expect("API client with custom redirect policy must build");
+        build_updater_client(RedirectTargetPolicy::GitHubDownload)
+            .expect("download client with custom redirect policy must build");
+    }
+
+    #[test]
+    fn detects_scoop_winget_and_homebrew_install_paths_and_messages() {
+        // Default user & global Scoop paths.
+        assert_eq!(
+            detect_windows_package_manager_path_with_env(
+                Path::new(r"C:\Users\Alice\scoop\apps\vdpi\current\vdpi.exe"),
+                None,
+                None,
+            ),
+            Some(PackageManager::Scoop)
+        );
+        assert_eq!(
+            detect_windows_package_manager_path_with_env(
+                Path::new(r"C:\ProgramData\scoop\apps\vdpi\0.5.6\vdpi.exe"),
+                None,
+                None,
+            ),
+            Some(PackageManager::Scoop)
+        );
+
+        // Custom SCOOP and SCOOP_GLOBAL env var roots (with trailing slash & boundary checks).
+        assert_eq!(
+            detect_windows_package_manager_path_with_env(
+                Path::new(r"D:\Tools\MyScoop\apps\vdpi\current\vdpi.exe"),
+                Some(OsStr::new(r"D:\Tools\MyScoop")),
+                None,
+            ),
+            Some(PackageManager::Scoop)
+        );
+        assert_eq!(
+            detect_windows_package_manager_path_with_env(
+                Path::new(r"D:\Tools\MyScoop\shims\vdpi.exe"),
+                Some(OsStr::new(r"D:\Tools\MyScoop\")),
+                None,
+            ),
+            Some(PackageManager::Scoop)
+        );
+        assert_eq!(
+            detect_windows_package_manager_path_with_env(
+                Path::new(r"D:\Tools\MyScoop2\apps\vdpi\current\vdpi.exe"),
+                Some(OsStr::new(r"D:\Tools\MyScoop")),
+                None,
+            ),
+            None
+        );
+        assert_eq!(
+            detect_windows_package_manager_path_with_env(
+                Path::new(r"E:\GlobalApps\apps\vdpi\0.5.6\vdpi.exe"),
+                None,
+                Some(OsStr::new(r"E:/GlobalApps/")),
+            ),
+            Some(PackageManager::Scoop)
+        );
+
+        // User-scope AND machine-scope WinGet paths.
+        assert_eq!(
+            detect_windows_package_manager_path_with_env(
+                Path::new(
+                    r"C:\Users\Alice\AppData\Local\Microsoft\WinGet\Packages\Vuln-Inc.vdpi_Microsoft.Winget.Source_8wekyb3d8bbwe\vdpi.exe"
+                ),
+                None,
+                None,
+            ),
+            Some(PackageManager::WinGet)
+        );
+        assert_eq!(
+            detect_windows_package_manager_path_with_env(
+                Path::new(
+                    r"C:\Program Files\WinGet\Packages\Vuln-Inc.vdpi_Microsoft.Winget.Source_8wekyb3d8bbwe\vdpi.exe"
+                ),
+                None,
+                None,
+            ),
+            Some(PackageManager::WinGet)
+        );
+        assert_eq!(
+            detect_windows_package_manager_path_with_env(
+                Path::new(r"C:\Program Files\vdpi\bin\vdpi.exe"),
+                None,
+                None,
+            ),
+            None
+        );
+
+        // macOS Homebrew paths (Apple Silicon + Intel) vs manual installs.
+        assert_eq!(
+            detect_macos_package_manager_path(Path::new("/opt/homebrew/Cellar/vdpi/0.5.6/bin/vdpi")),
+            Some(PackageManager::Homebrew)
+        );
+        assert_eq!(
+            detect_macos_package_manager_path(Path::new("/usr/local/Cellar/vdpi/0.5.6/bin/vdpi")),
+            Some(PackageManager::Homebrew)
+        );
+        assert_eq!(
+            detect_macos_package_manager_path(Path::new("/usr/local/bin/vdpi")),
+            None
+        );
+        assert_eq!(
+            detect_macos_package_manager_path(Path::new("/Users/alice/.vdpi/bin/vdpi")),
+            None
+        );
+
+        // Names & exact upgrade commands.
+        assert_eq!(PackageManager::Scoop.name(), "Scoop");
+        assert_eq!(PackageManager::WinGet.name(), "WinGet");
+        assert_eq!(PackageManager::Homebrew.name(), "Homebrew");
+        assert_eq!(PackageManager::Scoop.upgrade_command(), "scoop update vdpi");
+        assert_eq!(
+            PackageManager::WinGet.upgrade_command(),
+            "winget upgrade Vuln-Inc.vdpi"
+        );
+        assert_eq!(
+            PackageManager::Homebrew.upgrade_command(),
+            "brew upgrade vdpi"
+        );
+
+        // `--check` output must show the package manager command instead of `vdpi update`.
+        let scoop_msg = format_check_update_available_message(
+            "0.5.6",
+            "v0.6.0",
+            Some((
+                PackageManager::Scoop,
+                Path::new(r"C:\Users\Alice\scoop\apps\vdpi\current\vdpi.exe"),
+            )),
+        );
+        assert!(scoop_msg.contains("scoop update vdpi"));
+        assert!(!scoop_msg.contains("Run 'vdpi update' to install."));
+
+        let winget_msg = format_check_update_available_message(
+            "0.5.6",
+            "v0.6.0",
+            Some((
+                PackageManager::WinGet,
+                Path::new(r"C:\Program Files\WinGet\Packages\Vuln-Inc.vdpi\vdpi.exe"),
+            )),
+        );
+        assert!(winget_msg.contains("winget upgrade Vuln-Inc.vdpi"));
+        assert!(!winget_msg.contains("Run 'vdpi update' to install."));
+
+        let brew_msg = format_check_update_available_message(
+            "0.5.6",
+            "v0.6.0",
+            Some((
+                PackageManager::Homebrew,
+                Path::new("/opt/homebrew/Cellar/vdpi/0.5.6/bin/vdpi"),
+            )),
+        );
+        assert!(brew_msg.contains("brew upgrade vdpi"));
+        assert!(!brew_msg.contains("Run 'vdpi update' to install."));
+
+        let unmanaged_msg = format_check_update_available_message("0.5.6", "v0.6.0", None);
+        assert!(unmanaged_msg.contains("Run 'vdpi update' to install."));
+
+        // Refusal error for non-`--check` self-update carries manager command and `--force` hint.
+        let refusal = package_manager_self_update_refusal_error(
+            PackageManager::Homebrew,
+            Path::new("/opt/homebrew/Cellar/vdpi/0.5.6/bin/vdpi"),
+        );
+        let refusal_str = refusal.to_string();
+        assert!(refusal_str.contains("Homebrew"));
+        assert!(refusal_str.contains("brew upgrade vdpi"));
+        assert!(refusal_str.contains("--force"));
+    }
+
+    #[test]
+    fn detects_linuxbrew_install_paths() {
+        assert_eq!(
+            detect_linux_package_manager_path(Path::new(
+                "/home/linuxbrew/.linuxbrew/Cellar/vdpi/0.5.6/bin/vdpi"
+            )),
+            Some(PackageManager::Homebrew)
+        );
+        assert_eq!(
+            detect_linux_package_manager_path(Path::new(
+                "/home/linuxbrew/.linuxbrew/opt/vdpi/bin/vdpi"
+            )),
+            Some(PackageManager::Homebrew)
+        );
+        assert_eq!(
+            detect_linux_package_manager_path(Path::new(
+                "/home/linuxbrew/.linuxbrew/Cellar/vdpi2/0.5.6/bin/vdpi"
+            )),
+            None
+        );
+        assert_eq!(
+            detect_linux_package_manager_path(Path::new(
+                "/home/linuxbrew/.linuxbrew/opt/vdpi2/bin/vdpi"
+            )),
+            None
+        );
+        assert_eq!(
+            detect_linux_package_manager_path(Path::new("/usr/local/bin/vdpi")),
+            None
+        );
+        assert_eq!(
+            detect_linux_package_manager_path(Path::new("/home/alice/.local/bin/vdpi")),
+            None
+        );
+    }
+
+    #[test]
+    fn detects_custom_homebrew_prefix_and_home_linuxbrew_and_macos_sudo_install_args() {
+        // macOS custom $HOMEBREW_PREFIX detection (case-insensitive, Cellar + opt, trailing slash).
+        let custom_mac_prefix = OsStr::new("/Users/Alice/Homebrew/");
+        assert_eq!(
+            detect_macos_package_manager_path_with_env(
+                Path::new("/Users/Alice/Homebrew/Cellar/vdpi/0.5.6/bin/vdpi"),
+                Some(custom_mac_prefix),
+            ),
+            Some(PackageManager::Homebrew)
+        );
+        assert_eq!(
+            detect_macos_package_manager_path_with_env(
+                Path::new("/users/alice/homebrew/opt/vdpi/bin/vdpi"),
+                Some(custom_mac_prefix),
+            ),
+            Some(PackageManager::Homebrew)
+        );
+        assert_eq!(
+            detect_macos_package_manager_path_with_env(
+                Path::new("/Users/Alice/Homebrew/Cellar/vdpi2/0.5.6/bin/vdpi"),
+                Some(custom_mac_prefix),
+            ),
+            None
+        );
+        assert_eq!(
+            detect_macos_package_manager_path_with_env(
+                Path::new("/Users/Alice/Homebrew/bin/vdpi"),
+                Some(custom_mac_prefix),
+            ),
+            None
+        );
+        assert_eq!(
+            detect_macos_package_manager_path_with_env(
+                Path::new("/Cellar/vdpi/0.5.6/bin/vdpi"),
+                Some(OsStr::new("/")),
+            ),
+            None
+        );
+        assert_eq!(
+            detect_macos_package_manager_path_with_env(
+                Path::new("homebrew/Cellar/vdpi/0.5.6/bin/vdpi"),
+                Some(OsStr::new("homebrew")),
+            ),
+            None
+        );
+
+        // Linux custom $HOMEBREW_PREFIX and $HOME/.linuxbrew detection.
+        let custom_linux_prefix = OsStr::new("/opt/custom-brew/");
+        let alice_home = OsStr::new("/home/alice/");
+        assert_eq!(
+            detect_linux_package_manager_path_with_env(
+                Path::new("/opt/custom-brew/Cellar/vdpi/0.5.6/bin/vdpi"),
+                Some(custom_linux_prefix),
+                None,
+            ),
+            Some(PackageManager::Homebrew)
+        );
+        assert_eq!(
+            detect_linux_package_manager_path_with_env(
+                Path::new("/opt/custom-brew/opt/vdpi/bin/vdpi"),
+                Some(custom_linux_prefix),
+                None,
+            ),
+            Some(PackageManager::Homebrew)
+        );
+        assert_eq!(
+            detect_linux_package_manager_path_with_env(
+                Path::new("/home/alice/.linuxbrew/Cellar/vdpi/0.5.6/bin/vdpi"),
+                None,
+                Some(alice_home),
+            ),
+            Some(PackageManager::Homebrew)
+        );
+        assert_eq!(
+            detect_linux_package_manager_path_with_env(
+                Path::new("/home/alice/.linuxbrew/opt/vdpi/bin/vdpi"),
+                None,
+                Some(alice_home),
+            ),
+            Some(PackageManager::Homebrew)
+        );
+        assert_eq!(
+            detect_linux_package_manager_path_with_env(
+                Path::new("/home/alice/.linuxbrew/Cellar/vdpi2/0.5.6/bin/vdpi"),
+                None,
+                Some(alice_home),
+            ),
+            None
+        );
+        assert_eq!(
+            detect_linux_package_manager_path_with_env(
+                Path::new("/home/alice/.linuxbrew/bin/vdpi"),
+                None,
+                Some(alice_home),
+            ),
+            None
+        );
+        assert_eq!(
+            detect_linux_package_manager_path_with_env(
+                Path::new("/.linuxbrew/Cellar/vdpi/0.5.6/bin/vdpi"),
+                None,
+                Some(OsStr::new("/")),
+            ),
+            None
+        );
+        assert_eq!(
+            detect_linux_package_manager_path_with_env(
+                Path::new("alice/.linuxbrew/Cellar/vdpi/0.5.6/bin/vdpi"),
+                None,
+                Some(OsStr::new("alice")),
+            ),
+            None
+        );
+
+        // macOS sudo install uses BSD `-S` safe-copy; Linux GNU install omits `-S`.
+        let src = Path::new("/tmp/vdpi-stage/vdpi");
+        let dst = Path::new("/usr/local/bin/vdpi");
+        assert_eq!(
+            portable_sudo_install_args(src, dst, true),
+            vec![
+                OsStr::new("-S"),
+                OsStr::new("-m"),
+                OsStr::new("0755"),
+                OsStr::new("--"),
+                OsStr::new("/tmp/vdpi-stage/vdpi"),
+                OsStr::new("/usr/local/bin/vdpi"),
+            ]
+        );
+        assert_eq!(
+            portable_sudo_install_args(src, dst, false),
+            vec![
+                OsStr::new("-m"),
+                OsStr::new("0755"),
+                OsStr::new("--"),
+                OsStr::new("/tmp/vdpi-stage/vdpi"),
+                OsStr::new("/usr/local/bin/vdpi"),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn portable_wintun_verification_rejects_tampered_dll() {
+        let staging = StagingDir::new().expect("staging dir");
+        let exe = staging.path().join("vdpi.exe");
+        fs::write(&exe, b"fake-exe").expect("write fake exe");
+        assert_eq!(
+            verify_portable_wintun_if_present(&exe)
+                .expect("missing wintun.dll next to portable exe should pass"),
+            None
+        );
+
+        let wintun = staging.path().join("wintun.dll");
+        fs::write(&wintun, b"tampered-wintun-bytes").expect("write tampered wintun");
+        assert!(
+            verify_portable_wintun_if_present(&exe).is_err(),
+            "tampered wintun.dll must be rejected against expected_wintun_dll_sha256"
+        );
     }
 }

@@ -3,9 +3,13 @@
 
 use std::collections::HashSet;
 use std::env;
+use std::ffi::{CStr, CString, OsStr};
 use std::fs;
+use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::ptr;
 
 use super::{AppCategory, DiscoveredApp};
 
@@ -19,6 +23,7 @@ const SYSTEM_DESKTOP_DIRS: &[&str] = &[
     "/usr/share/applications",
     "/usr/local/share/applications",
     "/var/lib/flatpak/exports/share/applications",
+    "/var/lib/snapd/desktop/applications",
 ];
 
 /// Suffix appended by the Linux kernel to `/proc/<pid>/exe` symlinks when the
@@ -68,11 +73,143 @@ pub(super) fn lookup_local_port_process(
 }
 
 fn is_ignored_app_name(exe_name: &str) -> bool {
-    let trimmed = exe_name.trim();
-    trimmed.is_empty() || trimmed.eq_ignore_ascii_case("vdpi")
+    let lower = exe_name.trim().to_ascii_lowercase();
+    lower.is_empty() || lower == "vdpi" || lower.starts_with("vdpi-desktop")
 }
 
-fn desktop_application_dirs() -> Vec<PathBuf> {
+fn is_sandbox_or_helper_daemon(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "bwrap"
+            | "xdg-dbus-proxy"
+            | "flatpak-session-helper"
+            | "flatpak-portal"
+            | "flatpak-dbus-proxy"
+    ) || lower.starts_with("zypak-")
+}
+
+fn is_valid_non_root_username(username: &str) -> bool {
+    !username.is_empty()
+        && username != "root"
+        && !username.contains(':')
+        && !username.contains('/')
+        && !username.contains('\0')
+}
+
+fn resolve_user_home_from_passwd(passwd: &str, username: &str) -> Option<PathBuf> {
+    if !is_valid_non_root_username(username) {
+        return None;
+    }
+
+    for line in passwd.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let mut fields = trimmed.split(':');
+        let Some(user) = fields.next() else {
+            continue;
+        };
+        if user != username {
+            continue;
+        }
+        // Fields: user:passwd:uid:gid:gecos:home:shell
+        let Some(home) = fields.nth(4) else {
+            continue;
+        };
+        let home_trimmed = home.trim();
+        if home_trimmed.starts_with('/') && !home_trimmed.is_empty() {
+            return Some(PathBuf::from(home_trimmed));
+        }
+    }
+    None
+}
+
+fn resolve_user_home_via_getpwnam(username: &str) -> Option<PathBuf> {
+    if !is_valid_non_root_username(username) {
+        return None;
+    }
+
+    let c_name = CString::new(username).ok()?;
+    let mut buf_size = match unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) } {
+        n if n > 0 => (n as usize).clamp(1024, 65_536),
+        _ => 4096,
+    };
+    const MAX_BUF_SIZE: usize = 1024 * 1024;
+    let mut eintr_retries = 0u8;
+
+    loop {
+        let mut pwd = MaybeUninit::<libc::passwd>::zeroed();
+        let mut result: *mut libc::passwd = ptr::null_mut();
+        let mut buf = vec![0u8; buf_size];
+
+        let ret = unsafe {
+            libc::getpwnam_r(
+                c_name.as_ptr(),
+                pwd.as_mut_ptr(),
+                buf.as_mut_ptr().cast::<libc::c_char>(),
+                buf.len(),
+                &mut result,
+            )
+        };
+
+        if ret == 0 {
+            if result.is_null() {
+                return None;
+            }
+            let pw = unsafe { &*result };
+            if pw.pw_dir.is_null() {
+                return None;
+            }
+            let dir_bytes = unsafe { CStr::from_ptr(pw.pw_dir as *const libc::c_char) }.to_bytes();
+            if dir_bytes.is_empty() || dir_bytes[0] != b'/' {
+                return None;
+            }
+            return Some(PathBuf::from(OsStr::from_bytes(dir_bytes)));
+        }
+
+        if ret == libc::EINTR && eintr_retries < 3 {
+            eintr_retries += 1;
+            continue;
+        }
+
+        if ret == libc::ERANGE && buf_size < MAX_BUF_SIZE {
+            buf_size = buf_size.saturating_mul(2).min(MAX_BUF_SIZE);
+            continue;
+        }
+
+        return None;
+    }
+}
+
+fn resolve_sudo_user_home() -> Option<PathBuf> {
+    let sudo_user = env::var("SUDO_USER").ok()?;
+    let username = sudo_user.trim();
+    if !is_valid_non_root_username(username) {
+        return None;
+    }
+
+    if let Some(home) = resolve_user_home_via_getpwnam(username) {
+        return Some(home);
+    }
+
+    if let Ok(passwd) = fs::read_to_string("/etc/passwd") {
+        if let Some(home) = resolve_user_home_from_passwd(&passwd, username) {
+            return Some(home);
+        }
+    }
+
+    let fallback = PathBuf::from("/home").join(username);
+    fallback.is_dir().then_some(fallback)
+}
+
+fn desktop_application_dirs_from(
+    xdg_data_dirs: Option<&OsStr>,
+    xdg_data_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+    sudo_home: Option<PathBuf>,
+) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     let mut seen = HashSet::new();
 
@@ -82,21 +219,49 @@ fn desktop_application_dirs() -> Vec<PathBuf> {
         }
     };
 
+    if let Some(data_dirs) = xdg_data_dirs.filter(|v| !v.is_empty()) {
+        for base in env::split_paths(data_dirs) {
+            if base.is_absolute() {
+                push_unique(base.join("applications"));
+            }
+        }
+    }
+
     for dir in SYSTEM_DESKTOP_DIRS {
         push_unique(PathBuf::from(dir));
     }
 
-    if let Some(xdg_data_home) = env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
-        push_unique(PathBuf::from(xdg_data_home).join("applications"));
+    if let Some(xdg_data_home) = xdg_data_home.filter(|v| !v.is_empty()) {
+        let base = PathBuf::from(xdg_data_home);
+        if base.is_absolute() {
+            push_unique(base.join("applications"));
+        }
     }
 
-    if let Some(home) = env::var_os("HOME").filter(|v| !v.is_empty()) {
+    if let Some(home) = home.filter(|v| !v.is_empty()) {
         let home_path = PathBuf::from(home);
         push_unique(home_path.join(".local/share/applications"));
         push_unique(home_path.join(".local/share/flatpak/exports/share/applications"));
     }
 
+    if let Some(sudo_home) = sudo_home {
+        push_unique(sudo_home.join(".local/share/applications"));
+        push_unique(sudo_home.join(".local/share/flatpak/exports/share/applications"));
+    }
+
     dirs
+}
+
+fn desktop_application_dirs() -> Vec<PathBuf> {
+    let xdg_data_dirs = env::var_os("XDG_DATA_DIRS");
+    let xdg_data_home = env::var_os("XDG_DATA_HOME");
+    let home = env::var_os("HOME");
+    desktop_application_dirs_from(
+        xdg_data_dirs.as_deref(),
+        xdg_data_home.as_deref(),
+        home.as_deref(),
+        resolve_sudo_user_home(),
+    )
 }
 
 fn discover_desktop_apps(out: &mut Vec<DiscoveredApp>) {
@@ -154,6 +319,7 @@ fn parse_desktop_entry(content: &str) -> Option<DiscoveredApp> {
     let mut name: Option<&str> = None;
     let mut exec: Option<&str> = None;
     let mut try_exec: Option<&str> = None;
+    let mut x_flatpak: Option<&str> = None;
 
     for raw_line in cleaned.lines() {
         let line = raw_line.trim();
@@ -198,13 +364,27 @@ fn parse_desktop_entry(content: &str) -> Option<DiscoveredApp> {
             "TryExec" if try_exec.is_none() && !val.is_empty() => {
                 try_exec = Some(val);
             }
+            "X-Flatpak" if x_flatpak.is_none() && !val.is_empty() => {
+                x_flatpak = Some(val);
+            }
             _ => {}
         }
     }
 
-    let (exe_name, path) = exec
+    let exec_parsed = exec
         .and_then(parse_desktop_exec)
-        .or_else(|| try_exec.and_then(parse_desktop_exec))?;
+        .or_else(|| try_exec.and_then(parse_desktop_exec));
+
+    let (exe_name, path) = if let Some(flatpak_id) = x_flatpak.and_then(sanitize_flatpak_app_id) {
+        let path = exec_parsed.and_then(|(_, p)| p);
+        (flatpak_id, path)
+    } else {
+        let (exe, path) = exec_parsed?;
+        if exe.eq_ignore_ascii_case("flatpak") {
+            return None;
+        }
+        (exe, path)
+    };
 
     if is_ignored_app_name(&exe_name) {
         return None;
@@ -223,7 +403,9 @@ fn parse_desktop_entry(content: &str) -> Option<DiscoveredApp> {
 
 /// Extracts `(exe_basename, optional_full_path)` from a `.desktop` `Exec=`
 /// command line, stripping Desktop Entry field codes (`%u`, `%U`, `%f`, etc.),
-/// leading `KEY=VAL` assignments, and `env` wrapper prefixes.
+/// leading `KEY=VAL` assignments, `env` wrapper prefixes, and `flatpak run`
+/// wrappers (preferring the Flatpak reverse-DNS app ID so it matches runtime
+/// cgroup / `.flatpak-info` resolution, falling back to `--command=CMD`).
 fn parse_desktop_exec(exec: &str) -> Option<(String, Option<String>)> {
     let tokens = tokenize_desktop_exec(exec);
     let mut idx = 0;
@@ -268,6 +450,10 @@ fn parse_desktop_exec(exec: &str) -> Option<(String, Option<String>)> {
 
         let cleaned = strip_trailing_field_code(tok).trim();
         let exe_name = extract_exe_basename(cleaned)?;
+        if exe_name.eq_ignore_ascii_case("flatpak") {
+            return parse_flatpak_run_args(&tokens[idx..]);
+        }
+
         let full_path = if cleaned.contains('/') {
             Some(cleaned.to_string())
         } else {
@@ -277,6 +463,198 @@ fn parse_desktop_exec(exec: &str) -> Option<(String, Option<String>)> {
     }
 
     None
+}
+
+fn sanitize_flatpak_app_id(raw: &str) -> Option<String> {
+    let trimmed = strip_trailing_field_code(raw.trim()).trim();
+    let without_kind = trimmed.strip_prefix("app/").unwrap_or(trimmed);
+    let app_id = without_kind
+        .split('/')
+        .next()
+        .unwrap_or(without_kind)
+        .trim();
+    if app_id.is_empty()
+        || app_id == "."
+        || app_id == ".."
+        || app_id.contains('\0')
+        || app_id.contains('/')
+        || app_id.eq_ignore_ascii_case("flatpak")
+    {
+        return None;
+    }
+    Some(app_id.to_string())
+}
+
+fn is_reverse_dns_flatpak_id(id: &str) -> bool {
+    let mut parts = id.split('.');
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    let Some(second) = parts.next() else {
+        return false;
+    };
+    !first.is_empty()
+        && !second.is_empty()
+        && id.split('.').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+}
+
+fn flatpak_run_flag_takes_value(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--arch"
+            | "--branch"
+            | "--commit"
+            | "--runtime"
+            | "--runtime-version"
+            | "--runtime-commit"
+            | "--cwd"
+            | "--env"
+            | "--env-fd"
+            | "--unset-env"
+            | "--filesystem"
+            | "--nofilesystem"
+            | "--socket"
+            | "--nosocket"
+            | "--device"
+            | "--nodevice"
+            | "--share"
+            | "--unshare"
+            | "--allow"
+            | "--disallow"
+            | "--talk-name"
+            | "--own-name"
+            | "--no-talk-name"
+            | "--system-talk-name"
+            | "--system-own-name"
+            | "--system-no-talk-name"
+            | "--installation"
+            | "--persist"
+            | "--app-path"
+            | "--usr-path"
+            | "--parent-pid"
+            | "-p"
+    )
+}
+
+fn is_generic_flatpak_wrapper_cmd(base: &str) -> bool {
+    let lower = base.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "sh" | "bash" | "dash" | "zsh" | "env" | "flatpak" | "bwrap"
+    ) || lower.starts_with("zypak-")
+}
+
+/// Parses arguments following `flatpak` in a `.desktop` `Exec=` line
+/// (`flatpak run [OPTIONS...] [--command=CMD] APP_ID [ARGS...]`).
+fn parse_flatpak_run_args(args: &[String]) -> Option<(String, Option<String>)> {
+    let mut idx = 0;
+
+    // Skip optional global flags before the `run` subcommand.
+    while idx < args.len() {
+        let tok = args[idx].trim();
+        idx += 1;
+        if tok.is_empty() || is_desktop_field_code(tok) {
+            continue;
+        }
+        if tok == "run" {
+            break;
+        }
+        if tok.starts_with('-') {
+            if tok == "--installation" {
+                idx = idx.saturating_add(1);
+            }
+            continue;
+        }
+        // Non-`run` flatpak subcommand (e.g. `flatpak update`).
+        return None;
+    }
+
+    let mut command_override: Option<String> = None;
+    let mut app_id: Option<String> = None;
+    let mut fallback_positional: Option<String> = None;
+
+    while idx < args.len() {
+        let tok = args[idx].trim();
+        idx += 1;
+        if tok.is_empty()
+            || is_desktop_field_code(tok)
+            || matches!(tok, "@@" | "@@u" | "@@U" | "@@f" | "@@F")
+        {
+            continue;
+        }
+
+        if tok == "--" {
+            while idx < args.len() {
+                let candidate = args[idx].trim();
+                idx += 1;
+                if candidate.is_empty() || is_desktop_field_code(candidate) {
+                    continue;
+                }
+                if let Some(id) = sanitize_flatpak_app_id(candidate) {
+                    app_id = Some(id);
+                    break;
+                }
+            }
+            break;
+        }
+
+        if let Some(val) = tok.strip_prefix("--command=") {
+            if !val.trim().is_empty() {
+                command_override = Some(val.trim().to_string());
+            }
+            continue;
+        }
+
+        if tok == "--command" {
+            if idx < args.len() {
+                let val = args[idx].trim();
+                idx += 1;
+                if !val.is_empty() {
+                    command_override = Some(val.to_string());
+                }
+            }
+            continue;
+        }
+
+        if tok.starts_with('-') {
+            if !tok.contains('=') && flatpak_run_flag_takes_value(tok) {
+                idx = idx.saturating_add(1);
+            }
+            continue;
+        }
+
+        if let Some(id) = sanitize_flatpak_app_id(tok) {
+            if is_reverse_dns_flatpak_id(&id) {
+                app_id = Some(id);
+                break;
+            }
+            if fallback_positional.is_none() {
+                fallback_positional = Some(id);
+            }
+        }
+    }
+
+    let command_info = command_override.and_then(|cmd| {
+        let cleaned = strip_trailing_field_code(&cmd).trim();
+        let base = extract_exe_basename(cleaned)?;
+        if is_generic_flatpak_wrapper_cmd(&base) {
+            return None;
+        }
+        let full_path = cleaned.contains('/').then(|| cleaned.to_string());
+        Some((base, full_path))
+    });
+
+    if let Some(id) = app_id {
+        let full_path = command_info.and_then(|(_, p)| p);
+        return Some((id, full_path));
+    }
+
+    command_info.or_else(|| fallback_positional.map(|id| (id, None)))
 }
 
 /// Splits a `.desktop` `Exec=` value into shell-like arguments, handling single
@@ -412,18 +790,226 @@ fn clean_exe_link_path(link: &Path) -> Option<String> {
     }
 }
 
-/// Resolves `(exe_name, optional_exe_path)` for a `/proc/<pid>` directory.
-///
-/// Prefers the basename of `/proc/<pid>/exe` (avoiding the Linux kernel's
-/// 15-byte `TASK_COMM_LEN` truncation of `/proc/<pid>/comm`), falling back to
-/// `/proc/<pid>/comm` when `/proc/<pid>/exe` cannot be read.
-fn resolve_pid_process(pid_dir: &Path) -> Option<(String, Option<String>)> {
-    if let Ok(link) = fs::read_link(pid_dir.join("exe")) {
-        if let Some(cleaned_path) = clean_exe_link_path(&link) {
-            if let Some(base) = extract_exe_basename(&cleaned_path) {
-                return Some((base, Some(cleaned_path)));
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn unescape_systemd_unit_name(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 3 < bytes.len() && bytes[i] == b'\\' && bytes[i + 1] == b'x' {
+            if let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 2]), hex_nibble(bytes[i + 3])) {
+                out.push((hi << 4) | lo);
+                i += 4;
+                continue;
             }
         }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn is_uuid(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    for (idx, &b) in bytes.iter().enumerate() {
+        if matches!(idx, 8 | 13 | 18 | 23) {
+            if b != b'-' {
+                return false;
+            }
+        } else if !b.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_flatpak_hex_or_numeric_suffix(s: &str) -> bool {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return false;
+    }
+    // Strip any numeric suffix (e.g. PID `99`, `12345`), any hex suffix
+    // containing a digit (e.g. `1a2b`, `abcdef0123456789`, 32-char compact
+    // UUIDs), or long all-letter hex suffixes (e.g. `deadbeef`).
+    s.bytes().any(|b| b.is_ascii_digit()) || s.len() >= 6
+}
+
+fn strip_flatpak_instance_suffix(without_unit: &str) -> &str {
+    if let Some((before_at, _)) = without_unit.split_once('@') {
+        return before_at;
+    }
+
+    // Trailing `-<UUID>` (8-4-4-4-12 hyphenated UUID).
+    let bytes = without_unit.as_bytes();
+    if bytes.len() > 37 && bytes[bytes.len() - 37] == b'-' {
+        if let Some(candidate) = without_unit.get(bytes.len() - 36..) {
+            if is_uuid(candidate) {
+                return &without_unit[..bytes.len() - 37];
+            }
+        }
+    }
+
+    // Trailing `-<numeric>` or `-<hex>` (including compact 32-char UUIDs).
+    if let Some((prefix, suffix)) = without_unit.rsplit_once('-') {
+        if !prefix.is_empty() && is_flatpak_hex_or_numeric_suffix(suffix) {
+            return prefix;
+        }
+    }
+
+    without_unit
+}
+
+/// Extracts a Flatpak application ID from `/proc/<pid>/cgroup` lines containing
+/// a systemd `app-flatpak-<APP_ID>-<instance>.scope` (or `@<instance>.service`) unit,
+/// stripping numeric, hex, or UUID instance suffixes.
+fn parse_flatpak_cgroup_app_id(cgroup: &str) -> Option<String> {
+    const MARKER: &str = "app-flatpak-";
+
+    for line in cgroup.lines() {
+        let Some(pos) = line.find(MARKER) else {
+            continue;
+        };
+        let rest = &line[pos + MARKER.len()..];
+        let segment = rest
+            .split(|c: char| c == '/' || c.is_ascii_whitespace())
+            .next()
+            .unwrap_or(rest)
+            .trim();
+        let without_unit = segment
+            .strip_suffix(".scope")
+            .or_else(|| segment.strip_suffix(".service"))
+            .unwrap_or(segment);
+        let without_instance = strip_flatpak_instance_suffix(without_unit);
+        let decoded = unescape_systemd_unit_name(without_instance);
+        if let Some(app_id) = sanitize_flatpak_app_id(&decoded) {
+            return Some(app_id);
+        }
+    }
+
+    None
+}
+
+/// Parses the Flatpak application ID from the `[Application]` section (`name=...`)
+/// of `/proc/<pid>/root/.flatpak-info` for non-systemd Flatpak sessions.
+fn parse_flatpak_info_app_id(content: &str) -> Option<String> {
+    let cleaned = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let mut in_application = false;
+
+    for raw_line in cleaned.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+
+        if line.starts_with('[') && line.ends_with(']') {
+            if line == "[Application]" {
+                in_application = true;
+                continue;
+            }
+            if in_application {
+                break;
+            }
+            continue;
+        }
+
+        if !in_application {
+            continue;
+        }
+
+        let Some((raw_key, raw_val)) = line.split_once('=') else {
+            continue;
+        };
+        if raw_key.trim() == "name" {
+            return sanitize_flatpak_app_id(raw_val.trim());
+        }
+    }
+
+    None
+}
+
+/// Extracts a Snap package name from `/proc/<pid>/cgroup` lines containing a
+/// systemd `snap.<PACKAGE>.<APP>-<instance>.scope` unit so Snaps whose
+/// internal ELF basename differs from their Snap package name (e.g.
+/// `chromium` -> `chrome`, `obs-studio` -> `obs`) match their `.desktop` entry.
+fn parse_snap_cgroup_package(cgroup: &str) -> Option<String> {
+    for line in cgroup.lines() {
+        let path = line.splitn(3, ':').nth(2).unwrap_or(line).trim();
+        for segment in path.split('/') {
+            let segment = segment.trim();
+            let Some(rest) = segment.strip_prefix("snap.") else {
+                continue;
+            };
+            let Some(without_scope) = rest.strip_suffix(".scope") else {
+                continue;
+            };
+            let Some((raw_pkg, app_with_instance)) = without_scope.split_once('.') else {
+                continue;
+            };
+            let Some((app, instance)) = app_with_instance.split_once('-') else {
+                continue;
+            };
+            if app.is_empty() || instance.is_empty() {
+                continue;
+            }
+            let decoded = unescape_systemd_unit_name(raw_pkg);
+            let pkg = decoded.trim();
+            if !pkg.is_empty()
+                && pkg != "."
+                && pkg != ".."
+                && !pkg.contains('/')
+                && !pkg.contains('\0')
+                && !pkg.chars().any(|c| c.is_ascii_whitespace())
+            {
+                return Some(pkg.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Resolves `(exe_name, optional_exe_path)` for a `/proc/<pid>` directory.
+///
+/// Inspects `/proc/<pid>/cgroup` for `app-flatpak-` and `snap.<PKG>.<APP>-*.scope`
+/// units (with a `/proc/<pid>/root/.flatpak-info` fallback for non-systemd
+/// Flatpak sessions) so sandboxed Flatpak and Snap processes match their app
+/// ID / package name cleanly; otherwise prefers the basename of `/proc/<pid>/exe`
+/// (avoiding the Linux kernel's 15-byte `TASK_COMM_LEN` truncation of
+/// `/proc/<pid>/comm`), falling back to `/proc/<pid>/comm`.
+fn resolve_pid_process(pid_dir: &Path) -> Option<(String, Option<String>)> {
+    let exe_info = fs::read_link(pid_dir.join("exe")).ok().and_then(|link| {
+        let cleaned_path = clean_exe_link_path(&link)?;
+        let base = extract_exe_basename(&cleaned_path)?;
+        Some((base, cleaned_path))
+    });
+
+    if let Ok(cgroup) = fs::read_to_string(pid_dir.join("cgroup")) {
+        if let Some(flatpak_id) = parse_flatpak_cgroup_app_id(&cgroup) {
+            return Some((flatpak_id, exe_info.map(|(_, path)| path)));
+        }
+        if let Some(snap_pkg) = parse_snap_cgroup_package(&cgroup) {
+            return Some((snap_pkg, exe_info.map(|(_, path)| path)));
+        }
+    }
+
+    if let Ok(flatpak_info) = fs::read_to_string(pid_dir.join("root/.flatpak-info")) {
+        if let Some(flatpak_id) = parse_flatpak_info_app_id(&flatpak_info) {
+            return Some((flatpak_id, exe_info.map(|(_, path)| path)));
+        }
+    }
+
+    if let Some((base, cleaned_path)) = exe_info {
+        return Some((base, Some(cleaned_path)));
     }
 
     let comm = fs::read_to_string(pid_dir.join("comm")).ok()?;
@@ -458,19 +1044,26 @@ fn discover_proc_apps(proc_root: &Path, out: &mut Vec<DiscoveredApp>) {
             continue;
         }
 
+        // Skip sandbox/system helper daemons (`bwrap`, `xdg-dbus-proxy`, `zypak-*`)
+        // and `vdpi` itself by inspecting raw `exe` and `comm` before cgroup mapping.
+        if let Ok(link) = fs::read_link(pid_dir.join("exe")) {
+            if let Some(base) = clean_exe_link_path(&link).and_then(|p| extract_exe_basename(&p)) {
+                if is_ignored_app_name(&base) || is_sandbox_or_helper_daemon(&base) {
+                    continue;
+                }
+            }
+        }
+        if let Ok(comm) = fs::read_to_string(pid_dir.join("comm")) {
+            if is_ignored_app_name(&comm) || is_sandbox_or_helper_daemon(&comm) {
+                continue;
+            }
+        }
+
         let Some((exe_name, exe_path)) = resolve_pid_process(&pid_dir) else {
             continue;
         };
-        if is_ignored_app_name(&exe_name) {
+        if is_ignored_app_name(&exe_name) || is_sandbox_or_helper_daemon(&exe_name) {
             continue;
-        }
-
-        // Also skip if `/proc/<pid>/comm` identifies this process as `vdpi`
-        // (e.g., when invoked via a symlink or renamed wrapper).
-        if let Ok(comm) = fs::read_to_string(pid_dir.join("comm")) {
-            if is_ignored_app_name(&comm) {
-                continue;
-            }
         }
 
         out.push(DiscoveredApp {
@@ -1010,5 +1603,409 @@ Exec=/usr/local/bin/vdpi
         assert_eq!(apps[1].display_name, "OBS Studio");
 
         let _ = fs::remove_dir_all(&apps_dir);
+    }
+
+    #[test]
+    fn flatpak_desktop_entries_and_exec_never_collapse_to_flatpak() {
+        assert_eq!(
+            parse_desktop_exec(
+                "/usr/bin/flatpak run --branch=stable --arch=x86_64 --command=discord --file-forwarding com.discordapp.Discord @@u %U @@"
+            ),
+            Some(("com.discordapp.Discord".to_string(), None))
+        );
+        assert_eq!(
+            parse_desktop_exec(
+                "flatpak run --branch=stable --command=/app/bin/firefox org.mozilla.firefox %u"
+            ),
+            Some((
+                "org.mozilla.firefox".to_string(),
+                Some("/app/bin/firefox".to_string())
+            ))
+        );
+        assert_eq!(
+            parse_desktop_exec("/usr/bin/flatpak run --branch=stable org.vinegarhq.Sober %u"),
+            Some(("org.vinegarhq.Sober".to_string(), None))
+        );
+        assert_eq!(
+            parse_desktop_exec("flatpak run --command=sh com.example.WrappedApp"),
+            Some(("com.example.WrappedApp".to_string(), None))
+        );
+        assert_eq!(
+            parse_desktop_exec(
+                "flatpak run --branch=stable app/com.discordapp.Discord/x86_64/stable %U"
+            ),
+            Some(("com.discordapp.Discord".to_string(), None))
+        );
+        assert_eq!(
+            parse_desktop_exec(
+                "flatpak run --branch=stable --command=discord -- com.discordapp.Discord --start-minimized"
+            ),
+            Some(("com.discordapp.Discord".to_string(), None))
+        );
+
+        let discord_flatpak = "\
+[Desktop Entry]
+Type=Application
+Name=Discord
+Exec=/usr/bin/flatpak run --branch=stable --arch=x86_64 --command=discord --file-forwarding com.discordapp.Discord @@u %U @@
+X-Flatpak=com.discordapp.Discord
+";
+        let parsed = parse_desktop_entry(discord_flatpak).expect("flatpak desktop entry");
+        assert_eq!(parsed.display_name, "Discord");
+        assert_eq!(parsed.exe_name, "com.discordapp.Discord");
+        assert_ne!(parsed.exe_name, "flatpak");
+
+        // Without `X-Flatpak=`, `flatpak run ... APP_ID` must still resolve to
+        // the reverse-DNS Flatpak app ID rather than `--command` basename.
+        let discord_flatpak_without_x_flatpak = "\
+[Desktop Entry]
+Type=Application
+Name=Discord
+Exec=/usr/bin/flatpak run --branch=stable --arch=x86_64 --command=discord --file-forwarding com.discordapp.Discord @@u %U @@
+";
+        let parsed_no_x = parse_desktop_entry(discord_flatpak_without_x_flatpak)
+            .expect("flatpak desktop entry without X-Flatpak");
+        assert_eq!(parsed_no_x.display_name, "Discord");
+        assert_eq!(parsed_no_x.exe_name, "com.discordapp.Discord");
+
+        let sober_flatpak = "\
+[Desktop Entry]
+Type=Application
+Name=Sober
+Exec=/usr/bin/flatpak run --branch=stable org.vinegarhq.Sober %u
+X-Flatpak=org.vinegarhq.Sober
+";
+        let sober = parse_desktop_entry(sober_flatpak).expect("sober flatpak entry");
+        assert_eq!(sober.display_name, "Sober");
+        assert_eq!(sober.exe_name, "org.vinegarhq.Sober");
+    }
+
+    #[test]
+    fn flatpak_cgroup_hex_uuid_scopes_and_flatpak_info_fallback() {
+        assert_eq!(
+            parse_flatpak_cgroup_app_id(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-flatpak-org.mozilla.firefox-abcdef0123456789.scope\n"
+            )
+            .as_deref(),
+            Some("org.mozilla.firefox")
+        );
+        assert_eq!(
+            parse_flatpak_cgroup_app_id(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-flatpak-org.mozilla.firefox-deadbeef.scope\n"
+            )
+            .as_deref(),
+            Some("org.mozilla.firefox")
+        );
+        assert_eq!(
+            parse_flatpak_cgroup_app_id(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-flatpak-org.mozilla.firefox-550e8400-e29b-41d4-a716-446655440000.scope\n"
+            )
+            .as_deref(),
+            Some("org.mozilla.firefox")
+        );
+        assert_eq!(
+            parse_flatpak_cgroup_app_id(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-flatpak-org.mozilla.firefox-550e8400e29b41d4a716446655440000.scope\n"
+            )
+            .as_deref(),
+            Some("org.mozilla.firefox")
+        );
+        assert_eq!(
+            parse_flatpak_cgroup_app_id(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-flatpak-io.gitlab.librewolf\\x2dcommunity-550e8400-e29b-41d4-a716-446655440000.scope\n"
+            )
+            .as_deref(),
+            Some("io.gitlab.librewolf-community")
+        );
+        assert_eq!(
+            parse_flatpak_cgroup_app_id(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-flatpak-org.mozilla.firefox@550e8400-e29b-41d4-a716-446655440000.service\n"
+            )
+            .as_deref(),
+            Some("org.mozilla.firefox")
+        );
+
+        let flatpak_info = "\
+[Application]
+name=org.mozilla.firefox
+runtime=runtime/org.freedesktop.Platform/x86_64/23.08
+
+[Instance]
+name=ignored.instance.name
+instance-id=1234567890
+";
+        assert_eq!(
+            parse_flatpak_info_app_id(flatpak_info).as_deref(),
+            Some("org.mozilla.firefox")
+        );
+        assert_eq!(
+            parse_flatpak_info_app_id("[Instance]\nname=org.ignored.App\n"),
+            None
+        );
+
+        // Non-systemd Flatpak session falls back to `/proc/<pid>/root/.flatpak-info`.
+        let proc_root = unique_temp_dir("proc-flatpak-info");
+        let pid_dir = proc_root.join("401");
+        fs::create_dir_all(pid_dir.join("root")).unwrap();
+        fs::write(pid_dir.join("cmdline"), b"/app/lib/firefox/firefox\0").unwrap();
+        fs::write(pid_dir.join("comm"), "firefox-bin\n").unwrap();
+        fs::write(pid_dir.join("cgroup"), "0::/\n").unwrap();
+        fs::write(pid_dir.join("root/.flatpak-info"), flatpak_info).unwrap();
+
+        let resolved = resolve_pid_process(&pid_dir);
+        assert_eq!(
+            resolved.as_ref().map(|(exe, _)| exe.as_str()),
+            Some("org.mozilla.firefox")
+        );
+
+        let _ = fs::remove_dir_all(&proc_root);
+    }
+
+    #[test]
+    fn snap_cgroup_parsing_and_process_resolution() {
+        assert_eq!(
+            parse_snap_cgroup_package(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/snap.chromium.chromium-550e8400-e29b-41d4-a716-446655440000.scope\n"
+            )
+            .as_deref(),
+            Some("chromium")
+        );
+        assert_eq!(
+            parse_snap_cgroup_package(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/snap.obs-studio.obs-studio-12345.scope\n"
+            )
+            .as_deref(),
+            Some("obs-studio")
+        );
+        assert_eq!(
+            parse_snap_cgroup_package(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/snap.obs\\x2dstudio.obs\\x2dstudio-abcdef01.scope\n"
+            )
+            .as_deref(),
+            Some("obs-studio")
+        );
+        assert_eq!(
+            parse_snap_cgroup_package("0::/system.slice/snap.cups.cupsd.service\n"),
+            None
+        );
+        assert_eq!(
+            parse_snap_cgroup_package("0::/user.slice/user-1000.slice/session-2.scope\n"),
+            None
+        );
+
+        let proc_root = unique_temp_dir("proc-snap");
+
+        let chromium_dir = proc_root.join("501");
+        fs::create_dir_all(&chromium_dir).unwrap();
+        fs::write(
+            chromium_dir.join("cmdline"),
+            b"/snap/chromium/2810/usr/lib/chromium-browser/chrome\0",
+        )
+        .unwrap();
+        fs::write(chromium_dir.join("comm"), "chrome\n").unwrap();
+        fs::write(
+            chromium_dir.join("cgroup"),
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/snap.chromium.chromium-550e8400-e29b-41d4-a716-446655440000.scope\n",
+        )
+        .unwrap();
+
+        let obs_dir = proc_root.join("502");
+        fs::create_dir_all(&obs_dir).unwrap();
+        fs::write(obs_dir.join("cmdline"), b"/snap/obs-studio/1284/usr/bin/obs\0").unwrap();
+        fs::write(obs_dir.join("comm"), "obs\n").unwrap();
+        fs::write(
+            obs_dir.join("cgroup"),
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/snap.obs-studio.obs-studio-998877.scope\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_pid_process(&chromium_dir)
+                .as_ref()
+                .map(|(exe, _)| exe.as_str()),
+            Some("chromium")
+        );
+        assert_eq!(
+            resolve_pid_process(&obs_dir)
+                .as_ref()
+                .map(|(exe, _)| exe.as_str()),
+            Some("obs-studio")
+        );
+
+        let mut apps = Vec::new();
+        discover_proc_apps(&proc_root, &mut apps);
+        apps.sort_by(|a, b| a.exe_name.cmp(&b.exe_name));
+        assert_eq!(apps.len(), 2);
+        assert_eq!(apps[0].exe_name, "chromium");
+        assert_eq!(apps[1].exe_name, "obs-studio");
+
+        let _ = fs::remove_dir_all(&proc_root);
+    }
+
+    #[test]
+    fn desktop_application_dirs_respects_xdg_data_dirs_and_fallbacks() {
+        let dirs = desktop_application_dirs_from(
+            Some(OsStr::new(
+                "/run/current-system/sw/share::relative/dir:/usr/share:/opt/custom/share/",
+            )),
+            Some(OsStr::new("/home/alice/.custom-share")),
+            Some(OsStr::new("/home/alice")),
+            Some(PathBuf::from("/home/bob")),
+        );
+
+        assert!(dirs.contains(&PathBuf::from("/run/current-system/sw/share/applications")));
+        assert!(dirs.contains(&PathBuf::from("/opt/custom/share/applications")));
+        assert!(!dirs.contains(&PathBuf::from("relative/dir/applications")));
+        for std_dir in SYSTEM_DESKTOP_DIRS {
+            assert!(dirs.contains(&PathBuf::from(std_dir)));
+        }
+        assert!(dirs.contains(&PathBuf::from("/home/alice/.custom-share/applications")));
+        assert!(dirs.contains(&PathBuf::from("/home/bob/.local/share/applications")));
+
+        // `/usr/share/applications` appears only once despite being in both XDG_DATA_DIRS and SYSTEM_DESKTOP_DIRS.
+        let usr_share_count = dirs
+            .iter()
+            .filter(|p| *p == Path::new("/usr/share/applications"))
+            .count();
+        assert_eq!(usr_share_count, 1);
+
+        // `resolve_user_home_via_getpwnam` rejects invalid/root usernames.
+        assert_eq!(resolve_user_home_via_getpwnam("root"), None);
+        assert_eq!(resolve_user_home_via_getpwnam(""), None);
+        assert_eq!(resolve_user_home_via_getpwnam("bad:name"), None);
+        assert_eq!(resolve_user_home_via_getpwnam("bad/name"), None);
+    }
+
+    #[test]
+    fn flatpak_cgroup_resolution_sandbox_filtering_and_sudo_home_lookup() {
+        assert_eq!(
+            parse_flatpak_cgroup_app_id(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-flatpak-com.discordapp.Discord-12345.scope\n"
+            )
+            .as_deref(),
+            Some("com.discordapp.Discord")
+        );
+        assert_eq!(
+            parse_flatpak_cgroup_app_id(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-flatpak-io.gitlab.librewolf\\x2dcommunity-99.scope\n"
+            )
+            .as_deref(),
+            Some("io.gitlab.librewolf-community")
+        );
+        assert_eq!(
+            parse_flatpak_cgroup_app_id("0::/user.slice/user-1000.slice/session-2.scope\n"),
+            None
+        );
+
+        let proc_root = unique_temp_dir("proc-flatpak");
+
+        // Sandbox helpers must be skipped from discover_proc_apps()
+        for (pid, comm) in [
+            ("301", "bwrap"),
+            ("302", "xdg-dbus-proxy"),
+            ("303", "zypak-helper"),
+        ] {
+            let dir = proc_root.join(pid);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("cmdline"), format!("/usr/bin/{comm}\0")).unwrap();
+            fs::write(dir.join("comm"), format!("{comm}\n")).unwrap();
+            fs::write(
+                dir.join("cgroup"),
+                "0::/user.slice/user-1000.slice/app.slice/app-flatpak-com.discordapp.Discord-12345.scope\n",
+            )
+            .unwrap();
+        }
+
+        // Socket lookup on zypak-helper inside Flatpak cgroup still resolves to Flatpak app ID
+        let zypak_resolved = resolve_pid_process(&proc_root.join("303"));
+        assert_eq!(
+            zypak_resolved.as_ref().map(|(exe, _)| exe.as_str()),
+            Some("com.discordapp.Discord")
+        );
+
+        // Actual Flatpak app process is discovered with its Flatpak app ID
+        let discord_dir = proc_root.join("304");
+        fs::create_dir_all(&discord_dir).unwrap();
+        fs::write(discord_dir.join("cmdline"), b"/app/discord/Discord\0").unwrap();
+        fs::write(discord_dir.join("comm"), "Discord\n").unwrap();
+        fs::write(
+            discord_dir.join("cgroup"),
+            "0::/user.slice/user-1000.slice/app.slice/app-flatpak-com.discordapp.Discord-12345.scope\n",
+        )
+        .unwrap();
+
+        let mut apps = Vec::new();
+        discover_proc_apps(&proc_root, &mut apps);
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].exe_name, "com.discordapp.Discord");
+
+        let _ = fs::remove_dir_all(&proc_root);
+
+        // Snap dir present in SYSTEM_DESKTOP_DIRS
+        assert!(SYSTEM_DESKTOP_DIRS.contains(&"/var/lib/snapd/desktop/applications"));
+
+        // SUDO_USER /etc/passwd lookup
+        let passwd = "root:x:0:0:root:/root:/bin/bash\narda:x:1000:1000:Arda:/home/arda:/bin/zsh\n";
+        assert_eq!(
+            resolve_user_home_from_passwd(passwd, "arda"),
+            Some(PathBuf::from("/home/arda"))
+        );
+        assert_eq!(resolve_user_home_from_passwd(passwd, "root"), None);
+        assert_eq!(resolve_user_home_from_passwd(passwd, "missing"), None);
+    }
+
+    #[test]
+    fn ignored_app_names_skip_vdpi_and_vdpi_desktop() {
+        assert!(is_ignored_app_name(""));
+        assert!(is_ignored_app_name("vdpi"));
+        assert!(is_ignored_app_name("vdpi-desktop"));
+        assert!(is_ignored_app_name("  VDPI-Desktop \n"));
+        assert!(is_ignored_app_name("vdpi-desktop-linux-x86_64.AppImage"));
+        assert!(is_ignored_app_name("VDPI-DESKTOP-0.8.0-x86_64.AppImage"));
+        assert!(!is_ignored_app_name("firefox"));
+        assert!(!is_ignored_app_name("vdpi-helper"));
+
+        let desktop_gui_entry = "\
+[Desktop Entry]
+Type=Application
+Name=vdpi Desktop
+Exec=/usr/bin/vdpi-desktop
+";
+        assert!(parse_desktop_entry(desktop_gui_entry).is_none());
+
+        let appimage_gui_entry = "\
+[Desktop Entry]
+Type=Application
+Name=vdpi Desktop AppImage
+Exec=/opt/vdpi/vdpi-desktop-linux-x86_64.AppImage
+";
+        assert!(parse_desktop_entry(appimage_gui_entry).is_none());
+
+        let proc_root = unique_temp_dir("proc-vdpi-desktop");
+        let gui_pid = proc_root.join("101");
+        fs::create_dir_all(&gui_pid).unwrap();
+        fs::write(gui_pid.join("cmdline"), b"/usr/bin/vdpi-desktop\0").unwrap();
+        fs::write(gui_pid.join("comm"), "vdpi-desktop\n").unwrap();
+
+        let appimage_pid = proc_root.join("102");
+        fs::create_dir_all(&appimage_pid).unwrap();
+        fs::write(
+            appimage_pid.join("cmdline"),
+            b"/home/user/Applications/vdpi-desktop-linux-x86_64.AppImage\0",
+        )
+        .unwrap();
+        fs::write(appimage_pid.join("comm"), "vdpi-desktop-li\n").unwrap();
+
+        let firefox_pid = proc_root.join("202");
+        fs::create_dir_all(&firefox_pid).unwrap();
+        fs::write(firefox_pid.join("cmdline"), b"/usr/bin/firefox\0").unwrap();
+        fs::write(firefox_pid.join("comm"), "firefox\n").unwrap();
+
+        let mut apps = Vec::new();
+        discover_proc_apps(&proc_root, &mut apps);
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].exe_name, "firefox");
+
+        let _ = fs::remove_dir_all(&proc_root);
     }
 }

@@ -5,9 +5,13 @@ use super::{
     canonical_exe_entry, discover_apps, filter_and_rank_apps, normalize_exe,
     popular_app_display_name, AppCategory, DiscoveredApp,
 };
+use crate::config_file::MAX_SPLIT_TUNNEL_APPS;
 use anyhow::Result;
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
@@ -18,15 +22,15 @@ use ratatui::widgets::{Block, BorderType, Clear, Padding};
 use ratatui::{Frame, Terminal};
 use std::borrow::Cow;
 use std::collections::btree_map::Entry;
-use std::collections::BTreeMap;
-use std::io;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, IsTerminal};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Once;
 use vdpi_core::config::{SplitTunnelConfig, SplitTunnelMode};
 
 const MAX_CARD_WIDTH: u16 = 76;
 const MAX_CARD_HEIGHT: u16 = 28;
-const MAX_CUSTOM_INPUT_CHARS: usize = 256;
+const MAX_CUSTOM_INPUT_CHARS: usize = 1024;
 const MAX_SEARCH_CHARS: usize = 128;
 const RULE: &str = "────────────────────────────────────────────────────────────────────────────";
 
@@ -81,6 +85,7 @@ struct Palette {
     scroll_track: Style,
     modal_input_bg: Style,
     modal_error: Style,
+    notice_warn: Style,
     footer_key: Style,
     footer_text: Style,
 }
@@ -139,6 +144,7 @@ impl Palette {
                 scroll_track: Style::new().fg(DIVIDER_SLATE),
                 modal_input_bg: Style::new().fg(TEXT_WHITE).bg(ACTIVE_BG),
                 modal_error: Style::new().fg(RED_DANGER).add_modifier(Modifier::BOLD),
+                notice_warn: Style::new().fg(AMBER_WARN).add_modifier(Modifier::BOLD),
                 footer_key: Style::new().fg(TEXT_WHITE).add_modifier(Modifier::BOLD),
                 footer_text: Style::new().fg(SLATE_DIM),
             }
@@ -184,8 +190,9 @@ impl Palette {
                 badge_installed: dim,
                 scroll_thumb: bold,
                 scroll_track: dim,
-                modal_input_bg: bold,
+                modal_input_bg: rev,
                 modal_error: bold,
+                notice_warn: bold,
                 footer_key: bold,
                 footer_text: dim,
             }
@@ -209,7 +216,7 @@ fn install_picker_panic_hook() {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             if PICKER_TUI_ACTIVE.swap(false, Ordering::AcqRel) {
-                let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+                let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen, Show);
                 let _ = terminal::disable_raw_mode();
             }
             prev(info);
@@ -217,8 +224,9 @@ fn install_picker_panic_hook() {
     });
 }
 
-/// RAII terminal guard that enables raw mode + alternate screen and restores
-/// cursor, screen, and raw mode cleanly on drop, error, or panic unwind.
+/// RAII terminal guard that enables raw mode + alternate screen + bracketed paste
+/// and restores cursor, paste mode, screen, and raw mode cleanly on drop, error,
+/// or panic unwind.
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
 }
@@ -229,9 +237,9 @@ impl TerminalGuard {
         terminal::enable_raw_mode()?;
         PICKER_TUI_ACTIVE.store(true, Ordering::Release);
         let mut stdout = io::stdout();
-        if let Err(err) = execute!(stdout, EnterAlternateScreen, Hide) {
+        if let Err(err) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, Hide) {
             if PICKER_TUI_ACTIVE.swap(false, Ordering::AcqRel) {
-                let _ = execute!(stdout, LeaveAlternateScreen, Show);
+                let _ = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen, Show);
                 let _ = terminal::disable_raw_mode();
             }
             return Err(err);
@@ -241,7 +249,12 @@ impl TerminalGuard {
             Ok(terminal) => terminal,
             Err(err) => {
                 if PICKER_TUI_ACTIVE.swap(false, Ordering::AcqRel) {
-                    let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+                    let _ = execute!(
+                        io::stdout(),
+                        DisableBracketedPaste,
+                        LeaveAlternateScreen,
+                        Show
+                    );
                     let _ = terminal::disable_raw_mode();
                 }
                 return Err(err);
@@ -256,7 +269,12 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         if PICKER_TUI_ACTIVE.swap(false, Ordering::AcqRel) {
-            let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen, Show);
+            let _ = execute!(
+                self.terminal.backend_mut(),
+                DisableBracketedPaste,
+                LeaveAlternateScreen,
+                Show
+            );
             let _ = terminal::disable_raw_mode();
         }
     }
@@ -265,28 +283,233 @@ impl Drop for TerminalGuard {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct AddModalState {
     input: String,
+    /// Cursor position as a Unicode scalar (`char`) index in `0..=input.chars().count()`.
+    cursor: usize,
     error: Option<String>,
+}
+
+impl AddModalState {
+    fn char_count(&self) -> usize {
+        self.input.chars().count()
+    }
+
+    fn clamped_cursor(&self) -> usize {
+        self.cursor.min(self.char_count())
+    }
+
+    fn byte_index_at_char(&self, char_idx: usize) -> usize {
+        self.input
+            .char_indices()
+            .nth(char_idx)
+            .map_or(self.input.len(), |(byte_idx, _)| byte_idx)
+    }
+
+    fn insert_char(&mut self, ch: char) -> bool {
+        let len = self.char_count();
+        if len >= MAX_CUSTOM_INPUT_CHARS {
+            return false;
+        }
+        let cursor = self.cursor.min(len);
+        let byte_idx = self.byte_index_at_char(cursor);
+        self.input.insert(byte_idx, ch);
+        self.cursor = cursor + 1;
+        self.error = None;
+        true
+    }
+
+    fn insert_str_capped(&mut self, text: &str) -> bool {
+        let mut len = self.char_count();
+        let mut cursor = self.cursor.min(len);
+        let mut byte_idx = self.byte_index_at_char(cursor);
+        let mut changed = false;
+        for ch in text.chars() {
+            if ch.is_control() {
+                continue;
+            }
+            if len >= MAX_CUSTOM_INPUT_CHARS {
+                break;
+            }
+            self.input.insert(byte_idx, ch);
+            byte_idx += ch.len_utf8();
+            cursor += 1;
+            len += 1;
+            changed = true;
+        }
+        if changed {
+            self.cursor = cursor;
+            self.error = None;
+        }
+        changed
+    }
+
+    fn backspace(&mut self) -> bool {
+        let cursor = self.clamped_cursor();
+        if cursor > 0 {
+            let start = self.byte_index_at_char(cursor - 1);
+            let end = self.byte_index_at_char(cursor);
+            self.input.drain(start..end);
+            self.cursor = cursor - 1;
+            self.error = None;
+            true
+        } else if self.error.is_some() {
+            self.error = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn delete(&mut self) -> bool {
+        let len = self.char_count();
+        let cursor = self.cursor.min(len);
+        if cursor < len {
+            let start = self.byte_index_at_char(cursor);
+            let end = self.byte_index_at_char(cursor + 1);
+            self.input.drain(start..end);
+            self.cursor = cursor;
+            self.error = None;
+            true
+        } else if self.error.is_some() {
+            self.error = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn move_left(&mut self) -> bool {
+        let cursor = self.clamped_cursor();
+        if cursor > 0 {
+            self.cursor = cursor - 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn move_right(&mut self) -> bool {
+        let len = self.char_count();
+        let cursor = self.cursor.min(len);
+        if cursor < len {
+            self.cursor = cursor + 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn move_home(&mut self) -> bool {
+        let cursor = self.clamped_cursor();
+        if cursor != 0 {
+            self.cursor = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn move_end(&mut self) -> bool {
+        let len = self.char_count();
+        if self.cursor != len {
+            self.cursor = len;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn clear(&mut self) -> bool {
+        if !self.input.is_empty() || self.cursor != 0 || self.error.is_some() {
+            self.input.clear();
+            self.cursor = 0;
+            self.error = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoticeKind {
+    EmptyIncludeConfirm,
+    AllModeConfirm,
+    DiscardConfirm,
+}
+
+impl NoticeKind {
+    const fn default_text(self) -> &'static str {
+        match self {
+            Self::EmptyIncludeConfirm => {
+                "Empty Include protects no apps - press s/Enter again to save"
+            }
+            Self::AllModeConfirm => {
+                "All mode ignores checked apps (2/3) - press s/Enter again to save"
+            }
+            Self::DiscardConfirm => {
+                "Unsaved changes - Esc again to discard, or s/Enter to save"
+            }
+        }
+    }
+
+    fn text_for_budget(self, budget: usize) -> &'static str {
+        let variants: [&'static str; 3] = match self {
+            Self::EmptyIncludeConfirm => [
+                Self::EmptyIncludeConfirm.default_text(),
+                "Empty Include protects none - s/Enter again to save",
+                "Empty Include (none) - s/Enter to save",
+            ],
+            Self::AllModeConfirm => [
+                Self::AllModeConfirm.default_text(),
+                "All mode ignores checked - s/Enter again to save",
+                "All ignores checked - s/Enter to save",
+            ],
+            Self::DiscardConfirm => [
+                Self::DiscardConfirm.default_text(),
+                "Unsaved - Esc again to discard, s/Enter to save",
+                "Unsaved: Esc discard, s/Enter to save",
+            ],
+        };
+        variants
+            .into_iter()
+            .find(|text| display_width(text) <= budget)
+            .unwrap_or(variants[2])
+    }
 }
 
 #[derive(Debug, Clone)]
 struct PickerState {
+    initial_mode: SplitTunnelMode,
+    initial_selected_keys: BTreeSet<String>,
     mode: SplitTunnelMode,
     all_apps: Vec<DiscoveredApp>,
     /// Map from `normalize_exe(exe)` to canonical display/config exe name.
     selected_entries: BTreeMap<String, String>,
     search_query: String,
+    /// Cursor position in `search_query` as a Unicode scalar (`char`) index in
+    /// `0..=search_query.chars().count()`.
+    search_cursor: usize,
     search_focused: bool,
+    only_selected: bool,
     filtered_indices: Vec<usize>,
     cursor: usize,
     scroll_offset: usize,
     last_list_height: usize,
     add_modal: Option<AddModalState>,
+    notice: Option<String>,
+    notice_kind: Option<NoticeKind>,
+    pending_discard_confirm: bool,
+    pending_save_confirm: bool,
 }
 
 impl PickerState {
     fn new(initial: SplitTunnelConfig, all_apps: Vec<DiscoveredApp>) -> Self {
         let mut selected_entries = BTreeMap::new();
         for raw in &initial.apps {
+            if selected_entries.len() >= MAX_SPLIT_TUNNEL_APPS {
+                break;
+            }
             let Some(canonical) = canonical_exe_entry(raw) else {
                 continue;
             };
@@ -301,21 +524,51 @@ impl PickerState {
                 .unwrap_or(canonical);
             selected_entries.entry(key).or_insert(preferred);
         }
+        let initial_selected_keys: BTreeSet<String> = selected_entries.keys().cloned().collect();
 
         let mut state = Self {
+            initial_mode: initial.mode,
+            initial_selected_keys,
             mode: initial.mode,
             all_apps,
             selected_entries,
             search_query: String::new(),
+            search_cursor: 0,
             search_focused: false,
+            only_selected: false,
             filtered_indices: Vec::new(),
             cursor: 0,
             scroll_offset: 0,
             last_list_height: 10,
             add_modal: None,
+            notice: None,
+            notice_kind: None,
+            pending_discard_confirm: false,
+            pending_save_confirm: false,
         };
         state.refresh_filtered();
         state
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.mode != self.initial_mode
+            || self.selected_entries.len() != self.initial_selected_keys.len()
+            || self
+                .selected_entries
+                .keys()
+                .any(|key| !self.initial_selected_keys.contains(key))
+    }
+
+    fn clear_confirmations(&mut self) {
+        self.pending_discard_confirm = false;
+        self.pending_save_confirm = false;
+        self.notice_kind = None;
+        self.notice = None;
+    }
+
+    fn set_confirm_notice(&mut self, kind: NoticeKind) {
+        self.notice_kind = Some(kind);
+        self.notice = Some(kind.default_text().to_string());
     }
 
     fn selected_count(&self) -> usize {
@@ -331,18 +584,30 @@ impl PickerState {
         let Some(&app_idx) = self.filtered_indices.get(self.cursor) else {
             return false;
         };
-        let app = &self.all_apps[app_idx];
-        let key = normalize_exe(&app.exe_name);
+        let exe_name = self.all_apps[app_idx].exe_name.clone();
+        let key = normalize_exe(&exe_name);
         if key.is_empty() {
             return false;
         }
+        self.clear_confirmations();
+        let can_insert = self.selected_entries.len() < MAX_SPLIT_TUNNEL_APPS;
         match self.selected_entries.entry(key) {
             Entry::Occupied(entry) => {
                 entry.remove();
             }
             Entry::Vacant(entry) => {
-                entry.insert(app.exe_name.clone());
+                if !can_insert {
+                    self.notice_kind = None;
+                    self.notice = Some(format!(
+                        "Maximum {MAX_SPLIT_TUNNEL_APPS} apps reached - uncheck one first"
+                    ));
+                    return true;
+                }
+                entry.insert(exe_name);
             }
+        }
+        if self.only_selected {
+            self.refresh_filtered();
         }
         true
     }
@@ -375,6 +640,7 @@ impl PickerState {
                     .checked_div(stride)?;
                 (offset < self.all_apps.len()).then_some(offset)
             })
+            .filter(|&idx| !self.only_selected || self.is_selected(&self.all_apps[idx]))
             .collect();
         self.sync_viewport(self.last_list_height);
     }
@@ -423,6 +689,158 @@ impl PickerState {
         self.sync_viewport(self.last_list_height);
     }
 
+    fn search_char_count(&self) -> usize {
+        self.search_query.chars().count()
+    }
+
+    fn clamped_search_cursor(&self) -> usize {
+        self.search_cursor.min(self.search_char_count())
+    }
+
+    fn search_byte_index_at_char(&self, char_idx: usize) -> usize {
+        self.search_query
+            .char_indices()
+            .nth(char_idx)
+            .map_or(self.search_query.len(), |(byte_idx, _)| byte_idx)
+    }
+
+    fn search_insert_char(&mut self, ch: char) -> bool {
+        let len = self.search_char_count();
+        if len >= MAX_SEARCH_CHARS {
+            return false;
+        }
+        let cursor = self.search_cursor.min(len);
+        let byte_idx = self.search_byte_index_at_char(cursor);
+        self.search_query.insert(byte_idx, ch);
+        self.search_cursor = cursor + 1;
+        self.clear_confirmations();
+        self.cursor = 0;
+        self.scroll_offset = 0;
+        self.refresh_filtered();
+        true
+    }
+
+    fn search_insert_str_capped(&mut self, text: &str) -> bool {
+        let mut len = self.search_char_count();
+        let mut cursor = self.search_cursor.min(len);
+        let mut byte_idx = self.search_byte_index_at_char(cursor);
+        let mut changed = false;
+        for ch in text.chars() {
+            if ch.is_control() {
+                continue;
+            }
+            if len >= MAX_SEARCH_CHARS {
+                break;
+            }
+            self.search_query.insert(byte_idx, ch);
+            byte_idx += ch.len_utf8();
+            cursor += 1;
+            len += 1;
+            changed = true;
+        }
+        if changed {
+            self.search_cursor = cursor;
+            self.clear_confirmations();
+            self.cursor = 0;
+            self.scroll_offset = 0;
+            self.refresh_filtered();
+        }
+        changed
+    }
+
+    fn search_backspace(&mut self) -> bool {
+        let cursor = self.clamped_search_cursor();
+        if cursor > 0 {
+            let start = self.search_byte_index_at_char(cursor - 1);
+            let end = self.search_byte_index_at_char(cursor);
+            self.search_query.drain(start..end);
+            self.search_cursor = cursor - 1;
+            self.clear_confirmations();
+            self.cursor = 0;
+            self.scroll_offset = 0;
+            self.refresh_filtered();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn search_delete(&mut self) -> bool {
+        let len = self.search_char_count();
+        let cursor = self.search_cursor.min(len);
+        if cursor < len {
+            let start = self.search_byte_index_at_char(cursor);
+            let end = self.search_byte_index_at_char(cursor + 1);
+            self.search_query.drain(start..end);
+            self.search_cursor = cursor;
+            self.clear_confirmations();
+            self.cursor = 0;
+            self.scroll_offset = 0;
+            self.refresh_filtered();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn search_move_left(&mut self) -> bool {
+        let cursor = self.clamped_search_cursor();
+        if cursor > 0 {
+            self.search_cursor = cursor - 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn search_move_right(&mut self) -> bool {
+        let len = self.search_char_count();
+        let cursor = self.search_cursor.min(len);
+        if cursor < len {
+            self.search_cursor = cursor + 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn search_move_home(&mut self) -> bool {
+        let cursor = self.clamped_search_cursor();
+        if cursor != 0 {
+            self.search_cursor = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn search_move_end(&mut self) -> bool {
+        let len = self.search_char_count();
+        if self.search_cursor != len {
+            self.search_cursor = len;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn search_clear(&mut self) -> bool {
+        if !self.search_query.is_empty() || self.search_cursor != 0 {
+            let was_non_empty = !self.search_query.is_empty();
+            self.search_query.clear();
+            self.search_cursor = 0;
+            if was_non_empty {
+                self.clear_confirmations();
+                self.cursor = 0;
+                self.scroll_offset = 0;
+                self.refresh_filtered();
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     fn submit_custom_app(&mut self) {
         let Some(raw) = self.add_modal.as_ref().map(|m| m.input.clone()) else {
             return;
@@ -438,6 +856,17 @@ impl PickerState {
         if key.is_empty() {
             if let Some(modal) = self.add_modal.as_mut() {
                 modal.error = Some("Enter a valid executable name".to_string());
+            }
+            return;
+        }
+
+        if !self.selected_entries.contains_key(&key)
+            && self.selected_entries.len() >= MAX_SPLIT_TUNNEL_APPS
+        {
+            if let Some(modal) = self.add_modal.as_mut() {
+                modal.error = Some(format!(
+                    "Maximum {MAX_SPLIT_TUNNEL_APPS} apps reached - uncheck one first"
+                ));
             }
             return;
         }
@@ -465,6 +894,7 @@ impl PickerState {
             self.all_apps.len() - 1
         };
 
+        self.clear_confirmations();
         self.add_modal = None;
         self.refresh_filtered();
         if let Some(pos) = self.filtered_indices.iter().position(|&i| i == target_idx) {
@@ -473,6 +903,7 @@ impl PickerState {
         } else if !self.search_query.is_empty() {
             // Clear an unrelated active search filter so the newly added app is visible.
             self.search_query.clear();
+            self.search_cursor = 0;
             self.refresh_filtered();
             if let Some(pos) = self.filtered_indices.iter().position(|&i| i == target_idx) {
                 self.cursor = pos;
@@ -499,9 +930,18 @@ enum Action {
 
 /// Runs the interactive full-screen `ratatui` split-tunneling application picker.
 ///
-/// Returns `Ok(Some(updated))` when the user confirms with `Enter`, or `Ok(None)`
+/// Returns `Ok(Some(updated))` when the user confirms with `Enter`/`s`, or `Ok(None)`
 /// when cancelled with `Esc`, `q`, or `Ctrl+C`.
 pub fn run_split_tunnel_picker(initial: SplitTunnelConfig) -> Result<Option<SplitTunnelConfig>> {
+    if !io::stdin().is_terminal()
+        || !io::stdout().is_terminal()
+        || std::env::var("TERM").as_deref() == Ok("dumb")
+    {
+        anyhow::bail!(
+            "interactive split-tunnel picker requires a TTY; use 'vdpi split status|list|mode|add|remove'"
+        );
+    }
+
     let color = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
     let all_apps = discover_apps(&initial.apps);
     let mut state = PickerState::new(initial, all_apps);
@@ -514,6 +954,11 @@ pub fn run_split_tunnel_picker(initial: SplitTunnelConfig) -> Result<Option<Spli
         loop {
             match event::read()? {
                 Event::Resize(..) => break,
+                Event::Paste(text) => {
+                    if handle_paste(&mut state, &text) == Action::Redraw {
+                        break;
+                    }
+                }
                 Event::Key(key) => match handle_key(&mut state, key) {
                     Action::Redraw => break,
                     Action::Save => return Ok(Some(state.build_config())),
@@ -526,13 +971,44 @@ pub fn run_split_tunnel_picker(initial: SplitTunnelConfig) -> Result<Option<Spli
     }
 }
 
+fn is_altgr_char(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(_))
+        && (key.modifiers - KeyModifiers::SHIFT) == (KeyModifiers::CONTROL | KeyModifiers::ALT)
+}
+
+fn first_non_empty_pasted_line(pasted: &str) -> &str {
+    pasted
+        .split(['\r', '\n'])
+        .map(str::trim)
+        .find(|line| line.chars().any(|ch| !ch.is_control()))
+        .unwrap_or("")
+}
+
+fn handle_paste(state: &mut PickerState, pasted: &str) -> Action {
+    let first_line = first_non_empty_pasted_line(pasted);
+    if let Some(modal) = state.add_modal.as_mut() {
+        if modal.insert_str_capped(first_line) {
+            return Action::Redraw;
+        }
+        return Action::Ignore;
+    }
+
+    if state.search_focused && state.search_insert_str_capped(first_line) {
+        return Action::Redraw;
+    }
+
+    Action::Ignore
+}
+
 fn handle_key(state: &mut PickerState, key: KeyEvent) -> Action {
     // Windows ConPTY emits Release events alongside Press; ignore all Releases.
     if key.kind == KeyEventKind::Release {
         return Action::Ignore;
     }
 
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+        && matches!(key.code, KeyCode::Char('c' | 'C'))
     {
         return if key.kind == KeyEventKind::Press {
             Action::Cancel
@@ -553,37 +1029,90 @@ fn handle_key(state: &mut PickerState, key: KeyEvent) -> Action {
 }
 
 fn handle_modal_key(state: &mut PickerState, key: KeyEvent) -> Action {
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('u' | 'U'))
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+        && matches!(key.code, KeyCode::Char('u' | 'U'))
     {
         if key.kind != KeyEventKind::Press {
             return Action::Ignore;
         }
-        if let Some(modal) = state.add_modal.as_mut() {
-            if !modal.input.is_empty() || modal.error.is_some() {
-                modal.input.clear();
-                modal.error = None;
-                return Action::Redraw;
-            }
+        if state.add_modal.as_mut().is_some_and(AddModalState::clear) {
+            return Action::Redraw;
         }
         return Action::Ignore;
     }
 
-    if key
-        .modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    if !is_altgr_char(&key)
+        && key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
     {
         return Action::Ignore;
     }
 
     match key.code {
+        // Navigation and deletion keys allow Repeat cleanly.
         KeyCode::Backspace => {
-            if let Some(modal) = state.add_modal.as_mut() {
-                if modal.input.pop().is_some() || modal.error.is_some() {
-                    modal.error = None;
-                    return Action::Redraw;
-                }
+            if state
+                .add_modal
+                .as_mut()
+                .is_some_and(AddModalState::backspace)
+            {
+                Action::Redraw
+            } else {
+                Action::Ignore
             }
-            Action::Ignore
+        }
+        KeyCode::Delete => {
+            if state.add_modal.as_mut().is_some_and(AddModalState::delete) {
+                Action::Redraw
+            } else {
+                Action::Ignore
+            }
+        }
+        KeyCode::Left => {
+            if state
+                .add_modal
+                .as_mut()
+                .is_some_and(AddModalState::move_left)
+            {
+                Action::Redraw
+            } else {
+                Action::Ignore
+            }
+        }
+        KeyCode::Right => {
+            if state
+                .add_modal
+                .as_mut()
+                .is_some_and(AddModalState::move_right)
+            {
+                Action::Redraw
+            } else {
+                Action::Ignore
+            }
+        }
+        KeyCode::Home => {
+            if state
+                .add_modal
+                .as_mut()
+                .is_some_and(AddModalState::move_home)
+            {
+                Action::Redraw
+            } else {
+                Action::Ignore
+            }
+        }
+        KeyCode::End => {
+            if state
+                .add_modal
+                .as_mut()
+                .is_some_and(AddModalState::move_end)
+            {
+                Action::Redraw
+            } else {
+                Action::Ignore
+            }
         }
         _ if key.kind != KeyEventKind::Press => Action::Ignore,
         KeyCode::Esc => {
@@ -595,38 +1124,38 @@ fn handle_modal_key(state: &mut PickerState, key: KeyEvent) -> Action {
             Action::Redraw
         }
         KeyCode::Char(ch) if !ch.is_control() => {
-            if let Some(modal) = state.add_modal.as_mut() {
-                if modal.input.chars().count() < MAX_CUSTOM_INPUT_CHARS {
-                    modal.input.push(ch);
-                    modal.error = None;
-                    return Action::Redraw;
-                }
+            if state
+                .add_modal
+                .as_mut()
+                .is_some_and(|modal| modal.insert_char(ch))
+            {
+                Action::Redraw
+            } else {
+                Action::Ignore
             }
-            Action::Ignore
         }
         _ => Action::Ignore,
     }
 }
 
 fn handle_search_key(state: &mut PickerState, key: KeyEvent) -> Action {
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('u' | 'U'))
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+        && matches!(key.code, KeyCode::Char('u' | 'U'))
     {
         if key.kind != KeyEventKind::Press {
             return Action::Ignore;
         }
-        if !state.search_query.is_empty() {
-            state.search_query.clear();
-            state.cursor = 0;
-            state.scroll_offset = 0;
-            state.refresh_filtered();
+        if state.search_clear() {
             return Action::Redraw;
         }
         return Action::Ignore;
     }
 
-    if key
-        .modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    if !is_altgr_char(&key)
+        && key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
     {
         return Action::Ignore;
     }
@@ -634,7 +1163,7 @@ fn handle_search_key(state: &mut PickerState, key: KeyEvent) -> Action {
     let page_step = state.last_list_height.saturating_sub(1).max(1);
 
     match key.code {
-        // Navigation keys allow Repeat cleanly.
+        // Navigation and deletion keys allow Repeat cleanly.
         KeyCode::Up => {
             state.move_cursor_up(1);
             Action::Redraw
@@ -652,10 +1181,42 @@ fn handle_search_key(state: &mut PickerState, key: KeyEvent) -> Action {
             Action::Redraw
         }
         KeyCode::Backspace => {
-            if state.search_query.pop().is_some() {
-                state.cursor = 0;
-                state.scroll_offset = 0;
-                state.refresh_filtered();
+            if state.search_backspace() {
+                Action::Redraw
+            } else {
+                Action::Ignore
+            }
+        }
+        KeyCode::Delete => {
+            if state.search_delete() {
+                Action::Redraw
+            } else {
+                Action::Ignore
+            }
+        }
+        KeyCode::Left => {
+            if state.search_move_left() {
+                Action::Redraw
+            } else {
+                Action::Ignore
+            }
+        }
+        KeyCode::Right => {
+            if state.search_move_right() {
+                Action::Redraw
+            } else {
+                Action::Ignore
+            }
+        }
+        KeyCode::Home => {
+            if state.search_move_home() {
+                Action::Redraw
+            } else {
+                Action::Ignore
+            }
+        }
+        KeyCode::End => {
+            if state.search_move_end() {
                 Action::Redraw
             } else {
                 Action::Ignore
@@ -675,11 +1236,7 @@ fn handle_search_key(state: &mut PickerState, key: KeyEvent) -> Action {
             Action::Redraw
         }
         KeyCode::Char(ch) if !ch.is_control() => {
-            if state.search_query.chars().count() < MAX_SEARCH_CHARS {
-                state.search_query.push(ch);
-                state.cursor = 0;
-                state.scroll_offset = 0;
-                state.refresh_filtered();
+            if state.search_insert_char(ch) {
                 Action::Redraw
             } else {
                 Action::Ignore
@@ -689,17 +1246,39 @@ fn handle_search_key(state: &mut PickerState, key: KeyEvent) -> Action {
     }
 }
 
+fn try_save(state: &mut PickerState) -> Action {
+    state.pending_discard_confirm = false;
+    if state.mode == SplitTunnelMode::Include && state.selected_count() == 0 {
+        if state.pending_save_confirm {
+            state.clear_confirmations();
+            return Action::Save;
+        }
+        state.pending_save_confirm = true;
+        state.set_confirm_notice(NoticeKind::EmptyIncludeConfirm);
+        return Action::Redraw;
+    }
+    if state.mode == SplitTunnelMode::All && state.selected_count() > 0 {
+        if state.pending_save_confirm {
+            state.clear_confirmations();
+            return Action::Save;
+        }
+        state.pending_save_confirm = true;
+        state.set_confirm_notice(NoticeKind::AllModeConfirm);
+        return Action::Redraw;
+    }
+    state.clear_confirmations();
+    Action::Save
+}
+
 fn handle_normal_key(state: &mut PickerState, key: KeyEvent) -> Action {
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('u' | 'U'))
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+        && matches!(key.code, KeyCode::Char('u' | 'U'))
     {
         if key.kind != KeyEventKind::Press {
             return Action::Ignore;
         }
-        if !state.search_query.is_empty() {
-            state.search_query.clear();
-            state.cursor = 0;
-            state.scroll_offset = 0;
-            state.refresh_filtered();
+        if state.search_clear() {
             return Action::Redraw;
         }
         return Action::Ignore;
@@ -716,28 +1295,34 @@ fn handle_normal_key(state: &mut PickerState, key: KeyEvent) -> Action {
 
     match key.code {
         // Navigation keys allow Repeat smoothly.
-        KeyCode::Up | KeyCode::Char('k') => {
+        KeyCode::Up | KeyCode::Char('k' | 'K') => {
+            state.clear_confirmations();
             state.move_cursor_up(1);
             Action::Redraw
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Down | KeyCode::Char('j' | 'J') => {
+            state.clear_confirmations();
             state.move_cursor_down(1);
             Action::Redraw
         }
         KeyCode::PageUp => {
+            state.clear_confirmations();
             state.move_cursor_up(page_step);
             Action::Redraw
         }
         KeyCode::PageDown => {
+            state.clear_confirmations();
             state.move_cursor_down(page_step);
             Action::Redraw
         }
         KeyCode::Home => {
+            state.clear_confirmations();
             state.cursor = 0;
             state.sync_viewport(state.last_list_height);
             Action::Redraw
         }
         KeyCode::End => {
+            state.clear_confirmations();
             state.cursor = state.filtered_indices.len().saturating_sub(1);
             state.sync_viewport(state.last_list_height);
             Action::Redraw
@@ -752,15 +1337,18 @@ fn handle_normal_key(state: &mut PickerState, key: KeyEvent) -> Action {
             }
         }
         KeyCode::Tab => {
+            state.clear_confirmations();
             state.cycle_mode_forward();
             Action::Redraw
         }
         KeyCode::BackTab => {
+            state.clear_confirmations();
             state.cycle_mode_backward();
             Action::Redraw
         }
         KeyCode::Char('1') => {
             if state.mode != SplitTunnelMode::All {
+                state.clear_confirmations();
                 state.mode = SplitTunnelMode::All;
                 Action::Redraw
             } else {
@@ -769,6 +1357,7 @@ fn handle_normal_key(state: &mut PickerState, key: KeyEvent) -> Action {
         }
         KeyCode::Char('2') => {
             if state.mode != SplitTunnelMode::Include {
+                state.clear_confirmations();
                 state.mode = SplitTunnelMode::Include;
                 Action::Redraw
             } else {
@@ -777,30 +1366,57 @@ fn handle_normal_key(state: &mut PickerState, key: KeyEvent) -> Action {
         }
         KeyCode::Char('3') => {
             if state.mode != SplitTunnelMode::Exclude {
+                state.clear_confirmations();
                 state.mode = SplitTunnelMode::Exclude;
                 Action::Redraw
             } else {
                 Action::Ignore
             }
         }
+        KeyCode::Char('f' | 'F') => {
+            state.clear_confirmations();
+            state.only_selected = !state.only_selected;
+            state.cursor = 0;
+            state.scroll_offset = 0;
+            state.refresh_filtered();
+            Action::Redraw
+        }
         KeyCode::Char('/') => {
+            state.clear_confirmations();
             state.search_focused = true;
+            state.search_cursor = state.search_char_count();
             Action::Redraw
         }
         KeyCode::Char('a' | 'A') => {
+            state.clear_confirmations();
             state.add_modal = Some(AddModalState::default());
             Action::Redraw
         }
         KeyCode::Char('x' | 'X') => {
             if !state.selected_entries.is_empty() {
+                state.clear_confirmations();
                 state.selected_entries.clear();
+                if state.only_selected {
+                    state.cursor = 0;
+                    state.scroll_offset = 0;
+                    state.refresh_filtered();
+                }
                 Action::Redraw
             } else {
                 Action::Ignore
             }
         }
-        KeyCode::Enter => Action::Save,
-        KeyCode::Esc | KeyCode::Char('q' | 'Q') => Action::Cancel,
+        KeyCode::Enter | KeyCode::Char('s' | 'S') => try_save(state),
+        KeyCode::Esc | KeyCode::Char('q' | 'Q') => {
+            if state.is_dirty() && !state.pending_discard_confirm {
+                state.pending_save_confirm = false;
+                state.pending_discard_confirm = true;
+                state.set_confirm_notice(NoticeKind::DiscardConfirm);
+                Action::Redraw
+            } else {
+                Action::Cancel
+            }
+        }
         _ => Action::Ignore,
     }
 }
@@ -816,47 +1432,130 @@ fn sanitize_inline(text: &str) -> Cow<'_, str> {
     Cow::Owned(cleaned)
 }
 
-fn truncate_text(text: &str, max_chars: usize) -> Cow<'_, str> {
-    if max_chars == 0 {
+fn display_width(text: &str) -> usize {
+    Span::raw(text).width()
+}
+
+fn char_display_width(ch: char) -> usize {
+    let mut buf = [0u8; 4];
+    let s: &str = ch.encode_utf8(&mut buf);
+    Span::raw(s).width()
+}
+
+fn truncate_text(text: &str, max_cols: usize) -> Cow<'_, str> {
+    if max_cols == 0 {
         return Cow::Borrowed("");
     }
-    if text.chars().count() <= max_chars {
+    if display_width(text) <= max_cols {
         return Cow::Borrowed(text);
     }
-    if max_chars == 1 {
-        let end = text
-            .char_indices()
-            .nth(1)
-            .map_or(text.len(), |(idx, _)| idx);
-        return Cow::Borrowed(&text[..end]);
+    if max_cols == 1 {
+        let mut end_byte = 0usize;
+        let mut used = 0usize;
+        for (idx, ch) in text.char_indices() {
+            let w = char_display_width(ch);
+            if used.saturating_add(w) > 1 {
+                break;
+            }
+            used += w;
+            end_byte = idx + ch.len_utf8();
+        }
+        return if end_byte > 0 {
+            Cow::Borrowed(&text[..end_byte])
+        } else {
+            Cow::Borrowed("…")
+        };
     }
-    let mut out = String::with_capacity(max_chars + '…'.len_utf8());
-    for ch in text.chars().take(max_chars - 1) {
-        out.push(ch);
+    let budget = max_cols - 1;
+    let mut used = 0usize;
+    let mut end_byte = 0usize;
+    for (idx, ch) in text.char_indices() {
+        let w = char_display_width(ch);
+        if used.saturating_add(w) > budget {
+            break;
+        }
+        used += w;
+        end_byte = idx + ch.len_utf8();
     }
+    let mut out = String::with_capacity(end_byte + '…'.len_utf8());
+    out.push_str(&text[..end_byte]);
     out.push('…');
     Cow::Owned(out)
 }
 
-fn truncate_head(text: &str, max_chars: usize) -> Cow<'_, str> {
-    if max_chars == 0 {
+fn truncate_head(text: &str, max_cols: usize) -> Cow<'_, str> {
+    if max_cols == 0 {
         return Cow::Borrowed("");
     }
-    let total = text.chars().count();
-    if total <= max_chars {
+    if display_width(text) <= max_cols {
         return Cow::Borrowed(text);
     }
-    if max_chars == 1 {
-        let last = text.chars().next_back().unwrap_or('…');
-        return Cow::Owned(last.to_string());
+    if max_cols == 1 {
+        let mut start_byte = text.len();
+        let mut used = 0usize;
+        for (idx, ch) in text.char_indices().rev() {
+            let w = char_display_width(ch);
+            if used.saturating_add(w) > 1 {
+                break;
+            }
+            used += w;
+            start_byte = idx;
+        }
+        return if start_byte < text.len() {
+            Cow::Borrowed(&text[start_byte..])
+        } else {
+            Cow::Borrowed("…")
+        };
     }
-    let skip = total - (max_chars - 1);
-    let mut out = String::with_capacity(max_chars + '…'.len_utf8());
+    let budget = max_cols - 1;
+    let mut used = 0usize;
+    let mut start_byte = text.len();
+    for (idx, ch) in text.char_indices().rev() {
+        let w = char_display_width(ch);
+        if used.saturating_add(w) > budget {
+            break;
+        }
+        used += w;
+        start_byte = idx;
+    }
+    let mut out = String::with_capacity('…'.len_utf8() + (text.len() - start_byte));
     out.push('…');
-    for ch in text.chars().skip(skip) {
-        out.push(ch);
-    }
+    out.push_str(&text[start_byte..]);
     Cow::Owned(out)
+}
+
+fn window_around_cursor<'a>(
+    text: &'a str,
+    cursor_char: usize,
+    max_cols: usize,
+) -> (Cow<'a, str>, Cow<'a, str>) {
+    if max_cols == 0 {
+        return (Cow::Borrowed(""), Cow::Borrowed(""));
+    }
+    let split_byte = text
+        .char_indices()
+        .nth(cursor_char)
+        .map_or(text.len(), |(idx, _)| idx);
+    let before = &text[..split_byte];
+    let after = &text[split_byte..];
+
+    let before_w = display_width(before);
+    let after_w = display_width(after);
+    if before_w.saturating_add(after_w) <= max_cols {
+        return (Cow::Borrowed(before), Cow::Borrowed(after));
+    }
+
+    let after_reserve = if after.is_empty() {
+        0
+    } else {
+        after_w.min((max_cols / 3).max(1)).min(max_cols)
+    };
+    let before_budget = max_cols.saturating_sub(after_reserve);
+    let visible_before = truncate_head(before, before_budget);
+    let used_before = display_width(&visible_before);
+    let after_budget = max_cols.saturating_sub(used_before);
+    let visible_after = truncate_text(after, after_budget);
+    (visible_before, visible_after)
 }
 
 fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
@@ -965,17 +1664,30 @@ fn render(frame: &mut Frame<'_>, state: &mut PickerState, color: bool) {
         y = y.saturating_add(1);
     }
 
-    // 4. Footer reservation & scrollable app list
-    let footer_reserve = u16::from(show_footer) + u16::from(show_bot_div);
+    // 4. Footer, optional notice, & scrollable app list
+    let has_notice = state.notice.is_some();
+    let show_bot_div = show_bot_div && (!has_notice || inner.height >= 12);
+    let footer_reserve =
+        u16::from(show_footer) + u16::from(has_notice) + u16::from(show_bot_div);
     let list_bottom = bottom.saturating_sub(footer_reserve).max(y);
     let list_area = Rect::new(inner.x, y, inner.width, list_bottom.saturating_sub(y));
     render_app_list(frame, list_area, state, palette);
 
-    // 5. Bottom divider + footer
+    // 5. Bottom divider, optional inline warning notice, + footer
     let mut footer_y = bottom;
     if show_footer && footer_y > y {
         footer_y = footer_y.saturating_sub(1);
-        render_footer(frame, row(footer_y), state.search_focused, palette);
+        render_footer(
+            frame,
+            row(footer_y),
+            state.search_focused,
+            state.only_selected,
+            palette,
+        );
+    }
+    if state.notice.is_some() && footer_y > y {
+        footer_y = footer_y.saturating_sub(1);
+        render_notice(frame, row(footer_y), state, palette);
     }
     if show_bot_div && footer_y > y {
         footer_y = footer_y.saturating_sub(1);
@@ -988,13 +1700,101 @@ fn render(frame: &mut Frame<'_>, state: &mut PickerState, color: bool) {
     }
 }
 
+fn render_notice(frame: &mut Frame<'_>, area: Rect, state: &PickerState, palette: Palette) {
+    if area.is_empty() {
+        return;
+    }
+    let Some(raw_notice) = state.notice.as_deref() else {
+        return;
+    };
+    let prefix = "! ";
+    let budget = usize::from(area.width).saturating_sub(display_width(prefix));
+    let chosen = state
+        .notice_kind
+        .map_or(raw_notice, |kind| kind.text_for_budget(budget));
+    let msg = truncate_text(&sanitize_inline(chosen), budget).into_owned();
+    let line = Line::from(vec![
+        Span::styled(prefix, palette.notice_warn),
+        Span::styled(msg, palette.notice_warn),
+    ]);
+    frame.render_widget(line, area);
+}
+
 fn render_minimal(frame: &mut Frame<'_>, area: Rect, state: &PickerState, palette: Palette) {
+    let width = usize::from(area.width);
     let text = format!("vdpi Split ({} sel)", state.selected_count());
-    let line = Line::from(Span::styled(
-        truncate_text(&text, usize::from(area.width)),
-        palette.brand,
-    ));
+    let line = Line::from(Span::styled(truncate_text(&text, width), palette.brand));
     frame.render_widget(line, Rect::new(area.x, area.y, area.width, 1));
+
+    if area.height >= 2 {
+        let detail_row = Rect::new(area.x, area.y + 1, area.width, 1);
+        if let Some(modal) = state.add_modal.as_ref() {
+            let sanitized = sanitize_inline(&modal.input);
+            let cursor_char = modal.clamped_cursor();
+            let split_byte = sanitized
+                .char_indices()
+                .nth(cursor_char)
+                .map_or(sanitized.len(), |(idx, _)| idx);
+            let prompt = format!(
+                "Add: {}▏{}",
+                &sanitized[..split_byte],
+                &sanitized[split_byte..]
+            );
+            let prompt_cursor = "Add: ".chars().count() + cursor_char + 1;
+            let (before, after) = window_around_cursor(&prompt, prompt_cursor, width);
+            let visible = format!("{before}{after}");
+            frame.render_widget(
+                Line::from(Span::styled(visible, palette.search_text)),
+                detail_row,
+            );
+            if area.height >= 3 {
+                if let Some(err) = modal.error.as_deref() {
+                    frame.render_widget(
+                        Line::from(Span::styled(
+                            truncate_text(err, width),
+                            palette.modal_error,
+                        )),
+                        Rect::new(area.x, area.y + 2, area.width, 1),
+                    );
+                }
+            }
+        } else if state.search_focused {
+            let sanitized = sanitize_inline(&state.search_query);
+            let cursor_char = state.clamped_search_cursor();
+            let split_byte = sanitized
+                .char_indices()
+                .nth(cursor_char)
+                .map_or(sanitized.len(), |(idx, _)| idx);
+            let prompt = format!("/{}▏{}", &sanitized[..split_byte], &sanitized[split_byte..]);
+            let prompt_cursor = 1 + cursor_char + 1;
+            let (before, after) = window_around_cursor(&prompt, prompt_cursor, width);
+            let visible = format!("{before}{after}");
+            frame.render_widget(
+                Line::from(Span::styled(visible, palette.search_text)),
+                detail_row,
+            );
+        } else if !state.search_query.is_empty() {
+            let prompt = format!("/{}", sanitize_inline(&state.search_query));
+            frame.render_widget(
+                Line::from(Span::styled(
+                    truncate_head(&prompt, width).into_owned(),
+                    palette.search_text,
+                )),
+                detail_row,
+            );
+        } else if let Some(raw_notice) = state.notice.as_deref() {
+            let chosen = state
+                .notice_kind
+                .map_or(raw_notice, |kind| kind.text_for_budget(width));
+            frame.render_widget(
+                Line::from(Span::styled(
+                    truncate_text(&sanitize_inline(chosen), width).into_owned(),
+                    palette.notice_warn,
+                )),
+                detail_row,
+            );
+        }
+    }
 }
 
 fn render_divider(frame: &mut Frame<'_>, area: Rect, style: Style) {
@@ -1020,9 +1820,13 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &PickerState, palette
     }
     let width = usize::from(area.width);
     let count = state.selected_count();
-    let pill = format!("{count} selected");
-    let pill_len = pill.chars().count();
-    let pill_style = if count > 0 {
+    let pill = if state.only_selected {
+        format!("{count} selected [filter]")
+    } else {
+        format!("{count} selected")
+    };
+    let pill_len = display_width(&pill);
+    let pill_style = if state.only_selected || count > 0 {
         palette.pill_selected
     } else {
         palette.pill_zero
@@ -1043,7 +1847,7 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &PickerState, palette
     } else if width >= pill_len + 6 {
         let left_budget = width - pill_len - 1;
         let left_text = truncate_text("vdpi Split Tunneling", left_budget);
-        let left_len = left_text.chars().count();
+        let left_len = display_width(&left_text);
         let gap = width.saturating_sub(left_len + pill_len);
         Line::from(vec![
             Span::styled(left_text, palette.brand),
@@ -1100,7 +1904,7 @@ fn render_mode_bar(frame: &mut Frame<'_>, area: Rect, active: SplitTunnelMode, p
         let is_active = mode == active;
         let prefix = if is_active { " ● " } else { " " };
         let suffix = " ";
-        let pill_chars = prefix.chars().count() + label.chars().count() + suffix.len();
+        let pill_chars = display_width(prefix) + display_width(label) + suffix.len();
         let remaining = width.saturating_sub(used);
         if remaining == 0 {
             break;
@@ -1138,9 +1942,12 @@ fn render_mode_hint(frame: &mut Frame<'_>, area: Rect, state: &PickerState, pale
         return;
     }
     let hint = match state.mode {
+        SplitTunnelMode::All if state.selected_count() > 0 => {
+            "All mode protects every app (checked apps ignored; press 2 or 3)."
+        }
         SplitTunnelMode::All => "Every app is protected through DPI desync.",
         SplitTunnelMode::Include if state.selected_count() == 0 => {
-            "DPI desync ONLY for checked apps (check at least one below)."
+            "Empty Include protects no apps (check apps below to enable)."
         }
         SplitTunnelMode::Include => "DPI desync applies ONLY to checked apps.",
         SplitTunnelMode::Exclude => "Checked apps bypass DPI desync; all others stay protected.",
@@ -1159,14 +1966,18 @@ fn render_search_bar(frame: &mut Frame<'_>, area: Rect, state: &PickerState, pal
     let width = usize::from(area.width);
     let filtered = state.filtered_indices.len();
     let total = state.all_apps.len();
-    let count_badge = format!("{filtered} / {total} apps");
-    let count_len = count_badge.chars().count();
+    let count_badge = if state.only_selected {
+        format!("{filtered} / {total} (selected)")
+    } else {
+        format!("{filtered} / {total} apps")
+    };
+    let count_len = display_width(&count_badge);
 
     let line = if state.search_focused {
         let prompt = "Search: ";
         let cursor_glyph = "▏";
-        let prompt_len = prompt.chars().count();
-        let cursor_len = cursor_glyph.chars().count();
+        let prompt_len = display_width(prompt);
+        let cursor_len = display_width(cursor_glyph);
 
         let show_count = width >= prompt_len + cursor_len + count_len + 4;
         let query_budget = if show_count {
@@ -1175,13 +1986,15 @@ fn render_search_bar(frame: &mut Frame<'_>, area: Rect, state: &PickerState, pal
             width.saturating_sub(prompt_len + cursor_len)
         };
         let sanitized = sanitize_inline(&state.search_query);
-        let visible_query = truncate_head(&sanitized, query_budget).into_owned();
-        let query_len = visible_query.chars().count();
+        let (visible_before, visible_after) =
+            window_around_cursor(&sanitized, state.clamped_search_cursor(), query_budget);
+        let query_len = display_width(&visible_before) + display_width(&visible_after);
 
         let mut spans = vec![
             Span::styled(prompt, palette.search_prompt_active),
-            Span::styled(visible_query, palette.search_text),
+            Span::styled(visible_before.into_owned(), palette.search_text),
             Span::styled(cursor_glyph, palette.search_cursor),
+            Span::styled(visible_after.into_owned(), palette.search_text),
         ];
         if show_count {
             let left_used = prompt_len + query_len + cursor_len;
@@ -1193,7 +2006,7 @@ fn render_search_bar(frame: &mut Frame<'_>, area: Rect, state: &PickerState, pal
     } else if state.search_query.is_empty() {
         let full_left = "/ search";
         let sep = " · ";
-        let full_len = full_left.chars().count() + sep.chars().count() + count_len;
+        let full_len = display_width(full_left) + display_width(sep) + count_len;
         if width >= full_len {
             Line::from(vec![
                 Span::styled("/", palette.search_slash),
@@ -1212,7 +2025,7 @@ fn render_search_bar(frame: &mut Frame<'_>, area: Rect, state: &PickerState, pal
         let sanitized = sanitize_inline(&state.search_query);
         let sep = " · ";
         let prefix_len = 2usize; // "/ "
-        let suffix_len = sep.chars().count() + count_len;
+        let suffix_len = display_width(sep) + count_len;
         if width > prefix_len + suffix_len + 2 {
             let q_budget = width - prefix_len - suffix_len;
             let shown_q = truncate_text(&sanitized, q_budget).into_owned();
@@ -1245,14 +2058,26 @@ fn render_app_list(frame: &mut Frame<'_>, area: Rect, state: &mut PickerState, p
     let total_filtered = state.filtered_indices.len();
     if total_filtered == 0 {
         let msg = if state.search_query.is_empty() {
-            "No apps found. Press 'a' to add a custom executable.".to_string()
+            if state.only_selected {
+                "No selected apps. Press 'f' to show all apps.".to_string()
+            } else {
+                "No apps found. Press 'a' to add a custom executable.".to_string()
+            }
         } else {
             let sanitized_q = sanitize_inline(&state.search_query);
+            let suffix = if state.search_focused {
+                "Press Esc then 'a' to add custom."
+            } else if state.only_selected {
+                "Press 'f' for all apps or 'a' to add."
+            } else {
+                "Press 'a' to add custom."
+            };
+            let overhead = 18 + display_width(suffix);
             let q = truncate_text(
                 &sanitized_q,
-                usize::from(area.width).saturating_sub(28).max(4),
+                usize::from(area.width).saturating_sub(overhead).max(4),
             );
-            format!("No matches for \"{q}\". Press 'a' to add custom.")
+            format!("No matches for \"{q}\". {suffix}")
         };
         let line = Line::from(Span::styled(
             truncate_text(&msg, usize::from(area.width)).into_owned(),
@@ -1336,7 +2161,7 @@ fn render_app_list(frame: &mut Frame<'_>, area: Rect, state: &mut PickerState, p
         } else {
             ("", palette.badge_installed)
         };
-        let badge_len = badge_text.chars().count();
+        let badge_len = display_width(badge_text);
         let badge_reserve = if badge_len > 0 { badge_len + 1 } else { 0 };
 
         // Fixed prefix: marker(2) + checkbox(3) + space(1) = 6 cols.
@@ -1348,14 +2173,14 @@ fn render_app_list(frame: &mut Frame<'_>, area: Rect, state: &mut PickerState, p
         let show_exe = !clean_exe.eq_ignore_ascii_case(&clean_name) && mid_budget >= 18;
 
         let (shown_name, shown_exe) = if show_exe {
-            let name_len = clean_name.chars().count();
-            let exe_len = clean_exe.chars().count();
+            let name_len = display_width(&clean_name);
+            let exe_len = display_width(&clean_exe);
             if name_len + 2 + exe_len <= mid_budget {
                 (clean_name.into_owned(), Some(clean_exe.into_owned()))
             } else {
                 let name_cap = ((mid_budget * 3) / 5).max(10).min(mid_budget - 6);
                 let trunc_name = truncate_text(&clean_name, name_cap).into_owned();
-                let used_name = trunc_name.chars().count();
+                let used_name = display_width(&trunc_name);
                 let exe_cap = mid_budget.saturating_sub(used_name + 1);
                 if exe_cap >= 4 {
                     (
@@ -1371,7 +2196,7 @@ fn render_app_list(frame: &mut Frame<'_>, area: Rect, state: &mut PickerState, p
         };
 
         let name_style = if is_cursor {
-            palette.name_active
+            palette.name_active.patch(row_bg)
         } else {
             palette.name_inactive
         };
@@ -1387,16 +2212,17 @@ fn render_app_list(frame: &mut Frame<'_>, area: Rect, state: &mut PickerState, p
         spans.push(Span::styled(checkbox, check_style));
         spans.push(Span::styled(" ", row_bg));
 
-        let mut mid_used = shown_name.chars().count();
+        let mut mid_used = display_width(&shown_name);
         spans.push(Span::styled(shown_name, name_style));
 
         if let Some(exe) = shown_exe {
-            let exe_gap = if mid_used + 2 + exe.chars().count() <= mid_budget {
+            let exe_width = display_width(&exe);
+            let exe_gap = if mid_used + 2 + exe_width <= mid_budget {
                 "  "
             } else {
                 " "
             };
-            mid_used += exe_gap.len() + exe.chars().count();
+            mid_used += exe_gap.len() + exe_width;
             spans.push(Span::styled(exe_gap, row_bg));
             spans.push(Span::styled(exe, exe_style));
         }
@@ -1422,13 +2248,20 @@ fn render_app_list(frame: &mut Frame<'_>, area: Rect, state: &mut PickerState, p
     }
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect, search_focused: bool, palette: Palette) {
+fn render_footer(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    search_focused: bool,
+    only_selected: bool,
+    palette: Palette,
+) {
     if area.is_empty() {
         return;
     }
     let width = usize::from(area.width);
     let key = palette.footer_key;
     let text = palette.footer_text;
+    let filter_label = if only_selected { " all · " } else { " sel · " };
 
     let line = if search_focused {
         if width >= 66 {
@@ -1454,7 +2287,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, search_focused: bool, palett
                 Span::styled("^u", key),
                 Span::styled(" clear", text),
             ])
-        } else if width >= 36 {
+        } else if width >= 37 {
             Line::from(vec![
                 Span::styled("↑↓", key),
                 Span::styled(" · ", text),
@@ -1473,41 +2306,47 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, search_focused: bool, palett
                 Span::styled(" done", text),
             ])
         }
-    } else if width >= 70 {
+    } else if width >= 71 {
         Line::from(vec![
             Span::styled("space", key),
             Span::styled(" toggle · ", text),
             Span::styled("/", key),
-            Span::styled(" search · ", text),
+            Span::styled(" · ", text),
+            Span::styled("f", key),
+            Span::styled(filter_label, text),
             Span::styled("tab", key),
             Span::styled(" mode · ", text),
             Span::styled("a", key),
             Span::styled(" add · ", text),
             Span::styled("x", key),
-            Span::styled(" clear · ", text),
+            Span::styled(" clr · ", text),
             Span::styled("enter", key),
             Span::styled(" save · ", text),
             Span::styled("esc", key),
         ])
-    } else if width >= 54 {
-        Line::from(vec![
-            Span::styled("space", key),
-            Span::styled(" toggle · ", text),
-            Span::styled("/", key),
-            Span::styled(" find · ", text),
-            Span::styled("tab", key),
-            Span::styled(" mode · ", text),
-            Span::styled("a", key),
-            Span::styled(" add · ", text),
-            Span::styled("enter", key),
-            Span::styled(" · ", text),
-            Span::styled("esc", key),
-        ])
-    } else if width >= 38 {
+    } else if width >= 56 {
         Line::from(vec![
             Span::styled("spc", key),
             Span::styled(" toggle · ", text),
             Span::styled("/", key),
+            Span::styled(" find · ", text),
+            Span::styled("f", key),
+            Span::styled(filter_label, text),
+            Span::styled("tab", key),
+            Span::styled(" mode · ", text),
+            Span::styled("a", key),
+            Span::styled(" · ", text),
+            Span::styled("enter", key),
+            Span::styled(" · ", text),
+            Span::styled("esc", key),
+        ])
+    } else if width >= 42 {
+        Line::from(vec![
+            Span::styled("spc", key),
+            Span::styled(" toggle · ", text),
+            Span::styled("/", key),
+            Span::styled(" · ", text),
+            Span::styled("f", key),
             Span::styled(" · ", text),
             Span::styled("tab", key),
             Span::styled(" · ", text),
@@ -1598,19 +2437,24 @@ fn render_add_modal(
     if y < bottom {
         let prefix = " > ";
         let cursor_glyph = "▏";
-        let prefix_len = prefix.chars().count();
-        let cursor_len = cursor_glyph.chars().count();
-        let input_budget = width.saturating_sub(prefix_len + cursor_len + 1);
+        let prefix_w = display_width(prefix);
+        let cursor_w = display_width(cursor_glyph);
+        let input_budget = width.saturating_sub(prefix_w + cursor_w + 1);
         let sanitized = sanitize_inline(&modal.input);
-        let visible_input = truncate_head(&sanitized, input_budget).into_owned();
-        let used = prefix_len + visible_input.chars().count() + cursor_len;
+        let (visible_before, visible_after) =
+            window_around_cursor(&sanitized, modal.clamped_cursor(), input_budget);
+        let used = prefix_w
+            + display_width(&visible_before)
+            + cursor_w
+            + display_width(&visible_after);
         let pad = width.saturating_sub(used);
 
         let bg = palette.modal_input_bg;
         let line = Line::from(vec![
-            Span::styled(prefix, palette.search_prompt_active.patch(bg)),
-            Span::styled(visible_input, bg),
-            Span::styled(cursor_glyph, palette.search_cursor.patch(bg)),
+            Span::styled(prefix, bg.patch(palette.search_prompt_active)),
+            Span::styled(visible_before.into_owned(), bg),
+            Span::styled(cursor_glyph, bg.patch(palette.search_cursor)),
+            Span::styled(visible_after.into_owned(), bg),
             Span::styled(" ".repeat(pad), bg),
         ]);
         frame.render_widget(line, row(y));
@@ -1621,7 +2465,7 @@ fn render_add_modal(
     if let Some(err) = modal.error.as_deref() {
         if y + 1 < bottom {
             let err_prefix = if color { "● " } else { "! " };
-            let msg = truncate_text(err, width.saturating_sub(err_prefix.chars().count()));
+            let msg = truncate_text(err, width.saturating_sub(display_width(err_prefix)));
             let line = Line::from(vec![
                 Span::styled(err_prefix, palette.modal_error),
                 Span::styled(msg, palette.modal_error),
@@ -1633,7 +2477,7 @@ fn render_add_modal(
     // Footer at bottom of modal
     if bottom > inner.y {
         let footer_y = bottom - 1;
-        let line = if width >= 28 {
+        let line = if width >= 33 {
             Line::from(vec![
                 Span::styled("enter", palette.footer_key),
                 Span::styled(" add · ", palette.footer_text),
@@ -1642,12 +2486,18 @@ fn render_add_modal(
                 Span::styled("esc", palette.footer_key),
                 Span::styled(" cancel", palette.footer_text),
             ])
-        } else {
+        } else if width >= 22 {
             Line::from(vec![
                 Span::styled("enter", palette.footer_key),
                 Span::styled(" add · ", palette.footer_text),
                 Span::styled("esc", palette.footer_key),
                 Span::styled(" cancel", palette.footer_text),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("enter", palette.footer_key),
+                Span::styled(" · ", palette.footer_text),
+                Span::styled("esc", palette.footer_key),
             ])
         };
         frame.render_widget(line, row(footer_y));
@@ -1917,8 +2767,15 @@ mod tests {
         for &(w, h) in &[(0, 0), (1, 1), (10, 4), (16, 8), (24, 10), (35, 12)] {
             let mut state = PickerState::new(initial.clone(), sample_apps());
             let _ = render_to_buffer(&mut state, w, h, true);
+            state.search_focused = true;
+            state.search_query =
+                "very_long_search_query_exceeding_tiny_terminal_widths".to_string();
+            state.search_cursor = 18;
+            let _ = render_to_buffer(&mut state, w, h, true);
+            state.search_focused = false;
             state.add_modal = Some(AddModalState {
                 input: "very_long_executable_name_that_exceeds_small_widths.exe".to_string(),
+                cursor: 20,
                 error: Some("Invalid entry".to_string()),
             });
             let _ = render_to_buffer(&mut state, w, h, false);
@@ -1945,6 +2802,7 @@ mod tests {
             );
         }
         assert_eq!(state.search_query, "google chrome");
+        assert_eq!(state.search_cursor, 13);
         assert_eq!(state.filtered_indices.len(), 1);
         assert_eq!(
             state.all_apps[state.filtered_indices[0]].exe_name,
@@ -1959,6 +2817,7 @@ mod tests {
         // Ctrl+U clears query while staying focused.
         assert_eq!(handle_key(&mut state, press_ctrl('u')), Action::Redraw);
         assert!(state.search_query.is_empty());
+        assert_eq!(state.search_cursor, 0);
         assert!(state.search_focused);
         assert_eq!(state.filtered_indices.len(), 6);
 
@@ -1971,6 +2830,7 @@ mod tests {
             Action::Redraw
         );
         assert_eq!(state.search_query, "fir");
+        assert_eq!(state.search_cursor, 3);
         assert_eq!(state.filtered_indices.len(), 1);
         assert_eq!(
             state.all_apps[state.filtered_indices[0]].exe_name,
@@ -2061,10 +2921,21 @@ mod tests {
         );
         assert_eq!(state.selected_count(), 0);
 
-        // Esc, q, and Ctrl+C cancel cleanly.
-        assert_eq!(handle_key(&mut state, press(KeyCode::Esc)), Action::Cancel);
+        // Dirty Esc warns once, then discards on second Esc; Ctrl+C cancels immediately.
+        assert!(state.is_dirty());
+        assert_eq!(handle_key(&mut state, press(KeyCode::Esc)), Action::Redraw);
         assert_eq!(
-            handle_key(&mut state, press(KeyCode::Char('q'))),
+            state.notice.as_deref(),
+            Some("Unsaved changes - Esc again to discard, or s/Enter to save")
+        );
+        assert_eq!(handle_key(&mut state, press(KeyCode::Esc)), Action::Cancel);
+
+        // Clean state cancels immediately on Esc and q.
+        let mut clean = PickerState::new(SplitTunnelConfig::default(), sample_apps());
+        assert!(!clean.is_dirty());
+        assert_eq!(handle_key(&mut clean, press(KeyCode::Esc)), Action::Cancel);
+        assert_eq!(
+            handle_key(&mut clean, press(KeyCode::Char('q'))),
             Action::Cancel
         );
         assert_eq!(handle_key(&mut state, press_ctrl('c')), Action::Cancel);
@@ -2225,5 +3096,683 @@ mod tests {
         assert_eq!(state.cursor, 0);
         assert_eq!(state.scroll_offset, 0);
         let _ = render_to_buffer(&mut state, 46, 18, true);
+    }
+
+    #[test]
+    fn round1_cursor_bg_altgr_paste_filter_guards_and_layout() {
+        let mut state = PickerState::new(SplitTunnelConfig::default(), sample_apps());
+
+        // 1. Cursor row has ACTIVE_BG on app name (no dark background hole).
+        let buf = render_to_buffer(&mut state, 80, 24, true);
+        let text = buffer_text(&buf);
+        let cursor_y = text
+            .lines()
+            .position(|l| l.contains("▸") && l.contains("Discord"))
+            .expect("cursor row with Discord") as u16;
+        let name_x = (0..buf.area.width)
+            .find(|&x| buf[(x, cursor_y)].symbol() == "D")
+            .expect("Discord 'D' cell");
+        assert_eq!(buf[(name_x, cursor_y)].bg, ACTIVE_BG);
+
+        // 2. Uppercase J / K navigate cleanly.
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('J'))),
+            Action::Redraw
+        );
+        assert_eq!(state.cursor, 1);
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('K'))),
+            Action::Redraw
+        );
+        assert_eq!(state.cursor, 0);
+
+        // 3. AltGr (CONTROL | ALT) and Event::Paste work in modal and search.
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('a'))),
+            Action::Redraw
+        );
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        assert_eq!(
+            handle_key(&mut state, KeyEvent::new(KeyCode::Char('\\'), altgr)),
+            Action::Redraw
+        );
+        assert_eq!(
+            handle_key(&mut state, KeyEvent::new(KeyCode::Char('@'), altgr)),
+            Action::Redraw
+        );
+        assert_eq!(state.add_modal.as_ref().unwrap().input, r"\@");
+        assert_eq!(handle_paste(&mut state, "game.exe\r\n"), Action::Redraw);
+        assert_eq!(state.add_modal.as_ref().unwrap().input, r"\@game.exe");
+        // NO_COLOR modal input uses Modifier::REVERSED.
+        let nc_modal = render_to_buffer(&mut state, 80, 24, false);
+        assert_no_rgb_colors(&nc_modal);
+        let nc_modal_text = buffer_text(&nc_modal);
+        let modal_y = nc_modal_text
+            .lines()
+            .position(|l| l.contains(r"\@game.exe"))
+            .expect("modal input row") as u16;
+        let input_x = (0..nc_modal.area.width)
+            .find(|&x| nc_modal[(x, modal_y)].symbol() == "@")
+            .expect("modal input char");
+        assert!(nc_modal[(input_x, modal_y)]
+            .modifier
+            .contains(Modifier::REVERSED));
+        // Minimal view renders active modal input.
+        let min_modal = buffer_text(&render_to_buffer(&mut state, 14, 5, true));
+        assert!(min_modal.contains("game.exe"));
+        assert_eq!(handle_key(&mut state, press(KeyCode::Esc)), Action::Redraw);
+
+        // Search AltGr + Paste + empty-search focused hint + minimal search display.
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('/'))),
+            Action::Redraw
+        );
+        assert_eq!(
+            handle_key(&mut state, KeyEvent::new(KeyCode::Char('@'), altgr)),
+            Action::Redraw
+        );
+        assert_eq!(handle_paste(&mut state, "nomatch\n"), Action::Redraw);
+        assert_eq!(state.search_query, "@nomatch");
+        let empty_search = buffer_text(&render_to_buffer(&mut state, 80, 24, true));
+        assert!(empty_search.contains("Press Esc then 'a' to add custom."));
+        let min_search = buffer_text(&render_to_buffer(&mut state, 14, 5, true));
+        assert!(min_search.contains("nomatch"));
+        assert_eq!(handle_key(&mut state, press_ctrl('u')), Action::Redraw);
+        assert_eq!(handle_key(&mut state, press(KeyCode::Esc)), Action::Redraw);
+
+        // 4. [f] selected-only filter toggles cleanly with header indicator.
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char(' '))),
+            Action::Redraw
+        );
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('f'))),
+            Action::Redraw
+        );
+        assert!(state.only_selected);
+        assert_eq!(state.filtered_indices.len(), 1);
+        let filtered_text = buffer_text(&render_to_buffer(&mut state, 80, 24, true));
+        assert!(filtered_text.contains("1 selected [filter]"));
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('F'))),
+            Action::Redraw
+        );
+        assert!(!state.only_selected);
+        assert_eq!(state.filtered_indices.len(), 6);
+
+        // 5. Mode warnings on save: All mode with checked apps warns on first Enter/s, saves on second.
+        assert_eq!(state.mode, SplitTunnelMode::All);
+        assert_eq!(state.selected_count(), 1);
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('s'))),
+            Action::Redraw
+        );
+        assert!(state
+            .notice
+            .as_deref()
+            .is_some_and(|n| n.contains("All mode ignores checked apps")));
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('s'))),
+            Action::Save
+        );
+
+        // Include mode with 0 checked apps warns on first Enter, saves on second.
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('x'))),
+            Action::Redraw
+        );
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('2'))),
+            Action::Redraw
+        );
+        assert_eq!(handle_key(&mut state, press(KeyCode::Enter)), Action::Redraw);
+        assert!(state
+            .notice
+            .as_deref()
+            .is_some_and(|n| n.contains("Empty Include protects no apps")));
+        assert_eq!(handle_key(&mut state, press(KeyCode::Enter)), Action::Save);
+
+        // 6. MAX_SPLIT_TUNNEL_APPS (256) cap produces inline notice on toggle & modal error on add.
+        let mut big_apps = Vec::with_capacity(MAX_SPLIT_TUNNEL_APPS + 2);
+        let mut preselected = Vec::with_capacity(MAX_SPLIT_TUNNEL_APPS);
+        for i in 0..(MAX_SPLIT_TUNNEL_APPS + 2) {
+            let exe = format!("cap_app_{i:03}.exe");
+            if i < MAX_SPLIT_TUNNEL_APPS {
+                preselected.push(exe.clone());
+            }
+            big_apps.push(DiscoveredApp {
+                display_name: format!("Cap App {i:03}"),
+                exe_name: exe,
+                path: None,
+                is_running: false,
+                category: AppCategory::Installed,
+            });
+        }
+        let mut cap_state = PickerState::new(
+            SplitTunnelConfig {
+                mode: SplitTunnelMode::Exclude,
+                apps: preselected,
+            },
+            big_apps,
+        );
+        assert_eq!(cap_state.selected_count(), MAX_SPLIT_TUNNEL_APPS);
+        cap_state.cursor = MAX_SPLIT_TUNNEL_APPS;
+        assert_eq!(
+            handle_key(&mut cap_state, press(KeyCode::Char(' '))),
+            Action::Redraw
+        );
+        assert_eq!(cap_state.selected_count(), MAX_SPLIT_TUNNEL_APPS);
+        assert!(cap_state
+            .notice
+            .as_deref()
+            .is_some_and(|n| n.contains("Maximum 256 apps reached")));
+
+        handle_key(&mut cap_state, press(KeyCode::Char('a')));
+        assert_eq!(handle_paste(&mut cap_state, "overflow.exe"), Action::Redraw);
+        handle_key(&mut cap_state, press(KeyCode::Enter));
+        assert!(cap_state
+            .add_modal
+            .as_ref()
+            .and_then(|m| m.error.as_deref())
+            .is_some_and(|e| e.contains("Maximum 256 apps reached")));
+    }
+
+    #[test]
+    fn confirmation_notices_never_truncate_at_76_60_and_46_cols() {
+        for kind in [
+            NoticeKind::EmptyIncludeConfirm,
+            NoticeKind::AllModeConfirm,
+            NoticeKind::DiscardConfirm,
+        ] {
+            assert!(
+                display_width(kind.default_text()) <= 70,
+                "default notice exceeds 70 cols: {:?}",
+                kind.default_text()
+            );
+        }
+
+        for &(w, h) in &[(76, 24), (60, 22), (46, 18)] {
+            // 1. Empty Include confirmation notice
+            let mut empty_inc = PickerState::new(
+                SplitTunnelConfig {
+                    mode: SplitTunnelMode::Include,
+                    apps: Vec::new(),
+                },
+                sample_apps(),
+            );
+            assert_eq!(
+                handle_key(&mut empty_inc, press(KeyCode::Char('s'))),
+                Action::Redraw
+            );
+            let buf = render_to_buffer(&mut empty_inc, w, h, true);
+            let text = buffer_text(&buf);
+            let notice_line = text
+                .lines()
+                .find(|l| l.contains("! "))
+                .unwrap_or_else(|| panic!("missing Empty-Include notice at {w}x{h}:\n{text}"));
+            assert!(
+                !notice_line.contains('…'),
+                "Empty-Include notice truncated at {w}x{h}: {notice_line:?}"
+            );
+            assert!(
+                notice_line.contains("to save"),
+                "Empty-Include notice lost 'to save' at {w}x{h}: {notice_line:?}"
+            );
+
+            // 2. All mode with checked apps confirmation notice
+            let mut all_mode = PickerState::new(
+                SplitTunnelConfig {
+                    mode: SplitTunnelMode::All,
+                    apps: vec!["Discord.exe".to_string()],
+                },
+                sample_apps(),
+            );
+            assert_eq!(
+                handle_key(&mut all_mode, press(KeyCode::Enter)),
+                Action::Redraw
+            );
+            let buf = render_to_buffer(&mut all_mode, w, h, true);
+            let text = buffer_text(&buf);
+            let notice_line = text
+                .lines()
+                .find(|l| l.contains("! "))
+                .unwrap_or_else(|| panic!("missing All-mode notice at {w}x{h}:\n{text}"));
+            assert!(
+                !notice_line.contains('…'),
+                "All-mode notice truncated at {w}x{h}: {notice_line:?}"
+            );
+            assert!(
+                notice_line.contains("to save"),
+                "All-mode notice lost 'to save' at {w}x{h}: {notice_line:?}"
+            );
+
+            // 3. Esc unsaved changes confirmation notice
+            let mut dirty = PickerState::new(SplitTunnelConfig::default(), sample_apps());
+            assert_eq!(
+                handle_key(&mut dirty, press(KeyCode::Char(' '))),
+                Action::Redraw
+            );
+            assert_eq!(handle_key(&mut dirty, press(KeyCode::Esc)), Action::Redraw);
+            let buf = render_to_buffer(&mut dirty, w, h, true);
+            let text = buffer_text(&buf);
+            let notice_line = text
+                .lines()
+                .find(|l| l.contains("! "))
+                .unwrap_or_else(|| panic!("missing Esc-unsaved notice at {w}x{h}:\n{text}"));
+            assert!(
+                !notice_line.contains('…'),
+                "Esc-unsaved notice truncated at {w}x{h}: {notice_line:?}"
+            );
+            assert!(
+                notice_line.contains("discard"),
+                "Esc-unsaved notice lost 'discard' at {w}x{h}: {notice_line:?}"
+            );
+            assert!(
+                notice_line.contains("to save"),
+                "Esc-unsaved notice lost 'to save' at {w}x{h}: {notice_line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn modal_ice_blue_style_multiline_paste_and_cursor_navigation() {
+        let mut state = PickerState::new(SplitTunnelConfig::default(), sample_apps());
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('a'))),
+            Action::Redraw
+        );
+
+        // 1. Multiline paste takes ONLY the first non-empty line (never concatenates later lines).
+        assert_eq!(
+            handle_paste(&mut state, "\r\n   \n  alpha.exe  \r\nbeta.exe\ngamma.exe"),
+            Action::Redraw
+        );
+        assert_eq!(state.add_modal.as_ref().unwrap().input, "alpha.exe");
+        assert_eq!(state.add_modal.as_ref().unwrap().cursor, 9);
+
+        // 2. render_add_modal preserves ICE_BLUE fg over ACTIVE_BG on both '>' prompt and '▏' cursor.
+        let buf = render_to_buffer(&mut state, 80, 24, true);
+        let text = buffer_text(&buf);
+        let modal_y = text
+            .lines()
+            .position(|l| l.contains("> alpha.exe▏"))
+            .expect("modal input row with prompt and cursor") as u16;
+        let prompt_x = (0..buf.area.width)
+            .find(|&x| buf[(x, modal_y)].symbol() == ">")
+            .expect("modal '>' prompt cell");
+        let cursor_x = (0..buf.area.width)
+            .find(|&x| buf[(x, modal_y)].symbol() == "▏")
+            .expect("modal '▏' cursor cell");
+        assert_eq!(buf[(prompt_x, modal_y)].fg, ICE_BLUE);
+        assert_eq!(buf[(prompt_x, modal_y)].bg, ACTIVE_BG);
+        assert_eq!(buf[(cursor_x, modal_y)].fg, ICE_BLUE);
+        assert_eq!(buf[(cursor_x, modal_y)].bg, ACTIVE_BG);
+
+        // 3. Cursor Left, Right, Home, End, Delete, Backspace, and mid-string insertion/paste.
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Right)),
+            Action::Ignore
+        );
+        assert_eq!(handle_key(&mut state, press(KeyCode::End)), Action::Ignore);
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Delete)),
+            Action::Ignore
+        );
+
+        // Move left 4 times (including Repeat): "alpha|.exe" (cursor 5).
+        assert_eq!(handle_key(&mut state, press(KeyCode::Left)), Action::Redraw);
+        assert_eq!(
+            handle_key(
+                &mut state,
+                key_with_kind(KeyCode::Left, KeyEventKind::Repeat)
+            ),
+            Action::Redraw
+        );
+        assert_eq!(handle_key(&mut state, press(KeyCode::Left)), Action::Redraw);
+        assert_eq!(handle_key(&mut state, press(KeyCode::Left)), Action::Redraw);
+        assert_eq!(state.add_modal.as_ref().unwrap().cursor, 5);
+
+        // Insert '2' at cursor -> "alpha2.exe" (cursor 6), verify rendered cursor sits mid-string.
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('2'))),
+            Action::Redraw
+        );
+        assert_eq!(state.add_modal.as_ref().unwrap().input, "alpha2.exe");
+        assert_eq!(state.add_modal.as_ref().unwrap().cursor, 6);
+        let mid_text = buffer_text(&render_to_buffer(&mut state, 80, 24, true));
+        assert!(
+            mid_text.contains("> alpha2▏.exe"),
+            "expected mid-string cursor render:\n{mid_text}"
+        );
+
+        // Delete removes '.' at cursor -> "alpha2exe" (cursor stays 6).
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Delete)),
+            Action::Redraw
+        );
+        assert_eq!(state.add_modal.as_ref().unwrap().input, "alpha2exe");
+        assert_eq!(state.add_modal.as_ref().unwrap().cursor, 6);
+
+        // Right moves past 'e' -> cursor 7; Backspace removes 'e' -> "alpha2xe" (cursor 6).
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Right)),
+            Action::Redraw
+        );
+        assert_eq!(state.add_modal.as_ref().unwrap().cursor, 7);
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Backspace)),
+            Action::Redraw
+        );
+        assert_eq!(state.add_modal.as_ref().unwrap().input, "alpha2xe");
+        assert_eq!(state.add_modal.as_ref().unwrap().cursor, 6);
+
+        // Home jumps to 0; Home/Left at 0 are no-ops; Delete removes 'a' -> "lpha2xe".
+        assert_eq!(handle_key(&mut state, press(KeyCode::Home)), Action::Redraw);
+        assert_eq!(state.add_modal.as_ref().unwrap().cursor, 0);
+        assert_eq!(handle_key(&mut state, press(KeyCode::Home)), Action::Ignore);
+        assert_eq!(handle_key(&mut state, press(KeyCode::Left)), Action::Ignore);
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Delete)),
+            Action::Redraw
+        );
+        assert_eq!(state.add_modal.as_ref().unwrap().input, "lpha2xe");
+        assert_eq!(state.add_modal.as_ref().unwrap().cursor, 0);
+
+        // Paste at cursor 0 inserts at start; End jumps to end.
+        assert_eq!(
+            handle_paste(&mut state, "my_\nignored_second_line"),
+            Action::Redraw
+        );
+        assert_eq!(state.add_modal.as_ref().unwrap().input, "my_lpha2xe");
+        assert_eq!(state.add_modal.as_ref().unwrap().cursor, 3);
+        assert_eq!(handle_key(&mut state, press(KeyCode::End)), Action::Redraw);
+        assert_eq!(state.add_modal.as_ref().unwrap().cursor, 10);
+
+        // 4. Wide Unicode / CJK editing and horizontal windowing never panic and keep cursor visible.
+        assert_eq!(handle_key(&mut state, press_ctrl('u')), Action::Redraw);
+        assert_eq!(state.add_modal.as_ref().unwrap().cursor, 0);
+        assert_eq!(
+            handle_paste(&mut state, "日本語テストアプリゲーム名前長いパス.exe\nsecond"),
+            Action::Redraw
+        );
+        assert_eq!(
+            state.add_modal.as_ref().unwrap().input,
+            "日本語テストアプリゲーム名前長いパス.exe"
+        );
+        assert_eq!(handle_key(&mut state, press(KeyCode::Home)), Action::Redraw);
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Right)),
+            Action::Redraw
+        );
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Delete)),
+            Action::Redraw
+        );
+        assert_eq!(
+            state.add_modal.as_ref().unwrap().input,
+            "日語テストアプリゲーム名前長いパス.exe"
+        );
+        let cjk_buf = render_to_buffer(&mut state, 46, 18, true);
+        let cjk_text = buffer_text(&cjk_buf);
+        assert!(
+            cjk_text.contains("日 ▏語") && cjk_text.contains('…'),
+            "expected visible cursor and ellipsis on wide CJK modal render:\n{cjk_text}"
+        );
+    }
+
+    #[test]
+    fn empty_include_mode_hint_matches_fail_closed_behavior() {
+        let mut state = PickerState::new(
+            SplitTunnelConfig {
+                mode: SplitTunnelMode::Include,
+                apps: Vec::new(),
+            },
+            sample_apps(),
+        );
+
+        let buf = render_to_buffer(&mut state, 80, 24, true);
+        let text = buffer_text(&buf);
+        assert!(
+            text.contains("Empty Include protects no apps (check apps below to enable)."),
+            "expected fail-closed empty Include hint:\n{text}"
+        );
+        assert!(
+            !text.contains("falls back"),
+            "contradictory fallback wording must not appear:\n{text}"
+        );
+
+        // Saving empty Include warns with matching fail-closed confirmation notice.
+        assert_eq!(handle_key(&mut state, press(KeyCode::Enter)), Action::Redraw);
+        assert!(state
+            .notice
+            .as_deref()
+            .is_some_and(|n| n.contains("Empty Include protects no apps")));
+
+        // Checking an app updates the mode hint cleanly.
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char(' '))),
+            Action::Redraw
+        );
+        assert_eq!(state.selected_count(), 1);
+        let checked_text = buffer_text(&render_to_buffer(&mut state, 80, 24, true));
+        assert!(
+            checked_text.contains("DPI desync applies ONLY to checked apps."),
+            "expected active Include hint once an app is checked:\n{checked_text}"
+        );
+    }
+
+    #[test]
+    fn search_bar_cursor_navigation_editing_paste_and_windowing() {
+        let mut state = PickerState::new(SplitTunnelConfig::default(), sample_apps());
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('/'))),
+            Action::Redraw
+        );
+        assert!(state.search_focused);
+        assert_eq!(state.search_cursor, 0);
+
+        // Empty search boundary no-ops.
+        for code in [
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::Backspace,
+            KeyCode::Delete,
+        ] {
+            assert_eq!(handle_key(&mut state, press(code)), Action::Ignore);
+        }
+        assert_eq!(handle_key(&mut state, press_ctrl('u')), Action::Ignore);
+
+        // Type "firez" -> cursor 5; Right/End/Delete at end are no-ops.
+        for ch in "firez".chars() {
+            assert_eq!(
+                handle_key(&mut state, press(KeyCode::Char(ch))),
+                Action::Redraw
+            );
+        }
+        assert_eq!(state.search_query, "firez");
+        assert_eq!(state.search_cursor, 5);
+        assert!(state.filtered_indices.is_empty());
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Right)),
+            Action::Ignore
+        );
+        assert_eq!(handle_key(&mut state, press(KeyCode::End)), Action::Ignore);
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Delete)),
+            Action::Ignore
+        );
+
+        // Left moves to 4 ("fire|z"), Delete removes 'z' -> "fire" (cursor 4, matches Firefox).
+        assert_eq!(handle_key(&mut state, press(KeyCode::Left)), Action::Redraw);
+        assert_eq!(state.search_cursor, 4);
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Delete)),
+            Action::Redraw
+        );
+        assert_eq!(state.search_query, "fire");
+        assert_eq!(state.search_cursor, 4);
+        assert_eq!(state.filtered_indices.len(), 1);
+        assert_eq!(
+            state.all_apps[state.filtered_indices[0]].exe_name,
+            "firefox.exe"
+        );
+
+        // Move Left twice (including Repeat): "fi|re" (cursor 2), verify rendered mid-string cursor.
+        assert_eq!(handle_key(&mut state, press(KeyCode::Left)), Action::Redraw);
+        assert_eq!(
+            handle_key(
+                &mut state,
+                key_with_kind(KeyCode::Left, KeyEventKind::Repeat)
+            ),
+            Action::Redraw
+        );
+        assert_eq!(state.search_cursor, 2);
+
+        let buf = render_to_buffer(&mut state, 80, 24, true);
+        let text = buffer_text(&buf);
+        let search_y = text
+            .lines()
+            .position(|l| l.contains("Search: fi▏re"))
+            .unwrap_or_else(|| panic!("expected mid-string search cursor:\n{text}")) as u16;
+        let cursor_x = (0..buf.area.width)
+            .find(|&x| buf[(x, search_y)].symbol() == "▏")
+            .expect("search '▏' cursor cell");
+        assert_eq!(buf[(cursor_x, search_y)].fg, ICE_BLUE);
+
+        let nc_buf = render_to_buffer(&mut state, 80, 24, false);
+        assert_no_rgb_colors(&nc_buf);
+        assert!(buffer_text(&nc_buf).contains("Search: fi▏re"));
+
+        // Mid-string char insert ('z') -> "fizre" (cursor 3); Backspace removes 'z' -> "fire" (cursor 2).
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('z'))),
+            Action::Redraw
+        );
+        assert_eq!(state.search_query, "fizre");
+        assert_eq!(state.search_cursor, 3);
+        assert!(state.filtered_indices.is_empty());
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Backspace)),
+            Action::Redraw
+        );
+        assert_eq!(state.search_query, "fire");
+        assert_eq!(state.search_cursor, 2);
+        assert_eq!(state.filtered_indices.len(), 1);
+
+        // Right (Press + Repeat) walks to end; Home jumps to 0; End jumps back to 4.
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Right)),
+            Action::Redraw
+        );
+        assert_eq!(
+            handle_key(
+                &mut state,
+                key_with_kind(KeyCode::Right, KeyEventKind::Repeat)
+            ),
+            Action::Redraw
+        );
+        assert_eq!(state.search_cursor, 4);
+        assert_eq!(handle_key(&mut state, press(KeyCode::Home)), Action::Redraw);
+        assert_eq!(state.search_cursor, 0);
+        assert_eq!(handle_key(&mut state, press(KeyCode::Home)), Action::Ignore);
+        assert_eq!(handle_key(&mut state, press(KeyCode::Left)), Action::Ignore);
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Backspace)),
+            Action::Ignore
+        );
+        assert_eq!(handle_key(&mut state, press(KeyCode::End)), Action::Redraw);
+        assert_eq!(state.search_cursor, 4);
+        assert_eq!(handle_key(&mut state, press(KeyCode::End)), Action::Ignore);
+
+        // Mid-string multiline paste inserts only first non-empty line at search_cursor.
+        assert_eq!(handle_key(&mut state, press(KeyCode::Left)), Action::Redraw);
+        assert_eq!(handle_key(&mut state, press(KeyCode::Left)), Action::Redraw);
+        assert_eq!(state.search_cursor, 2);
+        assert_eq!(
+            handle_paste(&mut state, "\r\n  xx  \r\nignored_second_line"),
+            Action::Redraw
+        );
+        assert_eq!(state.search_query, "fixxre");
+        assert_eq!(state.search_cursor, 4);
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Backspace)),
+            Action::Redraw
+        );
+        assert_eq!(
+            handle_key(
+                &mut state,
+                key_with_kind(KeyCode::Backspace, KeyEventKind::Repeat)
+            ),
+            Action::Redraw
+        );
+        assert_eq!(state.search_query, "fire");
+        assert_eq!(state.search_cursor, 2);
+        assert_eq!(state.filtered_indices.len(), 1);
+
+        // Re-focusing '/' puts cursor at end; Ctrl+U from normal mode clears query and resets cursor.
+        assert_eq!(handle_key(&mut state, press(KeyCode::Esc)), Action::Redraw);
+        assert!(!state.search_focused);
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('/'))),
+            Action::Redraw
+        );
+        assert!(state.search_focused);
+        assert_eq!(state.search_cursor, 4);
+        assert_eq!(handle_key(&mut state, press(KeyCode::Esc)), Action::Redraw);
+        assert_eq!(handle_key(&mut state, press_ctrl('u')), Action::Redraw);
+        assert!(state.search_query.is_empty());
+        assert_eq!(state.search_cursor, 0);
+
+        // Ctrl+U while focused with mid-string cursor clears query and resets cursor to 0.
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('/'))),
+            Action::Redraw
+        );
+        assert_eq!(handle_paste(&mut state, "chrome"), Action::Redraw);
+        assert_eq!(handle_key(&mut state, press(KeyCode::Left)), Action::Redraw);
+        assert_eq!(handle_key(&mut state, press(KeyCode::Left)), Action::Redraw);
+        assert_eq!(state.search_cursor, 4);
+        assert_eq!(handle_key(&mut state, press_ctrl('u')), Action::Redraw);
+        assert!(state.search_query.is_empty());
+        assert_eq!(state.search_cursor, 0);
+        assert!(state.search_focused);
+        assert_eq!(handle_key(&mut state, press_ctrl('u')), Action::Ignore);
+
+        // Wide Unicode / CJK cursor editing and horizontal windowing in main & minimal views.
+        assert_eq!(
+            handle_paste(&mut state, "日本語テストアプリゲーム名前長いパス\nsecond"),
+            Action::Redraw
+        );
+        assert_eq!(state.search_query, "日本語テストアプリゲーム名前長いパス");
+        assert_eq!(state.search_cursor, 18);
+        assert_eq!(handle_key(&mut state, press(KeyCode::Home)), Action::Redraw);
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Right)),
+            Action::Redraw
+        );
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Delete)),
+            Action::Redraw
+        );
+        assert_eq!(state.search_query, "日語テストアプリゲーム名前長いパス");
+        assert_eq!(state.search_cursor, 1);
+
+        let cjk_buf = render_to_buffer(&mut state, 46, 18, true);
+        let cjk_text = buffer_text(&cjk_buf);
+        assert!(
+            cjk_text.contains("Search: 日 ▏語")
+                && cjk_text.contains('…')
+                && cjk_text.contains("0 / 6 apps"),
+            "expected visible cursor, ellipsis, and count badge on wide CJK search render:\n{cjk_text}"
+        );
+
+        let min_buf = render_to_buffer(&mut state, 14, 5, true);
+        let min_text = buffer_text(&min_buf);
+        assert!(
+            min_text.contains("/日 ▏語") && min_text.contains('…'),
+            "expected visible cursor and ellipsis on wide CJK minimal search render:\n{min_text}"
+        );
     }
 }

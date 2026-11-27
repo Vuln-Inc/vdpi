@@ -38,6 +38,14 @@ const RULE: &str = "────────────────────
 
 const GITHUB_LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/Vuln-Inc/vdpi/releases/latest";
+const GITHUB_API_HOST: &str = "api.github.com";
+const MAX_RELEASE_API_REDIRECT_HOPS: usize = 5;
+const ALLOWED_GITHUB_DOWNLOAD_HOSTS: &[&str] = &[
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+    "codeload.github.com",
+];
 const RELEASE_API_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_RELEASE_API_BYTES: usize = 2 * 1024 * 1024;
 const DIAG_DNS_TIMEOUT: Duration = Duration::from_secs(6);
@@ -143,8 +151,8 @@ impl EventReaderGuard {
         let (tx, rx) = mpsc::channel::<Event>(32);
 
         let handle = std::thread::spawn(move || {
-            while !flag.load(Ordering::Relaxed) {
-                match event::poll(Duration::from_millis(50)) {
+            while !flag.load(Ordering::Acquire) {
+                match event::poll(Duration::from_millis(15)) {
                     Ok(true) => match event::read() {
                         Ok(ev) => {
                             if tx.blocking_send(ev).is_err() {
@@ -176,10 +184,42 @@ impl EventReaderGuard {
 
 impl Drop for EventReaderGuard {
     fn drop(&mut self) {
-        self.stop_flag.store(true, Ordering::Relaxed);
+        self.stop_flag.store(true, Ordering::Release);
         self.ev_rx = None;
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
+        }
+    }
+}
+
+/// RAII guard that aborts an owned background task handle on drop, error return,
+/// or panic unwind so in-flight update checks can never leak past the TUI.
+struct TaskAbortGuard<T> {
+    handle: Option<JoinHandle<T>>,
+}
+
+impl<T> TaskAbortGuard<T> {
+    fn new(handle: JoinHandle<T>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    fn replace(&mut self, handle: JoinHandle<T>) {
+        if let Some(prev) = self.handle.replace(handle) {
+            prev.abort();
+        }
+    }
+
+    fn clear(&mut self) {
+        self.handle = None;
+    }
+}
+
+impl<T> Drop for TaskAbortGuard<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
         }
     }
 }
@@ -863,17 +903,66 @@ async fn read_response_text_bounded(
     String::from_utf8(buf).with_context(|| format!("{label} response was not valid UTF-8"))
 }
 
-async fn fetch_latest_release() -> Result<ReleaseCheckInfo> {
+fn is_allowed_release_api_redirect_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case(GITHUB_API_HOST)
+        || ALLOWED_GITHUB_DOWNLOAD_HOSTS
+            .iter()
+            .any(|allowed| host.eq_ignore_ascii_case(allowed))
+}
+
+fn validate_release_api_redirect_hop(next_url: &reqwest::Url, previous_hops: usize) -> Result<()> {
+    if previous_hops > MAX_RELEASE_API_REDIRECT_HOPS {
+        bail!("too many redirects (exceeded {MAX_RELEASE_API_REDIRECT_HOPS}-hop limit)");
+    }
+    if next_url.scheme() != "https" {
+        bail!("refusing non-HTTPS redirect from GitHub Releases API: {next_url}");
+    }
+    if !next_url.username().is_empty() || next_url.password().is_some() {
+        bail!(
+            "refusing URL with embedded credentials in GitHub Releases API redirect: {next_url}"
+        );
+    }
+    if next_url.port_or_known_default() != Some(443) {
+        bail!("refusing non-standard HTTPS port in GitHub Releases API redirect: {next_url}");
+    }
+    let host = next_url.host_str().ok_or_else(|| {
+        anyhow!("GitHub Releases API redirect URL is missing a host: {next_url}")
+    })?;
+    if !is_allowed_release_api_redirect_host(host) {
+        bail!(
+            "refusing untrusted redirect host '{host}' from GitHub Releases API (only {GITHUB_API_HOST} and GitHub release hosts are allowed)"
+        );
+    }
+    Ok(())
+}
+
+fn build_release_api_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        match validate_release_api_redirect_hop(attempt.url(), attempt.previous().len()) {
+            Ok(()) => attempt.follow(),
+            Err(err) => attempt.error(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                err.to_string(),
+            )),
+        }
+    })
+}
+
+fn build_release_api_client() -> Result<reqwest::Client> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let user_agent = format!("vdpi/{}", env!("CARGO_PKG_VERSION"));
-    let client = reqwest::Client::builder()
+    reqwest::Client::builder()
         .user_agent(&user_agent)
         .https_only(true)
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .redirect(build_release_api_redirect_policy())
         .timeout(RELEASE_API_TIMEOUT)
         .build()
-        .context("failed to build HTTP client")?;
+        .context("failed to build HTTP client")
+}
+
+async fn fetch_latest_release() -> Result<ReleaseCheckInfo> {
+    let client = build_release_api_client()?;
 
     let installed_handle = tokio::task::spawn_blocking(vdpi::service::detect_installed_info);
 
@@ -890,12 +979,7 @@ async fn fetch_latest_release() -> Result<ReleaseCheckInfo> {
             resp.status().as_u16()
         );
     }
-    if resp.url().scheme() != "https" {
-        bail!(
-            "refusing non-HTTPS redirect from GitHub Releases API: {}",
-            resp.url()
-        );
-    }
+    validate_release_api_redirect_hop(resp.url(), 0)?;
 
     let body_text =
         read_response_text_bounded(resp, MAX_RELEASE_API_BYTES, "GitHub Releases API").await?;
@@ -989,7 +1073,13 @@ fn handle_update_key(state: &mut UpdateTuiState, key: KeyEvent) -> UpdateKeyActi
         }
         _ if key.kind != KeyEventKind::Press => UpdateKeyAction::Ignore,
         KeyCode::Esc | KeyCode::Char('q' | 'Q') => UpdateKeyAction::Back,
-        KeyCode::Char('r' | 'R') => UpdateKeyAction::Recheck,
+        KeyCode::Char('r' | 'R') => {
+            if matches!(state.phase, UpdatePhase::Checking) {
+                UpdateKeyAction::Ignore
+            } else {
+                UpdateKeyAction::Recheck
+            }
+        }
         KeyCode::Char('u' | 'U') => match &state.phase {
             UpdatePhase::Available(info) => UpdateKeyAction::Install(info.clone()),
             _ => UpdateKeyAction::Ignore,
@@ -1094,10 +1184,61 @@ fn render_meta_row(
     if area.is_empty() {
         return;
     }
+    let width = usize::from(area.width);
     let padded_label = format!("{label:<10}");
+    let label_len = padded_label.chars().count();
+    if width <= label_len {
+        frame.render_widget(
+            Line::from(Span::styled(
+                truncate_text(&padded_label, width),
+                palette.label,
+            )),
+            area,
+        );
+        return;
+    }
+
+    let mut remaining = width - label_len;
     let mut spans = Vec::with_capacity(value_spans.len() + 1);
     spans.push(Span::styled(padded_label, palette.label));
-    spans.extend(value_spans);
+
+    let total_val_len: usize = value_spans
+        .iter()
+        .map(|s| s.content.chars().count())
+        .sum();
+    if total_val_len <= remaining {
+        spans.extend(value_spans);
+    } else {
+        let last_non_empty = value_spans
+            .iter()
+            .rposition(|s| !s.content.is_empty())
+            .unwrap_or(0);
+        for (idx, span) in value_spans.into_iter().enumerate() {
+            if remaining == 0 {
+                break;
+            }
+            let len = span.content.chars().count();
+            let has_more = idx < last_non_empty;
+            if len < remaining || (len == remaining && !has_more) {
+                remaining -= len;
+                spans.push(span);
+            } else if remaining == 1 {
+                spans.push(Span::styled("…", span.style));
+                remaining = 0;
+            } else if len == remaining && has_more {
+                let mut out: String = span.content.chars().take(remaining - 1).collect();
+                out.push('…');
+                spans.push(Span::styled(out, span.style));
+                remaining = 0;
+            } else {
+                spans.push(Span::styled(
+                    truncate_text(span.content.as_ref(), remaining),
+                    span.style,
+                ));
+                remaining = 0;
+            }
+        }
+    }
     frame.render_widget(Line::from(spans), area);
 }
 
@@ -1163,7 +1304,13 @@ fn render_update_tui(frame: &mut Frame<'_>, state: &mut UpdateTuiState, color: b
             },
             palette.ice_bold,
         ),
-        UpdatePhase::Unknown(_) => ("● Check complete".to_string(), palette.amber_bold),
+        UpdatePhase::Unknown(_) => (
+            format!(
+                "{} Check complete",
+                if color { "●" } else { palette.warn_icon }
+            ),
+            palette.amber_bold,
+        ),
         UpdatePhase::Error(_) => ("✕ Check failed".to_string(), palette.red_bold),
     };
 
@@ -1411,27 +1558,49 @@ fn render_update_tui(frame: &mut Frame<'_>, state: &mut UpdateTuiState, color: b
         }
         UpdatePhase::Error(err_msg) => {
             if y < content_bottom {
-                frame.render_widget(
+                let heading_line = if width > 2 {
                     Line::from(vec![
                         Span::styled("✕ ", palette.red_bold),
-                        Span::styled("Unable to check for updates", palette.red_bold),
-                    ]),
-                    row(y),
-                );
+                        Span::styled(
+                            truncate_text("Unable to check for updates", width - 2),
+                            palette.red_bold,
+                        ),
+                    ])
+                } else {
+                    Line::from(Span::styled(
+                        truncate_text("✕ Unable to check for updates", width),
+                        palette.red_bold,
+                    ))
+                };
+                frame.render_widget(heading_line, row(y));
                 y = y.saturating_add(1);
             }
             if y < content_bottom {
                 y = y.saturating_add(1);
             }
 
-            let err_lines: Vec<Line<'static>> =
-                wrap_words(&err_msg, width.saturating_sub(2).max(1))
-                    .into_iter()
-                    .map(|text| Line::from(Span::styled(text, palette.body_text)))
-                    .collect();
             let avail_rows = usize::from(content_bottom.saturating_sub(y));
             let hint_reserve = usize::from(avail_rows >= 3);
             let viewport_rows = avail_rows.saturating_sub(hint_reserve);
+
+            let first_pass = wrap_words(&err_msg, width);
+            let needs_scrollbar =
+                first_pass.len() > viewport_rows && width >= 12 && viewport_rows > 0;
+            let text_width = if needs_scrollbar {
+                width.saturating_sub(2)
+            } else {
+                width
+            };
+            let wrapped = if needs_scrollbar {
+                wrap_words(&err_msg, text_width)
+            } else {
+                first_pass
+            };
+            let err_lines: Vec<Line<'static>> = wrapped
+                .into_iter()
+                .map(|text| Line::from(Span::styled(text, palette.body_text)))
+                .collect();
+
             state.last_total_rows = err_lines.len();
             state.last_viewport_rows = viewport_rows;
             let max_scroll = state.last_total_rows.saturating_sub(viewport_rows);
@@ -1444,7 +1613,23 @@ fn render_update_tui(frame: &mut Frame<'_>, state: &mut UpdateTuiState, color: b
                 .enumerate()
             {
                 let ry = y.saturating_add(offset as u16);
-                frame.render_widget(line, Rect::new(inner.x, ry, inner.width, 1));
+                frame.render_widget(line, Rect::new(inner.x, ry, text_width as u16, 1));
+            }
+            if needs_scrollbar {
+                let bar_area = Rect::new(
+                    inner.x.saturating_add(inner.width.saturating_sub(1)),
+                    y,
+                    1,
+                    viewport_rows as u16,
+                );
+                render_scrollbar(
+                    frame,
+                    bar_area,
+                    state.last_total_rows,
+                    viewport_rows,
+                    state.scroll,
+                    palette,
+                );
             }
             if hint_reserve > 0 {
                 let hint_y = content_bottom.saturating_sub(1);
@@ -1473,10 +1658,17 @@ fn render_update_tui(frame: &mut Frame<'_>, state: &mut UpdateTuiState, color: b
                 }
             }
             UpdatePhase::Available(_) => {
-                if width >= 46 {
+                if width >= 43 {
                     vec![
                         ("u", "install"),
                         ("r", "re-check"),
+                        ("↑↓", "scroll"),
+                        ("q", "back"),
+                    ]
+                } else if width >= 40 {
+                    vec![
+                        ("u", "install"),
+                        ("r", "check"),
                         ("↑↓", "scroll"),
                         ("q", "back"),
                     ]
@@ -1484,7 +1676,13 @@ fn render_update_tui(frame: &mut Frame<'_>, state: &mut UpdateTuiState, color: b
                     vec![("u", "install"), ("r", "check"), ("q", "back")]
                 }
             }
-            UpdatePhase::Error(_) => vec![("r", "retry"), ("q", "back")],
+            UpdatePhase::Error(_) => {
+                if state.last_total_rows > state.last_viewport_rows {
+                    vec![("r", "retry"), ("↑↓", "scroll"), ("q", "back")]
+                } else {
+                    vec![("r", "retry"), ("q", "back")]
+                }
+            }
         };
         render_footer_hints(frame, row(footer_y), &hints, palette);
     }
@@ -1501,7 +1699,7 @@ fn render_whats_new_section(
     state: &mut UpdateTuiState,
     palette: Palette,
 ) {
-    if area.is_empty() {
+    if area.is_empty() || area.height < 2 {
         state.last_viewport_rows = 0;
         state.last_total_rows = 0;
         return;
@@ -1533,7 +1731,7 @@ fn render_whats_new_section(
 
     // Section title row: "What's New" + optional scroll range indicator
     let title = "What's New";
-    if needs_scrollbar && body_rows_available > 0 {
+    if needs_scrollbar {
         let start = state.scroll + 1;
         let end = (state.scroll + body_rows_available).min(lines.len());
         let indicator = format!("{start}-{end}/{}", lines.len());
@@ -1549,13 +1747,19 @@ fn render_whats_new_section(
             );
         } else {
             frame.render_widget(
-                Line::from(Span::styled(title, palette.section_title)),
+                Line::from(Span::styled(
+                    truncate_text(title, width),
+                    palette.section_title,
+                )),
                 Rect::new(area.x, y, area.width, 1),
             );
         }
     } else {
         frame.render_widget(
-            Line::from(Span::styled(title, palette.section_title)),
+            Line::from(Span::styled(
+                truncate_text(title, width),
+                palette.section_title,
+            )),
             Rect::new(area.x, y, area.width, 1),
         );
     }
@@ -1630,16 +1834,20 @@ pub async fn run_update_tui(cfg: &RuntimeConfig) -> Result<Option<String>> {
 
     let (check_tx, mut check_rx) = mpsc::channel::<(u64, Result<ReleaseCheckInfo, String>)>(4);
     let mut active_check_id: u64 = 1;
-    let mut check_task: Option<JoinHandle<()>> =
-        Some(spawn_release_check(active_check_id, check_tx.clone()));
+    let mut check_task = TaskAbortGuard::new(spawn_release_check(active_check_id, check_tx.clone()));
 
     let mut spinner = tokio::time::interval(SPINNER_INTERVAL);
     spinner.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    spinner.tick().await;
+    let mut dirty = true;
 
     let install_target: Option<ReleaseCheckInfo> = loop {
-        guard
-            .terminal
-            .draw(|frame| render_update_tui(frame, &mut state, color))?;
+        if dirty {
+            guard
+                .terminal
+                .draw(|frame| render_update_tui(frame, &mut state, color))?;
+            dirty = false;
+        }
 
         tokio::select! {
             maybe_ev = ev_reader.recv() => {
@@ -1647,19 +1855,21 @@ pub async fn run_update_tui(cfg: &RuntimeConfig) -> Result<Option<String>> {
                     break None;
                 };
                 match ev {
-                    Event::Resize(..) => {}
+                    Event::Resize(..) => {
+                        dirty = true;
+                    }
                     Event::Key(key) => match handle_update_key(&mut state, key) {
                         UpdateKeyAction::Ignore => {}
-                        UpdateKeyAction::Redraw => {}
+                        UpdateKeyAction::Redraw => {
+                            dirty = true;
+                        }
                         UpdateKeyAction::Recheck => {
-                            if let Some(handle) = check_task.take() {
-                                handle.abort();
-                            }
                             active_check_id = active_check_id.saturating_add(1);
                             state.phase = UpdatePhase::Checking;
                             state.spinner_tick = 0;
                             state.scroll = 0;
-                            check_task = Some(spawn_release_check(active_check_id, check_tx.clone()));
+                            check_task.replace(spawn_release_check(active_check_id, check_tx.clone()));
+                            dirty = true;
                         }
                         UpdateKeyAction::Install(info) => {
                             break Some(info);
@@ -1674,20 +1884,20 @@ pub async fn run_update_tui(cfg: &RuntimeConfig) -> Result<Option<String>> {
             maybe_res = check_rx.recv() => {
                 if let Some((id, res)) = maybe_res {
                     if id == active_check_id {
-                        check_task = None;
+                        check_task.clear();
                         state.apply_check_result(res);
+                        dirty = true;
                     }
                 }
             }
             _ = spinner.tick(), if matches!(state.phase, UpdatePhase::Checking) => {
                 state.spinner_tick = state.spinner_tick.wrapping_add(1);
+                dirty = true;
             }
         }
     };
 
-    if let Some(handle) = check_task.take() {
-        handle.abort();
-    }
+    drop(check_task);
 
     // Always drop EventReaderGuard BEFORE TerminalGuard so the terminal is fully
     // restored for sudo/Touch ID/Windows UAC prompts or clean return to Control Center.
@@ -1726,7 +1936,39 @@ fn spawn_release_check(
 // Screen 2: Interactive Live Network Diagnostics TUI (`run_diagnostics_tui`)
 // ============================================================================
 
+const DIAG_IDX_SERVICE: usize = 0;
+const DIAG_IDX_VPN: usize = 1;
+#[cfg(target_os = "windows")]
+const DIAG_IDX_WINTUN: usize = 2;
+#[cfg(target_os = "windows")]
+const DIAG_IDX_DOH: usize = 3;
+#[cfg(not(target_os = "windows"))]
+const DIAG_IDX_DOH: usize = 2;
+#[cfg(target_os = "windows")]
+const DIAG_IDX_DISCORD: usize = 4;
+#[cfg(not(target_os = "windows"))]
+const DIAG_IDX_DISCORD: usize = 3;
+#[cfg(target_os = "windows")]
+const DIAG_IDX_ROBLOX: usize = 5;
+#[cfg(not(target_os = "windows"))]
+const DIAG_IDX_ROBLOX: usize = 4;
+
+#[cfg(target_os = "windows")]
+const DIAG_CHECK_COUNT: usize = 6;
+#[cfg(not(target_os = "windows"))]
 const DIAG_CHECK_COUNT: usize = 5;
+
+#[cfg(target_os = "windows")]
+const DIAG_CHECK_NAMES: [&str; DIAG_CHECK_COUNT] = [
+    "Service & Engine",
+    "VPN & Split Tunnel",
+    "Wintun Driver (wintun.dll)",
+    "Encrypted DNS (DoH)",
+    "TLS Handshake (discord.com)",
+    "TLS Handshake (roblox.com)",
+];
+
+#[cfg(not(target_os = "windows"))]
 const DIAG_CHECK_NAMES: [&str; DIAG_CHECK_COUNT] = [
     "Service & Engine",
     "VPN & Split Tunnel",
@@ -1796,11 +2038,25 @@ enum DiagKeyAction {
     Back,
 }
 
+fn diag_dns_check_name(cfg: &RuntimeConfig) -> &'static str {
+    let (_, _, transport, _) = doh_check_target(cfg);
+    if transport == "DoH" {
+        "Encrypted DNS (DoH)"
+    } else {
+        "DNS Resolution (UDP)"
+    }
+}
+
 impl DiagnosticsTuiState {
-    fn new_running() -> Self {
+    fn new_running(cfg: &RuntimeConfig) -> Self {
+        let dns_name = diag_dns_check_name(cfg);
         Self {
             items: std::array::from_fn(|idx| DiagCheckItem {
-                name: DIAG_CHECK_NAMES[idx],
+                name: if idx == DIAG_IDX_DOH {
+                    dns_name
+                } else {
+                    DIAG_CHECK_NAMES[idx]
+                },
                 status: DiagStatus::Running,
             }),
             spinner_tick: 0,
@@ -1865,7 +2121,7 @@ impl DiagnosticsTuiState {
         } else if done < DIAG_CHECK_COUNT {
             format!("Diagnostics cancelled ({done}/{DIAG_CHECK_COUNT} complete, {passed} passed)")
         } else {
-            format!("Diagnostics complete ({passed}/{DIAG_CHECK_COUNT} passed)")
+            format!("Diagnostics finished with issues ({passed}/{DIAG_CHECK_COUNT} passed)")
         }
     }
 
@@ -1971,7 +2227,13 @@ fn handle_diag_key(state: &mut DiagnosticsTuiState, key: KeyEvent) -> DiagKeyAct
             }
         }
         _ if key.kind != KeyEventKind::Press => DiagKeyAction::Ignore,
-        KeyCode::Char('r' | 'R') => DiagKeyAction::Rerun,
+        KeyCode::Char('r' | 'R') => {
+            if state.is_running() {
+                DiagKeyAction::Ignore
+            } else {
+                DiagKeyAction::Rerun
+            }
+        }
         KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q' | 'Q') => DiagKeyAction::Back,
         _ => DiagKeyAction::Ignore,
     }
@@ -2096,59 +2358,110 @@ fn normalize_loopback_ip(ip: IpAddr) -> Option<IpAddr> {
     }
 }
 
-async fn run_doh_check(cfg: &RuntimeConfig) -> DiagStatus {
+fn doh_check_target(cfg: &RuntimeConfig) -> (String, String, &'static str, bool) {
     let dns_addr = if cfg.dns_addr.trim().is_empty() {
         "1.1.1.1".to_string()
     } else {
         cfg.dns_addr.trim().to_string()
     };
-    let transport = if cfg.enable_doh { "DoH" } else { "UDP" };
-    let started = Instant::now();
+    let dns_display = sanitize_single_line(&vdpi_core::dns::redact_dns_for_display(&dns_addr));
+    let effective_doh = vdpi_core::dns::effective_enable_doh(&dns_addr, cfg.enable_doh);
+    let transport = if vdpi_core::dns::is_effective_doh_target(&dns_addr, cfg.enable_doh) {
+        "DoH"
+    } else {
+        "UDP"
+    };
+    (dns_addr, dns_display, transport, effective_doh)
+}
 
-    let resolver =
-        match DnsResolver::new(&dns_addr, cfg.dns_port, cfg.enable_doh, cfg.dns_ipv4_only) {
-            Ok(r) => r,
-            Err(err) => {
-                return DiagStatus::Fail {
-                    summary: format!("Resolver init failed ({dns_addr})"),
-                    detail: Some(sanitize_single_line(&format!("{err:#}"))),
-                    latency_ms: Some(started.elapsed().as_millis()),
-                };
-            }
-        };
+fn sanitize_doh_error_detail(raw_err: &str, dns_addr: &str, dns_display: &str) -> String {
+    let url_redacted = vdpi_core::dns::redact_urls_in_text(raw_err);
+    let redacted = if !dns_addr.is_empty() && dns_addr != dns_display {
+        url_redacted.replace(dns_addr, dns_display)
+    } else {
+        url_redacted
+    };
+    sanitize_single_line(&redacted)
+}
 
-    let outcome = tokio::time::timeout(DIAG_DNS_TIMEOUT, resolver.resolve("discord.com")).await;
-    let latency_ms = started.elapsed().as_millis();
+fn format_doh_init_error(
+    dns_addr: &str,
+    dns_display: &str,
+    raw_err: &str,
+    latency_ms: u128,
+) -> DiagStatus {
+    DiagStatus::Fail {
+        summary: format!("Resolver init failed ({dns_display})"),
+        detail: Some(sanitize_doh_error_detail(raw_err, dns_addr, dns_display)),
+        latency_ms: Some(latency_ms),
+    }
+}
 
+fn evaluate_doh_outcome(
+    dns_addr: &str,
+    dns_display: &str,
+    transport: &str,
+    outcome: std::result::Result<Result<Vec<IpAddr>>, ()>,
+    latency_ms: u128,
+) -> DiagStatus {
     match outcome {
         Ok(Ok(ips)) if !ips.is_empty() => {
             let first = ips[0].to_string();
             let noun = if ips.len() == 1 { "IP" } else { "IPs" };
             DiagStatus::Pass {
                 summary: format!("discord.com resolved ({} {noun})", ips.len()),
-                detail: Some(format!("{transport} via {dns_addr} · {first}")),
+                detail: Some(format!("{transport} via {dns_display} · {first}")),
                 latency_ms: Some(latency_ms),
             }
         }
         Ok(Ok(_)) => DiagStatus::Fail {
             summary: "No IP addresses returned".to_string(),
-            detail: Some(format!("{transport} via {dns_addr}")),
+            detail: Some(format!("{transport} via {dns_display}")),
             latency_ms: Some(latency_ms),
         },
         Ok(Err(err)) => DiagStatus::Fail {
             summary: format!("{transport} lookup failed"),
-            detail: Some(sanitize_single_line(&format!("{err:#}"))),
+            detail: Some(sanitize_doh_error_detail(
+                &format!("{err:#}"),
+                dns_addr,
+                dns_display,
+            )),
             latency_ms: Some(latency_ms),
         },
-        Err(_) => DiagStatus::Fail {
+        Err(()) => DiagStatus::Fail {
             summary: format!("{transport} lookup timed out"),
             detail: Some(format!(
-                "No reply from {dns_addr} within {}s",
+                "No reply from {dns_display} within {}s",
                 DIAG_DNS_TIMEOUT.as_secs()
             )),
             latency_ms: Some(latency_ms),
         },
     }
+}
+
+async fn run_doh_check(cfg: &RuntimeConfig) -> DiagStatus {
+    let (dns_addr, dns_display, transport, effective_doh) = doh_check_target(cfg);
+    let started = Instant::now();
+
+    let resolver =
+        match DnsResolver::new(&dns_addr, cfg.dns_port, effective_doh, cfg.dns_ipv4_only) {
+            Ok(r) => r,
+            Err(err) => {
+                return format_doh_init_error(
+                    &dns_addr,
+                    &dns_display,
+                    &format!("{err:#}"),
+                    started.elapsed().as_millis(),
+                );
+            }
+        };
+
+    let outcome = tokio::time::timeout(DIAG_DNS_TIMEOUT, resolver.resolve("discord.com"))
+        .await
+        .map_err(|_| ());
+    let latency_ms = started.elapsed().as_millis();
+
+    evaluate_doh_outcome(&dns_addr, &dns_display, transport, outcome, latency_ms)
 }
 
 #[derive(Debug, Clone)]
@@ -2237,24 +2550,70 @@ async fn run_tls_handshake_check(host: &str, path: TlsProbePath) -> DiagStatus {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn evaluate_wintun_check(
+    result: Result<std::path::PathBuf, String>,
+    tun_configured: bool,
+) -> DiagStatus {
+    match result {
+        Ok(path) => DiagStatus::Pass {
+            summary: format!(
+                "wintun.dll v{} verified",
+                vdpi::platform::windows_tun::WINTUN_VERSION
+            ),
+            detail: Some(sanitize_single_line(&path.display().to_string())),
+            latency_ms: None,
+        },
+        Err(err) => {
+            let lower = sanitize_single_line(&err).to_ascii_lowercase();
+            let hash_mismatch =
+                lower.contains("sha-256") || lower.contains("hash") || lower.contains("mismatch");
+            let detail =
+                "Extract all files from the zip (keep wintun.dll beside vdpi.exe).".to_string();
+            if tun_configured {
+                DiagStatus::Fail {
+                    summary: if hash_mismatch {
+                        "wintun.dll corrupted or mismatched (required for TUN)".to_string()
+                    } else {
+                        "wintun.dll missing or invalid (required for TUN)".to_string()
+                    },
+                    detail: Some(detail),
+                    latency_ms: None,
+                }
+            } else {
+                DiagStatus::Warn {
+                    summary: if hash_mismatch {
+                        "wintun.dll corrupted or mismatched (Proxy ok; needed for TUN)".to_string()
+                    } else {
+                        "wintun.dll missing or invalid (Proxy ok; needed for TUN)".to_string()
+                    },
+                    detail: Some(detail),
+                    latency_ms: None,
+                }
+            }
+        }
+    }
+}
+
 fn spawn_diagnostics_run(
     tasks: &mut JoinSet<()>,
     run_id: u64,
     cfg: RuntimeConfig,
     tx: mpsc::Sender<(u64, usize, DiagStatus)>,
 ) {
-    // Check 3 (Encrypted DNS / DoH) runs immediately in parallel with service probe.
+    // Encrypted DNS (DoH) runs immediately in parallel with service probe.
     {
         let cfg_dns = cfg.clone();
         let tx_dns = tx.clone();
         tasks.spawn(async move {
             let status = run_doh_check(&cfg_dns).await;
-            let _ = tx_dns.send((run_id, 2, status)).await;
+            let _ = tx_dns.send((run_id, DIAG_IDX_DOH, status)).await;
         });
     }
 
-    // Check 1 & 2 probe Control Center status, then immediately launch Check 4 & 5
-    // over the discovered path (active local Proxy vs TUN vs Direct).
+    // Service & VPN checks probe Control Center status, then immediately launch
+    // Windows Wintun preflight (when on Windows) and TLS handshakes over the
+    // discovered path (active local Proxy vs TUN vs Direct).
     tasks.spawn(async move {
         let cfg_probe = cfg.clone();
         let cc_status = tokio::task::spawn_blocking(move || {
@@ -2270,10 +2629,10 @@ fn spawn_diagnostics_run(
         });
 
         let service_result = evaluate_service_engine_check(&cc_status);
-        let _ = tx.send((run_id, 0, service_result)).await;
+        let _ = tx.send((run_id, DIAG_IDX_SERVICE, service_result)).await;
 
         let vpn_result = evaluate_vpn_split_check(&cc_status, &cfg);
-        let _ = tx.send((run_id, 1, vpn_result)).await;
+        let _ = tx.send((run_id, DIAG_IDX_VPN, vpn_result)).await;
 
         let tls_path = match cc_status.live_engine.as_ref() {
             Some(live) if live.engine == EngineMode::Proxy => {
@@ -2287,20 +2646,44 @@ fn spawn_diagnostics_run(
             _ => TlsProbePath::Direct,
         };
 
+        #[cfg(target_os = "windows")]
+        let wintun_fut = {
+            let tx_wintun = tx.clone();
+            let tun_configured = cfg.engine == EngineMode::Tun
+                || cc_status.configured_engine == EngineMode::Tun
+                || cc_status
+                    .live_engine
+                    .as_ref()
+                    .is_some_and(|live| live.engine == EngineMode::Tun);
+            async move {
+                let wintun_res = tokio::task::spawn_blocking(|| {
+                    vdpi::platform::windows_tun::find_verified_wintun_dll()
+                        .map_err(|err| format!("{err:#}"))
+                })
+                .await
+                .unwrap_or_else(|err| Err(format!("wintun check task failed: {err}")));
+                let status = evaluate_wintun_check(wintun_res, tun_configured);
+                let _ = tx_wintun.send((run_id, DIAG_IDX_WINTUN, status)).await;
+            }
+        };
+
         let tx_discord = tx.clone();
         let path_discord = tls_path.clone();
         let discord_fut = async move {
             let status = run_tls_handshake_check("discord.com", path_discord).await;
-            let _ = tx_discord.send((run_id, 3, status)).await;
+            let _ = tx_discord.send((run_id, DIAG_IDX_DISCORD, status)).await;
         };
 
         let tx_roblox = tx;
         let path_roblox = tls_path;
         let roblox_fut = async move {
             let status = run_tls_handshake_check("roblox.com", path_roblox).await;
-            let _ = tx_roblox.send((run_id, 4, status)).await;
+            let _ = tx_roblox.send((run_id, DIAG_IDX_ROBLOX, status)).await;
         };
 
+        #[cfg(target_os = "windows")]
+        tokio::join!(wintun_fut, discord_fut, roblox_fut);
+        #[cfg(not(target_os = "windows"))]
         tokio::join!(discord_fut, roblox_fut);
     });
 }
@@ -2619,7 +3002,13 @@ fn render_diagnostics_tui(frame: &mut Frame<'_>, state: &mut DiagnosticsTuiState
     let mut footer_y = bottom;
     if show_footer && footer_y > y {
         footer_y = footer_y.saturating_sub(1);
-        let hints: Vec<(&str, &str)> = if width >= 46 {
+        let hints: Vec<(&str, &str)> = if state.is_running() {
+            if width >= 26 {
+                vec![("↑↓", "scroll"), ("enter / q", "back")]
+            } else {
+                vec![("↑↓", "scroll"), ("q", "back")]
+            }
+        } else if width >= 46 {
             vec![("r", "re-run"), ("↑↓", "scroll"), ("enter / q", "back")]
         } else {
             vec![("r", "re-run"), ("↑↓", "scroll"), ("q", "back")]
@@ -2641,7 +3030,7 @@ fn render_diagnostics_tui(frame: &mut Frame<'_>, state: &mut DiagnosticsTuiState
 /// Control Center with a concise summary string.
 pub async fn run_diagnostics_tui(cfg: RuntimeConfig) -> Result<String> {
     if !is_interactive_tty() {
-        let mut state = DiagnosticsTuiState::new_running();
+        let mut state = DiagnosticsTuiState::new_running(&cfg);
         let (tx, mut rx) = mpsc::channel::<(u64, usize, DiagStatus)>(16);
         let mut tasks = JoinSet::new();
         spawn_diagnostics_run(&mut tasks, 1, cfg, tx);
@@ -2657,7 +3046,7 @@ pub async fn run_diagnostics_tui(cfg: RuntimeConfig) -> Result<String> {
     }
 
     let color = color_enabled();
-    let mut state = DiagnosticsTuiState::new_running();
+    let mut state = DiagnosticsTuiState::new_running(&cfg);
 
     let mut guard =
         TerminalGuard::enter().context("failed to initialize Network Diagnostics TUI")?;
@@ -2670,13 +3059,18 @@ pub async fn run_diagnostics_tui(cfg: RuntimeConfig) -> Result<String> {
 
     let mut spinner = tokio::time::interval(SPINNER_INTERVAL);
     spinner.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    spinner.tick().await;
+    let mut dirty = true;
 
     loop {
         while tasks.try_join_next().is_some() {}
 
-        guard
-            .terminal
-            .draw(|frame| render_diagnostics_tui(frame, &mut state, color))?;
+        if dirty {
+            guard
+                .terminal
+                .draw(|frame| render_diagnostics_tui(frame, &mut state, color))?;
+            dirty = false;
+        }
 
         tokio::select! {
             maybe_ev = ev_reader.recv() => {
@@ -2684,16 +3078,21 @@ pub async fn run_diagnostics_tui(cfg: RuntimeConfig) -> Result<String> {
                     break;
                 };
                 match ev {
-                    Event::Resize(..) => {}
+                    Event::Resize(..) => {
+                        dirty = true;
+                    }
                     Event::Key(key) => match handle_diag_key(&mut state, key) {
                         DiagKeyAction::Ignore => {}
-                        DiagKeyAction::Redraw => {}
+                        DiagKeyAction::Redraw => {
+                            dirty = true;
+                        }
                         DiagKeyAction::Rerun => {
                             tasks.abort_all();
                             while tasks.try_join_next().is_some() {}
                             run_id = run_id.saturating_add(1);
                             state.reset_running();
                             spawn_diagnostics_run(&mut tasks, run_id, cfg.clone(), res_tx.clone());
+                            dirty = true;
                         }
                         DiagKeyAction::Back => break,
                     },
@@ -2704,11 +3103,13 @@ pub async fn run_diagnostics_tui(cfg: RuntimeConfig) -> Result<String> {
                 if let Some((id, idx, status)) = maybe_res {
                     if id == run_id {
                         state.set_result(idx, status);
+                        dirty = true;
                     }
                 }
             }
             _ = spinner.tick(), if state.is_running() => {
                 state.spinner_tick = state.spinner_tick.wrapping_add(1);
+                dirty = true;
             }
         }
     }
@@ -2849,9 +3250,9 @@ mod tests {
     }
 
     fn sample_all_pass_diag() -> DiagnosticsTuiState {
-        let mut state = DiagnosticsTuiState::new_running();
+        let mut state = DiagnosticsTuiState::new_running(&RuntimeConfig::default());
         state.set_result(
-            0,
+            DIAG_IDX_SERVICE,
             DiagStatus::Pass {
                 summary: "TUN active (utun4)".to_string(),
                 detail: Some("v0.5.6 · 18.4 MB RSS · desync combo".to_string()),
@@ -2859,15 +3260,27 @@ mod tests {
             },
         );
         state.set_result(
-            1,
+            DIAG_IDX_VPN,
             DiagStatus::Pass {
                 summary: "No VPN conflict · Include (2 apps)".to_string(),
                 detail: None,
                 latency_ms: None,
             },
         );
+        #[cfg(target_os = "windows")]
         state.set_result(
-            2,
+            DIAG_IDX_WINTUN,
+            DiagStatus::Pass {
+                summary: format!(
+                    "wintun.dll v{} verified",
+                    vdpi::platform::windows_tun::WINTUN_VERSION
+                ),
+                detail: Some(r"C:\Program Files\vdpi\bin\wintun.dll".to_string()),
+                latency_ms: None,
+            },
+        );
+        state.set_result(
+            DIAG_IDX_DOH,
             DiagStatus::Pass {
                 summary: "discord.com resolved (4 IPs)".to_string(),
                 detail: Some("DoH via 1.1.1.1 · 162.159.135.232".to_string()),
@@ -2875,7 +3288,7 @@ mod tests {
             },
         );
         state.set_result(
-            3,
+            DIAG_IDX_DISCORD,
             DiagStatus::Pass {
                 summary: "TLS verified (HTTP 200)".to_string(),
                 detail: Some("Via active TUN engine".to_string()),
@@ -2883,7 +3296,7 @@ mod tests {
             },
         );
         state.set_result(
-            4,
+            DIAG_IDX_ROBLOX,
             DiagStatus::Pass {
                 summary: "TLS verified (HTTP 301)".to_string(),
                 detail: Some("Via active TUN engine".to_string()),
@@ -2894,9 +3307,9 @@ mod tests {
     }
 
     fn sample_mixed_diag() -> DiagnosticsTuiState {
-        let mut state = DiagnosticsTuiState::new_running();
+        let mut state = DiagnosticsTuiState::new_running(&RuntimeConfig::default());
         state.set_result(
-            0,
+            DIAG_IDX_SERVICE,
             DiagStatus::Pass {
                 summary: "Proxy active (127.0.0.1:8080)".to_string(),
                 detail: Some("v0.5.6 · 14.2 MB RSS".to_string()),
@@ -2904,15 +3317,27 @@ mod tests {
             },
         );
         state.set_result(
-            1,
+            DIAG_IDX_VPN,
             DiagStatus::Warn {
                 summary: "VPN conflict: WireGuard (wg0)".to_string(),
                 detail: Some("Split tunnel: Exclude (1 app)".to_string()),
                 latency_ms: None,
             },
         );
+        #[cfg(target_os = "windows")]
         state.set_result(
-            2,
+            DIAG_IDX_WINTUN,
+            DiagStatus::Pass {
+                summary: format!(
+                    "wintun.dll v{} verified",
+                    vdpi::platform::windows_tun::WINTUN_VERSION
+                ),
+                detail: Some(r"C:\Program Files\vdpi\bin\wintun.dll".to_string()),
+                latency_ms: None,
+            },
+        );
+        state.set_result(
+            DIAG_IDX_DOH,
             DiagStatus::Pass {
                 summary: "discord.com resolved (2 IPs)".to_string(),
                 detail: Some("DoH via 94.140.14.14 · 162.159.136.232".to_string()),
@@ -2920,7 +3345,7 @@ mod tests {
             },
         );
         state.set_result(
-            3,
+            DIAG_IDX_DISCORD,
             DiagStatus::Pass {
                 summary: "TLS verified (HTTP 200)".to_string(),
                 detail: Some("Via local proxy 127.0.0.1:8080".to_string()),
@@ -2928,7 +3353,7 @@ mod tests {
             },
         );
         state.set_result(
-            4,
+            DIAG_IDX_ROBLOX,
             DiagStatus::Fail {
                 summary: "TLS handshake failed".to_string(),
                 detail: Some(
@@ -3083,11 +3508,11 @@ mod tests {
 
         for &(w, h) in &sizes {
             for &color in &[true, false] {
-                // 1. Running (partial progress 2/5)
-                let mut running = DiagnosticsTuiState::new_running();
+                // 1. Running (partial progress 2/DIAG_CHECK_COUNT)
+                let mut running = DiagnosticsTuiState::new_running(&RuntimeConfig::default());
                 running.spinner_tick = 2;
                 running.set_result(
-                    0,
+                    DIAG_IDX_SERVICE,
                     DiagStatus::Pass {
                         summary: "TUN active (utun4)".to_string(),
                         detail: None,
@@ -3095,7 +3520,7 @@ mod tests {
                     },
                 );
                 running.set_result(
-                    1,
+                    DIAG_IDX_VPN,
                     DiagStatus::Pass {
                         summary: "No VPN conflict · All apps".to_string(),
                         detail: None,
@@ -3105,19 +3530,28 @@ mod tests {
                 let buf = render_diag_buf(&mut running, w, h, color);
                 assert_outer_card_borders(&buf, color);
                 let text = buffer_text(&buf);
+                let expected_progress = format!("2/{DIAG_CHECK_COUNT}");
                 assert!(
-                    text.contains("2/5"),
-                    "missing live progress 2/5 at {w}x{h}:\n{text}"
+                    text.contains(&expected_progress),
+                    "missing live progress {expected_progress} at {w}x{h}:\n{text}"
                 );
                 assert!(
                     text.contains("Service & Engine"),
                     "missing check 1 at {w}x{h}:\n{text}"
                 );
+                assert!(
+                    !text.contains("re-run"),
+                    "running diagnostics footer must hide 'r re-run' at {w}x{h}:\n{text}"
+                );
+                assert!(
+                    text.contains("↑↓ scroll") && text.contains("back"),
+                    "running diagnostics footer missing scroll/back hints at {w}x{h}:\n{text}"
+                );
                 if !color {
                     assert_no_rgb_colors(&buf);
                 }
 
-                // 2. All pass (5/5)
+                // 2. All pass
                 let mut all_pass = sample_all_pass_diag();
                 let buf = render_diag_buf(&mut all_pass, w, h, color);
                 assert_outer_card_borders(&buf, color);
@@ -3127,9 +3561,15 @@ mod tests {
                     "missing all-passed pill at {w}x{h}:\n{text}"
                 );
                 assert!(
-                    text.contains("28 ms"),
-                    "missing DNS latency at {w}x{h}:\n{text}"
+                    text.contains("r re-run"),
+                    "completed diagnostics footer missing 'r re-run' at {w}x{h}:\n{text}"
                 );
+                if h >= 22 {
+                    assert!(
+                        text.contains("28 ms"),
+                        "missing DNS latency at {w}x{h}:\n{text}"
+                    );
+                }
                 if !color {
                     assert_no_rgb_colors(&buf);
                 }
@@ -3146,6 +3586,10 @@ mod tests {
                 assert!(
                     text.contains("WireGuard"),
                     "missing VPN warn summary at {w}x{h}:\n{text}"
+                );
+                assert!(
+                    text.contains("r re-run"),
+                    "completed mixed diagnostics footer missing 'r re-run' at {w}x{h}:\n{text}"
                 );
                 if !color {
                     assert_no_rgb_colors(&buf);
@@ -3238,10 +3682,36 @@ mod tests {
     #[test]
     fn diagnostics_key_handling_and_summary_strings() {
         let state = sample_all_pass_diag();
-        assert_eq!(state.summary_string(), "Diagnostics passed (5/5)");
+        assert_eq!(
+            state.summary_string(),
+            format!("Diagnostics passed ({DIAG_CHECK_COUNT}/{DIAG_CHECK_COUNT})")
+        );
+
+        let mut warn_only = sample_all_pass_diag();
+        warn_only.set_result(
+            DIAG_IDX_VPN,
+            DiagStatus::Warn {
+                summary: "VPN conflict: WireGuard (wg0)".to_string(),
+                detail: None,
+                latency_ms: None,
+            },
+        );
+        assert_eq!(
+            warn_only.summary_string(),
+            format!(
+                "Diagnostics finished with issues ({}/{DIAG_CHECK_COUNT} passed)",
+                DIAG_CHECK_COUNT - 1
+            )
+        );
 
         let mut mixed = sample_mixed_diag();
-        assert_eq!(mixed.summary_string(), "Diagnostics complete (3/5 passed)");
+        assert_eq!(
+            mixed.summary_string(),
+            format!(
+                "Diagnostics finished with issues ({}/{DIAG_CHECK_COUNT} passed)",
+                DIAG_CHECK_COUNT - 2
+            )
+        );
         let _ = render_diag_buf(&mut mixed, 46, 18, true);
         assert!(mixed.last_total_rows > mixed.last_viewport_rows);
 
@@ -3276,10 +3746,519 @@ mod tests {
             DiagKeyAction::Back
         );
 
-        let running = DiagnosticsTuiState::new_running();
+        let mut running = DiagnosticsTuiState::new_running(&RuntimeConfig::default());
         assert_eq!(
             running.summary_string(),
-            "Diagnostics cancelled (0/5 complete, 0 passed)"
+            format!("Diagnostics cancelled (0/{DIAG_CHECK_COUNT} complete, 0 passed)")
         );
+        // Pressing 'r' / 'R' while diagnostics are already running is ignored.
+        assert_eq!(
+            handle_diag_key(&mut running, press(KeyCode::Char('r'))),
+            DiagKeyAction::Ignore
+        );
+        assert_eq!(
+            handle_diag_key(&mut running, press(KeyCode::Char('R'))),
+            DiagKeyAction::Ignore
+        );
+    }
+
+    #[test]
+    fn update_polish_recheck_guard_error_scroll_available_footer_unknown_no_color_and_truncation() {
+        // 1. Pressing 'r' while Checking is ignored so rapid mash does not pile up tasks.
+        let mut checking = UpdateTuiState::new_checking("0.5.6");
+        assert_eq!(
+            handle_update_key(&mut checking, press(KeyCode::Char('r'))),
+            UpdateKeyAction::Ignore
+        );
+        assert_eq!(
+            handle_update_key(&mut checking, press(KeyCode::Char('R'))),
+            UpdateKeyAction::Ignore
+        );
+
+        // 2. Available footer at 46x18 (inner width 42) keeps "↑↓ scroll" and "q back".
+        let mut available = UpdateTuiState::new_checking("0.5.5");
+        available.apply_check_result(Ok(sample_available_info()));
+        let buf_46 = render_update_buf(&mut available, 46, 18, true);
+        let text_46 = buffer_text(&buf_46);
+        assert!(
+            text_46.contains("↑↓ scroll") && text_46.contains("q back"),
+            "expected scroll hint and back hint in 46x18 Available footer:\n{text_46}"
+        );
+
+        // 3. Error state overflow renders scrollbar and includes "↑↓ scroll" in footer.
+        let mut errored = UpdateTuiState::new_checking("0.5.6");
+        errored.apply_check_result(Err(
+            "GitHub Releases API failed with a long chain of TLS and proxy errors: \
+             upstream connection reset while negotiating TLS 1.3 handshake with \
+             api.github.com on port 443 after multiple retry attempts across fallback \
+             resolvers and system proxy configurations."
+                .to_string(),
+        ));
+        let err_buf = render_update_buf(&mut errored, 46, 14, true);
+        let err_text = buffer_text(&err_buf);
+        assert!(errored.last_total_rows > errored.last_viewport_rows);
+        assert!(
+            err_text.contains('┃') || err_text.contains('│'),
+            "expected scrollbar in overflowing UpdatePhase::Error:\n{err_text}"
+        );
+        assert!(
+            err_text.contains("↑↓ scroll"),
+            "expected scroll hint in overflowing UpdatePhase::Error footer:\n{err_text}"
+        );
+
+        // 4. Unknown version relation uses warn_icon ("!") under NO_COLOR=1.
+        let mut unknown = UpdateTuiState::new_checking("0.5.6");
+        let mut unknown_info = sample_up_to_date_info();
+        unknown_info.relation = VersionRelation::Unknown;
+        unknown_info.latest_tag = "nightly-build-very-long-tag-identifier-20261127".to_string();
+        unknown.apply_check_result(Ok(unknown_info));
+        let unk_buf = render_update_buf(&mut unknown, 46, 18, false);
+        let unk_text = buffer_text(&unk_buf);
+        assert!(
+            unk_text.contains("! Check complete"),
+            "expected NO_COLOR '!' icon for VersionRelation::Unknown:\n{unk_text}"
+        );
+        assert_no_rgb_colors(&unk_buf);
+        // Long tag value is truncated inside the card without breaking the right border.
+        for y in 1..unk_buf.area.height - 1 {
+            assert_eq!(unk_buf[(45, y)].symbol(), "│");
+        }
+
+        // 5. Short height where body_rows_available == 0 does not render orphaned "What's New".
+        let mut short_up_to_date = UpdateTuiState::new_checking("0.5.6");
+        short_up_to_date.apply_check_result(Ok(sample_up_to_date_info()));
+        let short_buf = render_update_buf(&mut short_up_to_date, 46, 8, true);
+        let short_text = buffer_text(&short_buf);
+        assert!(
+            !short_text.contains("What's New"),
+            "orphaned What's New heading rendered with 0 body rows:\n{short_text}"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_wintun_diagnostics_check_reports_pass_warn_and_fail() {
+        let expected_detail =
+            "Extract all files from the zip (keep wintun.dll beside vdpi.exe).";
+        let assert_no_raw_cache_paths = |summary: &str, detail: &str| {
+            for leaked in [
+                "ProgramData",
+                "AppData",
+                "vdpi-runtime",
+                "runtime",
+                "checked:",
+                "deadbeef",
+            ] {
+                assert!(
+                    !summary.contains(leaked) && !detail.contains(leaked),
+                    "wintun diagnostics leaked internal token {leaked:?} (summary={summary:?}, detail={detail:?})"
+                );
+            }
+        };
+
+        let pass = evaluate_wintun_check(
+            Ok(std::path::PathBuf::from(r"C:\Program Files\vdpi\bin\wintun.dll")),
+            true,
+        );
+        assert!(matches!(
+            pass,
+            DiagStatus::Pass { ref summary, detail: Some(ref detail), .. }
+                if summary.contains("wintun.dll") && detail.contains("wintun.dll")
+        ));
+
+        let raw_missing_err = r"wintun.dll (v0.14.1) not found beside vdpi executable or runtime cache (checked: C:\Users\demo\vdpi\wintun.dll, C:\ProgramData\vdpi\runtime\wintun-0.14.1.dll, C:\Users\demo\AppData\Local\vdpi\runtime\wintun-0.14.1.dll, C:\Users\demo\AppData\Local\Temp\vdpi-runtime\wintun-0.14.1.dll); place the verified amd64 wintun.dll next to vdpi.exe";
+
+        let warn_proxy = evaluate_wintun_check(Err(raw_missing_err.to_string()), false);
+        match warn_proxy {
+            DiagStatus::Warn {
+                summary,
+                detail: Some(detail),
+                ..
+            } => {
+                assert!(summary.contains("wintun.dll missing or invalid"));
+                assert_eq!(detail, expected_detail);
+                assert_no_raw_cache_paths(&summary, &detail);
+            }
+            other => panic!("expected Warn for missing wintun with Proxy mode, got {other:?}"),
+        }
+
+        let fail_tun = evaluate_wintun_check(Err(raw_missing_err.to_string()), true);
+        match fail_tun {
+            DiagStatus::Fail {
+                summary,
+                detail: Some(detail),
+                ..
+            } => {
+                assert!(summary.contains("wintun.dll missing or invalid"));
+                assert_eq!(detail, expected_detail);
+                assert_no_raw_cache_paths(&summary, &detail);
+            }
+            other => panic!("expected Fail for missing wintun with TUN mode, got {other:?}"),
+        }
+
+        let raw_hash_err = r"wintun.dll SHA-256 verification failed for C:\ProgramData\vdpi\runtime\wintun-0.14.1.dll: expected deadbeef, got badc0de";
+        let fail_hash = evaluate_wintun_check(Err(raw_hash_err.to_string()), true);
+        match fail_hash {
+            DiagStatus::Fail {
+                summary,
+                detail: Some(detail),
+                ..
+            } => {
+                assert!(summary.contains("wintun.dll") && summary.contains("corrupted or mismatched"));
+                assert!(!summary.contains("SHA-256"));
+                assert_eq!(detail, expected_detail);
+                assert_no_raw_cache_paths(&summary, &detail);
+            }
+            other => panic!("expected Fail for corrupted/mismatched wintun with TUN mode, got {other:?}"),
+        }
+
+        let warn_hash = evaluate_wintun_check(Err(raw_hash_err.to_string()), false);
+        match warn_hash {
+            DiagStatus::Warn {
+                summary,
+                detail: Some(detail),
+                ..
+            } => {
+                assert!(summary.contains("wintun.dll") && summary.contains("corrupted or mismatched"));
+                assert!(!summary.contains("SHA-256"));
+                assert_eq!(detail, expected_detail);
+                assert_no_raw_cache_paths(&summary, &detail);
+            }
+            other => panic!("expected Warn for corrupted/mismatched wintun with Proxy mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn doh_check_redacts_custom_urls_and_uses_effective_enable_doh() {
+        let nextdns_cfg = RuntimeConfig {
+            dns_addr: "https://dns.nextdns.io/a1b2c3".to_string(),
+            enable_doh: false, // --no-doh + https:// must still report DoH
+            ..RuntimeConfig::default()
+        };
+
+        let (dns_addr, dns_display, transport, effective_doh) = doh_check_target(&nextdns_cfg);
+        assert_eq!(dns_addr, "https://dns.nextdns.io/a1b2c3");
+        assert_eq!(dns_display, "https://dns.nextdns.io");
+        assert_eq!(transport, "DoH");
+        assert!(effective_doh);
+
+        let assert_no_secret = |status: &DiagStatus| {
+            let (summary, detail) = match status {
+                DiagStatus::Pass {
+                    summary, detail, ..
+                }
+                | DiagStatus::Warn {
+                    summary, detail, ..
+                }
+                | DiagStatus::Fail {
+                    summary, detail, ..
+                } => (summary.as_str(), detail.as_deref().unwrap_or("")),
+                DiagStatus::Running => panic!("unexpected Running status"),
+            };
+            assert!(
+                !summary.contains("a1b2c3") && !detail.contains("a1b2c3"),
+                "leaked NextDNS profile ID (summary={summary:?}, detail={detail:?})"
+            );
+        };
+
+        let init_err = format_doh_init_error(
+            &dns_addr,
+            &dns_display,
+            "failed to build client for https://dns.nextdns.io/a1b2c3",
+            12,
+        );
+        assert_no_secret(&init_err);
+        assert!(matches!(
+            init_err,
+            DiagStatus::Fail {
+                ref summary,
+                detail: Some(ref detail),
+                ..
+            } if summary == "Resolver init failed (https://dns.nextdns.io)"
+                && detail.contains("https://dns.nextdns.io")
+        ));
+
+        let pass = evaluate_doh_outcome(
+            &dns_addr,
+            &dns_display,
+            transport,
+            Ok(Ok(vec![IpAddr::V4(Ipv4Addr::new(162, 159, 135, 232))])),
+            25,
+        );
+        assert_no_secret(&pass);
+        assert!(matches!(
+            pass,
+            DiagStatus::Pass {
+                detail: Some(ref detail),
+                ..
+            } if detail == "DoH via https://dns.nextdns.io · 162.159.135.232"
+        ));
+
+        let empty = evaluate_doh_outcome(&dns_addr, &dns_display, transport, Ok(Ok(vec![])), 25);
+        assert_no_secret(&empty);
+        assert!(matches!(
+            empty,
+            DiagStatus::Fail {
+                detail: Some(ref detail),
+                ..
+            } if detail == "DoH via https://dns.nextdns.io"
+        ));
+
+        let lookup_err = evaluate_doh_outcome(
+            &dns_addr,
+            &dns_display,
+            transport,
+            Ok(Err(anyhow!("request to https://dns.nextdns.io/a1b2c3 failed"))),
+            25,
+        );
+        assert_no_secret(&lookup_err);
+        assert!(matches!(
+            lookup_err,
+            DiagStatus::Fail {
+                ref summary,
+                detail: Some(ref detail),
+                ..
+            } if summary == "DoH lookup failed" && detail.contains("https://dns.nextdns.io")
+        ));
+
+        let timed_out = evaluate_doh_outcome(&dns_addr, &dns_display, transport, Err(()), 6000);
+        assert_no_secret(&timed_out);
+        assert!(matches!(
+            timed_out,
+            DiagStatus::Fail {
+                ref summary,
+                detail: Some(ref detail),
+                ..
+            } if summary == "DoH lookup timed out"
+                && detail.contains("No reply from https://dns.nextdns.io within")
+        ));
+
+        // Valid ControlD profile URL with query is redacted to scheme://host and uses DoH.
+        let controld_cfg = RuntimeConfig {
+            dns_addr: "https://freedns.controld.com/p2profile99?device=laptop".to_string(),
+            enable_doh: true,
+            ..RuntimeConfig::default()
+        };
+        let (_, cd_display, cd_transport, cd_doh) = doh_check_target(&controld_cfg);
+        assert_eq!(cd_display, "https://freedns.controld.com");
+        assert_eq!(cd_transport, "DoH");
+        assert!(cd_doh);
+        for secret in ["p2profile99", "device", "laptop"] {
+            assert!(!cd_display.contains(secret));
+        }
+
+        // Malformed https:// URLs (empty host, missing host, userinfo/fragment) must NOT be
+        // treated as valid DoH transport and must still redact safely.
+        for malformed in [
+            "https://",
+            "https:///secret-path",
+            "https://user:***@freedns.controld.com/p2profile99?device=laptop#frag",
+        ] {
+            let bad_cfg = RuntimeConfig {
+                dns_addr: malformed.to_string(),
+                enable_doh: true,
+                ..RuntimeConfig::default()
+            };
+            let (_, bad_display, bad_transport, _) = doh_check_target(&bad_cfg);
+            assert_eq!(
+                bad_transport, "UDP",
+                "malformed https:// URL must not report DoH transport: {malformed}"
+            );
+            for secret in ["user", "secret-path", "p2profile99", "device", "frag"] {
+                assert!(
+                    !bad_display.contains(secret),
+                    "malformed https:// display leaked {secret:?}: {bad_display:?}"
+                );
+            }
+            let bad_state = DiagnosticsTuiState::new_running(&bad_cfg);
+            assert_eq!(bad_state.items[DIAG_IDX_DOH].name, "DNS Resolution (UDP)");
+        }
+
+        // Bare IP + --no-doh stays UDP.
+        let udp_cfg = RuntimeConfig {
+            dns_addr: "9.9.9.9".to_string(),
+            enable_doh: false,
+            ..RuntimeConfig::default()
+        };
+        let (_, udp_display, udp_transport, udp_doh) = doh_check_target(&udp_cfg);
+        assert_eq!(udp_display, "9.9.9.9");
+        assert_eq!(udp_transport, "UDP");
+        assert!(!udp_doh);
+        assert_eq!(
+            DiagnosticsTuiState::new_running(&udp_cfg).items[DIAG_IDX_DOH].name,
+            "DNS Resolution (UDP)"
+        );
+
+        // Blank dns_addr defaults to 1.1.1.1.
+        let blank_cfg = RuntimeConfig {
+            dns_addr: "   ".to_string(),
+            enable_doh: false,
+            ..RuntimeConfig::default()
+        };
+        let (blank_addr, blank_display, blank_transport, blank_doh) = doh_check_target(&blank_cfg);
+        assert_eq!(blank_addr, "1.1.1.1");
+        assert_eq!(blank_display, "1.1.1.1");
+        assert_eq!(blank_transport, "UDP");
+        assert!(!blank_doh);
+
+        // Bare custom non-DoH IPs (e.g. ControlD bare IP 76.76.2.0 or LAN 10.0.0.53) display UDP
+        // even when enable_doh=true, matching is_effective_doh_target, and use the UDP row heading.
+        let bare_custom_cfg = RuntimeConfig {
+            dns_addr: "76.76.2.0".to_string(),
+            enable_doh: true,
+            ..RuntimeConfig::default()
+        };
+        let (bc_addr, bc_display, bc_transport, bc_doh) = doh_check_target(&bare_custom_cfg);
+        assert_eq!(bc_addr, "76.76.2.0");
+        assert_eq!(bc_display, "76.76.2.0");
+        assert_eq!(bc_transport, "UDP");
+        assert!(bc_doh);
+        let mut bc_state = DiagnosticsTuiState::new_running(&bare_custom_cfg);
+        assert_eq!(bc_state.items[DIAG_IDX_DOH].name, "DNS Resolution (UDP)");
+        let bc_pass = evaluate_doh_outcome(
+            &bc_addr,
+            &bc_display,
+            bc_transport,
+            Ok(Ok(vec![IpAddr::V4(Ipv4Addr::new(162, 159, 135, 232))])),
+            18,
+        );
+        assert!(matches!(
+            bc_pass,
+            DiagStatus::Pass {
+                detail: Some(ref detail),
+                ..
+            } if detail == "UDP via 76.76.2.0 · 162.159.135.232"
+        ));
+        bc_state.set_result(DIAG_IDX_DOH, bc_pass);
+        let bc_buf = render_diag_buf(&mut bc_state, 80, 24, true);
+        let bc_text = buffer_text(&bc_buf);
+        assert!(
+            bc_text.contains("DNS Resolution (UDP)") && !bc_text.contains("Encrypted DNS (DoH)"),
+            "UDP DNS diagnostics row must not show Encrypted DNS (DoH) heading:\n{bc_text}"
+        );
+
+        let lan_cfg = RuntimeConfig {
+            dns_addr: "10.0.0.53".to_string(),
+            enable_doh: true,
+            ..RuntimeConfig::default()
+        };
+        let (_, lan_display, lan_transport, _) = doh_check_target(&lan_cfg);
+        assert_eq!(lan_display, "10.0.0.53");
+        assert_eq!(lan_transport, "UDP");
+        assert_eq!(
+            DiagnosticsTuiState::new_running(&lan_cfg).items[DIAG_IDX_DOH].name,
+            "DNS Resolution (UDP)"
+        );
+
+        // Known public DoH IP with enable_doh=true and valid custom DoH URLs use DoH row heading.
+        let quad9_doh_cfg = RuntimeConfig {
+            dns_addr: "9.9.9.9".to_string(),
+            enable_doh: true,
+            ..RuntimeConfig::default()
+        };
+        let (_, q9_display, q9_transport, q9_doh) = doh_check_target(&quad9_doh_cfg);
+        assert_eq!(q9_display, "9.9.9.9");
+        assert_eq!(q9_transport, "DoH");
+        assert!(q9_doh);
+        assert_eq!(
+            DiagnosticsTuiState::new_running(&quad9_doh_cfg).items[DIAG_IDX_DOH].name,
+            "Encrypted DNS (DoH)"
+        );
+        assert_eq!(
+            DiagnosticsTuiState::new_running(&nextdns_cfg).items[DIAG_IDX_DOH].name,
+            "Encrypted DNS (DoH)"
+        );
+
+        // sanitize_doh_error_detail runs redact_urls_in_text first so normalized host case/default
+        // port or uppercase schemes never leak profile tokens, queries, or userinfo.
+        let norm_err = sanitize_doh_error_detail(
+            "error sending request for url (https://dns.nextdns.io/a1b2c3/profile?token=secret): timed out",
+            "https://DNS.NEXTDNS.IO:443/a1b2c3/profile?token=secret",
+            "https://dns.nextdns.io",
+        );
+        assert!(norm_err.contains("https://dns.nextdns.io"));
+        for leaked in ["a1b2c3", "profile", "token", "secret"] {
+            assert!(
+                !norm_err.contains(leaked),
+                "sanitize_doh_error_detail leaked {leaked:?}: {norm_err:?}"
+            );
+        }
+        let scheme_case_err = sanitize_doh_error_detail(
+            "connect failed to HTTPS://user:pw@freedns.controld.com/p2?k=v\nextra",
+            "https://freedns.controld.com/p2?k=v",
+            "https://freedns.controld.com",
+        );
+        assert!(scheme_case_err.contains("https://freedns.controld.com"));
+        for leaked in ["user", "pw", "/p2", "k=v"] {
+            assert!(
+                !scheme_case_err.contains(leaked),
+                "sanitize_doh_error_detail leaked {leaked:?}: {scheme_case_err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn release_api_redirect_policy_validates_every_hop() {
+        for (hop, url_str) in [
+            (
+                1,
+                "https://api.github.com/repos/Vuln-Inc/vdpi/releases/latest",
+            ),
+            (
+                2,
+                "https://API.GITHUB.COM/repositories/123456/releases/latest",
+            ),
+            (3, "https://github.com/Vuln-Inc/vdpi/releases/latest"),
+            (
+                4,
+                "https://objects.githubusercontent.com/github-production-release-asset/123",
+            ),
+            (
+                5,
+                "https://release-assets.githubusercontent.com/github-production-release-asset/456",
+            ),
+            (
+                MAX_RELEASE_API_REDIRECT_HOPS,
+                "https://codeload.github.com/Vuln-Inc/vdpi/zip/refs/tags/v0.5.6",
+            ),
+        ] {
+            let parsed = reqwest::Url::parse(url_str).expect("parse allowed redirect hop");
+            validate_release_api_redirect_hop(&parsed, hop)
+                .unwrap_or_else(|e| panic!("hop {hop} to {url_str} must be allowed: {e:#}"));
+        }
+
+        for (hop, url_str) in [
+            (
+                1,
+                "http://api.github.com/repos/Vuln-Inc/vdpi/releases/latest",
+            ),
+            (1, "http://github.com/Vuln-Inc/vdpi/releases/latest"),
+            (1, "https://evil.example/repos/Vuln-Inc/vdpi/releases/latest"),
+            (
+                1,
+                "https://api.github.com.evil.example/repos/Vuln-Inc/vdpi/releases/latest",
+            ),
+            (1, "https://127.0.0.1/repos/Vuln-Inc/vdpi/releases/latest"),
+            (
+                1,
+                "https://api.github.com:8443/repos/Vuln-Inc/vdpi/releases/latest",
+            ),
+            (
+                1,
+                "https://token@api.github.com/repos/Vuln-Inc/vdpi/releases/latest",
+            ),
+            (
+                MAX_RELEASE_API_REDIRECT_HOPS + 1,
+                "https://api.github.com/repos/Vuln-Inc/vdpi/releases/latest",
+            ),
+        ] {
+            let parsed = reqwest::Url::parse(url_str).expect("parse rejected redirect hop");
+            assert!(
+                validate_release_api_redirect_hop(&parsed, hop).is_err(),
+                "expected rejected redirect hop {hop} -> {url_str}"
+            );
+        }
+
+        build_release_api_client().expect("release API client with custom redirect policy builds");
     }
 }

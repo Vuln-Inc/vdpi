@@ -56,17 +56,35 @@ struct SettingsView: View {
         isPresetDns(dnsAddr) ? "" : dnsAddr
     }
 
+    private func isSameDnsEndpoint(_ lhs: String, _ rhs: String) -> Bool {
+        let a = lhs.trimmingCharacters(in: .whitespacesAndNewlines)
+        let b = rhs.trimmingCharacters(in: .whitespacesAndNewlines)
+        if a.lowercased().hasPrefix("https://") || b.lowercased().hasPrefix("https://") {
+            return a == b
+        }
+        return a.caseInsensitiveCompare(b) == .orderedSame
+    }
+
+    private var isHttpsDohActive: Bool {
+        manager.settings.dnsAddr
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .hasPrefix("https://")
+    }
+
     private var isCustomDnsActive: Bool {
         let current = manager.settings.dnsAddr
         guard !isPresetDns(current) else { return false }
         let trimmed = dnsDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.caseInsensitiveCompare(current) == .orderedSame
+        let needsDohEnable = trimmed.lowercased().hasPrefix("https://") && !manager.settings.enableDoh
+        return !needsDohEnable && isSameDnsEndpoint(trimmed, current)
     }
 
     private var canApplyDns: Bool {
         let trimmed = dnsDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
-        return trimmed.caseInsensitiveCompare(manager.settings.dnsAddr) != .orderedSame
+        let needsDohEnable = trimmed.lowercased().hasPrefix("https://") && !manager.settings.enableDoh
+        return needsDohEnable || !isSameDnsEndpoint(trimmed, manager.settings.dnsAddr)
     }
 
     private var canAddBypass: Bool {
@@ -443,12 +461,15 @@ struct SettingsView: View {
 
                     toggleRow(
                         title: "DNS over HTTPS",
+                        subtitle: isHttpsDohActive ? "Always enabled for custom https:// resolvers" : nil,
                         isOn: Binding(
-                            get: { manager.settings.enableDoh },
+                            get: { isHttpsDohActive || manager.settings.enableDoh },
                             set: { val in
+                                guard !isHttpsDohActive else { return }
                                 manager.updateSettings { $0.enableDoh = val }
                             }
-                        )
+                        ),
+                        disabled: isHttpsDohActive
                     )
 
                     InsetDivider(leadingInset: 16)
@@ -854,19 +875,33 @@ struct SettingsView: View {
 
     private func formattedVersion(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "v0.5.8" }
+        guard !trimmed.isEmpty else { return "v0.6.0" }
         return trimmed.lowercased().hasPrefix("v") ? trimmed : "v\(trimmed)"
     }
 
     // MARK: - Row Helpers
 
-    private func toggleRow(title: String, isOn: Binding<Bool>) -> some View {
+    private func toggleRow(
+        title: String,
+        subtitle: String? = nil,
+        isOn: Binding<Bool>,
+        disabled: Bool = false
+    ) -> some View {
         Toggle(isOn: isOn) {
-            Text(title)
-                .font(.body)
-                .foregroundStyle(palette.inkPrimary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.body)
+                    .foregroundStyle(disabled ? palette.inkSecondary : palette.inkPrimary)
+                if let subtitle {
+                    Text(subtitle)
+                        .font(.footnote)
+                        .foregroundStyle(palette.inkSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
         }
         .tint(palette.signal)
+        .disabled(disabled)
         .frame(minHeight: 44)
         .padding(.horizontal, 16)
         .padding(.vertical, 6)
@@ -890,9 +925,17 @@ struct SettingsView: View {
         focusedField = nil
         dnsError = nil
         dnsDraft = draftValue(for: trimmed)
-        if trimmed.caseInsensitiveCompare(manager.settings.dnsAddr) != .orderedSame {
+        let isHttpsDoh = trimmed.lowercased().hasPrefix("https://")
+        let dnsChanged = !isSameDnsEndpoint(trimmed, manager.settings.dnsAddr)
+        let shouldEnableDoh = isHttpsDoh && !manager.settings.enableDoh
+        if dnsChanged || shouldEnableDoh {
             VdpiHaptics.trigger(.success)
-            manager.updateSettings { $0.dnsAddr = trimmed }
+            manager.updateSettings { settings in
+                settings.dnsAddr = trimmed
+                if isHttpsDoh {
+                    settings.enableDoh = true
+                }
+            }
             manager.showToast("Updated DNS resolver")
         }
     }

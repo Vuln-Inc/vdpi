@@ -3,7 +3,7 @@ use anyhow::{anyhow, Result};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 use serde::Serialize;
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -42,9 +42,176 @@ pub fn build_real_tls_client_hello(host: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+fn is_valid_host_label(label: &str) -> bool {
+    let bytes = label.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 63
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+}
+
+fn is_valid_port(port: &str) -> bool {
+    !port.is_empty()
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && port.parse::<u16>().is_ok()
+}
+
+/// Validates and extracts `host[:port]` (stripping any `userinfo@`) from an `https://`
+/// authority, supporting RFC 3986 bracketed IPv6 literals and rejecting malformed
+/// authorities so secrets stuffed into invalid URLs never leak.
+fn parse_valid_doh_authority(authority: &str) -> Option<&str> {
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, hp)| hp)
+        .unwrap_or(authority);
+    if host_port.is_empty() {
+        return None;
+    }
+
+    if let Some(after_open) = host_port.strip_prefix('[') {
+        let (ipv6_str, remainder) = after_open.split_once(']')?;
+        ipv6_str.parse::<Ipv6Addr>().ok()?;
+        if remainder.is_empty() {
+            return Some(host_port);
+        }
+        let port = remainder.strip_prefix(':')?;
+        return is_valid_port(port).then_some(host_port);
+    }
+
+    if host_port.contains(['[', ']']) {
+        return None;
+    }
+
+    let (host, port_opt) = match host_port.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (host_port, None),
+    };
+    if let Some(port) = port_opt {
+        if !is_valid_port(port) {
+            return None;
+        }
+    }
+
+    let host_no_dot = host.strip_suffix('.').unwrap_or(host);
+    if host_no_dot.is_empty() || host_no_dot.len() > 253 {
+        return None;
+    }
+    host_no_dot
+        .split('.')
+        .all(is_valid_host_label)
+        .then_some(host_port)
+}
+
+/// Redacts custom `https://` DoH URL path/query/userinfo tokens so NextDNS/ControlD
+/// profile identifiers are never leaked in doctor diagnostics or telemetry output.
+/// Bracketed IPv6 hosts are preserved; malformed `https://` URLs collapse to
+/// `https://[redacted]` so raw secrets can never leak.
+fn redact_dns_addr(dns_addr: &str) -> String {
+    let trimmed = dns_addr.trim();
+    let Some(rest) = trimmed
+        .get(..8)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("https://"))
+        .map(|_| &trimmed[8..])
+    else {
+        return trimmed.to_string();
+    };
+
+    let (authority, suffix) = match rest.find(['/', '?', '#']) {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, ""),
+    };
+    let Some(host_port) = parse_valid_doh_authority(authority) else {
+        return "https://[redacted]".to_string();
+    };
+    if !suffix.is_empty() && suffix != "/" {
+        format!("https://{host_port}/[redacted]")
+    } else {
+        format!("https://{host_port}")
+    }
+}
+
+fn find_https_scheme_ascii_ci(s: &str, from: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.len().saturating_sub(from) < 8 {
+        return None;
+    }
+    for i in from..=bytes.len() - 8 {
+        if bytes[i..i + 8].eq_ignore_ascii_case(b"https://") {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Redacts any embedded `https://` URLs inside diagnostic/error detail strings
+/// (e.g. `reqwest` or DNS resolver errors) so raw DoH tokens never leak in reports.
+fn redact_urls_in_detail(detail: &str) -> String {
+    let Some(first) = find_https_scheme_ascii_ci(detail, 0) else {
+        return detail.to_string();
+    };
+
+    let mut out = String::with_capacity(detail.len());
+    let mut cursor = 0usize;
+    let mut next_match = Some(first);
+
+    while let Some(start) = next_match {
+        out.push_str(&detail[cursor..start]);
+
+        let rest = &detail[start..];
+        let rel_end = rest
+            .char_indices()
+            .find(|&(_, ch)| {
+                ch.is_whitespace() || matches!(ch, '"' | '\'' | '<' | '>' | '`')
+            })
+            .map(|(idx, _)| idx)
+            .unwrap_or(rest.len());
+
+        let mut url_end = start + rel_end;
+        // Strip trailing wrapper/sentence punctuation without stripping a closing
+        // IPv6 bracket (`]`) or balanced delimiters inside the URL itself.
+        while url_end > start + 8 {
+            let candidate = &detail[start..url_end];
+            let last = candidate.as_bytes()[candidate.len() - 1];
+            let should_trim = match last {
+                b',' | b';' | b'.' | b':' => true,
+                b')' => {
+                    candidate.bytes().filter(|&b| b == b')').count()
+                        > candidate.bytes().filter(|&b| b == b'(').count()
+                }
+                b']' => {
+                    candidate.bytes().filter(|&b| b == b']').count()
+                        > candidate.bytes().filter(|&b| b == b'[').count()
+                }
+                b'}' => {
+                    candidate.bytes().filter(|&b| b == b'}').count()
+                        > candidate.bytes().filter(|&b| b == b'{').count()
+                }
+                _ => false,
+            };
+            if should_trim {
+                url_end -= 1;
+            } else {
+                break;
+            }
+        }
+
+        out.push_str(&redact_dns_addr(&detail[start..url_end]));
+        cursor = url_end;
+        next_match = find_https_scheme_ascii_ci(detail, cursor);
+    }
+
+    out.push_str(&detail[cursor..]);
+    out
+}
+
 /// Runs live connectivity probes using `vdpi`'s real DoH resolver and 7-stage TLS desync engine.
 pub async fn run_doctor(cfg: &TunnelConfig) -> DoctorReport {
-    let runtime_cfg = cfg.clone().into_runtime_config();
+    let mut runtime_cfg = cfg.clone().into_runtime_config();
+    // Prevent iOS/Android TUN DNS recursion loops through the system resolver.
+    runtime_cfg.disable_system_dns_fallback = true;
     let ctx = match EngineContext::new(runtime_cfg) {
         Ok(c) => c,
         Err(e) => {
@@ -55,40 +222,41 @@ pub async fn run_doctor(cfg: &TunnelConfig) -> DoctorReport {
                     target: "vdpi-core".into(),
                     passed: false,
                     latency_ms: 0,
-                    detail: format!("failed to initialize engine: {e}"),
+                    detail: redact_urls_in_detail(&format!("failed to initialize engine: {e}")),
                 }],
             };
         }
     };
 
     // 1. Anti-poisoning DoH / DNS ring check (bounded timeout so offline networks never stall)
+    let dns_target = format!("{} -> discord.com", redact_dns_addr(&ctx.config.dns_addr));
     let dns_start = Instant::now();
     let dns_check =
         match tokio::time::timeout(Duration::from_secs(8), ctx.dns.resolve("discord.com")).await {
             Ok(Ok(ips)) if !ips.is_empty() => DoctorCheck {
                 name: "DNS Ring".into(),
-                target: format!("{} -> discord.com", ctx.config.dns_addr),
+                target: dns_target,
                 passed: true,
                 latency_ms: dns_start.elapsed().as_millis() as u64,
                 detail: format!("resolved {} ({} records)", ips[0], ips.len()),
             },
             Ok(Ok(_)) => DoctorCheck {
                 name: "DNS Ring".into(),
-                target: format!("{} -> discord.com", ctx.config.dns_addr),
+                target: dns_target,
                 passed: false,
                 latency_ms: dns_start.elapsed().as_millis() as u64,
                 detail: "no usable IP records returned".into(),
             },
             Ok(Err(e)) => DoctorCheck {
                 name: "DNS Ring".into(),
-                target: format!("{} -> discord.com", ctx.config.dns_addr),
+                target: dns_target,
                 passed: false,
                 latency_ms: dns_start.elapsed().as_millis() as u64,
-                detail: e.to_string(),
+                detail: redact_urls_in_detail(&e.to_string()),
             },
             Err(_) => DoctorCheck {
                 name: "DNS Ring".into(),
-                target: format!("{} -> discord.com", ctx.config.dns_addr),
+                target: dns_target,
                 passed: false,
                 latency_ms: dns_start.elapsed().as_millis() as u64,
                 detail: "DNS resolution timed out (8s)".into(),
@@ -121,7 +289,7 @@ async fn probe_tls_target(ctx: &EngineContext, name: &str, host: &str, port: u16
                     target,
                     passed: false,
                     latency_ms: start.elapsed().as_millis() as u64,
-                    detail: format!("connect failed: {e}"),
+                    detail: redact_urls_in_detail(&format!("connect failed: {e}")),
                 };
             }
             Err(_) => {
@@ -304,5 +472,155 @@ mod tests {
 
         assert!(check.passed, "expected TLS ServerHello to pass: {check:?}");
         assert!(check.detail.contains("TLS ServerHello"));
+    }
+
+    #[test]
+    fn redact_dns_addr_masks_custom_doh_paths_and_queries() {
+        assert_eq!(redact_dns_addr("1.1.1.1"), "1.1.1.1");
+        assert_eq!(
+            redact_dns_addr("2606:4700:4700::1111"),
+            "2606:4700:4700::1111"
+        );
+        assert_eq!(
+            redact_dns_addr("https://dns.nextdns.io/abc123"),
+            "https://dns.nextdns.io/[redacted]"
+        );
+        assert_eq!(
+            redact_dns_addr("https://dns.nextdns.io/abc123/My-Desktop?foo=bar"),
+            "https://dns.nextdns.io/[redacted]"
+        );
+        assert_eq!(
+            redact_dns_addr("https://freedns.controld.com/p2"),
+            "https://freedns.controld.com/[redacted]"
+        );
+        assert_eq!(
+            redact_dns_addr("HTTPS://dns.nextdns.io?token=secret"),
+            "https://dns.nextdns.io/[redacted]"
+        );
+        assert_eq!(
+            redact_dns_addr("https://user:pass@dns.example.com/secret-id"),
+            "https://dns.example.com/[redacted]"
+        );
+        assert_eq!(
+            redact_dns_addr("https://[2606:4700:4700::1111]/dns-query"),
+            "https://[2606:4700:4700::1111]/[redacted]"
+        );
+        assert_eq!(
+            redact_dns_addr("https://dns.nextdns.io"),
+            "https://dns.nextdns.io"
+        );
+        assert_eq!(
+            redact_dns_addr("https://dns.nextdns.io/"),
+            "https://dns.nextdns.io"
+        );
+    }
+
+    #[test]
+    fn redact_dns_addr_handles_ipv6_bracketed_and_malformed_urls() {
+        assert_eq!(
+            redact_dns_addr("https://[2606:4700:4700::1111]/secret-token?k=v"),
+            "https://[2606:4700:4700::1111]/[redacted]"
+        );
+        assert_eq!(
+            redact_dns_addr("https://[2606:4700:4700::1111]:8443/secret-token?k=v"),
+            "https://[2606:4700:4700::1111]:8443/[redacted]"
+        );
+        assert_eq!(
+            redact_dns_addr("HTTPS://user:pass@[2606:4700:4700::1111]:8443/secret-token#frag"),
+            "https://[2606:4700:4700::1111]:8443/[redacted]"
+        );
+        assert_eq!(
+            redact_dns_addr("https://[2606:4700:4700::1111]"),
+            "https://[2606:4700:4700::1111]"
+        );
+        assert_eq!(
+            redact_dns_addr("https://[2606:4700:4700::1111]/"),
+            "https://[2606:4700:4700::1111]"
+        );
+        assert_eq!(
+            redact_dns_addr("https://[2606:4700:4700::1111]?token=secret"),
+            "https://[2606:4700:4700::1111]/[redacted]"
+        );
+
+        let malformed = [
+            "https://",
+            "https:///secret-token",
+            "https://?token=secret",
+            "https://user:secret@",
+            "https://user:secret@/path",
+            "https://[2606:4700:4700::1111/secret-token",
+            "https://[not-ipv6-secret]/dns-query",
+            "https://[2606:4700:4700::1111]extra-secret/dns-query",
+            "https://[2606:4700:4700::1111]:notaport/secret",
+            "https://dns.nextdns.io:secret-token/path",
+            "https://dns.nextdns.io\\secret-token",
+            "https://2606:4700:4700::1111/secret-token",
+            "https://dns.nextdns.io secret-token",
+        ];
+        for raw in malformed {
+            let redacted = redact_dns_addr(raw);
+            assert_eq!(
+                redacted, "https://[redacted]",
+                "expected malformed URL {raw:?} to collapse to https://[redacted]"
+            );
+            assert!(!redacted.contains("secret"));
+            assert!(!redacted.contains("notaport"));
+        }
+    }
+
+    #[test]
+    fn redact_urls_in_detail_masks_embedded_doh_urls_in_errors() {
+        assert_eq!(
+            redact_urls_in_detail("DNS resolution timed out (8s)"),
+            "DNS resolution timed out (8s)"
+        );
+        assert_eq!(
+            redact_urls_in_detail(
+                "error sending request for url (https://dns.nextdns.io/abc123/My-Phone?token=xyz): connection refused"
+            ),
+            "error sending request for url (https://dns.nextdns.io/[redacted]): connection refused"
+        );
+        assert_eq!(
+            redact_urls_in_detail(
+                "HTTP status server error (500) for url (https://[2606:4700:4700::1111]/secret-token?k=v): upstream failed"
+            ),
+            "HTTP status server error (500) for url (https://[2606:4700:4700::1111]/[redacted]): upstream failed"
+        );
+        assert_eq!(
+            redact_urls_in_detail(
+                "error sending request for url (https://[2606:4700:4700::1111]): connection reset"
+            ),
+            "error sending request for url (https://[2606:4700:4700::1111]): connection reset"
+        );
+        assert_eq!(
+            redact_urls_in_detail(
+                "error sending request for url (https://[2606:4700:4700::1111]:8443/secret-token): timeout"
+            ),
+            "error sending request for url (https://[2606:4700:4700::1111]:8443/[redacted]): timeout"
+        );
+        assert_eq!(
+            redact_urls_in_detail(
+                "DoH failed for 'HTTPS://user:pass@dns.nextdns.io/prof1?a=1', fallback <https://[2606:4700:4700::1111]/prof2>."
+            ),
+            "DoH failed for 'https://dns.nextdns.io/[redacted]', fallback <https://[2606:4700:4700::1111]/[redacted]>."
+        );
+        assert_eq!(
+            redact_urls_in_detail(
+                "invalid DoH endpoint (https://[bad-ipv6/secret-token): parse error"
+            ),
+            "invalid DoH endpoint (https://[redacted]): parse error"
+        );
+        assert_eq!(
+            redact_urls_in_detail(
+                "invalid DoH endpoint (https:///top-secret): empty host"
+            ),
+            "invalid DoH endpoint (https://[redacted]): empty host"
+        );
+        assert_eq!(
+            redact_urls_in_detail(
+                "bağlantı hatası (https://dns.nextdns.io/gizli?k=1): reddedildi"
+            ),
+            "bağlantı hatası (https://dns.nextdns.io/[redacted]): reddedildi"
+        );
     }
 }

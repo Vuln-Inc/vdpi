@@ -95,6 +95,7 @@ fn parse_health_json_extracts_enriched_and_legacy_payloads() {
         "version": "0.4.1",
         "mode": "combo",
         "doh": true,
+        "dns_addr": "94.140.14.14",
         "block_quic": true,
         "active_connections": 7,
         "total_connections": 142,
@@ -110,6 +111,7 @@ fn parse_health_json_extracts_enriched_and_legacy_payloads() {
     assert_eq!(enriched.version.as_deref(), Some("0.4.1"));
     assert_eq!(enriched.mode.as_deref(), Some("combo"));
     assert_eq!(enriched.doh, Some(true));
+    assert_eq!(enriched.dns_addr.as_deref(), Some("94.140.14.14"));
     assert_eq!(enriched.block_quic, Some(true));
     assert_eq!(enriched.active_connections, Some(7));
     assert_eq!(enriched.total_connections, Some(142));
@@ -129,6 +131,7 @@ fn parse_health_json_extracts_enriched_and_legacy_payloads() {
     assert_eq!(legacy.version.as_deref(), Some("0.4.0"));
     assert_eq!(legacy.mode, None);
     assert_eq!(legacy.doh, None);
+    assert_eq!(legacy.dns_addr, None);
     assert_eq!(legacy.block_quic, None);
     assert_eq!(legacy.active_connections, None);
     assert_eq!(legacy.total_connections, None);
@@ -170,6 +173,7 @@ fn parse_health_json_extracts_enriched_and_legacy_payloads() {
         "vpn_conflict": false,
         "mode": 123,
         "doh": "true",
+        "dns_addr": "   ",
         "block_quic": 1,
         "active_connections": -1,
         "total_connections": "many",
@@ -192,6 +196,7 @@ fn parse_health_json_extracts_enriched_and_legacy_payloads() {
     assert_eq!(degraded.version.as_deref(), Some("0.4.2"));
     assert_eq!(degraded.mode, None);
     assert_eq!(degraded.doh, None);
+    assert_eq!(degraded.dns_addr, None);
     assert_eq!(degraded.block_quic, None);
     assert_eq!(degraded.active_connections, None);
     assert_eq!(degraded.total_connections, None);
@@ -257,6 +262,7 @@ fn control_center_status_struct_sanity() {
         version: Some("0.5.0".to_string()),
         mode: Some("combo".to_string()),
         doh: Some(true),
+        dns_addr: Some("1.1.1.1".to_string()),
         block_quic: Some(true),
         active_connections: Some(3),
         total_connections: Some(25),
@@ -327,6 +333,7 @@ async fn live_http_vdpi_health_endpoint_roundtrips_through_parse_health_json() {
         tun_interface: Some("vdpi0".to_string()),
         physical_nic: Some("Ethernet".to_string()),
         vpn_conflict: Some("Mullvad (yielded)".to_string()),
+        dns_addr: Some("1.1.1.1".to_string()),
     });
 
     let (stop_tx, stop_rx) = watch::channel(false);

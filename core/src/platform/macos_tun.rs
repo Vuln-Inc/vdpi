@@ -57,6 +57,39 @@ pub const MACOS_TUN_STATE_PATH: &str = "/Library/Application Support/vdpi/macos-
 /// Restrictive file permissions (`0600`) applied to [`MACOS_TUN_STATE_PATH`].
 pub const MACOS_TUN_STATE_MODE: u32 = 0o600;
 
+/// Private/CGNAT/IETF IPv4 prefixes excluded from `utun` split routes and routed via the physical
+/// gateway (including `100.64.0.0/10` for Tailscale/CGNAT and `192.0.0.0/24` for RFC 6890
+/// DS-Lite/464XLAT).
+pub const RFC1918_EXCLUSIONS: &[&str] = &[
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "172.16.0.0/12",
+    "192.0.0.0/24",
+    "192.168.0.0/16",
+];
+
+/// Link-local, multicast, and reserved IPv4 prefixes excluded from `utun` split routes.
+pub const LINK_LOCAL_EXCLUSIONS: &[&str] = &["169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4"];
+
+/// IPv6 prefixes routed into `utun` when IPv6 TUN mode is active:
+/// - `2000::/3`: Global Unicast IPv6 space
+/// - `64:ff9b::/96`: RFC 6052 well-known NAT64 prefix (for NAT64/DNS64 IPv6-only uplinks)
+pub const IPV6_SPLIT_ROUTES: &[&str] = &["2000::/3", "64:ff9b::/96"];
+
+/// Builds the managed IPv6 split [`ManagedRoute`] entries installed on `iface_name`.
+pub fn build_ipv6_split_routes(iface_name: &str) -> Vec<ManagedRoute> {
+    IPV6_SPLIT_ROUTES
+        .iter()
+        .map(|prefix| ManagedRoute {
+            destination: (*prefix).to_string(),
+            is_ipv6: true,
+            interface: Some(iface_name.to_string()),
+            gateway: None,
+            ifscope: None,
+        })
+        .collect()
+}
+
 /// Returns `true` if `name` identifies a virtual, tunnel, loopback, or Apple peer-to-peer
 /// interface that must never be selected as the physical outbound uplink.
 pub fn is_virtual_macos_interface(name: &str) -> bool {
@@ -212,7 +245,7 @@ pub fn is_relevant_pf_route_msg(buf: &[u8]) -> bool {
 /// during normal `Drop` or crash-guard recovery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManagedRoute {
-    /// Destination CIDR prefix or `"default"` (e.g. `"1.0.0.0/8"`, `"10.0.0.0/8"`, `"2000::/3"`, `"default"`).
+    /// Destination CIDR prefix or `"default"` (e.g. `"1.0.0.0/8"`, `"10.0.0.0/8"`, `"2000::/3"`, `"64:ff9b::/96"`, `"default"`).
     pub destination: String,
     /// `true` for `-inet6` routes, `false` for IPv4 `-inet` routes.
     #[serde(default)]
@@ -367,11 +400,96 @@ pub fn compute_utun_max_pending_packets(rcvbuf_bytes: usize, mtu: u16) -> u32 {
         .clamp(1, MACOS_UTUN_MAX_PENDING_PACKETS_CAP)
 }
 
+/// Idle `poll(2)` interval for the macOS `PF_ROUTE` monitor so sleep/wake clock jumps are
+/// detected even if no `PF_ROUTE` message arrives immediately after wake.
+pub const MACOS_ROUTE_IDLE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Minimum wall-vs-uptime clock skew or excess monotonic jump treated as a macOS sleep/wake
+/// cycle or significant clock jump requiring forced re-syncing of managed routes.
+pub const MACOS_WAKE_TIME_JUMP_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Converts a remaining debounce duration into a `poll(2)` millisecond timeout, rounding
 /// any non-zero sub-millisecond remainder up to the next whole millisecond so `poll(2)`
 /// never busy-spins with `timeout_ms = 0` waiting for the final sub-millisecond to elapse.
 pub fn poll_timeout_ms_ceil(remaining: std::time::Duration) -> i32 {
     i32::try_from(remaining.as_nanos().div_ceil(1_000_000)).unwrap_or(i32::MAX)
+}
+
+/// Determines whether macOS IPv6 TUN routing (`2000::/3`, `64:ff9b::/96`) and `SCDynamicStore`
+/// IPv6 keys should be active for the current physical uplink state.
+///
+/// Active whenever a physical IPv6 default route exists and either `--tun-ipv6` was
+/// requested or no physical IPv4 default route is available (auto-enabled on IPv6-only uplinks).
+pub fn compute_desired_ipv6_active(tun_ipv6: bool, has_v4: bool, has_v6: bool) -> bool {
+    has_v6 && (tun_ipv6 || !has_v4)
+}
+
+/// Returns `true` when elapsed uptime (`Instant`) and wall-clock (`SystemTime`) deltas
+/// indicate a macOS sleep/wake cycle or significant clock jump requiring forced re-syncing
+/// of `-ifscope` and exclusion routes even when interface and gateway strings still match.
+///
+/// On macOS, `Instant` (`mach_absolute_time` / `CLOCK_UPTIME_RAW`) pauses during sleep while
+/// `SystemTime` continues advancing, producing a wall-vs-uptime skew >= [`MACOS_WAKE_TIME_JUMP_THRESHOLD`].
+/// Also catches backward wall-clock steps and monotonic elapsed time exceeding
+/// `expected_max_wait + MACOS_WAKE_TIME_JUMP_THRESHOLD`.
+pub fn detect_wake_or_time_jump(
+    instant_elapsed: std::time::Duration,
+    wall_delta: std::result::Result<std::time::Duration, std::time::Duration>,
+    expected_max_wait: std::time::Duration,
+) -> bool {
+    if instant_elapsed >= expected_max_wait.saturating_add(MACOS_WAKE_TIME_JUMP_THRESHOLD) {
+        return true;
+    }
+    match wall_delta {
+        Ok(wall_forward) => {
+            wall_forward.abs_diff(instant_elapsed) >= MACOS_WAKE_TIME_JUMP_THRESHOLD
+        }
+        Err(wall_backward) => wall_backward >= MACOS_WAKE_TIME_JUMP_THRESHOLD,
+    }
+}
+
+/// Returns `true` when managed IPv4 LAN/CGNAT exclusion routes must be re-synced.
+///
+/// Short-circuits when `current_uplink == desired_uplink`, except when `force_resync` is set
+/// (e.g. after macOS sleep/wake) and there is an uplink to clear or re-install.
+pub fn exclusion_routes_need_sync(
+    current_uplink: Option<&(String, Option<String>)>,
+    desired_uplink: Option<&(String, Option<String>)>,
+    force_resync: bool,
+) -> bool {
+    if force_resync {
+        current_uplink.is_some() || desired_uplink.is_some()
+    } else {
+        current_uplink != desired_uplink
+    }
+}
+
+/// Builds the desired `-ifscope` default [`ManagedRoute`] for a physical uplink if a gateway IP
+/// is present.
+pub fn build_ifscope_default_route(
+    is_ipv6: bool,
+    uplink: Option<&(String, Option<String>)>,
+) -> Option<ManagedRoute> {
+    let (iface, gw) = uplink?;
+    let gw = gw.as_deref()?;
+    Some(ManagedRoute {
+        destination: "default".to_string(),
+        is_ipv6,
+        interface: None,
+        gateway: Some(gw.to_string()),
+        ifscope: Some(iface.clone()),
+    })
+}
+
+/// Returns `true` when the currently installed `-ifscope` default route differs from the desired
+/// uplink state (including `None -> Some(gw)`, `Some(gw) -> None`, and interface/gateway swaps).
+pub fn ifscope_route_needs_sync(
+    current: Option<&ManagedRoute>,
+    is_ipv6: bool,
+    uplink: Option<&(String, Option<String>)>,
+) -> bool {
+    let desired = build_ifscope_default_route(is_ipv6, uplink);
+    current != desired.as_ref()
 }
 
 /// Serializes [`MacosTunGuardState`] as a single newline-delimited JSON payload for the
@@ -386,12 +504,14 @@ pub fn build_macos_tun_cleanup_payload(state: &MacosTunGuardState) -> Result<Str
 #[cfg(target_os = "macos")]
 mod imp {
     use super::{
-        build_macos_tun_cleanup_payload, compute_utun_max_pending_packets,
-        is_relevant_pf_route_msg, is_vdpi_owned_dns_servers, parse_dns_servers_output,
-        parse_route_get_default, poll_timeout_ms_ceil, MacosTunGuardState, ManagedRoute,
-        MACOS_TUN_DNS_V4, MACOS_TUN_DNS_V6, MACOS_TUN_GUARD_ARG, MACOS_TUN_IPV4, MACOS_TUN_IPV6,
-        MACOS_TUN_MTU, MACOS_TUN_NETMASK_V4, MACOS_TUN_STATE_PATH, MACOS_UTUN_DEFAULT_RCVBUF,
-        MACOS_UTUN_SOCKBUF_LADDER,
+        build_ifscope_default_route, build_ipv6_split_routes, build_macos_tun_cleanup_payload,
+        compute_desired_ipv6_active, compute_utun_max_pending_packets, detect_wake_or_time_jump,
+        exclusion_routes_need_sync, ifscope_route_needs_sync, is_relevant_pf_route_msg,
+        is_vdpi_owned_dns_servers, parse_dns_servers_output, parse_route_get_default,
+        poll_timeout_ms_ceil, MacosTunGuardState, ManagedRoute, LINK_LOCAL_EXCLUSIONS,
+        MACOS_ROUTE_IDLE_POLL_INTERVAL, MACOS_TUN_DNS_V4, MACOS_TUN_DNS_V6, MACOS_TUN_GUARD_ARG,
+        MACOS_TUN_IPV4, MACOS_TUN_IPV6, MACOS_TUN_MTU, MACOS_TUN_NETMASK_V4, MACOS_TUN_STATE_PATH,
+        MACOS_UTUN_DEFAULT_RCVBUF, MACOS_UTUN_SOCKBUF_LADDER, RFC1918_EXCLUSIONS,
     };
     use crate::binder::{DynamicOutboundBinder, OutboundTarget};
     use crate::platform::macos::list_configurable_network_services;
@@ -407,7 +527,7 @@ mod imp {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread::{self, JoinHandle};
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime};
     use tokio::sync::watch;
     use tracing::{debug, info, warn};
 
@@ -416,9 +536,6 @@ mod imp {
     /// `u_int32_t`). Not yet exposed by `libc 0.2.x`; defaults to `1` in XNU.
     const UTUN_OPT_MAX_PENDING_PACKETS: libc::c_int = 16;
     const GUARD_READY: &str = "ready";
-
-    const RFC1918_EXCLUSIONS: &[&str] = &["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"];
-    const LINK_LOCAL_EXCLUSIONS: &[&str] = &["169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4"];
 
     /// Non-zero-anchor IPv4 split routes covering `1.0.0.0..=255.255.255.255` while leaving
     /// `0.0.0.0/8` untouched so `IP_BOUND_IF` on Ventura/Sonoma/Sequoia/Tahoe never hits
@@ -624,12 +741,14 @@ mod imp {
     /// 1-3 seconds even on `SIGKILL` or process crash without ever touching `preferences.plist`.
     struct ScDynamicStoreDnsSession {
         store: SCDynamicStoreRef,
+        iface_name: String,
+        ipv6_active: bool,
         published_keys: Vec<&'static str>,
     }
 
     // SAFETY: `SCDynamicStoreRef` may be transferred sequentially between threads;
     // `ScDynamicStoreDnsSession` exclusively owns the handle, never shares it concurrently,
-    // and only mutates or releases it via `&mut self` (setup / `Drop`).
+    // and only mutates or releases it via `&mut self` (setup / dynamic updates / `Drop`).
     unsafe impl Send for ScDynamicStoreDnsSession {}
 
     impl ScDynamicStoreDnsSession {
@@ -666,6 +785,8 @@ mod imp {
 
             let mut session = Self {
                 store,
+                iface_name: iface_name.to_string(),
+                ipv6_active: false,
                 published_keys: Vec::with_capacity(4),
             };
 
@@ -692,24 +813,40 @@ mod imp {
 
             // 3. Optional IPv6 binding to utunN.
             if ipv6_active {
-                let v_ipv6_addr = cf_string(MACOS_TUN_IPV6)?;
-                let v_ipv6_addrs = cf_array(&[&v_ipv6_addr])?;
-                let ipv6_dict = cf_dict_raw(&[
-                    (k_addresses.as_ptr(), v_ipv6_addrs.as_ptr()),
-                    (k_router.as_ptr(), v_ipv6_addr.as_ptr()),
-                    (k_interface_name.as_ptr(), v_iface.as_ptr()),
-                ])?;
-                session.set_value(SC_KEY_IPV6, &ipv6_dict)?;
+                session.publish_ipv6_key()?;
             }
 
             // 4. Supplemental match-all DNS resolver scoped to com.vdpi.tun.
+            session.publish_dns_key(ipv6_active)?;
+            session.ipv6_active = ipv6_active;
+
+            flush_macos_dns_cache();
+            Ok(session)
+        }
+
+        fn publish_ipv6_key(&mut self) -> Result<()> {
+            let k_addresses = cf_string("Addresses")?;
+            let k_router = cf_string("Router")?;
+            let k_interface_name = cf_string("InterfaceName")?;
+            let v_iface = cf_string(&self.iface_name)?;
+            let v_ipv6_addr = cf_string(MACOS_TUN_IPV6)?;
+            let v_ipv6_addrs = cf_array(&[&v_ipv6_addr])?;
+            let ipv6_dict = cf_dict_raw(&[
+                (k_addresses.as_ptr(), v_ipv6_addrs.as_ptr()),
+                (k_router.as_ptr(), v_ipv6_addr.as_ptr()),
+                (k_interface_name.as_ptr(), v_iface.as_ptr()),
+            ])?;
+            self.set_value(SC_KEY_IPV6, &ipv6_dict)
+        }
+
+        fn publish_dns_key(&mut self, include_ipv6: bool) -> Result<()> {
             let k_server_addresses = cf_string("ServerAddresses")?;
             let k_match_domains = cf_string("SupplementalMatchDomains")?;
             let k_match_orders = cf_string("SupplementalMatchOrders")?;
             let k_match_no_search = cf_string("SupplementalMatchDomainsNoSearch")?;
 
             let v_dns_v4 = cf_string(MACOS_TUN_DNS_V4)?;
-            let v_dns_v6 = if ipv6_active {
+            let v_dns_v6 = if include_ipv6 {
                 Some(cf_string(MACOS_TUN_DNS_V6)?)
             } else {
                 None
@@ -734,10 +871,31 @@ mod imp {
                 (k_match_orders.as_ptr(), v_match_orders.as_ptr()),
                 (k_match_no_search.as_ptr(), v_no_search_one.as_ptr()),
             ])?;
-            session.set_value(SC_KEY_DNS, &dns_dict)?;
+            self.set_value(SC_KEY_DNS, &dns_dict)
+        }
 
-            flush_macos_dns_cache();
-            Ok(session)
+        /// Dynamically adds or removes `SC_KEY_IPV6` and updates `SC_KEY_DNS` `ServerAddresses`
+        /// when roaming between IPv4-only, dual-stack, and IPv6-only uplinks.
+        ///
+        /// Returns `Ok(true)` if the published IPv6 state changed.
+        fn set_ipv6_active(&mut self, enable: bool) -> Result<bool> {
+            if self.ipv6_active == enable {
+                return Ok(false);
+            }
+            if enable {
+                self.publish_ipv6_key()?;
+                if let Err(err) = self.publish_dns_key(true) {
+                    self.remove_value(SC_KEY_IPV6);
+                    return Err(err);
+                }
+                self.ipv6_active = true;
+                Ok(true)
+            } else {
+                self.publish_dns_key(false)?;
+                self.remove_value(SC_KEY_IPV6);
+                self.ipv6_active = false;
+                Ok(true)
+            }
         }
 
         fn set_value(&mut self, key: &'static str, value: &CfOwned) -> Result<()> {
@@ -747,8 +905,39 @@ mod imp {
             if ok == 0 {
                 bail!("SCDynamicStoreSetValue({key}) failed: {}", sc_last_error());
             }
-            self.published_keys.push(key);
+            if !self.published_keys.contains(&key) {
+                if key == SC_KEY_IPV6 {
+                    if let Some(dns_pos) =
+                        self.published_keys.iter().position(|&k| k == SC_KEY_DNS)
+                    {
+                        self.published_keys.insert(dns_pos, key);
+                    } else {
+                        self.published_keys.push(key);
+                    }
+                } else {
+                    self.published_keys.push(key);
+                }
+            }
             Ok(())
+        }
+
+        fn remove_value(&mut self, key: &'static str) -> bool {
+            if !self.published_keys.contains(&key) {
+                return false;
+            }
+            if let Ok(cf_key) = cf_string(key) {
+                // SAFETY: `self.store` and `cf_key` are valid non-null CoreFoundation refs.
+                let ok = unsafe { SCDynamicStoreRemoveValue(self.store, cf_key.as_ptr()) };
+                if ok == 0 {
+                    debug!(
+                        key,
+                        error = %sc_last_error(),
+                        "SCDynamicStoreRemoveValue returned false"
+                    );
+                }
+            }
+            self.published_keys.retain(|&k| k != key);
+            true
         }
     }
 
@@ -988,6 +1177,34 @@ mod imp {
         );
     }
 
+    #[derive(Debug, Default)]
+    struct ManagedExclusions {
+        uplink: Option<(String, Option<String>)>,
+        routes: Vec<ManagedRoute>,
+    }
+
+    #[derive(Debug, Default)]
+    struct ManagedSplitV4 {
+        active: bool,
+        routes: Vec<ManagedRoute>,
+    }
+
+    struct RouteMonitorContext {
+        iface_name: String,
+        tun_ipv6: bool,
+        utun_ipv6_configured: bool,
+        ipv6_active: Arc<AtomicBool>,
+        binder: Arc<DynamicOutboundBinder>,
+        route_tx: Arc<watch::Sender<u64>>,
+        dns_session: Arc<Mutex<Option<ScDynamicStoreDnsSession>>>,
+        managed_ifscope_v4: Arc<Mutex<Option<ManagedRoute>>>,
+        managed_ifscope_v6: Arc<Mutex<Option<ManagedRoute>>>,
+        managed_exclusions: Arc<Mutex<ManagedExclusions>>,
+        managed_split_v4: Arc<Mutex<ManagedSplitV4>>,
+        managed_split_v6: Arc<Mutex<Vec<ManagedRoute>>>,
+        managed_guard_state: Arc<Mutex<MacosTunGuardState>>,
+    }
+
     struct RouteMonitor {
         stop_flag: Arc<AtomicBool>,
         stop_write_fd: OwnedFd,
@@ -995,13 +1212,7 @@ mod imp {
     }
 
     impl RouteMonitor {
-        fn start(
-            binder: Arc<DynamicOutboundBinder>,
-            route_tx: Arc<watch::Sender<u64>>,
-            managed_ifscope_v4: Arc<Mutex<Option<ManagedRoute>>>,
-            managed_ifscope_v6: Arc<Mutex<Option<ManagedRoute>>>,
-            ipv6_active: bool,
-        ) -> Result<Self> {
+        fn start(ctx: RouteMonitorContext) -> Result<Self> {
             let route_fd = open_pf_route_socket()?;
             let (stop_read_fd, stop_write_fd) = create_stop_pipe()?;
             let stop_flag = Arc::new(AtomicBool::new(false));
@@ -1010,16 +1221,7 @@ mod imp {
             let handle = thread::Builder::new()
                 .name("vdpi-macos-route-watch".to_string())
                 .spawn(move || {
-                    run_pf_route_monitor_loop(
-                        route_fd,
-                        stop_read_fd,
-                        thread_stop_flag,
-                        binder,
-                        route_tx,
-                        managed_ifscope_v4,
-                        managed_ifscope_v6,
-                        ipv6_active,
-                    );
+                    run_pf_route_monitor_loop(route_fd, stop_read_fd, thread_stop_flag, ctx);
                 })
                 .context("failed to spawn macOS PF_ROUTE monitoring thread")?;
 
@@ -1054,13 +1256,18 @@ mod imp {
     /// `PF_ROUTE` monitor, and a detached crash-recovery guard.
     pub struct MacosTunSession {
         binder: Arc<DynamicOutboundBinder>,
+        iface_name: String,
         physical_nic: String,
         mtu: u16,
-        guard_state: MacosTunGuardState,
+        ipv6_active: Arc<AtomicBool>,
+        managed_guard_state: Arc<Mutex<MacosTunGuardState>>,
         guard_child: Option<Child>,
-        dns_session: Option<ScDynamicStoreDnsSession>,
+        dns_session: Arc<Mutex<Option<ScDynamicStoreDnsSession>>>,
         managed_ifscope_v4: Arc<Mutex<Option<ManagedRoute>>>,
         managed_ifscope_v6: Arc<Mutex<Option<ManagedRoute>>>,
+        managed_exclusions: Arc<Mutex<ManagedExclusions>>,
+        managed_split_v4: Arc<Mutex<ManagedSplitV4>>,
+        managed_split_v6: Arc<Mutex<Vec<ManagedRoute>>>,
         route_tx: Arc<watch::Sender<u64>>,
         route_monitor: Option<RouteMonitor>,
     }
@@ -1069,11 +1276,12 @@ mod imp {
         /// Starts a macOS desktop `utun` session:
         /// 1. Verifies root privileges, recovers any stale crash-recovery state on disk, and
         ///    heals any legacy v0.5.x `networksetup` DNS stuck on `198.18.0.2`.
-        /// 2. Detects the physical default uplink and binds `DynamicOutboundBinder` via `IP_BOUND_IF`.
+        /// 2. Detects the physical default uplink (IPv4 and/or IPv6) and binds `DynamicOutboundBinder`
+        ///    via `IP_BOUND_IF` / `IPV6_BOUND_IF`.
         /// 3. Opens `utunN` and configures `198.18.0.1 <-> 198.18.0.2` (Jumbo MTU fallback, optional IPv6).
         /// 4. Atomically persists crash-recovery state before mutating routes.
-        /// 5. Installs explicit `-ifscope` default route(s), LAN/special exclusion routes, and
-        ///    8 non-zero-anchor IPv4 split routes (`1.0.0.0/8`..`128.0.0.0/1`, optional `2000::/3`).
+        /// 5. Installs explicit `-ifscope` default route(s), LAN/CGNAT/special exclusion routes, and
+        ///    8 non-zero-anchor IPv4 split routes (`1.0.0.0/8`..`128.0.0.0/1`, optional `2000::/3` + `64:ff9b::/96`).
         /// 6. Publishes transient `SCDynamicStore` session keys bound to `utunN` and flushes DNS cache.
         /// 7. Starts the `PF_ROUTE` live route/uplink monitor and arms the detached `setsid()` crash guard.
         pub fn start(
@@ -1088,16 +1296,57 @@ mod imp {
             recover_stale_macos_tun_state();
             heal_legacy_networksetup_dns();
 
-            let (phys_iface, phys_gw) = detect_physical_default_v4()?;
-            let if_index_v4 = if_name_to_index(&phys_iface)?;
-            let phys_v6 = detect_physical_default_v6();
-            let if_index_v6 = phys_v6
+            let phys_v4_raw = match detect_physical_default_v4() {
+                Ok(found) => Some(found),
+                Err(e) => {
+                    debug!(error = %e, "no physical default IPv4 uplink detected");
+                    None
+                }
+            };
+            let if_index_v4 = phys_v4_raw
                 .as_ref()
-                .and_then(|(iface6, _)| if_name_to_index(iface6).ok());
+                .and_then(|(iface4, _)| match if_name_to_index(iface4) {
+                    Ok(idx) => Some(idx),
+                    Err(e) => {
+                        warn!(
+                            iface = %iface4,
+                            error = %e,
+                            "failed to resolve interface index for IPv4 physical uplink"
+                        );
+                        None
+                    }
+                });
+            let phys_v4 = phys_v4_raw.filter(|_| if_index_v4.is_some());
+
+            let phys_v6_raw = detect_physical_default_v6();
+            let if_index_v6 = phys_v6_raw
+                .as_ref()
+                .and_then(|(iface6, _)| match if_name_to_index(iface6) {
+                    Ok(idx) => Some(idx),
+                    Err(e) => {
+                        warn!(
+                            iface = %iface6,
+                            error = %e,
+                            "failed to resolve interface index for IPv6 physical uplink"
+                        );
+                        None
+                    }
+                });
+            let phys_v6 = phys_v6_raw.filter(|_| if_index_v6.is_some());
+
+            let Some(phys_iface) = phys_v4
+                .as_ref()
+                .map(|(iface4, _)| iface4.clone())
+                .or_else(|| phys_v6.as_ref().map(|(iface6, _)| iface6.clone()))
+            else {
+                bail!(
+                    "no physical default IPv4 or IPv6 interface found (disconnect any active VPN holding the default route)"
+                );
+            };
 
             binder.update(OutboundTarget {
                 nic_name: Some(phys_iface.clone()),
-                if_index_v4: Some(if_index_v4),
+                if_index_v4,
                 if_index_v6,
                 fwmark: None,
                 fail_closed: true,
@@ -1113,7 +1362,19 @@ mod imp {
             let (tun_fd, iface_name) = open_utun()?;
             rollback.state.iface_name = iface_name.clone();
 
-            let (mtu, ipv6_active) = configure_utun_interface(&iface_name, tun_ipv6)?;
+            let ipv6_requested = tun_ipv6 || phys_v4.is_none();
+            let desired_ipv6_active =
+                compute_desired_ipv6_active(tun_ipv6, phys_v4.is_some(), phys_v6.is_some());
+            let (mtu, utun_ipv6_configured) =
+                configure_utun_interface(&iface_name, desired_ipv6_active)?;
+            if ipv6_requested && phys_v6.is_none() {
+                warn!(
+                    iface = %iface_name,
+                    "no physical IPv6 default route detected; skipping IPv6 TUN routes (2000::/3, 64:ff9b::/96) and SCDynamicStore IPv6 key"
+                );
+            }
+            let ipv6_active = utun_ipv6_configured && desired_ipv6_active;
+
             let rcvbuf = get_socket_buf_size(tun_fd.as_raw_fd(), libc::SO_RCVBUF)
                 .unwrap_or(MACOS_UTUN_DEFAULT_RCVBUF);
             let sndbuf = get_socket_buf_size(tun_fd.as_raw_fd(), libc::SO_SNDBUF)
@@ -1128,14 +1389,7 @@ mod imp {
             // Install explicit `-ifscope <phys_iface>` default routes BEFORE split routes so
             // `IP_BOUND_IF` / `IPV6_BOUND_IF` outbound sockets always resolve a scoped default.
             let mut initial_ifscope_v4: Option<ManagedRoute> = None;
-            if let Some(ref gw) = phys_gw {
-                let route = ManagedRoute {
-                    destination: "default".to_string(),
-                    is_ipv6: false,
-                    interface: None,
-                    gateway: Some(gw.clone()),
-                    ifscope: Some(phys_iface.clone()),
-                };
+            if let Some(route) = build_ifscope_default_route(false, phys_v4.as_ref()) {
                 match add_managed_route(&route, true) {
                     Ok(true) => {
                         initial_ifscope_v4 = Some(route.clone());
@@ -1145,8 +1399,8 @@ mod imp {
                     Ok(false) => {}
                     Err(e) => {
                         warn!(
-                            iface = %phys_iface,
-                            gateway = %gw,
+                            iface = ?route.ifscope,
+                            gateway = ?route.gateway,
                             error = %e,
                             "failed to install -ifscope IPv4 default route for IP_BOUND_IF"
                         );
@@ -1156,14 +1410,7 @@ mod imp {
 
             let mut initial_ifscope_v6: Option<ManagedRoute> = None;
             if ipv6_active {
-                if let Some((ref iface6, Some(ref gw6))) = phys_v6 {
-                    let route = ManagedRoute {
-                        destination: "default".to_string(),
-                        is_ipv6: true,
-                        interface: None,
-                        gateway: Some(gw6.clone()),
-                        ifscope: Some(iface6.clone()),
-                    };
+                if let Some(route) = build_ifscope_default_route(true, phys_v6.as_ref()) {
                     match add_managed_route(&route, true) {
                         Ok(true) => {
                             initial_ifscope_v6 = Some(route.clone());
@@ -1173,8 +1420,8 @@ mod imp {
                         Ok(false) => {}
                         Err(e) => {
                             warn!(
-                                iface = %iface6,
-                                gateway = %gw6,
+                                iface = ?route.ifscope,
+                                gateway = ?route.gateway,
                                 error = %e,
                                 "failed to install -ifscope IPv6 default route for IPV6_BOUND_IF"
                             );
@@ -1183,128 +1430,156 @@ mod imp {
                 }
             }
 
-            // Install LAN exclusions before split routes so local networks stay reachable
-            // directly on the physical NIC.
-            for prefix in RFC1918_EXCLUSIONS {
-                let route = ManagedRoute {
-                    destination: (*prefix).to_string(),
-                    is_ipv6: false,
-                    interface: phys_gw.is_none().then(|| phys_iface.clone()),
-                    gateway: phys_gw.clone(),
-                    ifscope: None,
-                };
-                match add_managed_route(&route, true) {
-                    Ok(true) => {
-                        rollback.state.routes.push(route);
-                        save_macos_tun_state(&rollback.state)?;
+            // Install LAN/CGNAT exclusions before split routes so local networks and Tailscale
+            // CGNAT space stay reachable directly on the physical NIC.
+            let mut initial_exclusion_routes: Vec<ManagedRoute> = Vec::new();
+            let mut initial_split_v4: Vec<ManagedRoute> = Vec::new();
+            if let Some((ref iface4, ref gw4)) = phys_v4 {
+                for prefix in RFC1918_EXCLUSIONS {
+                    let route = ManagedRoute {
+                        destination: (*prefix).to_string(),
+                        is_ipv6: false,
+                        interface: gw4.is_none().then(|| iface4.clone()),
+                        gateway: gw4.clone(),
+                        ifscope: None,
+                    };
+                    match add_managed_route(&route, true) {
+                        Ok(true) => {
+                            initial_exclusion_routes.push(route.clone());
+                            rollback.state.routes.push(route);
+                            save_macos_tun_state(&rollback.state)?;
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            warn!(prefix, error = %e, "failed to install RFC1918/CGNAT exclusion route")
+                        }
                     }
-                    Ok(false) => {}
-                    Err(e) => {
-                        warn!(prefix, error = %e, "failed to install RFC1918 exclusion route")
+                }
+
+                for prefix in LINK_LOCAL_EXCLUSIONS {
+                    let route = ManagedRoute {
+                        destination: (*prefix).to_string(),
+                        is_ipv6: false,
+                        interface: Some(iface4.clone()),
+                        gateway: None,
+                        ifscope: None,
+                    };
+                    match add_managed_route(&route, true) {
+                        Ok(true) => {
+                            initial_exclusion_routes.push(route.clone());
+                            rollback.state.routes.push(route);
+                            save_macos_tun_state(&rollback.state)?;
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            warn!(
+                                prefix,
+                                error = %e,
+                                "failed to install link-local/multicast/reserved exclusion route"
+                            );
+                        }
                     }
+                }
+
+                // Install 8 non-zero-anchor IPv4 split routes on utunN (leaving 0.0.0.0/8 untouched
+                // so `IP_BOUND_IF` never hits ENETUNREACH on macOS Ventura/Sonoma/Sequoia/Tahoe).
+                // `allow_existing = false` ensures pre-existing conflicting routes fail startup cleanly.
+                for prefix in IPV4_SPLIT_ROUTES {
+                    let route = ManagedRoute {
+                        destination: (*prefix).to_string(),
+                        is_ipv6: false,
+                        interface: Some(iface_name.clone()),
+                        gateway: None,
+                        ifscope: None,
+                    };
+                    rollback.state.routes.push(route.clone());
+                    save_macos_tun_state(&rollback.state)?;
+                    if let Err(e) = add_managed_route(&route, false).with_context(|| {
+                        format!("failed to install split route {prefix} on {iface_name}")
+                    }) {
+                        rollback.state.routes.pop();
+                        let _ = save_macos_tun_state(&rollback.state);
+                        return Err(e);
+                    }
+                    initial_split_v4.push(route);
                 }
             }
 
-            for prefix in LINK_LOCAL_EXCLUSIONS {
-                let route = ManagedRoute {
-                    destination: (*prefix).to_string(),
-                    is_ipv6: false,
-                    interface: Some(phys_iface.clone()),
-                    gateway: None,
-                    ifscope: None,
-                };
-                match add_managed_route(&route, true) {
-                    Ok(true) => {
-                        rollback.state.routes.push(route);
-                        save_macos_tun_state(&rollback.state)?;
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        warn!(
-                            prefix,
-                            error = %e,
-                            "failed to install link-local/multicast/reserved exclusion route"
-                        );
-                    }
-                }
-            }
-
-            // Install 8 non-zero-anchor IPv4 split routes on utunN (leaving 0.0.0.0/8 untouched
-            // so `IP_BOUND_IF` never hits ENETUNREACH on macOS Ventura/Sonoma/Sequoia/Tahoe).
-            // `allow_existing = false` ensures pre-existing conflicting routes fail startup cleanly.
-            for prefix in IPV4_SPLIT_ROUTES {
-                let route = ManagedRoute {
-                    destination: (*prefix).to_string(),
-                    is_ipv6: false,
-                    interface: Some(iface_name.clone()),
-                    gateway: None,
-                    ifscope: None,
-                };
-                rollback.state.routes.push(route.clone());
-                save_macos_tun_state(&rollback.state)?;
-                if let Err(e) = add_managed_route(&route, false).with_context(|| {
-                    format!("failed to install split route {prefix} on {iface_name}")
-                }) {
-                    rollback.state.routes.pop();
-                    let _ = save_macos_tun_state(&rollback.state);
-                    return Err(e);
-                }
-            }
-
+            let mut initial_split_v6: Vec<ManagedRoute> = Vec::new();
             if ipv6_active {
-                let route = ManagedRoute {
-                    destination: "2000::/3".to_string(),
-                    is_ipv6: true,
-                    interface: Some(iface_name.clone()),
-                    gateway: None,
-                    ifscope: None,
-                };
-                rollback.state.routes.push(route.clone());
-                save_macos_tun_state(&rollback.state)?;
-                if let Err(e) = add_managed_route(&route, false).with_context(|| {
-                    format!("failed to install IPv6 split route 2000::/3 on {iface_name}")
-                }) {
-                    rollback.state.routes.pop();
-                    let _ = save_macos_tun_state(&rollback.state);
-                    return Err(e);
+                for route in build_ipv6_split_routes(&iface_name) {
+                    let prefix = route.destination.clone();
+                    rollback.state.routes.push(route.clone());
+                    save_macos_tun_state(&rollback.state)?;
+                    if let Err(e) = add_managed_route(&route, false).with_context(|| {
+                        format!("failed to install IPv6 split route {prefix} on {iface_name}")
+                    }) {
+                        rollback.state.routes.pop();
+                        let _ = save_macos_tun_state(&rollback.state);
+                        return Err(e);
+                    }
+                    initial_split_v6.push(route);
                 }
             }
 
             // Publish transient session-scoped SCDynamicStore DNS keys bound to utunN.
+            // `SC_KEY_IPV6` and IPv6 DNS server are gated on `ipv6_active` (`phys_v6.is_some()`).
             // If any later startup step fails, dropping `dns_session` automatically cleans them up.
-            let dns_session = ScDynamicStoreDnsSession::install(&iface_name, ipv6_active)?;
+            let dns_session = Arc::new(Mutex::new(Some(ScDynamicStoreDnsSession::install(
+                &iface_name,
+                ipv6_active,
+            )?)));
+            let ipv6_active_flag = Arc::new(AtomicBool::new(ipv6_active));
 
             // Start the PF_ROUTE monitoring thread after initial route setup so our own
             // startup mutations do not trigger spurious notifications.
             let managed_ifscope_v4 = Arc::new(Mutex::new(initial_ifscope_v4));
             let managed_ifscope_v6 = Arc::new(Mutex::new(initial_ifscope_v6));
+            let managed_exclusions = Arc::new(Mutex::new(ManagedExclusions {
+                uplink: phys_v4.clone(),
+                routes: initial_exclusion_routes,
+            }));
+            let managed_split_v4 = Arc::new(Mutex::new(ManagedSplitV4 {
+                active: phys_v4.is_some(),
+                routes: initial_split_v4,
+            }));
+            let managed_split_v6 = Arc::new(Mutex::new(initial_split_v6));
+            let managed_guard_state = Arc::new(Mutex::new(rollback.state.clone()));
             let (route_tx, _) = watch::channel::<u64>(0);
             let route_tx = Arc::new(route_tx);
-            let route_monitor = RouteMonitor::start(
-                Arc::clone(&binder),
-                Arc::clone(&route_tx),
-                Arc::clone(&managed_ifscope_v4),
-                Arc::clone(&managed_ifscope_v6),
-                ipv6_active,
-            )?;
+            let route_monitor = RouteMonitor::start(RouteMonitorContext {
+                iface_name: iface_name.clone(),
+                tun_ipv6,
+                utun_ipv6_configured,
+                ipv6_active: Arc::clone(&ipv6_active_flag),
+                binder: Arc::clone(&binder),
+                route_tx: Arc::clone(&route_tx),
+                dns_session: Arc::clone(&dns_session),
+                managed_ifscope_v4: Arc::clone(&managed_ifscope_v4),
+                managed_ifscope_v6: Arc::clone(&managed_ifscope_v6),
+                managed_exclusions: Arc::clone(&managed_exclusions),
+                managed_split_v4: Arc::clone(&managed_split_v4),
+                managed_split_v6: Arc::clone(&managed_split_v6),
+                managed_guard_state: Arc::clone(&managed_guard_state),
+            })?;
 
             // Arm the detached crash guard so SIGKILL still restores managed routes immediately.
             let guard_child = spawn_detached_guard(&rollback.state)?;
 
-            let guard_state = std::mem::take(&mut rollback.state);
+            let route_count = rollback.state.routes.len();
             rollback.committed = true;
             drop(rollback);
 
             info!(
-                iface = %guard_state.iface_name,
+                iface = %iface_name,
                 physical_nic = %phys_iface,
                 mtu,
                 rcvbuf,
                 sndbuf,
                 ?max_pending_packets,
-                if_index_v4,
+                ?if_index_v4,
                 ?if_index_v6,
-                routes = guard_state.routes.len(),
+                routes = route_count,
                 tun_ipv6,
                 ipv6_active,
                 "macOS desktop utun session active"
@@ -1313,13 +1588,18 @@ mod imp {
             Ok((
                 Self {
                     binder,
+                    iface_name,
                     physical_nic: phys_iface,
                     mtu,
-                    guard_state,
+                    ipv6_active: ipv6_active_flag,
+                    managed_guard_state,
                     guard_child: Some(guard_child),
-                    dns_session: Some(dns_session),
+                    dns_session,
                     managed_ifscope_v4,
                     managed_ifscope_v6,
+                    managed_exclusions,
+                    managed_split_v4,
+                    managed_split_v6,
                     route_tx,
                     route_monitor: Some(route_monitor),
                 },
@@ -1329,7 +1609,7 @@ mod imp {
 
         /// Returns the kernel-assigned `utun` interface name (e.g. `"utun4"`).
         pub fn iface_name(&self) -> &str {
-            &self.guard_state.iface_name
+            &self.iface_name
         }
 
         /// Returns the detected physical uplink interface name (e.g. `"en0"`).
@@ -1342,7 +1622,14 @@ mod imp {
             self.mtu
         }
 
-        /// Returns a live watch receiver signaled immediately on macOS `PF_ROUTE` changes.
+        /// Returns `true` if IPv6 TUN routing (`2000::/3`, `64:ff9b::/96`) and `SCDynamicStore`
+        /// IPv6 keys are active (activated at startup or auto-enabled on an IPv6-only uplink,
+        /// updated dynamically on uplink transitions).
+        pub fn is_ipv6_active(&self) -> bool {
+            self.ipv6_active.load(Ordering::Acquire)
+        }
+
+        /// Returns a live watch receiver signaled on macOS `PF_ROUTE` changes after uplink rebind.
         pub fn route_change_rx(&self) -> watch::Receiver<u64> {
             self.route_tx.subscribe()
         }
@@ -1355,12 +1642,46 @@ mod imp {
             drop(self.route_monitor.take());
 
             // Remove session-scoped SCDynamicStore DNS keys and flush mDNSResponder first so
-            // macOS immediately stops targeting `198.18.0.2`.
-            drop(self.dns_session.take());
+            // macOS immediately stops targeting `198.18.0.2` / `fd00:7664:7069::2`.
+            drop(
+                self.dns_session
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take(),
+            );
 
-            // Clean up any dynamically swapped `-ifscope` default route added by `RouteMonitor`.
+            // Clean up any dynamically managed split, exclusion, and `-ifscope` routes in reverse
+            // installation order before signaling the detached crash guard.
+            {
+                let mut split_v6 = self
+                    .managed_split_v6
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                for route in split_v6.drain(..).rev() {
+                    delete_managed_route(&route);
+                }
+            }
+            {
+                let mut split_v4 = self
+                    .managed_split_v4
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                for route in split_v4.routes.drain(..).rev() {
+                    delete_managed_route(&route);
+                }
+                split_v4.active = false;
+            }
+            {
+                let mut excl = self
+                    .managed_exclusions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                for route in excl.routes.drain(..).rev() {
+                    delete_managed_route(&route);
+                }
+            }
             if let Some(route) = self
-                .managed_ifscope_v4
+                .managed_ifscope_v6
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .take()
@@ -1368,7 +1689,7 @@ mod imp {
                 delete_managed_route(&route);
             }
             if let Some(route) = self
-                .managed_ifscope_v6
+                .managed_ifscope_v4
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .take()
@@ -1394,10 +1715,15 @@ mod imp {
                 }
             }
             if !restored_by_guard {
-                restore_macos_tun_state(&self.guard_state);
+                let state = self
+                    .managed_guard_state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                restore_macos_tun_state(&state);
             }
             self.binder.update(OutboundTarget::default());
-            debug!(iface = %self.guard_state.iface_name, "macOS TUN session stopped and cleaned up");
+            debug!(iface = %self.iface_name, "macOS TUN session stopped and cleaned up");
         }
     }
 
@@ -1445,7 +1771,13 @@ mod imp {
             }
         }
 
-        restore_macos_tun_state(&state);
+        // Prefer the latest on-disk state updated by RouteMonitor on uplink switches so
+        // SIGKILL cleanup also deletes dynamically swapped `-ifscope` and exclusion routes.
+        let effective_state = match MacosTunGuardState::load_from_path(Path::new(MACOS_TUN_STATE_PATH)) {
+            Ok(Some(disk_state)) if disk_state.iface_name == state.iface_name => disk_state,
+            _ => state,
+        };
+        restore_macos_tun_state(&effective_state);
         Ok(())
     }
 
@@ -1544,33 +1876,31 @@ mod imp {
         Ok((read_fd, write_fd))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn run_pf_route_monitor_loop(
         route_fd: OwnedFd,
         stop_read_fd: OwnedFd,
         stop_flag: Arc<AtomicBool>,
-        binder: Arc<DynamicOutboundBinder>,
-        route_tx: Arc<watch::Sender<u64>>,
-        managed_ifscope_v4: Arc<Mutex<Option<ManagedRoute>>>,
-        managed_ifscope_v6: Arc<Mutex<Option<ManagedRoute>>>,
-        ipv6_active: bool,
+        mut ctx: RouteMonitorContext,
     ) {
         let mut pending_rebind: Option<(Instant, Instant)> = None;
+        let mut pending_force_resync = false;
         let mut buf = [0u8; 4096];
+        let mut last_instant = Instant::now();
+        let mut last_wall = SystemTime::now();
 
         loop {
             if stop_flag.load(Ordering::Acquire) {
                 break;
             }
 
-            let timeout_ms: libc::c_int = match pending_rebind {
-                None => -1,
+            let expected_wait = match pending_rebind {
+                None => MACOS_ROUTE_IDLE_POLL_INTERVAL,
                 Some((burst_start, deadline)) => {
                     let effective = deadline.min(burst_start + ROUTE_DEBOUNCE_MAX_WAIT);
-                    let rem = effective.saturating_duration_since(Instant::now());
-                    poll_timeout_ms_ceil(rem)
+                    effective.saturating_duration_since(Instant::now())
                 }
             };
+            let timeout_ms: libc::c_int = poll_timeout_ms_ceil(expected_wait);
 
             let mut pfds = [
                 libc::pollfd {
@@ -1588,16 +1918,42 @@ mod imp {
             // SAFETY: `pfds` points to two valid `pollfd` entries with open file descriptors.
             let rc =
                 unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout_ms) };
-            if rc < 0 {
-                let err = io::Error::last_os_error();
+            let poll_err = (rc < 0).then(io::Error::last_os_error);
+
+            if stop_flag.load(Ordering::Acquire)
+                || (rc > 0 && (pfds[1].revents & libc::POLLIN) != 0)
+            {
+                break;
+            }
+
+            let now_instant = Instant::now();
+            let now_wall = SystemTime::now();
+            let instant_elapsed = now_instant.saturating_duration_since(last_instant);
+            let wall_delta = now_wall
+                .duration_since(last_wall)
+                .map_err(|err| err.duration());
+            last_instant = now_instant;
+            last_wall = now_wall;
+
+            if detect_wake_or_time_jump(instant_elapsed, wall_delta, expected_wait) {
+                info!(
+                    instant_elapsed_ms = instant_elapsed.as_millis(),
+                    ?wall_delta,
+                    "macOS wake or significant clock jump detected; scheduling forced route re-sync"
+                );
+                pending_force_resync = true;
+                let next_deadline = now_instant + ROUTE_DEBOUNCE_WINDOW;
+                pending_rebind = Some(match pending_rebind {
+                    Some((burst_start, _)) => (burst_start, next_deadline),
+                    None => (now_instant, next_deadline),
+                });
+            }
+
+            if let Some(err) = poll_err {
                 if err.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
                 warn!(error = %err, "PF_ROUTE poll() failed; stopping macOS route watcher");
-                break;
-            }
-
-            if stop_flag.load(Ordering::Acquire) || (pfds[1].revents & libc::POLLIN) != 0 {
                 break;
             }
 
@@ -1643,9 +1999,6 @@ mod imp {
                 }
 
                 if relevant_seen {
-                    // Notify route-change watchers (e.g. VpnGuard) immediately.
-                    route_tx.send_modify(|epoch| *epoch = epoch.saturating_add(1));
-
                     let now = Instant::now();
                     let next_deadline = now + ROUTE_DEBOUNCE_WINDOW;
                     pending_rebind = Some(match pending_rebind {
@@ -1661,131 +2014,591 @@ mod imp {
                     || now.saturating_duration_since(burst_start) >= ROUTE_DEBOUNCE_MAX_WAIT
                 {
                     pending_rebind = None;
-                    rebind_physical_uplink(
-                        &binder,
-                        &managed_ifscope_v4,
-                        &managed_ifscope_v6,
-                        ipv6_active,
-                    );
+                    let force_resync = std::mem::take(&mut pending_force_resync);
+                    rebind_physical_uplink(&mut ctx, force_resync);
+                    // Reset clock baseline after rebind work so subprocess execution time
+                    // is not miscounted as poll sleep/skew on the next iteration.
+                    last_instant = Instant::now();
+                    last_wall = SystemTime::now();
                 }
             }
+        }
+    }
+
+    fn update_guard_state_routes(
+        managed_guard_state: &Mutex<MacosTunGuardState>,
+        removed: &[ManagedRoute],
+        added: &[ManagedRoute],
+    ) {
+        if removed.is_empty() && added.is_empty() {
+            return;
+        }
+        let mut state = managed_guard_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for old in removed {
+            if let Some(pos) = state.routes.iter().position(|r| r == old) {
+                state.routes.remove(pos);
+            }
+        }
+        for new_route in added {
+            state.routes.push(new_route.clone());
+        }
+    }
+
+    fn persist_managed_guard_state(managed_guard_state: &Mutex<MacosTunGuardState>) {
+        let snapshot = managed_guard_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Err(e) = save_macos_tun_state(&snapshot) {
+            warn!(
+                path = MACOS_TUN_STATE_PATH,
+                error = %e,
+                "failed to persist updated macOS TUN state after uplink rebind"
+            );
         }
     }
 
     fn sync_managed_ifscope_route(
         slot: &Mutex<Option<ManagedRoute>>,
+        managed_guard_state: &Mutex<MacosTunGuardState>,
         is_ipv6: bool,
-        new_iface: &str,
-        new_gw: Option<&str>,
-    ) {
-        let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
-        let desired = new_gw.map(|gw| ManagedRoute {
-            destination: "default".to_string(),
-            is_ipv6,
-            interface: None,
-            gateway: Some(gw.to_string()),
-            ifscope: Some(new_iface.to_string()),
-        });
+        uplink: Option<&(String, Option<String>)>,
+        force_resync: bool,
+    ) -> bool {
+        let mut removed = Vec::new();
+        let mut added = Vec::new();
+        {
+            let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+            let desired = build_ifscope_default_route(is_ipv6, uplink);
+            let needs_sync = if force_resync {
+                guard.is_some() || desired.is_some()
+            } else {
+                ifscope_route_needs_sync(guard.as_ref(), is_ipv6, uplink)
+            };
+            if !needs_sync {
+                return false;
+            }
 
-        if *guard == desired {
-            return;
+            if let Some(old) = guard.take() {
+                delete_managed_route(&old);
+                removed.push(old);
+            }
+
+            if let Some(route) = desired {
+                match add_managed_route(&route, true) {
+                    Ok(true) => {
+                        added.push(route.clone());
+                        *guard = Some(route);
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        warn!(
+                            iface = ?route.ifscope,
+                            gateway = ?route.gateway,
+                            is_ipv6,
+                            error = %e,
+                            "failed to install -ifscope default route on new macOS uplink"
+                        );
+                    }
+                }
+            }
         }
 
-        if let Some(old) = guard.take() {
-            delete_managed_route(&old);
+        update_guard_state_routes(managed_guard_state, &removed, &added);
+        !removed.is_empty() || !added.is_empty()
+    }
+
+    fn sync_managed_exclusions(
+        managed_exclusions: &Mutex<ManagedExclusions>,
+        managed_guard_state: &Mutex<MacosTunGuardState>,
+        phys_v4: Option<&(String, Option<String>)>,
+        force_resync: bool,
+    ) -> bool {
+        let desired_uplink = phys_v4.cloned();
+        let mut removed = Vec::new();
+        let mut added = Vec::new();
+        {
+            let mut guard = managed_exclusions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !exclusion_routes_need_sync(
+                guard.uplink.as_ref(),
+                desired_uplink.as_ref(),
+                force_resync,
+            ) {
+                return false;
+            }
+
+            for old in guard.routes.drain(..).rev() {
+                delete_managed_route(&old);
+                removed.push(old);
+            }
+
+            if let Some((ref iface4, ref gw4)) = desired_uplink {
+                for prefix in RFC1918_EXCLUSIONS {
+                    let route = ManagedRoute {
+                        destination: (*prefix).to_string(),
+                        is_ipv6: false,
+                        interface: gw4.is_none().then(|| iface4.clone()),
+                        gateway: gw4.clone(),
+                        ifscope: None,
+                    };
+                    match add_managed_route(&route, true) {
+                        Ok(true) => {
+                            added.push(route.clone());
+                            guard.routes.push(route);
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            warn!(
+                                prefix,
+                                iface = %iface4,
+                                gateway = ?gw4,
+                                error = %e,
+                                "failed to update RFC1918/CGNAT exclusion route on new macOS uplink"
+                            );
+                        }
+                    }
+                }
+
+                for prefix in LINK_LOCAL_EXCLUSIONS {
+                    let route = ManagedRoute {
+                        destination: (*prefix).to_string(),
+                        is_ipv6: false,
+                        interface: Some(iface4.clone()),
+                        gateway: None,
+                        ifscope: None,
+                    };
+                    match add_managed_route(&route, true) {
+                        Ok(true) => {
+                            added.push(route.clone());
+                            guard.routes.push(route);
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            warn!(
+                                prefix,
+                                iface = %iface4,
+                                error = %e,
+                                "failed to update link-local/multicast/reserved exclusion route on new macOS uplink"
+                            );
+                        }
+                    }
+                }
+            }
+
+            guard.uplink = desired_uplink;
         }
 
-        if let Some(route) = desired {
-            match add_managed_route(&route, true) {
-                Ok(true) => {
-                    *guard = Some(route);
+        update_guard_state_routes(managed_guard_state, &removed, &added);
+        !removed.is_empty() || !added.is_empty()
+    }
+
+    fn sync_managed_split_v4_routes(
+        managed_split_v4: &Mutex<ManagedSplitV4>,
+        managed_guard_state: &Mutex<MacosTunGuardState>,
+        iface_name: &str,
+        desired_active: bool,
+        force_resync: bool,
+    ) -> bool {
+        let mut removed = Vec::new();
+        let mut added = Vec::new();
+        {
+            let mut guard = managed_split_v4.lock().unwrap_or_else(|e| e.into_inner());
+            if !force_resync && guard.active == desired_active {
+                return false;
+            }
+
+            if desired_active {
+                for prefix in IPV4_SPLIT_ROUTES {
+                    let route = ManagedRoute {
+                        destination: (*prefix).to_string(),
+                        is_ipv6: false,
+                        interface: Some(iface_name.to_string()),
+                        gateway: None,
+                        ifscope: None,
+                    };
+                    if guard.routes.contains(&route) {
+                        if force_resync {
+                            if let Err(e) = add_managed_route(&route, true) {
+                                warn!(
+                                    prefix,
+                                    iface = %iface_name,
+                                    error = %e,
+                                    "failed to verify/re-install IPv4 split route after macOS wake"
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                    match add_managed_route(&route, true) {
+                        Ok(true) => {
+                            added.push(route.clone());
+                            guard.routes.push(route);
+                        }
+                        Ok(false) => {
+                            debug!(
+                                prefix,
+                                iface = %iface_name,
+                                "IPv4 split route already existed during uplink transition; leaving existing entry untouched"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                prefix,
+                                iface = %iface_name,
+                                error = %e,
+                                "failed to install IPv4 split route on macOS uplink transition"
+                            );
+                        }
+                    }
                 }
-                Ok(false) => {}
-                Err(e) => {
-                    warn!(
-                        iface = %new_iface,
-                        gateway = ?new_gw,
-                        is_ipv6,
-                        error = %e,
-                        "failed to install -ifscope default route on new macOS uplink"
-                    );
+                guard.active = true;
+            } else {
+                for old in guard.routes.drain(..).rev() {
+                    delete_managed_route(&old);
+                    removed.push(old);
                 }
+                guard.active = false;
+            }
+        }
+
+        update_guard_state_routes(managed_guard_state, &removed, &added);
+        !removed.is_empty() || !added.is_empty()
+    }
+
+    fn sync_managed_split_v6_routes(
+        managed_split_v6: &Mutex<Vec<ManagedRoute>>,
+        managed_guard_state: &Mutex<MacosTunGuardState>,
+        iface_name: &str,
+        desired_active: bool,
+        force_resync: bool,
+    ) -> (bool, bool) {
+        let mut removed = Vec::new();
+        let mut added = Vec::new();
+        let active;
+        {
+            let mut guard = managed_split_v6.lock().unwrap_or_else(|e| e.into_inner());
+            if desired_active {
+                for route in build_ipv6_split_routes(iface_name) {
+                    if guard.contains(&route) {
+                        if force_resync {
+                            if let Err(e) = add_managed_route(&route, true) {
+                                warn!(
+                                    prefix = %route.destination,
+                                    iface = %iface_name,
+                                    error = %e,
+                                    "failed to verify/re-install IPv6 split route after macOS wake"
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                    match add_managed_route(&route, true) {
+                        Ok(true) => {
+                            added.push(route.clone());
+                            guard.push(route);
+                        }
+                        Ok(false) => {
+                            warn!(
+                                prefix = %route.destination,
+                                iface = %iface_name,
+                                "IPv6 split route already exists in macOS table; leaving existing entry untouched"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                prefix = %route.destination,
+                                iface = %iface_name,
+                                error = %e,
+                                "failed to install IPv6 split route on macOS uplink transition"
+                            );
+                        }
+                    }
+                }
+                active = guard.iter().any(|r| r.destination == "2000::/3");
+                if !active {
+                    // Avoid leaving a partial NAT64-only route active if 2000::/3 failed.
+                    for old in guard.drain(..).rev() {
+                        delete_managed_route(&old);
+                        if let Some(pos) = added.iter().position(|r| r == &old) {
+                            added.remove(pos);
+                        } else {
+                            removed.push(old);
+                        }
+                    }
+                }
+            } else {
+                for old in guard.drain(..).rev() {
+                    delete_managed_route(&old);
+                    removed.push(old);
+                }
+                active = false;
+            }
+        }
+
+        update_guard_state_routes(managed_guard_state, &removed, &added);
+        (!removed.is_empty() || !added.is_empty(), active)
+    }
+
+    fn sync_dns_session_ipv6(
+        dns_session: &Mutex<Option<ScDynamicStoreDnsSession>>,
+        desired_ipv6_active: bool,
+    ) -> bool {
+        let mut guard = dns_session.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(session) = guard.as_mut() else {
+            return false;
+        };
+        match session.set_ipv6_active(desired_ipv6_active) {
+            Ok(changed) => changed,
+            Err(e) => {
+                warn!(
+                    ipv6_active = desired_ipv6_active,
+                    error = %e,
+                    "failed to update macOS SCDynamicStore IPv6/DNS keys on uplink transition"
+                );
+                false
             }
         }
     }
 
-    fn rebind_physical_uplink(
-        binder: &DynamicOutboundBinder,
-        managed_ifscope_v4: &Mutex<Option<ManagedRoute>>,
-        managed_ifscope_v6: &Mutex<Option<ManagedRoute>>,
-        ipv6_active: bool,
-    ) {
-        let (phys_iface, phys_gw) = match detect_physical_default_v4() {
-            Ok(found) => found,
+    fn rebind_physical_uplink(ctx: &mut RouteMonitorContext, force_resync: bool) {
+        let phys_v4_raw = match detect_physical_default_v4() {
+            Ok(found) => Some(found),
             Err(e) => {
                 debug!(
                     error = %e,
-                    "failed to re-detect physical default IPv4 uplink after macOS route change"
+                    "no physical default IPv4 uplink detected after macOS route change"
                 );
-                return;
+                None
             }
         };
-
-        let if_index_v4 = match if_name_to_index(&phys_iface) {
-            Ok(idx) => idx,
-            Err(e) => {
-                warn!(
-                    iface = %phys_iface,
-                    error = %e,
-                    "failed to resolve interface index for detected macOS uplink"
-                );
-                return;
-            }
-        };
-
-        let phys_v6 = detect_physical_default_v6();
-        let if_index_v6 = phys_v6
+        let if_index_v4 = phys_v4_raw
             .as_ref()
-            .and_then(|(iface6, _)| if_name_to_index(iface6).ok());
+            .and_then(|(iface4, _)| match if_name_to_index(iface4) {
+                Ok(idx) => Some(idx),
+                Err(e) => {
+                    warn!(
+                        iface = %iface4,
+                        error = %e,
+                        "failed to resolve IPv4 interface index for detected macOS uplink"
+                    );
+                    None
+                }
+            });
+        let phys_v4 = phys_v4_raw.filter(|_| if_index_v4.is_some());
+
+        let phys_v6_raw = detect_physical_default_v6();
+        let if_index_v6 = phys_v6_raw
+            .as_ref()
+            .and_then(|(iface6, _)| match if_name_to_index(iface6) {
+                Ok(idx) => Some(idx),
+                Err(e) => {
+                    warn!(
+                        iface = %iface6,
+                        error = %e,
+                        "failed to resolve IPv6 interface index for detected macOS uplink"
+                    );
+                    None
+                }
+            });
+        let phys_v6 = phys_v6_raw.filter(|_| if_index_v6.is_some());
+
+        let Some(phys_iface) = phys_v4
+            .as_ref()
+            .map(|(iface4, _)| iface4.clone())
+            .or_else(|| phys_v6.as_ref().map(|(iface6, _)| iface6.clone()))
+        else {
+            // All physical uplinks disappeared: clear stale physical-gateway routes and reset the
+            // outbound binder to fail-closed `None` rather than keeping a dead interface bound.
+            let mut state_dirty = sync_managed_ifscope_route(
+                &ctx.managed_ifscope_v4,
+                &ctx.managed_guard_state,
+                false,
+                None,
+                force_resync,
+            );
+            state_dirty |= sync_managed_ifscope_route(
+                &ctx.managed_ifscope_v6,
+                &ctx.managed_guard_state,
+                true,
+                None,
+                force_resync,
+            );
+            state_dirty |= sync_managed_exclusions(
+                &ctx.managed_exclusions,
+                &ctx.managed_guard_state,
+                None,
+                force_resync,
+            );
+            if state_dirty {
+                persist_managed_guard_state(&ctx.managed_guard_state);
+            }
+
+            let fail_closed = OutboundTarget {
+                nic_name: None,
+                if_index_v4: None,
+                if_index_v6: None,
+                fwmark: None,
+                fail_closed: true,
+            };
+            if ctx.binder.snapshot() != fail_closed {
+                warn!(
+                    "no physical default IPv4 or IPv6 uplink detected after macOS route change; resetting outbound binder to fail-closed None"
+                );
+                ctx.binder.update(fail_closed);
+                flush_macos_dns_cache();
+            } else {
+                debug!(
+                    "no physical default IPv4 or IPv6 uplink detected after macOS route change; outbound binder already fail-closed"
+                );
+            }
+
+            // Still notify watchers (e.g. VpnGuard) when the physical default route disappears.
+            ctx.route_tx
+                .send_modify(|epoch| *epoch = epoch.saturating_add(1));
+            return;
+        };
 
         let next = OutboundTarget {
-            nic_name: Some(phys_iface.clone()),
-            if_index_v4: Some(if_index_v4),
+            nic_name: Some(phys_iface),
+            if_index_v4,
             if_index_v6,
             fwmark: None,
             fail_closed: true,
         };
 
-        let target_changed = binder.snapshot() != next;
-        let v4_gw_changed = {
-            let guard = managed_ifscope_v4.lock().unwrap_or_else(|e| e.into_inner());
-            guard.as_ref().is_some_and(|old| {
-                old.ifscope.as_deref() != Some(phys_iface.as_str())
-                    || old.gateway.as_deref() != phys_gw.as_deref()
-            })
-        };
-        let v6_gw_changed = ipv6_active && {
-            let guard = managed_ifscope_v6.lock().unwrap_or_else(|e| e.into_inner());
-            let desired_iface = phys_v6.as_ref().map(|(iface, _)| iface.as_str());
-            let desired_gw = phys_v6.as_ref().and_then(|(_, gw)| gw.as_deref());
-            guard.as_ref().is_some_and(|old| {
-                old.ifscope.as_deref() != desired_iface || old.gateway.as_deref() != desired_gw
-            })
-        };
+        let target_changed = ctx.binder.snapshot() != next;
 
-        if target_changed || v4_gw_changed || v6_gw_changed {
-            sync_managed_ifscope_route(managed_ifscope_v4, false, &phys_iface, phys_gw.as_deref());
-            if ipv6_active {
-                if let Some((ref iface6, ref gw6)) = phys_v6 {
-                    sync_managed_ifscope_route(managed_ifscope_v6, true, iface6, gw6.as_deref());
-                } else if let Some(old6) = managed_ifscope_v6
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .take()
-                {
-                    delete_managed_route(&old6);
+        let desired_v4_active = phys_v4.is_some();
+        let mut desired_v6_active =
+            compute_desired_ipv6_active(ctx.tun_ipv6, desired_v4_active, phys_v6.is_some());
+
+        if desired_v6_active && !ctx.utun_ipv6_configured {
+            match configure_utun_ipv6(&ctx.iface_name) {
+                Ok(()) => {
+                    ctx.utun_ipv6_configured = true;
+                }
+                Err(e) => {
+                    warn!(
+                        iface = %ctx.iface_name,
+                        error = %e,
+                        "failed to configure IPv6 on utun interface during uplink transition; skipping IPv6 TUN activation"
+                    );
+                    desired_v6_active = false;
                 }
             }
+        }
+
+        let mut state_dirty = false;
+        let mut dns_changed = false;
+
+        // 1. IPv4 routes: install `-ifscope` and exclusions before split routes; remove in reverse.
+        if desired_v4_active {
+            state_dirty |= sync_managed_ifscope_route(
+                &ctx.managed_ifscope_v4,
+                &ctx.managed_guard_state,
+                false,
+                phys_v4.as_ref(),
+                force_resync,
+            );
+            state_dirty |= sync_managed_exclusions(
+                &ctx.managed_exclusions,
+                &ctx.managed_guard_state,
+                phys_v4.as_ref(),
+                force_resync,
+            );
+            state_dirty |= sync_managed_split_v4_routes(
+                &ctx.managed_split_v4,
+                &ctx.managed_guard_state,
+                &ctx.iface_name,
+                true,
+                force_resync,
+            );
+        } else {
+            state_dirty |= sync_managed_split_v4_routes(
+                &ctx.managed_split_v4,
+                &ctx.managed_guard_state,
+                &ctx.iface_name,
+                false,
+                force_resync,
+            );
+            state_dirty |= sync_managed_exclusions(
+                &ctx.managed_exclusions,
+                &ctx.managed_guard_state,
+                None,
+                force_resync,
+            );
+            state_dirty |= sync_managed_ifscope_route(
+                &ctx.managed_ifscope_v4,
+                &ctx.managed_guard_state,
+                false,
+                None,
+                force_resync,
+            );
+        }
+
+        // 2. IPv6 routes & SCDynamicStore IPv6 keys: dynamically transition on roaming between
+        //    IPv4-only, dual-stack, and IPv6-only uplinks.
+        let effective_v6_active = if desired_v6_active {
+            state_dirty |= sync_managed_ifscope_route(
+                &ctx.managed_ifscope_v6,
+                &ctx.managed_guard_state,
+                true,
+                phys_v6.as_ref(),
+                force_resync,
+            );
+            let (split_dirty, split_v6_active) = sync_managed_split_v6_routes(
+                &ctx.managed_split_v6,
+                &ctx.managed_guard_state,
+                &ctx.iface_name,
+                true,
+                force_resync,
+            );
+            state_dirty |= split_dirty;
+            if split_v6_active {
+                dns_changed |= sync_dns_session_ipv6(&ctx.dns_session, true);
+                true
+            } else {
+                dns_changed |= sync_dns_session_ipv6(&ctx.dns_session, false);
+                false
+            }
+        } else {
+            dns_changed |= sync_dns_session_ipv6(&ctx.dns_session, false);
+            let (split_dirty, _) = sync_managed_split_v6_routes(
+                &ctx.managed_split_v6,
+                &ctx.managed_guard_state,
+                &ctx.iface_name,
+                false,
+                force_resync,
+            );
+            state_dirty |= split_dirty;
+            state_dirty |= sync_managed_ifscope_route(
+                &ctx.managed_ifscope_v6,
+                &ctx.managed_guard_state,
+                true,
+                None,
+                force_resync,
+            );
+            false
+        };
+
+        let prev_v6_active = ctx.ipv6_active.swap(effective_v6_active, Ordering::AcqRel);
+        if prev_v6_active != effective_v6_active {
+            info!(
+                iface = %ctx.iface_name,
+                prev_ipv6_active = prev_v6_active,
+                ipv6_active = effective_v6_active,
+                has_v4 = desired_v4_active,
+                has_v6 = phys_v6.is_some(),
+                "macOS TUN IPv6 state updated dynamically on uplink transition"
+            );
+        }
+
+        if state_dirty {
+            persist_managed_guard_state(&ctx.managed_guard_state);
         }
 
         if target_changed {
@@ -1793,15 +2606,34 @@ mod imp {
                 nic = ?next.nic_name,
                 if_index_v4 = ?next.if_index_v4,
                 if_index_v6 = ?next.if_index_v6,
+                ipv6_active = effective_v6_active,
+                force_resync,
                 "macOS physical uplink changed; updated outbound binder"
             );
-            binder.update(next);
+            ctx.binder.update(next);
+        } else if force_resync {
+            info!(
+                nic = ?next.nic_name,
+                if_index_v4 = ?next.if_index_v4,
+                if_index_v6 = ?next.if_index_v6,
+                ipv6_active = effective_v6_active,
+                "macOS wake or clock jump detected; re-synced managed routes"
+            );
         } else {
             debug!(
                 nic = ?next.nic_name,
                 "macOS route change observed; physical uplink unchanged"
             );
         }
+
+        if target_changed || state_dirty || dns_changed || force_resync {
+            flush_macos_dns_cache();
+        }
+
+        // Emit route-change notification AFTER `binder.update(next)` completes so UDP NAT
+        // rebinds onto the new live NIC rather than the dead NIC during the 350ms debounce.
+        ctx.route_tx
+            .send_modify(|epoch| *epoch = epoch.saturating_add(1));
     }
 
     fn set_fd_cloexec(fd: libc::c_int) -> Result<()> {
@@ -1926,10 +2758,7 @@ mod imp {
         if !tun_ipv6 {
             return Ok((mtu, false));
         }
-        match run_cmd(
-            "/sbin/ifconfig",
-            &[iface_name, "inet6", MACOS_TUN_IPV6, "prefixlen", "64", "up"],
-        ) {
+        match configure_utun_ipv6(iface_name) {
             Ok(()) => Ok((mtu, true)),
             Err(e) => {
                 warn!(
@@ -1940,6 +2769,13 @@ mod imp {
                 Ok((mtu, false))
             }
         }
+    }
+
+    fn configure_utun_ipv6(iface_name: &str) -> Result<()> {
+        run_cmd(
+            "/sbin/ifconfig",
+            &[iface_name, "inet6", MACOS_TUN_IPV6, "prefixlen", "64", "up"],
+        )
     }
 
     fn managed_route_args<'a>(action: &'a str, route: &'a ManagedRoute) -> Option<Vec<&'a str>> {
@@ -2566,6 +3402,13 @@ destination: default
                     gateway: None,
                     ifscope: None,
                 },
+                ManagedRoute {
+                    destination: "64:ff9b::/96".to_string(),
+                    is_ipv6: true,
+                    interface: Some("utun4".to_string()),
+                    gateway: None,
+                    ifscope: None,
+                },
             ],
             dns_snapshots: vec![
                 DnsServiceSnapshot {
@@ -2654,5 +3497,151 @@ destination: default
         assert_eq!(poll_timeout_ms_ceil(Duration::from_micros(1001)), 2);
         assert_eq!(poll_timeout_ms_ceil(Duration::from_millis(350)), 350);
         assert_eq!(poll_timeout_ms_ceil(Duration::MAX), i32::MAX);
+    }
+
+    #[test]
+    fn exclusion_routes_include_cgnat_and_ifscope_sync_handles_none_to_some_gateway() {
+        assert!(RFC1918_EXCLUSIONS.contains(&"100.64.0.0/10"));
+        assert!(RFC1918_EXCLUSIONS.contains(&"10.0.0.0/8"));
+        assert!(RFC1918_EXCLUSIONS.contains(&"172.16.0.0/12"));
+        assert!(RFC1918_EXCLUSIONS.contains(&"192.0.0.0/24"));
+        assert!(RFC1918_EXCLUSIONS.contains(&"192.168.0.0/16"));
+
+        let uplink_no_gw = ("en0".to_string(), None);
+        let uplink_with_gw = ("en0".to_string(), Some("192.168.1.1".to_string()));
+        let uplink_other_gw = ("en0".to_string(), Some("192.168.1.254".to_string()));
+
+        // None -> None: no sync needed.
+        assert!(!ifscope_route_needs_sync(None, false, None));
+        assert!(!ifscope_route_needs_sync(None, false, Some(&uplink_no_gw)));
+
+        // None -> Some(gw): MUST trigger sync (regression for `is_some_and` bug).
+        assert!(ifscope_route_needs_sync(None, false, Some(&uplink_with_gw)));
+
+        let installed = build_ifscope_default_route(false, Some(&uplink_with_gw)).unwrap();
+        // Matching route: no sync needed.
+        assert!(!ifscope_route_needs_sync(
+            Some(&installed),
+            false,
+            Some(&uplink_with_gw)
+        ));
+        // Gateway changed: sync needed.
+        assert!(ifscope_route_needs_sync(
+            Some(&installed),
+            false,
+            Some(&uplink_other_gw)
+        ));
+        // Some(gw) -> None: sync needed to remove stale route.
+        assert!(ifscope_route_needs_sync(
+            Some(&installed),
+            false,
+            Some(&uplink_no_gw)
+        ));
+        assert!(ifscope_route_needs_sync(Some(&installed), false, None));
+    }
+
+    #[test]
+    fn dynamic_ipv6_activation_handles_all_uplink_transitions() {
+        // With --tun-ipv6=false: only auto-enabled on IPv6-only uplinks.
+        assert!(!compute_desired_ipv6_active(false, true, false)); // IPv4-only
+        assert!(!compute_desired_ipv6_active(false, true, true)); // Dual-stack
+        assert!(compute_desired_ipv6_active(false, false, true)); // IPv6-only
+        assert!(!compute_desired_ipv6_active(false, false, false)); // Offline
+
+        // With --tun-ipv6=true: active whenever a physical IPv6 uplink exists.
+        assert!(!compute_desired_ipv6_active(true, true, false)); // IPv4-only
+        assert!(compute_desired_ipv6_active(true, true, true)); // Dual-stack
+        assert!(compute_desired_ipv6_active(true, false, true)); // IPv6-only
+        assert!(!compute_desired_ipv6_active(true, false, false)); // Offline
+    }
+
+    #[test]
+    fn wake_time_jump_detection_and_forced_exclusion_resync() {
+        use std::time::Duration;
+
+        let idle = MACOS_ROUTE_IDLE_POLL_INTERVAL;
+        let threshold = MACOS_WAKE_TIME_JUMP_THRESHOLD;
+
+        // Normal awake idle timeout (10s instant, 10s wall): no wake.
+        assert!(!detect_wake_or_time_jump(idle, Ok(idle), idle));
+        // Slight jitter below threshold: no wake.
+        assert!(!detect_wake_or_time_jump(
+            idle,
+            Ok(idle + Duration::from_secs(2)),
+            idle
+        ));
+        // macOS sleep where Instant paused (100ms) while SystemTime advanced (30s): wake!
+        assert!(detect_wake_or_time_jump(
+            Duration::from_millis(100),
+            Ok(Duration::from_secs(30)),
+            idle
+        ));
+        // Exact threshold skew between wall and uptime: wake!
+        assert!(detect_wake_or_time_jump(
+            Duration::from_millis(50),
+            Ok(Duration::from_millis(50) + threshold),
+            idle
+        ));
+        // Significant backward wall-clock jump: wake!
+        assert!(detect_wake_or_time_jump(
+            Duration::from_millis(100),
+            Err(threshold),
+            idle
+        ));
+        // Monotonic elapsed time exceeding expected poll wait + threshold: wake!
+        assert!(detect_wake_or_time_jump(
+            idle + threshold,
+            Ok(idle + threshold),
+            idle
+        ));
+
+        let same_uplink = ("en0".to_string(), Some("192.168.1.1".to_string()));
+        let other_uplink = ("en0".to_string(), Some("192.168.2.1".to_string()));
+
+        // Normal path short-circuits when uplink matches.
+        assert!(!exclusion_routes_need_sync(
+            Some(&same_uplink),
+            Some(&same_uplink),
+            false
+        ));
+        assert!(exclusion_routes_need_sync(
+            Some(&same_uplink),
+            Some(&other_uplink),
+            false
+        ));
+        // Wake / forced resync MUST NOT short-circuit when iface+gw matches!
+        assert!(exclusion_routes_need_sync(
+            Some(&same_uplink),
+            Some(&same_uplink),
+            true
+        ));
+        // Even with force_resync, None -> None has nothing to sync.
+        assert!(!exclusion_routes_need_sync(None, None, true));
+    }
+
+    #[test]
+    fn ipv6_split_routes_include_global_unicast_and_rfc6052_nat64_prefix() {
+        assert_eq!(IPV6_SPLIT_ROUTES, &["2000::/3", "64:ff9b::/96"]);
+
+        let routes = build_ipv6_split_routes("utun4");
+        assert_eq!(
+            routes,
+            vec![
+                ManagedRoute {
+                    destination: "2000::/3".to_string(),
+                    is_ipv6: true,
+                    interface: Some("utun4".to_string()),
+                    gateway: None,
+                    ifscope: None,
+                },
+                ManagedRoute {
+                    destination: "64:ff9b::/96".to_string(),
+                    is_ipv6: true,
+                    interface: Some("utun4".to_string()),
+                    gateway: None,
+                    ifscope: None,
+                },
+            ]
+        );
     }
 }

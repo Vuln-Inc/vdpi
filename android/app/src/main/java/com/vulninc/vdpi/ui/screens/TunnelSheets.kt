@@ -40,11 +40,13 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -658,14 +660,47 @@ internal fun EngineLogSheetContent(
         }
     }
 
-    LaunchedEffect(events.size) {
-        if (events.isNotEmpty()) {
-            val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index
-            val nearBottom = lastVisible == null || lastVisible >= (events.size - 3).coerceAtLeast(0)
-            if (nearBottom) {
-                listState.scrollToItem(events.lastIndex)
+    var isPinnedToBottom by remember { mutableStateOf(true) }
+    var previousCount by remember { mutableIntStateOf(0) }
+    var isAutoScrolling by remember { mutableStateOf(false) }
+    val isNearBottom by remember {
+        derivedStateOf {
+            val info = listState.layoutInfo
+            val lastVisible = info.visibleItemsInfo.lastOrNull()?.index
+            val refCount = if (previousCount > 0) previousCount else info.totalItemsCount
+            lastVisible == null || refCount == 0 || lastVisible >= (refCount - 2).coerceAtLeast(0)
+        }
+    }
+
+    LaunchedEffect(listState) {
+        var wasUserScrolling = false
+        snapshotFlow {
+            Triple(listState.isScrollInProgress, isAutoScrolling, isNearBottom)
+        }.collect { (scrolling, autoScrolling, nearBottom) ->
+            if (!autoScrolling && (scrolling || wasUserScrolling)) {
+                isPinnedToBottom = nearBottom
+                wasUserScrolling = scrolling
+            } else if (autoScrolling) {
+                wasUserScrolling = false
             }
         }
+    }
+
+    LaunchedEffect(events.lastOrNull()?.seq, events.size) {
+        if (events.isEmpty()) {
+            previousCount = 0
+            isPinnedToBottom = true
+            return@LaunchedEffect
+        }
+        if (isPinnedToBottom && !listState.isScrollInProgress) {
+            isAutoScrolling = true
+            try {
+                listState.scrollToItem(events.lastIndex)
+            } finally {
+                isAutoScrolling = false
+            }
+        }
+        previousCount = events.size
     }
 
     val logWellBackground = if (palette.isDark) DarkLogWellBackground else palette.surface

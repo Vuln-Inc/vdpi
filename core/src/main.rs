@@ -24,9 +24,10 @@ use vdpi::platform::unix_foreground as foreground;
 use vdpi::platform::windows::foreground;
 use vdpi::server::{bind_listeners, serve_until_shutdown};
 use vdpi::service::{
-    clear_runtime_state, install_service, install_service_with_options, print_status, run_doctor,
-    switch_service_engine, switch_service_engine_quiet, uninstall_service,
-    uninstall_service_with_options, write_runtime_state, ServiceState,
+    clear_runtime_state, install_service_quiet, install_service_with_options,
+    print_status_with_options_and_config, run_doctor, switch_service_engine,
+    switch_service_engine_quiet, uninstall_service_quiet, uninstall_service_with_options,
+    write_runtime_state, ServiceState,
 };
 
 mod launcher;
@@ -55,6 +56,21 @@ fn main() -> Result<()> {
         return run_internal_macos_tun_guard();
     }
 
+    let res = run_main();
+    if let Err(ref err) = res {
+        if err
+            .chain()
+            .any(|cause| cause.is::<ApplyFileRestartError>())
+        {
+            eprintln!("Error: {err:#}");
+            std::process::exit(EXIT_CODE_APPLY_RESTART_FAILED);
+        }
+        launcher::pause_on_own_console(&format!("{err:#}"));
+    }
+    res
+}
+
+fn run_main() -> Result<()> {
     vdpi::update::cleanup_stale_old_binary();
     raise_fd_limit();
 
@@ -77,14 +93,24 @@ fn main() -> Result<()> {
     if let Some(Command::Config { action }) = cli.command.clone() {
         return handle_config_command(action, cli, &raw_args);
     }
+    if let Some(Command::Split { action }) = cli.command.clone() {
+        return handle_split_command(
+            action,
+            cli.config_path.as_deref(),
+            cli.split_mode,
+            &cli.split_apps,
+        );
+    }
 
     let resilient_admin_cmd = matches!(
         cli.command,
         Some(Command::Uninstall { .. } | Command::Pause | Command::Resume)
     );
+    let effective_service_mode =
+        cli.service || (cli.config_path.is_none() && has_installed_system_service());
     let (_loaded_config_path, file_cfg) = match load_file_config(
         cli.config_path.as_deref(),
-        cli.service,
+        effective_service_mode,
     ) {
         Ok(loaded) => loaded,
         Err(err) if resilient_admin_cmd => {
@@ -95,6 +121,7 @@ fn main() -> Result<()> {
         }
         Err(err) => return Err(err),
     };
+    let explicit_config_path = cli.config_path.clone();
     let mut command = cli.command.clone();
     let mut cfg = cli.resolve_runtime_config(&file_cfg, &raw_args);
 
@@ -174,6 +201,14 @@ fn main() -> Result<()> {
                         }
                     }
                     #[cfg(target_os = "windows")]
+                    if cfg.engine == EngineMode::Tun {
+                        if let Err(msg) = preflight_windows_wintun_dll() {
+                            notice = Some(msg);
+                            explicit_launcher = true;
+                            continue;
+                        }
+                    }
+                    #[cfg(target_os = "windows")]
                     if cfg.engine == EngineMode::Tun
                         && !vdpi::platform::windows_service::is_elevated()
                     {
@@ -220,7 +255,15 @@ fn main() -> Result<()> {
                     break;
                 }
                 launcher::Choice::Install => {
-                    match install_service(&cfg) {
+                    #[cfg(target_os = "windows")]
+                    if cfg.engine == EngineMode::Tun {
+                        if let Err(msg) = preflight_windows_wintun_dll() {
+                            notice = Some(msg);
+                            explicit_launcher = true;
+                            continue;
+                        }
+                    }
+                    match install_service_quiet(&cfg) {
                         Ok(()) => {
                             launcher::clear_preference();
                             session_engine_override = None;
@@ -289,6 +332,14 @@ fn main() -> Result<()> {
                     explicit_launcher = true;
                 }
                 launcher::Choice::ResumeService => {
+                    #[cfg(target_os = "windows")]
+                    if status.configured_engine == EngineMode::Tun {
+                        if let Err(msg) = preflight_windows_wintun_dll() {
+                            notice = Some(msg);
+                            explicit_launcher = true;
+                            continue;
+                        }
+                    }
                     match vdpi::service::resume_service_quiet() {
                         Ok(()) => {
                             wait_for_live_engine(&cfg, status.configured_engine);
@@ -301,6 +352,14 @@ fn main() -> Result<()> {
                     explicit_launcher = true;
                 }
                 launcher::Choice::SwitchEngine(target) => {
+                    #[cfg(target_os = "windows")]
+                    if target == EngineMode::Tun {
+                        if let Err(msg) = preflight_windows_wintun_dll() {
+                            notice = Some(msg);
+                            explicit_launcher = true;
+                            continue;
+                        }
+                    }
                     let is_installed = status.installed.is_some()
                         || status.service_state != ServiceState::NotInstalled;
                     if is_installed {
@@ -326,11 +385,23 @@ fn main() -> Result<()> {
                     } else {
                         cfg.engine = target;
                         session_engine_override = Some(target);
-                        let msg = match target {
+                        let user_path = user_config_path();
+                        let save_res = load_file_config_or_default(Some(&user_path), false)
+                            .and_then(|(_, mut fc)| {
+                                fc.schema_version = Some(CONFIG_SCHEMA_VERSION);
+                                fc.engine = Some(target);
+                                save_config_with_ownership(&user_path, &fc)
+                            });
+                        let base_msg = match target {
                             EngineMode::Tun => "Engine set to TUN mode.",
                             EngineMode::Proxy => "Engine set to Proxy mode.",
                         };
-                        notice = Some(msg.to_string());
+                        notice = Some(match save_res {
+                            Ok(()) => base_msg.to_string(),
+                            Err(err) => sanitize_notice(&format!(
+                                "{base_msg} (warning: failed to save config: {err:#})"
+                            )),
+                        });
                     }
                     explicit_launcher = true;
                 }
@@ -341,13 +412,23 @@ fn main() -> Result<()> {
                 launcher::Choice::SetDns(dns_addr) => {
                     let was_installed = status.installed.is_some()
                         || status.service_state != ServiceState::NotInstalled;
+                    let was_running = status.service_state == ServiceState::Running;
+                    let target_engine = status
+                        .live_engine
+                        .as_ref()
+                        .map_or(status.configured_engine, |live| live.engine);
                     match resolve_dns_target(&dns_addr).and_then(|validated| {
                         vdpi::service::set_service_dns_quiet(&validated, &cfg).map(|()| validated)
                     }) {
                         Ok(validated) => {
                             let label = launcher::format_dns_label(&validated);
+                            cfg.enable_doh =
+                                vdpi_core::dns::effective_enable_doh(&validated, cfg.enable_doh);
                             cfg.dns_addr = validated.clone();
                             session_dns_override = Some(validated);
+                            if was_running {
+                                wait_for_live_engine(&cfg, target_engine);
+                            }
                             notice = Some(if was_installed {
                                 format!("DNS server set to {label}.")
                             } else {
@@ -364,12 +445,20 @@ fn main() -> Result<()> {
                 launcher::Choice::SplitTunnel => {
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     {
+                        let was_running = status.service_state == ServiceState::Running;
+                        let target_engine = status
+                            .live_engine
+                            .as_ref()
+                            .map_or(status.configured_engine, |live| live.engine);
                         match vdpi::split_tunnel::tui::run_split_tunnel_picker(configured_split) {
                             Ok(Some(new_cfg)) => {
                                 match vdpi::service::set_service_split_tunnel(&new_cfg) {
                                     Ok(msg) => {
                                         cfg.split_tunnel = new_cfg.clone();
                                         session_split_override = Some(new_cfg);
+                                        if was_running {
+                                            wait_for_live_engine(&cfg, target_engine);
+                                        }
                                         notice = Some(sanitize_notice(&msg));
                                     }
                                     Err(err) => {
@@ -459,10 +548,12 @@ fn main() -> Result<()> {
                     continue;
                 }
                 launcher::Choice::Uninstall => {
-                    match uninstall_service() {
+                    match uninstall_service_quiet() {
                         Ok(()) => {
                             launcher::clear_preference();
                             session_engine_override = None;
+                            session_dns_override = None;
+                            session_split_override = None;
                             notice = Some("vdpi background service uninstalled.".to_string());
                         }
                         Err(err) => {
@@ -509,7 +600,12 @@ fn main() -> Result<()> {
                     if let Some(live) = status.live_engine {
                         println!("{}", format_live_engine_line(&live));
                     } else {
-                        println!("Engine: {} (configured)", status.configured_engine.as_str());
+                        let configured = configured_engine_for_display(
+                            explicit_config_path.as_deref(),
+                            cfg.engine,
+                            status.configured_engine,
+                        );
+                        println!("Engine: {} (configured)", configured.as_str());
                     }
                     Ok(())
                 }
@@ -523,20 +619,30 @@ fn main() -> Result<()> {
                     vdpi::service::set_service_dns(&validated, &cfg)
                 }
                 None => {
-                    let current = vdpi::service::load_configured_dns(&cfg.dns_addr);
+                    let current = configured_dns_for_display(
+                        explicit_config_path.as_deref(),
+                        &cfg.dns_addr,
+                    );
                     println!("DNS: {}", launcher::format_dns_label(&current));
                     Ok(())
                 }
             }
         }
         Some(Command::Dashboard) => handle_dashboard_command(&cfg),
-        Some(Command::Split { action }) => handle_split_command(action),
-        Some(Command::Status) | Some(Command::Doctor) | Some(Command::Update { .. }) => {
+        Some(Command::Split { .. }) => unreachable!("handled by split command"),
+        Some(Command::Status { .. }) | Some(Command::Doctor) | Some(Command::Update { .. }) => {
             init_tracing(&cfg);
             let rt = build_cli_runtime()?;
             rt.block_on(async move {
                 match command {
-                    Some(Command::Status) => print_status(&cfg).await,
+                    Some(Command::Status { json }) => {
+                        print_status_with_options_and_config(
+                            &cfg,
+                            json,
+                            explicit_config_path.as_deref(),
+                        )
+                        .await
+                    }
                     Some(Command::Doctor) => run_doctor(cfg).await,
                     Some(Command::Update { check, force }) => {
                         vdpi::update::run_update(check, force, &cfg).await
@@ -546,6 +652,15 @@ fn main() -> Result<()> {
             })
         }
         Some(Command::Start) | None => {
+            #[cfg(target_os = "windows")]
+            if cfg.engine == EngineMode::Tun {
+                if let Err(msg) = preflight_windows_wintun_dll() {
+                    let _ = vdpi::platform::windows_tun::cleanup_orphan_wintun_adapter();
+                    return Err(desktop_tun::format_tun_start_error(anyhow::anyhow!(
+                        "{msg}"
+                    )));
+                }
+            }
             #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
             if cfg.engine == EngineMode::Tun
                 && !is_process_elevated()
@@ -599,11 +714,54 @@ fn run_internal_macos_tun_guard() -> Result<()> {
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn format_wintun_preflight_notice(err_chain: &str) -> String {
+    let lower = err_chain.to_ascii_lowercase();
+    if lower.contains("sha-256")
+        || lower.contains("hash")
+        || lower.contains("mismatch")
+        || lower.contains("verification failed")
+        || lower.contains("corrupt")
+    {
+        "wintun.dll is corrupted or mismatched - extract all files from the zip (keep wintun.dll beside vdpi.exe)"
+            .to_string()
+    } else {
+        "wintun.dll not found next to vdpi.exe - extract all files from the zip".to_string()
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn preflight_windows_wintun_dll() -> std::result::Result<(), String> {
+    match vdpi::platform::windows_tun::find_verified_wintun_dll() {
+        Ok(_) => Ok(()),
+        Err(err) => Err(format_wintun_preflight_notice(&format!("{err:#}"))),
+    }
+}
+
+fn has_installed_system_service() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        vdpi::platform::windows_service::query_windows_service_status().installed
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Path::new(vdpi::service::LAUNCH_DAEMON_PLIST_PATH).exists()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Path::new(vdpi::service::SYSTEMD_SYSTEM_UNIT_PATH).exists()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
+}
+
 fn resolve_config_path_for_display(explicit: Option<&Path>, service_mode: bool) -> PathBuf {
     if let Some(path) = explicit {
         return path.to_path_buf();
     }
-    if service_mode {
+    if service_mode || has_installed_system_service() {
         #[cfg(target_os = "windows")]
         {
             return system_config_path();
@@ -611,7 +769,7 @@ fn resolve_config_path_for_display(explicit: Option<&Path>, service_mode: bool) 
         #[cfg(not(target_os = "windows"))]
         {
             let sys = system_config_path();
-            if sys.is_file() {
+            if sys.is_file() || has_installed_system_service() {
                 return sys;
             }
             let usr = user_config_path();
@@ -686,11 +844,28 @@ fn resolve_writable_config_path(
     if service_mode {
         return Ok(WritableConfigPath::Ready(system_config_path()));
     }
+    let sys = system_config_path();
+    if has_installed_system_service() {
+        if is_process_elevated() {
+            return Ok(WritableConfigPath::Ready(sys));
+        }
+        #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+        if try_auto_elevate_current_cli("update system vdpi configuration")? {
+            return Ok(WritableConfigPath::ElevatedAndDone);
+        }
+        #[cfg(target_os = "windows")]
+        let hint = "Run this command from an elevated Administrator terminal to update the system config, or pass `--config <path>` to edit a separate file.";
+        #[cfg(not(target_os = "windows"))]
+        let hint = "Re-run with `sudo` to update the system config, or pass `--config <path>` to edit a separate file.";
+        anyhow::bail!(
+            "system service is installed and uses {} which requires elevated privileges to modify. {hint}",
+            sys.display()
+        );
+    }
     let usr = user_config_path();
     if usr.is_file() {
         return Ok(WritableConfigPath::Ready(usr));
     }
-    let sys = system_config_path();
     if sys.is_file() {
         if is_process_elevated() {
             return Ok(WritableConfigPath::Ready(sys));
@@ -738,6 +913,862 @@ fn runtime_to_file_config(cfg: &RuntimeConfig) -> FileConfig {
     }
 }
 
+fn resolve_effective_config_key(
+    cli: CliArgs,
+    file_cfg: &FileConfig,
+    raw_args: &[String],
+    key: &str,
+) -> Result<Option<String>> {
+    let mut effective = runtime_to_file_config(&cli.resolve_runtime_config(file_cfg, raw_args));
+    if let Some(ver) = file_cfg.schema_version {
+        effective.schema_version = Some(ver);
+    }
+    get_config_key(&effective, key)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ElevatedUserInfo {
+    uid: u32,
+    gid: u32,
+    home_dir: PathBuf,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn parse_nonzero_unix_id(raw: Option<&str>) -> Option<u32> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&id| id != 0)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn sanitize_unix_username(raw: Option<&str>) -> Option<&str> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "root" && !s.contains('/') && !s.contains('\0'))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[allow(clippy::too_many_arguments)]
+fn resolve_elevated_invoking_user_with<FByUid, FByName>(
+    sudo_uid: Option<&str>,
+    sudo_gid: Option<&str>,
+    sudo_user: Option<&str>,
+    pkexec_uid: Option<&str>,
+    doas_user: Option<&str>,
+    home_env: Option<&str>,
+    lookup_by_uid: FByUid,
+    lookup_by_name: FByName,
+) -> Option<ElevatedUserInfo>
+where
+    FByUid: Fn(u32) -> Option<ElevatedUserInfo>,
+    FByName: Fn(&str) -> Option<ElevatedUserInfo>,
+{
+    let fallback_home = home_env
+        .map(str::trim)
+        .filter(|h| !h.is_empty() && *h != "/root")
+        .map(PathBuf::from);
+
+    if let Some(uid) = parse_nonzero_unix_id(sudo_uid) {
+        if let Some(user) = lookup_by_uid(uid).filter(|u| u.uid != 0) {
+            return Some(user);
+        }
+        if let Some(home_dir) = fallback_home.clone() {
+            let gid = parse_nonzero_unix_id(sudo_gid).unwrap_or(uid);
+            return Some(ElevatedUserInfo { uid, gid, home_dir });
+        }
+    }
+    if let Some(user_name) = sanitize_unix_username(sudo_user) {
+        if let Some(user) = lookup_by_name(user_name).filter(|u| u.uid != 0) {
+            return Some(user);
+        }
+    }
+    if let Some(uid) = parse_nonzero_unix_id(pkexec_uid) {
+        if let Some(user) = lookup_by_uid(uid).filter(|u| u.uid != 0) {
+            return Some(user);
+        }
+        if let Some(home_dir) = fallback_home {
+            return Some(ElevatedUserInfo {
+                uid,
+                gid: uid,
+                home_dir,
+            });
+        }
+    }
+    if let Some(user_name) = sanitize_unix_username(doas_user) {
+        if let Some(user) = lookup_by_name(user_name).filter(|u| u.uid != 0) {
+            return Some(user);
+        }
+    }
+    None
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn lookup_unix_passwd_by_uid(uid: u32) -> Option<ElevatedUserInfo> {
+    use std::ffi::{CStr, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut pwd = std::mem::MaybeUninit::<libc::passwd>::zeroed();
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: `pwd` and `buf` are valid writable buffers for `getpwuid_r`.
+    let rc = unsafe {
+        libc::getpwuid_r(
+            uid as libc::uid_t,
+            pwd.as_mut_ptr(),
+            buf.as_mut_ptr().cast::<libc::c_char>(),
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() {
+        return None;
+    }
+    // SAFETY: `getpwuid_r` returned 0 with non-null `result` pointing to initialized `pwd`.
+    let pwd = unsafe { pwd.assume_init() };
+    if pwd.pw_dir.is_null() {
+        return None;
+    }
+    // SAFETY: `pw_dir` is a valid NUL-terminated C string inside `buf`.
+    let dir_bytes = unsafe { CStr::from_ptr(pwd.pw_dir) }.to_bytes();
+    if dir_bytes.is_empty() {
+        return None;
+    }
+    Some(ElevatedUserInfo {
+        uid: pwd.pw_uid as u32,
+        gid: pwd.pw_gid as u32,
+        home_dir: PathBuf::from(OsStr::from_bytes(dir_bytes)),
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn lookup_unix_passwd_by_name(name: &str) -> Option<ElevatedUserInfo> {
+    use std::ffi::{CStr, CString, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_name = CString::new(name).ok()?;
+    let mut pwd = std::mem::MaybeUninit::<libc::passwd>::zeroed();
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: `c_name` is NUL-terminated; `pwd` and `buf` are valid writable buffers.
+    let rc = unsafe {
+        libc::getpwnam_r(
+            c_name.as_ptr(),
+            pwd.as_mut_ptr(),
+            buf.as_mut_ptr().cast::<libc::c_char>(),
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() {
+        return None;
+    }
+    // SAFETY: `getpwnam_r` returned 0 with non-null `result` pointing to initialized `pwd`.
+    let pwd = unsafe { pwd.assume_init() };
+    if pwd.pw_dir.is_null() {
+        return None;
+    }
+    // SAFETY: `pw_dir` is a valid NUL-terminated C string inside `buf`.
+    let dir_bytes = unsafe { CStr::from_ptr(pwd.pw_dir) }.to_bytes();
+    if dir_bytes.is_empty() {
+        return None;
+    }
+    Some(ElevatedUserInfo {
+        uid: pwd.pw_uid as u32,
+        gid: pwd.pw_gid as u32,
+        home_dir: PathBuf::from(OsStr::from_bytes(dir_bytes)),
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn resolve_elevated_invoking_user() -> Option<ElevatedUserInfo> {
+    // SAFETY: `geteuid(2)` is always safe to call and never fails.
+    if unsafe { libc::geteuid() } != 0 {
+        return None;
+    }
+    let sudo_uid = std::env::var("SUDO_UID").ok();
+    let sudo_gid = std::env::var("SUDO_GID").ok();
+    let sudo_user = std::env::var("SUDO_USER").ok();
+    let pkexec_uid = std::env::var("PKEXEC_UID").ok();
+    let doas_user = std::env::var("DOAS_USER").ok();
+    let home_env = std::env::var("HOME").ok();
+    resolve_elevated_invoking_user_with(
+        sudo_uid.as_deref(),
+        sudo_gid.as_deref(),
+        sudo_user.as_deref(),
+        pkexec_uid.as_deref(),
+        doas_user.as_deref(),
+        home_env.as_deref(),
+        lookup_unix_passwd_by_uid,
+        lookup_unix_passwd_by_name,
+    )
+}
+
+/// Refuses to create directories, write files, or `lchown` through any symlink
+/// (or `..` traversal) located beneath the invoking non-root user's home directory
+/// while running as `root` under `sudo`, `pkexec`, or `doas`.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn verify_no_symlink_under_home(path: &Path, home_dir: &Path) -> Result<()> {
+    use std::path::Component;
+
+    let Ok(rel) = path.strip_prefix(home_dir) else {
+        return Ok(());
+    };
+    for comp in rel.components() {
+        if matches!(comp, Component::ParentDir) {
+            anyhow::bail!(
+                "refusing to traverse parent component '..' under user home '{}' while running as root",
+                home_dir.display()
+            );
+        }
+    }
+    let mut cur = home_dir.to_path_buf();
+    for comp in rel.components() {
+        match comp {
+            Component::CurDir => continue,
+            Component::ParentDir => unreachable!("ParentDir checked above"),
+            _ => cur.push(comp),
+        }
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "refusing to write or chown through symlink '{}' under user home while running as root",
+                    cur.display()
+                );
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+            Err(err) => {
+                return Err(anyhow::Error::new(err)
+                    .context(format!("failed to inspect path {}", cur.display())));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn collect_missing_dirs_under_home(dir: &Path, home_dir: &Path) -> Vec<PathBuf> {
+    if !dir.starts_with(home_dir) {
+        return Vec::new();
+    }
+    let mut missing = Vec::new();
+    let mut cur = dir.to_path_buf();
+    while cur != home_dir && cur.starts_with(home_dir) {
+        if std::fs::symlink_metadata(&cur).is_err() {
+            missing.push(cur.clone());
+        }
+        let Some(parent) = cur.parent() else {
+            break;
+        };
+        cur = parent.to_path_buf();
+    }
+    missing.reverse();
+    missing
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn absolutize_config_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(path)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn is_safe_chown_target_under_home(target: &Path, home_dir: &Path) -> bool {
+    use std::path::Component;
+
+    if !home_dir.is_absolute()
+        || home_dir.parent().is_none()
+        || home_dir
+            .components()
+            .any(|comp| matches!(comp, Component::ParentDir))
+    {
+        return false;
+    }
+    if !target.starts_with(home_dir) {
+        return false;
+    }
+    let Ok(rel) = target.strip_prefix(home_dir) else {
+        return false;
+    };
+    if !rel
+        .components()
+        .any(|comp| !matches!(comp, Component::CurDir))
+    {
+        return false;
+    }
+    verify_no_symlink_under_home(target, home_dir).is_ok()
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn collect_chown_targets_under_home(
+    abs_path: &Path,
+    created_dirs: &[PathBuf],
+    user_cfg_path: &Path,
+    home_dir: &Path,
+) -> Vec<PathBuf> {
+    if !is_safe_chown_target_under_home(abs_path, home_dir) {
+        return Vec::new();
+    }
+
+    let mut targets = Vec::new();
+    let mut push_unique = |candidate: PathBuf| {
+        if is_safe_chown_target_under_home(&candidate, home_dir) && !targets.contains(&candidate) {
+            targets.push(candidate);
+        }
+    };
+
+    for dir in created_dirs {
+        push_unique(dir.clone());
+    }
+
+    if abs_path == user_cfg_path {
+        if let Some(parent) = abs_path.parent() {
+            if parent.starts_with(home_dir) {
+                let mut ancestors = Vec::new();
+                let mut cur = parent.to_path_buf();
+                while cur != home_dir && cur.starts_with(home_dir) {
+                    ancestors.push(cur.clone());
+                    let Some(next) = cur.parent() else {
+                        break;
+                    };
+                    cur = next.to_path_buf();
+                }
+                ancestors.reverse();
+                for dir in ancestors {
+                    push_unique(dir);
+                }
+            }
+        }
+    }
+
+    push_unique(abs_path.to_path_buf());
+    targets
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn chown_user_config_if_sudo_with_created(path: &Path, created_dirs: &[PathBuf]) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    if path == system_config_path() {
+        return;
+    }
+    let Some(user) = resolve_elevated_invoking_user() else {
+        return;
+    };
+    let abs_path = absolutize_config_path(path);
+    if !abs_path.starts_with(&user.home_dir)
+        || verify_no_symlink_under_home(&abs_path, &user.home_dir).is_err()
+    {
+        return;
+    }
+    let targets = collect_chown_targets_under_home(
+        &abs_path,
+        created_dirs,
+        &user_config_path(),
+        &user.home_dir,
+    );
+    if targets.is_empty() {
+        return;
+    }
+
+    let uid = user.uid as libc::uid_t;
+    let gid = user.gid as libc::gid_t;
+    let chown_path = |target: &Path| {
+        if !is_safe_chown_target_under_home(target, &user.home_dir) {
+            return;
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(target) {
+            if meta.file_type().is_symlink() {
+                return;
+            }
+        }
+        if let Ok(c_path) = CString::new(target.as_os_str().as_bytes()) {
+            // SAFETY: `c_path` is a valid NUL-terminated path string; `lchown` avoids following symlinks.
+            let _ = unsafe { libc::lchown(c_path.as_ptr(), uid, gid) };
+        }
+    };
+
+    for target in targets {
+        chown_path(&target);
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn chown_user_config_if_sudo(path: &Path) {
+    let _ = path;
+}
+
+fn save_config_with_ownership(path: &Path, cfg: &FileConfig) -> Result<()> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let created_dirs = {
+        if path != system_config_path() {
+            if let Some(user) = resolve_elevated_invoking_user() {
+                let abs_path = absolutize_config_path(path);
+                verify_no_symlink_under_home(&abs_path, &user.home_dir)?;
+                abs_path
+                    .parent()
+                    .map(|parent| collect_missing_dirs_under_home(parent, &user.home_dir))
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        }
+    };
+
+    save_file_config_atomic(path, cfg)?;
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    chown_user_config_if_sudo_with_created(path, &created_dirs);
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    chown_user_config_if_sudo(path);
+
+    Ok(())
+}
+
+const MAX_APPLY_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_DOMAIN_ENTRIES: usize = 512;
+
+/// Exit code used by `vdpi config apply-file --restart` when `config.toml` was
+/// saved successfully but pausing/resuming the running service failed.
+const EXIT_CODE_APPLY_RESTART_FAILED: i32 = 2;
+
+#[derive(Debug)]
+struct ApplyFileRestartError {
+    target: PathBuf,
+    source: anyhow::Error,
+}
+
+impl std::fmt::Display for ApplyFileRestartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "applied configuration to {}, but failed to restart vdpi service",
+            self.target.display()
+        )
+    }
+}
+
+impl std::error::Error for ApplyFileRestartError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+#[cfg(windows)]
+const WIN_FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+#[cfg(windows)]
+const WIN_FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+fn verify_no_symlink_or_reparse_ancestors(path: &Path) -> Result<()> {
+    use anyhow::Context as _;
+    use std::path::Component;
+
+    let abs_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("failed to resolve current working directory for config file path")?
+            .join(path)
+    };
+
+    let mut cur = PathBuf::new();
+    let mut has_normal_component = false;
+    for comp in abs_path.components() {
+        match comp {
+            Component::Prefix(_) | Component::RootDir => {
+                cur.push(comp.as_os_str());
+                continue;
+            }
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                anyhow::bail!(
+                    "refusing to traverse parent component '..' in config file path {}",
+                    path.display()
+                );
+            }
+            Component::Normal(part) => {
+                has_normal_component = true;
+                cur.push(part);
+            }
+        }
+
+        let meta = std::fs::symlink_metadata(&cur).with_context(|| {
+            format!("failed to inspect config path component {}", cur.display())
+        })?;
+        if meta.file_type().is_symlink() {
+            #[cfg(target_os = "macos")]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                let is_macos_system_link =
+                    meta.uid() == 0 && matches!(cur.to_str(), Some("/var" | "/tmp" | "/etc"));
+                if is_macos_system_link {
+                    continue;
+                }
+            }
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                let is_linux_ostree_link = meta.uid() == 0
+                    && matches!(
+                        cur.to_str(),
+                        Some("/home" | "/usr/local" | "/var" | "/tmp" | "/etc")
+                    );
+                if is_linux_ostree_link {
+                    continue;
+                }
+            }
+            anyhow::bail!(
+                "refusing to apply config file through symlink {}",
+                cur.display()
+            );
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt as _;
+            if (meta.file_attributes() & WIN_FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                anyhow::bail!(
+                    "refusing to apply config file through reparse point {}",
+                    cur.display()
+                );
+            }
+        }
+    }
+
+    if !has_normal_component {
+        anyhow::bail!("config file path is not a regular file: {}", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(any(unix, test))]
+fn is_allowed_apply_file_owner(
+    file_uid: u32,
+    current_euid: u32,
+    invoking_uid: Option<u32>,
+) -> bool {
+    if file_uid == current_euid {
+        return true;
+    }
+    if current_euid == 0 {
+        if let Some(uid) = invoking_uid {
+            return file_uid == uid;
+        }
+    }
+    false
+}
+
+/// Safely reads a bounded (`<= 1 MiB`) non-symlink, non-reparse-point regular
+/// TOML file, parses it via [`vdpi::config_file::parse_config_toml`], and
+/// validates DNS, split-tunnel apps, `chunk_size`, and [`BypassPolicy`].
+fn load_and_validate_apply_config_file(path: &Path) -> Result<FileConfig> {
+    use anyhow::Context as _;
+    use std::io::Read as _;
+
+    verify_no_symlink_or_reparse_ancestors(path)?;
+
+    let meta = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect config file {}", path.display()))?;
+    if meta.file_type().is_symlink() {
+        anyhow::bail!("refusing to apply symlink config file {}", path.display());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        if (meta.file_attributes() & WIN_FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            anyhow::bail!(
+                "refusing to apply reparse-point config file {}",
+                path.display()
+            );
+        }
+    }
+    if !meta.file_type().is_file() {
+        anyhow::bail!("config file path is not a regular file: {}", path.display());
+    }
+    if meta.len() > MAX_APPLY_CONFIG_FILE_BYTES {
+        anyhow::bail!(
+            "config file {} exceeds maximum allowed size of {} bytes",
+            path.display(),
+            MAX_APPLY_CONFIG_FILE_BYTES
+        );
+    }
+
+    let mut open_opts = std::fs::OpenOptions::new();
+    open_opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        open_opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        open_opts.custom_flags(WIN_FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = open_opts
+        .open(path)
+        .with_context(|| format!("failed to open config file {}", path.display()))?;
+
+    let opened_meta = file
+        .metadata()
+        .with_context(|| format!("failed to stat opened config file {}", path.display()))?;
+    if opened_meta.file_type().is_symlink() {
+        anyhow::bail!("refusing to apply symlink config file {}", path.display());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        if (opened_meta.file_attributes() & WIN_FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            anyhow::bail!(
+                "refusing to apply reparse-point config file {}",
+                path.display()
+            );
+        }
+    }
+    if !opened_meta.file_type().is_file() {
+        anyhow::bail!("config file path is not a regular file: {}", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let file_uid = opened_meta.uid();
+        // SAFETY: `geteuid(2)` and `getuid(2)` are always safe to call and never fail.
+        let current_euid = unsafe { libc::geteuid() } as u32;
+        let current_ruid = unsafe { libc::getuid() } as u32;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let invoking_uid = resolve_elevated_invoking_user()
+            .map(|u| u.uid)
+            .or_else(|| (current_ruid != 0 && current_ruid != current_euid).then_some(current_ruid));
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let invoking_uid = (current_ruid != 0 && current_ruid != current_euid).then_some(current_ruid);
+        if !is_allowed_apply_file_owner(file_uid, current_euid, invoking_uid) {
+            anyhow::bail!(
+                "refusing to apply config file {} owned by unexpected uid {file_uid}",
+                path.display()
+            );
+        }
+        if current_euid == 0 && (opened_meta.mode() & 0o022) != 0 {
+            anyhow::bail!(
+                "refusing to apply group- or world-writable config file {} (mode {:04o})",
+                path.display(),
+                opened_meta.mode() & 0o7777
+            );
+        }
+    }
+
+    let mut buf = Vec::new();
+    file.take(MAX_APPLY_CONFIG_FILE_BYTES + 1)
+        .read_to_end(&mut buf)
+        .with_context(|| format!("failed to read config file {}", path.display()))?;
+    if (buf.len() as u64) > MAX_APPLY_CONFIG_FILE_BYTES {
+        anyhow::bail!(
+            "config file {} exceeds maximum allowed size of {} bytes",
+            path.display(),
+            MAX_APPLY_CONFIG_FILE_BYTES
+        );
+    }
+
+    let contents = String::from_utf8(buf)
+        .with_context(|| format!("config file {} is not valid UTF-8", path.display()))?;
+    let mut file_cfg = vdpi::config_file::parse_config_toml(&contents)
+        .with_context(|| format!("failed to parse config file {}", path.display()))?;
+    validate_applied_file_config(&mut file_cfg)?;
+    Ok(file_cfg)
+}
+
+fn validate_applied_file_config(file_cfg: &mut FileConfig) -> Result<()> {
+    file_cfg.schema_version.get_or_insert(CONFIG_SCHEMA_VERSION);
+    if file_cfg.chunk_size == Some(0) {
+        anyhow::bail!("chunk_size must be at least 1");
+    }
+    if let Some(ref raw_dns) = file_cfg.dns_addr {
+        let validated = vdpi_core::dns::validate_custom_dns_input(raw_dns).map_err(|err| {
+            let redacted = vdpi_core::dns::redact_dns_for_display(raw_dns);
+            anyhow::anyhow!("invalid DNS server '{redacted}': {err}")
+        })?;
+        file_cfg.dns_addr = Some(validated);
+    }
+    if let Some(ref apps) = file_cfg.split_tunnel_apps {
+        let validated_apps = vdpi::config_file::validate_split_tunnel_apps(apps)?;
+        file_cfg.split_tunnel_apps = Some(validated_apps);
+    }
+    let bypass_domains = file_cfg.bypass_domains.as_deref().unwrap_or(&[]);
+    if bypass_domains.len() > MAX_DOMAIN_ENTRIES {
+        anyhow::bail!(
+            "bypass_domains exceeds maximum of {MAX_DOMAIN_ENTRIES} entries (got {})",
+            bypass_domains.len()
+        );
+    }
+    let include_domains = file_cfg.include_domains.as_deref().unwrap_or(&[]);
+    if include_domains.len() > MAX_DOMAIN_ENTRIES {
+        anyhow::bail!(
+            "include_domains exceeds maximum of {MAX_DOMAIN_ENTRIES} entries (got {})",
+            include_domains.len()
+        );
+    }
+    let _ = BypassPolicy::new(bypass_domains, include_domains)?;
+    Ok(())
+}
+
+fn select_apply_file_target_path(
+    explicit: Option<&Path>,
+    service_mode: bool,
+    service_state: ServiceState,
+    system_service_installed: bool,
+    elevated: bool,
+    system_path: &Path,
+    user_path: &Path,
+) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path.to_path_buf());
+    }
+    if service_mode {
+        return Ok(system_path.to_path_buf());
+    }
+    if system_service_installed {
+        if elevated {
+            return Ok(system_path.to_path_buf());
+        }
+        #[cfg(target_os = "windows")]
+        let hint = "Run this command from an elevated Administrator terminal to update the system config, or pass `--config <path>` to target a separate file.";
+        #[cfg(not(target_os = "windows"))]
+        let hint = "Re-run with `sudo` to update the system config, or pass `--config <path>` to target a separate file.";
+        anyhow::bail!(
+            "system service is installed and uses {} which requires elevated privileges to modify. {hint}",
+            system_path.display()
+        );
+    }
+    if service_state != ServiceState::NotInstalled
+        && elevated
+        && !user_path.is_file()
+        && system_path.is_file()
+    {
+        return Ok(system_path.to_path_buf());
+    }
+    Ok(user_path.to_path_buf())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_config_file_with<FSave, FRestart>(
+    source_path: &Path,
+    restart: bool,
+    explicit_path: Option<&Path>,
+    service_mode: bool,
+    service_state: ServiceState,
+    system_service_installed: bool,
+    elevated: bool,
+    system_path: &Path,
+    user_path: &Path,
+    save_fn: FSave,
+    restart_fn: FRestart,
+) -> Result<(PathBuf, bool)>
+where
+    FSave: FnOnce(&Path, &FileConfig) -> Result<()>,
+    FRestart: FnOnce() -> Result<()>,
+{
+    let file_cfg = load_and_validate_apply_config_file(source_path)?;
+    let target = select_apply_file_target_path(
+        explicit_path,
+        service_mode,
+        service_state,
+        system_service_installed,
+        elevated,
+        system_path,
+        user_path,
+    )?;
+    save_fn(&target, &file_cfg)?;
+
+    let targets_active_config =
+        explicit_path.is_none() || target == system_path || target == user_path;
+    let restarted = if restart && targets_active_config && service_state == ServiceState::Running {
+        if let Err(source) = restart_fn() {
+            return Err(anyhow::Error::new(ApplyFileRestartError { target, source }));
+        }
+        true
+    } else {
+        false
+    };
+    Ok((target, restarted))
+}
+
+/// Applies a validated TOML configuration file atomically to the active
+/// `config.toml` target without placing sensitive DoH URLs on process argv, and
+/// optionally restarts a running OS service so changes take effect immediately.
+fn handle_config_apply_file(
+    source_path: &Path,
+    restart: bool,
+    explicit_path: Option<&Path>,
+    service_mode: bool,
+) -> Result<()> {
+    use anyhow::Context as _;
+
+    let service_state = vdpi::service::detect_service_state();
+    let system_service_installed = has_installed_system_service();
+    let elevated = is_process_elevated();
+
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    if explicit_path.is_none() && !service_mode && system_service_installed && !elevated {
+        // Validate before triggering an interactive elevation prompt.
+        let _ = load_and_validate_apply_config_file(source_path)?;
+        if try_auto_elevate_current_cli("update system vdpi configuration")? {
+            return Ok(());
+        }
+    }
+
+    let system_path = system_config_path();
+    let user_path = user_config_path();
+    let (target, restarted) = apply_config_file_with(
+        source_path,
+        restart,
+        explicit_path,
+        service_mode,
+        service_state,
+        system_service_installed,
+        elevated,
+        &system_path,
+        &user_path,
+        save_config_with_ownership,
+        || {
+            vdpi::service::pause_service_quiet()
+                .context("failed to pause running vdpi service for restart")?;
+            vdpi::service::resume_service_quiet()
+                .context("failed to resume vdpi service after pause")
+        },
+    )?;
+
+    if restarted {
+        println!(
+            "Applied configuration to {} and restarted vdpi service.",
+            target.display()
+        );
+    } else {
+        println!("Applied configuration to {}", target.display());
+        if !restart {
+            maybe_print_service_restart_note(explicit_path, &target);
+        }
+    }
+    Ok(())
+}
+
+fn maybe_print_service_restart_note(explicit_path: Option<&Path>, target: &Path) {
+    if explicit_path.is_some() && target != system_config_path() && target != user_config_path() {
+        return;
+    }
+    if vdpi::service::detect_service_state() == ServiceState::Running {
+        println!(
+            "Note: vdpi background service is running; changes apply on next restart (`vdpi pause && vdpi resume`)."
+        );
+    }
+}
+
 fn handle_config_command(
     action: Option<ConfigCommand>,
     cli: CliArgs,
@@ -745,10 +1776,13 @@ fn handle_config_command(
 ) -> Result<()> {
     let explicit_path = cli.config_path.clone();
     let service_mode = cli.service;
+    let effective_service_mode =
+        service_mode || (explicit_path.is_none() && has_installed_system_service());
 
     match action.unwrap_or(ConfigCommand::Show { json: false }) {
         ConfigCommand::Show { json } => {
-            let (loaded_path, file_cfg) = load_file_config(explicit_path.as_deref(), service_mode)?;
+            let (loaded_path, file_cfg) =
+                load_file_config(explicit_path.as_deref(), effective_service_mode)?;
             let cfg = cli.resolve_runtime_config(&file_cfg, raw_args);
             if json {
                 let payload = serde_json::json!({
@@ -795,16 +1829,10 @@ fn handle_config_command(
             Ok(())
         }
         ConfigCommand::Get { key } => {
-            let (_, file_cfg) = load_file_config(explicit_path.as_deref(), service_mode)?;
-            match get_config_key(&file_cfg, &key)? {
-                Some(val) => println!("{val}"),
-                None => {
-                    let effective =
-                        runtime_to_file_config(&cli.resolve_runtime_config(&file_cfg, raw_args));
-                    if let Some(default_val) = get_config_key(&effective, &key)? {
-                        println!("{default_val}");
-                    }
-                }
+            let (_, file_cfg) =
+                load_file_config(explicit_path.as_deref(), effective_service_mode)?;
+            if let Some(val) = resolve_effective_config_key(cli, &file_cfg, raw_args, &key)? {
+                println!("{val}");
             }
             Ok(())
         }
@@ -825,8 +1853,9 @@ fn handle_config_command(
                 anyhow::bail!("chunk_size must be at least 1");
             }
             let _ = BypassPolicy::new(&resolved.bypass_domains, &resolved.patterns)?;
-            save_file_config_atomic(&target, &file_cfg)?;
+            save_config_with_ownership(&target, &file_cfg)?;
             println!("Set {key} = {value} in {}", target.display());
+            maybe_print_service_restart_note(explicit_path.as_deref(), &target);
             Ok(())
         }
         ConfigCommand::Unset { key } => {
@@ -842,12 +1871,14 @@ fn handle_config_command(
                 println!("No config file at {}; nothing to unset.", target.display());
                 return Ok(());
             }
-            save_file_config_atomic(&target, &file_cfg)?;
+            save_config_with_ownership(&target, &file_cfg)?;
             println!("Unset {key} in {}", target.display());
+            maybe_print_service_restart_note(explicit_path.as_deref(), &target);
             Ok(())
         }
         ConfigCommand::Validate => {
-            let (loaded_path, file_cfg) = load_file_config(explicit_path.as_deref(), service_mode)?;
+            let (loaded_path, file_cfg) =
+                load_file_config(explicit_path.as_deref(), effective_service_mode)?;
             if file_cfg.chunk_size == Some(0) {
                 anyhow::bail!("chunk_size must be at least 1");
             }
@@ -869,9 +1900,13 @@ fn handle_config_command(
                 schema_version: Some(CONFIG_SCHEMA_VERSION),
                 ..Default::default()
             };
-            save_file_config_atomic(&target, &fresh)?;
+            save_config_with_ownership(&target, &fresh)?;
             println!("Reset configuration to defaults: {}", target.display());
+            maybe_print_service_restart_note(explicit_path.as_deref(), &target);
             Ok(())
+        }
+        ConfigCommand::ApplyFile { path, restart } => {
+            handle_config_apply_file(&path, restart, explicit_path.as_deref(), service_mode)
         }
     }
 }
@@ -950,11 +1985,16 @@ fn dashboard_info_from_live(
     live: &vdpi::service::LiveEngineStatus,
     fallback_cfg: &RuntimeConfig,
 ) -> tui_dashboard::DashboardInfo {
+    let dns_addr = live
+        .dns_addr
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| vdpi::service::load_configured_dns(&fallback_cfg.dns_addr));
     tui_dashboard::DashboardInfo {
         engine: dashboard_engine_from_live(live, fallback_cfg.system_proxy),
         mode: parse_live_desync_mode(live.mode.as_deref(), fallback_cfg.mode),
         enable_doh: live.doh.unwrap_or(fallback_cfg.enable_doh),
-        dns_addr: Some(vdpi::service::load_configured_dns(&fallback_cfg.dns_addr)),
+        dns_addr: Some(dns_addr),
     }
 }
 
@@ -963,12 +2003,17 @@ fn attached_telemetry_from_live(
     live: &vdpi::service::LiveEngineStatus,
     fallback_cfg: &RuntimeConfig,
 ) -> tui_dashboard::AttachedTelemetry {
+    let dns_addr = live
+        .dns_addr
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| vdpi::service::load_configured_dns(&fallback_cfg.dns_addr));
     tui_dashboard::AttachedTelemetry {
         snap: telemetry_snapshot_from_live(live),
         engine: dashboard_engine_from_live(live, fallback_cfg.system_proxy),
         mode: parse_live_desync_mode(live.mode.as_deref(), fallback_cfg.mode),
         doh: live.doh.unwrap_or(fallback_cfg.enable_doh),
-        dns_addr: Some(vdpi::service::load_configured_dns(&fallback_cfg.dns_addr)),
+        dns_addr: Some(dns_addr),
         block_quic: live.block_quic.unwrap_or(fallback_cfg.block_quic),
         rss_kb: live.rss_kb,
         isp_stage: live.isp_stage.clone(),
@@ -1070,9 +2115,15 @@ fn handle_dashboard_command(cfg: &RuntimeConfig) -> Result<()> {
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
+        use std::io::IsTerminal;
+
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            anyhow::bail!(
+                "live dashboard requires an interactive terminal (use 'vdpi status' for non-interactive output)"
+            );
+        }
         let Some(live) = probe_live_engine_for_dashboard(cfg) else {
-            println!("No running vdpi service detected. Run 'vdpi' or 'vdpi start' first.");
-            return Ok(());
+            anyhow::bail!("No running vdpi service detected. Run 'vdpi' or 'vdpi start' first.");
         };
         let rt = build_cli_runtime()?;
         rt.block_on(run_attached_dashboard_for_live(&live, cfg))
@@ -1090,24 +2141,107 @@ fn merge_split_tunnel_apps(existing: &[String], to_add: &[String]) -> Result<Vec
     vdpi::config_file::validate_split_tunnel_apps(&combined)
 }
 
-fn remove_split_tunnel_apps(existing: &[String], to_remove: &[String]) -> Vec<String> {
-    let remove_keys: std::collections::HashSet<String> = to_remove
-        .iter()
-        .map(|raw| vdpi_core::config::normalize_split_app_name(raw))
+fn remove_split_tunnel_apps(
+    existing: &[String],
+    to_remove: &[String],
+) -> Result<(Vec<String>, usize)> {
+    let validated_remove = vdpi::config_file::validate_split_tunnel_apps(to_remove)?;
+    if to_remove.iter().any(|raw| raw.trim().is_empty()) {
+        anyhow::bail!("application name cannot be empty");
+    }
+    let remove_keys: std::collections::HashSet<String> = validated_remove
+        .into_iter()
+        .map(|cleaned| vdpi_core::config::normalize_split_app_name(&cleaned))
         .filter(|key| !key.is_empty())
         .collect();
-    existing
+    if remove_keys.is_empty() {
+        anyhow::bail!("no valid application names provided");
+    }
+    let remaining: Vec<String> = existing
         .iter()
-        .filter(|entry| !remove_keys.contains(&vdpi_core::config::normalize_split_app_name(entry)))
+        .filter(|entry| {
+            let entry_key =
+                vdpi::config_file::sanitize_split_tunnel_apps(std::slice::from_ref(entry))
+                    .into_iter()
+                    .next()
+                    .map(|cleaned| vdpi_core::config::normalize_split_app_name(&cleaned))
+                    .unwrap_or_else(|| vdpi_core::config::normalize_split_app_name(entry));
+            !remove_keys.contains(&entry_key)
+        })
         .cloned()
-        .collect()
+        .collect();
+    let removed = existing.len().saturating_sub(remaining.len());
+    Ok((remaining, removed))
 }
 
-fn handle_split_command(action: Option<SplitCommand>) -> Result<()> {
+fn load_effective_split_tunnel(
+    config_path: Option<&Path>,
+    cli_split_mode: Option<SplitTunnelMode>,
+    cli_split_apps: &[String],
+    allow_missing_explicit: bool,
+) -> Result<SplitTunnelConfig> {
+    let mut cfg = if let Some(path) = config_path {
+        let (_, file_cfg) = if allow_missing_explicit {
+            load_file_config_or_default(Some(path), false)?
+        } else {
+            load_file_config(Some(path), false)?
+        };
+        SplitTunnelConfig {
+            mode: file_cfg.split_tunnel_mode.unwrap_or_default(),
+            apps: file_cfg
+                .split_tunnel_apps
+                .as_deref()
+                .map(vdpi::config_file::sanitize_split_tunnel_apps)
+                .unwrap_or_default(),
+        }
+    } else {
+        vdpi::service::load_configured_split_tunnel()
+    };
+    if let Some(mode) = cli_split_mode {
+        cfg.mode = mode;
+    }
+    if !cli_split_apps.is_empty() {
+        cfg.apps = vdpi::config_file::sanitize_split_tunnel_apps(cli_split_apps);
+    }
+    Ok(cfg)
+}
+
+fn save_split_tunnel_target(
+    config_path: Option<&Path>,
+    cfg: &SplitTunnelConfig,
+) -> Result<String> {
+    if let Some(path) = config_path {
+        let validated_apps = vdpi::config_file::validate_split_tunnel_apps(&cfg.apps)?;
+        let normalized = SplitTunnelConfig {
+            mode: cfg.mode,
+            apps: validated_apps,
+        };
+        let (_, mut file_cfg) = load_file_config_or_default(Some(path), false)?;
+        file_cfg.schema_version.get_or_insert(CONFIG_SCHEMA_VERSION);
+        file_cfg.split_tunnel_mode = Some(normalized.mode);
+        file_cfg.split_tunnel_apps = Some(normalized.apps.clone());
+        save_config_with_ownership(path, &file_cfg)?;
+        Ok(format!(
+            "Split tunneling saved: {} ({})",
+            normalized.summary_label(),
+            path.display()
+        ))
+    } else {
+        vdpi::service::set_service_split_tunnel(cfg)
+    }
+}
+
+fn handle_split_command(
+    action: Option<SplitCommand>,
+    config_path: Option<&Path>,
+    cli_split_mode: Option<SplitTunnelMode>,
+    cli_split_apps: &[String],
+) -> Result<()> {
     match action {
         None => {
             #[cfg(any(target_os = "android", target_os = "ios"))]
             {
+                let _ = (config_path, cli_split_mode, cli_split_apps);
                 anyhow::bail!(
                     "interactive split-tunnel picker is not supported on {}",
                     platform_name()
@@ -1115,32 +2249,51 @@ fn handle_split_command(action: Option<SplitCommand>) -> Result<()> {
             }
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             {
-                let current = vdpi::service::load_configured_split_tunnel();
+                use std::io::IsTerminal;
+
+                if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+                    anyhow::bail!(
+                        "interactive split-tunnel picker requires an interactive terminal (use 'vdpi split status|list|mode|add|remove|clear')"
+                    );
+                }
+                let current =
+                    load_effective_split_tunnel(config_path, cli_split_mode, cli_split_apps, true)?;
                 if let Some(new_cfg) = vdpi::split_tunnel::tui::run_split_tunnel_picker(current)? {
-                    let msg = vdpi::service::set_service_split_tunnel(&new_cfg)?;
+                    let msg = save_split_tunnel_target(config_path, &new_cfg)?;
                     println!("{msg}");
                 }
                 Ok(())
             }
         }
-        Some(SplitCommand::Status) => {
-            let current = vdpi::service::load_configured_split_tunnel();
-            println!("Split tunneling: {}", current.summary_label());
-            println!("Mode: {}", current.mode.as_str());
-            if current.apps.is_empty() {
-                println!("Apps: (none)");
+        Some(SplitCommand::Status { json }) => {
+            let current =
+                load_effective_split_tunnel(config_path, cli_split_mode, cli_split_apps, false)?;
+            if json {
+                let payload = serde_json::json!({
+                    "mode": current.mode.as_str(),
+                    "apps": current.apps,
+                    "summary": current.summary_label(),
+                });
+                println!("{}", serde_json::to_string_pretty(&payload)?);
             } else {
-                println!("Apps ({}):", current.apps.len());
-                for app in &current.apps {
-                    println!("  - {app}");
+                println!("Split tunneling: {}", current.summary_label());
+                println!("Mode: {}", current.mode.as_str());
+                if current.apps.is_empty() {
+                    println!("Apps: (none)");
+                } else {
+                    println!("Apps ({}):", current.apps.len());
+                    for app in &current.apps {
+                        println!("  - {app}");
+                    }
                 }
             }
             Ok(())
         }
-        Some(SplitCommand::List { query }) => {
+        Some(SplitCommand::List { query, filter }) => {
+            let query = query.or(filter);
             #[cfg(any(target_os = "android", target_os = "ios"))]
             {
-                let _ = query;
+                let _ = (query, config_path, cli_split_mode, cli_split_apps);
                 anyhow::bail!(
                     "application discovery is not supported on {}",
                     platform_name()
@@ -1148,7 +2301,12 @@ fn handle_split_command(action: Option<SplitCommand>) -> Result<()> {
             }
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             {
-                let current = vdpi::service::load_configured_split_tunnel();
+                let current = load_effective_split_tunnel(
+                    config_path,
+                    cli_split_mode,
+                    cli_split_apps,
+                    false,
+                )?;
                 let discovered = vdpi::split_tunnel::discover_apps(&current.apps);
                 let query_str = query.as_deref().unwrap_or("");
                 let matched = vdpi::split_tunnel::filter_and_rank_apps(&discovered, query_str);
@@ -1189,16 +2347,18 @@ fn handle_split_command(action: Option<SplitCommand>) -> Result<()> {
             }
         }
         Some(SplitCommand::Mode { mode }) => {
-            let mut current = vdpi::service::load_configured_split_tunnel();
+            let mut current =
+                load_effective_split_tunnel(config_path, cli_split_mode, cli_split_apps, true)?;
             current.mode = mode;
-            let msg = vdpi::service::set_service_split_tunnel(&current)?;
+            let msg = save_split_tunnel_target(config_path, &current)?;
             println!("{msg}");
             Ok(())
         }
         Some(SplitCommand::Add { apps }) => {
-            let mut current = vdpi::service::load_configured_split_tunnel();
+            let mut current =
+                load_effective_split_tunnel(config_path, cli_split_mode, cli_split_apps, true)?;
             current.apps = merge_split_tunnel_apps(&current.apps, &apps)?;
-            let msg = vdpi::service::set_service_split_tunnel(&current)?;
+            let msg = save_split_tunnel_target(config_path, &current)?;
             println!("{msg}");
             if current.mode == SplitTunnelMode::All {
                 println!(
@@ -1208,24 +2368,52 @@ fn handle_split_command(action: Option<SplitCommand>) -> Result<()> {
             Ok(())
         }
         Some(SplitCommand::Remove { apps }) => {
-            let mut current = vdpi::service::load_configured_split_tunnel();
-            current.apps = remove_split_tunnel_apps(&current.apps, &apps);
-            let msg = vdpi::service::set_service_split_tunnel(&current)?;
+            let mut current =
+                load_effective_split_tunnel(config_path, cli_split_mode, cli_split_apps, true)?;
+            let (remaining, removed) = remove_split_tunnel_apps(&current.apps, &apps)?;
+            if removed == 0 {
+                println!(
+                    "No matching applications found in the configured split-tunnel list; no changes made."
+                );
+                return Ok(());
+            }
+            current.apps = remaining;
+            let msg = save_split_tunnel_target(config_path, &current)?;
             println!("{msg}");
             Ok(())
         }
         Some(SplitCommand::Clear) => {
             let cleared = SplitTunnelConfig::default();
-            let msg = vdpi::service::set_service_split_tunnel(&cleared)?;
+            let msg = save_split_tunnel_target(config_path, &cleared)?;
             println!("{msg}");
             Ok(())
         }
         Some(SplitCommand::Apply { mode, apps }) => {
             let new_cfg = SplitTunnelConfig { mode, apps };
-            let msg = vdpi::service::set_service_split_tunnel(&new_cfg)?;
+            let msg = save_split_tunnel_target(config_path, &new_cfg)?;
             println!("{msg}");
             Ok(())
         }
+    }
+}
+
+fn configured_engine_for_display(
+    explicit_config_path: Option<&Path>,
+    cfg_engine: EngineMode,
+    probed_configured_engine: EngineMode,
+) -> EngineMode {
+    if explicit_config_path.is_some() {
+        cfg_engine
+    } else {
+        probed_configured_engine
+    }
+}
+
+fn configured_dns_for_display(explicit_config_path: Option<&Path>, cfg_dns_addr: &str) -> String {
+    if explicit_config_path.is_some() {
+        cfg_dns_addr.to_string()
+    } else {
+        vdpi::service::load_configured_dns(cfg_dns_addr)
     }
 }
 
@@ -1287,8 +2475,10 @@ fn resolve_dns_target(raw: &str) -> Result<String> {
     if normalized_key == "family" {
         return Ok("1.1.1.3".to_string());
     }
-    vdpi_core::dns::validate_custom_dns_input(trimmed)
-        .map_err(|err| anyhow::anyhow!("invalid DNS server '{trimmed}': {err}"))
+    vdpi_core::dns::validate_custom_dns_input(trimmed).map_err(|err| {
+        let redacted = vdpi_core::dns::redact_dns_for_display(trimmed);
+        anyhow::anyhow!("invalid DNS server '{redacted}': {err}")
+    })
 }
 
 fn foreground_tokio_worker_threads() -> usize {
@@ -1301,6 +2491,7 @@ fn build_runtime() -> Result<tokio::runtime::Runtime> {
     // engines such as VoiceMeeter.
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(foreground_tokio_worker_threads())
+        .max_blocking_threads(16)
         .enable_all()
         .build()
         .map_err(Into::into)
@@ -1347,6 +2538,21 @@ fn wait_for_live_engine(cfg: &RuntimeConfig, target: EngineMode) {
 }
 
 #[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
+const FOREGROUND_PROXY_VPN_POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
+const FOREGROUND_PROXY_VPN_RECOVERY_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
+fn foreground_proxy_vpn_poll_interval(vpn_yielded: bool) -> Duration {
+    if vpn_yielded {
+        FOREGROUND_PROXY_VPN_RECOVERY_POLL_INTERVAL
+    } else {
+        FOREGROUND_PROXY_VPN_POLL_INTERVAL
+    }
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
 fn normalize_system_proxy_addr(addr: std::net::SocketAddr) -> std::net::SocketAddr {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -1367,23 +2573,54 @@ struct ForegroundProxySpec {
     #[cfg(windows)]
     env_proxy: bool,
     bypass_domains: Vec<String>,
+    include_domains: Vec<String>,
+    vpn_coexistence: vdpi::config::VpnCoexistence,
 }
 
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 impl ForegroundProxySpec {
+    fn from_runtime_config(
+        cfg: &RuntimeConfig,
+        primary_addr: std::net::SocketAddr,
+        socks_addr: Option<std::net::SocketAddr>,
+    ) -> Self {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let _ = socks_addr;
+        Self {
+            proxy_addr: normalize_system_proxy_addr(primary_addr),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            socks_port: socks_addr
+                .filter(|_| cfg.socks_system_proxy)
+                .map(|a| a.port()),
+            #[cfg(windows)]
+            env_proxy: cfg.env_proxy,
+            bypass_domains: cfg.bypass_domains.clone(),
+            include_domains: cfg.patterns.clone(),
+            vpn_coexistence: cfg.vpn_coexistence,
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn to_unix_spec(&self) -> foreground::ForegroundProxySpec {
+        foreground::ForegroundProxySpec {
+            addr: self.proxy_addr,
+            socks_port: self.socks_port,
+            bypass: self.bypass_domains.clone(),
+            include_domains: self.include_domains.clone(),
+            vpn_coexistence: self.vpn_coexistence,
+        }
+    }
+
     fn activate(&self) -> Result<(foreground::ForegroundProxy, String)> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            let session = foreground::ForegroundProxy::activate(
-                self.proxy_addr,
-                self.socks_port,
-                &self.bypass_domains,
-            )?;
+            let session = foreground::ForegroundProxy::activate_spec(&self.to_unix_spec())?;
             let summary = session.summary.clone();
             Ok((session, summary))
         }
         #[cfg(windows)]
         {
+            let _ = (&self.include_domains, self.vpn_coexistence);
             let session = foreground::ForegroundProxy::activate(
                 self.proxy_addr,
                 self.env_proxy,
@@ -1461,16 +2698,7 @@ async fn run_daemon(
         let mut last_warned: Option<String> = None;
 
         if cfg.system_proxy {
-            let spec = ForegroundProxySpec {
-                proxy_addr: normalize_system_proxy_addr(primary_addr),
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
-                socks_port: socks_addr
-                    .filter(|_| cfg.socks_system_proxy)
-                    .map(|a| a.port()),
-                #[cfg(windows)]
-                env_proxy: cfg.env_proxy,
-                bypass_domains: cfg.bypass_domains.clone(),
-            };
+            let spec = ForegroundProxySpec::from_runtime_config(&cfg, primary_addr, socks_addr);
 
             let initial_scope = if cfg.vpn_coexistence != VpnCoexistence::Off {
                 tokio::task::spawn_blocking(|| detect_active_vpn(None))
@@ -1487,6 +2715,14 @@ async fn run_daemon(
                         provider = %provider,
                         "full-tunnel VPN active at startup; holding system proxy in yielded standby until VPN disconnects"
                     );
+                    #[cfg(windows)]
+                    {
+                        let _ = tokio::task::spawn_blocking(|| {
+                            let _ = vdpi::platform::windows::clear_all_windows_proxies();
+                            vdpi::platform::windows::flush_dns_resolver_cache();
+                        })
+                        .await;
+                    }
                     (
                         Some(spec),
                         None,
@@ -1555,7 +2791,7 @@ async fn run_daemon(
             platform = platform_name(),
             mode = ?cfg.mode,
             chunk_size = cfg.chunk_size,
-            doh = cfg.enable_doh,
+            doh = vdpi_core::dns::is_effective_doh_target(&cfg.dns_addr, cfg.enable_doh),
             system_proxy = cfg.system_proxy,
             vpn_coexistence = cfg.vpn_coexistence.as_str(),
             "vdpi engine active"
@@ -1571,19 +2807,18 @@ async fn run_daemon(
         use vdpi::platform::vpn_guard::GuardAction;
 
         let mut sup_shutdown_rx = shutdown_rx.clone();
+        let sup_ctx = ctx.clone();
         let vpn_policy = cfg.vpn_coexistence;
         tokio::spawn(async move {
             if vpn_policy == VpnCoexistence::Off {
                 let _ = sup_shutdown_rx.wait_for(|stopped| *stopped).await;
             } else {
-                let mut vpn_tick = tokio::time::interval(Duration::from_secs(1));
-                vpn_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                vpn_tick.tick().await;
-
                 let mut last_resume_attempt: Option<Instant> = None;
                 let mut last_activate_error: Option<(String, Instant)> = None;
 
                 loop {
+                    let poll_interval =
+                        foreground_proxy_vpn_poll_interval(proxy_vpn_guard.is_yielded());
                     tokio::select! {
                         biased;
                         changed = sup_shutdown_rx.changed() => {
@@ -1591,7 +2826,7 @@ async fn run_daemon(
                                 break;
                             }
                         }
-                        _ = vpn_tick.tick() => {
+                        _ = tokio::time::sleep(poll_interval) => {
                             let scope = tokio::task::spawn_blocking(|| detect_active_vpn(None))
                                 .await
                                 .unwrap_or(VpnScope::None);
@@ -1613,9 +2848,18 @@ async fn run_daemon(
                                         let _ = tokio::task::spawn_blocking(move || drop(session))
                                             .await;
                                     }
+                                    sup_ctx.dns.clear_cache().await;
+                                    #[cfg(windows)]
+                                    let _ = tokio::task::spawn_blocking(
+                                        vdpi::platform::windows::flush_dns_resolver_cache,
+                                    )
+                                    .await;
                                 }
                                 GuardAction::ResumeTun => {
                                     proxy_last_warned = None;
+                                    sup_ctx.dns.clear_cache().await;
+                                    #[cfg(windows)]
+                                    let mut flushed_os_dns = false;
                                     if proxy_session.is_none() {
                                         let cooldown_ok = last_resume_attempt.is_none_or(|t| {
                                             now.saturating_duration_since(t)
@@ -1648,6 +2892,14 @@ async fn run_daemon(
                                                     }
                                                     proxy_session = Some(session);
                                                     last_activate_error = None;
+                                                    #[cfg(windows)]
+                                                    {
+                                                        let _ = tokio::task::spawn_blocking(
+                                                            vdpi::platform::windows::flush_dns_resolver_cache,
+                                                        )
+                                                        .await;
+                                                        flushed_os_dns = true;
+                                                    }
                                                     info!(
                                                         "full-tunnel VPN cleared; resumed system proxy"
                                                     );
@@ -1671,6 +2923,13 @@ async fn run_daemon(
                                                 }
                                             }
                                         }
+                                    }
+                                    #[cfg(windows)]
+                                    if !flushed_os_dns {
+                                        let _ = tokio::task::spawn_blocking(
+                                            vdpi::platform::windows::flush_dns_resolver_cache,
+                                        )
+                                        .await;
                                     }
                                 }
                                 GuardAction::WarnOnly { provider } => {
@@ -1718,6 +2977,12 @@ async fn run_daemon(
                                                     }
                                                     proxy_session = Some(session);
                                                     last_activate_error = None;
+                                                    sup_ctx.dns.clear_cache().await;
+                                                    #[cfg(windows)]
+                                                    let _ = tokio::task::spawn_blocking(
+                                                        vdpi::platform::windows::flush_dns_resolver_cache,
+                                                    )
+                                                    .await;
                                                     info!("resumed system proxy after retry");
                                                 }
                                                 Err(err) => {
@@ -1764,7 +3029,7 @@ async fn run_daemon(
                 system_proxy: cfg.system_proxy,
             },
             mode: cfg.mode,
-            enable_doh: cfg.enable_doh,
+            enable_doh: vdpi_core::dns::is_effective_doh_target(&cfg.dns_addr, cfg.enable_doh),
             dns_addr: Some(cfg.dns_addr.clone()),
         };
 
@@ -1856,11 +3121,235 @@ mod desktop_tun {
 
     const MAX_CONSECUTIVE_PIPELINE_EXITS: u32 = 5;
     const HEALTHY_PIPELINE_UPTIME: Duration = Duration::from_secs(30);
+    pub(super) const TUN_RECONCILE_ACTIVE_INTERVAL: Duration = Duration::from_secs(3);
+    pub(super) const TUN_RECONCILE_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
+    const OFFLINE_STANDBY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+    pub(super) fn tun_reconcile_interval(tun_running: bool, vpn_yielded: bool) -> Duration {
+        if tun_running && !vpn_yielded {
+            TUN_RECONCILE_ACTIVE_INTERVAL
+        } else {
+            TUN_RECONCILE_RECOVERY_INTERVAL
+        }
+    }
 
     pub(super) fn retry_backoff(failures: u32) -> Duration {
         let shift = failures.saturating_sub(1).min(4);
         let secs = 3u64.saturating_mul(1u64 << shift).min(30);
         Duration::from_secs(secs)
+    }
+
+    pub(super) fn is_transient_offline_tun_error(err: &anyhow::Error) -> bool {
+        let lower = format!("{err:#}").to_ascii_lowercase();
+        lower.contains("no active physical network uplink")
+            || lower.contains("no physical default ipv4")
+            || lower.contains("no non-tun ipv4 or ipv6 default route")
+            || lower.contains("no active uplink")
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum TunStartErrorLogAction {
+        LogOfflineStandby,
+        SuppressOfflineStandby,
+        LogRetryableError,
+    }
+
+    pub(super) fn classify_tun_start_error_log(
+        offline_standby_logged: &mut bool,
+        err: &anyhow::Error,
+    ) -> TunStartErrorLogAction {
+        if is_transient_offline_tun_error(err) {
+            if *offline_standby_logged {
+                TunStartErrorLogAction::SuppressOfflineStandby
+            } else {
+                *offline_standby_logged = true;
+                TunStartErrorLogAction::LogOfflineStandby
+            }
+        } else {
+            *offline_standby_logged = false;
+            TunStartErrorLogAction::LogRetryableError
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(super) mod windows_power {
+        use std::ffi::c_void;
+        use std::ptr;
+        use std::sync::{Mutex, OnceLock};
+        use tokio::sync::watch;
+        use tracing::{info, warn};
+        use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
+        use windows_sys::Win32::System::LibraryLoader::{
+            GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+        };
+
+        pub(crate) const PBT_APMRESUMESUSPEND: u32 = 0x0000_0007;
+        pub(crate) const PBT_APMRESUMEAUTOMATIC: u32 = 0x0000_0012;
+        const DEVICE_NOTIFY_CALLBACK: u32 = 0x0000_0002;
+        const NO_ERROR: u32 = 0;
+
+        static POWER_RESUME_TX: OnceLock<Mutex<Option<watch::Sender<u64>>>> = OnceLock::new();
+
+        pub(crate) fn should_trigger_power_resume_reconcile(event_type: u32) -> bool {
+            event_type == PBT_APMRESUMEAUTOMATIC || event_type == PBT_APMRESUMESUSPEND
+        }
+
+        #[repr(C)]
+        struct DeviceNotifySubscribeParameters {
+            callback: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> u32,
+            context: *mut c_void,
+        }
+
+        type PowerRegisterSuspendResumeNotificationFn = unsafe extern "system" fn(
+            flags: u32,
+            recipient: *mut c_void,
+            registration_handle: *mut *mut c_void,
+        ) -> u32;
+
+        type PowerUnregisterSuspendResumeNotificationFn =
+            unsafe extern "system" fn(registration_handle: *mut c_void) -> u32;
+
+        unsafe extern "system" fn power_suspend_resume_callback(
+            _context: *mut c_void,
+            event_type: u32,
+            _setting: *mut c_void,
+        ) -> u32 {
+            if should_trigger_power_resume_reconcile(event_type) {
+                if let Some(lock) = POWER_RESUME_TX.get() {
+                    if let Some(ref tx) = *lock.lock().unwrap_or_else(|e| e.into_inner()) {
+                        tx.send_modify(|n| *n = n.wrapping_add(1));
+                    }
+                }
+            }
+            NO_ERROR
+        }
+
+        pub(super) struct SuspendResumeNotificationGuard {
+            hmod: HMODULE,
+            reg_handle: *mut c_void,
+            unregister_fn: PowerUnregisterSuspendResumeNotificationFn,
+        }
+
+        // SAFETY: `HMODULE` and `HPOWERNOTIFY` are process-global Win32 handles that can be
+        // unregistered and freed safely when the foreground TUN supervisor stops.
+        unsafe impl Send for SuspendResumeNotificationGuard {}
+
+        fn clear_power_resume_tx() {
+            if let Some(lock) = POWER_RESUME_TX.get() {
+                *lock.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+        }
+
+        impl SuspendResumeNotificationGuard {
+            pub(super) fn register(tx: watch::Sender<u64>) -> Option<Self> {
+                {
+                    let lock = POWER_RESUME_TX.get_or_init(|| Mutex::new(None));
+                    *lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+                }
+
+                let dll_wide: Vec<u16> = "powrprof.dll\0".encode_utf16().collect();
+                let hmod = unsafe {
+                    LoadLibraryExW(
+                        dll_wide.as_ptr(),
+                        ptr::null_mut(),
+                        LOAD_LIBRARY_SEARCH_SYSTEM32,
+                    )
+                };
+                if hmod.is_null() {
+                    warn!("could not load powrprof.dll for Modern Standby wake notifications");
+                    clear_power_resume_tx();
+                    return None;
+                }
+
+                let register_proc = unsafe {
+                    GetProcAddress(
+                        hmod,
+                        c"PowerRegisterSuspendResumeNotification"
+                            .as_ptr()
+                            .cast::<u8>(),
+                    )
+                };
+                let unregister_proc = unsafe {
+                    GetProcAddress(
+                        hmod,
+                        c"PowerUnregisterSuspendResumeNotification"
+                            .as_ptr()
+                            .cast::<u8>(),
+                    )
+                };
+                let (Some(register_proc), Some(unregister_proc)) = (register_proc, unregister_proc)
+                else {
+                    warn!(
+                        "powrprof.dll missing PowerRegisterSuspendResumeNotification exports"
+                    );
+                    unsafe {
+                        let _ = FreeLibrary(hmod);
+                    }
+                    clear_power_resume_tx();
+                    return None;
+                };
+
+                let register_fn: PowerRegisterSuspendResumeNotificationFn =
+                    unsafe { std::mem::transmute_copy(&register_proc) };
+                let unregister_fn: PowerUnregisterSuspendResumeNotificationFn =
+                    unsafe { std::mem::transmute_copy(&unregister_proc) };
+
+                let mut params = DeviceNotifySubscribeParameters {
+                    callback: power_suspend_resume_callback,
+                    context: ptr::null_mut(),
+                };
+                let mut reg_handle: *mut c_void = ptr::null_mut();
+                let rc = unsafe {
+                    register_fn(
+                        DEVICE_NOTIFY_CALLBACK,
+                        (&mut params as *mut DeviceNotifySubscribeParameters).cast::<c_void>(),
+                        &mut reg_handle,
+                    )
+                };
+                if rc != NO_ERROR || reg_handle.is_null() {
+                    warn!(
+                        error = rc,
+                        "PowerRegisterSuspendResumeNotification failed for foreground TUN"
+                    );
+                    unsafe {
+                        let _ = FreeLibrary(hmod);
+                    }
+                    clear_power_resume_tx();
+                    return None;
+                }
+
+                info!("registered Modern Standby (S0ix) power suspend/resume notification");
+                Some(Self {
+                    hmod,
+                    reg_handle,
+                    unregister_fn,
+                })
+            }
+        }
+
+        impl Drop for SuspendResumeNotificationGuard {
+            fn drop(&mut self) {
+                let mut unregistered = true;
+                if !self.reg_handle.is_null() {
+                    let rc = unsafe { (self.unregister_fn)(self.reg_handle) };
+                    if rc != NO_ERROR {
+                        warn!(
+                            error = rc,
+                            "PowerUnregisterSuspendResumeNotification failed"
+                        );
+                        unregistered = false;
+                    }
+                    self.reg_handle = ptr::null_mut();
+                }
+                clear_power_resume_tx();
+                if unregistered && !self.hmod.is_null() {
+                    unsafe {
+                        let _ = FreeLibrary(self.hmod);
+                    }
+                    self.hmod = ptr::null_mut();
+                }
+            }
+        }
     }
 
     fn is_fatal_tun_start_error(err: &anyhow::Error) -> bool {
@@ -1876,7 +3365,41 @@ mod desktop_tun {
                     || lower.contains("missing")
                     || lower.contains("sha-256")
                     || lower.contains("verify")
+                    || lower.contains("mismatch")
+                    || lower.contains("corrupt")
                     || lower.contains("loadlibrary")))
+    }
+
+    pub(super) fn effective_tun_dns_ipv4_only(
+        explicit_dns_ipv4_only: bool,
+        session_ipv6_active: bool,
+    ) -> bool {
+        explicit_dns_ipv4_only || !session_ipv6_active
+    }
+
+    pub(super) async fn sync_tun_dns_ipv4_only_if_changed<F, Fut>(
+        dns: &vdpi::dns::DnsResolver,
+        tun_running: bool,
+        explicit_dns_ipv4_only: bool,
+        tun_ipv6_active: bool,
+        flush_os_cache: F,
+    ) -> bool
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        if !tun_running {
+            return false;
+        }
+        let next = effective_tun_dns_ipv4_only(explicit_dns_ipv4_only, tun_ipv6_active);
+        let prev = dns.is_ipv4_only();
+        if prev == next {
+            return false;
+        }
+        dns.set_ipv4_only(next);
+        dns.clear_cache().await;
+        flush_os_cache().await;
+        true
     }
 
     enum PlatformTunHandle {
@@ -1916,13 +3439,26 @@ mod desktop_tun {
                 Self::Unsupported => None,
             }
         }
+
+        fn is_ipv6_active(&self) -> bool {
+            match self {
+                #[cfg(target_os = "windows")]
+                Self::Windows(s) => s.is_ipv6_active(),
+                #[cfg(target_os = "macos")]
+                Self::Macos(s) => s.is_ipv6_active(),
+                #[cfg(target_os = "linux")]
+                Self::Linux(s) => s.is_ipv6_active(),
+                #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+                Self::Unsupported => false,
+            }
+        }
     }
 
     struct DesktopTunSlot {
         session: Option<PlatformTunHandle>,
         pipeline_stop_tx: Option<watch::Sender<bool>>,
         pipeline_task: Option<tokio::task::JoinHandle<Result<()>>>,
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
         route_rx: Option<watch::Receiver<u64>>,
     }
 
@@ -1932,7 +3468,7 @@ mod desktop_tun {
                 session: None,
                 pipeline_stop_tx: None,
                 pipeline_task: None,
-                #[cfg(any(target_os = "windows", target_os = "macos"))]
+                #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
                 route_rx: None,
             }
         }
@@ -1951,10 +3487,24 @@ mod desktop_tun {
                 .and_then(PlatformTunHandle::physical_nic_name)
         }
 
+        fn is_ipv6_active(&self) -> bool {
+            self.session
+                .as_ref()
+                .is_some_and(PlatformTunHandle::is_ipv6_active)
+        }
+
+        #[cfg(target_os = "windows")]
+        fn force_reconcile_uplink(&self) {
+            if let Some(PlatformTunHandle::Windows(ref session)) = self.session {
+                session.force_reconcile_uplink();
+            }
+        }
+
         async fn start(
             &mut self,
             binder: &Arc<DynamicOutboundBinder>,
             tun_ipv6: bool,
+            explicit_dns_ipv4_only: bool,
             ctx: &EngineContext,
             tun_stats: &Arc<TunStats>,
             events: &Arc<EventRing>,
@@ -1976,6 +3526,10 @@ mod desktop_tun {
                     .context("Windows TUN startup task panicked")?
                     .map_err(format_tun_start_error)?;
 
+                ctx.dns.set_ipv4_only(effective_tun_dns_ipv4_only(
+                    explicit_dns_ipv4_only,
+                    session.is_ipv6_active(),
+                ));
                 let app_bypass =
                     vdpi::split_tunnel::build_tun_app_bypass_hook(&ctx.config.split_tunnel);
                 let (stop_tx, stop_rx) = watch::channel(false);
@@ -2019,6 +3573,10 @@ mod desktop_tun {
                     }
                 };
 
+                ctx.dns.set_ipv4_only(effective_tun_dns_ipv4_only(
+                    explicit_dns_ipv4_only,
+                    session.is_ipv6_active(),
+                ));
                 let tun_mtu = usize::from(session.mtu());
                 let route_rx = session.route_change_rx();
                 let app_bypass =
@@ -2048,7 +3606,7 @@ mod desktop_tun {
                 use vdpi::platform::linux_tun::LinuxTunSession;
 
                 let start_binder = Arc::clone(binder);
-                let (session, tun_fd) = tokio::task::spawn_blocking(move || {
+                let (mut session, tun_fd) = tokio::task::spawn_blocking(move || {
                     LinuxTunSession::start(start_binder, tun_ipv6)
                 })
                 .await
@@ -2063,6 +3621,11 @@ mod desktop_tun {
                     }
                 };
 
+                ctx.dns.set_ipv4_only(effective_tun_dns_ipv4_only(
+                    explicit_dns_ipv4_only,
+                    session.is_ipv6_active(),
+                ));
+                let route_rx = session.take_route_watch();
                 let app_bypass =
                     vdpi::split_tunnel::build_tun_app_bypass_hook(&ctx.config.split_tunnel);
                 let (stop_tx, stop_rx) = watch::channel(false);
@@ -2074,19 +3637,27 @@ mod desktop_tun {
                     DESKTOP_MTU,
                     TunProfile::DESKTOP,
                     stop_rx,
-                    None,
+                    route_rx.clone(),
                     app_bypass,
                 ));
 
                 self.session = Some(PlatformTunHandle::Linux(session));
                 self.pipeline_stop_tx = Some(stop_tx);
                 self.pipeline_task = Some(pipeline_task);
+                self.route_rx = route_rx;
                 Ok(())
             }
 
             #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
             {
-                let _ = (binder, tun_ipv6, ctx, tun_stats, events);
+                let _ = (
+                    binder,
+                    tun_ipv6,
+                    explicit_dns_ipv4_only,
+                    ctx,
+                    tun_stats,
+                    events,
+                );
                 Err(format_tun_start_error(anyhow::anyhow!(
                     "desktop TUN mode is not supported on {}",
                     platform_name()
@@ -2095,9 +3666,22 @@ mod desktop_tun {
         }
 
         async fn stop(&mut self) {
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
             {
                 self.route_rx = None;
+            }
+            #[cfg(target_os = "linux")]
+            if let Some(PlatformTunHandle::Linux(linux_tun)) = self.session.take() {
+                if let Ok(returned) = tokio::task::spawn_blocking(move || {
+                    #[allow(unused_mut)]
+                    let mut linux_tun = linux_tun;
+                    linux_tun.revert_dns_early();
+                    linux_tun
+                })
+                .await
+                {
+                    self.session = Some(PlatformTunHandle::Linux(returned));
+                }
             }
             if let Some(tx) = self.pipeline_stop_tx.take() {
                 let _ = tx.send(true);
@@ -2133,8 +3717,8 @@ mod desktop_tun {
                 return anyhow::anyhow!(
                     "failed to start Windows TUN mode: {chain}\n\n\
                      To fix this:\n  \
-                     - Official Windows release builds embed the WHQL-signed Wintun driver inside vdpi.exe (run `vdpi update --force` or re-download the official release archive).\n  \
-                     - For source / `cargo install` builds without embedded Wintun, place the official WHQL-signed wintun.dll next to vdpi.exe.\n  \
+                     - Extract all files from the official release zip keeping wintun.dll in the same folder as vdpi.exe (or run `vdpi update --force`).\n  \
+                     - For source / `cargo install` builds, place the official WHQL-signed wintun.dll in the same folder as vdpi.exe.\n  \
                      - Or switch to Proxy mode without a virtual adapter: `vdpi --proxy start` (or `vdpi engine proxy`)."
                 );
             }
@@ -2153,7 +3737,7 @@ mod desktop_tun {
             }
             anyhow::anyhow!(
                 "failed to start Windows TUN mode: {chain}\n\n\
-                 Tip: Run elevated as Administrator (official release builds embed Wintun inside vdpi.exe; source builds need wintun.dll next to vdpi.exe), or switch to Proxy mode with `vdpi --proxy start` (`vdpi engine proxy`)."
+                 Tip: Run elevated as Administrator with wintun.dll in the same folder as vdpi.exe (extract all files from the zip), or switch to Proxy mode with `vdpi --proxy start` (`vdpi engine proxy`)."
             )
         }
         #[cfg(target_os = "macos")]
@@ -2170,7 +3754,8 @@ mod desktop_tun {
             anyhow::anyhow!(
                 "failed to start Linux TUN mode: {chain}\n\n\
                  To fix this:\n  \
-                 - Run elevated (`sudo vdpi --tun start`), grant CAP_NET_ADMIN (`sudo setcap cap_net_admin+eip $(which vdpi)`), or install the system service (`sudo vdpi install --tun`).\n  \
+                 - Run with root privileges (`sudo vdpi --tun start`) or install the systemd system service (`sudo vdpi install --tun`).\n  \
+                 - Note: bare `setcap cap_net_admin` on the binary alone is not sufficient because child `ip`/`resolvectl` helpers do not inherit file capabilities without ambient capabilities (even though non-root runtime state falls back to `$XDG_RUNTIME_DIR/vdpi`).\n  \
                  - Or switch to unprivileged Proxy mode: `vdpi --proxy start` (or `vdpi engine proxy`)."
             )
         }
@@ -2207,7 +3792,7 @@ mod desktop_tun {
         }
     }
 
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     async fn wait_route_change(route_rx: &mut Option<watch::Receiver<u64>>) {
         match route_rx.as_mut() {
             Some(rx) => {
@@ -2220,7 +3805,7 @@ mod desktop_tun {
         }
     }
 
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     async fn wait_route_change() {
         std::future::pending::<()>().await;
     }
@@ -2231,6 +3816,7 @@ mod desktop_tun {
         tun_stats: Arc<TunStats>,
         events: Arc<EventRing>,
         tun_ipv6: bool,
+        explicit_dns_ipv4_only: bool,
         health_addr: SocketAddr,
     }
 
@@ -2241,6 +3827,7 @@ mod desktop_tun {
         consecutive_pipeline_exits: u32,
         last_started_at: Option<Instant>,
         last_start_error: Option<(String, Instant)>,
+        offline_standby_logged: bool,
     }
 
     impl TunRetryState {
@@ -2252,6 +3839,7 @@ mod desktop_tun {
                 consecutive_pipeline_exits: 0,
                 last_started_at: running.then(Instant::now),
                 last_start_error: None,
+                offline_standby_logged: false,
             }
         }
 
@@ -2264,6 +3852,10 @@ mod desktop_tun {
         }
 
         fn record_started(&mut self, now: Instant) {
+            if self.offline_standby_logged {
+                info!("physical network uplink restored; TUN session is active");
+                self.offline_standby_logged = false;
+            }
             self.consecutive_failures = 0;
             self.next_retry_at = None;
             self.last_start_error = None;
@@ -2276,23 +3868,40 @@ mod desktop_tun {
             self.next_retry_at = None;
             self.last_start_error = None;
             self.last_started_at = None;
+            self.offline_standby_logged = false;
         }
 
         fn record_start_failure(&mut self, now: Instant, err: &anyhow::Error) {
-            self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-            let backoff = retry_backoff(self.consecutive_failures);
-            self.next_retry_at = Some(now + backoff);
-            let err_text = format!("{err:#}");
-            let should_log = self.last_start_error.as_ref().is_none_or(|(prev, ts)| {
-                prev != &err_text || now.saturating_duration_since(*ts) >= Duration::from_secs(30)
-            });
-            if should_log {
-                warn!(
-                    error = %err,
-                    retry_in_secs = backoff.as_secs(),
-                    "failed to start or resume TUN session; will retry"
-                );
-                self.last_start_error = Some((err_text, now));
+            match classify_tun_start_error_log(&mut self.offline_standby_logged, err) {
+                TunStartErrorLogAction::LogOfflineStandby => {
+                    self.next_retry_at = Some(now + OFFLINE_STANDBY_RETRY_INTERVAL);
+                    self.last_start_error = None;
+                    warn!(
+                        error = %err,
+                        "no active physical network uplink; holding TUN in standby and polling for connectivity"
+                    );
+                }
+                TunStartErrorLogAction::SuppressOfflineStandby => {
+                    self.next_retry_at = Some(now + OFFLINE_STANDBY_RETRY_INTERVAL);
+                }
+                TunStartErrorLogAction::LogRetryableError => {
+                    self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+                    let backoff = retry_backoff(self.consecutive_failures);
+                    self.next_retry_at = Some(now + backoff);
+                    let err_text = format!("{err:#}");
+                    let should_log = self.last_start_error.as_ref().is_none_or(|(prev, ts)| {
+                        prev != &err_text
+                            || now.saturating_duration_since(*ts) >= Duration::from_secs(30)
+                    });
+                    if should_log {
+                        warn!(
+                            error = %err,
+                            retry_in_secs = backoff.as_secs(),
+                            "failed to start or resume TUN session; will retry"
+                        );
+                        self.last_start_error = Some((err_text, now));
+                    }
+                }
             }
         }
     }
@@ -2300,8 +3909,11 @@ mod desktop_tun {
     enum LoopEvent {
         None,
         Reconcile,
+        RouteChanged,
         PipelineExited,
         RetryStart,
+        #[cfg(target_os = "windows")]
+        PowerResume,
     }
 
     enum StartOutcome {
@@ -2327,6 +3939,7 @@ mod desktop_tun {
             .start(
                 &env.binder,
                 env.tun_ipv6,
+                env.explicit_dns_ipv4_only,
                 &env.ctx,
                 &env.tun_stats,
                 &env.events,
@@ -2352,6 +3965,13 @@ mod desktop_tun {
             }
             Err(err) => {
                 if is_fatal_tun_start_error(&err) {
+                    #[cfg(target_os = "windows")]
+                    {
+                        let _ = tokio::task::spawn_blocking(
+                            vdpi::platform::windows_tun::cleanup_orphan_wintun_adapter,
+                        )
+                        .await;
+                    }
                     error!(error = %err, "unrecoverable TUN startup error");
                     return StartOutcome::Fatal(err);
                 }
@@ -2381,10 +4001,21 @@ mod desktop_tun {
         meta.vpn_conflict = guard.active_conflict_label(scope);
     }
 
+    pub(super) fn normalize_tun_runtime_config(mut cfg: RuntimeConfig) -> RuntimeConfig {
+        // When IPv6 TUN routing is disabled, force IPv4-only DNS answers so browsers
+        // (Happy Eyeballs) on dual-stack ISPs do not leak AAAA connections past vdpi0.
+        if !cfg.tun_ipv6 {
+            cfg.dns_ipv4_only = true;
+        }
+        cfg
+    }
+
     pub(super) async fn run_tun_daemon(
         cfg: RuntimeConfig,
         dashboard_tracing: Option<DashboardTracing>,
     ) -> Result<()> {
+        let explicit_dns_ipv4_only = cfg.dns_ipv4_only;
+        let cfg = normalize_tun_runtime_config(cfg);
         let binder = DynamicOutboundBinder::new(OutboundTarget::default());
         let binder_dyn: Arc<dyn OutboundBinder> = binder.clone();
         let ctx = EngineContext::new_with_binder(cfg.clone(), Some(binder_dyn))?;
@@ -2396,6 +4027,7 @@ mod desktop_tun {
         let events = Arc::new(EventRing::new());
         let mut vpn_guard = VpnGuard::new(cfg.vpn_coexistence);
         let mut slot = DesktopTunSlot::empty();
+        let mut initial_retry = TunRetryState::new(false);
 
         let initial_scope = tokio::task::spawn_blocking(|| detect_active_vpn(None))
             .await
@@ -2416,13 +4048,95 @@ mod desktop_tun {
                     "full-tunnel VPN detected (vpn_coexistence=warn); starting TUN mode anyway"
                 );
                 last_warned_provider = Some(provider);
-                slot.start(&binder, cfg.tun_ipv6, &ctx, &tun_stats, &events)
-                    .await?;
+                match slot
+                    .start(
+                        &binder,
+                        cfg.tun_ipv6,
+                        explicit_dns_ipv4_only,
+                        &ctx,
+                        &tun_stats,
+                        &events,
+                    )
+                    .await
+                {
+                    Ok(()) => initial_retry.record_started(Instant::now()),
+                    Err(err) if is_fatal_tun_start_error(&err) => {
+                        #[cfg(target_os = "windows")]
+                        {
+                            let _ = tokio::task::spawn_blocking(
+                                vdpi::platform::windows_tun::cleanup_orphan_wintun_adapter,
+                            )
+                            .await;
+                        }
+                        return Err(err);
+                    }
+                    Err(err) => {
+                        let now = Instant::now();
+                        initial_retry.last_attempt = Some(now);
+                        initial_retry.record_start_failure(now, &err);
+                    }
+                }
             }
             GuardAction::None | GuardAction::ResumeTun => {
-                slot.start(&binder, cfg.tun_ipv6, &ctx, &tun_stats, &events)
-                    .await?;
+                match slot
+                    .start(
+                        &binder,
+                        cfg.tun_ipv6,
+                        explicit_dns_ipv4_only,
+                        &ctx,
+                        &tun_stats,
+                        &events,
+                    )
+                    .await
+                {
+                    Ok(()) => initial_retry.record_started(Instant::now()),
+                    Err(err) if is_fatal_tun_start_error(&err) => {
+                        #[cfg(target_os = "windows")]
+                        {
+                            let _ = tokio::task::spawn_blocking(
+                                vdpi::platform::windows_tun::cleanup_orphan_wintun_adapter,
+                            )
+                            .await;
+                        }
+                        return Err(err);
+                    }
+                    Err(err) => {
+                        let now = Instant::now();
+                        initial_retry.last_attempt = Some(now);
+                        initial_retry.record_start_failure(now, &err);
+                    }
+                }
             }
+        }
+
+        #[cfg(target_os = "windows")]
+        if !slot.is_running() {
+            // Clean up any orphaned vdpi0 adapter left behind by a prior crash so it cannot
+            // blackhole traffic while TUN is held in VPN-yielded or offline preflight standby.
+            let _ = tokio::task::spawn_blocking(
+                vdpi::platform::windows_tun::cleanup_orphan_wintun_adapter,
+            )
+            .await;
+        }
+
+        #[cfg(target_os = "linux")]
+        if !slot.is_running() {
+            // Clean up any orphaned Linux TUN routes/rules/DNS state left behind by a prior
+            // crash so it cannot blackhole traffic while TUN is held in VPN-yielded or offline
+            // standby.
+            let _ = tokio::task::spawn_blocking(
+                vdpi::platform::linux_tun::cleanup_linux_tun_state,
+            )
+            .await;
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            // Clear any leftover WinINET/WinHTTP/user-env proxy settings once when running in TUN mode.
+            let _ = tokio::task::spawn_blocking(
+                vdpi::platform::windows::clear_all_windows_proxies,
+            )
+            .await;
         }
 
         if slot.is_running() {
@@ -2485,6 +4199,7 @@ mod desktop_tun {
             tun_interface: Some(initial_iface.clone()),
             physical_nic: initial_nic.clone(),
             vpn_conflict: initial_vpn.clone(),
+            dns_addr: Some(cfg.dns_addr.clone()),
         }));
 
         write_runtime_state_with_meta(
@@ -2513,7 +4228,7 @@ mod desktop_tun {
                 physical_nic = ?initial_nic,
                 mode = ?cfg.mode,
                 chunk_size = cfg.chunk_size,
-                doh = cfg.enable_doh,
+                doh = vdpi_core::dns::is_effective_doh_target(&cfg.dns_addr, cfg.enable_doh),
                 vpn_coexistence = cfg.vpn_coexistence.as_str(),
                 "vdpi desktop TUN engine active"
             );
@@ -2554,6 +4269,7 @@ mod desktop_tun {
             tun_stats: Arc::clone(&tun_stats),
             events: Arc::clone(&events),
             tun_ipv6: cfg.tun_ipv6,
+            explicit_dns_ipv4_only,
             health_addr,
         };
         let sup_meta = Arc::clone(&health_meta);
@@ -2563,13 +4279,20 @@ mod desktop_tun {
         let mut last_scope = initial_scope;
 
         let supervisor_task: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
+            #[cfg(target_os = "windows")]
+            let (mut power_resume_rx, _power_notify_guard, mut power_resume_open) = {
+                let (tx, rx) = watch::channel::<u64>(0);
+                let guard = windows_power::SuspendResumeNotificationGuard::register(tx);
+                let open = guard.is_some();
+                (rx, guard, open)
+            };
+
             let mut telemetry_tick = tokio::time::interval(Duration::from_millis(250));
             telemetry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut vpn_tick = tokio::time::interval(Duration::from_secs(1));
-            vpn_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            vpn_tick.tick().await;
+            let mut next_reconcile_at = tokio::time::Instant::now()
+                + tun_reconcile_interval(slot.is_running(), vpn_guard.is_yielded());
 
-            let mut retry = TunRetryState::new(slot.is_running());
+            let mut retry = initial_retry;
             let mut fatal_error: Option<anyhow::Error> = None;
 
             loop {
@@ -2577,9 +4300,16 @@ mod desktop_tun {
                     break;
                 }
 
+                let desired_interval =
+                    tun_reconcile_interval(slot.is_running(), vpn_guard.is_yielded());
+                let max_deadline = tokio::time::Instant::now() + desired_interval;
+                if next_reconcile_at > max_deadline {
+                    next_reconcile_at = max_deadline;
+                }
+
                 let event = {
                     let pipeline_task = &mut slot.pipeline_task;
-                    #[cfg(any(target_os = "windows", target_os = "macos"))]
+                    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
                     let route_rx = &mut slot.route_rx;
                     let slot_running = slot.session.is_some();
 
@@ -2641,17 +4371,49 @@ mod desktop_tun {
                                 LoopEvent::PipelineExited
                             }
                         }
+                        power_changed = async {
+                            #[cfg(target_os = "windows")]
+                            {
+                                if power_resume_open {
+                                    power_resume_rx.changed().await.is_ok()
+                                } else {
+                                    std::future::pending().await
+                                }
+                            }
+                            #[cfg(not(target_os = "windows"))]
+                            {
+                                std::future::pending::<bool>().await
+                            }
+                        } => {
+                            if power_changed {
+                                LoopEvent::PowerResume
+                            } else {
+                                #[cfg(target_os = "windows")]
+                                {
+                                    power_resume_open = false;
+                                }
+                                LoopEvent::None
+                            }
+                        }
                         _ = async {
-                            #[cfg(any(target_os = "windows", target_os = "macos"))]
+                            #[cfg(any(
+                                target_os = "windows",
+                                target_os = "macos",
+                                target_os = "linux"
+                            ))]
                             {
                                 wait_route_change(route_rx).await;
                             }
-                            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+                            #[cfg(not(any(
+                                target_os = "windows",
+                                target_os = "macos",
+                                target_os = "linux"
+                            )))]
                             {
                                 wait_route_change().await;
                             }
                         } => {
-                            LoopEvent::Reconcile
+                            LoopEvent::RouteChanged
                         }
                         _ = telemetry_tick.tick() => {
                             sync_tun_telemetry(&sup_env.ctx, &sup_env.tun_stats);
@@ -2663,7 +4425,8 @@ mod desktop_tun {
                             };
                             LoopEvent::None
                         }
-                        _ = vpn_tick.tick() => {
+                        _ = tokio::time::sleep_until(next_reconcile_at) => {
+                            next_reconcile_at = tokio::time::Instant::now() + desired_interval;
                             if vpn_policy != VpnCoexistence::Off {
                                 LoopEvent::Reconcile
                             } else if !slot_running {
@@ -2690,8 +4453,57 @@ mod desktop_tun {
                     }
                 }
 
+                #[cfg(target_os = "windows")]
+                let (is_power_resume, was_running_before_wake) = (
+                    matches!(event, LoopEvent::PowerResume),
+                    slot.is_running(),
+                );
+
                 match event {
                     LoopEvent::None => continue,
+                    #[cfg(target_os = "windows")]
+                    LoopEvent::PowerResume => {
+                        sup_env.ctx.dns.clear_cache().await;
+                        retry.last_attempt = None;
+                        retry.next_retry_at = None;
+                        if vpn_policy == VpnCoexistence::Off {
+                            if slot.is_running() {
+                                slot.force_reconcile_uplink();
+                                let _ = tokio::task::spawn_blocking(
+                                    vdpi::platform::windows::flush_dns_resolver_cache,
+                                )
+                                .await;
+                            } else {
+                                let now = Instant::now();
+                                match try_start_slot(
+                                    &mut slot,
+                                    &sup_env,
+                                    &sup_shutdown_rx,
+                                    &mut retry,
+                                    now,
+                                    "resumed TUN mode after system wake",
+                                )
+                                .await
+                                {
+                                    StartOutcome::Started | StartOutcome::RetryLater => {}
+                                    StartOutcome::Shutdown => break,
+                                    StartOutcome::Fatal(err) => {
+                                        fatal_error = Some(err);
+                                        let _ = sup_shutdown_tx.send(true);
+                                        break;
+                                    }
+                                }
+                                update_health_meta(
+                                    &sup_meta,
+                                    &sup_env.binder,
+                                    &slot,
+                                    &vpn_guard,
+                                    &last_scope,
+                                );
+                            }
+                            continue;
+                        }
+                    }
                     LoopEvent::RetryStart => {
                         let now = Instant::now();
                         if !slot.is_running() && retry.retry_due(now) {
@@ -2722,6 +4534,35 @@ mod desktop_tun {
                             );
                         }
                         continue;
+                    }
+                    LoopEvent::RouteChanged => {
+                        let tun_ipv6_active = slot.is_ipv6_active();
+                        if sync_tun_dns_ipv4_only_if_changed(
+                            &sup_env.ctx.dns,
+                            slot.is_running(),
+                            sup_env.explicit_dns_ipv4_only,
+                            tun_ipv6_active,
+                            || async {
+                                #[cfg(target_os = "windows")]
+                                {
+                                    let _ = tokio::task::spawn_blocking(
+                                        vdpi::platform::windows::flush_dns_resolver_cache,
+                                    )
+                                    .await;
+                                }
+                            },
+                        )
+                        .await
+                        {
+                            debug!(
+                                ipv4_only = sup_env.ctx.dns.is_ipv4_only(),
+                                tun_ipv6_active,
+                                "re-synced TUN DNS IPv4-only filtering after route change"
+                            );
+                        }
+                        if vpn_policy == VpnCoexistence::Off {
+                            continue;
+                        }
                     }
                     LoopEvent::Reconcile | LoopEvent::PipelineExited => {
                         if vpn_policy == VpnCoexistence::Off {
@@ -2764,11 +4605,20 @@ mod desktop_tun {
                                 provider = %provider,
                                 "full-tunnel VPN active during recovery; keeping TUN in yielded standby"
                             );
+                            #[cfg(target_os = "linux")]
+                            {
+                                let _ = tokio::task::spawn_blocking(
+                                    vdpi::platform::linux_tun::cleanup_linux_tun_state,
+                                )
+                                .await;
+                            }
                         }
+                        sup_env.ctx.dns.clear_cache().await;
                     }
                     GuardAction::ResumeTun => {
                         last_warned_provider = None;
                         retry.consecutive_pipeline_exits = 0;
+                        sup_env.ctx.dns.clear_cache().await;
                         if !slot.is_running() && retry.retry_due(now) {
                             match try_start_slot(
                                 &mut slot,
@@ -2846,6 +4696,15 @@ mod desktop_tun {
                     }
                 }
 
+                #[cfg(target_os = "windows")]
+                if is_power_resume && was_running_before_wake && slot.is_running() {
+                    slot.force_reconcile_uplink();
+                    let _ = tokio::task::spawn_blocking(
+                        vdpi::platform::windows::flush_dns_resolver_cache,
+                    )
+                    .await;
+                }
+
                 update_health_meta(&sup_meta, &sup_env.binder, &slot, &vpn_guard, &last_scope);
             }
 
@@ -2875,7 +4734,7 @@ mod desktop_tun {
                     vpn_conflict: initial_vpn.clone(),
                 },
                 mode: cfg.mode,
-                enable_doh: cfg.enable_doh,
+                enable_doh: vdpi_core::dns::is_effective_doh_target(&cfg.dns_addr, cfg.enable_doh),
                 dns_addr: Some(cfg.dns_addr.clone()),
             };
             let probe_meta = Arc::clone(&health_meta);
@@ -2978,17 +4837,24 @@ mod desktop_tun {
         );
         println!(
             "  DNS Resolution      : {}",
-            if cfg.enable_doh {
-                format!("RFC 8484 DoH ({}) + non-53 UDP fallback", cfg.dns_addr)
-            } else {
-                format!("UDP ({}:{})", cfg.dns_addr, cfg.dns_port)
-            }
+            super::format_dns_resolution_line(&cfg.dns_addr, cfg.dns_port, cfg.enable_doh)
         );
         println!("  VPN Coexistence     : {}", cfg.vpn_coexistence.as_str());
         if let Some(vpn) = vpn_conflict {
             println!("  VPN Status          : {vpn}");
         }
         println!();
+    }
+}
+
+fn format_dns_resolution_line(dns_addr: &str, dns_port: u16, enable_doh: bool) -> String {
+    let display_addr = vdpi_core::dns::redact_dns_for_display(dns_addr);
+    if vdpi_core::dns::is_effective_doh_target(dns_addr, enable_doh) {
+        format!("RFC 8484 DoH ({display_addr}) + non-53 UDP fallback")
+    } else if display_addr.contains(':') && !display_addr.starts_with('[') {
+        format!("UDP ([{display_addr}]:{dns_port})")
+    } else {
+        format!("UDP ({display_addr}:{dns_port})")
     }
 }
 
@@ -3013,11 +4879,7 @@ fn print_startup_banner(
     );
     println!(
         "  DNS Resolution      : {}",
-        if cfg.enable_doh {
-            format!("RFC 8484 DoH ({}) + non-53 UDP fallback", cfg.dns_addr)
-        } else {
-            format!("UDP ({}:{})", cfg.dns_addr, cfg.dns_port)
-        }
+        format_dns_resolution_line(&cfg.dns_addr, cfg.dns_port, cfg.enable_doh)
     );
     println!(
         "  System Integration  : {}\n",
@@ -3039,6 +4901,7 @@ fn init_tracing(cfg: &RuntimeConfig) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level));
     let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(filter)
         .with_target(false)
         .compact()
@@ -3218,11 +5081,94 @@ mod tests {
         let msg = missing_dll.to_string();
         assert!(msg.contains("--proxy"));
         #[cfg(target_os = "windows")]
-        assert!(msg.contains("embed"));
+        {
+            assert!(!msg.to_ascii_lowercase().contains("embed"));
+            assert!(msg.contains("wintun.dll"));
+            assert!(msg.contains("zip"));
+        }
 
         let priv_err =
             desktop_tun::format_tun_start_error(anyhow::anyhow!("Access is denied (os error 5)"));
-        assert!(priv_err.to_string().contains("--proxy"));
+        let priv_msg = priv_err.to_string();
+        assert!(priv_msg.contains("--proxy"));
+        #[cfg(target_os = "linux")]
+        {
+            assert!(priv_msg.contains("sudo vdpi --tun start"));
+            assert!(priv_msg.contains("sudo vdpi install --tun"));
+            assert!(priv_msg.contains("$XDG_RUNTIME_DIR/vdpi"));
+            assert!(!priv_msg.contains("root access to `/run/vdpi`"));
+            assert!(!priv_msg.contains("sudo setcap"));
+        }
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[test]
+    fn desktop_tun_forces_dns_ipv4_only_when_tun_ipv6_disabled() {
+        let ipv4_tun = RuntimeConfig {
+            engine: EngineMode::Tun,
+            tun_ipv6: false,
+            dns_ipv4_only: false,
+            ..RuntimeConfig::default()
+        };
+        let explicit_v4_default = ipv4_tun.dns_ipv4_only;
+        let normalized = desktop_tun::normalize_tun_runtime_config(ipv4_tun);
+        assert!(normalized.dns_ipv4_only);
+        // Capturing `explicit_dns_ipv4_only` before normalization lets IPv6-only uplinks
+        // that auto-enable IPv6 TUN (`session_ipv6_active = true`) resolve AAAA records.
+        assert!(!desktop_tun::effective_tun_dns_ipv4_only(
+            explicit_v4_default,
+            true
+        ));
+        assert!(desktop_tun::effective_tun_dns_ipv4_only(
+            explicit_v4_default,
+            false
+        ));
+
+        // Explicit `--ipv4-only` must be preserved even when TUN IPv6 is active or roams on.
+        assert!(desktop_tun::effective_tun_dns_ipv4_only(true, true));
+        assert!(desktop_tun::effective_tun_dns_ipv4_only(true, false));
+
+        let dual_tun = RuntimeConfig {
+            engine: EngineMode::Tun,
+            tun_ipv6: true,
+            dns_ipv4_only: false,
+            ..RuntimeConfig::default()
+        };
+        let normalized_dual = desktop_tun::normalize_tun_runtime_config(dual_tun);
+        assert!(!normalized_dual.dns_ipv4_only);
+    }
+
+    #[test]
+    fn config_get_evaluates_cli_over_file_over_default() {
+        let file_cfg = FileConfig {
+            schema_version: Some(CONFIG_SCHEMA_VERSION),
+            engine: Some(EngineMode::Proxy),
+            port: Some(8088),
+            ..Default::default()
+        };
+        let raw_args = vec![
+            "--tun".to_string(),
+            "--port".to_string(),
+            "9090".to_string(),
+            "config".to_string(),
+            "get".to_string(),
+            "port".to_string(),
+        ];
+        let mut argv = vec!["vdpi".to_string()];
+        argv.extend(raw_args.iter().cloned());
+        let cli = CliArgs::parse_from_iter(&argv).unwrap();
+        assert_eq!(
+            resolve_effective_config_key(cli.clone(), &file_cfg, &raw_args, "port")
+                .unwrap()
+                .as_deref(),
+            Some("9090")
+        );
+        assert_eq!(
+            resolve_effective_config_key(cli, &file_cfg, &raw_args, "engine")
+                .unwrap()
+                .as_deref(),
+            Some("tun")
+        );
     }
 
     #[test]
@@ -3420,6 +5366,7 @@ mod tests {
             version: None,
             mode: None,
             doh: None,
+            dns_addr: None,
             block_quic: None,
             active_connections: None,
             total_connections: None,
@@ -3493,6 +5440,7 @@ mod tests {
             version: Some("0.5.5".to_string()),
             mode: Some("tls-record".to_string()),
             doh: Some(false),
+            dns_addr: Some("94.140.14.14".to_string()),
             block_quic: Some(true),
             active_connections: Some(7),
             total_connections: Some(42),
@@ -3511,6 +5459,7 @@ mod tests {
         let info = dashboard_info_from_live(&tun_live, &fallback_cfg);
         assert_eq!(info.mode, DesyncMode::TlsRecord);
         assert!(!info.enable_doh);
+        assert_eq!(info.dns_addr.as_deref(), Some("94.140.14.14"));
         assert_eq!(
             info.engine,
             tui_dashboard::DashboardEngine::Tun {
@@ -3521,6 +5470,7 @@ mod tests {
         );
 
         let attached = attached_telemetry_from_live(&tun_live, &fallback_cfg);
+        assert_eq!(attached.dns_addr.as_deref(), Some("94.140.14.14"));
         assert_eq!(attached.snap.active_connections, 7);
         assert_eq!(attached.snap.total_connections, 42);
         assert_eq!(attached.snap.bytes_rx, 65_536);
@@ -3575,8 +5525,1060 @@ mod tests {
 
         assert!(merge_split_tunnel_apps(&existing, &["   ".to_string()]).is_err());
 
-        let remaining =
-            remove_split_tunnel_apps(&merged, &["discord".to_string(), "STEAM.EXE".to_string()]);
+        let (remaining, removed) =
+            remove_split_tunnel_apps(&merged, &["discord".to_string(), "STEAM.EXE".to_string()])
+                .unwrap();
+        assert_eq!(removed, 2);
         assert_eq!(remaining, vec!["firefox.exe".to_string()]);
+    }
+
+    #[test]
+    fn dns_banner_uses_effective_enable_doh_and_redacts_custom_url() {
+        let doh_line = format_dns_resolution_line(
+            "https://dns.nextdns.io/secret-token/my-profile",
+            53,
+            false,
+        );
+        assert!(doh_line.starts_with("RFC 8484 DoH ("));
+        assert!(!doh_line.contains("UDP (https://"));
+        assert!(!doh_line.contains(":53)"));
+        assert!(doh_line.contains("dns.nextdns.io"));
+        assert!(!doh_line.contains("secret-token"));
+        assert!(!doh_line.contains("my-profile"));
+
+        assert_eq!(
+            format_dns_resolution_line("1.1.1.1", 53, false),
+            "UDP (1.1.1.1:53)"
+        );
+        assert_eq!(
+            format_dns_resolution_line("1.1.1.1", 53, true),
+            "RFC 8484 DoH (1.1.1.1) + non-53 UDP fallback"
+        );
+        assert_eq!(
+            format_dns_resolution_line("2606:4700:4700::1111", 53, false),
+            "UDP ([2606:4700:4700::1111]:53)"
+        );
+        // Bare custom non-DoH IPs must report UDP even when enable_doh is true.
+        assert_eq!(
+            format_dns_resolution_line("76.76.2.0", 53, true),
+            "UDP (76.76.2.0:53)"
+        );
+        assert_eq!(
+            format_dns_resolution_line("2606:1a40::", 53, true),
+            "UDP ([2606:1a40::]:53)"
+        );
+    }
+
+    #[test]
+    fn resolve_dns_target_redacts_tokens_in_error_messages() {
+        let http_err =
+            resolve_dns_target("http://user:secretpass@dns.nextdns.io/my-secret-token/profile")
+                .unwrap_err()
+                .to_string();
+        assert!(http_err.contains("http://dns.nextdns.io"));
+        assert!(!http_err.contains("secretpass"));
+        assert!(!http_err.contains("my-secret-token"));
+        assert!(!http_err.contains("profile"));
+
+        let malformed_err = resolve_dns_target("https://bad_host/top-secret-token")
+            .unwrap_err()
+            .to_string();
+        assert!(malformed_err.contains("https://<redacted>"));
+        assert!(!malformed_err.contains("top-secret-token"));
+
+        let whitespace_err = resolve_dns_target("https://bad host/top-secret-token")
+            .unwrap_err()
+            .to_string();
+        assert!(!whitespace_err.contains("top-secret-token"));
+    }
+
+    #[test]
+    fn wintun_preflight_notice_is_concise_without_raw_paths_or_hashes() {
+        let hash_err = "wintun.dll SHA-256 verification failed for C:\\Users\\Alice\\Downloads\\vdpi\\wintun.dll: expected 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef, got fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+        let notice = format_wintun_preflight_notice(hash_err);
+        assert_eq!(
+            notice,
+            "wintun.dll is corrupted or mismatched - extract all files from the zip (keep wintun.dll beside vdpi.exe)"
+        );
+        assert!(!notice.contains("C:\\Users"));
+        assert!(!notice.contains("0123456789abcdef"));
+
+        let missing = format_wintun_preflight_notice(
+            "wintun.dll (v0.14.1) not found beside vdpi executable or runtime cache",
+        );
+        assert_eq!(
+            missing,
+            "wintun.dll not found next to vdpi.exe - extract all files from the zip"
+        );
+    }
+
+    #[test]
+    fn foreground_proxy_vpn_poll_interval_matches_three_second_cadence() {
+        assert_eq!(FOREGROUND_PROXY_VPN_POLL_INTERVAL, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn explicit_config_path_overrides_probed_engine_and_dns_display() {
+        let explicit = Path::new("custom.toml");
+        assert_eq!(
+            configured_engine_for_display(Some(explicit), EngineMode::Tun, EngineMode::Proxy),
+            EngineMode::Tun
+        );
+        assert_eq!(
+            configured_engine_for_display(None, EngineMode::Tun, EngineMode::Proxy),
+            EngineMode::Proxy
+        );
+        assert_eq!(
+            configured_dns_for_display(Some(explicit), "76.76.2.0"),
+            "76.76.2.0"
+        );
+    }
+
+    #[test]
+    fn split_command_respects_explicit_config_path_and_cli_overrides() {
+        let dir = std::env::temp_dir().join(format!(
+            "vdpi-main-split-cfg-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg_path = dir.join("config.toml");
+
+        handle_split_command(
+            Some(SplitCommand::Mode {
+                mode: SplitTunnelMode::Exclude,
+            }),
+            Some(&cfg_path),
+            None,
+            &[],
+        )
+        .unwrap();
+        handle_split_command(
+            Some(SplitCommand::Add {
+                apps: vec!["discord.exe".to_string()],
+            }),
+            Some(&cfg_path),
+            None,
+            &[],
+        )
+        .unwrap();
+
+        let loaded = load_effective_split_tunnel(Some(&cfg_path), None, &[], false).unwrap();
+        assert_eq!(loaded.mode, SplitTunnelMode::Exclude);
+        assert_eq!(loaded.apps, vec!["discord.exe".to_string()]);
+
+        let overridden = load_effective_split_tunnel(
+            Some(&cfg_path),
+            Some(SplitTunnelMode::Include),
+            &["firefox.exe".to_string()],
+            false,
+        )
+        .unwrap();
+        assert_eq!(overridden.mode, SplitTunnelMode::Include);
+        assert_eq!(overridden.apps, vec!["firefox.exe".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_split_tunnel_apps_strips_shortcut_cli_arguments() {
+        let existing = vec![
+            "RiotClientServices.exe".to_string(),
+            "Discord.exe".to_string(),
+            "firefox".to_string(),
+            "steam.exe".to_string(),
+        ];
+        let (remaining, removed) = remove_split_tunnel_apps(
+            &existing,
+            &[
+                r#""C:\Riot Games\Riot Client\RiotClientServices.exe" --launch-product=valorant --launch-patchline=live"#
+                    .to_string(),
+                r"C:\Program Files\Discord\Discord.exe --start-minimized".to_string(),
+                "'/usr/bin/firefox' --new-window".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(removed, 3);
+        assert_eq!(remaining, vec!["steam.exe".to_string()]);
+    }
+
+    #[test]
+    fn split_remove_rejects_invalid_args_and_skips_write_on_zero_matches() {
+        let existing = vec!["Discord.exe".to_string()];
+
+        // Reject empty, whitespace, mixed empty, control-char, and non-name inputs.
+        assert!(remove_split_tunnel_apps(&existing, &[]).is_err());
+        assert!(remove_split_tunnel_apps(&existing, &[String::new()]).is_err());
+        assert!(remove_split_tunnel_apps(&existing, &["   ".to_string()]).is_err());
+        assert!(
+            remove_split_tunnel_apps(&existing, &["discord.exe".to_string(), "  ".to_string()])
+                .is_err()
+        );
+        assert!(remove_split_tunnel_apps(&existing, &["discord\n".to_string()]).is_err());
+        assert!(remove_split_tunnel_apps(&existing, &["discord\x00.exe".to_string()]).is_err());
+        assert!(remove_split_tunnel_apps(&existing, &["..".to_string()]).is_err());
+
+        // Non-matching valid app returns unchanged list with 0 removed.
+        let (remaining, removed) =
+            remove_split_tunnel_apps(&existing, &["steam.exe".to_string()]).unwrap();
+        assert_eq!(removed, 0);
+        assert_eq!(remaining, existing);
+
+        let dir = std::env::temp_dir().join(format!(
+            "vdpi-main-split-remove-noop-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg_path = dir.join("config.toml");
+
+        // Removing from a missing explicit config with 0 matches must not create config.toml.
+        handle_split_command(
+            Some(SplitCommand::Remove {
+                apps: vec!["steam.exe".to_string()],
+            }),
+            Some(&cfg_path),
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(!cfg_path.exists());
+
+        // Existing file with sentinel comment must not be rewritten on invalid args or 0 matches.
+        std::fs::create_dir_all(&dir).unwrap();
+        let sentinel_toml =
+            "# keep-sentinel-comment\nsplit_tunnel_mode = \"exclude\"\nsplit_tunnel_apps = [\"Discord.exe\"]\n";
+        std::fs::write(&cfg_path, sentinel_toml).unwrap();
+
+        assert!(handle_split_command(
+            Some(SplitCommand::Remove {
+                apps: vec!["   ".to_string()],
+            }),
+            Some(&cfg_path),
+            None,
+            &[],
+        )
+        .is_err());
+        assert!(handle_split_command(
+            Some(SplitCommand::Remove {
+                apps: vec!["discord\n".to_string()],
+            }),
+            Some(&cfg_path),
+            None,
+            &[],
+        )
+        .is_err());
+        handle_split_command(
+            Some(SplitCommand::Remove {
+                apps: vec!["steam.exe".to_string()],
+            }),
+            Some(&cfg_path),
+            None,
+            &[],
+        )
+        .unwrap();
+        let after_noop = std::fs::read_to_string(&cfg_path).unwrap();
+        assert_eq!(after_noop, sentinel_toml);
+
+        // Matching removal updates and rewrites config.toml.
+        handle_split_command(
+            Some(SplitCommand::Remove {
+                apps: vec!["discord".to_string()],
+            }),
+            Some(&cfg_path),
+            None,
+            &[],
+        )
+        .unwrap();
+        let loaded = load_effective_split_tunnel(Some(&cfg_path), None, &[], false).unwrap();
+        assert!(loaded.apps.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn elevated_invoking_user_resolves_sudo_pkexec_and_doas() {
+        let alice = ElevatedUserInfo {
+            uid: 1000,
+            gid: 1000,
+            home_dir: PathBuf::from("/home/alice"),
+        };
+        let bob = ElevatedUserInfo {
+            uid: 1001,
+            gid: 1001,
+            home_dir: PathBuf::from("/home/bob"),
+        };
+        let by_uid = |uid: u32| match uid {
+            1000 => Some(alice.clone()),
+            1001 => Some(bob.clone()),
+            _ => None,
+        };
+        let by_name = |name: &str| match name {
+            "alice" => Some(alice.clone()),
+            "bob" => Some(bob.clone()),
+            _ => None,
+        };
+
+        // PKEXEC_UID resolves invoking user when SUDO_* is absent.
+        assert_eq!(
+            resolve_elevated_invoking_user_with(
+                None,
+                None,
+                None,
+                Some("1000"),
+                None,
+                None,
+                by_uid,
+                by_name,
+            ),
+            Some(alice.clone())
+        );
+
+        // PKEXEC_UID falls back to non-root HOME when passwd lookup misses.
+        assert_eq!(
+            resolve_elevated_invoking_user_with(
+                None,
+                None,
+                None,
+                Some("2000"),
+                None,
+                Some("/home/charlie"),
+                by_uid,
+                by_name,
+            ),
+            Some(ElevatedUserInfo {
+                uid: 2000,
+                gid: 2000,
+                home_dir: PathBuf::from("/home/charlie"),
+            })
+        );
+
+        // DOAS_USER resolves invoking user via name lookup.
+        assert_eq!(
+            resolve_elevated_invoking_user_with(
+                None,
+                None,
+                None,
+                None,
+                Some("bob"),
+                None,
+                by_uid,
+                by_name,
+            ),
+            Some(bob.clone())
+        );
+
+        // Root UID 0, "root", and invalid paths are ignored.
+        assert_eq!(
+            resolve_elevated_invoking_user_with(
+                Some("0"),
+                Some("0"),
+                Some("root"),
+                Some("0"),
+                Some("root"),
+                Some("/root"),
+                by_uid,
+                by_name,
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_elevated_invoking_user_with(
+                None,
+                None,
+                None,
+                None,
+                Some("../alice"),
+                None,
+                by_uid,
+                by_name,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn verify_no_symlink_under_home_rejects_traversal_and_symlinks() {
+        let base = std::env::temp_dir().join(format!(
+            "vdpi-main-symlink-check-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // Non-existent nested config path under home is allowed and missing dirs are collected top-down.
+        let nested_cfg = home.join(".config").join("vdpi").join("config.toml");
+        assert!(verify_no_symlink_under_home(&nested_cfg, &home).is_ok());
+        assert_eq!(
+            collect_missing_dirs_under_home(nested_cfg.parent().unwrap(), &home),
+            vec![home.join(".config"), home.join(".config").join("vdpi")]
+        );
+
+        // Parent traversal `..` under user home is rejected.
+        let traversal = home.join(".config").join("..").join("outside").join("config.toml");
+        assert!(verify_no_symlink_under_home(&traversal, &home).is_err());
+
+        // Path outside home is unaffected.
+        assert!(verify_no_symlink_under_home(&outside.join("config.toml"), &home).is_ok());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let symlink_parent = home.join(".config");
+            symlink(&outside, &symlink_parent).unwrap();
+            assert!(verify_no_symlink_under_home(&nested_cfg, &home).is_err());
+            let _ = std::fs::remove_file(&symlink_parent);
+
+            let real_dir = home.join(".config").join("vdpi");
+            std::fs::create_dir_all(&real_dir).unwrap();
+            let symlink_file = real_dir.join("config.toml");
+            symlink(outside.join("target.toml"), &symlink_file).unwrap();
+            assert!(verify_no_symlink_under_home(&symlink_file, &home).is_err());
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn foreground_proxy_spec_forwards_include_domains_and_vpn_coexistence() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use vdpi::config::VpnCoexistence;
+
+        let cfg = RuntimeConfig {
+            bypass_domains: vec!["local.example".to_string()],
+            patterns: vec!["^example\\.org\\.tr$".to_string()],
+            vpn_coexistence: VpnCoexistence::Warn,
+            socks_system_proxy: true,
+            ..RuntimeConfig::default()
+        };
+        let primary = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080);
+        let socks = Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1080));
+        let spec = ForegroundProxySpec::from_runtime_config(&cfg, primary, socks);
+        assert_eq!(
+            spec.proxy_addr,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080)
+        );
+        assert_eq!(spec.bypass_domains, vec!["local.example".to_string()]);
+        assert_eq!(spec.include_domains, vec!["^example\\.org\\.tr$".to_string()]);
+        assert_eq!(spec.vpn_coexistence, VpnCoexistence::Warn);
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let unix_spec = spec.to_unix_spec();
+            assert_eq!(unix_spec.socks_port, Some(1080));
+            assert_eq!(unix_spec.include_domains, cfg.patterns);
+            assert_eq!(unix_spec.vpn_coexistence, VpnCoexistence::Warn);
+        }
+    }
+
+    #[test]
+    fn yielded_recovery_poll_intervals_shorten_to_one_second() {
+        assert_eq!(
+            foreground_proxy_vpn_poll_interval(false),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            foreground_proxy_vpn_poll_interval(true),
+            Duration::from_secs(1)
+        );
+
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            assert_eq!(
+                desktop_tun::tun_reconcile_interval(true, false),
+                Duration::from_secs(3)
+            );
+            assert_eq!(
+                desktop_tun::tun_reconcile_interval(false, false),
+                Duration::from_secs(1)
+            );
+            assert_eq!(
+                desktop_tun::tun_reconcile_interval(true, true),
+                Duration::from_secs(1)
+            );
+            assert_eq!(
+                desktop_tun::tun_reconcile_interval(false, true),
+                Duration::from_secs(1)
+            );
+        }
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[test]
+    fn tun_offline_standby_warning_is_deduplicated_until_recovered_or_changed() {
+        let mut logged = false;
+        let win_offline = anyhow::anyhow!(
+            "no active physical network uplink detected; connect to Wi-Fi or Ethernet and retry"
+        );
+        let mac_offline = anyhow::anyhow!(
+            "no physical default IPv4 or IPv6 interface found (disconnect any active VPN holding the default route)"
+        );
+        let transient_other = anyhow::anyhow!("temporary routing table lock contention");
+
+        assert_eq!(
+            desktop_tun::classify_tun_start_error_log(&mut logged, &win_offline),
+            desktop_tun::TunStartErrorLogAction::LogOfflineStandby
+        );
+        assert!(logged);
+        assert_eq!(
+            desktop_tun::classify_tun_start_error_log(&mut logged, &win_offline),
+            desktop_tun::TunStartErrorLogAction::SuppressOfflineStandby
+        );
+        assert_eq!(
+            desktop_tun::classify_tun_start_error_log(&mut logged, &mac_offline),
+            desktop_tun::TunStartErrorLogAction::SuppressOfflineStandby
+        );
+        assert_eq!(
+            desktop_tun::classify_tun_start_error_log(&mut logged, &transient_other),
+            desktop_tun::TunStartErrorLogAction::LogRetryableError
+        );
+        assert!(!logged);
+        assert_eq!(
+            desktop_tun::classify_tun_start_error_log(&mut logged, &win_offline),
+            desktop_tun::TunStartErrorLogAction::LogOfflineStandby
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_foreground_tun_power_resume_event_filter() {
+        assert!(
+            desktop_tun::windows_power::should_trigger_power_resume_reconcile(
+                desktop_tun::windows_power::PBT_APMRESUMEAUTOMATIC
+            )
+        );
+        assert!(
+            desktop_tun::windows_power::should_trigger_power_resume_reconcile(
+                desktop_tun::windows_power::PBT_APMRESUMESUSPEND
+            )
+        );
+        assert!(!desktop_tun::windows_power::should_trigger_power_resume_reconcile(0x0000_0004));
+        assert!(!desktop_tun::windows_power::should_trigger_power_resume_reconcile(0x0000_000A));
+    }
+
+    #[test]
+    fn chown_targets_strictly_restricted_to_user_home_dir() {
+        let base = std::env::temp_dir().join(format!(
+            "vdpi-main-chown-allowlist-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let user_cfg = home.join(".config").join("vdpi").join("config.toml");
+
+        // Normal user config strictly beneath home collects ancestors (excluding home itself) and file.
+        assert!(is_safe_chown_target_under_home(&user_cfg, &home));
+        assert_eq!(
+            collect_chown_targets_under_home(&user_cfg, &[], &user_cfg, &home),
+            vec![
+                home.join(".config"),
+                home.join(".config").join("vdpi"),
+                user_cfg.clone(),
+            ]
+        );
+
+        // Paths outside user home are NEVER eligible for lchown (neither file nor parent),
+        // even if `user_cfg_path` was redirected outside home (e.g. XDG_CONFIG_HOME=/etc).
+        let outside_cfg = outside.join("vdpi").join("config.toml");
+        assert!(!is_safe_chown_target_under_home(&outside_cfg, &home));
+        assert!(collect_chown_targets_under_home(
+            &outside_cfg,
+            &[outside.join("vdpi")],
+            &outside_cfg,
+            &home
+        )
+        .is_empty());
+
+        // Parent traversal (`..`) under home is rejected for both file and created_dirs.
+        let traversal = home
+            .join(".config")
+            .join("..")
+            .join("outside")
+            .join("config.toml");
+        assert!(!is_safe_chown_target_under_home(&traversal, &home));
+        assert!(collect_chown_targets_under_home(&traversal, &[], &traversal, &home).is_empty());
+
+        // Injected outside or traversal entries in created_dirs are filtered out.
+        let custom_under_home = home.join("custom").join("vdpi.toml");
+        assert_eq!(
+            collect_chown_targets_under_home(
+                &custom_under_home,
+                &[
+                    outside.join("vdpi"),
+                    home.join("custom").join("..").join("outside"),
+                    home.join("custom"),
+                ],
+                &user_cfg,
+                &home
+            ),
+            vec![home.join("custom"), custom_under_home.clone()]
+        );
+
+        // Home directory itself (and `.` alias) or invalid home dirs are rejected.
+        assert!(!is_safe_chown_target_under_home(&home, &home));
+        assert!(!is_safe_chown_target_under_home(&home.join("."), &home));
+        assert!(!is_safe_chown_target_under_home(
+            &user_cfg,
+            Path::new("relative/home")
+        ));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let symlink_parent = home.join(".config");
+            symlink(&outside, &symlink_parent).unwrap();
+            assert!(!is_safe_chown_target_under_home(&user_cfg, &home));
+            assert!(collect_chown_targets_under_home(&user_cfg, &[], &user_cfg, &home).is_empty());
+            let _ = std::fs::remove_file(&symlink_parent);
+
+            let real_dir = home.join(".config").join("vdpi");
+            std::fs::create_dir_all(&real_dir).unwrap();
+            let symlink_file = real_dir.join("config.toml");
+            symlink(outside.join("target.toml"), &symlink_file).unwrap();
+            assert!(!is_safe_chown_target_under_home(&symlink_file, &home));
+            assert!(
+                collect_chown_targets_under_home(&symlink_file, &[], &symlink_file, &home)
+                    .is_empty()
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[tokio::test]
+    async fn foreground_tun_route_change_sync_flushes_os_dns_cache_on_ipv4_only_toggle() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let ctx = EngineContext::new(RuntimeConfig {
+            tun_ipv6: false,
+            dns_ipv4_only: true,
+            ..RuntimeConfig::default()
+        })
+        .expect("EngineContext::new should succeed for default config");
+        assert!(ctx.dns.is_ipv4_only());
+
+        // Stopped TUN slot must not mutate DNS filtering or flush OS cache.
+        let flushes = Arc::new(AtomicU32::new(0));
+        let flushes_clone = Arc::clone(&flushes);
+        let changed = desktop_tun::sync_tun_dns_ipv4_only_if_changed(
+            &ctx.dns,
+            false,
+            false,
+            true,
+            move || async move {
+                flushes_clone.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+        assert!(!changed);
+        assert!(ctx.dns.is_ipv4_only());
+        assert_eq!(flushes.load(Ordering::SeqCst), 0);
+
+        // No-op when effective ipv4_only matches current state (true -> true).
+        let flushes_clone = Arc::clone(&flushes);
+        let changed = desktop_tun::sync_tun_dns_ipv4_only_if_changed(
+            &ctx.dns,
+            true,
+            false,
+            false,
+            move || async move {
+                flushes_clone.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+        assert!(!changed);
+        assert!(ctx.dns.is_ipv4_only());
+        assert_eq!(flushes.load(Ordering::SeqCst), 0);
+
+        // Transition true -> false must flip ipv4_only BEFORE flushing OS DNS cache.
+        let flushes_clone = Arc::clone(&flushes);
+        let ipv4_only_seen_at_flush = Arc::new(AtomicBool::new(true));
+        let ipv4_only_seen_clone = Arc::clone(&ipv4_only_seen_at_flush);
+        let dns_ref = &ctx.dns;
+        let changed = desktop_tun::sync_tun_dns_ipv4_only_if_changed(
+            dns_ref,
+            true,
+            false,
+            true,
+            move || async move {
+                ipv4_only_seen_clone.store(dns_ref.is_ipv4_only(), Ordering::SeqCst);
+                flushes_clone.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+        assert!(changed);
+        assert!(!ctx.dns.is_ipv4_only());
+        assert!(!ipv4_only_seen_at_flush.load(Ordering::SeqCst));
+        assert_eq!(flushes.load(Ordering::SeqCst), 1);
+
+        // Repeated route change with unchanged IPv6 state must not re-flush.
+        let flushes_clone = Arc::clone(&flushes);
+        let changed = desktop_tun::sync_tun_dns_ipv4_only_if_changed(
+            &ctx.dns,
+            true,
+            false,
+            true,
+            move || async move {
+                flushes_clone.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+        assert!(!changed);
+        assert!(!ctx.dns.is_ipv4_only());
+        assert_eq!(flushes.load(Ordering::SeqCst), 1);
+
+        // Transition false -> true must flip back to ipv4_only=true before flushing again.
+        let flushes_clone = Arc::clone(&flushes);
+        let ipv4_only_seen_at_flush = Arc::new(AtomicBool::new(false));
+        let ipv4_only_seen_clone = Arc::clone(&ipv4_only_seen_at_flush);
+        let dns_ref = &ctx.dns;
+        let changed = desktop_tun::sync_tun_dns_ipv4_only_if_changed(
+            dns_ref,
+            true,
+            false,
+            false,
+            move || async move {
+                ipv4_only_seen_clone.store(dns_ref.is_ipv4_only(), Ordering::SeqCst);
+                flushes_clone.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+        assert!(changed);
+        assert!(ctx.dns.is_ipv4_only());
+        assert!(ipv4_only_seen_at_flush.load(Ordering::SeqCst));
+        assert_eq!(flushes.load(Ordering::SeqCst), 2);
+
+        // Explicit --ipv4-only stays true even when IPv6 TUN is active; no flush.
+        let flushes_clone = Arc::clone(&flushes);
+        let changed = desktop_tun::sync_tun_dns_ipv4_only_if_changed(
+            &ctx.dns,
+            true,
+            true,
+            true,
+            move || async move {
+                flushes_clone.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+        assert!(!changed);
+        assert!(ctx.dns.is_ipv4_only());
+        assert_eq!(flushes.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn apply_config_file_validates_regular_file_bounds_dns_split_apps_and_bypass_policy() {
+        let dir = std::env::temp_dir().join(format!(
+            "vdpi-main-apply-file-validate-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let valid_path = dir.join("valid.toml");
+        std::fs::write(
+            &valid_path,
+            r#"
+engine = "tun"
+doh = true
+dns_addr = "https://dns.nextdns.io/secret-token-123"
+bypass_domains = ["*.local"]
+include_domains = ["^discord\\.com$"]
+split_tunnel_mode = "exclude"
+split_tunnel_apps = ["discord.exe"]
+"#,
+        )
+        .unwrap();
+        let parsed = load_and_validate_apply_config_file(&valid_path).unwrap();
+        assert_eq!(parsed.schema_version, Some(CONFIG_SCHEMA_VERSION));
+        assert_eq!(parsed.engine, Some(EngineMode::Tun));
+        assert_eq!(
+            parsed.dns_addr.as_deref(),
+            Some("https://dns.nextdns.io/secret-token-123")
+        );
+        assert_eq!(parsed.split_tunnel_mode, Some(SplitTunnelMode::Exclude));
+        assert_eq!(
+            parsed.split_tunnel_apps.as_deref(),
+            Some(&["discord.exe".to_string()][..])
+        );
+
+        // Directories are rejected.
+        assert!(load_and_validate_apply_config_file(&dir).is_err());
+
+        // Oversized (> 1 MiB) files are rejected.
+        let oversized_path = dir.join("oversized.toml");
+        std::fs::write(
+            &oversized_path,
+            vec![b'#'; (MAX_APPLY_CONFIG_FILE_BYTES as usize) + 1],
+        )
+        .unwrap();
+        assert!(load_and_validate_apply_config_file(&oversized_path).is_err());
+
+        // Invalid DNS URL is rejected.
+        let bad_dns_path = dir.join("bad_dns.toml");
+        std::fs::write(&bad_dns_path, "dns_addr = \"http://insecure.example/dns\"\n").unwrap();
+        assert!(load_and_validate_apply_config_file(&bad_dns_path).is_err());
+
+        // Invalid split_tunnel_apps entry (control character) is rejected.
+        let bad_apps_path = dir.join("bad_apps.toml");
+        std::fs::write(&bad_apps_path, "split_tunnel_apps = [\"bad\\u0007app.exe\"]\n").unwrap();
+        assert!(load_and_validate_apply_config_file(&bad_apps_path).is_err());
+
+        // Invalid BypassPolicy regex is rejected.
+        let bad_regex_path = dir.join("bad_regex.toml");
+        std::fs::write(&bad_regex_path, "include_domains = [\"[unclosed\"]\n").unwrap();
+        assert!(load_and_validate_apply_config_file(&bad_regex_path).is_err());
+
+        // MAX_DOMAIN_ENTRIES (512) is enforced on both bypass_domains and include_domains.
+        let at_limit_entries: String = (0..MAX_DOMAIN_ENTRIES)
+            .map(|i| format!("\"host-{i}.example.org\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let at_limit_path = dir.join("domains_at_limit.toml");
+        std::fs::write(
+            &at_limit_path,
+            format!(
+                "bypass_domains = [{at_limit_entries}]\ninclude_domains = [{at_limit_entries}]\n"
+            ),
+        )
+        .unwrap();
+        assert!(load_and_validate_apply_config_file(&at_limit_path).is_ok());
+
+        let over_limit_entries: String = (0..=MAX_DOMAIN_ENTRIES)
+            .map(|i| format!("\"host-{i}.example.org\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let over_bypass_path = dir.join("bypass_over_limit.toml");
+        std::fs::write(
+            &over_bypass_path,
+            format!("bypass_domains = [{over_limit_entries}]\n"),
+        )
+        .unwrap();
+        assert!(load_and_validate_apply_config_file(&over_bypass_path).is_err());
+
+        let over_include_path = dir.join("include_over_limit.toml");
+        std::fs::write(
+            &over_include_path,
+            format!("include_domains = [{over_limit_entries}]\n"),
+        )
+        .unwrap();
+        assert!(load_and_validate_apply_config_file(&over_include_path).is_err());
+
+        // Parent traversal (`..`) in config file path is rejected.
+        let traversal_path = dir.join("sub").join("..").join("valid.toml");
+        assert!(load_and_validate_apply_config_file(&traversal_path).is_err());
+
+        // Ownership policy allows current UID when unprivileged, and root or invoking UID when elevated.
+        assert!(is_allowed_apply_file_owner(1000, 1000, None));
+        assert!(!is_allowed_apply_file_owner(0, 1000, None));
+        assert!(!is_allowed_apply_file_owner(2000, 1000, None));
+        assert!(is_allowed_apply_file_owner(0, 0, None));
+        assert!(!is_allowed_apply_file_owner(1000, 0, None));
+        assert!(is_allowed_apply_file_owner(0, 0, Some(1000)));
+        assert!(is_allowed_apply_file_owner(1000, 0, Some(1000)));
+        assert!(!is_allowed_apply_file_owner(2000, 0, Some(1000)));
+
+        // Symlinks (leaf and ancestor directories) are rejected.
+        #[cfg(unix)]
+        {
+            let link_path = dir.join("link.toml");
+            std::os::unix::fs::symlink(&valid_path, &link_path).unwrap();
+            assert!(load_and_validate_apply_config_file(&link_path).is_err());
+
+            let real_sub = dir.join("real_sub");
+            std::fs::create_dir_all(&real_sub).unwrap();
+            std::fs::write(real_sub.join("nested.toml"), "doh = true\n").unwrap();
+            let linked_dir = dir.join("linked_sub");
+            std::os::unix::fs::symlink(&real_sub, &linked_dir).unwrap();
+            assert!(load_and_validate_apply_config_file(&linked_dir.join("nested.toml")).is_err());
+        }
+        #[cfg(windows)]
+        {
+            let link_path = dir.join("link.toml");
+            if std::os::windows::fs::symlink_file(&valid_path, &link_path).is_ok() {
+                assert!(load_and_validate_apply_config_file(&link_path).is_err());
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_config_file_selects_target_saves_atomically_and_restarts_only_when_running() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = std::env::temp_dir().join(format!(
+            "vdpi-main-apply-file-target-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let staged = dir.join("staged.toml");
+        let sys_cfg = dir.join("system").join("config.toml");
+        let user_cfg = dir.join("user").join("config.toml");
+        let other_cfg = dir.join("other").join("custom.toml");
+        std::fs::write(
+            &staged,
+            "engine = \"tun\"\ndns_addr = \"https://dns.nextdns.io/private-profile\"\n",
+        )
+        .unwrap();
+
+        // System service running + elevated + --restart => writes system_path and restarts.
+        let restarts = AtomicUsize::new(0);
+        let (target, restarted) = apply_config_file_with(
+            &staged,
+            true,
+            None,
+            false,
+            ServiceState::Running,
+            true,
+            true,
+            &sys_cfg,
+            &user_cfg,
+            save_file_config_atomic,
+            || {
+                restarts.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(target, sys_cfg);
+        assert!(restarted);
+        assert_eq!(restarts.load(Ordering::SeqCst), 1);
+        let (_, loaded_sys) = load_file_config(Some(&sys_cfg), true).unwrap();
+        assert_eq!(
+            loaded_sys.dns_addr.as_deref(),
+            Some("https://dns.nextdns.io/private-profile")
+        );
+
+        // System service installed + not elevated => rejected before saving or restarting.
+        let blocked = apply_config_file_with(
+            &staged,
+            true,
+            None,
+            false,
+            ServiceState::Running,
+            true,
+            false,
+            &sys_cfg,
+            &user_cfg,
+            |_, _| panic!("save_fn must not run when elevation is required"),
+            || panic!("restart_fn must not run when elevation is required"),
+        );
+        assert!(blocked.is_err());
+
+        // Not installed + --restart => writes user_path and does not restart.
+        let (target, restarted) = apply_config_file_with(
+            &staged,
+            true,
+            None,
+            false,
+            ServiceState::NotInstalled,
+            false,
+            false,
+            &sys_cfg,
+            &user_cfg,
+            save_file_config_atomic,
+            || panic!("restart_fn must not run when service is not running"),
+        )
+        .unwrap();
+        assert_eq!(target, user_cfg);
+        assert!(!restarted);
+        assert!(user_cfg.is_file());
+
+        // User-level service running + restart=false => writes user_path without restarting.
+        let (target, restarted) = apply_config_file_with(
+            &staged,
+            false,
+            None,
+            false,
+            ServiceState::Running,
+            false,
+            false,
+            &sys_cfg,
+            &user_cfg,
+            save_file_config_atomic,
+            || panic!("restart_fn must not run when restart=false"),
+        )
+        .unwrap();
+        assert_eq!(target, user_cfg);
+        assert!(!restarted);
+
+        // User-level service running + restart=true => writes user_path and restarts.
+        let user_restarts = AtomicUsize::new(0);
+        let (target, restarted) = apply_config_file_with(
+            &staged,
+            true,
+            None,
+            false,
+            ServiceState::Running,
+            false,
+            false,
+            &sys_cfg,
+            &user_cfg,
+            save_file_config_atomic,
+            || {
+                user_restarts.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(target, user_cfg);
+        assert!(restarted);
+        assert_eq!(user_restarts.load(Ordering::SeqCst), 1);
+
+        // Explicit unrelated --config path does not restart the OS service.
+        let (target, restarted) = apply_config_file_with(
+            &staged,
+            true,
+            Some(&other_cfg),
+            false,
+            ServiceState::Running,
+            true,
+            true,
+            &sys_cfg,
+            &user_cfg,
+            save_file_config_atomic,
+            || panic!("restart_fn must not run for unrelated explicit --config path"),
+        )
+        .unwrap();
+        assert_eq!(target, other_cfg);
+        assert!(!restarted);
+        assert!(other_cfg.is_file());
+
+        // Save succeeds but restart fails => tagged ApplyFileRestartError (exit code 2 in main).
+        let restart_fail_cfg = dir.join("restart_fail").join("config.toml");
+        let restart_err = apply_config_file_with(
+            &staged,
+            true,
+            None,
+            false,
+            ServiceState::Running,
+            true,
+            true,
+            &restart_fail_cfg,
+            &user_cfg,
+            save_file_config_atomic,
+            || anyhow::bail!("simulated service restart failure"),
+        )
+        .unwrap_err();
+        assert!(restart_fail_cfg.is_file());
+        let tagged = restart_err
+            .downcast_ref::<ApplyFileRestartError>()
+            .expect("restart failure after save must be tagged with ApplyFileRestartError");
+        assert_eq!(tagged.target, restart_fail_cfg);
+        assert_eq!(EXIT_CODE_APPLY_RESTART_FAILED, 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

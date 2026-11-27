@@ -6,6 +6,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-27
+
+### Added
+- **Native cross-platform Desktop GUI (`vdpi Desktop`) for Windows, macOS, and Linux**:
+  - Built with Tauri v2 + React 19 with a clean Light/Dark/System aesthetic (no neon glows or clutter), Overview live status & throughput chart, visual Split Tunneling with search, one-click app/game presets, companion process inspection, and custom app picker, DNS & Rules editor with custom DoH token redaction, built-in read-only Diagnostics with redacted report copy, and Settings.
+  - Optional system tray / menu bar behavior (`Keep in system tray when closed`, `Minimize to tray`, `Start minimized to tray`, and `Show taskbar/Dock icon when minimized`) — stays out of the tray/taskbar completely when disabled.
+  - Bundled `vdpi` CLI sidecar with OS-native privilege prompts (`ShellExecuteExW` UAC on Windows, `osascript` on macOS, `pkexec` with AppImage FUSE staging on Linux) and argv-free owner-only atomic config handoff (`vdpi config apply-file`).
+  - Added Desktop release artifacts for Windows (NSIS installer & portable zip with loose WHQL-signed `wintun.dll`), macOS universal `.dmg` (`arm64` + `x86_64`), and Linux `.deb` + `.AppImage`.
+
+### Changed
+- **Hardened core engine, service control, split tunneling, and mobile apps**:
+  - Added wildcard (`*.example.org`, `.example.org`) and anchored plain-domain translation for `include_domains` while preserving raw regex compatibility.
+  - Hardened service installation, config persistence, DNS/DoH redaction, Windows `ProgramData` ACLs & symlink/reparse checks, macOS LaunchDaemon/pf & Linux systemd/ostree/Wayland compatibility, and Android/iOS TUN parity.
+  - Guarded Windows console pause prompts so hidden elevated sidecar runs never stall waiting for input.
+
 ## [0.5.8] - 2026-11-27
 
 ### Added
@@ -193,7 +208,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Configured `CODE_SIGN_ENTITLEMENTS` in iOS `project.yml` so XcodeGen preserves `.entitlements` files.
 - Fixed release workflow entitlement verification and restricted automatic release runs to version tags and manual dispatch.
 
-[Unreleased]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.8...HEAD
+[Unreleased]: https://github.com/Vuln-Inc/vdpi/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.8...v0.6.0
 [0.5.8]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.7...v0.5.8
 [0.5.7]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.6...v0.5.7
 [0.5.6]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.5...v0.5.6

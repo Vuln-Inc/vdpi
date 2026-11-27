@@ -11,7 +11,7 @@ This guide covers the Rust workspace layout and build steps for Desktop (Windows
 | Path | Crate / Target | Role |
 | :--- | :--- | :--- |
 | `core/engine` | `vdpi-core` | Pure-Rust anti-DPI core: 7-stage adaptive TLS desync engine, RFC 8484 DoH DNS ring, bypass policy, socket binder, and shared `RuntimeConfig`. |
-| `core/tun` | `vdpi-tun` | Shared pure-Rust userspace TUN stack (`netstack-smoltcp`, `etherparse`, packet pipeline, Cone-NAT UDP relay, TUN diagnostics `doctor`) used by Desktop TUN, Android, and iOS. |
+| `core/tun` | `vdpi-tun` | Shared pure-Rust userspace TUN stack (in-tree `smoltcp` 0.14, `etherparse`, packet pipeline, Cone-NAT UDP relay, TUN diagnostics `doctor`) used by Desktop TUN, Android, and iOS. |
 | `core` | `vdpi` | Desktop binary and library: HTTP/HTTPS `CONNECT` + SOCKS5/4a proxy, desktop TUN driver integration, OS background service installer/control, `ratatui` Control Center and live dashboard, and SHA-256 self-updater. |
 | `android/native` | `vdpi-android` | Rust JNI + `OwnedFd` bridge (`cdylib` + `rlib`) wrapping `vdpi-core` and `vdpi-tun` for the Android app (`android/app`). |
 | `ios/native` | `vdpi-ios` | Rust C-ABI static library (`staticlib` + `rlib`) wrapping `vdpi-core` and `vdpi-tun`, packaged into `VdpiCore.xcframework` for `ios/VdpiApp` and `ios/PacketTunnel`. |
@@ -68,7 +68,7 @@ Optional lint and live DNS checks:
 cargo clippy --workspace --locked --all-targets -- -D warnings
 
 # Optional live public DoH smoke test (default test suite runs offline against local sockets)
-cargo test --locked resolves_discord_and_roblox_via_live_doh -- --ignored
+cargo test -p vdpi-core --locked resolves_discord_and_roblox_via_live_doh -- --ignored
 ```
 
 > Runtime note: The desktop proxy allows up to 256 concurrent client sessions across both listeners (with a 15-second negotiation timeout for incomplete HTTP/SOCKS handshakes).
@@ -226,9 +226,9 @@ To reproduce the release `vdpi-ios-unsigned.ipa` locally after running `xcodebui
 APP_PATH="build/Build/Products/Release-iphoneos/VdpiApp.app"
 APPEX_PATH="$APP_PATH/PlugIns/VdpiPacketTunnel.appex"
 
-# Embed ad-hoc arm64 entitlements (preserved by TrollStore; replaced cleanly by re-signers)
-ldid -SPacketTunnel/PacketTunnel.entitlements "$APPEX_PATH/VdpiPacketTunnel"
-ldid -SVdpiApp/VdpiApp.entitlements "$APP_PATH/VdpiApp"
+# Embed ad-hoc arm64 entitlements and signing identifiers (preserved by TrollStore; replaced cleanly by re-signers)
+ldid -Icom.vulninc.vdpi.packet-tunnel -SPacketTunnel/PacketTunnel.entitlements "$APPEX_PATH/VdpiPacketTunnel"
+ldid -Icom.vulninc.vdpi -SVdpiApp/VdpiApp.entitlements "$APP_PATH/VdpiApp"
 
 mkdir -p ipa-stage/Payload
 cp -R "$APP_PATH" ipa-stage/Payload/VdpiApp.app

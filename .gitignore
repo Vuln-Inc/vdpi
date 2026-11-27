@@ -30,3 +30,11 @@ ios/Frameworks/
 *.xcuserstate
 *.dSYM
 DerivedData/
+
+# Desktop GUI build outputs
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+desktop/src-tauri/binaries/
+desktop/src-tauri/resources/
+desktop/ui/node_modules/
+desktop/ui/dist/

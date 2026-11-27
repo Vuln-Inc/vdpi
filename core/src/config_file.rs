@@ -239,12 +239,93 @@ fn is_unix_abs(v: &OsStr) -> bool {
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn windows_system_config_path(program_data: Option<&OsStr>) -> PathBuf {
+fn windows_programdata_vdpi_dir(program_data: Option<&OsStr>) -> PathBuf {
     let base = program_data
         .filter(|v| is_windows_abs(v))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-    base.join("vdpi").join("config.toml")
+    base.join("vdpi")
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_system_config_path(program_data: Option<&OsStr>) -> PathBuf {
+    windows_programdata_vdpi_dir(program_data).join("config.toml")
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn split_windows_root(s: &str) -> (String, &str) {
+    if let Some(unc) = s.strip_prefix(r"\\") {
+        return (r"\\".to_string(), unc);
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        let drive = (bytes[0] as char).to_ascii_lowercase();
+        if bytes.get(2) == Some(&b'\\') {
+            return (format!("{drive}:\\"), &s[3..]);
+        }
+        return (format!("{drive}:"), &s[2..]);
+    }
+    (String::new(), s)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn normalize_windows_path_for_compare(path: &Path) -> String {
+    let replaced = path.to_string_lossy().replace('/', "\\");
+    let (prefix, rest) = if replaced.len() >= 8
+        && replaced.as_bytes()[..8].eq_ignore_ascii_case(br"\\?\UNC\")
+    {
+        (r"\\".to_string(), &replaced[8..])
+    } else if let Some(verbatim_tail) = replaced.strip_prefix(r"\\?\") {
+        split_windows_root(verbatim_tail)
+    } else {
+        split_windows_root(&replaced)
+    };
+
+    let mut parts: Vec<String> = Vec::new();
+    let is_rooted = !prefix.is_empty();
+    for seg in rest.split('\\') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            if parts.last().is_some_and(|p| p != "..") {
+                parts.pop();
+            } else if !is_rooted {
+                parts.push("..".to_string());
+            }
+        } else {
+            parts.push(seg.to_ascii_lowercase());
+        }
+    }
+
+    if parts.is_empty() {
+        prefix
+    } else if prefix.is_empty() || prefix.ends_with('\\') {
+        format!("{prefix}{}", parts.join("\\"))
+    } else {
+        format!("{prefix}\\{}", parts.join("\\"))
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_programdata_target_dir(path: &Path, program_data: Option<&OsStr>) -> Option<PathBuf> {
+    let vdpi_dir = windows_programdata_vdpi_dir(program_data);
+    let norm_vdpi = normalize_windows_path_for_compare(&vdpi_dir);
+    let norm_path = normalize_windows_path_for_compare(path);
+    let norm_parent = norm_path.rsplit_once('\\').map(|(p, _)| p).unwrap_or("");
+
+    let matches_dir = |candidate: &str| {
+        candidate == norm_vdpi
+            || candidate
+                .strip_prefix(&norm_vdpi)
+                .is_some_and(|tail| tail.starts_with('\\'))
+    };
+
+    if matches_dir(norm_parent) || norm_path == norm_vdpi {
+        Some(vdpi_dir)
+    } else {
+        None
+    }
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -395,11 +476,43 @@ fn read_bounded_config_file(path: &Path) -> Result<Option<String>> {
 /// calls `sync_all()`, and atomically replaces the target via
 /// `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`
 /// on Windows or `fs::rename` on Unix.
+///
+/// On Windows, when targeting `%ProgramData%\vdpi`, NTFS reparse points
+/// (`FILE_ATTRIBUTE_REPARSE_POINT`) on the parent directory or target file are
+/// rejected and `%ProgramData%\vdpi` (plus any pre-existing `config.toml`) is
+/// hardened with owner `BUILTIN\Administrators` (`O:BA`) and a protected DACL
+/// (`SYSTEM` and `Administrators` full control, `Users` read-only) via handles
+/// opened with `FILE_FLAG_OPEN_REPARSE_POINT`.
 pub fn save_file_config_atomic(path: &Path, cfg: &FileConfig) -> Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+
+    #[cfg(windows)]
+    let programdata_vdpi_dir = {
+        let abs_for_check;
+        let check_path = if path.is_absolute() {
+            path
+        } else if let Ok(cwd) = std::env::current_dir() {
+            abs_for_check = cwd.join(path);
+            &abs_for_check
+        } else {
+            path
+        };
+        windows_programdata_target_dir(check_path, std::env::var_os("ProgramData").as_deref())
+    };
+
+    #[cfg(windows)]
+    if let Some(ref vdpi_dir) = programdata_vdpi_dir {
+        windows_fs::ensure_safe_programdata_chain(vdpi_dir, parent)?;
+        windows_fs::reject_reparse_point_or_dir(path)?;
+    } else {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create config directory {}", parent.display()))?;
+    }
+
+    #[cfg(not(windows))]
     fs::create_dir_all(parent)
         .with_context(|| format!("failed to create config directory {}", parent.display()))?;
 
@@ -415,11 +528,14 @@ pub fn save_file_config_atomic(path: &Path, cfg: &FileConfig) -> Result<()> {
     for _ in 0..16 {
         let seq = ATOMIC_SAVE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let candidate = parent.join(format!(".{file_name}.tmp.{pid}.{seq}"));
-        match OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&candidate)
+        let mut open_opts = OpenOptions::new();
+        open_opts.create_new(true).write(true);
+        #[cfg(windows)]
         {
+            use std::os::windows::fs::OpenOptionsExt;
+            open_opts.custom_flags(windows_fs::FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        match open_opts.open(&candidate) {
             Ok(file) => {
                 created = Some((candidate, file));
                 break;
@@ -439,6 +555,15 @@ pub fn save_file_config_atomic(path: &Path, cfg: &FileConfig) -> Result<()> {
         )
     })?;
 
+    #[cfg(windows)]
+    if programdata_vdpi_dir.is_some() {
+        if let Err(err) = windows_fs::verify_opened_regular_file(&file, &tmp_path) {
+            drop(file);
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err);
+        }
+    }
+
     let write_res = (|| -> Result<()> {
         file.write_all(rendered.as_bytes())
             .with_context(|| format!("failed to write temporary file {}", tmp_path.display()))?;
@@ -451,6 +576,17 @@ pub fn save_file_config_atomic(path: &Path, cfg: &FileConfig) -> Result<()> {
     if let Err(err) = write_res {
         let _ = fs::remove_file(&tmp_path);
         return Err(err);
+    }
+
+    #[cfg(windows)]
+    if let Some(ref vdpi_dir) = programdata_vdpi_dir {
+        if let Err(err) = windows_fs::reject_reparse_point(vdpi_dir)
+            .and_then(|()| windows_fs::reject_reparse_point(parent))
+            .and_then(|()| windows_fs::reject_reparse_point_or_dir(path))
+        {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err);
+        }
     }
 
     if let Err(err) = atomic_replace(&tmp_path, path) {
@@ -468,11 +604,665 @@ pub fn save_file_config_atomic(path: &Path, cfg: &FileConfig) -> Result<()> {
 }
 
 #[cfg(windows)]
+mod windows_fs {
+    use super::normalize_windows_path_for_compare;
+    use anyhow::{bail, Context, Result};
+    use std::ffi::c_void;
+    use std::fs::{self, File};
+    use std::io::ErrorKind;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::MetadataExt;
+    use std::path::Path;
+    use tracing::warn;
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE};
+
+    pub(super) const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+    pub(super) const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    pub(super) const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    pub(super) const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+    const READ_CONTROL: u32 = 0x0002_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+    const WRITE_OWNER: u32 = 0x0008_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    const OPEN_EXISTING: u32 = 3;
+
+    const ERROR_SUCCESS: u32 = 0;
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+    const ERROR_PATH_NOT_FOUND: i32 = 3;
+    pub(super) const ERROR_ACCESS_DENIED: u32 = 5;
+    const ERROR_ALREADY_EXISTS: i32 = 183;
+    pub(super) const ERROR_INVALID_OWNER: u32 = 1307;
+    pub(super) const ERROR_PRIVILEGE_NOT_HELD: u32 = 1314;
+
+    const SDDL_REVISION_1: u32 = 1;
+    const SE_FILE_OBJECT: u32 = 1;
+    const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
+    const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+    const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
+
+    /// Hardened security descriptor for `%ProgramData%\vdpi`:
+    /// - `O:BA`: sets NTFS owner to `BUILTIN\Administrators` so a standard user who pre-created
+    ///   `%ProgramData%\vdpi` cannot retain implicit owner `WRITE_DAC` rights
+    /// - `D:P`: blocks inherited `ProgramData` ACEs that otherwise allow standard users to create files/junctions
+    /// - `SY` (`NT AUTHORITY\SYSTEM`): Full Control (`FA`), inherited by child dirs/files (`OICI`)
+    /// - `BA` (`BUILTIN\Administrators`): Full Control (`FA`), inherited by child dirs/files (`OICI`)
+    /// - `BU` (`BUILTIN\Users`): Read & Execute / traverse (`FRFX`), inherited by child dirs/files (`OICI`)
+    pub(super) const PROGRAMDATA_DIR_SDDL: &str =
+        "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FRFX;;;BU)";
+
+    /// Hardened security descriptor for an existing `config.toml` child file inside `%ProgramData%\vdpi`:
+    /// - `O:BA`: transfers NTFS owner to `BUILTIN\Administrators`
+    /// - `D:P`: blocks inherited ACEs and grants `SYSTEM`/`Administrators` Full Control and `Users` Read & Execute
+    pub(super) const PROGRAMDATA_FILE_SDDL: &str =
+        "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;BU)";
+
+    #[repr(C)]
+    struct SecurityAttributes {
+        n_length: u32,
+        lp_security_descriptor: *mut c_void,
+        b_inherit_handle: i32,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct ByHandleFileInformation {
+        dw_file_attributes: u32,
+        ft_creation_time: FILETIME,
+        ft_last_access_time: FILETIME,
+        ft_last_write_time: FILETIME,
+        dw_volume_serial_number: u32,
+        n_file_size_high: u32,
+        n_file_size_low: u32,
+        n_number_of_links: u32,
+        n_file_index_high: u32,
+        n_file_index_low: u32,
+    }
+
+    struct HandleGuard(HANDLE);
+
+    impl Drop for HandleGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+                // SAFETY: `self.0` is an owned Win32 kernel handle returned by `CreateFileW`.
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    struct LocalAllocGuard(*mut c_void);
+
+    impl Drop for LocalAllocGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` was allocated by `ConvertStringSecurityDescriptorToSecurityDescriptorW`.
+                unsafe {
+                    let _ = LocalFree(self.0);
+                }
+            }
+        }
+    }
+
+    pub(super) struct ParsedHardenedSd {
+        sd: LocalAllocGuard,
+        owner: *mut c_void,
+        dacl: *mut c_void,
+    }
+
+    impl ParsedHardenedSd {
+        pub(super) fn from_sddl(sddl: &str) -> Result<Self> {
+            let sddl_w: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut sd: *mut c_void = std::ptr::null_mut();
+            let mut sd_size: u32 = 0;
+            // SAFETY: `sddl_w` is NUL-terminated UTF-16; `sd` and `sd_size` are valid out-pointers.
+            let ok = unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl_w.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut sd,
+                    &mut sd_size,
+                )
+            };
+            if ok == 0 || sd.is_null() {
+                let err = std::io::Error::last_os_error();
+                return Err(err)
+                    .context("ConvertStringSecurityDescriptorToSecurityDescriptorW failed");
+            }
+            let guard = LocalAllocGuard(sd);
+
+            let mut owner: *mut c_void = std::ptr::null_mut();
+            let mut owner_defaulted: i32 = 0;
+            // SAFETY: `guard.0` is a valid security descriptor allocated above.
+            let owner_ok = unsafe {
+                GetSecurityDescriptorOwner(guard.0, &mut owner, &mut owner_defaulted)
+            };
+            if owner_ok == 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(err)
+                    .context("GetSecurityDescriptorOwner failed to extract hardened owner SID");
+            }
+            if owner.is_null() {
+                bail!("security descriptor parsed from SDDL is missing an explicit owner SID");
+            }
+
+            let mut dacl_present: i32 = 0;
+            let mut dacl_defaulted: i32 = 0;
+            let mut dacl: *mut c_void = std::ptr::null_mut();
+            // SAFETY: `guard.0` is a valid security descriptor allocated above.
+            let dacl_ok = unsafe {
+                GetSecurityDescriptorDacl(
+                    guard.0,
+                    &mut dacl_present,
+                    &mut dacl,
+                    &mut dacl_defaulted,
+                )
+            };
+            if dacl_ok == 0 || dacl_present == 0 || dacl.is_null() {
+                let err = std::io::Error::last_os_error();
+                return Err(err)
+                    .context("GetSecurityDescriptorDacl failed to extract hardened DACL");
+            }
+
+            Ok(Self {
+                sd: guard,
+                owner,
+                dacl,
+            })
+        }
+
+        fn as_sd_ptr(&self) -> *mut c_void {
+            self.sd.0
+        }
+
+        pub(super) fn as_owner_ptr(&self) -> *mut c_void {
+            self.owner
+        }
+
+        pub(super) fn as_dacl_ptr(&self) -> *mut c_void {
+            self.dacl
+        }
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileAttributesW(lp_file_name: *const u16) -> u32;
+        fn CreateDirectoryW(
+            lp_path_name: *const u16,
+            lp_security_attributes: *mut c_void,
+        ) -> i32;
+        fn CreateFileW(
+            lp_file_name: *const u16,
+            dw_desired_access: u32,
+            dw_share_mode: u32,
+            lp_security_attributes: *mut c_void,
+            dw_creation_disposition: u32,
+            dw_flags_and_attributes: u32,
+            h_template_file: HANDLE,
+        ) -> HANDLE;
+        fn GetFileInformationByHandle(
+            h_file: HANDLE,
+            lp_file_information: *mut ByHandleFileInformation,
+        ) -> i32;
+        fn LocalFree(h_mem: *mut c_void) -> *mut c_void;
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            string_security_descriptor: *const u16,
+            string_sd_revision: u32,
+            security_descriptor: *mut *mut c_void,
+            security_descriptor_size: *mut u32,
+        ) -> i32;
+        fn GetSecurityDescriptorOwner(
+            p_security_descriptor: *mut c_void,
+            p_owner: *mut *mut c_void,
+            lpb_owner_defaulted: *mut i32,
+        ) -> i32;
+        fn GetSecurityDescriptorDacl(
+            p_security_descriptor: *mut c_void,
+            lpb_dacl_present: *mut i32,
+            p_dacl: *mut *mut c_void,
+            lpb_dacl_defaulted: *mut i32,
+        ) -> i32;
+        fn SetSecurityInfo(
+            handle: HANDLE,
+            object_type: u32,
+            security_info: u32,
+            psid_owner: *mut c_void,
+            psid_group: *mut c_void,
+            p_dacl: *mut c_void,
+            p_sacl: *mut c_void,
+        ) -> u32;
+    }
+
+    fn encode_wide_nul(path: &Path) -> Vec<u16> {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    pub(super) fn is_reparse_point_attrs(attrs: u32) -> bool {
+        attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+    }
+
+    fn is_owner_privilege_error(code: u32) -> bool {
+        matches!(
+            code,
+            ERROR_PRIVILEGE_NOT_HELD | ERROR_ACCESS_DENIED | ERROR_INVALID_OWNER
+        )
+    }
+
+    pub(super) fn should_fallback_to_dacl_only(is_elevated: bool, code: u32) -> bool {
+        !is_elevated && is_owner_privilege_error(code)
+    }
+
+    fn is_not_found_os_error(err: &std::io::Error) -> bool {
+        matches!(
+            err.raw_os_error(),
+            Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND)
+        ) || err.kind() == ErrorKind::NotFound
+    }
+
+    fn path_attributes_no_follow(path: &Path) -> std::io::Result<Option<u32>> {
+        let wide = encode_wide_nul(path);
+        // SAFETY: `wide` is valid NUL-terminated UTF-16 for the synchronous `GetFileAttributesW` call.
+        let attrs = unsafe { GetFileAttributesW(wide.as_ptr()) };
+        if attrs != INVALID_FILE_ATTRIBUTES {
+            return Ok(Some(attrs));
+        }
+        let err = std::io::Error::last_os_error();
+        if is_not_found_os_error(&err) {
+            return Ok(None);
+        }
+        Err(err)
+    }
+
+    pub(super) fn reject_reparse_point(path: &Path) -> Result<()> {
+        if let Some(attrs) = path_attributes_no_follow(path)
+            .with_context(|| format!("failed to inspect attributes for {}", path.display()))?
+        {
+            if is_reparse_point_attrs(attrs) {
+                bail!("refusing to access NTFS reparse point: {}", path.display());
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn reject_reparse_point_or_dir(path: &Path) -> Result<()> {
+        if let Some(attrs) = path_attributes_no_follow(path)
+            .with_context(|| format!("failed to inspect attributes for {}", path.display()))?
+        {
+            if is_reparse_point_attrs(attrs) {
+                bail!("refusing to access NTFS reparse point: {}", path.display());
+            }
+            if (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0 {
+                bail!(
+                    "refusing to treat directory as config file: {}",
+                    path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn verify_opened_regular_file(file: &File, path: &Path) -> Result<()> {
+        let meta = file
+            .metadata()
+            .with_context(|| format!("failed to inspect metadata for {}", path.display()))?;
+        if is_reparse_point_attrs(meta.file_attributes()) || !meta.is_file() {
+            bail!(
+                "refusing to write config file: opened handle is a reparse point or non-file: {}",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
+    fn create_dir_with_hardened_dacl(dir: &Path) -> Result<()> {
+        if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if !parent.exists() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("failed to create ancestor directory {}", parent.display())
+                })?;
+            }
+        }
+
+        let parsed_sd = ParsedHardenedSd::from_sddl(PROGRAMDATA_DIR_SDDL)?;
+        let mut sa = SecurityAttributes {
+            n_length: std::mem::size_of::<SecurityAttributes>() as u32,
+            lp_security_descriptor: parsed_sd.as_sd_ptr(),
+            b_inherit_handle: 0,
+        };
+        let dir_w = encode_wide_nul(dir);
+        // SAFETY: `dir_w` is NUL-terminated UTF-16 and `sa` borrows `parsed_sd` for the
+        // synchronous `CreateDirectoryW` call.
+        let ok = unsafe {
+            CreateDirectoryW(dir_w.as_ptr(), (&mut sa as *mut SecurityAttributes).cast())
+        };
+        if ok != 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(ERROR_ALREADY_EXISTS) {
+            return Ok(());
+        }
+        Err(err).with_context(|| format!("failed to create hardened directory {}", dir.display()))
+    }
+
+    /// Opens an existing directory or file handle without following reparse points so
+    /// `GetFileInformationByHandle` and `SetSecurityInfo` target the exact same kernel object
+    /// (no TOCTOU).
+    ///
+    /// Requests `WRITE_OWNER` alongside `WRITE_DAC` so NTFS ownership can be transferred to
+    /// `BUILTIN\Administrators`. Only when running non-elevated (e.g. non-admin unit tests) and
+    /// `WRITE_OWNER` fails with an ownership privilege error does it fall back to opening with
+    /// `WRITE_DAC` only; when elevated / LocalSystem, failure fails closed.
+    fn open_handle_for_hardening(path: &Path) -> std::io::Result<(HandleGuard, bool)> {
+        let path_w = encode_wide_nul(path);
+        let share_mode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+        let flags = FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT;
+        let full_access = FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC | WRITE_OWNER;
+
+        // SAFETY: `path_w` is valid NUL-terminated UTF-16; returned handle is owned by `HandleGuard`.
+        let raw_handle = unsafe {
+            CreateFileW(
+                path_w.as_ptr(),
+                full_access,
+                share_mode,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                flags,
+                std::ptr::null_mut(),
+            )
+        };
+        if !raw_handle.is_null() && raw_handle != INVALID_HANDLE_VALUE {
+            return Ok((HandleGuard(raw_handle), true));
+        }
+
+        let err = std::io::Error::last_os_error();
+        let allow_dacl_only_fallback = match err.raw_os_error() {
+            Some(code) if code >= 0 && is_owner_privilege_error(code as u32) => {
+                should_fallback_to_dacl_only(
+                    crate::platform::windows_service::is_elevated(),
+                    code as u32,
+                )
+            }
+            _ => false,
+        };
+        if !allow_dacl_only_fallback {
+            return Err(err);
+        }
+
+        warn!(
+            path = %path.display(),
+            error = %err,
+            "non-elevated process denied WRITE_OWNER when opening handle for hardening; retrying with DACL-only access"
+        );
+        let dacl_only_access = FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC;
+        // SAFETY: `path_w` is valid NUL-terminated UTF-16; returned handle is owned by `HandleGuard`.
+        let fallback_handle = unsafe {
+            CreateFileW(
+                path_w.as_ptr(),
+                dacl_only_access,
+                share_mode,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                flags,
+                std::ptr::null_mut(),
+            )
+        };
+        if !fallback_handle.is_null() && fallback_handle != INVALID_HANDLE_VALUE {
+            return Ok((HandleGuard(fallback_handle), false));
+        }
+        Err(std::io::Error::last_os_error())
+    }
+
+    fn apply_hardened_sd_to_handle(
+        handle: HANDLE,
+        path: &Path,
+        parsed_sd: &ParsedHardenedSd,
+        can_write_owner: bool,
+    ) -> Result<()> {
+        if can_write_owner {
+            // SAFETY: `handle` is a valid open kernel handle and `parsed_sd` keeps both
+            // the owner SID and DACL pointers alive for the synchronous `SetSecurityInfo` call.
+            let status = unsafe {
+                SetSecurityInfo(
+                    handle,
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION
+                        | DACL_SECURITY_INFORMATION
+                        | PROTECTED_DACL_SECURITY_INFORMATION,
+                    parsed_sd.as_owner_ptr(),
+                    std::ptr::null_mut(),
+                    parsed_sd.as_dacl_ptr(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if status == ERROR_SUCCESS {
+                return Ok(());
+            }
+            let allow_dacl_only_fallback = is_owner_privilege_error(status)
+                && should_fallback_to_dacl_only(
+                    crate::platform::windows_service::is_elevated(),
+                    status,
+                );
+            if !allow_dacl_only_fallback {
+                return Err(std::io::Error::from_raw_os_error(status as i32)).with_context(|| {
+                    format!(
+                        "SetSecurityInfo failed to harden owner and DACL on {}",
+                        path.display()
+                    )
+                });
+            }
+            warn!(
+                path = %path.display(),
+                win32_error = status,
+                "non-elevated process could not transfer NTFS owner to BUILTIN\\Administrators; falling back to DACL-only hardening"
+            );
+        } else if crate::platform::windows_service::is_elevated() {
+            bail!(
+                "refusing DACL-only hardening on {} while elevated without WRITE_OWNER handle access",
+                path.display()
+            );
+        }
+
+        // SAFETY: `handle` is a valid open kernel handle and `parsed_sd` keeps the DACL
+        // pointer alive for the synchronous `SetSecurityInfo` call.
+        let status = unsafe {
+            SetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                parsed_sd.as_dacl_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(std::io::Error::from_raw_os_error(status as i32)).with_context(|| {
+                format!("SetSecurityInfo failed to harden DACL on {}", path.display())
+            });
+        }
+        Ok(())
+    }
+
+    fn harden_existing_config_child(config_path: &Path) -> Result<()> {
+        let (guard, can_write_owner) = match open_handle_for_hardening(config_path) {
+            Ok(opened) => opened,
+            Err(err) if is_not_found_os_error(&err) => return Ok(()),
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to open existing config file {} for security hardening",
+                        config_path.display()
+                    )
+                });
+            }
+        };
+
+        // SAFETY: `info` is a plain C struct initialized before calling `GetFileInformationByHandle`.
+        let mut info: ByHandleFileInformation = unsafe { std::mem::zeroed() };
+        let info_ok = unsafe { GetFileInformationByHandle(guard.0, &mut info) };
+        if info_ok == 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(err).with_context(|| {
+                format!(
+                    "GetFileInformationByHandle failed for config file {}",
+                    config_path.display()
+                )
+            });
+        }
+        if is_reparse_point_attrs(info.dw_file_attributes) {
+            bail!(
+                "refusing to harden NTFS reparse point config file: {}",
+                config_path.display()
+            );
+        }
+        if (info.dw_file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 {
+            bail!(
+                "refusing to harden directory masquerading as config file: {}",
+                config_path.display()
+            );
+        }
+
+        let parsed_file_sd = ParsedHardenedSd::from_sddl(PROGRAMDATA_FILE_SDDL)?;
+        apply_hardened_sd_to_handle(guard.0, config_path, &parsed_file_sd, can_write_owner)
+    }
+
+    pub(super) fn apply_hardened_dir_dacl(dir: &Path) -> Result<()> {
+        reject_reparse_point(dir)?;
+
+        let parsed_sd = ParsedHardenedSd::from_sddl(PROGRAMDATA_DIR_SDDL)?;
+        let (guard, can_write_owner) = open_handle_for_hardening(dir).with_context(|| {
+            format!(
+                "failed to open directory {} for DACL hardening",
+                dir.display()
+            )
+        })?;
+
+        // SAFETY: `info` is a plain C struct initialized before calling `GetFileInformationByHandle`.
+        let mut info: ByHandleFileInformation = unsafe { std::mem::zeroed() };
+        let info_ok = unsafe { GetFileInformationByHandle(guard.0, &mut info) };
+        if info_ok == 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(err).with_context(|| {
+                format!(
+                    "GetFileInformationByHandle failed for directory {}",
+                    dir.display()
+                )
+            });
+        }
+        if is_reparse_point_attrs(info.dw_file_attributes) {
+            bail!(
+                "refusing to apply DACL to NTFS reparse point directory: {}",
+                dir.display()
+            );
+        }
+        if (info.dw_file_attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 {
+            bail!(
+                "refusing to apply directory DACL to non-directory path: {}",
+                dir.display()
+            );
+        }
+
+        apply_hardened_sd_to_handle(guard.0, dir, &parsed_sd, can_write_owner)?;
+        drop(guard);
+
+        // Harden any pre-existing `config.toml` child file inside the directory so a standard
+        // user who pre-created `%ProgramData%\vdpi\config.toml` cannot keep NTFS owner `WRITE_DAC`.
+        harden_existing_config_child(&dir.join("config.toml"))
+    }
+
+    fn ensure_safe_programdata_dir(dir: &Path) -> Result<()> {
+        match path_attributes_no_follow(dir)
+            .with_context(|| format!("failed to inspect config directory {}", dir.display()))?
+        {
+            Some(attrs) => {
+                if is_reparse_point_attrs(attrs) {
+                    bail!(
+                        "refusing to use NTFS reparse point as config directory: {}",
+                        dir.display()
+                    );
+                }
+                if (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0 {
+                    bail!(
+                        "config directory path exists and is not a directory: {}",
+                        dir.display()
+                    );
+                }
+            }
+            None => {
+                create_dir_with_hardened_dacl(dir)?;
+                let attrs = path_attributes_no_follow(dir)
+                    .with_context(|| format!("failed to verify config directory {}", dir.display()))?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "config directory disappeared after creation: {}",
+                            dir.display()
+                        )
+                    })?;
+                if is_reparse_point_attrs(attrs) {
+                    bail!(
+                        "refusing to use NTFS reparse point as config directory: {}",
+                        dir.display()
+                    );
+                }
+                if (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0 {
+                    bail!(
+                        "config directory path is not a directory after creation: {}",
+                        dir.display()
+                    );
+                }
+            }
+        }
+
+        apply_hardened_dir_dacl(dir)
+    }
+
+    pub(super) fn ensure_safe_programdata_chain(vdpi_dir: &Path, parent: &Path) -> Result<()> {
+        ensure_safe_programdata_dir(vdpi_dir)?;
+
+        let norm_vdpi = normalize_windows_path_for_compare(vdpi_dir);
+        let norm_parent = normalize_windows_path_for_compare(parent);
+        if norm_parent != norm_vdpi {
+            if let Some(tail) = norm_parent
+                .strip_prefix(&norm_vdpi)
+                .and_then(|s| s.strip_prefix('\\'))
+            {
+                let mut cur = vdpi_dir.to_path_buf();
+                for seg in tail.split('\\').filter(|s| !s.is_empty()) {
+                    cur.push(seg);
+                    ensure_safe_programdata_dir(&cur)?;
+                }
+            }
+            reject_reparse_point(parent)?;
+        } else if parent != vdpi_dir {
+            reject_reparse_point(parent)?;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
 fn atomic_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
     const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+    const RETRY_DELAYS_MS: [u64; 5] = [10, 25, 50, 100, 200];
 
     #[link(name = "kernel32")]
     extern "system" {
@@ -494,20 +1284,32 @@ fn atomic_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
         .chain(std::iter::once(0))
         .collect();
 
-    // SAFETY: `src_w` and `dst_w` are valid NUL-terminated UTF-16 buffers that
-    // remain alive for the entire synchronous `MoveFileExW` call.
-    let ok = unsafe {
-        MoveFileExW(
-            src_w.as_ptr(),
-            dst_w.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if ok != 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
+    for delay_ms in RETRY_DELAYS_MS.iter().copied().chain(std::iter::once(0)) {
+        // SAFETY: `src_w` and `dst_w` are valid NUL-terminated UTF-16 buffers that
+        // remain alive for the entire synchronous `MoveFileExW` call.
+        let ok = unsafe {
+            MoveFileExW(
+                src_w.as_ptr(),
+                dst_w.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok != 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        let retryable = matches!(
+            err.raw_os_error(),
+            Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+        );
+        if retryable && delay_ms > 0 {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+            continue;
+        }
+        return Err(err);
     }
+
+    Err(std::io::Error::last_os_error())
 }
 
 #[cfg(not(windows))]
@@ -798,23 +1600,115 @@ pub fn validate_split_tunnel_apps(apps: &[String]) -> Result<Vec<String>> {
     Ok(sanitize_split_tunnel_apps(apps))
 }
 
+fn strip_cli_args_after_extension(s: &str) -> &str {
+    const EXTENSIONS: &[&str] = &[".exe", ".app", ".appimage", ".bat", ".cmd"];
+    let lower = s.to_ascii_lowercase();
+    let mut earliest_end: Option<usize> = None;
+
+    for ext in EXTENSIONS {
+        let mut search_from = 0;
+        while let Some(rel) = lower[search_from..].find(ext) {
+            let ext_start = search_from + rel;
+            let ext_end = ext_start + ext.len();
+            let preceded_by_name = ext_start > 0
+                && !matches!(lower.as_bytes()[ext_start - 1], b'/' | b'\\' | b' ' | b'\t');
+            let followed_by_ws = lower[ext_end..]
+                .chars()
+                .next()
+                .is_some_and(char::is_whitespace);
+            if preceded_by_name && followed_by_ws {
+                earliest_end = Some(earliest_end.map_or(ext_end, |prev| prev.min(ext_end)));
+                break;
+            }
+            search_from = ext_end;
+        }
+    }
+
+    if let Some(end) = earliest_end {
+        return &s[..end];
+    }
+
+    // Fallback for unquoted extensionless command lines (e.g. `/usr/bin/firefox --new-window`).
+    let bytes = s.as_bytes();
+    for idx in 1..bytes.len().saturating_sub(3) {
+        if bytes[idx].is_ascii_whitespace()
+            && bytes[idx + 1] == b'-'
+            && bytes[idx + 2] == b'-'
+            && bytes[idx + 3].is_ascii_alphanumeric()
+        {
+            return s[..idx].trim_end();
+        }
+    }
+
+    s
+}
+
+fn canonical_split_app_entry(raw: &str) -> Option<&str> {
+    if raw.chars().any(char::is_control) {
+        return None;
+    }
+
+    let mut cleaned = raw.trim();
+    loop {
+        let mut chars = cleaned.chars();
+        let Some(quote @ ('"' | '\'')) = chars.next() else {
+            break;
+        };
+        let rest_after_open = chars.as_str();
+        let Some(close_idx) = rest_after_open.find(quote) else {
+            break;
+        };
+        let after_close = &rest_after_open[close_idx + quote.len_utf8()..];
+        if after_close.is_empty() || after_close.starts_with(char::is_whitespace) {
+            cleaned = rest_after_open[..close_idx].trim();
+        } else {
+            break;
+        }
+    }
+
+    cleaned = strip_cli_args_after_extension(cleaned).trim();
+
+    if cleaned.is_empty() {
+        return None;
+    }
+
+    let without_trailing_sep = cleaned.trim_end_matches(['/', '\\']);
+    if without_trailing_sep.is_empty() {
+        return None;
+    }
+
+    let file_name = without_trailing_sep
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(without_trailing_sep)
+        .trim();
+
+    if file_name.is_empty() || file_name == "." || file_name == ".." || file_name.ends_with(':') {
+        return None;
+    }
+
+    Some(file_name)
+}
+
 /// Lossily sanitizes per-application split-tunnel entries for rendering/apply.
 ///
 /// Drops entries containing control characters or newlines, trims whitespace,
-/// skips empty/blank entries, deduplicates by normalized executable name
-/// (preserving first-seen order), and caps the list at
+/// unwraps leading single/double-quoted tokens (discarding trailing Windows
+/// shortcut CLI arguments), strips trailing CLI flags after executable
+/// extensions or `--` options, extracts the executable filename from full
+/// paths, skips empty/invalid entries, deduplicates by normalized executable
+/// name (preserving first-seen order), and caps the list at
 /// [`MAX_SPLIT_TUNNEL_APPS`].
 pub fn sanitize_split_tunnel_apps(apps: &[String]) -> Vec<String> {
     let mut out = Vec::with_capacity(apps.len().min(MAX_SPLIT_TUNNEL_APPS));
     let mut seen = HashSet::with_capacity(apps.len().min(MAX_SPLIT_TUNNEL_APPS));
 
     for raw in apps {
-        if raw.chars().any(char::is_control) {
+        let Some(cleaned) = canonical_split_app_entry(raw) else {
             continue;
-        }
-        let trimmed = raw.trim();
-        let key = normalize_split_app_name(trimmed);
-        if trimmed.is_empty() || key.is_empty() {
+        };
+        let key = normalize_split_app_name(cleaned);
+        if key.is_empty() {
             continue;
         }
         if !seen.insert(key) {
@@ -827,7 +1721,7 @@ pub fn sanitize_split_tunnel_apps(apps: &[String]) -> Vec<String> {
             );
             break;
         }
-        out.push(trimmed.to_string());
+        out.push(cleaned.to_string());
     }
 
     out
@@ -2424,6 +3318,260 @@ split_tunnel_apps = [
             capped_apps[MAX_SPLIT_TUNNEL_APPS - 1],
             format!("proc-{}.exe", MAX_SPLIT_TUNNEL_APPS - 1)
         );
+    }
+
+    #[test]
+    fn sanitize_split_tunnel_apps_strips_surrounding_quotes() {
+        let sanitized = sanitize_split_tunnel_apps(&[
+            "\"Discord.exe\"".to_string(),
+            " 'steam.exe' ".to_string(),
+            "\"C:\\Program Files\\Mozilla Firefox\\firefox.exe\"".to_string(),
+            "\"\"".to_string(),
+            "''".to_string(),
+        ]);
+        assert_eq!(
+            sanitized,
+            vec![
+                "Discord.exe".to_string(),
+                "steam.exe".to_string(),
+                "firefox.exe".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn sanitize_split_tunnel_apps_strips_shortcut_cli_arguments() {
+        let sanitized = sanitize_split_tunnel_apps(&[
+            r#""C:\Riot Games\Riot Client\RiotClientServices.exe" --launch-product=valorant --launch-patchline=live"#.to_string(),
+            r"C:\Riot Games\Riot Client\RiotClientServices.exe --launch-product=valorant".to_string(),
+            r#""C:\Program Files\Discord\Discord.exe" --profile="Work Profile""#.to_string(),
+            "Discord.exe --start-minimized".to_string(),
+            "'/usr/bin/firefox' --new-window --private-window".to_string(),
+            r"C:\Games\VALORANT.EXE /silent".to_string(),
+            "/Applications/Google Chrome.app --incognito".to_string(),
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".to_string(),
+            "/usr/bin/obs --startreplaybuffer".to_string(),
+            "League of Legends".to_string(),
+            r#""" --launch-product=valorant"#.to_string(),
+            ".".to_string(),
+            "..".to_string(),
+            r"C:\".to_string(),
+        ]);
+        assert_eq!(
+            sanitized,
+            vec![
+                "RiotClientServices.exe".to_string(),
+                "Discord.exe".to_string(),
+                "firefox".to_string(),
+                "VALORANT.EXE".to_string(),
+                "Google Chrome.app".to_string(),
+                "Google Chrome".to_string(),
+                "obs".to_string(),
+                "League of Legends".to_string(),
+            ]
+        );
+
+        let mut cfg = FileConfig::default();
+        set_config_key(
+            &mut cfg,
+            "split_tunnel_apps",
+            r#""C:\Riot Games\Riot Client\RiotClientServices.exe" --launch-product=valorant, Discord.exe --start-minimized"#,
+        )
+        .expect("set_config_key accepts Windows shortcut command lines");
+        assert_eq!(
+            cfg.split_tunnel_apps,
+            Some(vec![
+                "RiotClientServices.exe".to_string(),
+                "Discord.exe".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn windows_programdata_target_detection_handles_variants() {
+        let pd = Some(OsStr::new(r"C:\ProgramData"));
+        let expected = PathBuf::from(r"C:\ProgramData").join("vdpi");
+
+        assert_eq!(
+            windows_programdata_target_dir(Path::new(r"C:\ProgramData\vdpi\config.toml"), pd),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            windows_programdata_target_dir(Path::new(r"c:/programdata/VDPI/config.toml"), pd),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            windows_programdata_target_dir(Path::new(r"\\?\C:\ProgramData\vdpi\config.toml"), pd),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            windows_programdata_target_dir(
+                Path::new(r"C:\ProgramData\other\..\vdpi\sub\config.toml"),
+                pd
+            ),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            windows_programdata_target_dir(Path::new(r"C:\ProgramData\vdpi"), pd),
+            Some(expected)
+        );
+
+        let custom_pd = Some(OsStr::new(r"D:\ProgramData"));
+        assert_eq!(
+            windows_programdata_target_dir(
+                Path::new(r"D:\ProgramData\vdpi\config.toml"),
+                custom_pd
+            ),
+            Some(PathBuf::from(r"D:\ProgramData").join("vdpi"))
+        );
+
+        assert_eq!(
+            windows_programdata_target_dir(Path::new(r"C:\ProgramData\vdpi2\config.toml"), pd),
+            None
+        );
+        assert_eq!(
+            windows_programdata_target_dir(
+                Path::new(r"C:\Users\alice\AppData\Local\vdpi\config.toml"),
+                pd
+            ),
+            None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reparse_point_guards_reject_junctions_and_dirs() {
+        use std::os::windows::process::CommandExt;
+        use std::process::Command;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        assert!(windows_fs::is_reparse_point_attrs(
+            windows_fs::FILE_ATTRIBUTE_REPARSE_POINT
+        ));
+        assert!(windows_fs::is_reparse_point_attrs(
+            windows_fs::FILE_ATTRIBUTE_DIRECTORY | windows_fs::FILE_ATTRIBUTE_REPARSE_POINT
+        ));
+        assert!(!windows_fs::is_reparse_point_attrs(
+            windows_fs::FILE_ATTRIBUTE_DIRECTORY
+        ));
+        assert!(!windows_fs::is_reparse_point_attrs(
+            windows_fs::INVALID_FILE_ATTRIBUTES
+        ));
+
+        let root = TestTempDir::new("reparse-guard");
+        let target_dir = root.path().join("target");
+        fs::create_dir_all(&target_dir).expect("create target dir");
+
+        let dir_as_file = root.path().join("dir-as-config");
+        fs::create_dir_all(&dir_as_file).expect("create dir-as-config");
+        assert!(windows_fs::reject_reparse_point_or_dir(&dir_as_file).is_err());
+
+        let cmd_exe = std::env::var_os("SystemRoot")
+            .or_else(|| std::env::var_os("WINDIR"))
+            .filter(|v| !v.is_empty())
+            .map(|root| PathBuf::from(root).join("System32").join("cmd.exe"))
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\cmd.exe"));
+        let junction_dir = root.path().join("vdpi-junction");
+        let status = Command::new(cmd_exe)
+            .creation_flags(CREATE_NO_WINDOW)
+            .args([
+                OsStr::new("/C"),
+                OsStr::new("mklink"),
+                OsStr::new("/J"),
+                junction_dir.as_os_str(),
+                target_dir.as_os_str(),
+            ])
+            .status()
+            .expect("spawn cmd.exe mklink /J");
+        assert!(
+            status.success(),
+            "mklink /J must create NTFS directory junction"
+        );
+
+        assert!(windows_fs::reject_reparse_point(&junction_dir).is_err());
+        assert!(windows_fs::reject_reparse_point_or_dir(&junction_dir).is_err());
+        assert!(windows_fs::apply_hardened_dir_dacl(&junction_dir).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_programdata_sddl_sets_administrators_owner_and_parses() {
+        assert!(
+            windows_fs::PROGRAMDATA_DIR_SDDL.starts_with("O:BA"),
+            "directory SDDL must explicitly set BUILTIN\\Administrators owner (O:BA): {}",
+            windows_fs::PROGRAMDATA_DIR_SDDL
+        );
+        assert_eq!(
+            windows_fs::PROGRAMDATA_DIR_SDDL,
+            "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FRFX;;;BU)"
+        );
+        let parsed_dir = windows_fs::ParsedHardenedSd::from_sddl(windows_fs::PROGRAMDATA_DIR_SDDL)
+            .expect("PROGRAMDATA_DIR_SDDL must parse owner SID and protected DACL cleanly");
+        assert!(
+            !parsed_dir.as_owner_ptr().is_null(),
+            "parsed directory security descriptor must expose a non-null owner SID"
+        );
+        assert!(
+            !parsed_dir.as_dacl_ptr().is_null(),
+            "parsed directory security descriptor must expose a non-null DACL"
+        );
+
+        assert!(
+            windows_fs::PROGRAMDATA_FILE_SDDL.starts_with("O:BA"),
+            "file SDDL must explicitly set BUILTIN\\Administrators owner (O:BA): {}",
+            windows_fs::PROGRAMDATA_FILE_SDDL
+        );
+        let parsed_file =
+            windows_fs::ParsedHardenedSd::from_sddl(windows_fs::PROGRAMDATA_FILE_SDDL)
+                .expect("PROGRAMDATA_FILE_SDDL must parse owner SID and protected DACL cleanly");
+        assert!(
+            !parsed_file.as_owner_ptr().is_null(),
+            "parsed file security descriptor must expose a non-null owner SID"
+        );
+        assert!(
+            !parsed_file.as_dacl_ptr().is_null(),
+            "parsed file security descriptor must expose a non-null DACL"
+        );
+
+        assert!(
+            windows_fs::ParsedHardenedSd::from_sddl(
+                "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FRFX;;;BU)"
+            )
+            .is_err(),
+            "ParsedHardenedSd must require an explicit owner SID"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_owner_fallback_is_strictly_gated_on_non_elevated() {
+        let privilege_errors = [
+            windows_fs::ERROR_ACCESS_DENIED,
+            windows_fs::ERROR_INVALID_OWNER,
+            windows_fs::ERROR_PRIVILEGE_NOT_HELD,
+        ];
+        for code in privilege_errors {
+            assert!(
+                !windows_fs::should_fallback_to_dacl_only(true, code),
+                "elevated process must fail closed on owner privilege error {code}"
+            );
+            assert!(
+                windows_fs::should_fallback_to_dacl_only(false, code),
+                "non-elevated process may fall back to DACL-only on owner privilege error {code}"
+            );
+        }
+
+        for other_code in [0_u32, 2, 3, 6, 32] {
+            assert!(
+                !windows_fs::should_fallback_to_dacl_only(true, other_code),
+                "elevated process must fail closed on error {other_code}"
+            );
+            assert!(
+                !windows_fs::should_fallback_to_dacl_only(false, other_code),
+                "non-elevated process must not fall back on non-privilege error {other_code}"
+            );
+        }
     }
 
     #[test]

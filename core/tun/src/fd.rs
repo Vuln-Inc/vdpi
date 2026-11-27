@@ -6,6 +6,7 @@ use crate::pipeline::{run_tun_pipeline_with_app_bypass, wait_shutdown, TunStats}
 use anyhow::{anyhow, Context, Result};
 use std::io::ErrorKind;
 use std::os::unix::io::{AsRawFd, OwnedFd};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, watch};
@@ -26,6 +27,18 @@ const SYSPROTO_CONTROL: libc::c_int = 2;
 const UTUN_OPT_FLAGS: libc::c_int = 1;
 #[cfg(target_vendor = "apple")]
 const UTUN_FLAGS_ENABLE_PROC_UUID: u32 = 0x0004;
+
+/// Bounded outbound TUN TX channel depth (128 packets).
+///
+/// Caps the downstream FIFO ahead of the Unix TUN writer so bulk TCP flows hit
+/// event-driven backpressure via `outbound_tx.reserve().await` instead of
+/// queuing up to 4096 TCP packets behind `inbound` (`profile.channel_capacity`)
+/// and delaying UDP voice/game preemption.
+const TUN_TX_CHANNEL_CAPACITY: usize = 128;
+
+fn outbound_channel_capacity(profile: TunProfile) -> usize {
+    profile.channel_capacity.clamp(1, TUN_TX_CHANNEL_CAPACITY)
+}
 
 struct AbortOnDrop(Vec<AbortHandle>);
 
@@ -119,7 +132,8 @@ pub async fn run_registered_tun_fd_with_app_bypass(
     let clamped_mtu = mtu.clamp(MIN_MTU, MAX_MTU);
     let io_batch_limit = profile.batch_size.clamp(16, 256);
     let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>(profile.channel_capacity);
-    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(profile.channel_capacity);
+    let (outbound_tx, mut outbound_rx) =
+        mpsc::channel::<Vec<u8>>(outbound_channel_capacity(profile));
     let (fd_stop_tx, fd_stop_rx) = watch::channel(false);
 
     let mut ext_stop = shutdown_rx.clone();
@@ -210,6 +224,7 @@ pub async fn run_registered_tun_fd_with_app_bypass(
     });
 
     let write_fd = Arc::clone(&async_fd);
+    let write_stats = Arc::clone(&tun_stats);
     let mut stop_write = fd_stop_rx.clone();
     let write_stop_tx = fd_stop_tx.clone();
     let writer_task = tokio::spawn(async move {
@@ -261,37 +276,31 @@ pub async fn run_registered_tun_fd_with_app_bypass(
                         written += 1;
                         congestion_retries = 0;
                     }
-                    Ok(Err(e)) if e.kind() == ErrorKind::Interrupted => {
-                        pending = Some(pkt);
-                    }
-                    Ok(Err(e)) if is_congestion_tun_errno(&e) => {
-                        // On iOS/macOS Skywalk utun, XNU returns ENOSPC/ENOBUFS (not EAGAIN)
-                        // when the pending input chain exceeds 512 packets. Back off briefly
-                        // instead of dropping segments or hammering XNU.
-                        if congestion_retries < 8 {
-                            congestion_retries += 1;
-                            pending = Some(pkt);
-                            drop(guard);
-                            let backoff_ms = u64::from(congestion_retries).min(4);
-                            tokio::select! {
-                                biased;
-                                _ = wait_shutdown(&mut stop_write) => break 'outer,
-                                _ = tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)) => {}
-                            }
-                            continue 'outer;
-                        }
-                        debug!(error = %e, "dropping TUN packet after sustained ENOSPC/ENOBUFS");
-                        congestion_retries = 0;
-                        written += 1;
-                    }
                     Ok(Err(e)) => {
-                        if is_fatal_tun_errno(&e) {
-                            warn!(error = %e, "fatal TUN write error");
-                            let _ = write_stop_tx.send(true);
-                            break 'outer;
+                        match handle_tun_write_error(&e, &mut congestion_retries, &write_stats) {
+                            TunWriteErrorAction::RetryImmediate => {
+                                pending = Some(pkt);
+                            }
+                            TunWriteErrorAction::BackoffMs(backoff_ms) => {
+                                pending = Some(pkt);
+                                drop(guard);
+                                tokio::select! {
+                                    biased;
+                                    _ = wait_shutdown(&mut stop_write) => break 'outer,
+                                    _ = tokio::time::sleep(std::time::Duration::from_millis(
+                                        backoff_ms,
+                                    )) => {}
+                                }
+                                continue 'outer;
+                            }
+                            TunWriteErrorAction::Dropped => {
+                                written += 1;
+                            }
+                            TunWriteErrorAction::Fatal => {
+                                let _ = write_stop_tx.send(true);
+                                break 'outer;
+                            }
                         }
-                        debug!(error = %e, "transient TUN write drop");
-                        written += 1;
                     }
                     Err(_would_block) => {
                         pending = Some(pkt);
@@ -337,6 +346,47 @@ pub async fn run_registered_tun_fd_with_app_bypass(
     } else {
         pipeline_res.and_then(|_| Err(anyhow!("TUN interface closed unexpectedly")))
     }
+}
+
+const MAX_TUN_WRITE_CONGESTION_RETRIES: u8 = 8;
+
+#[derive(Debug, PartialEq, Eq)]
+enum TunWriteErrorAction {
+    RetryImmediate,
+    BackoffMs(u64),
+    Dropped,
+    Fatal,
+}
+
+fn handle_tun_write_error(
+    err: &std::io::Error,
+    congestion_retries: &mut u8,
+    tun_stats: &TunStats,
+) -> TunWriteErrorAction {
+    if err.kind() == ErrorKind::Interrupted {
+        return TunWriteErrorAction::RetryImmediate;
+    }
+    if is_congestion_tun_errno(err) {
+        // On iOS/macOS Skywalk utun, XNU returns ENOSPC/ENOBUFS (not EAGAIN)
+        // when the pending input chain exceeds 512 packets. Back off briefly
+        // instead of dropping segments or hammering XNU.
+        if *congestion_retries < MAX_TUN_WRITE_CONGESTION_RETRIES {
+            *congestion_retries += 1;
+            return TunWriteErrorAction::BackoffMs(u64::from(*congestion_retries).min(4));
+        }
+        *congestion_retries = 0;
+        tun_stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+        debug!(error = %err, "dropping TUN packet after sustained ENOSPC/ENOBUFS");
+        return TunWriteErrorAction::Dropped;
+    }
+    if is_fatal_tun_errno(err) {
+        warn!(error = %err, "fatal TUN write error");
+        return TunWriteErrorAction::Fatal;
+    }
+    *congestion_retries = 0;
+    tun_stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+    debug!(error = %err, "transient TUN write drop");
+    TunWriteErrorAction::Dropped
 }
 
 fn is_fatal_tun_errno(err: &std::io::Error) -> bool {
@@ -569,5 +619,78 @@ mod tests {
         assert_eq!(strip_tun_pi(&[], TUN_PI_LEN), None);
         let pkt = [0x45u8, 0x00, 0x00, 0x14];
         assert_eq!(strip_tun_pi(&pkt, TUN_PI_LEN), Some(pkt.as_slice()));
+    }
+
+    #[test]
+    fn tun_write_error_counts_congestion_exhaustion_and_transient_drops() {
+        let stats = TunStats::default();
+        let mut retries = 0u8;
+
+        let eintr = std::io::Error::new(ErrorKind::Interrupted, "interrupted");
+        assert_eq!(
+            handle_tun_write_error(&eintr, &mut retries, &stats),
+            TunWriteErrorAction::RetryImmediate
+        );
+        assert_eq!(retries, 0);
+        assert_eq!(stats.dropped_packets.load(Ordering::Relaxed), 0);
+
+        let enobufs = std::io::Error::from_raw_os_error(libc::ENOBUFS);
+        for attempt in 1..=MAX_TUN_WRITE_CONGESTION_RETRIES {
+            assert_eq!(
+                handle_tun_write_error(&enobufs, &mut retries, &stats),
+                TunWriteErrorAction::BackoffMs(u64::from(attempt).min(4))
+            );
+            assert_eq!(retries, attempt);
+            assert_eq!(stats.dropped_packets.load(Ordering::Relaxed), 0);
+        }
+
+        let enospc = std::io::Error::from_raw_os_error(libc::ENOSPC);
+        assert_eq!(
+            handle_tun_write_error(&enospc, &mut retries, &stats),
+            TunWriteErrorAction::Dropped
+        );
+        assert_eq!(retries, 0);
+        assert_eq!(stats.dropped_packets.load(Ordering::Relaxed), 1);
+
+        let emsgsize = std::io::Error::from_raw_os_error(libc::EMSGSIZE);
+        assert_eq!(
+            handle_tun_write_error(&emsgsize, &mut retries, &stats),
+            TunWriteErrorAction::Dropped
+        );
+        assert_eq!(retries, 0);
+        assert_eq!(stats.dropped_packets.load(Ordering::Relaxed), 2);
+
+        let ebadf = std::io::Error::from_raw_os_error(libc::EBADF);
+        assert_eq!(
+            handle_tun_write_error(&ebadf, &mut retries, &stats),
+            TunWriteErrorAction::Fatal
+        );
+        assert_eq!(stats.dropped_packets.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn outbound_channel_capacity_caps_fifo_depth_below_inbound() {
+        assert_eq!(TUN_TX_CHANNEL_CAPACITY, 128);
+        assert_eq!(TunProfile::DESKTOP.channel_capacity, 4096);
+        assert_eq!(
+            outbound_channel_capacity(TunProfile::DESKTOP),
+            TUN_TX_CHANNEL_CAPACITY
+        );
+        assert_eq!(
+            outbound_channel_capacity(TunProfile::STANDARD),
+            TUN_TX_CHANNEL_CAPACITY
+        );
+        assert_eq!(
+            outbound_channel_capacity(TunProfile::LOW_MEMORY),
+            TUN_TX_CHANNEL_CAPACITY
+        );
+
+        let mut small = TunProfile::LOW_MEMORY;
+        small.channel_capacity = 64;
+        assert_eq!(outbound_channel_capacity(small), 64);
+
+        let mut zero = TunProfile::LOW_MEMORY;
+        zero.channel_capacity = 0;
+        assert_eq!(outbound_channel_capacity(zero), 1);
     }
 }

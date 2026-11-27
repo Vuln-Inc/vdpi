@@ -39,9 +39,11 @@ const MAX_PROMOTION_VOTE_HOSTS: usize = 64;
 const PROMOTION_VOTE_WINDOW_SECS: u64 = 15 * 60;
 const FAST_EOF_THRESHOLD: Duration = Duration::from_millis(800);
 const FAST_SERVER_HELLO_THRESHOLD: Duration = Duration::from_millis(800);
-const MAX_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(12);
+const MAX_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(16);
 const DIRECT_PASSTHROUGH_FALLBACK_BUDGET: Duration = Duration::from_millis(2000);
 const RETRY_DNS_TIMEOUT: Duration = Duration::from_millis(1500);
+const MAX_DEAD_RETRY_IPS: usize = 256;
+const DEAD_RETRY_IP_TTL: Duration = Duration::from_secs(60);
 
 #[cfg(target_os = "ios")]
 const RELAY_BUF_SIZE: usize = 16 * 1024;
@@ -150,7 +152,7 @@ fn parent_domain_cache_key(host: &str) -> Option<String> {
     }
     let last = labels[labels.len() - 1];
     let second_last = labels[labels.len() - 2];
-    let is_two_part_tld = last.len() == 2
+    let is_two_part_tld = (last.len() == 2
         && matches!(
             second_last,
             "co" | "com"
@@ -164,6 +166,18 @@ fn parent_domain_cache_key(host: &str) -> Option<String> {
                 | "web"
                 | "biz"
                 | "nom"
+        ))
+        || matches!(
+            (second_last, last),
+            ("cloudfront", "net")
+                | ("amazonaws", "com")
+                | ("github", "io")
+                | ("pages", "dev")
+                | ("workers", "dev")
+                | ("akamaized", "net")
+                | ("fastly", "net")
+                | ("vercel", "app")
+                | ("k12" | "bel" | "pol" | "kep" | "tsk", "tr")
         );
     let parent = if is_two_part_tld {
         if labels.len() < 4 {
@@ -354,6 +368,17 @@ impl LearnedStrategy {
         }
     }
 
+    fn is_oob(self) -> bool {
+        matches!(self, Self::OobSniDesync | Self::MultiRecordOob)
+    }
+
+    fn is_clean_non_oob(self) -> bool {
+        matches!(
+            self,
+            Self::Primary | Self::FineFragment | Self::DeepRecordStorm | Self::SlowSniSlice
+        )
+    }
+
     fn promotion_quorum(self) -> Option<usize> {
         match self {
             Self::Primary | Self::OobSniDesync | Self::MultiRecordOob | Self::FineFragment => {
@@ -386,8 +411,13 @@ impl PromotionVoteTracker {
         host: &str,
         now: u64,
     ) -> bool {
-        let Some(required_quorum) = candidate.promotion_quorum() else {
-            return false;
+        let required_quorum = if current_global.is_oob() && candidate.is_clean_non_oob() {
+            FAST_PROMOTION_QUORUM
+        } else {
+            let Some(quorum) = candidate.promotion_quorum() else {
+                return false;
+            };
+            quorum
         };
         if candidate == current_global || !is_valid_cache_host(host) {
             return false;
@@ -445,6 +475,25 @@ fn is_hard_block_write_error(err: &anyhow::Error) -> bool {
     })
 }
 
+fn is_tcp_connect_io_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        ErrorKind::ConnectionRefused
+            | ErrorKind::NotConnected
+            | ErrorKind::AddrNotAvailable
+            | ErrorKind::NetworkUnreachable
+            | ErrorKind::HostUnreachable
+    )
+}
+
+fn is_tcp_connect_write_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(is_tcp_connect_io_error)
+    })
+}
+
 fn evict_oldest_adaptive_entries(
     cache: &mut HashMap<String, LearnedStrategy>,
     timestamps: &mut HashMap<String, u64>,
@@ -485,18 +534,27 @@ fn upsert_adaptive_entry(
     prev != Some(stage)
 }
 
+#[repr(align(64))]
+#[derive(Debug, Default)]
+struct CacheLinePad;
+
 /// Lock-free live engine counters shared across proxy and TUN sessions.
+/// Hot byte counters (`bytes_tx` / `bytes_rx`) are isolated on separate 64-byte cache lines
+/// to prevent false sharing across relay worker threads at Gigabit throughput.
+#[repr(C)]
 #[derive(Debug, Default)]
 pub struct EngineTelemetry {
     pub active_connections: AtomicUsize,
     pub total_connections: AtomicU64,
-    pub bytes_tx: AtomicU64,
-    pub bytes_rx: AtomicU64,
     pub tls_handshakes: AtomicU64,
     pub auto_heal_escalations: AtomicU64,
     pub learned_hosts: AtomicUsize,
     pub udp_flows_active: AtomicU64,
     pub quic_blocked: AtomicU64,
+    _pad_tx: CacheLinePad,
+    pub bytes_tx: AtomicU64,
+    _pad_rx: CacheLinePad,
+    pub bytes_rx: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -514,9 +572,10 @@ pub struct EngineTelemetrySnapshot {
 }
 
 /// Wraps an upstream stream to track `bytes_tx` / `bytes_rx` with batched `Relaxed` atomic
-/// updates (flushed on batch threshold, yield/Pending, EOF, flush, shutdown, and drop) and a
-/// zero-syscall activity flag so idle connections can be reaped without per-chunk `Instant::now()`
-/// calls or cross-core cache-line contention at Gigabit speeds.
+/// updates (flushed on batch threshold, EOF, error, shutdown, and drop — never on
+/// `Poll::Pending` or `poll_flush` below threshold) and a zero-syscall activity flag so idle
+/// connections can be reaped without per-chunk `Instant::now()` calls or cross-core cache-line
+/// contention at Gigabit speeds.
 struct CountingStream<'a, S> {
     inner: S,
     telemetry: &'a EngineTelemetry,
@@ -588,9 +647,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for CountingStream<'_, S> {
                     self.flush_rx();
                 }
             }
-            Poll::Pending | Poll::Ready(Err(_)) => {
+            Poll::Ready(Err(_)) => {
                 self.flush_rx();
             }
+            Poll::Pending => {}
         }
         poll
     }
@@ -611,15 +671,18 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<'_, S> {
                     self.flush_tx();
                 }
             }
-            Poll::Pending | Poll::Ready(Ok(_)) | Poll::Ready(Err(_)) => {
+            Poll::Ready(Ok(_)) | Poll::Ready(Err(_)) => {
                 self.flush_tx();
             }
+            Poll::Pending => {}
         }
         poll
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        self.flush_tx();
+        if self.pending_tx >= TELEMETRY_BATCH_BYTES {
+            self.flush_tx();
+        }
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
@@ -710,6 +773,7 @@ pub struct EngineContext {
     last_persist_epoch: Arc<AtomicU64>,
     persist_scheduled: Arc<AtomicBool>,
     persist_lock: Arc<Mutex<()>>,
+    dead_retry_ips: Arc<RwLock<HashMap<SocketAddr, Instant>>>,
 }
 
 impl EngineContext {
@@ -746,6 +810,7 @@ impl EngineContext {
             last_persist_epoch: Arc::new(AtomicU64::new(0)),
             persist_scheduled: Arc::new(AtomicBool::new(false)),
             persist_lock: Arc::new(Mutex::new(())),
+            dead_retry_ips: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -1162,10 +1227,36 @@ impl EngineContext {
             bail!("no addresses returned for {host}");
         }
 
-        let total_ips = ips.len();
-        let mut last_err = None;
+        let ordered_ips = if ips.len() > 1 {
+            let guard = self.dead_retry_ips.read().await;
+            if guard.is_empty() {
+                ips
+            } else {
+                let now = Instant::now();
+                let mut healthy = Vec::with_capacity(ips.len());
+                let mut dead = Vec::new();
+                for ip in ips {
+                    let key = canonical_socket_addr(SocketAddr::new(ip, port));
+                    if guard.get(&key).is_some_and(|&marked_at| {
+                        now.saturating_duration_since(marked_at) < DEAD_RETRY_IP_TTL
+                    }) {
+                        dead.push(ip);
+                    } else {
+                        healthy.push(ip);
+                    }
+                }
+                healthy.extend(dead);
+                healthy
+            }
+        } else {
+            ips
+        };
 
-        for (idx, ip) in ips.into_iter().enumerate() {
+        let total_ips = ordered_ips.len();
+        let mut last_err = None;
+        let mut failed_targets = Vec::new();
+
+        for (idx, ip) in ordered_ips.into_iter().enumerate() {
             let target = SocketAddr::new(ip, port);
             let attempt_timeout = if idx + 1 < total_ips {
                 self.config.connect_timeout.min(Duration::from_secs(3))
@@ -1175,13 +1266,22 @@ impl EngineContext {
 
             match tokio::time::timeout(attempt_timeout, self.connect_upstream(target)).await {
                 Ok(Ok(stream)) => {
+                    let canonical_target = canonical_socket_addr(target);
+                    for failed in failed_targets {
+                        if canonical_socket_addr(failed) != canonical_target {
+                            self.mark_dead_retry_ip(failed).await;
+                        }
+                    }
+                    self.clear_dead_retry_ip(target).await;
                     let _ = stream.set_nodelay(true);
                     return Ok((stream, target));
                 }
                 Ok(Err(e)) => {
+                    failed_targets.push(target);
                     last_err = Some(anyhow!("connect {target} failed: {e}"));
                 }
                 Err(_) => {
+                    failed_targets.push(target);
                     last_err = Some(anyhow!(
                         "connect {target} timed out after {attempt_timeout:?}"
                     ));
@@ -1192,13 +1292,66 @@ impl EngineContext {
         Err(last_err.unwrap_or_else(|| anyhow!("failed to connect to {host}:{port}")))
     }
 
-    async fn connect_upstream(&self, target: SocketAddr) -> std::io::Result<TcpStream> {
-        let target = match target {
-            SocketAddr::V6(v6) if v6.ip().to_ipv4_mapped().is_some() => {
-                SocketAddr::new(target.ip().to_canonical(), target.port())
+    async fn is_dead_retry_ip(&self, addr: SocketAddr) -> bool {
+        let key = canonical_socket_addr(addr);
+        let guard = self.dead_retry_ips.read().await;
+        guard
+            .get(&key)
+            .is_some_and(|&marked_at| marked_at.elapsed() < DEAD_RETRY_IP_TTL)
+    }
+
+    async fn sync_dead_retry_ips(&self, addrs: &[SocketAddr], local_dead: &mut Vec<SocketAddr>) {
+        let guard = self.dead_retry_ips.read().await;
+        if guard.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        for &addr in addrs {
+            if local_dead.contains(&addr) {
+                continue;
             }
-            _ => target,
+            let key = canonical_socket_addr(addr);
+            if guard.get(&key).is_some_and(|&marked_at| {
+                now.saturating_duration_since(marked_at) < DEAD_RETRY_IP_TTL
+            }) {
+                local_dead.push(addr);
+            }
+        }
+    }
+
+    async fn mark_dead_retry_ip(&self, addr: SocketAddr) {
+        let key = canonical_socket_addr(addr);
+        let now = Instant::now();
+        let mut guard = self.dead_retry_ips.write().await;
+        guard.retain(|_, &mut marked_at| {
+            now.saturating_duration_since(marked_at) < DEAD_RETRY_IP_TTL
+        });
+        while !guard.contains_key(&key) && guard.len() >= MAX_DEAD_RETRY_IPS {
+            let Some(oldest) = guard
+                .iter()
+                .min_by(|(ka, ta), (kb, tb)| ta.cmp(tb).then_with(|| ka.cmp(kb)))
+                .map(|(&addr, _)| addr)
+            else {
+                break;
+            };
+            guard.remove(&oldest);
+        }
+        guard.insert(key, now);
+    }
+
+    async fn clear_dead_retry_ip(&self, addr: SocketAddr) {
+        let key = canonical_socket_addr(addr);
+        let present = {
+            let guard = self.dead_retry_ips.read().await;
+            guard.contains_key(&key)
         };
+        if present {
+            self.dead_retry_ips.write().await.remove(&key);
+        }
+    }
+
+    async fn connect_upstream(&self, target: SocketAddr) -> std::io::Result<TcpStream> {
+        let target = canonical_socket_addr(target);
         if target.ip().is_unspecified() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1229,6 +1382,7 @@ impl EngineContext {
         } else {
             TcpStream::connect(target).await?
         };
+        self.clear_dead_retry_ip(target).await;
         let keepalive = socket2::TcpKeepalive::new()
             .with_time(Duration::from_secs(60))
             .with_interval(Duration::from_secs(15));
@@ -1477,11 +1631,37 @@ impl EngineContext {
     async fn establish_initial_flight_with_deadline<C>(
         &self,
         client: &mut C,
-        mut remote: TcpStream,
+        remote: TcpStream,
         payload: &[u8],
         known_host: Option<&str>,
         remote_addr: SocketAddr,
         handshake_budget: Duration,
+    ) -> Result<TcpStream>
+    where
+        C: AsyncRead + AsyncWrite + Unpin,
+    {
+        self.establish_initial_flight_inner(
+            client,
+            remote,
+            payload,
+            known_host,
+            remote_addr,
+            HandshakeAttemptConfig {
+                budget: handshake_budget,
+                preseeded_retry_addrs: None,
+            },
+        )
+        .await
+    }
+
+    async fn establish_initial_flight_inner<C>(
+        &self,
+        client: &mut C,
+        mut remote: TcpStream,
+        payload: &[u8],
+        known_host: Option<&str>,
+        remote_addr: SocketAddr,
+        attempt_cfg: HandshakeAttemptConfig,
     ) -> Result<TcpStream>
     where
         C: AsyncRead + AsyncWrite + Unpin,
@@ -1530,14 +1710,16 @@ impl EngineContext {
             }
 
             let stages = self.build_stage_order(cached_stage);
-            let mut retry_addrs: Option<Vec<SocketAddr>> = None;
+            let mut retry_addrs: Option<Vec<SocketAddr>> = attempt_cfg.preseeded_retry_addrs;
+            let mut dead_retry_ips: Vec<SocketAddr> = Vec::new();
 
-            let mut probe_buf = vec![0u8; 16384];
+            let mut probe_buf = vec![0u8; 16384 + 512];
             let mut current_remote = Some(remote);
             let mut current_global_hard_blocked = false;
             let mut current_global_timed_out = false;
             let mut saw_tls_alert = false;
-            let handshake_deadline = Instant::now() + handshake_budget;
+            let mut stage0_connect_error = false;
+            let handshake_deadline = Instant::now() + attempt_cfg.budget;
             let mut tried_direct_passthrough = false;
             let mut deadline_exceeded = false;
 
@@ -1581,17 +1763,25 @@ impl EngineContext {
                                     retry_addrs.insert(resolved)
                                 }
                             };
-                            if addrs.len() > 1 {
-                                addrs[1 + (idx.saturating_sub(1) % (addrs.len() - 1))]
-                            } else {
-                                remote_addr
-                            }
+                            self.sync_dead_retry_ips(addrs, &mut dead_retry_ips).await;
+                            select_retry_target(addrs, remote_addr, &dead_retry_ips, idx)
                         };
-                        match connect_retry_stream(self, remote_addr, alt_target, stage_deadline)
-                            .await
+                        match connect_retry_stream(
+                            self,
+                            alt_target,
+                            remote_addr,
+                            stage_deadline,
+                            &mut dead_retry_ips,
+                        )
+                        .await
                         {
                             Some(pair) => pair,
-                            None => continue,
+                            None => {
+                                if idx == 0 {
+                                    stage0_connect_error = true;
+                                }
+                                continue;
+                            }
                         }
                     }
                 };
@@ -1617,6 +1807,9 @@ impl EngineContext {
                             self.telemetry
                                 .auto_heal_escalations
                                 .fetch_add(1, Ordering::Relaxed);
+                        }
+                        if idx == 0 && is_tcp_connect_write_error(&err) {
+                            stage0_connect_error = true;
                         }
                         if stage == current_global_stage && is_hard_block_write_error(&err) {
                             current_global_hard_blocked = true;
@@ -1647,9 +1840,9 @@ impl EngineContext {
                 }
 
                 let wait_ms = match stage {
-                    LearnedStrategy::DeepRecordStorm | LearnedStrategy::SlowSniSlice => 2400,
+                    LearnedStrategy::DeepRecordStorm | LearnedStrategy::SlowSniSlice => 2000,
                     _ if idx == 0 => 1500,
-                    _ => 2000,
+                    _ => 1800,
                 };
                 let read_timeout = Duration::from_millis(wait_ms).min(read_remaining);
 
@@ -1673,7 +1866,27 @@ impl EngineContext {
                         );
                         continue;
                     }
-                    Ok(Ok(n)) => {
+                    Ok(Ok(mut n)) => {
+                        if n == 1 && probe_buf[0] == 0x16 {
+                            let hdr_wait = read_remaining.min(Duration::from_millis(400));
+                            if !hdr_wait.is_zero() {
+                                let _ = tokio::time::timeout(hdr_wait, async {
+                                    while n < 5 {
+                                        let m = stream.read(&mut probe_buf[n..5]).await?;
+                                        if m == 0 {
+                                            break;
+                                        }
+                                        n += m;
+                                        if n >= 2 && probe_buf[1] != 0x03 {
+                                            break;
+                                        }
+                                    }
+                                    Ok::<(), std::io::Error>(())
+                                })
+                                .await;
+                            }
+                        }
+
                         let is_valid_tls_server_hello =
                             n >= 2 && probe_buf[0] == 0x16 && probe_buf[1] == 0x03;
 
@@ -1705,27 +1918,111 @@ impl EngineContext {
                             continue;
                         }
 
+                        let mut expected_server_record_len = None;
                         if is_valid_tls_server_hello {
                             let elapsed = read_started.elapsed();
                             let used_alternate_ip = stream_addr != remote_addr;
+                            let blocked_by_dead_primary_ip =
+                                used_alternate_ip && stage0_connect_error;
                             let silent_drop_recovered =
                                 current_global_timed_out && elapsed < FAST_SERVER_HELLO_THRESHOLD;
+                            let oob_alert_demotion = current_global_stage.is_oob()
+                                && saw_tls_alert
+                                && stage.is_clean_non_oob();
                             let eligible_for_promotion = idx > 0
-                                && (current_global_hard_blocked || silent_drop_recovered)
-                                && !saw_tls_alert
-                                && !used_alternate_ip;
+                                && (((current_global_hard_blocked || silent_drop_recovered)
+                                    && !saw_tls_alert)
+                                    || oob_alert_demotion)
+                                && !blocked_by_dead_primary_ip;
                             self.record_host_stage(
                                 cache_key.as_deref(),
                                 stage,
                                 eligible_for_promotion,
                             )
                             .await;
+
+                            // Finish reading the full outer ServerHello/HRR TLS record before
+                            // checking HelloRetryRequest and forwarding to the client so a
+                            // partial HRR read cannot either miss HRR detection (< 43 bytes)
+                            // or deadlock waiting for ClientHello #2 while tail bytes remain unread.
+                            if n < 5 {
+                                let _ =
+                                    tokio::time::timeout(Duration::from_millis(400), async {
+                                        while n < 5 {
+                                            let m = stream.read(&mut probe_buf[n..5]).await?;
+                                            if m == 0 {
+                                                break;
+                                            }
+                                            n += m;
+                                        }
+                                        Ok::<(), std::io::Error>(())
+                                    })
+                                    .await;
+                            }
+                            expected_server_record_len = expected_tls_record_len(&probe_buf[..n]);
+                            if let Some(expected_total) = expected_server_record_len
+                                .filter(|&total| total <= probe_buf.len() && n < total)
+                            {
+                                let _ =
+                                    tokio::time::timeout(Duration::from_millis(1000), async {
+                                        while n < expected_total {
+                                            let m = stream.read(&mut probe_buf[n..]).await?;
+                                            if m == 0 {
+                                                break;
+                                            }
+                                            n += m;
+                                        }
+                                        Ok::<(), std::io::Error>(())
+                                    })
+                                    .await;
+                            }
                         } else if let (Some(_), Some(key)) = (cached_stage, cache_key.as_deref()) {
                             self.evict_cached_host_stage(key).await;
                         }
 
                         let is_hrr = is_valid_tls_server_hello
+                            && expected_server_record_len
+                                .is_some_and(|expected_total| n >= expected_total)
                             && is_tls_hello_retry_request(&probe_buf[..n]);
+
+                        // Drain any trailing TLS 1.3 middlebox ChangeCipherSpec (6 bytes:
+                        // `0x14 0x03 0x03 0x00 0x01 0x01`) coalesced with or immediately
+                        // following HelloRetryRequest so the client receives complete records
+                        // before waiting for ClientHello #2.
+                        if let Some(expected_total) = expected_server_record_len.filter(|_| is_hrr)
+                        {
+                            let ccs_end = (expected_total + 6).min(probe_buf.len());
+                            if n == expected_total && n < ccs_end {
+                                n += stream.try_read(&mut probe_buf[n..ccs_end]).unwrap_or(0);
+                            }
+                            if n > expected_total
+                                && n < ccs_end
+                                && probe_buf[expected_total] == 0x14
+                                && (n - expected_total < 2
+                                    || probe_buf[expected_total + 1] == 0x03)
+                            {
+                                let _ =
+                                    tokio::time::timeout(Duration::from_millis(400), async {
+                                        while n < ccs_end {
+                                            let m = stream
+                                                .read(&mut probe_buf[n..ccs_end])
+                                                .await?;
+                                            if m == 0 {
+                                                break;
+                                            }
+                                            n += m;
+                                            if n - expected_total >= 2
+                                                && probe_buf[expected_total + 1] != 0x03
+                                            {
+                                                break;
+                                            }
+                                        }
+                                        Ok::<(), std::io::Error>(())
+                                    })
+                                    .await;
+                            }
+                        }
+
                         self.telemetry
                             .bytes_tx
                             .fetch_add(payload.len() as u64, Ordering::Relaxed);
@@ -1737,102 +2034,157 @@ impl EngineContext {
                         drop(probe_buf);
 
                         // TLS 1.3 HelloRetryRequest (e.g. server declines iOS X25519MLKEM768
-                        // key_share and requests secp256r1/x25519): read ClientHello #2 and
-                        // apply the exact winning desync strategy so DPI cannot drop CH #2.
+                        // key_share and requests secp256r1/x25519): forward any late-arriving
+                        // server CCS bytes cleanly while waiting for ClientHello #2, then apply
+                        // the exact winning desync strategy so DPI cannot drop CH #2.
                         if is_hrr {
                             let mut ch2_buf = vec![0u8; 16384 + 512];
-                            if let Ok(Ok(mut filled2)) = tokio::time::timeout(
-                                Duration::from_secs(4),
-                                client.read(&mut ch2_buf),
-                            )
-                            .await
-                            {
-                                if filled2 > 0 {
-                                    // Skip optional leading 6-byte ChangeCipherSpec record (0x14 0x03 0x03 0x00 0x01 0x01)
-                                    let ccs_prefix =
-                                        if filled2 >= 6 && ch2_buf[0] == 0x14 && ch2_buf[1] == 0x03
-                                        {
-                                            6usize
-                                        } else {
-                                            0usize
-                                        };
-                                    // If CCS arrived alone or the CH #2 5-byte TLS record header was split
-                                    // across TCP reads, finish reading the header before inspecting record len.
-                                    let header_end = ccs_prefix + 5;
-                                    if filled2 < header_end
-                                        && (filled2 == ccs_prefix
-                                            || (ch2_buf[ccs_prefix] == 0x16
-                                                && (filled2 - ccs_prefix < 2
-                                                    || ch2_buf[ccs_prefix + 1] == 0x03)
-                                                && (filled2 - ccs_prefix < 3
-                                                    || ch2_buf[ccs_prefix + 2] <= 0x04)))
-                                    {
+                            let mut srv_tail = [0u8; 64];
+                            let mut srv_tail_forwarded = 0usize;
+                            let hrr_deadline = Instant::now() + Duration::from_secs(4);
+                            let mut filled2 = 0usize;
+                            loop {
+                                let wait = hrr_deadline.saturating_duration_since(Instant::now());
+                                if wait.is_zero() {
+                                    break;
+                                }
+                                let next = tokio::time::timeout(wait, async {
+                                    tokio::select! {
+                                        biased;
+                                        res = client.read(&mut ch2_buf) => Ok::<_, std::io::Error>((true, res?)),
+                                        res = stream.read(&mut srv_tail) => Ok::<_, std::io::Error>((false, res?)),
+                                    }
+                                })
+                                .await;
+                                match next {
+                                    Ok(Ok((true, m))) => {
+                                        filled2 = m;
+                                        break;
+                                    }
+                                    Ok(Ok((false, 0))) | Ok(Err(_)) | Err(_) => {
+                                        break;
+                                    }
+                                    Ok(Ok((false, m))) => {
+                                        client.write_all(&srv_tail[..m]).await?;
+                                        client.flush().await?;
+                                        self.telemetry
+                                            .bytes_rx
+                                            .fetch_add(m as u64, Ordering::Relaxed);
+                                        srv_tail_forwarded += m;
+                                        if srv_tail_forwarded >= srv_tail.len() {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if filled2 > 0 {
+                                // Finish reading a split 6-byte ChangeCipherSpec prefix
+                                // (`0x14 0x03 0x03 0x00 0x01 0x01`) before parsing CH #2.
+                                if filled2 < 6
+                                    && ch2_buf[0] == 0x14
+                                    && (filled2 == 1 || ch2_buf[1] == 0x03)
+                                {
+                                    let _ = tokio::time::timeout(
+                                        Duration::from_millis(400),
+                                        async {
+                                            while filled2 < 6 {
+                                                let m = client
+                                                    .read(&mut ch2_buf[filled2..6])
+                                                    .await?;
+                                                if m == 0 {
+                                                    break;
+                                                }
+                                                filled2 += m;
+                                                if filled2 >= 2 && ch2_buf[1] != 0x03 {
+                                                    break;
+                                                }
+                                            }
+                                            Ok::<(), std::io::Error>(())
+                                        },
+                                    )
+                                    .await;
+                                }
+                                // Skip optional leading 6-byte ChangeCipherSpec record (0x14 0x03 0x03 0x00 0x01 0x01)
+                                let ccs_prefix =
+                                    if filled2 >= 6 && ch2_buf[0] == 0x14 && ch2_buf[1] == 0x03 {
+                                        6usize
+                                    } else {
+                                        0usize
+                                    };
+                                // If CCS arrived alone or the CH #2 5-byte TLS record header was split
+                                // across TCP reads, finish reading the header before inspecting record len.
+                                let header_end = ccs_prefix + 5;
+                                if filled2 < header_end
+                                    && (filled2 == ccs_prefix
+                                        || (ch2_buf[ccs_prefix] == 0x16
+                                            && (filled2 - ccs_prefix < 2
+                                                || ch2_buf[ccs_prefix + 1] == 0x03)
+                                            && (filled2 - ccs_prefix < 3
+                                                || ch2_buf[ccs_prefix + 2] <= 0x04)))
+                                {
+                                    let _ = tokio::time::timeout(
+                                        Duration::from_millis(400),
+                                        async {
+                                            while filled2 < header_end {
+                                                let m = client
+                                                    .read(&mut ch2_buf[filled2..header_end])
+                                                    .await?;
+                                                if m == 0 {
+                                                    break;
+                                                }
+                                                filled2 += m;
+                                                let ch2_have = filled2 - ccs_prefix;
+                                                if (ch2_have >= 1 && ch2_buf[ccs_prefix] != 0x16)
+                                                    || (ch2_have >= 2
+                                                        && ch2_buf[ccs_prefix + 1] != 0x03)
+                                                    || (ch2_have >= 3
+                                                        && ch2_buf[ccs_prefix + 2] > 0x04)
+                                                {
+                                                    break;
+                                                }
+                                            }
+                                            Ok::<(), std::io::Error>(())
+                                        },
+                                    )
+                                    .await;
+                                }
+                                if let Some(expected2) =
+                                    expected_tls_record_len(&ch2_buf[ccs_prefix..filled2])
+                                {
+                                    let target_len = (ccs_prefix + expected2).min(ch2_buf.len());
+                                    if filled2 < target_len {
                                         let _ = tokio::time::timeout(
-                                            Duration::from_millis(400),
+                                            Duration::from_millis(600),
                                             async {
-                                                while filled2 < header_end {
+                                                while filled2 < target_len {
                                                     let m = client
-                                                        .read(&mut ch2_buf[filled2..header_end])
+                                                        .read(&mut ch2_buf[filled2..target_len])
                                                         .await?;
                                                     if m == 0 {
                                                         break;
                                                     }
                                                     filled2 += m;
-                                                    let ch2_have = filled2 - ccs_prefix;
-                                                    if (ch2_have >= 1
-                                                        && ch2_buf[ccs_prefix] != 0x16)
-                                                        || (ch2_have >= 2
-                                                            && ch2_buf[ccs_prefix + 1] != 0x03)
-                                                        || (ch2_have >= 3
-                                                            && ch2_buf[ccs_prefix + 2] > 0x04)
-                                                    {
-                                                        break;
-                                                    }
                                                 }
                                                 Ok::<(), std::io::Error>(())
                                             },
                                         )
                                         .await;
                                     }
-                                    if let Some(expected2) =
-                                        expected_tls_record_len(&ch2_buf[ccs_prefix..filled2])
-                                    {
-                                        let target_len =
-                                            (ccs_prefix + expected2).min(ch2_buf.len());
-                                        if filled2 < target_len {
-                                            let _ = tokio::time::timeout(
-                                                Duration::from_millis(600),
-                                                async {
-                                                    while filled2 < target_len {
-                                                        let m = client
-                                                            .read(&mut ch2_buf[filled2..target_len])
-                                                            .await?;
-                                                        if m == 0 {
-                                                            break;
-                                                        }
-                                                        filled2 += m;
-                                                    }
-                                                    Ok::<(), std::io::Error>(())
-                                                },
-                                            )
-                                            .await;
-                                        }
-                                    }
-                                    let ch2_slice = &ch2_buf[..filled2];
-                                    if ccs_prefix > 0 {
-                                        stream.write_all(&ch2_slice[..ccs_prefix]).await?;
-                                    }
-                                    let tail = &ch2_slice[ccs_prefix..];
-                                    if let Some(ch2_info) = parse_client_hello(tail) {
-                                        self.write_tls_flight(&mut stream, tail, &ch2_info, stage)
-                                            .await?;
-                                    } else if !tail.is_empty() {
-                                        stream.write_all(tail).await?;
-                                    }
-                                    self.telemetry
-                                        .bytes_tx
-                                        .fetch_add(filled2 as u64, Ordering::Relaxed);
                                 }
+                                let ch2_slice = &ch2_buf[..filled2];
+                                if ccs_prefix > 0 {
+                                    stream.write_all(&ch2_slice[..ccs_prefix]).await?;
+                                }
+                                let tail = &ch2_slice[ccs_prefix..];
+                                if let Some(ch2_info) = parse_client_hello(tail) {
+                                    self.write_tls_flight(&mut stream, tail, &ch2_info, stage)
+                                        .await?;
+                                } else if !tail.is_empty() {
+                                    stream.write_all(tail).await?;
+                                }
+                                self.telemetry
+                                    .bytes_tx
+                                    .fetch_add(filled2 as u64, Ordering::Relaxed);
                             }
                         }
 
@@ -1843,6 +2195,9 @@ impl EngineContext {
                             self.telemetry
                                 .auto_heal_escalations
                                 .fetch_add(1, Ordering::Relaxed);
+                        }
+                        if idx == 0 && is_tcp_connect_io_error(&err) {
+                            stage0_connect_error = true;
                         }
                         if stage == current_global_stage && is_hard_block_io_error(&err) {
                             current_global_hard_blocked = true;
@@ -1913,11 +2268,11 @@ impl EngineContext {
             return;
         };
 
-        let now = unix_now_secs();
         let mut cache_changed = false;
         let mut promoted = false;
 
         if hard_block_promotion_eligible {
+            let now = unix_now_secs();
             let current_global = self.preferred_stage();
             let reached_quorum = {
                 let mut tracker = self
@@ -1942,6 +2297,31 @@ impl EngineContext {
             }
         }
 
+        // Fast-path: when no global promotion occurred, check under a shared read lock whether
+        // the cache already reflects `stage` (either uncached when matching `preferred_stage()`,
+        // or already cached with the unchanged exception `stage` + matching parent wildcard)
+        // before acquiring any exclusive write locks.
+        if !promoted {
+            let current_preferred = self.preferred_stage();
+            let guard = self.adaptive_cache.read().await;
+            let already_up_to_date = if stage == current_preferred {
+                !guard.contains_key(&key)
+            } else if guard.get(&key) != Some(&stage) {
+                false
+            } else if stage != LearnedStrategy::Primary
+                && stage != LearnedStrategy::DirectPassthrough
+            {
+                parent_domain_cache_key(&key)
+                    .is_none_or(|parent_key| guard.get(&parent_key) == Some(&stage))
+            } else {
+                true
+            };
+            if already_up_to_date {
+                return;
+            }
+        }
+
+        let now = unix_now_secs();
         {
             let mut guard = self.adaptive_cache.write().await;
             let mut ts_guard = self.adaptive_timestamps.write().await;
@@ -1968,7 +2348,9 @@ impl EngineContext {
                     cache_changed = true;
                 }
             } else {
-                let parent_key = if stage != LearnedStrategy::Primary {
+                let parent_key = if stage != LearnedStrategy::Primary
+                    && stage != LearnedStrategy::DirectPassthrough
+                {
                     parent_domain_cache_key(&key)
                 } else {
                     None
@@ -1998,13 +2380,19 @@ impl EngineContext {
             return Some(stage);
         }
         if let Some(parent_key) = parent_domain_cache_key(key) {
-            if let Some(&stage) = guard.get(&parent_key) {
+            if let Some(stage) = guard
+                .get(&parent_key)
+                .copied()
+                .filter(|&s| s != LearnedStrategy::DirectPassthrough)
+            {
                 return Some(stage);
             }
-            if let Some(apex) = parent_key.strip_prefix("*.") {
-                if let Some(&stage) = guard.get(apex) {
-                    return Some(stage);
-                }
+            if let Some(stage) = parent_key
+                .strip_prefix("*.")
+                .and_then(|apex| guard.get(apex).copied())
+                .filter(|&s| s != LearnedStrategy::DirectPassthrough)
+            {
+                return Some(stage);
             }
         }
         None
@@ -2014,15 +2402,17 @@ impl EngineContext {
         let removed = {
             let mut guard = self.adaptive_cache.write().await;
             let mut ts_guard = self.adaptive_timestamps.write().await;
-            let removed = if guard.remove(key).is_some() {
+            let mut removed = false;
+            if guard.remove(key).is_some() {
                 ts_guard.remove(key);
-                true
-            } else if let Some(parent_key) = parent_domain_cache_key(key) {
-                ts_guard.remove(&parent_key);
-                guard.remove(&parent_key).is_some()
-            } else {
-                false
-            };
+                removed = true;
+            }
+            if let Some(parent_key) = parent_domain_cache_key(key) {
+                if guard.remove(&parent_key).is_some() {
+                    ts_guard.remove(&parent_key);
+                    removed = true;
+                }
+            }
             self.telemetry
                 .learned_hosts
                 .store(guard.len(), Ordering::Relaxed);
@@ -2035,15 +2425,24 @@ impl EngineContext {
 
     fn build_stage_order(&self, cached_stage: Option<LearnedStrategy>) -> Vec<LearnedStrategy> {
         let mut order = Vec::with_capacity(ALL_STAGES.len());
+        let fragment_primary = self.config.mode == DesyncMode::Fragment;
+        let is_duplicate = |order: &[LearnedStrategy], candidate: LearnedStrategy| {
+            order.contains(&candidate)
+                || (fragment_primary
+                    && ((candidate == LearnedStrategy::FineFragment
+                        && order.contains(&LearnedStrategy::Primary))
+                        || (candidate == LearnedStrategy::Primary
+                            && order.contains(&LearnedStrategy::FineFragment))))
+        };
         if let Some(cached) = cached_stage {
             order.push(cached);
         }
         let preferred = self.preferred_stage();
-        if !order.contains(&preferred) {
+        if !is_duplicate(&order, preferred) {
             order.push(preferred);
         }
         for stage in ALL_STAGES {
-            if !order.contains(&stage) {
+            if !is_duplicate(&order, stage) {
                 order.push(stage);
             }
         }
@@ -2275,6 +2674,11 @@ impl EngineContext {
     }
 }
 
+struct HandshakeAttemptConfig {
+    budget: Duration,
+    preseeded_retry_addrs: Option<Vec<SocketAddr>>,
+}
+
 fn compute_stage_deadline(
     now: Instant,
     handshake_deadline: Instant,
@@ -2333,39 +2737,79 @@ fn can_bind_locally(mut addr: SocketAddr) -> bool {
         .is_ok()
 }
 
+fn canonical_socket_addr(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) if v6.ip().to_ipv4_mapped().is_some() => {
+            SocketAddr::new(addr.ip().to_canonical(), addr.port())
+        }
+        _ => addr,
+    }
+}
+
+fn select_retry_target(
+    addrs: &[SocketAddr],
+    remote_addr: SocketAddr,
+    dead_retry_ips: &[SocketAddr],
+    idx: usize,
+) -> SocketAddr {
+    let live_count = addrs
+        .iter()
+        .skip(1)
+        .filter(|addr| **addr != remote_addr && !dead_retry_ips.contains(addr))
+        .count();
+    if live_count == 0 {
+        return remote_addr;
+    }
+    let pick = idx.saturating_sub(1) % live_count;
+    addrs
+        .iter()
+        .skip(1)
+        .copied()
+        .filter(|addr| *addr != remote_addr && !dead_retry_ips.contains(addr))
+        .nth(pick)
+        .unwrap_or(remote_addr)
+}
+
 async fn connect_retry_stream(
     ctx: &EngineContext,
     target: SocketAddr,
     fallback: SocketAddr,
     deadline: Instant,
+    dead_retry_ips: &mut Vec<SocketAddr>,
 ) -> Option<(TcpStream, SocketAddr)> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return None;
+    }
+    if target != fallback && !dead_retry_ips.contains(&target) {
+        if ctx.is_dead_retry_ip(target).await {
+            dead_retry_ips.push(target);
+        } else {
+            if let Ok(Ok(s)) = tokio::time::timeout(
+                Duration::from_millis(2200).min(remaining),
+                ctx.connect_upstream(target),
+            )
+            .await
+            {
+                let _ = s.set_nodelay(true);
+                return Some((s, target));
+            }
+            dead_retry_ips.push(target);
+            ctx.mark_dead_retry_ip(target).await;
+        }
+    }
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return None;
     }
     if let Ok(Ok(s)) = tokio::time::timeout(
         Duration::from_millis(2200).min(remaining),
-        ctx.connect_upstream(target),
+        ctx.connect_upstream(fallback),
     )
     .await
     {
         let _ = s.set_nodelay(true);
-        return Some((s, target));
-    }
-    if target != fallback {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return None;
-        }
-        if let Ok(Ok(s)) = tokio::time::timeout(
-            Duration::from_millis(2200).min(remaining),
-            ctx.connect_upstream(fallback),
-        )
-        .await
-        {
-            let _ = s.set_nodelay(true);
-            return Some((s, fallback));
-        }
+        return Some((s, fallback));
     }
     None
 }
@@ -4194,15 +4638,14 @@ mod tests {
         let (mut peer, local) = tokio::io::duplex(64 * 1024);
         let mut counted = CountingStream::new(local, &telemetry, &active);
 
-        // Small write (< TELEMETRY_BATCH_BYTES) stays batched until flush/pending, while setting active.
+        // Small write (< TELEMETRY_BATCH_BYTES) stays batched across poll_flush until
+        // threshold/shutdown/drop, while still flushing the inner stream and setting active.
         let small = b"ping-frame";
         counted.write_all(small).await.unwrap();
         assert!(active.load(Ordering::Relaxed));
+        assert_eq!(telemetry.bytes_tx.load(Ordering::Relaxed), 0);
         counted.flush().await.unwrap();
-        assert_eq!(
-            telemetry.bytes_tx.load(Ordering::Relaxed),
-            small.len() as u64
-        );
+        assert_eq!(telemetry.bytes_tx.load(Ordering::Relaxed), 0);
 
         let mut got = [0u8; 10];
         peer.read_exact(&mut got).await.unwrap();
@@ -4219,15 +4662,37 @@ mod tests {
                 remaining -= n;
             }
             peer.shutdown().await.unwrap();
+            peer
         });
 
         active.store(false, Ordering::Relaxed);
         let mut drained = Vec::with_capacity(total_rx);
         counted.read_to_end(&mut drained).await.unwrap();
-        writer.await.unwrap();
+        let _peer = writer.await.unwrap();
         assert_eq!(drained.len(), total_rx);
         assert!(active.load(Ordering::Relaxed));
         assert_eq!(telemetry.bytes_rx.load(Ordering::Relaxed), total_rx as u64);
+
+        // Residual TX bytes below TELEMETRY_BATCH_BYTES flush on shutdown.
+        counted.shutdown().await.unwrap();
+        assert_eq!(
+            telemetry.bytes_tx.load(Ordering::Relaxed),
+            small.len() as u64
+        );
+
+        // Residual TX bytes also flush on Drop without shutdown.
+        let telemetry_drop = EngineTelemetry::default();
+        let active_drop = AtomicBool::new(false);
+        let (_peer2, local2) = tokio::io::duplex(1024);
+        let mut counted2 = CountingStream::new(local2, &telemetry_drop, &active_drop);
+        counted2.write_all(small).await.unwrap();
+        counted2.flush().await.unwrap();
+        assert_eq!(telemetry_drop.bytes_tx.load(Ordering::Relaxed), 0);
+        drop(counted2);
+        assert_eq!(
+            telemetry_drop.bytes_tx.load(Ordering::Relaxed),
+            small.len() as u64
+        );
     }
 
     #[tokio::test]
@@ -4319,5 +4784,1218 @@ mod tests {
 
         app_task.await.unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hrr_partial_server_record_and_split_ccs_prefix_avoids_deadlock() {
+        let config = RuntimeConfig {
+            system_proxy: false,
+            chunk_size: 10,
+            patterns: vec!["hrr-partial\\.example$".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let ctx = EngineContext::new(config).unwrap();
+
+        let ch1 = build_synthetic_client_hello("edge.hrr-partial.example", 512);
+        let ch2 = build_synthetic_client_hello("edge.hrr-partial.example", 512);
+        let ch1_payload_len = ch1.len() - 5;
+        let ch2_expected_payload = ch2[5..].to_vec();
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = upstream.accept().await.unwrap();
+            let mut got1 = 0usize;
+            while got1 < ch1_payload_len {
+                let mut hdr = [0u8; 5];
+                sock.read_exact(&mut hdr).await.unwrap();
+                let rlen = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                let mut body = vec![0u8; rlen];
+                sock.read_exact(&mut body).await.unwrap();
+                got1 += rlen;
+            }
+
+            // Send TLS 1.3 HelloRetryRequest split across 3 TCP segments (2 bytes, 42 bytes, tail).
+            let mut hrr = vec![
+                0x16, 0x03, 0x03, 0x00, 0x30, 0x02, 0x00, 0x00, 0x2c, 0x03, 0x03,
+            ];
+            hrr.extend_from_slice(&TLS13_HELLO_RETRY_REQUEST_RANDOM);
+            hrr.extend_from_slice(&[0u8; 10]);
+            sock.write_all(&hrr[..2]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            sock.write_all(&hrr[2..44]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            sock.write_all(&hrr[44..]).await.unwrap();
+
+            // Expect 6-byte ChangeCipherSpec followed by desynced multi-record ClientHello #2.
+            let mut ccs = [0u8; 6];
+            sock.read_exact(&mut ccs).await.unwrap();
+            assert_eq!(ccs, [0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
+
+            let mut reassembled2 = Vec::with_capacity(ch2_expected_payload.len());
+            let mut ch2_records = 0usize;
+            while reassembled2.len() < ch2_expected_payload.len() {
+                let mut hdr = [0u8; 5];
+                sock.read_exact(&mut hdr).await.unwrap();
+                assert_eq!(hdr[0], 0x16);
+                let rlen = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                let mut body = vec![0u8; rlen];
+                sock.read_exact(&mut body).await.unwrap();
+                reassembled2.extend_from_slice(&body);
+                ch2_records += 1;
+            }
+            assert_eq!(reassembled2, ch2_expected_payload);
+            assert!(ch2_records >= 2);
+            let _ = sock.shutdown().await;
+        });
+
+        let (mut app_side, tun_side) = tokio::io::duplex(64 * 1024);
+        let ch1_send = ch1.clone();
+        let ch2_send = ch2.clone();
+        let app_task = tokio::spawn(async move {
+            app_side.write_all(&ch1_send).await.unwrap();
+            let mut hrr_reply = [0u8; 53];
+            app_side.read_exact(&mut hrr_reply).await.unwrap();
+
+            // Send CCS split across two reads (2 bytes + 4 bytes), then ClientHello #2.
+            app_side.write_all(&[0x14, 0x03]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            app_side.write_all(&[0x03, 0x00, 0x01, 0x01]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            app_side.write_all(&ch2_send).await.unwrap();
+            app_side.shutdown().await.unwrap();
+        });
+
+        let remote = ctx.connect_upstream_addr(upstream_addr).await.unwrap();
+        ctx.relay_stream(
+            tun_side,
+            remote,
+            Some("edge.hrr-partial.example"),
+            upstream_addr,
+        )
+        .await
+        .unwrap();
+
+        app_task.await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_passthrough_skips_parent_wildcard_and_eviction_removes_both_keys() {
+        let ctx = test_engine_context();
+
+        // Multi-tenant cloud and Turkish suffixes must be treated as two-part TLDs.
+        for host in [
+            "d123.cloudfront.net",
+            "s3.amazonaws.com",
+            "user.github.io",
+            "site.pages.dev",
+            "app.workers.dev",
+            "tenant.akamaized.net",
+            "cdn.fastly.net",
+            "demo.vercel.app",
+            "school.k12.tr",
+            "ankara.bel.tr",
+            "egm.pol.tr",
+            "corp.kep.tr",
+            "kkk.tsk.tr",
+        ] {
+            assert_eq!(
+                parent_domain_cache_key(host),
+                None,
+                "multi-tenant/2-part TLD {host} must not collapse into broad wildcard"
+            );
+        }
+        assert_eq!(
+            parent_domain_cache_key("sub.school.k12.tr").as_deref(),
+            Some("*.school.k12.tr")
+        );
+        assert_eq!(
+            parent_domain_cache_key("a.site.pages.dev").as_deref(),
+            Some("*.site.pages.dev")
+        );
+
+        // DirectPassthrough must never write a `*.parent` wildcard entry.
+        ctx.record_host_stage(
+            Some("strict.vendor.example"),
+            LearnedStrategy::DirectPassthrough,
+            false,
+        )
+        .await;
+        {
+            let guard = ctx.adaptive_cache.read().await;
+            assert_eq!(
+                guard.get("strict.vendor.example").copied(),
+                Some(LearnedStrategy::DirectPassthrough)
+            );
+            assert!(!guard.contains_key("*.vendor.example"));
+        }
+
+        // Non-Primary / non-DirectPassthrough writes both host and `*.parent`, and eviction
+        // must remove both together so stale `*.parent` does not survive.
+        ctx.record_host_stage(
+            Some("shard1.cdn.example"),
+            LearnedStrategy::FineFragment,
+            false,
+        )
+        .await;
+        {
+            let guard = ctx.adaptive_cache.read().await;
+            assert_eq!(
+                guard.get("shard1.cdn.example").copied(),
+                Some(LearnedStrategy::FineFragment)
+            );
+            assert_eq!(
+                guard.get("*.cdn.example").copied(),
+                Some(LearnedStrategy::FineFragment)
+            );
+        }
+        ctx.evict_cached_host_stage("shard1.cdn.example").await;
+        {
+            let guard = ctx.adaptive_cache.read().await;
+            assert!(!guard.contains_key("shard1.cdn.example"));
+            assert!(!guard.contains_key("*.cdn.example"));
+        }
+
+        // Fragment mode must deduplicate FineFragment in build_stage_order.
+        let frag_ctx = EngineContext::new(RuntimeConfig {
+            system_proxy: false,
+            mode: DesyncMode::Fragment,
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        let frag_order = frag_ctx.build_stage_order(None);
+        assert!(frag_order.contains(&LearnedStrategy::Primary));
+        assert!(!frag_order.contains(&LearnedStrategy::FineFragment));
+        assert_eq!(frag_order.len(), ALL_STAGES.len() - 1);
+    }
+
+    #[tokio::test]
+    async fn oob_stage_demotes_to_clean_non_oob_after_three_tls_alert_hosts() {
+        let config = RuntimeConfig {
+            system_proxy: false,
+            chunk_size: 10,
+            patterns: vec!["oob-demote-[a-z]\\.example$".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let ctx = EngineContext::new(config).unwrap();
+        ctx.preferred_isp_stage_updated_at
+            .store(unix_now_secs(), Ordering::Release);
+        ctx.preferred_isp_stage
+            .store(LearnedStrategy::OobSniDesync as u8, Ordering::Release);
+        assert_eq!(ctx.preferred_stage(), LearnedStrategy::OobSniDesync);
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let step_counter = Arc::new(AtomicUsize::new(0));
+        let step_srv = Arc::clone(&step_counter);
+
+        // Even attempts (OobSniDesync) get TLS Alert 0x15; odd attempts (Primary) succeed.
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = upstream.accept().await else {
+                    break;
+                };
+                let step = step_srv.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut hdr = [0u8; 5];
+                    if sock.read_exact(&mut hdr).await.is_err() {
+                        return;
+                    }
+                    let rlen = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                    let mut body = vec![0u8; rlen];
+                    let _ = sock.read_exact(&mut body).await;
+
+                    if step.is_multiple_of(2) {
+                        let _ = sock
+                            .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x32])
+                            .await;
+                    } else {
+                        let _ = sock
+                            .write_all(&[
+                                0x16, 0x03, 0x03, 0x00, 0x05, b'C', b'L', b'E', b'A', b'N',
+                            ])
+                            .await;
+                    }
+                    let _ = sock.shutdown().await;
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        tokio::io::copy(&mut sock, &mut tokio::io::sink()),
+                    )
+                    .await;
+                });
+            }
+        });
+
+        let hosts = [
+            "a.oob-demote-a.example",
+            "b.oob-demote-b.example",
+            "c.oob-demote-c.example",
+        ];
+        for (idx, &host) in hosts.iter().enumerate() {
+            let ch = build_synthetic_client_hello(host, 256);
+            let (mut app_side, mut tun_side) = tokio::io::duplex(8192);
+            let reader = tokio::spawn(async move {
+                let mut reply = [0u8; 10];
+                app_side.read_exact(&mut reply).await.unwrap();
+                reply
+            });
+            let remote = TcpStream::connect(upstream_addr).await.unwrap();
+            let _ = ctx
+                .establish_initial_flight(&mut tun_side, remote, &ch, Some(host), upstream_addr)
+                .await
+                .unwrap();
+            let reply = reader.await.unwrap();
+            assert_eq!(
+                &reply,
+                &[0x16, 0x03, 0x03, 0x00, 0x05, b'C', b'L', b'E', b'A', b'N']
+            );
+            if idx + 1 < FAST_PROMOTION_QUORUM {
+                assert_eq!(ctx.preferred_stage(), LearnedStrategy::OobSniDesync);
+            }
+        }
+        assert_eq!(ctx.preferred_stage(), LearnedStrategy::Primary);
+    }
+
+    #[tokio::test]
+    async fn connect_retry_stream_dials_alt_target_before_fallback() {
+        let ctx = test_engine_context();
+        let alt_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let alt_addr = alt_listener.local_addr().unwrap();
+        let orig_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let orig_addr = orig_listener.local_addr().unwrap();
+
+        let mut dead_retry_ips = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (_stream, connected) =
+            connect_retry_stream(&ctx, alt_addr, orig_addr, deadline, &mut dead_retry_ips)
+                .await
+                .expect("should connect to alt_addr first");
+        assert_eq!(connected, alt_addr);
+        assert!(dead_retry_ips.is_empty());
+
+        // When alt_addr is closed, falls back cleanly to orig_addr and marks alt_addr dead.
+        drop(alt_listener);
+        let (_stream2, connected2) =
+            connect_retry_stream(&ctx, alt_addr, orig_addr, deadline, &mut dead_retry_ips)
+                .await
+                .expect("should fall back to orig_addr");
+        assert_eq!(connected2, orig_addr);
+        assert_eq!(dead_retry_ips, vec![alt_addr]);
+    }
+
+    #[tokio::test]
+    async fn dead_alternate_ip_is_skipped_on_subsequent_retry_stages_reaching_oob() {
+        let primary_ip: SocketAddr = "198.51.100.1:443".parse().unwrap();
+        let dead_ip: SocketAddr = "198.51.100.2:443".parse().unwrap();
+        let live_ip: SocketAddr = "198.51.100.3:443".parse().unwrap();
+        let sample_addrs = [primary_ip, dead_ip, live_ip];
+        assert_eq!(select_retry_target(&sample_addrs, primary_ip, &[], 1), dead_ip);
+        assert_eq!(
+            select_retry_target(&sample_addrs, primary_ip, &[dead_ip], 2),
+            live_ip
+        );
+        assert_eq!(
+            select_retry_target(&sample_addrs, primary_ip, &[dead_ip, live_ip], 3),
+            primary_ip
+        );
+
+        #[derive(Debug, Default)]
+        struct DialCountingBinder {
+            calls: AtomicUsize,
+        }
+
+        impl OutboundBinder for DialCountingBinder {
+            fn bind_socket(
+                &self,
+                _sock: socket2::SockRef<'_>,
+                _is_ipv4: bool,
+            ) -> std::io::Result<()> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let binder = Arc::new(DialCountingBinder::default());
+        let binder_trait: Arc<dyn OutboundBinder> = binder.clone();
+        let config = RuntimeConfig {
+            system_proxy: false,
+            chunk_size: 10,
+            patterns: vec!["dead-alt\\.example$".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let ctx = EngineContext::new_with_binder(config, Some(binder_trait)).unwrap();
+
+        let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = primary_listener.local_addr().unwrap();
+        let dead_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead_listener.local_addr().unwrap();
+        drop(dead_listener);
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_srv = Arc::clone(&attempts);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = primary_listener.accept().await else {
+                    break;
+                };
+                let step = attempts_srv.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut hdr = [0u8; 5];
+                    if sock.read_exact(&mut hdr).await.is_err() {
+                        return;
+                    }
+                    let rlen = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                    let mut body = vec![0u8; rlen];
+                    let _ = sock.read_exact(&mut body).await;
+
+                    if step == 0 {
+                        let _ = sock
+                            .write_all(
+                                b"HTTP/1.1 302 Found\r\nLocation: http://blocked.isp/\r\n\r\n",
+                            )
+                            .await;
+                    } else if step < 4 {
+                        let _ = sock
+                            .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x32])
+                            .await;
+                    } else {
+                        let _ = sock
+                            .write_all(&[
+                                0x16, 0x03, 0x03, 0x00, 0x05, b'O', b'O', b'B', b'O', b'K',
+                            ])
+                            .await;
+                    }
+                    let _ = sock.shutdown().await;
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        tokio::io::copy(&mut sock, &mut tokio::io::sink()),
+                    )
+                    .await;
+                });
+            }
+        });
+
+        let host = "edge.dead-alt.example";
+        let ch = build_synthetic_client_hello(host, 256);
+        let (mut app_side, mut tun_side) = tokio::io::duplex(8192);
+        let reader = tokio::spawn(async move {
+            let mut reply = [0u8; 10];
+            app_side.read_exact(&mut reply).await.unwrap();
+            reply
+        });
+
+        let initial_remote = TcpStream::connect(primary_addr).await.unwrap();
+        let _stream = ctx
+            .establish_initial_flight_inner(
+                &mut tun_side,
+                initial_remote,
+                &ch,
+                Some(host),
+                primary_addr,
+                HandshakeAttemptConfig {
+                    budget: MAX_HANDSHAKE_DEADLINE,
+                    preseeded_retry_addrs: Some(vec![primary_addr, dead_addr]),
+                },
+            )
+            .await
+            .unwrap();
+
+        let reply = reader.await.unwrap();
+        assert_eq!(
+            &reply,
+            &[0x16, 0x03, 0x03, 0x00, 0x05, b'O', b'O', b'B', b'O', b'K']
+        );
+        // Stages 0..=4 hit primary_addr 5 times total; dead_addr is dialed ONLY once on stage 1
+        // and skipped on stages 2, 3, and 4 (1 dead dial + 4 primary retry dials = 5 total dials).
+        assert_eq!(attempts.load(Ordering::SeqCst), 5);
+        assert_eq!(binder.calls.load(Ordering::SeqCst), 5);
+        assert_eq!(
+            ctx.adaptive_cache.read().await.get(host).copied(),
+            Some(LearnedStrategy::OobSniDesync)
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_alternate_ip_is_skipped_across_connections_and_cleared_on_success() {
+        #[derive(Debug, Default)]
+        struct DialCountingBinder {
+            calls: AtomicUsize,
+        }
+
+        impl OutboundBinder for DialCountingBinder {
+            fn bind_socket(
+                &self,
+                _sock: socket2::SockRef<'_>,
+                _is_ipv4: bool,
+            ) -> std::io::Result<()> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let binder = Arc::new(DialCountingBinder::default());
+        let binder_trait: Arc<dyn OutboundBinder> = binder.clone();
+        let config = RuntimeConfig {
+            system_proxy: false,
+            chunk_size: 10,
+            patterns: vec!["cross-dead-[12]\\.example$".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let ctx = EngineContext::new_with_binder(config, Some(binder_trait)).unwrap();
+
+        let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = primary_listener.local_addr().unwrap();
+        let dead_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead_listener.local_addr().unwrap();
+        drop(dead_listener);
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_srv = Arc::clone(&attempts);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = primary_listener.accept().await else {
+                    break;
+                };
+                let step = attempts_srv.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut hdr = [0u8; 5];
+                    if sock.read_exact(&mut hdr).await.is_err() {
+                        return;
+                    }
+                    let rlen = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                    let mut body = vec![0u8; rlen];
+                    let _ = sock.read_exact(&mut body).await;
+
+                    if step.is_multiple_of(2) {
+                        let _ = sock
+                            .write_all(
+                                b"HTTP/1.1 302 Found\r\nLocation: http://blocked.isp/\r\n\r\n",
+                            )
+                            .await;
+                    } else {
+                        let _ = sock
+                            .write_all(&[
+                                0x16, 0x03, 0x03, 0x00, 0x05, b'R', b'E', b'T', b'R', b'Y',
+                            ])
+                            .await;
+                    }
+                    let _ = sock.shutdown().await;
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        tokio::io::copy(&mut sock, &mut tokio::io::sink()),
+                    )
+                    .await;
+                });
+            }
+        });
+
+        // Connection 1 discovers dead_addr once on stage 1 (1 dead dial + 1 fallback dial = 2).
+        let host1 = "a.cross-dead-1.example";
+        let ch1 = build_synthetic_client_hello(host1, 256);
+        let (mut app1, mut tun1) = tokio::io::duplex(8192);
+        let reader1 = tokio::spawn(async move {
+            let mut reply = [0u8; 10];
+            app1.read_exact(&mut reply).await.unwrap();
+            reply
+        });
+        let init1 = TcpStream::connect(primary_addr).await.unwrap();
+        let _stream1 = ctx
+            .establish_initial_flight_inner(
+                &mut tun1,
+                init1,
+                &ch1,
+                Some(host1),
+                primary_addr,
+                HandshakeAttemptConfig {
+                    budget: MAX_HANDSHAKE_DEADLINE,
+                    preseeded_retry_addrs: Some(vec![primary_addr, dead_addr]),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            &reader1.await.unwrap(),
+            &[0x16, 0x03, 0x03, 0x00, 0x05, b'R', b'E', b'T', b'R', b'Y']
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(binder.calls.load(Ordering::SeqCst), 2);
+        assert!(ctx.is_dead_retry_ip(dead_addr).await);
+
+        // Connection 2 on a cloned EngineContext skips dead_addr completely (0 dead dials + 1 fallback dial).
+        let ctx2 = ctx.clone();
+        let host2 = "b.cross-dead-2.example";
+        let ch2 = build_synthetic_client_hello(host2, 256);
+        let (mut app2, mut tun2) = tokio::io::duplex(8192);
+        let reader2 = tokio::spawn(async move {
+            let mut reply = [0u8; 10];
+            app2.read_exact(&mut reply).await.unwrap();
+            reply
+        });
+        let init2 = TcpStream::connect(primary_addr).await.unwrap();
+        let _stream2 = ctx2
+            .establish_initial_flight_inner(
+                &mut tun2,
+                init2,
+                &ch2,
+                Some(host2),
+                primary_addr,
+                HandshakeAttemptConfig {
+                    budget: MAX_HANDSHAKE_DEADLINE,
+                    preseeded_retry_addrs: Some(vec![primary_addr, dead_addr]),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            &reader2.await.unwrap(),
+            &[0x16, 0x03, 0x03, 0x00, 0x05, b'R', b'E', b'T', b'R', b'Y']
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 4);
+        assert_eq!(binder.calls.load(Ordering::SeqCst), 3);
+
+        // Cached dead IP is skipped directly in connect_retry_stream, and cleared if it succeeds.
+        let recovered_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let recovered_addr = recovered_listener.local_addr().unwrap();
+        ctx.mark_dead_retry_ip(recovered_addr).await;
+        assert!(ctx.is_dead_retry_ip(recovered_addr).await);
+
+        let mut local_dead = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (_s, connected) =
+            connect_retry_stream(&ctx, recovered_addr, primary_addr, deadline, &mut local_dead)
+                .await
+                .expect("should skip cached dead IP and connect to fallback");
+        assert_eq!(connected, primary_addr);
+        assert_eq!(local_dead, vec![recovered_addr]);
+        assert_eq!(binder.calls.load(Ordering::SeqCst), 4);
+
+        let _recovered_stream = ctx.connect_upstream_addr(recovered_addr).await.unwrap();
+        assert!(!ctx.is_dead_retry_ip(recovered_addr).await);
+        assert!(!ctx.dead_retry_ips.read().await.contains_key(&recovered_addr));
+
+        let (_s2, connected2) =
+            connect_retry_stream(&ctx, recovered_addr, primary_addr, deadline, &mut Vec::new())
+                .await
+                .expect("should dial recovered_addr once cleared from cache");
+        assert_eq!(connected2, recovered_addr);
+
+        // Expired TTL entry is ignored and cleared once dial succeeds.
+        if let Some(expired) = Instant::now().checked_sub(DEAD_RETRY_IP_TTL + Duration::from_secs(1))
+        {
+            ctx.dead_retry_ips
+                .write()
+                .await
+                .insert(recovered_addr, expired);
+            assert!(!ctx.is_dead_retry_ip(recovered_addr).await);
+            let (_s3, connected3) =
+                connect_retry_stream(&ctx, recovered_addr, primary_addr, deadline, &mut Vec::new())
+                    .await
+                    .expect("expired dead IP should be retried");
+            assert_eq!(connected3, recovered_addr);
+            assert!(!ctx.dead_retry_ips.read().await.contains_key(&recovered_addr));
+        }
+
+        // Cache stays bounded at MAX_DEAD_RETRY_IPS entries.
+        for i in 0..(MAX_DEAD_RETRY_IPS + 20) {
+            let addr = SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(198, 51, (i / 256) as u8, (i % 256) as u8)),
+                443,
+            );
+            ctx.mark_dead_retry_ip(addr).await;
+        }
+        assert_eq!(ctx.dead_retry_ips.read().await.len(), MAX_DEAD_RETRY_IPS);
+    }
+
+    #[tokio::test]
+    async fn stage_promotion_and_oob_demotion_succeed_with_alternate_ip_after_dpi_reset() {
+        let config = RuntimeConfig {
+            system_proxy: false,
+            chunk_size: 10,
+            patterns: vec![
+                "alt-promo-[a-z]\\.example$".to_string(),
+                "alt-demote-[a-z]\\.example$".to_string(),
+            ],
+            ..RuntimeConfig::default()
+        };
+        let ctx = EngineContext::new(config).unwrap();
+
+        // Part A: Primary IP connects and gets DPI fast-EOF on stage 0 (Primary), while stage 1
+        // (FineFragment) succeeds on an alternate IP. Must still promote preferred_isp_stage.
+        let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = primary_listener.local_addr().unwrap();
+        let alt_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let alt_addr = alt_listener.local_addr().unwrap();
+        let alt_hits = Arc::new(AtomicUsize::new(0));
+        let alt_hits_srv = Arc::clone(&alt_hits);
+
+        let promo_hosts = [
+            "a.alt-promo-a.example",
+            "b.alt-promo-b.example",
+            "c.alt-promo-c.example",
+        ];
+        let expected_payload_len = build_synthetic_client_hello(promo_hosts[0], 256).len() - 5;
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = primary_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut total = 0usize;
+                    while total < expected_payload_len {
+                        let mut hdr = [0u8; 5];
+                        if sock.read_exact(&mut hdr).await.is_err() {
+                            break;
+                        }
+                        let rlen = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                        let mut body = vec![0u8; rlen];
+                        if sock.read_exact(&mut body).await.is_err() {
+                            break;
+                        }
+                        total += rlen;
+                    }
+                    // Simulate immediate DPI connection teardown after ClientHello.
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = alt_listener.accept().await else {
+                    break;
+                };
+                let hits = Arc::clone(&alt_hits_srv);
+                tokio::spawn(async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let mut hdr = [0u8; 5];
+                    if sock.read_exact(&mut hdr).await.is_err() {
+                        return;
+                    }
+                    let rlen = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                    let mut body = vec![0u8; rlen];
+                    let _ = sock.read_exact(&mut body).await;
+                    let _ = sock
+                        .write_all(&[0x16, 0x03, 0x03, 0x00, 0x05, b'A', b'L', b'T', b'O', b'K'])
+                        .await;
+                    let _ = sock.shutdown().await;
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        tokio::io::copy(&mut sock, &mut tokio::io::sink()),
+                    )
+                    .await;
+                });
+            }
+        });
+
+        for &host in &promo_hosts {
+            let ch = build_synthetic_client_hello(host, 256);
+            let (mut app_side, mut tun_side) = tokio::io::duplex(8192);
+            let reader = tokio::spawn(async move {
+                let mut reply = [0u8; 10];
+                app_side.read_exact(&mut reply).await.unwrap();
+                reply
+            });
+            let remote = TcpStream::connect(primary_addr).await.unwrap();
+            let _stream = ctx
+                .establish_initial_flight_inner(
+                    &mut tun_side,
+                    remote,
+                    &ch,
+                    Some(host),
+                    primary_addr,
+                    HandshakeAttemptConfig {
+                        budget: MAX_HANDSHAKE_DEADLINE,
+                        preseeded_retry_addrs: Some(vec![primary_addr, alt_addr]),
+                    },
+                )
+                .await
+                .unwrap();
+            let reply = reader.await.unwrap();
+            assert_eq!(
+                &reply,
+                &[0x16, 0x03, 0x03, 0x00, 0x05, b'A', b'L', b'T', b'O', b'K']
+            );
+        }
+        assert_eq!(alt_hits.load(Ordering::SeqCst), FAST_PROMOTION_QUORUM);
+        assert_eq!(ctx.preferred_stage(), LearnedStrategy::FineFragment);
+
+        // Part B: Promoted OOB stage receives TLS Alert (0x15) on primary IP, and clean non-OOB
+        // Primary succeeds on an alternate IP. Must still demote OOB back to Primary.
+        ctx.preferred_isp_stage_updated_at
+            .store(unix_now_secs(), Ordering::Release);
+        ctx.preferred_isp_stage
+            .store(LearnedStrategy::OobSniDesync as u8, Ordering::Release);
+
+        let primary_oob = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_oob_addr = primary_oob.local_addr().unwrap();
+        let alt_oob = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let alt_oob_addr = alt_oob.local_addr().unwrap();
+        let alt_oob_hits = Arc::new(AtomicUsize::new(0));
+        let alt_oob_hits_srv = Arc::clone(&alt_oob_hits);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = primary_oob.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut hdr = [0u8; 5];
+                    if sock.read_exact(&mut hdr).await.is_err() {
+                        return;
+                    }
+                    let rlen = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                    let mut body = vec![0u8; rlen];
+                    let _ = sock.read_exact(&mut body).await;
+                    let _ = sock
+                        .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x32])
+                        .await;
+                    let _ = sock.shutdown().await;
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        tokio::io::copy(&mut sock, &mut tokio::io::sink()),
+                    )
+                    .await;
+                });
+            }
+        });
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = alt_oob.accept().await else {
+                    break;
+                };
+                let hits = Arc::clone(&alt_oob_hits_srv);
+                tokio::spawn(async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let mut hdr = [0u8; 5];
+                    if sock.read_exact(&mut hdr).await.is_err() {
+                        return;
+                    }
+                    let rlen = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                    let mut body = vec![0u8; rlen];
+                    let _ = sock.read_exact(&mut body).await;
+                    let _ = sock
+                        .write_all(&[0x16, 0x03, 0x03, 0x00, 0x05, b'C', b'L', b'E', b'A', b'N'])
+                        .await;
+                    let _ = sock.shutdown().await;
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        tokio::io::copy(&mut sock, &mut tokio::io::sink()),
+                    )
+                    .await;
+                });
+            }
+        });
+
+        let demote_hosts = [
+            "a.alt-demote-a.example",
+            "b.alt-demote-b.example",
+            "c.alt-demote-c.example",
+        ];
+        for &host in &demote_hosts {
+            let ch = build_synthetic_client_hello(host, 256);
+            let (mut app_side, mut tun_side) = tokio::io::duplex(8192);
+            let reader = tokio::spawn(async move {
+                let mut reply = [0u8; 10];
+                app_side.read_exact(&mut reply).await.unwrap();
+                reply
+            });
+            let remote = TcpStream::connect(primary_oob_addr).await.unwrap();
+            let _stream = ctx
+                .establish_initial_flight_inner(
+                    &mut tun_side,
+                    remote,
+                    &ch,
+                    Some(host),
+                    primary_oob_addr,
+                    HandshakeAttemptConfig {
+                        budget: MAX_HANDSHAKE_DEADLINE,
+                        preseeded_retry_addrs: Some(vec![primary_oob_addr, alt_oob_addr]),
+                    },
+                )
+                .await
+                .unwrap();
+            let reply = reader.await.unwrap();
+            assert_eq!(
+                &reply,
+                &[0x16, 0x03, 0x03, 0x00, 0x05, b'C', b'L', b'E', b'A', b'N']
+            );
+        }
+        assert_eq!(alt_oob_hits.load(Ordering::SeqCst), FAST_PROMOTION_QUORUM);
+        assert_eq!(ctx.preferred_stage(), LearnedStrategy::Primary);
+    }
+
+    #[tokio::test]
+    async fn hrr_drains_trailing_server_ccs_and_skips_incomplete_hrr() {
+        let config = RuntimeConfig {
+            system_proxy: false,
+            chunk_size: 10,
+            patterns: vec!["hrr-edge\\.example$".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let ctx = EngineContext::new(config).unwrap();
+
+        let ch1 = build_synthetic_client_hello("edge.hrr-edge.example", 512);
+        let ch2 = build_synthetic_client_hello("edge.hrr-edge.example", 512);
+        let ch1_payload_len = ch1.len() - 5;
+        let ch2_expected_payload = ch2[5..].to_vec();
+
+        // Subtest A: Server sends HRR followed by a delayed 6-byte middlebox CCS; client waits
+        // for both HRR + server CCS before sending ClientHello #2 (must not deadlock).
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = upstream.accept().await.unwrap();
+            let mut got1 = 0usize;
+            while got1 < ch1_payload_len {
+                let mut hdr = [0u8; 5];
+                sock.read_exact(&mut hdr).await.unwrap();
+                let rlen = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                let mut body = vec![0u8; rlen];
+                sock.read_exact(&mut body).await.unwrap();
+                got1 += rlen;
+            }
+
+            let mut hrr = vec![
+                0x16, 0x03, 0x03, 0x00, 0x30, 0x02, 0x00, 0x00, 0x2c, 0x03, 0x03,
+            ];
+            hrr.extend_from_slice(&TLS13_HELLO_RETRY_REQUEST_RANDOM);
+            hrr.extend_from_slice(&[0u8; 10]);
+            sock.write_all(&hrr).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            sock.write_all(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01])
+                .await
+                .unwrap();
+
+            let mut ccs = [0u8; 6];
+            sock.read_exact(&mut ccs).await.unwrap();
+            assert_eq!(ccs, [0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
+
+            let mut reassembled2 = Vec::with_capacity(ch2_expected_payload.len());
+            let mut ch2_records = 0usize;
+            while reassembled2.len() < ch2_expected_payload.len() {
+                let mut hdr = [0u8; 5];
+                sock.read_exact(&mut hdr).await.unwrap();
+                assert_eq!(hdr[0], 0x16);
+                let rlen = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                let mut body = vec![0u8; rlen];
+                sock.read_exact(&mut body).await.unwrap();
+                reassembled2.extend_from_slice(&body);
+                ch2_records += 1;
+            }
+            assert_eq!(reassembled2, ch2_expected_payload);
+            assert!(ch2_records >= 2);
+            let _ = sock.shutdown().await;
+        });
+
+        let (mut app_side, tun_side) = tokio::io::duplex(64 * 1024);
+        let ch1_send = ch1.clone();
+        let ch2_send = ch2.clone();
+        let app_task = tokio::spawn(async move {
+            app_side.write_all(&ch1_send).await.unwrap();
+            // Client waits for BOTH the 53-byte HRR AND the 6-byte trailing server CCS.
+            let mut hrr_and_ccs = [0u8; 59];
+            app_side.read_exact(&mut hrr_and_ccs).await.unwrap();
+            assert_eq!(&hrr_and_ccs[53..], &[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
+
+            app_side
+                .write_all(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01])
+                .await
+                .unwrap();
+            app_side.write_all(&ch2_send).await.unwrap();
+            app_side.shutdown().await.unwrap();
+        });
+
+        let remote = ctx.connect_upstream_addr(upstream_addr).await.unwrap();
+        ctx.relay_stream(tun_side, remote, Some("edge.hrr-edge.example"), upstream_addr)
+            .await
+            .unwrap();
+        app_task.await.unwrap();
+        server.await.unwrap();
+
+        // Subtest B: Truncated HRR (45 < 53 expected_total) must NOT classify as HRR or stall
+        // waiting 4s for ClientHello #2.
+        let trunc_upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let trunc_addr = trunc_upstream.local_addr().unwrap();
+        let trunc_srv = tokio::spawn(async move {
+            let (mut sock, _) = trunc_upstream.accept().await.unwrap();
+            let mut got1 = 0usize;
+            while got1 < ch1_payload_len {
+                let mut hdr = [0u8; 5];
+                sock.read_exact(&mut hdr).await.unwrap();
+                let rlen = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                let mut body = vec![0u8; rlen];
+                sock.read_exact(&mut body).await.unwrap();
+                got1 += rlen;
+            }
+            let mut partial_hrr = vec![
+                0x16, 0x03, 0x03, 0x00, 0x30, 0x02, 0x00, 0x00, 0x2c, 0x03, 0x03,
+            ];
+            partial_hrr.extend_from_slice(&TLS13_HELLO_RETRY_REQUEST_RANDOM);
+            partial_hrr.extend_from_slice(&[0u8; 2]); // 45 of 53 bytes
+            sock.write_all(&partial_hrr).await.unwrap();
+            let _ = sock.shutdown().await;
+        });
+
+        let (mut app_side2, mut tun_side2) = tokio::io::duplex(8192);
+        let reader2 = tokio::spawn(async move {
+            let mut got = [0u8; 45];
+            app_side2.read_exact(&mut got).await.unwrap();
+            got
+        });
+        let remote2 = TcpStream::connect(trunc_addr).await.unwrap();
+        let started = Instant::now();
+        let _stream2 = ctx
+            .establish_initial_flight(
+                &mut tun_side2,
+                remote2,
+                &ch1,
+                Some("edge.hrr-edge.example"),
+                trunc_addr,
+            )
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "incomplete HRR must not stall waiting 4s for ClientHello #2"
+        );
+        let _ = reader2.await.unwrap();
+        trunc_srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn apex_direct_passthrough_not_inherited_and_cached_hit_skips_write_lock() {
+        let ctx = test_engine_context();
+
+        // Apex DirectPassthrough applies only to exact host, never inherited by subdomains.
+        ctx.record_host_stage(
+            Some("vendor.example"),
+            LearnedStrategy::DirectPassthrough,
+            false,
+        )
+        .await;
+        assert_eq!(
+            ctx.lookup_cached_host_stage("vendor.example").await,
+            Some(LearnedStrategy::DirectPassthrough)
+        );
+        assert_eq!(ctx.lookup_cached_host_stage("sub.vendor.example").await, None);
+
+        // Even a legacy `*.parent` DirectPassthrough entry must not be inherited.
+        ctx.adaptive_cache.write().await.insert(
+            "*.legacy-direct.example".to_string(),
+            LearnedStrategy::DirectPassthrough,
+        );
+        assert_eq!(
+            ctx.lookup_cached_host_stage("a.legacy-direct.example").await,
+            None
+        );
+
+        // Non-DirectPassthrough apex strategies remain inheritable by subdomains.
+        ctx.record_host_stage(Some("cdn-ok.example"), LearnedStrategy::FineFragment, false)
+            .await;
+        assert_eq!(
+            ctx.lookup_cached_host_stage("img.cdn-ok.example").await,
+            Some(LearnedStrategy::FineFragment)
+        );
+
+        // Cached exception host hits (apex, subdomain, DirectPassthrough) must take the shared
+        // read-lock fast path without ever acquiring an exclusive write lock.
+        ctx.record_host_stage(
+            Some("shard1.exc-sub.example"),
+            LearnedStrategy::FineFragment,
+            false,
+        )
+        .await;
+        let _read_guard = ctx.adaptive_cache.read().await;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(250),
+                ctx.record_host_stage(Some("cdn-ok.example"), LearnedStrategy::FineFragment, false),
+            )
+            .await
+            .is_ok()
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(250),
+                ctx.record_host_stage(
+                    Some("shard1.exc-sub.example"),
+                    LearnedStrategy::FineFragment,
+                    false,
+                ),
+            )
+            .await
+            .is_ok()
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(250),
+                ctx.record_host_stage(
+                    Some("vendor.example"),
+                    LearnedStrategy::DirectPassthrough,
+                    false,
+                ),
+            )
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_target_deprioritizes_dead_ips_across_connections_and_clears_on_recovery() {
+        #[derive(Debug)]
+        struct FailingFirstDialBinder {
+            calls: AtomicUsize,
+            fail_remaining: AtomicUsize,
+        }
+
+        impl OutboundBinder for FailingFirstDialBinder {
+            fn bind_socket(
+                &self,
+                _sock: socket2::SockRef<'_>,
+                _is_ipv4: bool,
+            ) -> std::io::Result<()> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let prev = self
+                    .fail_remaining
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+                if prev.is_ok() {
+                    return Err(std::io::Error::new(
+                        ErrorKind::TimedOut,
+                        "simulated SYN-blackholed dead IP",
+                    ));
+                }
+                Ok(())
+            }
+        }
+
+        let live_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = live_listener.local_addr().unwrap();
+        let live_port = live_addr.port();
+        let dead_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), live_port);
+
+        let accept_task = tokio::spawn(async move {
+            while let Ok((_sock, _)) = live_listener.accept().await {}
+        });
+
+        let udp_dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_dns_addr = udp_dns.local_addr().unwrap();
+        let dns_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, peer)) = udp_dns.recv_from(&mut buf).await {
+                if n < 12 {
+                    continue;
+                }
+                let mut pos = 12usize;
+                while pos < n && buf[pos] != 0 {
+                    pos = pos.saturating_add(1 + usize::from(buf[pos]));
+                }
+                let question_end = pos.saturating_add(5);
+                if question_end > n {
+                    continue;
+                }
+                let rd = u16::from_be_bytes([buf[2], buf[3]]) & 0x0100;
+                let resp_flags = 0x8080 | rd;
+                let answers = [Ipv4Addr::new(127, 0, 0, 2), Ipv4Addr::LOCALHOST];
+                let mut resp = Vec::with_capacity(12 + (question_end - 12) + answers.len() * 16);
+                resp.extend_from_slice(&buf[0..2]); // TX ID
+                resp.extend_from_slice(&resp_flags.to_be_bytes());
+                resp.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+                resp.extend_from_slice(&u16::try_from(answers.len()).unwrap().to_be_bytes()); // ANCOUNT
+                resp.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+                resp.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+                resp.extend_from_slice(&buf[12..question_end]);
+                for v4 in answers {
+                    resp.extend_from_slice(&[0xc0, 0x0c]); // QNAME pointer at offset 12
+                    resp.extend_from_slice(&1u16.to_be_bytes()); // TYPE A
+                    resp.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+                    resp.extend_from_slice(&60u32.to_be_bytes()); // TTL 60s
+                    resp.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH 4
+                    resp.extend_from_slice(&v4.octets());
+                }
+                let _ = udp_dns.send_to(&resp, peer).await;
+            }
+        });
+
+        let binder = Arc::new(FailingFirstDialBinder {
+            calls: AtomicUsize::new(0),
+            fail_remaining: AtomicUsize::new(1),
+        });
+        let binder_trait: Arc<dyn OutboundBinder> = binder.clone();
+        let config = RuntimeConfig {
+            system_proxy: false,
+            dns_addr: "127.0.0.1".to_string(),
+            dns_port: udp_dns_addr.port(),
+            enable_doh: false,
+            dns_ipv4_only: true,
+            disable_system_dns_fallback: true,
+            connect_timeout: Duration::from_secs(5),
+            ..RuntimeConfig::default()
+        };
+        let ctx = EngineContext::new_with_binder(config, Some(binder_trait)).unwrap();
+
+        // Connection 1: DNS returns [dead_ip, live_ip]. First dial fails, second succeeds,
+        // so dead_addr is cached in dead_retry_ips and live_addr stays clear.
+        let (_s1, connected1) = ctx
+            .connect_target("dead-first.example", live_port)
+            .await
+            .expect("second A record should succeed after first fails");
+        assert_eq!(connected1, live_addr);
+        assert_eq!(binder.calls.load(Ordering::SeqCst), 2);
+        assert!(ctx.is_dead_retry_ip(dead_addr).await);
+        assert!(!ctx.is_dead_retry_ip(live_addr).await);
+
+        // Connection 2 on a cloned EngineContext: dead_addr is deprioritized behind live_addr,
+        // so live_addr is dialed first and succeeds immediately (only 1 dial, no 3s timeout).
+        let ctx2 = ctx.clone();
+        let started = Instant::now();
+        let (_s2, connected2) = ctx2
+            .connect_target("dead-first.example", live_port)
+            .await
+            .expect("healthy A record should be dialed first without touching cached dead IP");
+        assert_eq!(connected2, live_addr);
+        assert_eq!(binder.calls.load(Ordering::SeqCst), 3);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "deprioritized dead IP must not burn the 3s connect timeout"
+        );
+        assert!(ctx2.is_dead_retry_ip(dead_addr).await);
+
+        // If all candidates are marked dead, deprioritized IPs are still dialed as fallback,
+        // and the succeeding IP is cleared from dead_retry_ips.
+        ctx.mark_dead_retry_ip(live_addr).await;
+        assert!(ctx.is_dead_retry_ip(live_addr).await);
+        binder.fail_remaining.store(1, Ordering::SeqCst);
+        let (_s3, connected3) = ctx
+            .connect_target("dead-first.example", live_port)
+            .await
+            .expect("all-dead fallback should still connect and clear succeeding IP");
+        assert_eq!(connected3, live_addr);
+        assert_eq!(binder.calls.load(Ordering::SeqCst), 5);
+        assert!(ctx.is_dead_retry_ip(dead_addr).await);
+        assert!(!ctx.is_dead_retry_ip(live_addr).await);
+        assert!(!ctx.dead_retry_ips.read().await.contains_key(&live_addr));
+
+        // When every candidate fails (e.g. transient outage), do not poison dead_retry_ips.
+        let unused_port = {
+            let tmp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            tmp.local_addr().unwrap().port()
+        };
+        let unused_dead = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), unused_port);
+        let unused_live = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), unused_port);
+        binder.fail_remaining.store(2, Ordering::SeqCst);
+        assert!(ctx
+            .connect_target("dead-first.example", unused_port)
+            .await
+            .is_err());
+        assert_eq!(binder.calls.load(Ordering::SeqCst), 7);
+        assert!(!ctx.is_dead_retry_ip(unused_dead).await);
+        assert!(!ctx.is_dead_retry_ip(unused_live).await);
+
+        dns_task.abort();
+        accept_task.abort();
     }
 }

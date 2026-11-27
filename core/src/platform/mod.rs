@@ -92,14 +92,86 @@ impl SystemProxySession {
         }
     }
 
-    pub fn with_vpn_coexistence(self, mode: VpnCoexistence) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub fn activate_with_options(
+        addr: IpAddr,
+        http_port: u16,
+        socks_port: Option<u16>,
+        enable_socks_system_proxy: bool,
+        enable_env_proxy: bool,
+        extra_bypass: &[String],
+        include_domains: &[String],
+        vpn_coexistence: VpnCoexistence,
+    ) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            let inner = macos::MacosProxySession::activate_with_options(
+                addr,
+                http_port,
+                socks_port,
+                enable_socks_system_proxy,
+                enable_env_proxy,
+                extra_bypass,
+                include_domains,
+                vpn_coexistence,
+            )?;
+            Ok(Self { inner })
+        }
+
         #[cfg(target_os = "windows")]
+        {
+            let _ = include_domains;
+            let inner = windows::WindowsProxySession::activate(
+                addr,
+                http_port,
+                socks_port,
+                enable_socks_system_proxy,
+                enable_env_proxy,
+                extra_bypass,
+            )
+            .map(|s| s.with_vpn_coexistence(vpn_coexistence))?;
+            Ok(Self { inner })
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let _ = vpn_coexistence;
+            let inner = linux::LinuxProxySession::activate_with_options(
+                addr,
+                http_port,
+                socks_port,
+                enable_socks_system_proxy,
+                enable_env_proxy,
+                extra_bypass,
+                include_domains,
+            )?;
+            Ok(Self { inner })
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        {
+            let _ = (
+                addr,
+                http_port,
+                socks_port,
+                enable_socks_system_proxy,
+                enable_env_proxy,
+                extra_bypass,
+                include_domains,
+                vpn_coexistence,
+            );
+            Ok(Self {})
+        }
+    }
+
+    pub fn with_vpn_coexistence(self, mode: VpnCoexistence) -> Self {
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             Self {
                 inner: self.inner.with_vpn_coexistence(mode),
             }
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
             let _ = mode;
             self

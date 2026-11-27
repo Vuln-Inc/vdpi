@@ -1,5 +1,6 @@
 package com.vulninc.vdpi.engine
 
+import android.net.VpnService
 import android.os.ParcelFileDescriptor
 import com.vulninc.vdpi.BuildConfig
 import kotlinx.serialization.SerialName
@@ -59,6 +60,7 @@ data class TelemetrySnapshot(
     @SerialName("dns_queries") val dnsQueries: Long = 0L,
     @SerialName("quic_blocked") val quicBlocked: Long = 0L,
     @SerialName("udp_flows_active") val udpFlowsActive: Long = 0L,
+    @SerialName("dropped_packets") val droppedPackets: Long = 0L,
     @SerialName("learned_hosts") val learnedHosts: Int = 0,
     @SerialName("stage_number") val stageNumber: Int = 1,
     @SerialName("stage_label") val stageLabel: String = "ComboMultiRecord",
@@ -106,6 +108,13 @@ object NativeEngine {
     private external fun nativeStart(tunFd: Int, configJson: String): String?
 
     @JvmStatic
+    private external fun nativeStartWithProtector(
+        tunFd: Int,
+        configJson: String,
+        vpnService: VpnService?,
+    ): String?
+
+    @JvmStatic
     private external fun nativeStop()
 
     @JvmStatic
@@ -116,6 +125,9 @@ object NativeEngine {
 
     @JvmStatic
     private external fun nativeClearCache()
+
+    @JvmStatic
+    private external fun nativeNotifyRouteChange()
 
     @JvmStatic
     private external fun nativeVersion(): String
@@ -144,10 +156,18 @@ object NativeEngine {
         }
     }
 
-    fun startWithEncoded(tunFd: Int, encodedConfig: String): Result<Unit> {
+    fun startWithEncoded(
+        tunFd: Int,
+        encodedConfig: String,
+        vpnService: VpnService? = null,
+    ): Result<Unit> {
         val err = try {
             ensureLoaded()
-            nativeStart(tunFd, encodedConfig)
+            if (vpnService != null) {
+                nativeStartWithProtector(tunFd, encodedConfig, vpnService)
+            } else {
+                nativeStart(tunFd, encodedConfig)
+            }
         } catch (t: Throwable) {
             // Native never took ownership of tunFd if library load or JNI symbol binding threw.
             closeUnownedFd(tunFd)
@@ -160,11 +180,19 @@ object NativeEngine {
         }
     }
 
-    fun start(tunFd: Int, config: NativeEngineConfig): Result<Unit> {
+    fun start(
+        tunFd: Int,
+        config: NativeEngineConfig,
+        vpnService: VpnService? = null,
+    ): Result<Unit> {
         val err = try {
             ensureLoaded()
             val encoded = encodeConfig(config)
-            nativeStart(tunFd, encoded)
+            if (vpnService != null) {
+                nativeStartWithProtector(tunFd, encoded, vpnService)
+            } else {
+                nativeStart(tunFd, encoded)
+            }
         } catch (t: Throwable) {
             // Native never took ownership of tunFd if load, encoding, or JNI symbol binding threw.
             closeUnownedFd(tunFd)
@@ -214,6 +242,11 @@ object NativeEngine {
             nativeClearCache()
             true
         }.getOrDefault(false)
+    }
+
+    fun notifyRouteChange() {
+        if (!loaded) return
+        runCatching { nativeNotifyRouteChange() }
     }
 
     fun version(): String {

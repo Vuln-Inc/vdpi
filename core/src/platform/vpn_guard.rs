@@ -106,22 +106,24 @@ impl VpnGuard {
                 }
             }
             VpnCoexistence::AutoYield => match scope {
-                VpnScope::FullTunnel { provider, .. } => {
-                    let already_yielded = match &mut self.state {
-                        GuardState::YieldedStandby {
-                            provider: active_provider,
-                            ..
-                        } => {
-                            if active_provider != provider {
-                                active_provider.clone_from(provider);
-                            }
-                            true
+                VpnScope::FullTunnel { provider, .. } => match &mut self.state {
+                    GuardState::YieldedStandby {
+                        provider: active_provider,
+                        ..
+                    } => {
+                        if active_provider != provider {
+                            active_provider.clone_from(provider);
                         }
-                        GuardState::Active | GuardState::Recovering { .. } => false,
-                    };
-                    if already_yielded {
                         GuardAction::None
-                    } else {
+                    }
+                    GuardState::Recovering { .. } => {
+                        self.state = GuardState::YieldedStandby {
+                            provider: provider.clone(),
+                            since: now,
+                        };
+                        GuardAction::None
+                    }
+                    GuardState::Active => {
                         self.state = GuardState::YieldedStandby {
                             provider: provider.clone(),
                             since: now,
@@ -130,7 +132,7 @@ impl VpnGuard {
                             provider: provider.clone(),
                         }
                     }
-                }
+                },
                 VpnScope::None | VpnScope::SplitOverlay { .. } => {
                     let transition = match &self.state {
                         GuardState::Active => None,
@@ -368,14 +370,10 @@ mod tests {
             GuardAction::None
         );
 
-        // VPN reappears before 3s elapses -> cancels recovery immediately without ResumeTun.
+        // VPN reappears before 3s elapses -> cancels recovery smoothly back to YieldedStandby
+        // without emitting ResumeTun or a duplicate YieldTun.
         let t2 = t1 + Duration::from_millis(2900);
-        assert_eq!(
-            guard.evaluate(&nord, t2),
-            GuardAction::YieldTun {
-                provider: "NordVPN".to_string(),
-            }
-        );
+        assert_eq!(guard.evaluate(&nord, t2), GuardAction::None);
         assert_eq!(
             guard.state(),
             &GuardState::YieldedStandby {

@@ -28,6 +28,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.intOrNull
 import java.io.IOException
+import java.net.URI
 import java.util.Locale
 
 private val Context.vdpiDataStore: DataStore<Preferences> by preferencesDataStore(
@@ -72,15 +73,18 @@ data class VdpiSettings(
     val splitPackages: Set<String> = emptySet(),
     val theme: ThemePreference = ThemePreference.SYSTEM,
 ) {
-    fun toNativeConfig(): NativeEngineConfig = NativeEngineConfig(
-        mode = desyncMode,
-        chunkSize = chunkSize.coerceIn(1, 64),
-        dnsAddr = dnsAddr.trim().ifEmpty { "1.1.1.1" },
-        enableDoh = enableDoh,
-        ipv4Only = ipv4Only,
-        blockQuic = blockQuic,
-        bypassDomains = bypassDomains,
-    )
+    fun toNativeConfig(): NativeEngineConfig {
+        val cleanedDns = dnsAddr.trim().ifEmpty { "1.1.1.1" }
+        return NativeEngineConfig(
+            mode = desyncMode,
+            chunkSize = chunkSize.coerceIn(1, 64),
+            dnsAddr = cleanedDns,
+            enableDoh = enableDoh || cleanedDns.startsWith("https://", ignoreCase = true),
+            ipv4Only = ipv4Only,
+            blockQuic = blockQuic,
+            bypassDomains = bypassDomains,
+        )
+    }
 }
 
 data class UpdateCheckCache(
@@ -148,12 +152,15 @@ class SettingsRepository(private val context: Context) {
 
             val splitMode = SplitTunnelMode.fromWire(prefs[Keys.SPLIT_MODE])
             val theme = ThemePreference.fromWire(prefs[Keys.THEME])
+            val dnsAddr = prefs[Keys.DNS_ADDR]?.takeIf { it.isNotBlank() } ?: "1.1.1.1"
+            val enableDoh = (prefs[Keys.ENABLE_DOH] ?: true) ||
+                dnsAddr.trim().startsWith("https://", ignoreCase = true)
 
             VdpiSettings(
                 desyncMode = mode,
                 chunkSize = (prefs[Keys.CHUNK_SIZE] ?: 10).coerceIn(1, 64),
-                dnsAddr = prefs[Keys.DNS_ADDR]?.takeIf { it.isNotBlank() } ?: "1.1.1.1",
-                enableDoh = prefs[Keys.ENABLE_DOH] ?: true,
+                dnsAddr = dnsAddr,
+                enableDoh = enableDoh,
                 ipv4Only = prefs[Keys.IPV4_ONLY] ?: false,
                 blockQuic = prefs[Keys.BLOCK_QUIC] ?: true,
                 bypassDomains = prefs[Keys.BYPASS_DOMAINS]?.sorted() ?: emptyList(),
@@ -175,11 +182,19 @@ class SettingsRepository(private val context: Context) {
 
     suspend fun setDnsAddr(addr: String) {
         val cleaned = addr.trim().ifEmpty { "1.1.1.1" }
-        context.vdpiDataStore.edit { it[Keys.DNS_ADDR] = cleaned }
+        context.vdpiDataStore.edit { prefs ->
+            prefs[Keys.DNS_ADDR] = cleaned
+            if (cleaned.startsWith("https://", ignoreCase = true)) {
+                prefs[Keys.ENABLE_DOH] = true
+            }
+        }
     }
 
     suspend fun setEnableDoh(enabled: Boolean) {
-        context.vdpiDataStore.edit { it[Keys.ENABLE_DOH] = enabled }
+        context.vdpiDataStore.edit { prefs ->
+            val currentDns = prefs[Keys.DNS_ADDR]?.trim().orEmpty()
+            prefs[Keys.ENABLE_DOH] = enabled || currentDns.startsWith("https://", ignoreCase = true)
+        }
     }
 
     suspend fun setIpv4Only(enabled: Boolean) {
@@ -235,6 +250,8 @@ class SettingsRepository(private val context: Context) {
 
     suspend fun applySettings(settings: VdpiSettings) {
         val cleanedDns = settings.dnsAddr.trim().ifEmpty { "1.1.1.1" }
+        val normalizedEnableDoh = settings.enableDoh ||
+            cleanedDns.startsWith("https://", ignoreCase = true)
         val cleanedDomains = settings.bypassDomains
             .map { sanitizeDomainInput(it) }
             .filter { isValidBypassDomain(it) }
@@ -243,7 +260,7 @@ class SettingsRepository(private val context: Context) {
             prefs[Keys.DESYNC_MODE] = settings.desyncMode.wireName
             prefs[Keys.CHUNK_SIZE] = settings.chunkSize.coerceIn(1, 64)
             prefs[Keys.DNS_ADDR] = cleanedDns
-            prefs[Keys.ENABLE_DOH] = settings.enableDoh
+            prefs[Keys.ENABLE_DOH] = normalizedEnableDoh
             prefs[Keys.IPV4_ONLY] = settings.ipv4Only
             prefs[Keys.BLOCK_QUIC] = settings.blockQuic
             prefs[Keys.BYPASS_DOMAINS] = cleanedDomains
@@ -307,6 +324,22 @@ class SettingsRepository(private val context: Context) {
             encodeDefaults = true
         }
 
+        private fun redactDnsInputForError(raw: String): String {
+            val trimmed = raw.trim()
+            if (trimmed.contains("https://", ignoreCase = true)) {
+                val lower = trimmed.lowercase(Locale.ROOT)
+                if (!lower.startsWith("https://")) return "https://<redacted>"
+                val parsed = runCatching { URI(trimmed) }.getOrNull()
+                val host = parsed?.host?.takeIf { it.isNotBlank() && parsed.userInfo == null }
+                val portSuffix = parsed?.port?.takeIf { it in 1..65535 }?.let { ":$it" }.orEmpty()
+                return if (host != null) "https://$host$portSuffix/<redacted>" else "https://<redacted>"
+            }
+            if (trimmed.contains("http://", ignoreCase = true)) {
+                return "http://<redacted>"
+            }
+            return trimmed.ifEmpty { "<empty>" }
+        }
+
         fun decodeCachedUpdate(raw: String): ReleaseUpdateInfo? {
             if (raw.isBlank()) return null
             return runCatching {
@@ -332,7 +365,7 @@ class SettingsRepository(private val context: Context) {
                 desyncMode = settings.desyncMode.wireName,
                 chunkSize = settings.chunkSize.coerceIn(1, 64),
                 dnsAddr = cleanedDns,
-                enableDoh = settings.enableDoh,
+                enableDoh = settings.enableDoh || cleanedDns.startsWith("https://", ignoreCase = true),
                 ipv4Only = settings.ipv4Only,
                 blockQuic = settings.blockQuic,
                 bypassDomains = cleanedDomains,
@@ -372,7 +405,9 @@ class SettingsRepository(private val context: Context) {
             } ?: throw IllegalArgumentException("Unsupported desync mode: $modeKey")
 
             val dns = payload.dnsAddr.trim()
-            require(isValidDnsInput(dns)) { "Invalid DNS address: ${payload.dnsAddr}" }
+            require(isValidDnsInput(dns)) { "Invalid DNS address: ${redactDnsInputForError(payload.dnsAddr)}" }
+            val normalizedEnableDoh = payload.enableDoh ||
+                dns.startsWith("https://", ignoreCase = true)
 
             val splitModeKey = payload.splitTunnelMode.trim()
             val splitMode = SplitTunnelMode.entries.firstOrNull {
@@ -401,7 +436,7 @@ class SettingsRepository(private val context: Context) {
                 desyncMode = desyncMode,
                 chunkSize = payload.chunkSize.coerceIn(1, 64),
                 dnsAddr = dns,
-                enableDoh = payload.enableDoh,
+                enableDoh = normalizedEnableDoh,
                 ipv4Only = payload.ipv4Only,
                 blockQuic = payload.blockQuic,
                 bypassDomains = sanitizedDomains,

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use regex::{RegexSet, RegexSetBuilder};
+use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use std::borrow::Cow;
 use std::net::{IpAddr, Ipv4Addr};
 
@@ -9,11 +9,30 @@ use std::net::{IpAddr, Ipv4Addr};
 pub const DEFAULT_BYPASS_PATTERNS: &[&str] = &[
     // Local / private networks & Tailscale
     "localhost",
+    "*.localhost",
+    "*.localdomain",
     "*.local",
     "*.lan",
     "*.internal",
     "*.home.arpa",
     "*.ts.net",
+    // OS captive-portal & connectivity probe domains
+    "www.msftconnecttest.com",
+    "msftconnecttest.com",
+    "ipv6.msftconnecttest.com",
+    "www.msftncsi.com",
+    "msftncsi.com",
+    "dns.msftncsi.com",
+    "captive.apple.com",
+    "connectivitycheck.gstatic.com",
+    "connectivitycheck.android.com",
+    "clients3.google.com",
+    "detectportal.firefox.com",
+    "nmcheck.gnome.org",
+    "networkcheck.kde.org",
+    "connectivity-check.ubuntu.com",
+    "ping.archlinux.org",
+    "neverssl.com",
     // Government, military, international & Turkish public-sector domains
     "*.gov",
     "*.mil",
@@ -24,6 +43,7 @@ pub const DEFAULT_BYPASS_PATTERNS: &[&str] = &[
     "*.pol.tr",
     "*.tsk.tr",
     "*.kep.tr",
+    "*.k12.tr",
     "*.edu.tr",
     "*.org.tr",
     "*.osym.gov.tr",
@@ -39,8 +59,11 @@ pub const DEFAULT_BYPASS_PATTERNS: &[&str] = &[
     "*.garanti.com.tr",
     "*.garantibbva.com.tr",
     "*.ziraatbank.com.tr",
+    "*.ziraatkatilim.com.tr",
     "*.yapikredi.com.tr",
     "*.vakifbank.com.tr",
+    "*.vakifkatilim.com.tr",
+    "*.emlakkatilim.com.tr",
     "*.qnb.com.tr",
     "*.qnbfinansbank.com",
     "*.qnbfinansbank.com.tr",
@@ -51,14 +74,34 @@ pub const DEFAULT_BYPASS_PATTERNS: &[&str] = &[
     "*.kuveytturk.com.tr",
     "*.albaraka.com.tr",
     "*.odeabank.com.tr",
+    "*.sekerbank.com.tr",
+    "*.fibabanka.com.tr",
+    "*.anadolubank.com.tr",
+    "*.burgan.com.tr",
+    "*.alternatifbank.com.tr",
+    "*.hsbc.com.tr",
+    "*.turkiyefinans.com.tr",
+    "*.aktifbank.com.tr",
+    "*.nkolay.com",
     "*.iyzico.com",
     "*.iyzipay.com",
     "*.paytr.com",
     "*.papara.com",
+    "*.troyodeme.com",
+    "*.tosla.com",
+    "*.param.com.tr",
+    "*.ininal.com",
     // Sensitive Turkish platforms & telecom
     "*.sahibinden.com",
     "*.shbdn.com",
     "*.turktelekom.com.tr",
+    "*.turkcell.com.tr",
+    "*.vodafone.com.tr",
+    "*.superonline.net",
+    "*.turk.net",
+    "*.kablonet.com.tr",
+    "*.turksat.com.tr",
+    "*.ttnet.com.tr",
     "*.pttavm.com",
     // Riot / Valorant (strict TLS & anti-cheat)
     "*.riotgames.com",
@@ -174,19 +217,20 @@ impl IpNet {
 /// or pass through untouched.
 #[derive(Debug, Clone)]
 pub struct BypassPolicy {
-    bypass_regexes: RegexSet,
+    default_bypass_regexes: RegexSet,
+    user_bypass_regexes: RegexSet,
     bypass_cidrs: Vec<IpNet>,
     target_patterns: Option<RegexSet>,
 }
 
 impl BypassPolicy {
     pub fn new(extra_bypass: &[String], include_patterns: &[String]) -> Result<Self> {
-        let mut bypass_exprs =
-            Vec::with_capacity(DEFAULT_BYPASS_PATTERNS.len() + extra_bypass.len());
+        let mut default_bypass_exprs = Vec::with_capacity(DEFAULT_BYPASS_PATTERNS.len());
+        let mut user_bypass_exprs = Vec::with_capacity(extra_bypass.len());
         let mut bypass_cidrs = Vec::new();
         for pat in DEFAULT_BYPASS_PATTERNS {
             if let Some(expr) = wildcard_to_regex(pat) {
-                bypass_exprs.push(expr);
+                default_bypass_exprs.push(expr);
             }
         }
         for pat in extra_bypass {
@@ -203,18 +247,25 @@ impl BypassPolicy {
             } else if let Ok(ip) = trimmed.trim_matches(['[', ']']).parse::<IpAddr>() {
                 bypass_cidrs.push(IpNet::from_ip(ip));
             } else if let Some(expr) = wildcard_to_regex(trimmed) {
-                bypass_exprs.push(expr);
+                user_bypass_exprs.push(expr);
             }
         }
 
-        let bypass_regexes =
-            RegexSet::new(&bypass_exprs).context("failed to compile bypass wildcard rules")?;
+        let default_bypass_regexes = RegexSet::new(&default_bypass_exprs)
+            .context("failed to compile default bypass wildcard rules")?;
+        let user_bypass_regexes = RegexSet::new(&user_bypass_exprs)
+            .context("failed to compile user bypass wildcard rules")?;
 
-        let target_patterns = if include_patterns.is_empty() {
+        let include_exprs: Vec<String> = include_patterns
+            .iter()
+            .map(String::as_str)
+            .filter_map(include_pattern_to_regex)
+            .collect();
+        let target_patterns = if include_exprs.is_empty() {
             None
         } else {
             Some(
-                RegexSetBuilder::new(include_patterns)
+                RegexSetBuilder::new(&include_exprs)
                     .case_insensitive(true)
                     .build()
                     .context("failed to compile --include regular expressions")?,
@@ -222,7 +273,8 @@ impl BypassPolicy {
         };
 
         Ok(Self {
-            bypass_regexes,
+            default_bypass_regexes,
+            user_bypass_regexes,
             bypass_cidrs,
             target_patterns,
         })
@@ -323,7 +375,7 @@ impl BypassPolicy {
                 if is_local_hostname(clean.as_ref()) {
                     return BypassClass::LocalLan;
                 }
-                if self.bypass_regexes.is_match(clean.as_ref()) {
+                if self.user_bypass_regexes.is_match(clean.as_ref()) {
                     return BypassClass::SensitiveDirect;
                 }
                 if ip.is_some_and(|resolved| self.matches_bypass_cidr(resolved)) {
@@ -337,6 +389,9 @@ impl BypassPolicy {
                     } else {
                         BypassClass::SensitiveDirect
                     };
+                }
+                if self.default_bypass_regexes.is_match(clean.as_ref()) {
+                    return BypassClass::SensitiveDirect;
                 }
                 return BypassClass::DesyncEligible;
             }
@@ -393,17 +448,25 @@ fn normalize_host(raw: &str) -> Cow<'_, str> {
     }
 }
 
-/// Returns `true` if an already-normalized lowercase hostname belongs to a local/private namespace.
-fn is_local_hostname(host: &str) -> bool {
+/// Returns `true` if an already-normalized lowercase hostname belongs to a reserved local/private
+/// DNS namespace (such as `localhost`, `.local`, `.home.arpa`, or `.ts.net`).
+fn is_local_namespace(host: &str) -> bool {
     matches!(
         host,
-        "localhost" | "local" | "lan" | "internal" | "home.arpa" | "ts.net"
+        "localhost" | "localdomain" | "local" | "lan" | "internal" | "home.arpa" | "ts.net"
     ) || host.ends_with(".localhost")
+        || host.ends_with(".localdomain")
         || host.ends_with(".local")
         || host.ends_with(".lan")
         || host.ends_with(".internal")
         || host.ends_with(".home.arpa")
         || host.ends_with(".ts.net")
+}
+
+/// Returns `true` if an already-normalized lowercase hostname belongs to a local/private namespace
+/// (including single-label plain hostnames such as `router` or `nas`).
+fn is_local_hostname(host: &str) -> bool {
+    (!host.contains('.') && !host.contains(':')) || is_local_namespace(host)
 }
 
 /// Converts a proxy bypass wildcard (like `*.gov`, `.example.com`, or `*.example.com`)
@@ -439,15 +502,126 @@ fn wildcard_to_regex(pattern: &str) -> Option<String> {
     }
 }
 
+fn is_plain_domain_label(label: &str) -> bool {
+    !label.is_empty()
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn is_plain_domain_hostname(host: &str) -> bool {
+    let trimmed = host.trim_end_matches('.');
+    trimmed.contains('.') && trimmed.split('.').all(is_plain_domain_label)
+}
+
+/// Translates `--include` / `include_domains` entries that are leading `*.`
+/// wildcards (e.g. `*.example.org`), leading-dot domain patterns
+/// (e.g. `.example.org`), or plain multi-label domain hostnames without regex
+/// metacharacters (e.g. `service.gov.tr`) using [`wildcard_to_regex`], while
+/// preserving explicit raw regular expressions (`^`, `$`, `\`, `[`, `+`, `?`,
+/// `(`, `|`, etc.) for CLI compatibility.
+fn include_pattern_to_regex(pattern: &str) -> Option<String> {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix("*.") {
+        let rest_trimmed = rest.trim_end_matches('.');
+        if !rest_trimmed.is_empty() && rest_trimmed.split('.').all(is_plain_domain_label) {
+            return wildcard_to_regex(trimmed);
+        }
+    } else if let Some(rest) = trimmed.strip_prefix('.') {
+        if is_plain_domain_hostname(rest) {
+            return wildcard_to_regex(trimmed);
+        }
+    } else if is_plain_domain_hostname(trimmed) {
+        return wildcard_to_regex(trimmed);
+    }
+    Some(trimmed.to_string())
+}
+
+/// Extracts lowercase multi-label hostname candidates from an `--include` pattern
+/// (supporting both plain domains/wildcards like `forum.org.tr` / `*.org.tr` and
+/// regex forms like `^forum\.org\.tr$` or `(discord\.com|forum\.org\.tr)$`).
+fn extract_include_domain_candidates(pattern: &str) -> Vec<String> {
+    let trimmed = pattern.trim().trim_end_matches('.');
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let unescaped = trimmed.replace(r"\.", ".").replace(r"\-", "-");
+    let mut candidates = Vec::new();
+    for segment in unescaped.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-')) {
+        // Ignore prefix fragments such as `org.tr.` in `org\.tr\.(example|test)\.com$`.
+        if segment.is_empty() || segment.ends_with('.') {
+            continue;
+        }
+        let cleaned = segment.trim_start_matches('.').trim_matches('-');
+        if cleaned.contains('.') {
+            candidates.push(cleaned.to_ascii_lowercase());
+        }
+    }
+    candidates
+}
+
+/// Returns `true` if a non-local `DEFAULT_BYPASS_PATTERNS` entry is overridden by any
+/// configured `include_domains` pattern.
+fn default_pattern_overridden_by_includes(
+    pat: &str,
+    cleaned: &str,
+    include_regexes: &[Regex],
+    include_candidates: &[String],
+) -> bool {
+    if include_regexes.is_empty() && include_candidates.is_empty() {
+        return false;
+    }
+
+    let base = cleaned.trim_start_matches('.').to_ascii_lowercase();
+    if base.is_empty() || is_local_namespace(&base) {
+        return false;
+    }
+
+    let sample_subdomain = format!("a.{base}");
+    if include_regexes
+        .iter()
+        .any(|re| re.is_match(&base) || re.is_match(cleaned) || re.is_match(&sample_subdomain))
+    {
+        return true;
+    }
+
+    if include_candidates.is_empty() {
+        return false;
+    }
+    let Some(expr) = wildcard_to_regex(pat) else {
+        return false;
+    };
+    let Ok(pat_re) = Regex::new(&expr) else {
+        return false;
+    };
+    include_candidates.iter().any(|cand| pat_re.is_match(cand))
+}
+
 /// Builds a deduplicated `NO_PROXY` comma-separated string suitable for desktop runtimes and `libcurl`.
 pub fn build_no_proxy_value(extra: &[String]) -> String {
+    build_no_proxy_value_with_includes(extra, &[])
+}
+
+/// Builds a deduplicated `NO_PROXY` comma-separated string suitable for desktop runtimes and `libcurl`,
+/// skipping any non-local `DEFAULT_BYPASS_PATTERNS` entry matched by `include_domains` so `--include`
+/// overrides built-in bypasses (such as `.org.tr`) consistently in `NO_PROXY` as well.
+pub fn build_no_proxy_value_with_includes(
+    extra: &[String],
+    include_domains: &[String],
+) -> String {
     let mut items: Vec<String> = vec![
         "localhost".into(),
         "127.0.0.1".into(),
+        "127.0.0.0/8".into(),
         "::1".into(),
         "0.0.0.0".into(),
         "10.0.0.0/8".into(),
         "172.16.0.0/12".into(),
+        "192.0.0.0/24".into(),
         "192.168.0.0/16".into(),
         "169.254.0.0/16".into(),
         "100.64.0.0/10".into(),
@@ -455,9 +629,35 @@ pub fn build_no_proxy_value(extra: &[String]) -> String {
         "fe80::/10".into(),
     ];
 
+    let mut include_regexes = Vec::new();
+    let mut include_candidates = Vec::new();
+    for raw in include_domains {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(expr) = include_pattern_to_regex(trimmed) {
+            if let Ok(re) = RegexBuilder::new(&expr).case_insensitive(true).build() {
+                include_regexes.push(re);
+            }
+        }
+        include_candidates.extend(extract_include_domain_candidates(trimmed));
+    }
+
     for pat in DEFAULT_BYPASS_PATTERNS {
         let cleaned = pat.trim().trim_start_matches('*');
-        if !cleaned.is_empty() && !items.iter().any(|x| x.eq_ignore_ascii_case(cleaned)) {
+        if cleaned.is_empty() {
+            continue;
+        }
+        if default_pattern_overridden_by_includes(
+            pat,
+            cleaned,
+            &include_regexes,
+            &include_candidates,
+        ) {
+            continue;
+        }
+        if !items.iter().any(|x| x.eq_ignore_ascii_case(cleaned)) {
             items.push(cleaned.to_string());
         }
     }
@@ -910,5 +1110,361 @@ mod tests {
                 "expected NO_PROXY to contain `{expected}`, got: {no_proxy}"
             );
         }
+    }
+
+    #[test]
+    fn bypasses_captive_portals_local_namespaces_and_missing_turkish_portals() {
+        let policy = BypassPolicy::new(&[], &[]).unwrap();
+
+        for captive in [
+            "www.msftconnecttest.com",
+            "msftconnecttest.com",
+            "ipv6.msftconnecttest.com",
+            "www.msftncsi.com",
+            "msftncsi.com",
+            "dns.msftncsi.com",
+            "captive.apple.com",
+            "connectivitycheck.gstatic.com",
+            "connectivitycheck.android.com",
+            "clients3.google.com",
+            "detectportal.firefox.com",
+            "nmcheck.gnome.org",
+            "networkcheck.kde.org",
+            "connectivity-check.ubuntu.com",
+            "ping.archlinux.org",
+            "neverssl.com",
+        ] {
+            assert_eq!(
+                policy.classify(Some(captive), None),
+                BypassClass::SensitiveDirect,
+                "expected SensitiveDirect for captive portal {captive}"
+            );
+        }
+
+        for local in [
+            "router",
+            "nas",
+            "intranet",
+            "app.localhost",
+            "dev.localdomain",
+            "localdomain",
+        ] {
+            assert_eq!(
+                policy.classify(Some(local), None),
+                BypassClass::LocalLan,
+                "expected LocalLan for {local}"
+            );
+        }
+
+        for tr_portal in [
+            "www.turkcell.com.tr",
+            "www.vodafone.com.tr",
+            "www.superonline.net",
+            "www.turk.net",
+            "www.ziraatkatilim.com.tr",
+            "www.fibabanka.com.tr",
+            "www.sekerbank.com.tr",
+            "www.turkiyefinans.com.tr",
+            "www.kablonet.com.tr",
+        ] {
+            assert_eq!(
+                policy.classify(Some(tr_portal), None),
+                BypassClass::SensitiveDirect,
+                "expected SensitiveDirect for {tr_portal}"
+            );
+        }
+    }
+
+    #[test]
+    fn include_overrides_default_bypass_while_user_bypass_and_local_lan_remain_highest() {
+        let policy = BypassPolicy::new(
+            &["blocked.org.tr".into(), "203.0.113.0/24".into()],
+            &[r"\.org\.tr$".into(), r"localhost$".into(), r"^nas$".into()],
+        )
+        .unwrap();
+
+        // Explicit --include overrides DEFAULT_BYPASS_PATTERNS (*.org.tr)
+        assert_eq!(
+            policy.classify(Some("forum.org.tr"), None),
+            BypassClass::DesyncEligible
+        );
+        // Explicit user --bypass (domain and CIDR) still wins over --include
+        assert_eq!(
+            policy.classify(Some("blocked.org.tr"), None),
+            BypassClass::SensitiveDirect
+        );
+        assert_eq!(
+            policy.classify(Some("forum.org.tr"), Some(ip("203.0.113.10"))),
+            BypassClass::SensitiveDirect
+        );
+        // LocalLan (localhost, *.localhost, single-label hostnames, LAN IPs) still wins over --include
+        assert_eq!(
+            policy.classify(Some("app.localhost"), None),
+            BypassClass::LocalLan
+        );
+        assert_eq!(policy.classify(Some("nas"), None), BypassClass::LocalLan);
+        assert_eq!(
+            policy.classify(Some("forum.org.tr"), Some(ip("192.168.1.5"))),
+            BypassClass::LocalLan
+        );
+        // Unmatched hosts are still excluded by --include
+        assert_eq!(
+            policy.classify(Some("discord.com"), None),
+            BypassClass::SensitiveDirect
+        );
+    }
+
+    #[test]
+    fn build_no_proxy_value_includes_loopback_cidr_and_new_captive_portal_domains() {
+        let no_proxy = build_no_proxy_value(&[]);
+        let entries: Vec<&str> = no_proxy.split(',').collect();
+
+        for expected in [
+            "127.0.0.1",
+            "127.0.0.0/8",
+            "192.0.0.0/24",
+            "msftncsi.com",
+            "dns.msftncsi.com",
+            "ipv6.msftconnecttest.com",
+            "connectivitycheck.android.com",
+            "ping.archlinux.org",
+            "neverssl.com",
+            ".org.tr",
+        ] {
+            assert!(
+                entries.contains(&expected),
+                "expected NO_PROXY to contain `{expected}`, got: {no_proxy}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_no_proxy_value_with_includes_skips_overridden_defaults_and_keeps_locals_and_extra() {
+        // Regex --include matching .org.tr skips .org.tr while retaining explicit user bypasses
+        // and unrelated default entries.
+        let with_regex =
+            build_no_proxy_value_with_includes(&["blocked.org.tr".into()], &[r"\.org\.tr$".into()]);
+        let entries: Vec<&str> = with_regex.split(',').collect();
+        assert!(!entries.contains(&".org.tr"));
+        assert!(entries.contains(&"blocked.org.tr"));
+        assert!(entries.contains(&"127.0.0.0/8"));
+        assert!(entries.contains(&".gov.tr"));
+        assert!(entries.contains(&".isbank.com.tr"));
+        assert!(entries.contains(&"localhost"));
+        assert!(entries.contains(&".localhost"));
+        assert!(entries.contains(&".local"));
+        assert!(entries.contains(&".ts.net"));
+
+        // Subdomain include patterns (plain or anchored regex) also omit the broader .org.tr default.
+        for include_pat in ["forum.org.tr", r"^forum\.org\.tr$", "*.org.tr"] {
+            let no_proxy =
+                build_no_proxy_value_with_includes(&[], &[include_pat.into(), "   ".into()]);
+            let items: Vec<&str> = no_proxy.split(',').collect();
+            assert!(
+                !items.contains(&".org.tr"),
+                "expected `{include_pat}` to omit `.org.tr` from NO_PROXY"
+            );
+            assert!(
+                items.contains(&".gov.tr"),
+                "expected `{include_pat}` to keep `.gov.tr` in NO_PROXY"
+            );
+        }
+
+        // Broad --include patterns must still never strip local/private namespaces or loopback CIDRs.
+        let with_broad =
+            build_no_proxy_value_with_includes(&[], &[r"localhost$".into(), r".*".into()]);
+        let broad_items: Vec<&str> = with_broad.split(',').collect();
+        for local in [
+            "localhost",
+            "127.0.0.1",
+            "127.0.0.0/8",
+            "192.0.0.0/24",
+            ".localhost",
+            ".localdomain",
+            ".local",
+            ".lan",
+            ".internal",
+            ".home.arpa",
+            ".ts.net",
+        ] {
+            assert!(
+                broad_items.contains(&local),
+                "expected local entry `{local}` to remain in NO_PROXY"
+            );
+        }
+        assert!(!broad_items.contains(&".org.tr"));
+        assert!(!broad_items.contains(&"ping.archlinux.org"));
+        assert!(!broad_items.contains(&"neverssl.com"));
+
+        // Guard against false-positive stripping from group labels or domain prefixes.
+        let with_unrelated = build_no_proxy_value_with_includes(
+            &[],
+            &[
+                r"(gov|discord)\.example\.com$".into(),
+                r"org\.tr\.(example|test)\.com$".into(),
+            ],
+        );
+        let unrelated_items: Vec<&str> = with_unrelated.split(',').collect();
+        assert!(unrelated_items.contains(&".gov"));
+        assert!(unrelated_items.contains(&".org.tr"));
+    }
+
+    #[test]
+    fn include_patterns_translate_wildcards_and_plain_hostnames_while_preserving_raw_regex() {
+        let policy = BypassPolicy::new(
+            &[],
+            &[
+                "*.example.org".into(),
+                "service.gov.tr".into(),
+                r"^(api|cdn)\.raw-regex\.(com|net)$".into(),
+            ],
+        )
+        .unwrap();
+
+        // Leading `*.` wildcard matches apex and subdomains case-insensitively, anchored.
+        assert_eq!(
+            policy.classify(Some("example.org"), None),
+            BypassClass::DesyncEligible
+        );
+        assert_eq!(
+            policy.classify(Some("sub.example.org"), None),
+            BypassClass::DesyncEligible
+        );
+        assert_eq!(
+            policy.classify(Some("DEEP.SUB.EXAMPLE.ORG"), None),
+            BypassClass::DesyncEligible
+        );
+        assert_eq!(
+            policy.classify(Some("notexample.org"), None),
+            BypassClass::SensitiveDirect
+        );
+        assert_eq!(
+            policy.classify(Some("exampleXorg.com"), None),
+            BypassClass::SensitiveDirect
+        );
+        assert_eq!(
+            policy.classify(Some("example.org.evil.com"), None),
+            BypassClass::SensitiveDirect
+        );
+
+        // Plain domain hostname is translated with escaped dots and anchors (and overrides default *.gov.tr).
+        assert_eq!(
+            policy.classify(Some("service.gov.tr"), None),
+            BypassClass::DesyncEligible
+        );
+        assert_eq!(
+            policy.classify(Some("portal.service.gov.tr"), None),
+            BypassClass::DesyncEligible
+        );
+        assert_eq!(
+            policy.classify(Some("SERVICE.GOV.TR"), None),
+            BypassClass::DesyncEligible
+        );
+        assert_eq!(
+            policy.classify(Some("serviceXgovYtr.evil.com"), None),
+            BypassClass::SensitiveDirect
+        );
+        assert_eq!(
+            policy.classify(Some("serviceXgovYtr"), None),
+            BypassClass::LocalLan
+        );
+        assert_eq!(
+            policy.classify(Some("evilservice.gov.tr"), None),
+            BypassClass::SensitiveDirect
+        );
+        assert_eq!(
+            policy.classify(Some("service.gov.tr.evil.com"), None),
+            BypassClass::SensitiveDirect
+        );
+        assert_eq!(
+            policy.classify(Some("other.gov.tr"), None),
+            BypassClass::SensitiveDirect
+        );
+
+        // Explicit raw regex syntax remains supported for CLI backward compatibility.
+        assert_eq!(
+            policy.classify(Some("api.raw-regex.com"), None),
+            BypassClass::DesyncEligible
+        );
+        assert_eq!(
+            policy.classify(Some("cdn.raw-regex.net"), None),
+            BypassClass::DesyncEligible
+        );
+        assert_eq!(
+            policy.classify(Some("web.raw-regex.com"), None),
+            BypassClass::SensitiveDirect
+        );
+
+        // Invalid raw regex still fails compilation.
+        assert!(BypassPolicy::new(&[], &["[unclosed".into()]).is_err());
+    }
+
+    #[test]
+    fn include_patterns_translate_leading_dot_domains_matching_bypass_domains() {
+        assert_eq!(
+            include_pattern_to_regex(".example.org").as_deref(),
+            Some(r"^(?:.+\.)?example\.org$")
+        );
+        assert_eq!(
+            include_pattern_to_regex(".example.org.").as_deref(),
+            Some(r"^(?:.+\.)?example\.org$")
+        );
+        // Raw regexes and single-label leading-dot patterns remain untouched.
+        assert_eq!(include_pattern_to_regex(".*").as_deref(), Some(".*"));
+        assert_eq!(include_pattern_to_regex(".+").as_deref(), Some(".+"));
+        assert_eq!(include_pattern_to_regex(".foo").as_deref(), Some(".foo"));
+        assert_eq!(
+            include_pattern_to_regex("..example.org").as_deref(),
+            Some("..example.org")
+        );
+
+        let policy =
+            BypassPolicy::new(&[], &[".example.org".into(), ".service.gov.tr".into()]).unwrap();
+
+        // Leading-dot domain matches apex and subdomains case-insensitively, anchored.
+        assert_eq!(
+            policy.classify(Some("example.org"), None),
+            BypassClass::DesyncEligible
+        );
+        assert_eq!(
+            policy.classify(Some("sub.example.org"), None),
+            BypassClass::DesyncEligible
+        );
+        assert_eq!(
+            policy.classify(Some("DEEP.SUB.EXAMPLE.ORG"), None),
+            BypassClass::DesyncEligible
+        );
+        assert_eq!(
+            policy.classify(Some("notexample.org"), None),
+            BypassClass::SensitiveDirect
+        );
+        assert_eq!(
+            policy.classify(Some("exampleXorg.com"), None),
+            BypassClass::SensitiveDirect
+        );
+        assert_eq!(
+            policy.classify(Some("example.org.evil.com"), None),
+            BypassClass::SensitiveDirect
+        );
+
+        // Leading-dot domain also overrides built-in default bypasses (*.gov.tr).
+        assert_eq!(
+            policy.classify(Some("service.gov.tr"), None),
+            BypassClass::DesyncEligible
+        );
+        assert_eq!(
+            policy.classify(Some("portal.service.gov.tr"), None),
+            BypassClass::DesyncEligible
+        );
+        assert_eq!(
+            policy.classify(Some("other.gov.tr"), None),
+            BypassClass::SensitiveDirect
+        );
+
+        // Leading-dot include pattern also omits the overridden default from NO_PROXY.
+        let no_proxy = build_no_proxy_value_with_includes(&[], &[".org.tr".into()]);
+        let entries: Vec<&str> = no_proxy.split(',').collect();
+        assert!(!entries.contains(&".org.tr"));
+        assert!(entries.contains(&".gov.tr"));
     }
 }

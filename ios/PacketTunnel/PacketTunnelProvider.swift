@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import Network
 import NetworkExtension
 import os
 import VdpiCore
@@ -65,12 +66,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var lastProviderConfigJSON: String?
     private var lastPathSignature: String?
     private var defaultPathObservation: NSKeyValueObservation?
+    private var networkPathMonitor: NWPathMonitor?
+    private var latestNetworkPath: Network.NWPath?
     private var pathUpdateWorkItem: DispatchWorkItem?
     private var pathUpdateGeneration: UInt64 = 0
     private var reloadGeneration: UInt64 = 0
 
     private let lifecycleQueue = DispatchQueue(label: "com.vulninc.vdpi.tunnel.lifecycle", qos: .userInitiated)
     private let inboundPumpQueue = DispatchQueue(label: "com.vulninc.vdpi.tunnel.inbound", qos: .userInitiated)
+    private let pathMonitorQueue = DispatchQueue(label: "com.vulninc.vdpi.tunnel.path", qos: .utility)
     private let doctorQueue = DispatchQueue(label: "com.vulninc.vdpi.tunnel.doctor", qos: .utility)
 
     deinit {
@@ -153,7 +157,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             self.stateLock.unlock()
 
             let settings = self.loadEffectiveSettings(options: options, overrideJSON: nil)
-            let primaryIface = Self.resolvePrimaryPhysicalInterface(for: self.defaultPath)
+            let initialNetworkPath = self.currentPhysicalNetworkPath()
+            let primaryIface = Self.resolvePrimaryPhysicalInterface(
+                for: self.defaultPath,
+                networkPath: initialNetworkPath
+            )
             let effectiveIpv4Only = settings.ipv4Only
                 || !TunnelNetworkSettingsBuilder.hasGlobalIpv6(onInterface: primaryIface)
             let effectiveMtu = TunnelNetworkSettingsBuilder.effectiveMtu(for: settings)
@@ -221,7 +229,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     self.running = true
                     self.stateLock.unlock()
 
-                    self.startPathMonitoring()
+                    self.startPathMonitoring(initialNetworkPath: initialNetworkPath)
                     if !startOutcome.usedDirectFd {
                         self.ensureInboundPumpRunning()
                     }
@@ -352,7 +360,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 overrideJSON: overrideJSON,
                 preferAppGroupWhenProviderConfigUnchanged: true
             )
-            let primaryIface = Self.resolvePrimaryPhysicalInterface(for: self.defaultPath)
+            let primaryIface = Self.resolvePrimaryPhysicalInterface(
+                for: self.defaultPath,
+                networkPath: self.currentPhysicalNetworkPath()
+            )
             let effectiveIpv4Only = settings.ipv4Only
                 || !TunnelNetworkSettingsBuilder.hasGlobalIpv6(onInterface: primaryIface)
             let effectiveMtu = TunnelNetworkSettingsBuilder.effectiveMtu(for: settings)
@@ -388,7 +399,24 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     )
                     let startOutcome = self.startNativeEngine(configJSON: configJSON)
                     if let errMsg = startOutcome.error {
+                        Self.logger.error(
+                            "reloadTunnelEngine failed to restart native engine: \(errMsg, privacy: .public)"
+                        )
+                        self.stopPathMonitoring()
+                        self.stateLock.lock()
+                        self.running = false
+                        self.usingDirectUtunFd = false
+                        self.hasArmedPacketFlowRead = false
+                        self.inboundPumpArmed = false
+                        self.currentEffectiveIpv4Only = nil
+                        self.stateLock.unlock()
+                        VdpiAppGroup.saveAppliedConfig(nil)
                         finish(ProviderCommandResponse(ok: false, error: errMsg))
+                        self.cancelTunnelWithError(NSError(
+                            domain: Self.tunnelErrorDomain,
+                            code: 1004,
+                            userInfo: [NSLocalizedDescriptionKey: errMsg]
+                        ))
                         return
                     }
 
@@ -400,6 +428,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         return
                     }
                     guard self.isCurrentReloadGeneration(generation) else {
+                        if !startOutcome.usedDirectFd {
+                            self.ensureInboundPumpRunning()
+                        }
                         completionHandler?(ProviderCommandResponse(ok: false, error: "Reload superseded").encodeData())
                         return
                     }
@@ -703,25 +734,45 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     // MARK: - Active Physical Interface & defaultPath KVO Monitoring
 
-    private func startPathMonitoring() {
+    private func startPathMonitoring(initialNetworkPath: Network.NWPath? = nil) {
         stopPathMonitoring()
 
-        let initialSignature = Self.pathSignature(for: defaultPath)
+        let monitor = NWPathMonitor(prohibitedInterfaceTypes: [.other])
+        monitor.pathUpdateHandler = { [weak self] networkPath in
+            guard let self else { return }
+            self.stateLock.lock()
+            self.latestNetworkPath = networkPath
+            self.stateLock.unlock()
+            self.handleDefaultPathChange(self.defaultPath)
+        }
+
+        let initialPath = defaultPath
+        let resolvedNetworkPath = initialNetworkPath ?? currentPhysicalNetworkPath()
+        let initialSignature: String? = (initialPath?.status == .satisfied)
+            ? Self.pathSignature(for: initialPath, networkPath: resolvedNetworkPath)
+            : nil
         let observation = observe(\.defaultPath, options: [.new]) { [weak self] provider, _ in
             self?.handleDefaultPathChange(provider.defaultPath)
         }
 
         stateLock.lock()
+        latestNetworkPath = resolvedNetworkPath
         lastPathSignature = initialSignature
+        networkPathMonitor = monitor
         defaultPathObservation = observation
         stateLock.unlock()
+
+        monitor.start(queue: pathMonitorQueue)
     }
 
     private func stopPathMonitoring() {
         stateLock.lock()
         let observation = defaultPathObservation
+        let monitor = networkPathMonitor
         let pending = pathUpdateWorkItem
         defaultPathObservation = nil
+        networkPathMonitor = nil
+        latestNetworkPath = nil
         pathUpdateWorkItem = nil
         pathUpdateGeneration &+= 1
         lastPathSignature = nil
@@ -729,32 +780,83 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         pending?.cancel()
         observation?.invalidate()
+        monitor?.pathUpdateHandler = nil
+        monitor?.cancel()
     }
 
-    private func handleDefaultPathChange(_ path: NWPath?) {
+    private func cachedNetworkPath() -> Network.NWPath? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return latestNetworkPath
+    }
+
+    private func currentPhysicalNetworkPath() -> Network.NWPath? {
+        if let cached = cachedNetworkPath() {
+            return cached
+        }
+
+        let probe = NWPathMonitor(prohibitedInterfaceTypes: [.other])
+        let probeLock = NSLock()
+        let semaphore = DispatchSemaphore(value: 0)
+        var resolved: Network.NWPath?
+        var finished = false
+
+        probe.pathUpdateHandler = { path in
+            probeLock.lock()
+            let shouldSignal = !finished
+            if shouldSignal {
+                finished = true
+                resolved = path
+            }
+            probeLock.unlock()
+            if shouldSignal {
+                probe.pathUpdateHandler = nil
+                probe.cancel()
+                semaphore.signal()
+            }
+        }
+        probe.start(queue: pathMonitorQueue)
+        _ = semaphore.wait(timeout: .now() + .milliseconds(100))
+
+        probeLock.lock()
+        let didFinish = finished
+        finished = true
+        let result = resolved
+        probeLock.unlock()
+        if !didFinish {
+            probe.pathUpdateHandler = nil
+            probe.cancel()
+        }
+        return result
+    }
+
+    private func handleDefaultPathChange(_ path: NetworkExtension.NWPath?) {
         guard isRunning else { return }
         evaluateDefaultPathChange(path, forceNotify: false)
     }
 
-    private func evaluateDefaultPathChange(_ path: NWPath?, forceNotify: Bool) {
-        guard isRunning, let path, path.status == .satisfied else { return }
-        let signature = Self.pathSignature(for: path)
+    private func evaluateDefaultPathChange(_ path: NetworkExtension.NWPath?, forceNotify: Bool) {
+        guard isRunning else { return }
+        guard let path, path.status == .satisfied else {
+            stateLock.lock()
+            let pending = pathUpdateWorkItem
+            pathUpdateWorkItem = nil
+            pathUpdateGeneration &+= 1
+            lastPathSignature = nil
+            stateLock.unlock()
+            pending?.cancel()
+            return
+        }
+        let signature = Self.pathSignature(for: path, networkPath: cachedNetworkPath())
 
         stateLock.lock()
-        if !forceNotify {
-            if lastPathSignature == nil {
-                lastPathSignature = signature
-                stateLock.unlock()
-                return
-            }
-            if lastPathSignature == signature {
-                let pending = pathUpdateWorkItem
-                pathUpdateWorkItem = nil
-                pathUpdateGeneration &+= 1
-                stateLock.unlock()
-                pending?.cancel()
-                return
-            }
+        if !forceNotify && lastPathSignature == signature {
+            let pending = pathUpdateWorkItem
+            pathUpdateWorkItem = nil
+            pathUpdateGeneration &+= 1
+            stateLock.unlock()
+            pending?.cancel()
+            return
         }
 
         let previousPending = pathUpdateWorkItem
@@ -765,7 +867,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             guard let self, self.isRunning else { return }
             let latestPath = self.defaultPath
             guard let latestPath, latestPath.status == .satisfied else { return }
-            let latestSignature = Self.pathSignature(for: latestPath)
+            let currentNetworkPath = self.cachedNetworkPath()
+            let latestSignature = Self.pathSignature(for: latestPath, networkPath: currentNetworkPath)
 
             self.stateLock.lock()
             guard self.pathUpdateGeneration == generation else {
@@ -786,7 +889,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             VdpiNativeBridge.notifyRouteChange()
 
             let settings = activeSettings ?? self.loadEffectiveSettings(options: nil, overrideJSON: nil)
-            let primaryIface = Self.resolvePrimaryPhysicalInterface(for: latestPath)
+            let primaryIface = Self.resolvePrimaryPhysicalInterface(
+                for: latestPath,
+                networkPath: currentNetworkPath
+            )
             let newEffectiveIpv4Only = settings.ipv4Only
                 || !TunnelNetworkSettingsBuilder.hasGlobalIpv6(onInterface: primaryIface)
 
@@ -803,10 +909,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         lifecycleQueue.asyncAfter(deadline: .now() + .milliseconds(300), execute: workItem)
     }
 
-    private static func pathSignature(for path: NWPath?) -> String {
+    private static func pathSignature(
+        for path: NetworkExtension.NWPath?,
+        networkPath: Network.NWPath?
+    ) -> String {
         guard let path else { return "none" }
         let snapshot = activePhysicalInterfacesSnapshot()
-        let primaryIface = selectPrimaryInterface(from: snapshot, path: path)
+        let primaryIface = selectPrimaryInterface(from: snapshot, path: path, networkPath: networkPath)
         // Exclude volatile IPv6 temporary privacy addresses (RFC 4941) from the path signature
         // so routine IPv6 address churn does not tear down active UDP Cone-NAT flows.
         let primaryIpv4s = primaryIface
@@ -817,9 +926,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         return "\(path.status.rawValue):exp=\(path.isExpensive):con=\(path.isConstrained):if=\(primaryIface ?? "none"):v4=\(primaryIpv4s):v6=\(hasV6)"
     }
 
-    private static func resolvePrimaryPhysicalInterface(for path: NWPath?) -> String? {
+    private static func resolvePrimaryPhysicalInterface(
+        for path: NetworkExtension.NWPath?,
+        networkPath: Network.NWPath?
+    ) -> String? {
         let snapshot = activePhysicalInterfacesSnapshot()
-        return selectPrimaryInterface(from: snapshot, path: path)
+        return selectPrimaryInterface(from: snapshot, path: path, networkPath: networkPath)
     }
 
     private struct PhysicalInterfacesSnapshot {
@@ -831,15 +943,54 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private static func selectPrimaryInterface(
         from snapshot: PhysicalInterfacesSnapshot,
-        path: NWPath?
+        path: NetworkExtension.NWPath?,
+        networkPath: Network.NWPath?
     ) -> String? {
-        // Note: Personal Hotspot Wi-Fi sets `path.isExpensive == true` on `en0`! Only prefer
-        // cellular when `enInterfaces` has no active IPv4/UP interface (or Wi-Fi is off).
-        if let wifi = snapshot.enInterfaces.first {
-            return wifi
+        if let path {
+            guard path.status == .satisfied else {
+                return nil
+            }
         }
-        return snapshot.cellularInterfaces.first
+        if let networkPath, networkPath.status == .satisfied {
+            func firstAvailable(where predicate: (NWInterface) -> Bool) -> String? {
+                networkPath.availableInterfaces.first { iface in
+                    snapshot.addressesByName[iface.name] != nil && predicate(iface)
+                }?.name
+            }
+
+            // Prefer `networkPath.availableInterfaces` order over lexicographic `en*`/`pdp_ip*`
+            // sorting so iPadOS USB-C Ethernet (e.g. `en3` over `en0`) and Dual-SIM/eSIM
+            // (e.g. `pdp_ip1` over `pdp_ip0`) select the true active interface.
+            // Check Wi-Fi / wired Ethernet BEFORE `isExpensive` so an IPv4-only Personal Hotspot
+            // or Low Data Mode Wi-Fi (`en0` with `isExpensive == true`) never selects standby
+            // cellular `pdp_ip*` IPv6 and blackholes dual-stack traffic.
+            if networkPath.usesInterfaceType(.wifi) || networkPath.usesInterfaceType(.wiredEthernet) {
+                return firstAvailable(where: {
+                    ($0.type == .wiredEthernet || $0.type == .wifi)
+                        && networkPath.usesInterfaceType($0.type)
+                })
+                    ?? firstAvailable(where: { $0.type == .wiredEthernet || $0.type == .wifi })
+                    ?? firstAvailable(where: { snapshot.enInterfaces.contains($0.name) })
+                    ?? firstAvailable(where: { snapshot.otherInterfaces.contains($0.name) })
+                    ?? snapshot.enInterfaces.first
+                    ?? snapshot.otherInterfaces.first
+                    ?? snapshot.cellularInterfaces.first
+            }
+            if networkPath.usesInterfaceType(.cellular) || networkPath.isExpensive {
+                return firstAvailable(where: { $0.type == .cellular })
+                    ?? firstAvailable(where: { snapshot.cellularInterfaces.contains($0.name) })
+                    ?? snapshot.cellularInterfaces.first
+                    ?? firstAvailable(where: { snapshot.enInterfaces.contains($0.name) })
+                    ?? snapshot.enInterfaces.first
+                    ?? snapshot.otherInterfaces.first
+            }
+            if let preferred = firstAvailable(where: { _ in true }) {
+                return preferred
+            }
+        }
+        return snapshot.enInterfaces.first
             ?? snapshot.otherInterfaces.first
+            ?? snapshot.cellularInterfaces.first
     }
 
     private static func activePhysicalInterfacesSnapshot() -> PhysicalInterfacesSnapshot {

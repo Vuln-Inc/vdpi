@@ -108,9 +108,14 @@ import com.vulninc.vdpi.ui.theme.VdpiThemeTokens
 import com.vulninc.vdpi.util.formatBytes
 import com.vulninc.vdpi.util.formatStageLabel
 import com.vulninc.vdpi.util.formatUptime
+import com.vulninc.vdpi.util.isValidDnsInput
 import com.vulninc.vdpi.vpn.TunnelPhase
 import com.vulninc.vdpi.vpn.TunnelRuntimeSnapshot
+import com.vulninc.vdpi.vpn.TunnelRuntimeState
 import kotlinx.coroutines.flow.StateFlow
+import java.net.Inet4Address
+import java.net.Inet6Address
+import java.net.InetAddress
 import java.util.Locale
 
 // ── Shared Update Presentation Model ──
@@ -147,6 +152,7 @@ fun TunnelScreen(
 ) {
     // Scoped locally so 1Hz telemetry updates never recompose MainActivity, Apps, or Settings.
     val runtime by tunnelState.collectAsStateWithLifecycle()
+    val appliedSettings by TunnelRuntimeState.appliedSettings.collectAsStateWithLifecycle()
     val samples by throughputSamples.collectAsStateWithLifecycle()
     val currentRate by currentRateBytesPerSec.collectAsStateWithLifecycle()
     val palette = VdpiThemeTokens.palette
@@ -234,6 +240,7 @@ fun TunnelScreen(
         LandscapeTunnelLayout(
             runtime = runtime,
             settings = settings,
+            appliedSettings = appliedSettings,
             throughputSamples = samples,
             currentRateBytesPerSec = currentRate,
             availableUpdate = availableUpdate,
@@ -256,6 +263,7 @@ fun TunnelScreen(
         PortraitTunnelLayout(
             runtime = runtime,
             settings = settings,
+            appliedSettings = appliedSettings,
             throughputSamples = samples,
             currentRateBytesPerSec = currentRate,
             availableUpdate = availableUpdate,
@@ -325,6 +333,7 @@ fun TunnelScreen(
 private fun LandscapeTunnelLayout(
     runtime: TunnelRuntimeSnapshot,
     settings: VdpiSettings,
+    appliedSettings: VdpiSettings?,
     throughputSamples: List<Long>,
     currentRateBytesPerSec: Long,
     availableUpdate: UpdateBannerInfo?,
@@ -398,6 +407,7 @@ private fun LandscapeTunnelLayout(
                     TunnelHeroCard(
                         runtime = runtime,
                         settings = settings,
+                        appliedSettings = appliedSettings,
                         reduceMotion = reduceMotion,
                         compact = true,
                         onToggleTunnel = onToggleTunnel,
@@ -412,6 +422,7 @@ private fun LandscapeTunnelLayout(
                         throughputSamples = throughputSamples,
                         currentRateBytesPerSec = currentRateBytesPerSec,
                         settings = settings,
+                        appliedSettings = appliedSettings,
                         reduceMotion = reduceMotion,
                         transitionLabel = "tunnelDetailsTransitionLandscape",
                     )
@@ -427,6 +438,7 @@ private fun LandscapeTunnelLayout(
 private fun PortraitTunnelLayout(
     runtime: TunnelRuntimeSnapshot,
     settings: VdpiSettings,
+    appliedSettings: VdpiSettings?,
     throughputSamples: List<Long>,
     currentRateBytesPerSec: Long,
     availableUpdate: UpdateBannerInfo?,
@@ -471,6 +483,7 @@ private fun PortraitTunnelLayout(
         TunnelHeroCard(
             runtime = runtime,
             settings = settings,
+            appliedSettings = appliedSettings,
             reduceMotion = reduceMotion,
             onToggleTunnel = onToggleTunnel,
         )
@@ -501,6 +514,7 @@ private fun PortraitTunnelLayout(
             throughputSamples = throughputSamples,
             currentRateBytesPerSec = currentRateBytesPerSec,
             settings = settings,
+            appliedSettings = appliedSettings,
             reduceMotion = reduceMotion,
             transitionLabel = "tunnelDetailsTransition",
         )
@@ -664,6 +678,7 @@ private fun TunnelDetailsSection(
     throughputSamples: List<Long>,
     currentRateBytesPerSec: Long,
     settings: VdpiSettings,
+    appliedSettings: VdpiSettings?,
     reduceMotion: Boolean,
     transitionLabel: String,
 ) {
@@ -680,6 +695,7 @@ private fun TunnelDetailsSection(
                 throughputSamples = throughputSamples,
                 currentRateBytesPerSec = currentRateBytesPerSec,
                 settings = settings,
+                appliedSettings = appliedSettings,
                 reduceMotion = reduceMotion,
             )
         } else {
@@ -696,6 +712,7 @@ private fun TunnelDetailsSection(
 private fun TunnelHeroCard(
     runtime: TunnelRuntimeSnapshot,
     settings: VdpiSettings,
+    appliedSettings: VdpiSettings?,
     reduceMotion: Boolean,
     onToggleTunnel: () -> Unit,
     compact: Boolean = false,
@@ -749,7 +766,9 @@ private fun TunnelHeroCard(
         TunnelPhase.ERROR -> "Connection Error"
     }
 
-    val dnsCompact = "${formatDnsDisplayAddr(settings.dnsAddr)} ${if (settings.enableDoh) "DoH" else "UDP"}"
+    val activeDnsAddr = snap.dnsAddr.trim().ifBlank { (appliedSettings ?: settings).dnsAddr }
+    val activeDoh = isEffectiveDohTarget(activeDnsAddr, snap.dohEnabled)
+    val dnsCompact = "${formatDnsDisplayAddr(activeDnsAddr)} ${if (activeDoh) "DoH" else "UDP"}"
     val subtitle = when (phase) {
         TunnelPhase.CONNECTED -> "$dnsCompact · ${formatHeroUptime(snap.uptimeSecs)}"
         TunnelPhase.CONNECTING -> "Establishing local tunnel..."
@@ -1155,8 +1174,11 @@ private fun LiveTelemetrySection(
     throughputSamples: List<Long>,
     currentRateBytesPerSec: Long,
     settings: VdpiSettings,
+    appliedSettings: VdpiSettings?,
     reduceMotion: Boolean,
 ) {
+    val effectiveSettings = appliedSettings ?: settings
+    val activeDnsAddr = telemetry.dnsAddr.trim().ifBlank { effectiveSettings.dnsAddr }
     Column(modifier = Modifier.fillMaxWidth()) {
         SectionOverline(text = "Connection")
 
@@ -1211,7 +1233,7 @@ private fun LiveTelemetrySection(
                 title = "DNS",
                 trailing = {
                     TabularRowValue(
-                        text = formatDnsDetail(settings),
+                        text = formatDnsDetail(activeDnsAddr, telemetry.dohEnabled),
                         textDirection = TextDirection.Ltr,
                     )
                 },
@@ -1221,7 +1243,16 @@ private fun LiveTelemetrySection(
                 title = "QUIC Blocked",
                 trailing = {
                     TabularRowValue(
-                        text = if (settings.blockQuic) telemetry.quicBlocked.toString() else "Allowed",
+                        text = if (effectiveSettings.blockQuic) telemetry.quicBlocked.toString() else "Allowed",
+                    )
+                },
+            )
+            HairlineRule(startIndent = 16.dp)
+            InsetGroupedRow(
+                title = "Dropped Packets",
+                trailing = {
+                    TabularRowValue(
+                        text = telemetry.droppedPackets.coerceAtLeast(0L).toString(),
                     )
                 },
             )
@@ -1393,7 +1424,7 @@ private fun StandbyProfileSection(
                 title = "DNS",
                 trailing = {
                     TabularRowValue(
-                        text = formatDnsDetail(settings),
+                        text = formatDnsDetail(settings.dnsAddr, settings.enableDoh),
                         textDirection = TextDirection.Ltr,
                     )
                 },
@@ -1682,23 +1713,91 @@ private fun formatHeroUptime(totalSecs: Long): String {
 private fun formatDnsDisplayAddr(rawAddr: String): String {
     val addr = rawAddr.trim().ifBlank { "1.1.1.1" }
     return if (addr.startsWith("https://", ignoreCase = true)) {
-        runCatching { java.net.URI(addr).host }.getOrNull()?.takeIf { it.isNotBlank() } ?: addr
+        runCatching { java.net.URI(addr).host }.getOrNull()?.takeIf { it.isNotBlank() } ?: "custom DoH"
     } else {
         addr
     }
 }
 
-private fun formatDnsDetail(settings: VdpiSettings): String {
-    val addr = formatDnsDisplayAddr(settings.dnsAddr)
-    val proto = if (settings.enableDoh) "DoH" else "UDP"
+private fun isKnownPublicDohIp(rawIp: String): Boolean {
+    val trimmed = rawIp.trim()
+    if (trimmed.isEmpty() || trimmed.startsWith("https://", ignoreCase = true)) return false
+    if (!isValidDnsInput(trimmed)) return false
+    val unbracketed = if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+        trimmed.substring(1, trimmed.length - 1)
+    } else {
+        trimmed
+    }
+    val addr = runCatching { InetAddress.getByName(unbracketed) }.getOrNull() ?: return false
+    return when (addr) {
+        is Inet4Address -> {
+            val b = addr.address
+            if (b.size != 4) return false
+            val b0 = b[0].toInt() and 0xFF
+            val b1 = b[1].toInt() and 0xFF
+            val b2 = b[2].toInt() and 0xFF
+            val b3 = b[3].toInt() and 0xFF
+            (b0 == 1 && b1 == 1 && b2 == 1 && b3 in 1..3) ||
+                (b0 == 1 && b1 == 0 && b2 == 0 && b3 in 1..3) ||
+                (b0 == 8 && b1 == 8 && ((b2 == 8 && b3 == 8) || (b2 == 4 && b3 == 4))) ||
+                (b0 == 9 && b1 == 9 && b2 == 9 && b3 == 9) ||
+                (b0 == 149 && b1 == 112 && b2 == 112 && b3 == 112) ||
+                (b0 == 94 && b1 == 140 && b2 == 14 && (b3 == 14 || b3 == 15 || b3 == 140 || b3 == 141)) ||
+                (b0 == 94 && b1 == 140 && b2 == 15 && (b3 == 15 || b3 == 16))
+        }
+        is Inet6Address -> {
+            val b = addr.address
+            if (b.size != 16) return false
+            val s0 = ((b[0].toInt() and 0xFF) shl 8) or (b[1].toInt() and 0xFF)
+            val s1 = ((b[2].toInt() and 0xFF) shl 8) or (b[3].toInt() and 0xFF)
+            val s2 = ((b[4].toInt() and 0xFF) shl 8) or (b[5].toInt() and 0xFF)
+            val s3 = ((b[6].toInt() and 0xFF) shl 8) or (b[7].toInt() and 0xFF)
+            val s4 = ((b[8].toInt() and 0xFF) shl 8) or (b[9].toInt() and 0xFF)
+            val s5 = ((b[10].toInt() and 0xFF) shl 8) or (b[11].toInt() and 0xFF)
+            val s6 = ((b[12].toInt() and 0xFF) shl 8) or (b[13].toInt() and 0xFF)
+            val s7 = ((b[14].toInt() and 0xFF) shl 8) or (b[15].toInt() and 0xFF)
+            if (s3 != 0 || s4 != 0 || s5 != 0) return false
+            when {
+                s0 == 0x2606 && s1 == 0x4700 && s2 == 0x4700 && s6 == 0 ->
+                    s7 == 0x1111 || s7 == 0x1001 || s7 == 0x1112 || s7 == 0x1002 || s7 == 0x1113 || s7 == 0x1003
+                s0 == 0x2001 && s1 == 0x4860 && s2 == 0x4860 && s6 == 0 ->
+                    s7 == 0x8888 || s7 == 0x8844
+                s0 == 0x2620 && s1 == 0x00fe && s2 == 0 && s6 == 0 ->
+                    s7 == 0x00fe || s7 == 0x0009
+                s0 == 0x2a10 && s1 == 0x50c0 && s2 == 0 && s7 == 0x00ff ->
+                    s6 == 0x0ad1 || s6 == 0x0ad2 || s6 == 0xbad1 || s6 == 0xbad2 || s6 == 0x0001 || s6 == 0x0002
+                else -> false
+            }
+        }
+        else -> false
+    }
+}
+
+internal fun isEffectiveDohTarget(rawAddr: String, enableDoh: Boolean): Boolean {
+    val trimmed = rawAddr.trim().ifBlank { "1.1.1.1" }
+    if (trimmed.startsWith("https://", ignoreCase = true)) {
+        if (trimmed.equals("https://<redacted>", ignoreCase = true)) return true
+        val candidate = if (trimmed.endsWith("/<redacted>", ignoreCase = true)) {
+            trimmed.dropLast("/<redacted>".length)
+        } else {
+            trimmed
+        }
+        return isValidDnsInput(candidate)
+    }
+    if (!enableDoh) return false
+    return isKnownPublicDohIp(trimmed)
+}
+
+private fun formatDnsDetail(rawAddr: String, enableDoh: Boolean): String {
+    val addr = formatDnsDisplayAddr(rawAddr)
+    val proto = if (isEffectiveDohTarget(rawAddr, enableDoh)) "DoH" else "UDP"
     return "$addr · $proto"
 }
 
-private fun splitSummary(settings: VdpiSettings): String? {
+internal fun splitSummary(settings: VdpiSettings): String? {
     val count = settings.splitPackages.size
-    if (count == 0) return null
     return when (settings.splitTunnelMode) {
-        SplitTunnelMode.BYPASS_SELECTED -> "$count Bypassed"
-        SplitTunnelMode.ONLY_SELECTED -> "$count Routed"
+        SplitTunnelMode.BYPASS_SELECTED -> if (count == 0) null else "$count Bypassed"
+        SplitTunnelMode.ONLY_SELECTED -> if (count == 0) "0 apps (none protected)" else "$count Routed"
     }
 }

@@ -397,4 +397,347 @@ final class VdpiSharedTests: XCTestCase {
         XCTAssertNil(VdpiAppGroup.extractAppGroupFromProvisioningProfile(Data("not a plist".utf8)))
         XCTAssertNil(VdpiAppGroup.extractAppGroupFromProvisioningProfile(Data()))
     }
+
+    func testRedactedDnsSummaryHandlesIpv4Ipv6MalformedHttpsAndDetails() {
+        XCTAssertEqual(TunnelManager.redactedDnsSummary("1.1.1.1"), "1.1.1.1")
+        XCTAssertEqual(TunnelManager.redactedDnsSummary("   "), "1.1.1.1")
+        XCTAssertEqual(
+            TunnelManager.redactedDnsSummary("2606:4700:4700::1111"),
+            "2606:4700:4700::1111"
+        )
+        XCTAssertEqual(
+            TunnelManager.redactedDnsSummary("https://dns.google/dns-query"),
+            "https://dns.google/dns-query"
+        )
+        XCTAssertEqual(
+            TunnelManager.redactedDnsSummary("https://dns.nextdns.io/abc123/iphone"),
+            "https://dns.nextdns.io/[redacted]"
+        )
+        XCTAssertEqual(
+            TunnelManager.redactedDnsSummary("https://dns.example.com/dns-query?token=secret"),
+            "https://dns.example.com/[redacted]"
+        )
+        XCTAssertEqual(
+            TunnelManager.redactedDnsSummary("https://[2606:4700:4700::1111]/dns-query"),
+            "https://[2606:4700:4700::1111]/dns-query"
+        )
+        XCTAssertEqual(
+            TunnelManager.redactedDnsSummary("https://[2606:4700:4700::1111]:8443/profile-secret"),
+            "https://[2606:4700:4700::1111]:8443/[redacted]"
+        )
+        XCTAssertEqual(
+            TunnelManager.redactedDnsSummary("https://dns.nextdns.io/abc123 -> discord.com"),
+            "https://dns.nextdns.io/[redacted] -> discord.com"
+        )
+        XCTAssertEqual(
+            TunnelManager.redactedDnsSummary("https://[2606:4700:4700::1111]/secret -> discord.com"),
+            "https://[2606:4700:4700::1111]/[redacted] -> discord.com"
+        )
+
+        // Malformed https:// inputs must never leak raw URL text.
+        XCTAssertEqual(TunnelManager.redactedDnsSummary("https://"), "Custom DoH")
+        XCTAssertEqual(TunnelManager.redactedDnsSummary("https:///secret-profile"), "Custom DoH")
+        XCTAssertEqual(TunnelManager.redactedDnsSummary("https://[bad-ipv6/secret-token"), "Custom DoH")
+        XCTAssertEqual(TunnelManager.redactedDnsSummary("https://dns.nextdns.io:badport/secret"), "Custom DoH")
+        XCTAssertEqual(
+            TunnelManager.redactedDnsSummary("HTTPS://[bad/secret -> discord.com"),
+            "Custom DoH -> discord.com"
+        )
+        let withSpace = TunnelManager.redactedDnsSummary("https://dns.nextdns.io/secret with space")
+        XCTAssertFalse(withSpace.contains("secret"))
+
+        // Doctor detail strings must also redact embedded https:// URLs.
+        XCTAssertEqual(
+            TunnelManager.redactHttpsUrls(
+                in: "error sending request for url (https://dns.nextdns.io/abc123/device?key=1): reset"
+            ),
+            "error sending request for url (https://dns.nextdns.io/[redacted]): reset"
+        )
+        XCTAssertEqual(
+            TunnelManager.redactHttpsUrls(
+                in: "failed connecting to https://[2606:4700:4700::1111]:8443/secret-id."
+            ),
+            "failed connecting to https://[2606:4700:4700::1111]:8443/[redacted]."
+        )
+        XCTAssertEqual(
+            TunnelManager.redactHttpsUrls(
+                in: "malformed url https://[bad/secret-token failed"
+            ),
+            "malformed url Custom DoH failed"
+        )
+        XCTAssertEqual(
+            TunnelManager.redactHttpsUrls(in: "resolved 162.159.135.232 (2 records)"),
+            "resolved 162.159.135.232 (2 records)"
+        )
+    }
+
+    func testPushPacketsPartialAcceptanceBreaksBeforeNextChunk() {
+        let cfg = "{\"enable_doh\":false,\"block_quic\":true,\"ipv4_only\":true,\"mtu\":4064}"
+        let startError = VdpiNativeBridge.startBatched(
+            configJSON: cfg,
+            writeBatchCallback: { _, _, _ in },
+            userCtx: nil
+        )
+        XCTAssertNil(startError)
+        defer { VdpiNativeBridge.stop() }
+
+        let validPacket = Data(repeating: 0, count: 20)
+        let undersizedPacket = Data(repeating: 0, count: 10)
+
+        // Chunk 1 (64 packets): 63 valid + 1 undersized -> native accepts 63 (< 64).
+        // Chunk 2 (64 packets): 64 valid -> must NOT be pushed because chunk 1 partially accepted.
+        var mixedBatch = Array(repeating: validPacket, count: 63)
+        mixedBatch.append(undersizedPacket)
+        mixedBatch.append(contentsOf: Array(repeating: validPacket, count: 64))
+        XCTAssertEqual(mixedBatch.count, 128)
+
+        let partialAccepted = VdpiNativeBridge.pushPackets(mixedBatch)
+        XCTAssertEqual(partialAccepted, 63)
+
+        // Full multi-chunk batch (64 + 6) continues across chunks when chunk 1 fully accepts.
+        let validMultiChunk = Array(repeating: validPacket, count: 70)
+        XCTAssertEqual(VdpiNativeBridge.pushPackets(validMultiChunk), 70)
+
+        XCTAssertEqual(VdpiNativeBridge.pushPackets([]), 0)
+
+        VdpiNativeBridge.stop()
+        XCTAssertEqual(VdpiNativeBridge.pushPackets(validMultiChunk), 0)
+    }
+
+    func testJsonImportNormalizesEnableDohForHttpsDns() throws {
+        let httpsWithDohDisabled = """
+        {
+            "dnsAddr": "https://dns.google/dns-query",
+            "enableDoh": false
+        }
+        """
+        let importedHttps = try TunnelManager.parseImportedSettings(httpsWithDohDisabled)
+        XCTAssertEqual(importedHttps.dnsAddr, "https://dns.google/dns-query")
+        XCTAssertTrue(importedHttps.enableDoh)
+
+        let uppercaseHttps = """
+        {
+            "dnsAddr": "  HTTPS://dns.nextdns.io/abc123  ",
+            "enableDoh": false
+        }
+        """
+        let importedUpper = try TunnelManager.parseImportedSettings(uppercaseHttps)
+        XCTAssertEqual(importedUpper.dnsAddr, "HTTPS://dns.nextdns.io/abc123")
+        XCTAssertTrue(importedUpper.enableDoh)
+
+        let ipv6Https = """
+        {
+            "dnsAddr": "https://[2606:4700:4700::1111]/dns-query",
+            "enableDoh": false
+        }
+        """
+        let importedIpv6Https = try TunnelManager.parseImportedSettings(ipv6Https)
+        XCTAssertEqual(importedIpv6Https.dnsAddr, "https://[2606:4700:4700::1111]/dns-query")
+        XCTAssertTrue(importedIpv6Https.enableDoh)
+
+        let plainIpv4WithDohDisabled = """
+        {
+            "dnsAddr": "9.9.9.9",
+            "enableDoh": false
+        }
+        """
+        let importedIpv4 = try TunnelManager.parseImportedSettings(plainIpv4WithDohDisabled)
+        XCTAssertEqual(importedIpv4.dnsAddr, "9.9.9.9")
+        XCTAssertFalse(importedIpv4.enableDoh)
+
+        let plainIpv6WithDohDisabled = """
+        {
+            "dnsAddr": "2606:4700:4700::1111",
+            "enableDoh": false
+        }
+        """
+        let importedIpv6 = try TunnelManager.parseImportedSettings(plainIpv6WithDohDisabled)
+        XCTAssertEqual(importedIpv6.dnsAddr, "2606:4700:4700::1111")
+        XCTAssertFalse(importedIpv6.enableDoh)
+    }
+
+    func testLegacyHttpsWithEnableDohFalseNormalizesOnVdpiSettingsAndNativeEngineConfig() throws {
+        // Direct VdpiSettings Codable decode (legacy persisted JSON).
+        let legacySettingsJson = """
+        {
+            "dnsAddr": "  HTTPS://dns.nextdns.io/abc123  ",
+            "enableDoh": false
+        }
+        """
+        let decodedSettings = try JSONDecoder().decode(
+            VdpiSettings.self,
+            from: try XCTUnwrap(legacySettingsJson.data(using: .utf8))
+        )
+        XCTAssertTrue(decodedSettings.enableDoh)
+
+        let legacyPlainIpSettingsJson = """
+        {
+            "dnsAddr": "9.9.9.9",
+            "enableDoh": false
+        }
+        """
+        let decodedPlainSettings = try JSONDecoder().decode(
+            VdpiSettings.self,
+            from: try XCTUnwrap(legacyPlainIpSettingsJson.data(using: .utf8))
+        )
+        XCTAssertFalse(decodedPlainSettings.enableDoh)
+
+        // Direct NativeEngineConfig init with https:// and enableDoh: false.
+        let directHttpsConfig = NativeEngineConfig(
+            dnsAddr: "https://dns.google/dns-query",
+            enableDoh: false
+        )
+        XCTAssertTrue(directHttpsConfig.enableDoh)
+
+        let directUpperHttpsConfig = NativeEngineConfig(
+            dnsAddr: "  HTTPS://[2606:4700:4700::1111]/dns-query  ",
+            enableDoh: false
+        )
+        XCTAssertEqual(directUpperHttpsConfig.dnsAddr, "HTTPS://[2606:4700:4700::1111]/dns-query")
+        XCTAssertTrue(directUpperHttpsConfig.enableDoh)
+
+        let directPlainIpConfig = NativeEngineConfig(
+            dnsAddr: "9.9.9.9",
+            enableDoh: false
+        )
+        XCTAssertFalse(directPlainIpConfig.enableDoh)
+
+        // NativeEngineConfig Codable decode (legacy persisted applied config JSON).
+        let legacyNativeJson = """
+        {
+            "mode": "combo",
+            "chunk_size": 10,
+            "dns_addr": "https://dns.nextdns.io/abc123",
+            "enable_doh": false,
+            "ipv4_only": false,
+            "block_quic": true,
+            "timeout_ms": 8000,
+            "mtu": 4064,
+            "bypass_domains": []
+        }
+        """
+        let decodedNative = try JSONDecoder().decode(
+            NativeEngineConfig.self,
+            from: try XCTUnwrap(legacyNativeJson.data(using: .utf8))
+        )
+        XCTAssertEqual(decodedNative.dnsAddr, "https://dns.nextdns.io/abc123")
+        XCTAssertTrue(decodedNative.enableDoh)
+
+        let legacyNativePlainIpJson = """
+        {
+            "dns_addr": "8.8.8.8",
+            "enable_doh": false
+        }
+        """
+        let decodedNativePlainIp = try JSONDecoder().decode(
+            NativeEngineConfig.self,
+            from: try XCTUnwrap(legacyNativePlainIpJson.data(using: .utf8))
+        )
+        XCTAssertFalse(decodedNativePlainIp.enableDoh)
+    }
+
+    func testTelemetrySnapshotDecodesDroppedPacketsWithZeroDefault() throws {
+        XCTAssertEqual(TelemetrySnapshot.idle.droppedPackets, 0)
+
+        let missingDroppedJson = try XCTUnwrap("{\"running\":true,\"udp_flows_active\":3}".data(using: .utf8))
+        let missingDecoded = try JSONDecoder().decode(TelemetrySnapshot.self, from: missingDroppedJson)
+        XCTAssertTrue(missingDecoded.running)
+        XCTAssertEqual(missingDecoded.udpFlowsActive, 3)
+        XCTAssertEqual(missingDecoded.droppedPackets, 0)
+
+        let withDroppedJson = try XCTUnwrap(
+            "{\"running\":true,\"udp_flows_active\":2,\"dropped_packets\":42}".data(using: .utf8)
+        )
+        let withDroppedDecoded = try JSONDecoder().decode(TelemetrySnapshot.self, from: withDroppedJson)
+        XCTAssertEqual(withDroppedDecoded.droppedPackets, 42)
+
+        let reencoded = try JSONEncoder().encode(withDroppedDecoded)
+        let dict = try XCTUnwrap(JSONSerialization.jsonObject(with: reencoded) as? [String: Any])
+        XCTAssertEqual((dict["dropped_packets"] as? NSNumber)?.uint64Value, 42)
+        let roundTripped = try JSONDecoder().decode(TelemetrySnapshot.self, from: reencoded)
+        XCTAssertEqual(roundTripped.droppedPackets, 42)
+    }
+
+    func testTightenedIsValidDnsInputMatchesRustDohValidation() {
+        // Valid HTTPS DoH endpoints
+        XCTAssertTrue(VdpiFormatters.isValidDnsInput("https://dns.google/dns-query"))
+        XCTAssertTrue(VdpiFormatters.isValidDnsInput("https://dns.quad9.net:443/dns-query"))
+        XCTAssertTrue(VdpiFormatters.isValidDnsInput("https://1.1.1.1/dns-query"))
+        XCTAssertTrue(VdpiFormatters.isValidDnsInput("https://[2606:4700:4700::1111]/dns-query"))
+        XCTAssertTrue(VdpiFormatters.isValidDnsInput("https://[2606:4700:4700::1111]:8443/dns-query?token=abc%201"))
+        XCTAssertTrue(VdpiFormatters.isValidDnsInput("HTTPS://dns.nextdns.io/abc123"))
+
+        // Reject fragments
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://dns.google/dns-query#frag"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://dns.google/dns-query#"))
+
+        // Reject userinfo credentials
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://user:pass@dns.google/dns-query"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://user@dns.google/dns-query"))
+
+        // Reject loopback, link-local, unspecified, multicast, broadcast, and single-label localhost
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://127.0.0.1/dns-query"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://127.0.0.53/dns-query"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://169.254.1.1/dns-query"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://0.0.0.0/dns-query"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://224.0.0.1/dns-query"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://255.255.255.255/dns-query"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://[::1]/dns-query"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://[fe80::1]/dns-query"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://[::]/dns-query"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://[ff02::1]/dns-query"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://[::ffff:127.0.0.1]/dns-query"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://[::ffff:169.254.1.1]/dns-query"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://localhost/dns-query"))
+
+        // Reject invalid ports, unbracketed IPv6, and invalid path characters / percent-encoding
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://dns.google:0/dns-query"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://dns.google:65536/dns-query"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://dns.google:70000/dns-query"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://dns.google:-1/dns-query"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://dns.google:abc/dns-query"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://dns.google:/dns-query"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://[2606:4700:4700::1111]:0/dns-query"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://[2606:4700:4700::1111]:70000/dns-query"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://2606:4700:4700::1111/dns-query"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://[2606:4700:4700::1111/dns-query"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://dns.google/bad path"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://dns.google/bad%ZZ"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https://"))
+        XCTAssertFalse(VdpiFormatters.isValidDnsInput("https:///dns-query"))
+    }
+
+    func testRedactHttpsUrlsPreservesBalancedParenthesesAndOuterDelimiters() {
+        // Balanced parentheses inside the URL path are fully redacted (no trailing `)` leak).
+        XCTAssertEqual(
+            TunnelManager.redactHttpsUrls(
+                in: "failed for https://dns.nextdns.io/profile(iphone)"
+            ),
+            "failed for https://dns.nextdns.io/[redacted]"
+        )
+
+        // Balanced parentheses inside the URL path wrapped in outer sentence parentheses.
+        XCTAssertEqual(
+            TunnelManager.redactHttpsUrls(
+                in: "error for url (https://dns.nextdns.io/profile(iphone)): timeout"
+            ),
+            "error for url (https://dns.nextdns.io/[redacted]): timeout"
+        )
+
+        // Nested balanced parentheses in query string wrapped in outer parentheses.
+        XCTAssertEqual(
+            TunnelManager.redactHttpsUrls(
+                in: "probe (https://dns.example.com/dns-query?device=(work(1))): reset"
+            ),
+            "probe (https://dns.example.com/[redacted]): reset"
+        )
+
+        // IPv6 bracketed URL wrapped in outer square brackets.
+        XCTAssertEqual(
+            TunnelManager.redactHttpsUrls(
+                in: "endpoint [https://[2606:4700:4700::1111]/secret-profile] unreachable"
+            ),
+            "endpoint [https://[2606:4700:4700::1111]/[redacted]] unreachable"
+        )
+    }
 }

@@ -393,14 +393,10 @@ fn vpn_guard_full_lifecycle_transitions() {
     );
     assert_eq!(guard.state(), &GuardState::Recovering { since: t_clear });
 
-    // Brief VPN reconnect before 3s cancels recovery immediately.
+    // Brief VPN reconnect before 3s cancels recovery immediately without emitting a
+    // redundant YieldTun (the tunnel/proxy is already yielded during Recovering).
     let t_flap = t_clear + Duration::from_millis(2999);
-    assert_eq!(
-        guard.evaluate(&wireguard, t_flap),
-        GuardAction::YieldTun {
-            provider: "WireGuard".to_string(),
-        }
-    );
+    assert_eq!(guard.evaluate(&wireguard, t_flap), GuardAction::None);
     assert_eq!(
         guard.state(),
         &GuardState::YieldedStandby {
@@ -457,7 +453,9 @@ fn vpn_guard_full_lifecycle_transitions() {
 
 #[test]
 fn windows_tun_51_cidr_complement_invariants() {
-    assert_eq!(PUBLIC_IPV4_COMPLEMENT_CIDRS.len(), 51);
+    // 65 exact minimal disjoint CIDRs excluding 192.0.0.0/24 (IETF/DS-Lite) alongside
+    // all RFC 1918, CGNAT, loopback, link-local, multicast, and reserved ranges.
+    assert_eq!(PUBLIC_IPV4_COMPLEMENT_CIDRS.len(), 65);
 
     // 0. Every complement and excluded CIDR must have a valid prefix and canonical zero host bits.
     for &(net, prefix) in PUBLIC_IPV4_COMPLEMENT_CIDRS
@@ -810,6 +808,7 @@ async fn health_v050_tun_and_proxy_json_contract() {
         tun_interface: Some("vdpi0".to_string()),
         physical_nic: Some("Ethernet".to_string()),
         vpn_conflict: Some("Mullvad (yielded)".to_string()),
+        dns_addr: Some("1.1.1.1".to_string()),
     };
     let tun_json = render_health_json(&ctx, &tun_meta);
     let tun_status = parse_health_json(&tun_json, loopback, 18089, None)

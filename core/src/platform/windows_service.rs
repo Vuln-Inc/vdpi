@@ -1,6 +1,7 @@
 use crate::binder::{DynamicOutboundBinder, OutboundBinder, OutboundTarget};
 use crate::config::{EngineMode, RuntimeConfig, VpnCoexistence};
 use crate::desync::EngineContext;
+use crate::dns::DnsResolver;
 use crate::health::{
     bind_loopback_health_listener, serve_health_until_shutdown, HealthMetaFn, HealthRuntimeMeta,
     DEFAULT_TUN_HEALTH_PORT,
@@ -8,26 +9,33 @@ use crate::health::{
 use crate::platform::vpn::{detect_active_vpn, VpnScope};
 use crate::platform::vpn_guard::{GuardAction, VpnGuard};
 use crate::platform::windows::{
-    clear_all_windows_proxies, notify_wininet_refresh, set_running_as_service,
+    clear_all_windows_proxies, flush_dns_resolver_cache, notify_wininet_refresh,
+    set_running_as_service, WindowsProxySession,
 };
-use crate::platform::windows_tun::{find_verified_wintun_dll, WindowsTunSession, VDPI_TUN_NAME};
-use crate::platform::SystemProxySession;
+use crate::platform::windows_tun::{
+    cleanup_orphan_wintun_adapter, find_verified_wintun_dll, WindowsTunSession, VDPI_TUN_NAME,
+};
 use crate::server::{bind_listeners, serve_until_shutdown};
 use crate::service::{clear_runtime_state, write_runtime_state_with_meta};
 use anyhow::{bail, Context, Result};
 use std::ffi::c_void;
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use vdpi_tun::config::{TunProfile, DESKTOP_MTU};
 use vdpi_tun::events::EventRing;
 use vdpi_tun::pipeline::{run_tun_pipeline_with_app_bypass, TunStats};
+use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
+use windows_sys::Win32::System::LibraryLoader::{
+    GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+};
 
 pub const SERVICE_NAME: &str = "vdpi";
 pub const SERVICE_DISPLAY_NAME: &str = "vdpi Anti-DPI Service";
@@ -84,6 +92,7 @@ const SERVICE_CONTROL_SESSIONCHANGE: Dword = 0x0000_000E;
 
 const PBT_APMRESUMESUSPEND: Dword = 0x0000_0007;
 const PBT_APMRESUMEAUTOMATIC: Dword = 0x0000_0012;
+const DEVICE_NOTIFY_CALLBACK: Dword = 0x0000_0002;
 
 const WTS_SESSION_LOGON: Dword = 0x0000_0005;
 const WTS_SESSION_UNLOCK: Dword = 0x0000_0008;
@@ -105,6 +114,8 @@ const ERROR_SERVICE_NOT_ACTIVE: Dword = 1062;
 const ERROR_FAILED_SERVICE_CONTROLLER_CONNECT: Dword = 1063;
 const ERROR_SERVICE_MARKED_FOR_DELETE: Dword = 1072;
 const ERROR_CANCELLED: Dword = 1223;
+const STATUS_CONTROL_C_EXIT: Dword = 0xC000_013A;
+const DBG_TERMINATE_PROCESS: Dword = 0x4001_0004;
 
 const SEE_MASK_NOCLOSEPROCESS: Dword = 0x0000_0040;
 const SW_SHOWNORMAL: i32 = 1;
@@ -322,9 +333,14 @@ fn should_fallback_upgrade_control(win32_err: Dword) -> bool {
     win32_err == ERROR_INVALID_SERVICE_CONTROL || win32_err == ERROR_CALL_NOT_IMPLEMENTED
 }
 
+const RECONCILE_EVENT_SESSION_LOGON: u32 = 1 << 0;
+const RECONCILE_EVENT_SESSION_UNLOCK: u32 = 1 << 1;
+const RECONCILE_EVENT_POWER_RESUME: u32 = 1 << 2;
+
 struct ControlChannels {
     stop_tx: watch::Sender<Option<StopReason>>,
     reconcile_tx: watch::Sender<u64>,
+    reconcile_events: Arc<AtomicU32>,
 }
 
 static SERVICE_CONFIG: OnceLock<Mutex<Option<RuntimeConfig>>> = OnceLock::new();
@@ -354,9 +370,31 @@ pub fn is_elevated() -> bool {
     }
 }
 
+fn classify_elevated_child_exit(exit_code: Dword) -> Result<()> {
+    match exit_code {
+        0 | STATUS_CONTROL_C_EXIT | DBG_TERMINATE_PROCESS => Ok(()),
+        code if code >= 0x10000 => bail!(
+            "elevated vdpi command failed (exit code {code} / 0x{code:08X}); \
+             re-run from an elevated Administrator terminal to see full error output"
+        ),
+        code => bail!(
+            "elevated vdpi command failed (exit code {code}); \
+             re-run from an elevated Administrator terminal to see full error output"
+        ),
+    }
+}
+
 /// Relaunches the current `vdpi.exe` with explicit CLI arguments under UAC elevation (`runas`)
 /// and waits for the elevated process to finish.
 pub fn relaunch_elevated_and_wait(args: &[String]) -> Result<()> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        bail!(
+            "Administrator privileges are required, and UAC elevation cannot be prompted in a \
+             non-interactive or piped session (e.g. CI/SSH). Re-run from an elevated \
+             Administrator terminal."
+        );
+    }
+
     let current_exe = crate::update::strip_windows_verbatim_prefix(
         &std::env::current_exe().context("failed to determine current executable")?,
     );
@@ -399,7 +437,7 @@ pub fn relaunch_elevated_and_wait(args: &[String]) -> Result<()> {
         let err = unsafe { GetLastError() };
         if err == ERROR_CANCELLED {
             bail!(
-                "UAC elevation was cancelled. Administrator privileges are required to manage the '{SERVICE_NAME}' Windows service."
+                "UAC elevation was cancelled. Administrator privileges are required for Windows TUN mode and '{SERVICE_NAME}' service management."
             );
         }
         bail!("ShellExecuteExW(runas) failed with Win32 error {err}");
@@ -440,11 +478,8 @@ pub fn relaunch_elevated_and_wait(args: &[String]) -> Result<()> {
     if let Some(err) = exit_code_err {
         bail!("GetExitCodeProcess for elevated vdpi command failed with Win32 error {err}");
     }
-    if exit_code != 0 {
-        bail!("elevated vdpi command exited with status code {exit_code}");
-    }
 
-    Ok(())
+    classify_elevated_child_exit(exit_code)
 }
 
 /// Connects the current process to the Windows Service Control Manager (SCM) and blocks
@@ -562,10 +597,21 @@ impl TunSlot {
         self.session.as_ref().and_then(|s| s.physical_nic_name())
     }
 
+    fn force_reconcile_uplink(&self) {
+        if let Some(ref session) = self.session {
+            session.force_reconcile_uplink();
+        }
+    }
+
+    fn is_ipv6_active(&self) -> bool {
+        self.session.as_ref().is_some_and(|s| s.is_ipv6_active())
+    }
+
     async fn start(
         &mut self,
         binder: &Arc<DynamicOutboundBinder>,
         tun_ipv6: bool,
+        explicit_dns_ipv4_only: bool,
         ctx: &EngineContext,
         tun_stats: &Arc<TunStats>,
         events: &Arc<EventRing>,
@@ -578,6 +624,16 @@ impl TunSlot {
             tokio::task::spawn_blocking(move || WindowsTunSession::start(start_binder, tun_ipv6))
                 .await
                 .context("Windows TUN startup task panicked")??;
+
+        // Sync live DNS IPv4-only filtering with explicit `--ipv4-only` config and the
+        // actual active TUN IPv6 state:
+        // - Explicit `--ipv4-only` is always honored (`explicit_dns_ipv4_only == true`)
+        // - IPv4-only / dual-stack with !tun_ipv6 -> ipv6_active=false -> ipv4_only=true (prevents Happy Eyeballs AAAA leak)
+        // - IPv6-only uplink (auto-enabled IPv6 TUN) or tun_ipv6=true on dual-stack -> ipv6_active=true -> ipv4_only=false
+        ctx.dns.set_ipv4_only(effective_tun_dns_ipv4_only(
+            explicit_dns_ipv4_only,
+            session.is_ipv6_active(),
+        ));
 
         let app_bypass = crate::split_tunnel::build_tun_app_bypass_hook(&ctx.config.split_tunnel);
         let (pipeline_stop_tx, pipeline_stop_rx) = watch::channel(false);
@@ -645,18 +701,84 @@ fn sync_tun_telemetry(ctx: &EngineContext, tun_stats: &TunStats) {
         .fetch_max(quic, Ordering::Relaxed);
 }
 
+fn is_transient_offline_tun_error(err: &anyhow::Error) -> bool {
+    format!("{err:#}")
+        .to_ascii_lowercase()
+        .contains("no active physical network uplink")
+}
+
+fn effective_tun_dns_ipv4_only(explicit_dns_ipv4_only: bool, tun_ipv6_active: bool) -> bool {
+    explicit_dns_ipv4_only || !tun_ipv6_active
+}
+
+async fn sync_tun_dns_ipv4_only_if_changed<F, Fut>(
+    dns: &DnsResolver,
+    tun_running: bool,
+    explicit_dns_ipv4_only: bool,
+    tun_ipv6_active: bool,
+    flush_os_cache: F,
+) -> bool
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    if !tun_running {
+        return false;
+    }
+    let next = effective_tun_dns_ipv4_only(explicit_dns_ipv4_only, tun_ipv6_active);
+    let prev = dns.is_ipv4_only();
+    if prev == next {
+        return false;
+    }
+    dns.set_ipv4_only(next);
+    dns.clear_cache().await;
+    flush_os_cache().await;
+    true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TunStartErrorLogAction {
+    LogOfflineStandby,
+    SuppressOfflineStandby,
+    LogRetryableError,
+}
+
+fn classify_tun_start_error_log(
+    offline_standby_logged: &mut bool,
+    err: &anyhow::Error,
+) -> TunStartErrorLogAction {
+    if is_transient_offline_tun_error(err) {
+        if *offline_standby_logged {
+            TunStartErrorLogAction::SuppressOfflineStandby
+        } else {
+            *offline_standby_logged = true;
+            TunStartErrorLogAction::LogOfflineStandby
+        }
+    } else {
+        *offline_standby_logged = false;
+        TunStartErrorLogAction::LogRetryableError
+    }
+}
+
+fn redact_dns_addr_for_health(raw: &str) -> Option<String> {
+    let redacted = vdpi_core::dns::redact_dns_for_display(raw);
+    (!redacted.is_empty()).then_some(redacted)
+}
+
 struct TunSupervisor {
     binder: Arc<DynamicOutboundBinder>,
     ctx: EngineContext,
     tun_stats: Arc<TunStats>,
     events: Arc<EventRing>,
     tun_ipv6: bool,
+    explicit_dns_ipv4_only: bool,
     health_addr: SocketAddr,
     vpn_guard: VpnGuard,
     health_meta: Arc<Mutex<HealthRuntimeMeta>>,
     last_scope: VpnScope,
     last_start_attempt: Option<Instant>,
     last_warned_provider: Option<String>,
+    offline_standby_logged: bool,
 }
 
 impl TunSupervisor {
@@ -676,16 +798,19 @@ impl TunSupervisor {
         match action {
             GuardAction::YieldTun { provider } => {
                 self.last_warned_provider = None;
+                self.offline_standby_logged = false;
                 warn!(
                     provider = %provider,
                     "full-tunnel VPN detected; yielding Windows TUN session"
                 );
                 slot.stop().await;
+                self.ctx.dns.clear_cache().await;
                 self.sync_runtime_state(slot);
             }
             GuardAction::ResumeTun => {
                 self.last_warned_provider = None;
                 info!("full-tunnel VPN cleared after cooldown; resuming Windows TUN session");
+                self.ctx.dns.clear_cache().await;
                 self.try_start_slot(slot, now).await;
             }
             GuardAction::WarnOnly { provider } => {
@@ -721,6 +846,7 @@ impl TunSupervisor {
             .start(
                 &self.binder,
                 self.tun_ipv6,
+                self.explicit_dns_ipv4_only,
                 &self.ctx,
                 &self.tun_stats,
                 &self.events,
@@ -728,14 +854,48 @@ impl TunSupervisor {
             .await
         {
             Ok(()) => {
+                if self.offline_standby_logged {
+                    info!("physical network uplink restored; Windows TUN session is active");
+                    self.offline_standby_logged = false;
+                }
                 self.sync_runtime_state(slot);
             }
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    "failed to start or resume Windows TUN session; will retry"
-                );
-            }
+            Err(err) => match classify_tun_start_error_log(&mut self.offline_standby_logged, &err) {
+                TunStartErrorLogAction::LogOfflineStandby => {
+                    warn!(
+                        error = %err,
+                        "no active physical network uplink; holding Windows TUN in standby and polling for connectivity"
+                    );
+                }
+                TunStartErrorLogAction::SuppressOfflineStandby => {}
+                TunStartErrorLogAction::LogRetryableError => {
+                    warn!(
+                        error = %err,
+                        "failed to start or resume Windows TUN session; will retry"
+                    );
+                }
+            },
+        }
+    }
+
+    async fn sync_dns_ipv4_only(&self, slot: &TunSlot) {
+        let tun_ipv6_active = slot.is_ipv6_active();
+        if sync_tun_dns_ipv4_only_if_changed(
+            &self.ctx.dns,
+            slot.is_running(),
+            self.explicit_dns_ipv4_only,
+            tun_ipv6_active,
+            || async {
+                let _ = tokio::task::spawn_blocking(flush_dns_resolver_cache).await;
+            },
+        )
+        .await
+        {
+            debug!(
+                ipv4_only = self.ctx.dns.is_ipv4_only(),
+                tun_ipv6_active,
+                "re-synced Windows TUN service DNS IPv4-only filtering after route change"
+            );
         }
     }
 
@@ -760,8 +920,11 @@ impl TunSupervisor {
 }
 
 const SERVICE_MAX_BLOCKING_THREADS: usize = 16;
-const TUN_RECONCILE_ACTIVE_INTERVAL: Duration = Duration::from_secs(10);
+const TUN_RECONCILE_ACTIVE_INTERVAL: Duration = Duration::from_secs(3);
 const TUN_RECONCILE_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
+const PROXY_VPN_POLL_ACTIVE_INTERVAL: Duration = Duration::from_secs(3);
+const PROXY_VPN_POLL_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
+const PROXY_RECONCILE_INTERVAL: Duration = Duration::from_secs(15);
 
 fn service_tokio_worker_threads() -> usize {
     std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 4))
@@ -775,15 +938,41 @@ fn tun_reconcile_interval(tun_running: bool, vpn_yielded: bool) -> Duration {
     }
 }
 
+fn proxy_vpn_poll_interval(vpn_yielded: bool) -> Duration {
+    if vpn_yielded {
+        PROXY_VPN_POLL_RECOVERY_INTERVAL
+    } else {
+        PROXY_VPN_POLL_ACTIVE_INTERVAL
+    }
+}
+
+fn should_reapply_yielded_proxy_cleanup(vpn_yielded: bool, forced_reconcile: bool) -> bool {
+    vpn_yielded && forced_reconcile
+}
+
+fn normalize_tun_service_config(mut cfg: RuntimeConfig) -> RuntimeConfig {
+    // When IPv6 TUN routing is disabled, force IPv4-only DNS answers so browsers
+    // (Happy Eyeballs) on dual-stack ISPs do not leak AAAA connections past vdpi0.
+    // Once WindowsTunSession::start succeeds, TunSlot::start syncs the live resolver
+    // with `explicit_dns_ipv4_only || !session.is_ipv6_active()` so explicit `--ipv4-only`
+    // is preserved while IPv6-only uplinks that auto-enable IPv6 TUN still receive AAAA records.
+    if !cfg.tun_ipv6 {
+        cfg.dns_ipv4_only = true;
+    }
+    cfg
+}
+
 fn run_service_runtime(handle: ServiceStatusHandle, cfg: RuntimeConfig) -> Result<()> {
     let (stop_tx, stop_rx) = watch::channel::<Option<StopReason>>(None);
     let (reconcile_tx, reconcile_rx) = watch::channel::<u64>(0);
+    let reconcile_events = Arc::new(AtomicU32::new(0));
 
     {
         let lock = CONTROL_CHANNELS.get_or_init(|| Mutex::new(None));
         *lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(ControlChannels {
             stop_tx,
             reconcile_tx,
+            reconcile_events: Arc::clone(&reconcile_events),
         });
     }
 
@@ -796,7 +985,11 @@ fn run_service_runtime(handle: ServiceStatusHandle, cfg: RuntimeConfig) -> Resul
         .build()
         .context("failed to initialize Tokio runtime for Windows service")?;
 
-    rt.block_on(async move {
+    // Register Modern Standby (S0ix) suspend/resume notifications alongside
+    // SERVICE_ACCEPT_POWEREVENT so modern laptops also fire reconcile_events on wake.
+    let power_notify_guard = SuspendResumeNotificationGuard::register();
+
+    let result = rt.block_on(async move {
         if cfg.engine == EngineMode::Tun {
             match find_verified_wintun_dll() {
                 Ok(_) => {
@@ -805,6 +998,7 @@ fn run_service_runtime(handle: ServiceStatusHandle, cfg: RuntimeConfig) -> Resul
                         cfg.clone(),
                         stop_rx.clone(),
                         reconcile_rx.clone(),
+                        Arc::clone(&reconcile_events),
                     )
                     .await?
                     {
@@ -827,11 +1021,21 @@ fn run_service_runtime(handle: ServiceStatusHandle, cfg: RuntimeConfig) -> Resul
 
             let mut fallback_cfg = cfg;
             fallback_cfg.engine = EngineMode::Proxy;
-            return run_proxy_service_runtime(handle, fallback_cfg, stop_rx, reconcile_rx).await;
+            return run_proxy_service_runtime(
+                handle,
+                fallback_cfg,
+                stop_rx,
+                reconcile_rx,
+                reconcile_events,
+            )
+            .await;
         }
 
-        run_proxy_service_runtime(handle, cfg, stop_rx, reconcile_rx).await
-    })
+        run_proxy_service_runtime(handle, cfg, stop_rx, reconcile_rx, reconcile_events).await
+    });
+
+    drop(power_notify_guard);
+    result
 }
 
 async fn run_tun_service_runtime(
@@ -839,7 +1043,10 @@ async fn run_tun_service_runtime(
     cfg: RuntimeConfig,
     mut stop_rx: watch::Receiver<Option<StopReason>>,
     mut reconcile_rx: watch::Receiver<u64>,
+    reconcile_events: Arc<AtomicU32>,
 ) -> Result<TunRunOutcome> {
+    let explicit_dns_ipv4_only = cfg.dns_ipv4_only;
+    let cfg = normalize_tun_service_config(cfg);
     let binder = DynamicOutboundBinder::new(OutboundTarget {
         fail_closed: true,
         ..OutboundTarget::default()
@@ -879,15 +1086,36 @@ async fn run_tun_service_runtime(
 
     let mut slot = TunSlot::empty();
     let mut last_start_attempt = None;
+    let mut offline_standby_logged = false;
     if !vpn_guard.is_yielded() {
         last_start_attempt = Some(Instant::now());
         if let Err(err) = slot
-            .start(&binder, cfg.tun_ipv6, &ctx, &tun_stats, &events)
+            .start(
+                &binder,
+                cfg.tun_ipv6,
+                explicit_dns_ipv4_only,
+                &ctx,
+                &tun_stats,
+                &events,
+            )
             .await
         {
             slot.stop().await;
-            return Ok(TunRunOutcome::FallbackToProxy(err));
+            if is_transient_offline_tun_error(&err) {
+                let _ = tokio::task::spawn_blocking(cleanup_orphan_wintun_adapter).await;
+                warn!(
+                    error = %err,
+                    "no active physical network uplink at startup; holding Windows TUN in standby and polling for connectivity"
+                );
+                offline_standby_logged = true;
+            } else {
+                return Ok(TunRunOutcome::FallbackToProxy(err));
+            }
         }
+    } else {
+        // Clean up any orphaned vdpi0 adapter left from a prior crash so it cannot
+        // blackhole traffic while TUN is held in VPN standby.
+        let _ = tokio::task::spawn_blocking(cleanup_orphan_wintun_adapter).await;
     }
 
     // Clear any leftover WinINET/WinHTTP/user-env proxy settings once when running in TUN mode.
@@ -898,6 +1126,7 @@ async fn run_tun_service_runtime(
         tun_interface: slot.iface_name(),
         physical_nic: slot.physical_nic_name(),
         vpn_conflict: vpn_guard.active_conflict_label(&initial_scope),
+        dns_addr: redact_dns_addr_for_health(&cfg.dns_addr),
     }));
 
     let health_listener = match bind_loopback_health_listener(DEFAULT_TUN_HEALTH_PORT) {
@@ -961,12 +1190,14 @@ async fn run_tun_service_runtime(
         tun_stats,
         events,
         tun_ipv6: cfg.tun_ipv6,
+        explicit_dns_ipv4_only,
         health_addr,
         vpn_guard,
         health_meta,
         last_scope: initial_scope,
         last_start_attempt,
         last_warned_provider,
+        offline_standby_logged,
     };
 
     let mut reconcile_open = true;
@@ -1010,11 +1241,11 @@ async fn run_tun_service_runtime(
                 }
             } => {
                 if changed.is_ok() {
-                    let was_running = slot.is_running();
+                    // Sync DNS IPv4-only filtering before reconcile (which runs blocking
+                    // VPN detection) so queries during the transition never hit stale
+                    // ipv4_only=true and cache synthetic NODATA in Windows Dnscache.
+                    supervisor.sync_dns_ipv4_only(&slot).await;
                     supervisor.reconcile(&mut slot).await;
-                    if was_running && slot.is_running() {
-                        let _ = tokio::task::spawn_blocking(notify_wininet_refresh).await;
-                    }
                 } else {
                     slot.route_rx = None;
                 }
@@ -1027,10 +1258,20 @@ async fn run_tun_service_runtime(
                 }
             } => {
                 if changed.is_ok() {
+                    let event_flags = reconcile_events.swap(0, Ordering::SeqCst);
+                    let is_power_resume = (event_flags & RECONCILE_EVENT_POWER_RESUME) != 0;
+                    let is_session_unlock = (event_flags & RECONCILE_EVENT_SESSION_UNLOCK) != 0;
+                    if is_power_resume || is_session_unlock {
+                        supervisor.ctx.dns.clear_cache().await;
+                    }
+                    if is_power_resume {
+                        supervisor.last_start_attempt = None;
+                    }
                     let was_running = slot.is_running();
                     supervisor.reconcile(&mut slot).await;
-                    if was_running && slot.is_running() {
-                        let _ = tokio::task::spawn_blocking(notify_wininet_refresh).await;
+                    if is_power_resume && was_running && slot.is_running() {
+                        slot.force_reconcile_uplink();
+                        let _ = tokio::task::spawn_blocking(flush_dns_resolver_cache).await;
                     }
                 } else {
                     reconcile_open = false;
@@ -1065,7 +1306,12 @@ async fn run_proxy_service_runtime(
     cfg: RuntimeConfig,
     mut stop_rx: watch::Receiver<Option<StopReason>>,
     mut reconcile_rx: watch::Receiver<u64>,
+    reconcile_events: Arc<AtomicU32>,
 ) -> Result<()> {
+    // Clean up any orphaned vdpi0 Wintun adapter left behind by a prior TUN run or crash
+    // (covers direct Proxy mode startup, missing wintun.dll fallback, and TUN init fallback).
+    let _ = tokio::task::spawn_blocking(cleanup_orphan_wintun_adapter).await;
+
     let ctx = EngineContext::new(cfg.clone())?;
     ctx.attach_cache_file(windows_service_cache_path()).await;
     let bound = bind_listeners(&ctx)?;
@@ -1073,18 +1319,64 @@ async fn run_proxy_service_runtime(
     let primary_addr = bound.primary_addr;
     let socks_addr = bound.socks_addr;
 
+    let mut vpn_guard = VpnGuard::new(cfg.vpn_coexistence);
+    let mut last_warned_provider: Option<String> = None;
+    let initial_scope = if cfg.system_proxy && vpn_guard.policy() != VpnCoexistence::Off {
+        tokio::task::spawn_blocking(|| detect_active_vpn(None))
+            .await
+            .unwrap_or(VpnScope::None)
+    } else {
+        VpnScope::None
+    };
+    if cfg.system_proxy {
+        match vpn_guard.evaluate(&initial_scope, Instant::now()) {
+            GuardAction::YieldTun { ref provider } => {
+                warn!(
+                    provider = %provider,
+                    "full-tunnel VPN active at startup; holding Windows system proxy in standby"
+                );
+            }
+            GuardAction::WarnOnly { ref provider } => {
+                warn!(
+                    provider = %provider,
+                    "full-tunnel VPN active at startup (vpn_coexistence=warn); keeping Windows system proxy active"
+                );
+                last_warned_provider = Some(provider.clone());
+            }
+            GuardAction::ResumeTun | GuardAction::None => {}
+        }
+    }
+
     let proxy_session = if cfg.system_proxy {
-        Some(
-            SystemProxySession::activate(
+        if vpn_guard.is_yielded() {
+            let standby = WindowsProxySession::new_standby(
                 primary_addr.ip(),
                 primary_addr.port(),
-                socks_addr.map(|a| a.port()),
-                cfg.socks_system_proxy,
-                cfg.env_proxy,
-                &cfg.bypass_domains,
-            )?
-            .with_vpn_coexistence(cfg.vpn_coexistence),
-        )
+                cfg.vpn_coexistence,
+            );
+            // Clear any leftover vdpi AutoConfigURL/proxy settings preserved across
+            // reboot or upgrade while a full-tunnel VPN is already connected, without
+            // removing saved user proxy state on disk.
+            let yield_session = standby.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                yield_session.yield_for_vpn();
+                flush_dns_resolver_cache();
+            })
+            .await;
+            Some(standby)
+        } else {
+            Some(
+                WindowsProxySession::activate(
+                    primary_addr.ip(),
+                    primary_addr.port(),
+                    socks_addr.map(|a| a.port()),
+                    cfg.socks_system_proxy,
+                    cfg.env_proxy,
+                    &cfg.bypass_domains,
+                )?
+                .with_vpn_coexistence(cfg.vpn_coexistence),
+            )
+        }
     } else {
         None
     };
@@ -1110,98 +1402,161 @@ async fn run_proxy_service_runtime(
     info!(
         primary = %primary_addr,
         socks = ?socks_addr,
+        proxy_yielded = vpn_guard.is_yielded(),
         "vdpi Windows service is running"
     );
 
     let (server_shutdown_tx, server_shutdown_rx) = watch::channel(false);
 
-    let watchdog = if let Some(ref session) = proxy_session {
-        let watchdog_session = session.clone();
-        let mut watchdog_shutdown = server_shutdown_rx.clone();
-        let vpn_policy = cfg.vpn_coexistence;
-        Some(tokio::spawn(async move {
-            let mut vpn_guard = VpnGuard::new(vpn_policy);
-            let mut last_warned_provider: Option<String> = None;
-            let mut reconcile_open = true;
-            loop {
-                let poll_interval = if vpn_guard.is_yielded() {
-                    Duration::from_secs(2)
-                } else {
-                    Duration::from_secs(15)
-                };
-                tokio::select! {
-                    _ = watchdog_shutdown.changed() => {
-                        if *watchdog_shutdown.borrow() {
-                            break;
-                        }
-                        continue;
+    let watchdog_session = proxy_session.clone();
+    let watchdog_ctx = ctx.clone();
+    let mut watchdog_shutdown = server_shutdown_rx.clone();
+    let watchdog = tokio::spawn(async move {
+        let mut reconcile_open = true;
+        let mut last_proxy_reconcile = Instant::now();
+        loop {
+            let poll_interval = proxy_vpn_poll_interval(vpn_guard.is_yielded());
+            let mut forced_reconcile = false;
+            let mut power_or_unlock = false;
+            tokio::select! {
+                biased;
+                _ = watchdog_shutdown.changed() => {
+                    if *watchdog_shutdown.borrow() {
+                        break;
                     }
-                    changed = async {
-                        if reconcile_open {
-                            reconcile_rx.changed().await
-                        } else {
-                            std::future::pending().await
-                        }
-                    } => {
-                        if changed.is_err() {
-                            reconcile_open = false;
-                            continue;
-                        }
-                    }
-                    _ = tokio::time::sleep(poll_interval) => {}
-                }
-
-                if vpn_guard.policy() == VpnCoexistence::Off {
-                    let s = watchdog_session.clone();
-                    let _ = tokio::task::spawn_blocking(move || s.reconcile()).await;
                     continue;
                 }
+                changed = async {
+                    if reconcile_open {
+                        reconcile_rx.changed().await
+                    } else {
+                        std::future::pending().await
+                    }
+                } => {
+                    if changed.is_err() {
+                        reconcile_open = false;
+                        continue;
+                    }
+                    let event_flags = reconcile_events.swap(0, Ordering::SeqCst);
+                    let is_power_resume = (event_flags & RECONCILE_EVENT_POWER_RESUME) != 0;
+                    let is_session_unlock = (event_flags & RECONCILE_EVENT_SESSION_UNLOCK) != 0;
+                    power_or_unlock = is_power_resume || is_session_unlock;
+                    forced_reconcile = true;
+                }
+                _ = async {
+                    if watchdog_session.is_some() {
+                        tokio::time::sleep(poll_interval).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {}
+            }
 
-                let scope = tokio::task::spawn_blocking(|| detect_active_vpn(None))
-                    .await
-                    .unwrap_or(VpnScope::None);
-                match vpn_guard.evaluate(&scope, Instant::now()) {
-                    GuardAction::YieldTun { provider } => {
-                        last_warned_provider = None;
+            let Some(ref session) = watchdog_session else {
+                if power_or_unlock {
+                    watchdog_ctx.dns.clear_cache().await;
+                    let _ = tokio::task::spawn_blocking(flush_dns_resolver_cache).await;
+                }
+                continue;
+            };
+
+            if power_or_unlock {
+                watchdog_ctx.dns.clear_cache().await;
+            }
+
+            if vpn_guard.policy() == VpnCoexistence::Off {
+                if forced_reconcile || last_proxy_reconcile.elapsed() >= PROXY_RECONCILE_INTERVAL {
+                    let s = session.clone();
+                    let _ = tokio::task::spawn_blocking(move || s.reconcile()).await;
+                    last_proxy_reconcile = Instant::now();
+                }
+                if power_or_unlock {
+                    let _ = tokio::task::spawn_blocking(flush_dns_resolver_cache).await;
+                }
+                continue;
+            }
+
+            let scope = tokio::task::spawn_blocking(|| detect_active_vpn(None))
+                .await
+                .unwrap_or(VpnScope::None);
+            let mut dns_flushed = false;
+            match vpn_guard.evaluate(&scope, Instant::now()) {
+                GuardAction::YieldTun { provider } => {
+                    last_warned_provider = None;
+                    warn!(
+                        provider = %provider,
+                        "full-tunnel VPN detected; yielding Windows system proxy"
+                    );
+                    let s = session.clone();
+                    let _ = tokio::task::spawn_blocking(move || s.yield_for_vpn()).await;
+                    watchdog_ctx.dns.clear_cache().await;
+                    let _ = tokio::task::spawn_blocking(flush_dns_resolver_cache).await;
+                    dns_flushed = true;
+                }
+                GuardAction::ResumeTun => {
+                    last_warned_provider = None;
+                    info!(
+                        "full-tunnel VPN cleared after cooldown; restoring Windows system proxy"
+                    );
+                    watchdog_ctx.dns.clear_cache().await;
+                    let s = session.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        s.reconcile();
+                        flush_dns_resolver_cache();
+                    })
+                    .await;
+                    last_proxy_reconcile = Instant::now();
+                    dns_flushed = true;
+                }
+                GuardAction::WarnOnly { provider } => {
+                    if last_warned_provider.as_deref() != Some(provider.as_str()) {
                         warn!(
                             provider = %provider,
-                            "full-tunnel VPN detected; yielding Windows system proxy"
+                            "full-tunnel VPN detected (vpn_coexistence=warn); keeping Windows system proxy active"
                         );
-                        let s = watchdog_session.clone();
-                        let _ = tokio::task::spawn_blocking(move || s.deactivate()).await;
+                        last_warned_provider = Some(provider);
                     }
-                    GuardAction::ResumeTun => {
-                        last_warned_provider = None;
-                        info!(
-                            "full-tunnel VPN cleared after cooldown; restoring Windows system proxy"
-                        );
-                        let s = watchdog_session.clone();
+                    if forced_reconcile
+                        || last_proxy_reconcile.elapsed() >= PROXY_RECONCILE_INTERVAL
+                    {
+                        let s = session.clone();
                         let _ = tokio::task::spawn_blocking(move || s.reconcile()).await;
+                        last_proxy_reconcile = Instant::now();
                     }
-                    GuardAction::WarnOnly { provider } => {
-                        if last_warned_provider.as_deref() != Some(provider.as_str()) {
-                            warn!(
-                                provider = %provider,
-                                "full-tunnel VPN detected (vpn_coexistence=warn); keeping Windows system proxy active"
-                            );
-                            last_warned_provider = Some(provider);
-                        }
+                }
+                GuardAction::None => {
+                    if !scope.is_full_tunnel() {
+                        last_warned_provider = None;
                     }
-                    GuardAction::None => {
-                        if !scope.is_full_tunnel() {
-                            last_warned_provider = None;
-                        }
-                        if !vpn_guard.is_yielded() {
-                            let s = watchdog_session.clone();
-                            let _ = tokio::task::spawn_blocking(move || s.reconcile()).await;
-                        }
+                    if should_reapply_yielded_proxy_cleanup(
+                        vpn_guard.is_yielded(),
+                        forced_reconcile,
+                    ) {
+                        // A forced reconcile (e.g. WTS_SESSION_LOGON after boot-before-logon)
+                        // may have just loaded an interactive user hive that still holds a
+                        // stale shutdown AutoConfigURL; re-yield and flush DNS immediately.
+                        let s = session.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            s.yield_for_vpn();
+                            flush_dns_resolver_cache();
+                        })
+                        .await;
+                        dns_flushed = true;
+                    } else if !vpn_guard.is_yielded()
+                        && (forced_reconcile
+                            || last_proxy_reconcile.elapsed() >= PROXY_RECONCILE_INTERVAL)
+                    {
+                        let s = session.clone();
+                        let _ = tokio::task::spawn_blocking(move || s.reconcile()).await;
+                        last_proxy_reconcile = Instant::now();
                     }
                 }
             }
-        }))
-    } else {
-        None
-    };
+            if power_or_unlock && !dns_flushed {
+                let _ = tokio::task::spawn_blocking(flush_dns_resolver_cache).await;
+            }
+        }
+    });
 
     let shutdown_ctx = ctx.clone();
     let server_task = tokio::spawn(serve_until_shutdown(bound, ctx, server_shutdown_rx));
@@ -1217,9 +1572,7 @@ async fn run_proxy_service_runtime(
 
     report_service_status(handle, SERVICE_STOP_PENDING, 0, NO_ERROR, 2, 5000);
     let _ = server_shutdown_tx.send(true);
-    if let Some(watchdog) = watchdog {
-        let _ = watchdog.await;
-    }
+    let _ = watchdog.await;
     clear_runtime_state(std::process::id());
 
     if should_deactivate_proxy_on_stop(reason) {
@@ -1240,9 +1593,152 @@ async fn run_proxy_service_runtime(
     Ok(())
 }
 
-fn trigger_reconcile() {
+fn should_trigger_power_resume_reconcile(event_type: Dword) -> bool {
+    event_type == PBT_APMRESUMEAUTOMATIC || event_type == PBT_APMRESUMESUSPEND
+}
+
+#[repr(C)]
+struct DeviceNotifySubscribeParameters {
+    callback: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> u32,
+    context: *mut c_void,
+}
+
+type PowerRegisterSuspendResumeNotificationFn = unsafe extern "system" fn(
+    flags: Dword,
+    recipient: *mut c_void,
+    registration_handle: *mut *mut c_void,
+) -> Dword;
+
+type PowerUnregisterSuspendResumeNotificationFn =
+    unsafe extern "system" fn(registration_handle: *mut c_void) -> Dword;
+
+unsafe extern "system" fn power_suspend_resume_callback(
+    _context: *mut c_void,
+    event_type: Dword,
+    _setting: *mut c_void,
+) -> u32 {
+    if should_trigger_power_resume_reconcile(event_type) {
+        trigger_reconcile(RECONCILE_EVENT_POWER_RESUME);
+    }
+    NO_ERROR
+}
+
+struct SuspendResumeNotificationGuard {
+    hmod: HMODULE,
+    reg_handle: *mut c_void,
+    unregister_fn: PowerUnregisterSuspendResumeNotificationFn,
+}
+
+// Safety: `HMODULE` and `HPOWERNOTIFY` are process-global Win32 handles that can be
+// unregistered and freed safely when the service runtime stops.
+unsafe impl Send for SuspendResumeNotificationGuard {}
+
+impl SuspendResumeNotificationGuard {
+    fn register() -> Option<Self> {
+        let dll_wide = to_wide_null("powrprof.dll");
+        let hmod = unsafe {
+            LoadLibraryExW(
+                dll_wide.as_ptr(),
+                ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        };
+        if hmod.is_null() {
+            warn!("could not load powrprof.dll for Modern Standby wake notifications");
+            return None;
+        }
+
+        let register_proc = unsafe {
+            GetProcAddress(
+                hmod,
+                c"PowerRegisterSuspendResumeNotification"
+                    .as_ptr()
+                    .cast::<u8>(),
+            )
+        };
+        let unregister_proc = unsafe {
+            GetProcAddress(
+                hmod,
+                c"PowerUnregisterSuspendResumeNotification"
+                    .as_ptr()
+                    .cast::<u8>(),
+            )
+        };
+        let (Some(register_proc), Some(unregister_proc)) = (register_proc, unregister_proc) else {
+            warn!(
+                "powrprof.dll missing PowerRegisterSuspendResumeNotification exports; \
+                 relying on SERVICE_ACCEPT_POWEREVENT only"
+            );
+            unsafe {
+                let _ = FreeLibrary(hmod);
+            }
+            return None;
+        };
+
+        let register_fn: PowerRegisterSuspendResumeNotificationFn =
+            unsafe { std::mem::transmute_copy(&register_proc) };
+        let unregister_fn: PowerUnregisterSuspendResumeNotificationFn =
+            unsafe { std::mem::transmute_copy(&unregister_proc) };
+
+        let mut params = DeviceNotifySubscribeParameters {
+            callback: power_suspend_resume_callback,
+            context: ptr::null_mut(),
+        };
+        let mut reg_handle: *mut c_void = ptr::null_mut();
+        let rc = unsafe {
+            register_fn(
+                DEVICE_NOTIFY_CALLBACK,
+                (&mut params as *mut DeviceNotifySubscribeParameters).cast::<c_void>(),
+                &mut reg_handle,
+            )
+        };
+        if rc != NO_ERROR || reg_handle.is_null() {
+            warn!(
+                error = rc,
+                "PowerRegisterSuspendResumeNotification failed; relying on SERVICE_ACCEPT_POWEREVENT only"
+            );
+            unsafe {
+                let _ = FreeLibrary(hmod);
+            }
+            return None;
+        }
+
+        info!("registered Modern Standby (S0ix) power suspend/resume notification");
+        Some(Self {
+            hmod,
+            reg_handle,
+            unregister_fn,
+        })
+    }
+}
+
+impl Drop for SuspendResumeNotificationGuard {
+    fn drop(&mut self) {
+        let mut unregistered = true;
+        if !self.reg_handle.is_null() {
+            let rc = unsafe { (self.unregister_fn)(self.reg_handle) };
+            if rc != NO_ERROR {
+                warn!(
+                    error = rc,
+                    "PowerUnregisterSuspendResumeNotification failed"
+                );
+                unregistered = false;
+            }
+            self.reg_handle = ptr::null_mut();
+        }
+        if unregistered && !self.hmod.is_null() {
+            unsafe {
+                let _ = FreeLibrary(self.hmod);
+            }
+            self.hmod = ptr::null_mut();
+        }
+    }
+}
+
+fn trigger_reconcile(event_bits: u32) {
     if let Some(lock) = CONTROL_CHANNELS.get() {
         if let Some(ref ch) = *lock.lock().unwrap_or_else(|e| e.into_inner()) {
+            ch.reconcile_events.fetch_or(event_bits, Ordering::SeqCst);
             ch.reconcile_tx.send_modify(|n| *n = n.wrapping_add(1));
         }
     }
@@ -1273,14 +1769,16 @@ unsafe extern "system" fn service_control_handler(
             NO_ERROR
         }
         SERVICE_CONTROL_SESSIONCHANGE => {
-            if event_type == WTS_SESSION_LOGON || event_type == WTS_SESSION_UNLOCK {
-                trigger_reconcile();
+            if event_type == WTS_SESSION_LOGON {
+                trigger_reconcile(RECONCILE_EVENT_SESSION_LOGON);
+            } else if event_type == WTS_SESSION_UNLOCK {
+                trigger_reconcile(RECONCILE_EVENT_SESSION_UNLOCK);
             }
             NO_ERROR
         }
         SERVICE_CONTROL_POWEREVENT => {
-            if event_type == PBT_APMRESUMEAUTOMATIC || event_type == PBT_APMRESUMESUSPEND {
-                trigger_reconcile();
+            if should_trigger_power_resume_reconcile(event_type) {
+                trigger_reconcile(RECONCILE_EVENT_POWER_RESUME);
             }
             NO_ERROR
         }
@@ -1997,9 +2495,253 @@ mod tests {
         assert!((2..=4).contains(&workers));
         assert_eq!(SERVICE_MAX_BLOCKING_THREADS, 16);
 
-        assert_eq!(tun_reconcile_interval(true, false), Duration::from_secs(10));
+        assert_eq!(tun_reconcile_interval(true, false), Duration::from_secs(3));
         assert_eq!(tun_reconcile_interval(true, true), Duration::from_secs(1));
         assert_eq!(tun_reconcile_interval(false, false), Duration::from_secs(1));
         assert_eq!(tun_reconcile_interval(false, true), Duration::from_secs(1));
+
+        assert_eq!(proxy_vpn_poll_interval(false), Duration::from_secs(3));
+        assert_eq!(proxy_vpn_poll_interval(true), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn transient_offline_tun_errors_and_health_dns_redaction_behave_as_expected() {
+        let offline = anyhow::anyhow!(
+            "no active physical network uplink detected; connect to Wi-Fi or Ethernet and retry"
+        );
+        assert!(is_transient_offline_tun_error(&offline));
+        let fatal = anyhow::anyhow!("WintunCreateAdapter failed with access denied");
+        assert!(!is_transient_offline_tun_error(&fatal));
+
+        assert_eq!(redact_dns_addr_for_health("   "), None);
+        assert_eq!(
+            redact_dns_addr_for_health("1.1.1.1").as_deref(),
+            Some("1.1.1.1")
+        );
+        assert_eq!(
+            redact_dns_addr_for_health("https://dns.nextdns.io/abc123/my-device").as_deref(),
+            Some("https://dns.nextdns.io")
+        );
+        assert_eq!(
+            redact_dns_addr_for_health("HTTPS://user:secret@dns.example.com:8443/token?k=v")
+                .as_deref(),
+            Some("https://dns.example.com:8443")
+        );
+    }
+
+    #[test]
+    fn elevated_child_exit_treats_user_close_as_ok_and_formats_failures() {
+        assert_eq!(STATUS_CONTROL_C_EXIT, 0xC000_013A);
+        assert_eq!(DBG_TERMINATE_PROCESS, 0x4001_0004);
+
+        assert!(classify_elevated_child_exit(0).is_ok());
+        assert!(classify_elevated_child_exit(STATUS_CONTROL_C_EXIT).is_ok());
+        assert!(classify_elevated_child_exit(DBG_TERMINATE_PROCESS).is_ok());
+
+        let err_small = classify_elevated_child_exit(1).unwrap_err().to_string();
+        assert!(err_small.contains("exit code 1"));
+        assert!(err_small.contains("Administrator terminal"));
+
+        let err_ntstatus = classify_elevated_child_exit(0xC000_0135)
+            .unwrap_err()
+            .to_string();
+        assert!(err_ntstatus.contains("0xC0000135"));
+        assert!(err_ntstatus.contains("Administrator terminal"));
+    }
+
+    #[test]
+    fn tun_service_config_and_modern_standby_power_helpers_match_spec() {
+        let cfg_v4 = normalize_tun_service_config(RuntimeConfig {
+            tun_ipv6: false,
+            dns_ipv4_only: false,
+            ..RuntimeConfig::default()
+        });
+        assert!(cfg_v4.dns_ipv4_only);
+
+        let cfg_v6 = normalize_tun_service_config(RuntimeConfig {
+            tun_ipv6: true,
+            dns_ipv4_only: false,
+            ..RuntimeConfig::default()
+        });
+        assert!(!cfg_v6.dns_ipv4_only);
+
+        assert_eq!(DEVICE_NOTIFY_CALLBACK, 2);
+        assert!(should_trigger_power_resume_reconcile(
+            PBT_APMRESUMEAUTOMATIC
+        ));
+        assert!(should_trigger_power_resume_reconcile(PBT_APMRESUMESUSPEND));
+        assert!(!should_trigger_power_resume_reconcile(0x0004));
+        assert!(!should_trigger_power_resume_reconcile(0));
+    }
+
+    #[test]
+    fn yielded_proxy_reapplies_cleanup_only_on_forced_reconcile() {
+        assert!(should_reapply_yielded_proxy_cleanup(true, true));
+        assert!(!should_reapply_yielded_proxy_cleanup(true, false));
+        assert!(!should_reapply_yielded_proxy_cleanup(false, true));
+        assert!(!should_reapply_yielded_proxy_cleanup(false, false));
+    }
+
+    #[test]
+    fn effective_tun_dns_ipv4_only_preserves_explicit_flag_and_tracks_ipv6() {
+        // Explicit `--ipv4-only` is never overridden even when IPv6 TUN is active.
+        assert!(effective_tun_dns_ipv4_only(true, true));
+        assert!(effective_tun_dns_ipv4_only(true, false));
+        // Without explicit `--ipv4-only`, follow `!is_ipv6_active()`.
+        assert!(effective_tun_dns_ipv4_only(false, false));
+        assert!(!effective_tun_dns_ipv4_only(false, true));
+    }
+
+    #[tokio::test]
+    async fn sync_tun_dns_ipv4_only_clears_and_flushes_only_on_change() {
+        let ctx = EngineContext::new(RuntimeConfig {
+            tun_ipv6: false,
+            dns_ipv4_only: true,
+            ..RuntimeConfig::default()
+        })
+        .expect("EngineContext::new should succeed for default config");
+        assert!(ctx.dns.is_ipv4_only());
+
+        // Stopped TUN slot must not mutate DNS filtering or flush OS cache.
+        let flushes = Arc::new(AtomicU32::new(0));
+        let flushes_clone = Arc::clone(&flushes);
+        let changed = sync_tun_dns_ipv4_only_if_changed(
+            &ctx.dns,
+            false,
+            false,
+            true,
+            move || async move {
+                flushes_clone.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+        assert!(!changed);
+        assert!(ctx.dns.is_ipv4_only());
+        assert_eq!(flushes.load(Ordering::SeqCst), 0);
+
+        // No-op when effective ipv4_only matches current state (true -> true).
+        let flushes_clone = Arc::clone(&flushes);
+        let changed = sync_tun_dns_ipv4_only_if_changed(
+            &ctx.dns,
+            true,
+            false,
+            false,
+            move || async move {
+                flushes_clone.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+        assert!(!changed);
+        assert!(ctx.dns.is_ipv4_only());
+        assert_eq!(flushes.load(Ordering::SeqCst), 0);
+
+        // Transition true -> false (e.g. IPv4-only Wi-Fi to IPv6-only cellular):
+        // must flip ipv4_only BEFORE flushing Windows Dnscache.
+        let flushes_clone = Arc::clone(&flushes);
+        let ipv4_only_seen_at_flush = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let ipv4_only_seen_clone = Arc::clone(&ipv4_only_seen_at_flush);
+        let dns_ref = &ctx.dns;
+        let changed = sync_tun_dns_ipv4_only_if_changed(
+            dns_ref,
+            true,
+            false,
+            true,
+            move || async move {
+                ipv4_only_seen_clone.store(dns_ref.is_ipv4_only(), Ordering::SeqCst);
+                flushes_clone.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+        assert!(changed);
+        assert!(!ctx.dns.is_ipv4_only());
+        assert!(!ipv4_only_seen_at_flush.load(Ordering::SeqCst));
+        assert_eq!(flushes.load(Ordering::SeqCst), 1);
+
+        // Repeated route notification with the same IPv6 state must not re-flush.
+        let flushes_clone = Arc::clone(&flushes);
+        let changed = sync_tun_dns_ipv4_only_if_changed(
+            &ctx.dns,
+            true,
+            false,
+            true,
+            move || async move {
+                flushes_clone.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+        assert!(!changed);
+        assert!(!ctx.dns.is_ipv4_only());
+        assert_eq!(flushes.load(Ordering::SeqCst), 1);
+
+        // Transition false -> true (e.g. IPv6-only back to IPv4-only / dual-stack with !tun_ipv6):
+        // must flip back to ipv4_only=true before flushing OS cache again.
+        let flushes_clone = Arc::clone(&flushes);
+        let ipv4_only_seen_at_flush = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ipv4_only_seen_clone = Arc::clone(&ipv4_only_seen_at_flush);
+        let dns_ref = &ctx.dns;
+        let changed = sync_tun_dns_ipv4_only_if_changed(
+            dns_ref,
+            true,
+            false,
+            false,
+            move || async move {
+                ipv4_only_seen_clone.store(dns_ref.is_ipv4_only(), Ordering::SeqCst);
+                flushes_clone.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+        assert!(changed);
+        assert!(ctx.dns.is_ipv4_only());
+        assert!(ipv4_only_seen_at_flush.load(Ordering::SeqCst));
+        assert_eq!(flushes.load(Ordering::SeqCst), 2);
+
+        // Explicit --ipv4-only stays true even when IPv6 TUN is active; no flush.
+        let flushes_clone = Arc::clone(&flushes);
+        let changed = sync_tun_dns_ipv4_only_if_changed(
+            &ctx.dns,
+            true,
+            true,
+            true,
+            move || async move {
+                flushes_clone.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+        assert!(!changed);
+        assert!(ctx.dns.is_ipv4_only());
+        assert_eq!(flushes.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn offline_standby_log_deduplicates_repeated_uplink_errors() {
+        let offline = anyhow::anyhow!(
+            "no active physical network uplink detected; connect to Wi-Fi or Ethernet and retry"
+        );
+        let other = anyhow::anyhow!("WintunCreateAdapter failed with access denied");
+        let mut logged = false;
+
+        assert_eq!(
+            classify_tun_start_error_log(&mut logged, &offline),
+            TunStartErrorLogAction::LogOfflineStandby
+        );
+        assert!(logged);
+
+        assert_eq!(
+            classify_tun_start_error_log(&mut logged, &offline),
+            TunStartErrorLogAction::SuppressOfflineStandby
+        );
+        assert!(logged);
+
+        assert_eq!(
+            classify_tun_start_error_log(&mut logged, &other),
+            TunStartErrorLogAction::LogRetryableError
+        );
+        assert!(!logged);
+
+        assert_eq!(
+            classify_tun_start_error_log(&mut logged, &offline),
+            TunStartErrorLogAction::LogOfflineStandby
+        );
+        assert!(logged);
     }
 }

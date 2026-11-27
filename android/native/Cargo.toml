@@ -20,3 +20,4 @@ vdpi-tun.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
+socket2 = { version = "0.5", features = ["all"] }

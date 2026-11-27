@@ -5,7 +5,7 @@
 Self-healing anti-DPI engine in Rust, native across Windows, macOS, Linux, Android, and iOS.  
 Runs as a transparent system-wide TUN adapter or a lightweight local proxy with zero remote servers and zero telemetry.
 
-[![Release](https://img.shields.io/github/v/release/Vuln-Inc/vdpi?style=for-the-badge&logo=github&color=38bdf8)](https://github.com/Vuln-Inc/vdpi/releases/latest)
+[![Release](https://img.shields.io/badge/Release-v0.6.0-38bdf8?style=for-the-badge&logo=github)](https://github.com/Vuln-Inc/vdpi/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-34d399?style=for-the-badge)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/Platforms-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Android%20%7C%20iOS-818cf8?style=for-the-badge)](#quick-install)
 
@@ -72,14 +72,14 @@ irm https://vuln-inc.github.io/vdpi/install.ps1 | iex
 # Scoop (direct manifest, no extra bucket required)
 scoop install https://vuln-inc.github.io/vdpi/vdpi.json
 
-# WinGet
+# WinGet *(pending review: microsoft/winget-pkgs#489148)*
 winget install Vuln-Inc.vdpi
 
 # Cargo (https://crates.io/crates/vdpi)
 cargo install vdpi
 ```
 
-> **Note:** Official Windows releases (`vdpi-windows-x86_64.zip`) ship `vdpi.exe` alongside the unmodified WHQL-signed `wintun.dll` (`0.14.1`) and `WINTUN-LICENSE.txt` (needed only for TUN mode). Proxy mode uses a fail-open PAC proxy (`AutoConfigURL` -> `PROXY 127.0.0.1:<port>; DIRECT`) so terminating or crashing `vdpi` can never brick your internet connection. `cargo install vdpi` works in Proxy mode immediately; for TUN mode, place `wintun.dll` beside `vdpi.exe` or install via `install.ps1`, Scoop, or WinGet.
+> **Note:** Official Windows releases (`vdpi-windows-x86_64.zip`) ship `vdpi.exe` alongside the unmodified WHQL-signed `wintun.dll` (`0.14.1`) and `WINTUN-LICENSE.txt` (needed only for TUN mode). Proxy mode uses a fail-open `/vdpi.pac` auto-config proxy across Windows (`AutoConfigURL`), macOS (`AutoProxyURL`), and Linux (GNOME/KDE PAC; Linux also exports user-session `HTTP_PROXY`/`HTTPS_PROXY` unless `--no-env-proxy` is set), so terminating or crashing `vdpi` on Windows/macOS never bricks direct internet access. `cargo install vdpi` works in Proxy mode immediately; for TUN mode on Windows, copy `wintun.dll` from the matching release zip beside `vdpi.exe`.
 
 Direct download: [`vdpi-windows-x86_64.zip`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-windows-x86_64.zip) (`vdpi.exe`, WHQL-signed `wintun.dll` `0.14.1`, and `WINTUN-LICENSE.txt`) or [crates.io/crates/vdpi](https://crates.io/crates/vdpi).
 
@@ -113,16 +113,16 @@ Direct downloads: [`vdpi-macos-universal.tar.gz`](https://github.com/Vuln-Inc/vd
 
 ## Engine Modes (Proxy vs TUN)
 
-- **Proxy mode (default):** Zero admin privileges required, zero virtual adapter, routing table, or DNS changes, and most stable out of the box for browsers, Discord, Telegram, and apps that honor system proxy.
+- **Proxy mode (default):** Zero admin privileges required for portable/foreground runs (and unprivileged background services on macOS/Linux; Admin only for Windows Service install), zero virtual adapter, routing table, or DNS changes, and most stable out of the box for browsers, Discord, Telegram, and apps that honor system proxy.
 - **TUN mode (system-wide):** Captures all TCP & UDP traffic including games (Roblox, Valorant, etc.) and apps that ignore system proxy.
 - **How to switch:** Open the `vdpi` Control Center (`vdpi` with no args) and select **Switch to TUN** / **Switch to Proxy** (automatically prompts for UAC on Windows or `sudo` / Touch ID password on macOS & Linux - no need to pre-run as root), or run `vdpi install --tun` / `vdpi --tun`.
 
 | Dimension | Proxy Mode (`--proxy`, **Default**) | TUN Mode (`--tun`) |
 | :--- | :--- | :--- |
 | **Traffic capture** | Local `127.0.0.1:8080` (HTTP/HTTPS/SOCKS5/4a) + `:1080` (SOCKS5 TCP/UDP) | Layer 3 virtual NIC (`Wintun` / `utun` / `/dev/net/tun`) + userspace stack |
-| **App coverage** | Browsers, Discord, Telegram & apps honoring system proxy or `HTTP_PROXY` / `HTTPS_PROXY` | System-wide TCP & UDP: games (Roblox, Valorant, etc.), Discord voice, CLI, all apps |
-| **OS integration** | Fail-open PAC proxy (`AutoConfigURL` / `AutoProxyURL`) & env vars; no virtual adapter, route, or DNS changes | Zero proxy env edits; no browser restart required |
-| **Privileges & memory** | Zero admin privileges required; ~8-14 MB RAM | Prompts for UAC (Windows) or `sudo` / Touch ID (macOS & Linux); ~16-22 MB RAM |
+| **App coverage** | Browsers, Discord, Telegram & apps honoring OS fail-open PAC (`/vdpi.pac`) or explicit local proxy listeners | System-wide TCP & UDP: games (Roblox, Valorant, etc.), Discord voice, CLI, all apps |
+| **OS integration** | Fail-open `/vdpi.pac` auto-config (Windows `AutoConfigURL` & macOS `AutoProxyURL` with zero env vars; Linux GNOME/KDE PAC plus optional `systemd --user` env vars, disabled via `--no-env-proxy`); no virtual adapter, route, or DNS changes | Zero proxy edits; no browser restart required |
+| **Privileges & memory** | Zero admin for portable/foreground (unprivileged service on macOS/Linux; Admin only for Windows Service install); ~8-14 MB RAM | Prompts for UAC (Windows) or `sudo` / Touch ID (macOS & Linux); ~16-22 MB RAM |
 | **VPN & anticheat** | Pure loopback proxy; no virtual adapter; `VpnGuard` auto-yield | `VpnGuard` 0ms auto-yield; WHQL-signed Wintun (anticheat safe) |
 
 ### Switching Modes
@@ -141,15 +141,16 @@ Your current mode (`Proxy` or `TUN`) is always shown in the `Engine` row of the 
   vdpi --proxy start  # Run a one-off foreground Proxy session
   ```
 
-For anti-DPI framing modes (`--mode combo` default with 7-stage self-healing auto-escalation, `tls-record`, `split`, `oob`, `disorder`), see [Engine Modes](docs/engines.md) and [CLI Reference](docs/cli.md).
+For anti-DPI framing modes (`--mode combo` default with 7-stage self-healing auto-escalation, `tls-record`, `fragment`, `split`), see [Engine Modes](docs/engines.md) and [CLI Reference](docs/cli.md).
 
 ---
 
 ## Getting Started
 
 ```bash
-vdpi              # Open the Control Center TUI (`l` Open live dashboard, `s` Split tunneling, switch engine)
+vdpi              # Open the Control Center TUI (`l` live dashboard, `d` DNS picker, `s` Split tunneling, switch engine)
 vdpi dashboard    # Attach the live throughput & telemetry dashboard to the running background service
+vdpi dns          # Show or switch upstream DNS / DoH server (e.g. `vdpi dns cloudflare`, `vdpi dns 94.140.14.14`)
 vdpi split        # Open the per-app Split tunneling picker (alias `vdpi apps`; `--split-mode`, `--split-app`)
 vdpi engine tun   # Switch desktop engine to TUN mode (or `vdpi engine proxy`)
 vdpi pause        # Temporarily pause the background service (`vdpi resume` to re-enable)

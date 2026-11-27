@@ -608,7 +608,7 @@ private fun VdpiAppRoot(
                                             onSetChunkSize = viewModel::setChunkSize,
                                             onSetDnsAddr = { addr ->
                                                 viewModel.setDnsAddr(addr)
-                                                showNotice("DNS updated to $addr")
+                                                showNotice("DNS updated to ${formatDnsDisplayAddr(addr)}")
                                             },
                                             onSetEnableDoh = viewModel::setEnableDoh,
                                             onSetIpv4Only = viewModel::setIpv4Only,
@@ -797,5 +797,14 @@ private fun VdpiAppRoot(
                 }
             }
         }
+    }
+}
+
+private fun formatDnsDisplayAddr(rawAddr: String): String {
+    val addr = rawAddr.trim().ifBlank { "1.1.1.1" }
+    return if (addr.startsWith("https://", ignoreCase = true)) {
+        runCatching { java.net.URI(addr).host }.getOrNull()?.takeIf { it.isNotBlank() } ?: "custom DoH"
+    } else {
+        addr
     }
 }

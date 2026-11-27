@@ -22,6 +22,7 @@ import com.vulninc.vdpi.data.VdpiSettings
 import com.vulninc.vdpi.engine.DesyncMode
 import com.vulninc.vdpi.engine.DoctorReport
 import com.vulninc.vdpi.engine.NativeEngine
+import com.vulninc.vdpi.ui.screens.isEffectiveDohTarget
 import com.vulninc.vdpi.util.formatStageLabel
 import com.vulninc.vdpi.util.formatUptime
 import com.vulninc.vdpi.util.sanitizeDomainInput
@@ -89,21 +90,78 @@ fun appendThroughputSample(
     return samples.subList(samples.size - limit + 1, samples.size) + safeRate
 }
 
+private val HTTP_URL_REGEX = Regex("""https?://[^\s),"'<>]+""", RegexOption.IGNORE_CASE)
+private val ALREADY_REDACTED_HTTP_URL_REGEX = Regex(
+    """^https?://[^/?#@\s]+/(?:\[redacted]|<redacted>)$""",
+    RegexOption.IGNORE_CASE,
+)
+private val PRIVATE_172_IPV4_REGEX = Regex("""^172\.(1[6-9]|2\d|3[0-1])\.""")
+private val CGNAT_IPV4_REGEX = Regex("""^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.""")
+private val PRIVATE_IPV6_ULA_REGEX = Regex("""^f[cd][0-9a-f]{2}:""")
+private val PRIVATE_IPV6_LINK_LOCAL_REGEX = Regex("""^fe[89ab][0-9a-f]:""")
+
+private fun redactHttpUrl(url: String): String {
+    if (ALREADY_REDACTED_HTTP_URL_REGEX.matches(url)) {
+        return url
+    }
+    val scheme = if (url.startsWith("http://", ignoreCase = true)) "http" else "https"
+    val parsed = runCatching { URI(url) }.getOrNull()
+    val host = parsed?.host?.takeIf { it.isNotBlank() }
+    val portSuffix = parsed?.port?.takeIf { it in 1..65535 }?.let { ":$it" }.orEmpty()
+    return if (host != null) "$scheme://$host$portSuffix/<redacted>" else "$scheme://<redacted>"
+}
+
+internal fun redactUrlsForReport(text: String): String {
+    if (!text.contains("https://", ignoreCase = true) && !text.contains("http://", ignoreCase = true)) {
+        return text
+    }
+    return HTTP_URL_REGEX.replace(text) { match ->
+        val raw = match.value
+        val afterIdx = match.range.last + 1
+        val schemeEnd = raw.indexOf("://") + 3
+        if (
+            schemeEnd >= 3 &&
+            raw.endsWith("/") &&
+            !raw.contains('@') &&
+            raw.indexOf('/', startIndex = schemeEnd) == raw.lastIndex &&
+            text.regionMatches(afterIdx, "<redacted>", 0, "<redacted>".length, ignoreCase = true)
+        ) {
+            return@replace raw
+        }
+        var trimmed = raw.trimEnd('.', ':', ';')
+        while (
+            (trimmed.endsWith(']') && trimmed.count { it == ']' } > trimmed.count { it == '[' }) ||
+            (trimmed.endsWith('}') && trimmed.count { it == '}' } > trimmed.count { it == '{' })
+        ) {
+            trimmed = trimmed.dropLast(1).trimEnd('.', ':', ';')
+        }
+        val trailing = raw.substring(trimmed.length)
+        redactHttpUrl(trimmed) + trailing
+    }
+}
+
 private fun redactDnsForReport(rawDns: String): String {
     val trimmed = rawDns.trim().ifEmpty { "1.1.1.1" }
     val lower = trimmed.lowercase(Locale.ROOT)
-    if (lower.startsWith("https://")) {
-        val host = runCatching { URI(trimmed).host }.getOrNull().orEmpty()
-        return if (host.isNotBlank()) "https://$host/<redacted>" else "https://<redacted>"
+    if (lower.startsWith("https://") || lower.startsWith("http://")) {
+        return redactHttpUrl(trimmed)
     }
-    val isPrivateIpv4 = lower.startsWith("10.") ||
-        lower.startsWith("192.168.") ||
-        lower.startsWith("127.") ||
-        Regex("^172\\.(1[6-9]|2\\d|3[0-1])\\.").containsMatchIn(lower)
-    val isPrivateIpv6 = lower.startsWith("fc") ||
-        lower.startsWith("fd") ||
-        lower.startsWith("fe80:") ||
-        lower == "::1"
+    val hostCandidate = if (lower.startsWith("[")) {
+        val closing = lower.indexOf(']')
+        if (closing > 1) lower.substring(1, closing) else lower.removePrefix("[")
+    } else {
+        lower
+    }.substringBefore('%')
+    val ipv4Candidate = hostCandidate.removePrefix("::ffff:")
+    val isPrivateIpv4 = ipv4Candidate.startsWith("10.") ||
+        ipv4Candidate.startsWith("192.168.") ||
+        ipv4Candidate.startsWith("127.") ||
+        ipv4Candidate.startsWith("169.254.") ||
+        PRIVATE_172_IPV4_REGEX.containsMatchIn(ipv4Candidate) ||
+        CGNAT_IPV4_REGEX.containsMatchIn(ipv4Candidate)
+    val isPrivateIpv6 = PRIVATE_IPV6_ULA_REGEX.containsMatchIn(hostCandidate) ||
+        PRIVATE_IPV6_LINK_LOCAL_REGEX.containsMatchIn(hostCandidate) ||
+        hostCandidate == "::1"
     return if (isPrivateIpv4 || isPrivateIpv6) "<private-dns>" else trimmed
 }
 
@@ -126,11 +184,24 @@ fun buildDiagnosticsReport(
         val snap = runtime.telemetry
         appendLine("Active Stage: Stage ${snap.stageNumber.coerceAtLeast(1)} (${formatStageLabel(snap.stageLabel)})")
         appendLine("Uptime: ${formatUptime(snap.uptimeSecs)}")
+        appendLine("Dropped Packets: ${snap.droppedPackets.coerceAtLeast(0L)}")
+    } else if (runtime.telemetry.droppedPackets > 0L) {
+        appendLine("Dropped Packets: ${runtime.telemetry.droppedPackets}")
     }
     appendLine("Desync Mode: ${settings.desyncMode.label} (${settings.desyncMode.wireName}), chunk=${settings.chunkSize.coerceIn(1, 64)}")
+    val effectiveDnsAddr = if (runtime.phase == TunnelPhase.CONNECTED) {
+        runtime.telemetry.dnsAddr.trim().ifBlank { settings.dnsAddr }
+    } else {
+        settings.dnsAddr
+    }
+    val effectiveDohEnabled = if (runtime.phase == TunnelPhase.CONNECTED) {
+        isEffectiveDohTarget(effectiveDnsAddr, runtime.telemetry.dohEnabled)
+    } else {
+        isEffectiveDohTarget(effectiveDnsAddr, settings.enableDoh)
+    }
     appendLine(
-        "DNS: ${redactDnsForReport(settings.dnsAddr)} " +
-            "(DoH: ${if (settings.enableDoh) "enabled" else "disabled"}, " +
+        "DNS: ${redactDnsForReport(effectiveDnsAddr)} " +
+            "(DoH: ${if (effectiveDohEnabled) "enabled" else "disabled"}, " +
             "IPv4-only: ${if (settings.ipv4Only) "yes" else "no"})",
     )
     appendLine("QUIC Blocking: ${if (settings.blockQuic) "enabled" else "disabled"}")
@@ -143,8 +214,13 @@ fun buildDiagnosticsReport(
         appendLine("Diagnostic Probes: ${if (doctorReport.ok) "PASS" else "FAIL"} (${doctorReport.checks.size} checks)")
         doctorReport.checks.forEach { check ->
             val status = if (check.passed) "PASS" else "FAIL"
-            val detailSuffix = check.detail.trim().takeIf { it.isNotEmpty() }?.let { " - $it" }.orEmpty()
-            appendLine("- [$status] ${check.name} (${check.target}): ${check.latencyMs} ms$detailSuffix")
+            val safeTarget = redactUrlsForReport(check.target)
+            val detailSuffix = redactUrlsForReport(check.detail)
+                .trim()
+                .takeIf { it.isNotEmpty() }
+                ?.let { " - $it" }
+                .orEmpty()
+            appendLine("- [$status] ${check.name} ($safeTarget): ${check.latencyMs} ms$detailSuffix")
         }
     }
 }.trimEnd()
@@ -487,7 +563,9 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
                 SettingsRepository.parseSettingsJson(rawJson)
             }
             if (parsed.isFailure) {
-                val reason = parsed.exceptionOrNull()?.message?.takeIf { it.isNotBlank() }
+                val reason = parsed.exceptionOrNull()?.message
+                    ?.let(::redactUrlsForReport)
+                    ?.takeIf { it.isNotBlank() }
                     ?: "Invalid settings JSON"
                 emitStatusFeedback("Import failed: $reason")
                 return@launch
@@ -662,13 +740,22 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setDnsAddr(addr: String) {
         val normalized = addr.trim().ifBlank { "1.1.1.1" }
-        mutateRuntimeSetting(isNoOp = { it.dnsAddr.trim().ifBlank { "1.1.1.1" } == normalized }) {
+        val requiresDoh = normalized.startsWith("https://", ignoreCase = true)
+        mutateRuntimeSetting(
+            isNoOp = {
+                it.dnsAddr.trim().ifBlank { "1.1.1.1" } == normalized &&
+                    (!requiresDoh || it.enableDoh)
+            },
+        ) {
             repo.setDnsAddr(normalized)
         }
     }
 
     fun setEnableDoh(enabled: Boolean) = mutateRuntimeSetting(
-        isNoOp = { it.enableDoh == enabled },
+        isNoOp = {
+            val effective = enabled || it.dnsAddr.trim().startsWith("https://", ignoreCase = true)
+            it.enableDoh == effective
+        },
     ) {
         repo.setEnableDoh(enabled)
     }

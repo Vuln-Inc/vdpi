@@ -38,6 +38,7 @@ const TIME_WAIT_REAP_TIMEOUT: StdDuration = StdDuration::from_secs(2);
 const CLOSING_REAP_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 const DEFERRED_SYN_TTL: StdDuration = StdDuration::from_secs(2);
 const MAX_DEFERRED_SYNS: usize = 32;
+const IP_PROTO_TCP: u8 = 6;
 
 /// Monotonic microsecond clock for `smoltcp`, anchored above `Instant::ZERO` so
 /// Windows NTP clock adjustments can never move timestamps backwards or collide
@@ -88,17 +89,76 @@ struct TcpSocketControl {
     rx_backpressured: bool,
 }
 
-struct SocketShared {
+#[cfg_attr(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    repr(align(128))
+)]
+#[cfg_attr(
+    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    repr(align(64))
+)]
+struct CachePadded<T>(T);
+
+struct SocketDirtyFlags {
     tx_dirty: AtomicBool,
     rx_dirty: AtomicBool,
+}
+
+/// Shared state between a `TunNetstackTcpStream` and the reactor loop.
+/// `dirty` is padded to its own cache line so hot reactor dirty-flag scans never
+/// false-share with `control` mutex lock/unlock traffic on application cores.
+#[repr(C)]
+struct SocketShared {
+    dirty: CachePadded<SocketDirtyFlags>,
     control: Mutex<TcpSocketControl>,
 }
 
 impl SocketShared {
+    fn new(control: TcpSocketControl) -> Self {
+        Self {
+            dirty: CachePadded(SocketDirtyFlags {
+                tx_dirty: AtomicBool::new(false),
+                rx_dirty: AtomicBool::new(false),
+            }),
+            control: Mutex::new(control),
+        }
+    }
+
+    #[inline]
     fn lock_control(&self) -> std::sync::MutexGuard<'_, TcpSocketControl> {
         self.control
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[inline]
+    fn mark_tx_dirty(&self) {
+        self.dirty.0.tx_dirty.store(true, Ordering::SeqCst);
+    }
+
+    #[inline]
+    fn mark_rx_dirty(&self) {
+        self.dirty.0.rx_dirty.store(true, Ordering::SeqCst);
+    }
+
+    /// Guarded swap so idle sockets perform only a shared `SeqCst` read (plain `MOV` on
+    /// x86-64 with zero write invalidation, and formally Dekker-sound on ARMv8.3-RCPC)
+    /// instead of an unconditional `SeqCst` RMW (`LOCK XCHG`) cache-line write on every
+    /// reactor tick.
+    #[inline]
+    fn take_tx_dirty(&self) -> bool {
+        self.dirty.0.tx_dirty.load(Ordering::SeqCst)
+            && self.dirty.0.tx_dirty.swap(false, Ordering::SeqCst)
+    }
+
+    /// Guarded swap so idle sockets perform only a shared `SeqCst` read (plain `MOV` on
+    /// x86-64 with zero write invalidation, and formally Dekker-sound on ARMv8.3-RCPC)
+    /// instead of an unconditional `SeqCst` RMW (`LOCK XCHG`) cache-line write on every
+    /// reactor tick.
+    #[inline]
+    fn take_rx_dirty(&self) -> bool {
+        self.dirty.0.rx_dirty.load(Ordering::SeqCst)
+            && self.dirty.0.rx_dirty.swap(false, Ordering::SeqCst)
     }
 }
 
@@ -111,6 +171,7 @@ pub(crate) struct TunNetstackTcpStream {
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
     notify: Arc<Notify>,
+    reactor_notified: Arc<AtomicBool>,
     shared: SharedControl,
 }
 
@@ -121,6 +182,20 @@ impl TunNetstackTcpStream {
 
     pub(crate) fn remote_addr(&self) -> SocketAddr {
         self.dst_addr
+    }
+
+    /// Coalesces reactor notifications behind a shared `AtomicBool` so high-rate
+    /// download streams do not hammer `Arc<Notify>` on every `poll_write`.
+    /// Callers MUST store `tx_dirty` / `rx_dirty` with `Ordering::SeqCst` prior to
+    /// invoking this method; the reactor clears `reactor_notified` with `SeqCst`
+    /// before scanning dirty flags, guaranteeing zero lost wakeups on x86 and ARM64.
+    #[inline]
+    fn notify_reactor(&self) {
+        if !self.reactor_notified.load(Ordering::SeqCst)
+            && !self.reactor_notified.swap(true, Ordering::SeqCst)
+        {
+            self.notify.notify_one();
+        }
     }
 }
 
@@ -134,9 +209,9 @@ impl Drop for TunNetstackTcpStream {
             control.send_state = HalfState::Close;
         }
         drop(control);
-        self.shared.tx_dirty.store(true, Ordering::Release);
-        self.shared.rx_dirty.store(true, Ordering::Release);
-        self.notify.notify_one();
+        self.shared.mark_tx_dirty();
+        self.shared.mark_rx_dirty();
+        self.notify_reactor();
     }
 }
 
@@ -156,7 +231,9 @@ impl AsyncRead for TunNetstackTcpStream {
             if matches!(control.recv_state, HalfState::Closed) {
                 return Poll::Ready(Ok(()));
             }
-            if let Some(old) = control.recv_waker.replace(cx.waker().clone()) {
+            let old_waker = control.recv_waker.replace(cx.waker().clone());
+            drop(control);
+            if let Some(old) = old_waker {
                 if !old.will_wake(cx.waker()) {
                     old.wake();
                 }
@@ -177,8 +254,8 @@ impl AsyncRead for TunNetstackTcpStream {
         drop(control);
 
         if should_notify {
-            self.shared.rx_dirty.store(true, Ordering::Release);
-            self.notify.notify_one();
+            self.shared.mark_rx_dirty();
+            self.notify_reactor();
         }
         Poll::Ready(Ok(()))
     }
@@ -201,7 +278,9 @@ impl AsyncWrite for TunNetstackTcpStream {
         }
 
         if control.send_buffer.is_full() {
-            if let Some(old) = control.send_waker.replace(cx.waker().clone()) {
+            let old_waker = control.send_waker.replace(cx.waker().clone());
+            drop(control);
+            if let Some(old) = old_waker {
                 if !old.will_wake(cx.waker()) {
                     old.wake();
                 }
@@ -213,8 +292,8 @@ impl AsyncWrite for TunNetstackTcpStream {
         drop(control);
 
         if n > 0 {
-            self.shared.tx_dirty.store(true, Ordering::Release);
-            self.notify.notify_one();
+            self.shared.mark_tx_dirty();
+            self.notify_reactor();
         }
         Poll::Ready(Ok(n))
     }
@@ -234,15 +313,16 @@ impl AsyncWrite for TunNetstackTcpStream {
             control.send_state = HalfState::Close;
         }
 
-        if let Some(old) = control.send_waker.replace(cx.waker().clone()) {
+        let old_waker = control.send_waker.replace(cx.waker().clone());
+        drop(control);
+        if let Some(old) = old_waker {
             if !old.will_wake(cx.waker()) {
                 old.wake();
             }
         }
-        drop(control);
 
-        self.shared.tx_dirty.store(true, Ordering::Release);
-        self.notify.notify_one();
+        self.shared.mark_tx_dirty();
+        self.notify_reactor();
         Poll::Pending
     }
 }
@@ -441,10 +521,11 @@ impl Device for VirtualDevice {
         caps.medium = Medium::Ip;
         caps.max_transmission_unit = self.mtu;
         // Skip redundant software RX checksum verification on OS-generated local TUN frames,
-        // while always emitting valid IPv4 + TCP TX checksums required by Wintun/utun/Linux TUN.
+        // while always emitting valid IPv4 + TCP + ICMPv6 TX checksums required by Wintun/utun/Linux TUN.
         let mut checksum = ChecksumCapabilities::ignored();
         checksum.ipv4 = Checksum::Tx;
         checksum.tcp = Checksum::Tx;
+        checksum.icmpv6 = Checksum::Tx;
         caps.checksum = checksum;
         caps
     }
@@ -546,10 +627,8 @@ fn build_tcp_rst_ack_reply(syn_frame: &[u8]) -> Option<Vec<u8>> {
         }
         6 => {
             let ip = Ipv6Packet::new_checked(syn_frame).ok()?;
-            if ip.next_header() != IpProtocol::Tcp {
-                return None;
-            }
-            let tcp = TcpPacket::new_checked(ip.payload()).ok()?;
+            let tcp_payload = crate::packet::ipv6_tcp_payload(syn_frame)?;
+            let tcp = TcpPacket::new_checked(tcp_payload).ok()?;
             let src_ip = ip.dst_addr().octets();
             let dst_ip = ip.src_addr().octets();
             let ack_num = tcp.seq_number().0.wrapping_add(1);
@@ -624,13 +703,16 @@ fn evict_reclaimable_socket(
         }
         if let Some(entry) = sockets.remove(&handle) {
             active_endpoints.remove(&entry.endpoints);
-            let mut control = entry.shared.lock_control();
-            control.send_state = HalfState::Closed;
-            control.recv_state = HalfState::Closed;
-            if let Some(w) = control.send_waker.take() {
+            let (send_waker, recv_waker) = {
+                let mut control = entry.shared.lock_control();
+                control.send_state = HalfState::Closed;
+                control.recv_state = HalfState::Closed;
+                (control.send_waker.take(), control.recv_waker.take())
+            };
+            if let Some(w) = send_waker {
                 w.wake();
             }
-            if let Some(w) = control.recv_waker.take() {
+            if let Some(w) = recv_waker {
                 w.wake();
             }
         }
@@ -715,10 +797,10 @@ fn classify_inbound_tcp(frame: &[u8]) -> InboundTcpKind {
             let Ok(ip) = Ipv6Packet::new_checked(frame) else {
                 return InboundTcpKind::Invalid;
             };
-            if ip.next_header() != IpProtocol::Tcp {
+            let Some(tcp_payload) = crate::packet::ipv6_tcp_payload(frame) else {
                 return InboundTcpKind::Invalid;
-            }
-            let Ok(tcp) = TcpPacket::new_checked(ip.payload()) else {
+            };
+            let Ok(tcp) = TcpPacket::new_checked(tcp_payload) else {
                 return InboundTcpKind::Invalid;
             };
             if tcp.syn() && !tcp.ack() && !tcp.rst() && !tcp.fin() {
@@ -731,6 +813,34 @@ fn classify_inbound_tcp(frame: &[u8]) -> InboundTcpKind {
         }
         _ => InboundTcpKind::Invalid,
     }
+}
+
+/// Strips IPv6 extension headers (Hop-by-Hop `0`, Routing `43`, atomic Fragment `44`,
+/// Destination Options `60`) from a validated inbound IPv6 TCP packet into a canonical
+/// 40-byte IPv6 header (`NextHeader = 6`, `PayloadLength = tcp_segment.len()`) + TCP
+/// segment before pushing into `device.rx_queue`, because `smoltcp` 0.14 otherwise
+/// rejects IPv6 extension headers with ICMPv6 Parameter Problem.
+#[inline]
+fn normalize_inbound_ipv6_tcp(mut frame: Vec<u8>) -> Option<Vec<u8>> {
+    if frame.len() < 40 || (frame[0] >> 4) != 6 || frame[6] == IP_PROTO_TCP {
+        return Some(frame);
+    }
+    let (tcp_start, tcp_len) = {
+        let tcp = crate::packet::ipv6_tcp_payload(&frame)?;
+        let start = (tcp.as_ptr() as usize).checked_sub(frame.as_ptr() as usize)?;
+        let len = tcp.len();
+        let end = start.checked_add(len)?;
+        if start <= 40 || end > frame.len() {
+            return None;
+        }
+        (start, len)
+    };
+    let payload_len = u16::try_from(tcp_len).ok()?;
+    frame.copy_within(tcp_start..tcp_start + tcp_len, 40);
+    frame.truncate(40 + tcp_len);
+    frame[4..6].copy_from_slice(&payload_len.to_be_bytes());
+    frame[6] = IP_PROTO_TCP;
+    Some(frame)
 }
 
 /// Inspects an IPv4/IPv6 frame to see whether it is a valid TCP packet.
@@ -752,13 +862,11 @@ fn inspect_tcp_frame(frame: &[u8]) -> Option<(SocketAddr, SocketAddr, bool)> {
         }
         6 => {
             let ip = Ipv6Packet::new_checked(frame).ok()?;
-            if ip.next_header() != IpProtocol::Tcp {
-                return None;
-            }
+            let tcp_payload = crate::packet::ipv6_tcp_payload(frame)?;
             (
                 IpAddr::V6(ip.src_addr()),
                 IpAddr::V6(ip.dst_addr()),
-                ip.payload(),
+                tcp_payload,
             )
         }
         _ => return None,
@@ -805,6 +913,18 @@ async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
     }
 }
 
+/// Computes the hard handle ceiling in `smoltcp`'s `SocketSet` (including `TimeWait`/closing
+/// handles). Tightened on `low_memory` (iOS ~50 MB Jetsam ceiling) from `2 * max_tcp_sessions`
+/// (256) to `max_tcp_sessions + 32` (160).
+#[inline]
+fn hard_handle_cap_for(max_tcp_sessions: usize, low_memory: bool) -> usize {
+    if low_memory {
+        max_tcp_sessions.saturating_add(32)
+    } else {
+        max_tcp_sessions.saturating_mul(2)
+    }
+}
+
 /// Spawns the in-tree `smoltcp` 0.14 TCP netstack runner directly bridging `tcp_in_rx`
 /// and `outbound_tx` with batched ingress draining before a single `iface.poll()`,
 /// `ack_delay = None`, `nagle = false`, `CongestionControl::None`, `Checksum::Tx`,
@@ -824,8 +944,8 @@ pub(crate) fn spawn_tcp_netstack(
     tokio::task::JoinHandle<()>,
 )> {
     let max_tcp_sessions = max_tcp_sessions.max(1);
-    let hard_handle_cap = max_tcp_sessions.saturating_mul(2);
     let low_memory = tcp_recv_buffer_size <= 32 * 1024;
+    let hard_handle_cap = hard_handle_cap_for(max_tcp_sessions, low_memory);
     let control_recv_size = control_ring_size(tcp_recv_buffer_size);
     let control_send_size = control_ring_size(tcp_send_buffer_size);
     let clock = MonotonicClock::new();
@@ -833,6 +953,7 @@ pub(crate) fn spawn_tcp_netstack(
     let mut iface = create_interface(&mut device, clock.now())?;
     let (stream_tx, stream_rx) = mpsc::channel(max_tcp_sessions.clamp(16, 256));
     let notify = Arc::new(Notify::new());
+    let reactor_notified = Arc::new(AtomicBool::new(false));
 
     let handle = tokio::spawn(async move {
         let mut socket_set = SocketSet::new(Vec::new());
@@ -859,15 +980,22 @@ pub(crate) fn spawn_tcp_netstack(
                                active_endpoints: &mut HashSet<(SocketAddr, SocketAddr)>,
                                listening_dsts: &mut HashSet<SocketAddr>,
                                stream_tx: &mpsc::Sender<TunNetstackTcpStream>,
-                               notify: &Arc<Notify>|
+                               notify: &Arc<Notify>,
+                               reactor_notified: &Arc<AtomicBool>|
          -> EnqueueOutcome {
             match classify_inbound_tcp(&frame) {
                 InboundTcpKind::Invalid => EnqueueOutcome::Dropped,
                 InboundTcpKind::NonSyn => {
+                    let Some(frame) = normalize_inbound_ipv6_tcp(frame) else {
+                        return EnqueueOutcome::Dropped;
+                    };
                     device.rx_queue.push_back(frame);
                     EnqueueOutcome::Enqueued
                 }
                 InboundTcpKind::InitialSyn(src_addr, dst_addr) => {
+                    let Some(frame) = normalize_inbound_ipv6_tcp(frame) else {
+                        return EnqueueOutcome::Dropped;
+                    };
                     if !active_endpoints.contains(&(src_addr, dst_addr)) {
                         // Prevent smoltcp SocketSet slot-reuse cross-wiring when multiple parallel
                         // SYNs target the same dst_addr in one ingress batch: defer the second SYN
@@ -878,8 +1006,9 @@ pub(crate) fn spawn_tcp_netstack(
 
                         // Count only active non-closing sockets (`Listen`, `SynReceived`, `Established`)
                         // against `max_tcp_sessions` so `TimeWait` and closing sockets cannot starve new
-                        // connections, while still enforcing a hard handle cap (`2 * max_tcp_sessions`)
-                        // via immediate reclaim of `TimeWait`/closing handles to protect iOS Jetsam RAM.
+                        // connections, while still enforcing a hard handle cap (`max_tcp_sessions + 32`
+                        // on `low_memory`, `2 * max_tcp_sessions` otherwise) via immediate reclaim of
+                        // `TimeWait`/closing handles to protect iOS Jetsam RAM.
                         if sockets.len() >= hard_handle_cap {
                             let _ = evict_reclaimable_socket(socket_set, sockets, active_endpoints);
                         }
@@ -915,24 +1044,21 @@ pub(crate) fn spawn_tcp_netstack(
                             return EnqueueOutcome::Dropped;
                         }
 
-                        let shared = Arc::new(SocketShared {
-                            tx_dirty: AtomicBool::new(false),
-                            rx_dirty: AtomicBool::new(false),
-                            control: Mutex::new(TcpSocketControl {
-                                send_buffer: RingBuffer::new(vec![0u8; control_send_size]),
-                                send_waker: None,
-                                recv_buffer: RingBuffer::new(vec![0u8; control_recv_size]),
-                                recv_waker: None,
-                                recv_state: HalfState::Normal,
-                                send_state: HalfState::Normal,
-                                rx_backpressured: false,
-                            }),
-                        });
+                        let shared = Arc::new(SocketShared::new(TcpSocketControl {
+                            send_buffer: RingBuffer::new(vec![0u8; control_send_size]),
+                            send_waker: None,
+                            recv_buffer: RingBuffer::new(vec![0u8; control_recv_size]),
+                            recv_waker: None,
+                            recv_state: HalfState::Normal,
+                            send_state: HalfState::Normal,
+                            rx_backpressured: false,
+                        }));
 
                         let stream = TunNetstackTcpStream {
                             src_addr,
                             dst_addr,
                             notify: Arc::clone(notify),
+                            reactor_notified: Arc::clone(reactor_notified),
                             shared: Arc::clone(&shared),
                         };
 
@@ -1012,6 +1138,7 @@ pub(crate) fn spawn_tcp_netstack(
                     &mut listening_dsts,
                     &stream_tx,
                     &notify,
+                    &reactor_notified,
                 ) {
                     EnqueueOutcome::Enqueued => {
                         ingress_drained += 1;
@@ -1038,6 +1165,7 @@ pub(crate) fn spawn_tcp_netstack(
                     &mut listening_dsts,
                     &stream_tx,
                     &notify,
+                    &reactor_notified,
                 ) {
                     EnqueueOutcome::Enqueued => {
                         ingress_drained += 1;
@@ -1071,6 +1199,7 @@ pub(crate) fn spawn_tcp_netstack(
                     &mut listening_dsts,
                     &stream_tx,
                     &notify,
+                    &reactor_notified,
                 ) {
                     EnqueueOutcome::Enqueued => {
                         ingress_drained += 1;
@@ -1089,11 +1218,16 @@ pub(crate) fn spawn_tcp_netstack(
             }
             let ingress_hit_limit = ingress_drained >= INGRESS_DRAIN_LIMIT;
 
+            // Clear the coalesced notification latch BEFORE scanning per-socket dirty flags
+            // in Steps 2 and 4 so any concurrent `poll_write`/`poll_read` either becomes visible
+            // during this pass or observes `false` and issues a fresh `notify_one()`.
+            reactor_notified.store(false, Ordering::SeqCst);
+
             // 2. Drain application TX buffers into smoltcp BEFORE polling so segments emit immediately.
             //    Skip idle sockets with zero mutex locks via per-socket `tx_dirty` atomic.
             let mut pre_poll_tx = false;
             for (&handle, entry) in &mut sockets {
-                let tx_dirty = entry.shared.tx_dirty.swap(false, Ordering::AcqRel);
+                let tx_dirty = entry.shared.take_tx_dirty();
                 let socket = socket_set.get_mut::<TcpSocket>(handle);
                 if !(tx_dirty || (entry.tx_has_pending && socket.can_send())) {
                     continue;
@@ -1162,10 +1296,14 @@ pub(crate) fn spawn_tcp_netstack(
                             HalfState::Close | HalfState::Closing | HalfState::Closed
                         );
 
-                if wake_sender {
-                    if let Some(waker) = control.send_waker.take() {
-                        waker.wake();
-                    }
+                let send_waker = if wake_sender {
+                    control.send_waker.take()
+                } else {
+                    None
+                };
+                drop(control);
+                if let Some(waker) = send_waker {
+                    waker.wake();
                 }
             }
 
@@ -1191,20 +1329,23 @@ pub(crate) fn spawn_tcp_netstack(
 
                 if state == TcpState::Closed {
                     sockets_to_remove.push(handle);
-                    let mut control = entry.shared.lock_control();
-                    control.send_state = HalfState::Closed;
-                    control.recv_state = HalfState::Closed;
-                    if let Some(waker) = control.send_waker.take() {
+                    let (send_waker, recv_waker) = {
+                        let mut control = entry.shared.lock_control();
+                        control.send_state = HalfState::Closed;
+                        control.recv_state = HalfState::Closed;
+                        (control.send_waker.take(), control.recv_waker.take())
+                    };
+                    if let Some(waker) = send_waker {
                         waker.wake();
                     }
-                    if let Some(waker) = control.recv_waker.take() {
+                    if let Some(waker) = recv_waker {
                         waker.wake();
                     }
                     continue;
                 }
 
-                let rx_dirty = entry.shared.rx_dirty.swap(false, Ordering::AcqRel);
-                let tx_dirty = entry.shared.tx_dirty.swap(false, Ordering::AcqRel);
+                let rx_dirty = entry.shared.take_rx_dirty();
+                let tx_dirty = entry.shared.take_tx_dirty();
                 if rx_dirty {
                     entry.rx_backpressured = false;
                 }
@@ -1220,13 +1361,16 @@ pub(crate) fn spawn_tcp_netstack(
                 {
                     socket.abort();
                     sockets_to_remove.push(handle);
-                    let mut control = entry.shared.lock_control();
-                    control.send_state = HalfState::Closed;
-                    control.recv_state = HalfState::Closed;
-                    if let Some(waker) = control.send_waker.take() {
+                    let (send_waker, recv_waker) = {
+                        let mut control = entry.shared.lock_control();
+                        control.send_state = HalfState::Closed;
+                        control.recv_state = HalfState::Closed;
+                        (control.send_waker.take(), control.recv_waker.take())
+                    };
+                    if let Some(waker) = send_waker {
                         waker.wake();
                     }
-                    if let Some(waker) = control.recv_waker.take() {
+                    if let Some(waker) = recv_waker {
                         waker.wake();
                     }
                     continue;
@@ -1239,9 +1383,18 @@ pub(crate) fn spawn_tcp_netstack(
                     let elapsed = wall_now.saturating_duration_since(since);
                     if elapsed >= TIME_WAIT_REAP_TIMEOUT {
                         socket.abort();
-                        let mut control = entry.shared.lock_control();
-                        control.send_state = HalfState::Closed;
-                        control.recv_state = HalfState::Closed;
+                        let (send_waker, recv_waker) = {
+                            let mut control = entry.shared.lock_control();
+                            control.send_state = HalfState::Closed;
+                            control.recv_state = HalfState::Closed;
+                            (control.send_waker.take(), control.recv_waker.take())
+                        };
+                        if let Some(waker) = send_waker {
+                            waker.wake();
+                        }
+                        if let Some(waker) = recv_waker {
+                            waker.wake();
+                        }
                         post_poll_mutated = true;
                         continue;
                     }
@@ -1299,6 +1452,15 @@ pub(crate) fn spawn_tcp_netstack(
                         socket.abort();
                         control.send_state = HalfState::Closed;
                         control.recv_state = HalfState::Closed;
+                        let send_waker = control.send_waker.take();
+                        let recv_waker = control.recv_waker.take();
+                        drop(control);
+                        if let Some(waker) = send_waker {
+                            waker.wake();
+                        }
+                        if let Some(waker) = recv_waker {
+                            waker.wake();
+                        }
                         if state == TcpState::Listen {
                             sockets_to_remove.push(handle);
                         } else {
@@ -1352,11 +1514,11 @@ pub(crate) fn spawn_tcp_netstack(
                         wake_receiver = true;
                     }
 
-                    if wake_receiver {
-                        if let Some(waker) = control.recv_waker.take() {
-                            waker.wake();
-                        }
-                    }
+                    let recv_waker = if wake_receiver {
+                        control.recv_waker.take()
+                    } else {
+                        None
+                    };
 
                     // Refill TX immediately if ACK freed window space during poll().
                     let mut wake_sender = false;
@@ -1414,10 +1576,18 @@ pub(crate) fn spawn_tcp_netstack(
                                 HalfState::Close | HalfState::Closing | HalfState::Closed
                             );
 
-                    if wake_sender {
-                        if let Some(waker) = control.send_waker.take() {
-                            waker.wake();
-                        }
+                    let send_waker = if wake_sender {
+                        control.send_waker.take()
+                    } else {
+                        None
+                    };
+                    drop(control);
+
+                    if let Some(waker) = recv_waker {
+                        waker.wake();
+                    }
+                    if let Some(waker) = send_waker {
+                        waker.wake();
                     }
                 }
 
@@ -1442,9 +1612,18 @@ pub(crate) fn spawn_tcp_netstack(
                     let elapsed = wall_now.saturating_duration_since(since);
                     if elapsed >= CLOSING_REAP_TIMEOUT {
                         socket.abort();
-                        let mut control = entry.shared.lock_control();
-                        control.send_state = HalfState::Closed;
-                        control.recv_state = HalfState::Closed;
+                        let (send_waker, recv_waker) = {
+                            let mut control = entry.shared.lock_control();
+                            control.send_state = HalfState::Closed;
+                            control.recv_state = HalfState::Closed;
+                            (control.send_waker.take(), control.recv_waker.take())
+                        };
+                        if let Some(waker) = send_waker {
+                            waker.wake();
+                        }
+                        if let Some(waker) = recv_waker {
+                            waker.wake();
+                        }
                         post_poll_mutated = true;
                         continue;
                     }
@@ -2258,5 +2437,293 @@ mod tests {
 
         let _ = stop_tx.send(true);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), runner_handle).await;
+    }
+
+    #[test]
+    fn low_memory_hard_handle_cap_and_icmpv6_tx_checksum_and_ipv6_ext_hdr_tcp() {
+        assert_eq!(hard_handle_cap_for(128, true), 160);
+        assert_eq!(hard_handle_cap_for(512, false), 1024);
+
+        let dev = VirtualDevice::new(1500, 128, true);
+        let caps = dev.capabilities();
+        assert!(matches!(caps.checksum.ipv4, Checksum::Tx));
+        assert!(matches!(caps.checksum.tcp, Checksum::Tx));
+        assert!(matches!(caps.checksum.icmpv6, Checksum::Tx));
+
+        // Build an IPv6 TCP SYN preceded by Hop-by-Hop (0) -> Destination Options (60).
+        let src_ip = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let dst_ip = std::net::Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111);
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&[60u8, 0, 1, 4, 0, 0, 0, 0]);
+        ext.extend_from_slice(&[6u8, 0, 1, 4, 0, 0, 0, 0]);
+        let mut tcp = [0u8; 20];
+        tcp[0..2].copy_from_slice(&51_234u16.to_be_bytes());
+        tcp[2..4].copy_from_slice(&443u16.to_be_bytes());
+        tcp[4..8].copy_from_slice(&0x0102_0304u32.to_be_bytes());
+        tcp[12] = 0x50;
+        tcp[13] = 0x02; // SYN
+
+        let payload_len = (ext.len() + tcp.len()) as u16;
+        let mut pkt = Vec::with_capacity(40 + usize::from(payload_len));
+        pkt.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]);
+        pkt.extend_from_slice(&payload_len.to_be_bytes());
+        pkt.push(0); // Hop-by-Hop
+        pkt.push(64);
+        pkt.extend_from_slice(&src_ip.octets());
+        pkt.extend_from_slice(&dst_ip.octets());
+        pkt.extend_from_slice(&ext);
+        pkt.extend_from_slice(&tcp);
+
+        match classify_inbound_tcp(&pkt) {
+            InboundTcpKind::InitialSyn(src, dst) => {
+                assert_eq!(src, SocketAddr::new(IpAddr::V6(src_ip), 51_234));
+                assert_eq!(dst, SocketAddr::new(IpAddr::V6(dst_ip), 443));
+            }
+            _ => panic!("expected InitialSyn for IPv6 TCP SYN with extension headers"),
+        }
+
+        let rst = build_tcp_rst_ack_reply(&pkt)
+            .expect("expected valid IPv6 RST+ACK for SYN with extension headers");
+        let rst_ip = Ipv6Packet::new_checked(&rst).unwrap();
+        assert_eq!(rst_ip.next_header(), IpProtocol::Tcp);
+        assert_eq!(rst_ip.src_addr(), dst_ip);
+        assert_eq!(rst_ip.dst_addr(), src_ip);
+        let rst_tcp = TcpPacket::new_checked(rst_ip.payload()).unwrap();
+        assert!(rst_tcp.rst() && rst_tcp.ack());
+        assert_eq!(rst_tcp.src_port(), 443);
+        assert_eq!(rst_tcp.dst_port(), 51_234);
+        assert_eq!(rst_tcp.ack_number().0, 0x0102_0305);
+    }
+
+    #[test]
+    fn normalize_ipv6_ext_headers_and_socket_shared_cache_line_separation() {
+        // Build an IPv6 TCP SYN carrying Routing (43) -> atomic Fragment (44) -> DestOpts (60) -> TCP (6).
+        let src_ip = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let dst_ip = std::net::Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111);
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&[44u8, 0, 0, 0, 0, 0, 0, 0]); // Routing (43) -> Fragment (44)
+        ext.extend_from_slice(&[60u8, 0, 0, 0, 0x12, 0x34, 0x56, 0x78]); // atomic Fragment (44) -> DestOpts (60)
+        ext.extend_from_slice(&[6u8, 0, 1, 4, 0, 0, 0, 0]); // DestOpts (60) -> TCP (6)
+
+        let mut tcp = [0u8; 20];
+        tcp[0..2].copy_from_slice(&51_234u16.to_be_bytes());
+        tcp[2..4].copy_from_slice(&443u16.to_be_bytes());
+        tcp[4..8].copy_from_slice(&0x0102_0304u32.to_be_bytes());
+        tcp[12] = 0x50;
+        tcp[13] = 0x02; // SYN
+
+        let orig_payload_len = (ext.len() + tcp.len()) as u16;
+        let mut pkt = Vec::with_capacity(40 + usize::from(orig_payload_len));
+        pkt.extend_from_slice(&[0x60, 0x12, 0x34, 0x56]); // Version 6 + Traffic Class / Flow Label
+        pkt.extend_from_slice(&orig_payload_len.to_be_bytes());
+        pkt.push(43); // Routing
+        pkt.push(55); // Hop Limit
+        pkt.extend_from_slice(&src_ip.octets());
+        pkt.extend_from_slice(&dst_ip.octets());
+        pkt.extend_from_slice(&ext);
+        pkt.extend_from_slice(&tcp);
+
+        let normalized = normalize_inbound_ipv6_tcp(pkt).expect("normalized IPv6 TCP packet");
+        assert_eq!(normalized.len(), 60);
+        assert_eq!(&normalized[0..4], &[0x60, 0x12, 0x34, 0x56]);
+        assert_eq!(u16::from_be_bytes([normalized[4], normalized[5]]), 20);
+        assert_eq!(normalized[6], IP_PROTO_TCP);
+        assert_eq!(normalized[7], 55);
+        let ip = Ipv6Packet::new_checked(&normalized).expect("valid canonical IPv6 packet");
+        assert_eq!(ip.next_header(), IpProtocol::Tcp);
+        assert_eq!(ip.src_addr(), src_ip);
+        assert_eq!(ip.dst_addr(), dst_ip);
+        assert_eq!(ip.payload(), &tcp);
+
+        // Already-canonical IPv6 TCP packet passes through untouched.
+        let passthrough = normalize_inbound_ipv6_tcp(normalized.clone()).expect("passthrough");
+        assert_eq!(passthrough, normalized);
+
+        // Verify SocketShared separates dirty atomics from the control Mutex cache line
+        // and guarded take_{tx,rx}_dirty helpers behave cleanly.
+        let shared = SocketShared::new(TcpSocketControl {
+            send_buffer: RingBuffer::new(vec![0u8; 1024]),
+            send_waker: None,
+            recv_buffer: RingBuffer::new(vec![0u8; 1024]),
+            recv_waker: None,
+            recv_state: HalfState::Normal,
+            send_state: HalfState::Normal,
+            rx_backpressured: false,
+        });
+        let dirty_addr = &shared.dirty.0.tx_dirty as *const AtomicBool as usize;
+        let control_addr = &shared.control as *const Mutex<TcpSocketControl> as usize;
+        assert!(
+            control_addr.abs_diff(dirty_addr) >= 64,
+            "dirty atomics and control mutex must not share a 64B cache line"
+        );
+        assert!(control_addr.abs_diff(dirty_addr) >= std::mem::align_of::<CachePadded<()>>());
+
+        assert!(!shared.take_tx_dirty());
+        assert!(!shared.take_rx_dirty());
+        shared.mark_tx_dirty();
+        assert!(shared.take_tx_dirty());
+        assert!(!shared.take_tx_dirty());
+        shared.mark_rx_dirty();
+        assert!(shared.take_rx_dirty());
+        assert!(!shared.take_rx_dirty());
+    }
+
+    #[tokio::test]
+    async fn ipv6_syn_with_dest_opts_completes_handshake_without_icmpv6_parameter_problem() {
+        const MTU: usize = 1500;
+        const BUF: usize = 32 * 1024;
+
+        let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (stop_tx, stop_rx) = watch::channel(false);
+
+        let (mut stream_rx, runner_handle) =
+            spawn_tcp_netstack(in_rx, out_tx, MTU, BUF, BUF, 16, 128, stop_rx).unwrap();
+
+        let clock = MonotonicClock::new();
+        let mut client_dev = VirtualDevice::new(MTU, 128, true);
+        let mut client_cfg = InterfaceConfig::new(HardwareAddress::Ip);
+        client_cfg.random_seed = 0x2001_0db8_cafe_babe;
+        let mut client_iface = Interface::new(client_cfg, &mut client_dev, clock.now());
+
+        let client_ip = Ipv6Address::new(0xfd00, 0x7664, 0x7069, 0, 0, 0, 0, 1);
+        let gateway_ip = Ipv6Address::new(0xfd00, 0x7664, 0x7069, 0, 0, 0, 0, 2);
+        let remote_ip = Ipv6Address::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111);
+        client_iface.update_ip_addrs(|addrs| {
+            let _ = addrs.push(IpCidr::new(IpAddress::Ipv6(client_ip), 64));
+        });
+        client_iface
+            .routes_mut()
+            .add_default_ipv6_route(gateway_ip)
+            .unwrap();
+
+        let mut client_sockets = SocketSet::new(Vec::new());
+        let mut client_sock = TcpSocket::new(
+            TcpSocketBuffer::new(vec![0u8; BUF]),
+            TcpSocketBuffer::new(vec![0u8; BUF]),
+        );
+        configure_local_tun_socket(&mut client_sock);
+        client_sock
+            .connect(client_iface.context(), (remote_ip, 443), 51_443)
+            .unwrap();
+        let client_handle = client_sockets.add(client_sock);
+
+        let wrap_with_dest_opts = |pkt: &[u8]| -> Vec<u8> {
+            assert!(pkt.len() >= 40);
+            assert_eq!(pkt[0] >> 4, 6);
+            assert_eq!(pkt[6], IP_PROTO_TCP);
+            let tcp_len = usize::from(u16::from_be_bytes([pkt[4], pkt[5]]));
+            let tcp = &pkt[40..40 + tcp_len];
+            // Destination Options (60) -> NextHeader=TCP(6), HdrExtLen=0 (8B), PadN(4).
+            let dest_opts: [u8; 8] = [IP_PROTO_TCP, 0, 1, 4, 0, 0, 0, 0];
+            let new_payload_len = u16::try_from(dest_opts.len() + tcp.len()).unwrap();
+            let mut out = Vec::with_capacity(40 + usize::from(new_payload_len));
+            out.extend_from_slice(&pkt[..40]);
+            out[4..6].copy_from_slice(&new_payload_len.to_be_bytes());
+            out[6] = 60; // Destination Options
+            out.extend_from_slice(&dest_opts);
+            out.extend_from_slice(tcp);
+            out
+        };
+
+        client_iface.poll(clock.now(), &mut client_dev, &mut client_sockets);
+        let raw_syn = client_dev.tx_queue.pop_front().expect("IPv6 SYN emitted");
+        let syn_with_dest_opts = wrap_with_dest_opts(&raw_syn);
+        assert_eq!(syn_with_dest_opts[6], 60);
+        in_tx.send(syn_with_dest_opts).await.unwrap();
+
+        let mut server_stream = tokio::time::timeout(StdDuration::from_secs(3), stream_rx.recv())
+            .await
+            .expect("IPv6 DestOpts accept timeout")
+            .expect("accepted IPv6 stream");
+        assert_eq!(
+            server_stream.local_addr(),
+            SocketAddr::new(IpAddr::V6(client_ip), 51_443)
+        );
+        assert_eq!(
+            server_stream.remote_addr(),
+            SocketAddr::new(IpAddr::V6(remote_ip), 443)
+        );
+
+        // Verify smoltcp emits an IPv6 TCP SYN+ACK (never ICMPv6 Parameter Problem).
+        let syn_ack = tokio::time::timeout(StdDuration::from_secs(3), out_rx.recv())
+            .await
+            .expect("IPv6 SYN+ACK timeout")
+            .expect("IPv6 SYN+ACK packet");
+        let syn_ack_ip = Ipv6Packet::new_checked(&syn_ack).expect("valid IPv6 SYN+ACK");
+        assert_eq!(
+            syn_ack_ip.next_header(),
+            IpProtocol::Tcp,
+            "expected IPv6 TCP SYN+ACK, not ICMPv6 Parameter Problem"
+        );
+        let syn_ack_tcp = TcpPacket::new_checked(syn_ack_ip.payload()).expect("valid TCP SYN+ACK");
+        assert!(syn_ack_tcp.syn() && syn_ack_tcp.ack());
+        assert_eq!(syn_ack_tcp.src_port(), 443);
+        assert_eq!(syn_ack_tcp.dst_port(), 51_443);
+        client_dev.rx_queue.push_back(syn_ack);
+
+        let server_task = tokio::spawn(async move {
+            let mut req = [0u8; 5];
+            server_stream.read_exact(&mut req).await.unwrap();
+            assert_eq!(&req, b"HELLO");
+            server_stream.write_all(b"WORLD").await.unwrap();
+            server_stream.shutdown().await.unwrap();
+        });
+
+        let mut sent_hello = false;
+        let mut reply = Vec::new();
+        let mut client_closed = false;
+        let deadline = StdInstant::now() + StdDuration::from_secs(5);
+        loop {
+            assert!(
+                StdInstant::now() < deadline,
+                "IPv6 DestOpts handshake/transfer timed out (reply={reply:?})"
+            );
+            while let Ok(pkt) = out_rx.try_recv() {
+                let ip = Ipv6Packet::new_checked(&pkt).expect("valid IPv6 reply packet");
+                assert_eq!(
+                    ip.next_header(),
+                    IpProtocol::Tcp,
+                    "expected TCP reply, not ICMPv6 Parameter Problem"
+                );
+                client_dev.rx_queue.push_back(pkt);
+            }
+            client_iface.poll(clock.now(), &mut client_dev, &mut client_sockets);
+            {
+                let sock = client_sockets.get_mut::<TcpSocket>(client_handle);
+                if !sent_hello && sock.can_send() {
+                    sock.send_slice(b"HELLO").unwrap();
+                    sent_hello = true;
+                }
+                while sock.can_recv() {
+                    sock.recv(|buf| {
+                        reply.extend_from_slice(buf);
+                        (buf.len(), ())
+                    })
+                    .unwrap();
+                }
+                if reply == b"WORLD" && !sock.may_recv() && !client_closed {
+                    sock.close();
+                    client_closed = true;
+                }
+            }
+            client_iface.poll(clock.now(), &mut client_dev, &mut client_sockets);
+            while let Some(pkt) = client_dev.tx_queue.pop_front() {
+                in_tx.send(wrap_with_dest_opts(&pkt)).await.unwrap();
+            }
+            if reply == b"WORLD"
+                && matches!(
+                    client_sockets.get::<TcpSocket>(client_handle).state(),
+                    TcpState::TimeWait | TcpState::Closed
+                )
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        server_task.await.unwrap();
+        let _ = stop_tx.send(true);
+        let _ = tokio::time::timeout(StdDuration::from_secs(2), runner_handle).await;
     }
 }

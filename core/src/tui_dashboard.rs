@@ -1,6 +1,8 @@
 use anyhow::Result;
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
@@ -66,13 +68,13 @@ pub fn push_log_entry(ring: &SharedLogRing, mut entry: LogEntry) {
     guard.push_back(entry);
 }
 
+fn is_interactive_tty() -> bool {
+    let dumb = std::env::var_os("TERM").is_some_and(|v| v == "dumb");
+    io::stdin().is_terminal() && io::stdout().is_terminal() && !dumb
+}
+
 pub fn should_enable_dashboard(cfg: &RuntimeConfig, is_service: bool) -> bool {
-    io::stdin().is_terminal()
-        && io::stdout().is_terminal()
-        && !cfg.quiet
-        && !cfg.debug
-        && !is_service
-        && std::env::var("TERM").as_deref() != Ok("dumb")
+    is_interactive_tty() && !cfg.quiet && !cfg.debug && !is_service
 }
 
 /// Lightweight tracing subscriber layer that routes `INFO`/`WARN`/`ERROR` events into
@@ -248,12 +250,27 @@ pub enum DashboardEngine {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DashboardInfo {
     pub engine: DashboardEngine,
     pub mode: DesyncMode,
     pub enable_doh: bool,
     pub dns_addr: Option<String>,
+}
+
+impl fmt::Debug for DashboardInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let redacted_dns = self
+            .dns_addr
+            .as_deref()
+            .map(vdpi_core::dns::redact_dns_for_display);
+        f.debug_struct("DashboardInfo")
+            .field("engine", &self.engine)
+            .field("mode", &self.mode)
+            .field("enable_doh", &self.enable_doh)
+            .field("dns_addr", &redacted_dns)
+            .finish()
+    }
 }
 
 /// Live telemetry snapshot returned by a remote-attach probe callback for
@@ -293,7 +310,7 @@ enum ProbeStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProbeRow {
-    label: &'static str,
+    label: String,
     host: &'static str,
     status: ProbeStatus,
 }
@@ -305,32 +322,38 @@ struct DiagnosticsState {
 }
 
 impl DiagnosticsState {
-    fn new_running(run_id: u64) -> Self {
+    fn new_running(run_id: u64, dns_addr: Option<&str>, enable_doh: bool) -> Self {
         Self {
             run_id,
             rows: [
                 ProbeRow {
-                    label: "1.1.1.1 / DoH DNS Ring",
+                    label: diagnostics_dns_row_label(dns_addr, enable_doh),
                     host: "one.one.one.one",
                     status: ProbeStatus::Running,
                 },
                 ProbeRow {
-                    label: "discord.com",
+                    label: "discord.com".to_string(),
                     host: "discord.com",
                     status: ProbeStatus::Running,
                 },
                 ProbeRow {
-                    label: "gateway.discord.gg",
+                    label: "gateway.discord.gg".to_string(),
                     host: "gateway.discord.gg",
                     status: ProbeStatus::Running,
                 },
                 ProbeRow {
-                    label: "www.roblox.com",
+                    label: "www.roblox.com".to_string(),
                     host: "www.roblox.com",
                     status: ProbeStatus::Running,
                 },
             ],
         }
+    }
+
+    fn is_running(&self) -> bool {
+        self.rows
+            .iter()
+            .any(|row| matches!(row.status, ProbeStatus::Running))
     }
 }
 
@@ -344,6 +367,7 @@ const RED_DANGER: Color = Color::Rgb(235, 96, 107);
 
 #[derive(Debug, Clone, Copy)]
 struct Palette {
+    color: bool,
     border_type: BorderType,
     border: Style,
     title: Style,
@@ -360,6 +384,7 @@ impl Palette {
     fn new(color: bool) -> Self {
         if !color {
             return Self {
+                color: false,
                 border_type: BorderType::Plain,
                 border: Style::default(),
                 title: Style::default().add_modifier(Modifier::BOLD),
@@ -374,6 +399,7 @@ impl Palette {
         }
 
         Self {
+            color: true,
             border_type: BorderType::Rounded,
             border: Style::default().fg(BORDER_SLATE),
             title: Style::default().fg(TEXT_WHITE).add_modifier(Modifier::BOLD),
@@ -386,6 +412,12 @@ impl Palette {
             key_hint: Style::default().fg(TEXT_WHITE).add_modifier(Modifier::BOLD),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoticeKind {
+    Info,
+    Warn,
 }
 
 struct DashboardState {
@@ -404,7 +436,7 @@ struct DashboardState {
     follow_logs: bool,
     log_scroll: usize,
     log_viewport_rows: usize,
-    notice: Option<(String, Instant)>,
+    notice: Option<(String, NoticeKind, Instant)>,
     diagnostics_open: bool,
     diagnostics: Arc<Mutex<DiagnosticsState>>,
     diag_tasks: JoinSet<()>,
@@ -418,6 +450,8 @@ struct DashboardState {
 
 impl DashboardState {
     fn new(info: DashboardInfo, logs: SharedLogRing, color: bool, now: Instant) -> Self {
+        let initial_diag =
+            DiagnosticsState::new_running(0, info.dns_addr.as_deref(), info.enable_doh);
         Self {
             info,
             palette: Palette::new(color),
@@ -436,7 +470,7 @@ impl DashboardState {
             log_viewport_rows: 1,
             notice: None,
             diagnostics_open: false,
-            diagnostics: Arc::new(Mutex::new(DiagnosticsState::new_running(0))),
+            diagnostics: Arc::new(Mutex::new(initial_diag)),
             diag_tasks: JoinSet::new(),
             next_diag_run: 0,
             is_attached: false,
@@ -476,6 +510,9 @@ impl DashboardState {
         } else if snap.bytes_rx < self.prev_rx || snap.bytes_tx < self.prev_tx {
             // Daemon restarted and byte counters reset to a lower value:
             // re-baseline cleanly without stalling or underflowing.
+            if self.is_attached {
+                self.started_at = now;
+            }
             if now.saturating_duration_since(self.last_rate_sample) >= Duration::from_secs(1) {
                 self.throughput.push(0);
             }
@@ -504,7 +541,12 @@ impl DashboardState {
 
     fn apply_attached_sample(&mut self, sample: AttachedTelemetry, now: Instant) {
         let was_reconnecting = self.reconnecting;
+        let counters_reset = self.rate_initialized
+            && (sample.snap.bytes_rx < self.prev_rx || sample.snap.bytes_tx < self.prev_tx);
         self.reconnecting = false;
+        if counters_reset {
+            self.started_at = now;
+        }
         if was_reconnecting {
             // Re-baseline after an offline window so accumulated traffic during
             // disconnect never shows up as a fake catch-up spike.
@@ -514,9 +556,7 @@ impl DashboardState {
         self.info.engine = sample.engine;
         self.info.mode = sample.mode;
         self.info.enable_doh = sample.doh;
-        if sample.dns_addr.is_some() {
-            self.info.dns_addr = normalize_opt_string(sample.dns_addr);
-        }
+        self.info.dns_addr = normalize_opt_string(sample.dns_addr);
         self.rss_kb = sample.rss_kb;
         self.isp_stage = normalize_opt_string(sample.isp_stage);
         self.remote_version = normalize_opt_string(sample.version).and_then(|v| {
@@ -543,7 +583,7 @@ impl DashboardState {
     }
 
     fn expire_notice(&mut self, now: Instant) {
-        if self.notice.as_ref().is_some_and(|(_, exp)| now >= *exp) {
+        if self.notice.as_ref().is_some_and(|(_, _, exp)| now >= *exp) {
             self.notice = None;
         }
     }
@@ -564,7 +604,11 @@ impl DashboardState {
     }
 
     fn set_notice(&mut self, message: impl Into<String>, now: Instant) {
-        self.notice = Some((message.into(), now + NOTICE_TTL));
+        self.notice = Some((message.into(), NoticeKind::Info, now + NOTICE_TTL));
+    }
+
+    fn set_notice_warn(&mut self, message: impl Into<String>, now: Instant) {
+        self.notice = Some((message.into(), NoticeKind::Warn, now + NOTICE_TTL));
     }
 
     fn log_count(&self) -> usize {
@@ -624,11 +668,19 @@ impl DashboardState {
         while self.diag_tasks.try_join_next().is_some() {}
     }
 
+    fn diagnostics_running(&self) -> bool {
+        self.diagnostics
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_running()
+    }
+
     fn begin_diagnostics_run(&mut self) -> (u64, [(usize, &'static str); 4]) {
         self.abort_diagnostics_tasks();
         self.next_diag_run = self.next_diag_run.wrapping_add(1).max(1);
         let run_id = self.next_diag_run;
-        let fresh = DiagnosticsState::new_running(run_id);
+        let fresh =
+            DiagnosticsState::new_running(run_id, self.info.dns_addr.as_deref(), self.info.enable_doh);
         let targets = [
             (0, fresh.rows[0].host),
             (1, fresh.rows[1].host),
@@ -647,6 +699,7 @@ enum KeyAction {
     ClearCache,
     Refresh,
     RunDiagnostics,
+    DiagnosticsOffline,
     Quit,
 }
 
@@ -657,7 +710,11 @@ fn handle_key_event(state: &mut DashboardState, key: KeyEvent) -> KeyAction {
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
     {
-        return KeyAction::Quit;
+        return if key.kind == KeyEventKind::Press {
+            KeyAction::Quit
+        } else {
+            KeyAction::None
+        };
     }
 
     if key
@@ -677,18 +734,28 @@ fn handle_key_event(state: &mut DashboardState, key: KeyEvent) -> KeyAction {
                 state.abort_diagnostics_tasks();
                 KeyAction::Redraw
             }
-            KeyCode::Char('r' | 'R') => KeyAction::RunDiagnostics,
+            KeyCode::Char('r' | 'R') => {
+                if state.is_attached && state.reconnecting {
+                    state.diagnostics_open = false;
+                    state.abort_diagnostics_tasks();
+                    KeyAction::DiagnosticsOffline
+                } else if state.diagnostics_running() {
+                    KeyAction::None
+                } else {
+                    KeyAction::RunDiagnostics
+                }
+            }
             KeyCode::Char('q' | 'Q') => KeyAction::Quit,
             _ => KeyAction::None,
         };
     }
 
     match key.code {
-        KeyCode::Up | KeyCode::Char('k') => {
+        KeyCode::Up | KeyCode::Char('k' | 'K') => {
             state.scroll_up(1);
             KeyAction::Redraw
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Down | KeyCode::Char('j' | 'J') => {
             state.scroll_down(1);
             KeyAction::Redraw
         }
@@ -712,8 +779,12 @@ fn handle_key_event(state: &mut DashboardState, key: KeyEvent) -> KeyAction {
         }
         _ if key.kind != KeyEventKind::Press => KeyAction::None,
         KeyCode::Char('d' | 'D') => {
-            state.diagnostics_open = true;
-            KeyAction::RunDiagnostics
+            if state.is_attached && state.reconnecting {
+                KeyAction::DiagnosticsOffline
+            } else {
+                state.diagnostics_open = true;
+                KeyAction::RunDiagnostics
+            }
         }
         KeyCode::Char('r' | 'R') if state.is_attached => KeyAction::Refresh,
         KeyCode::Char('c' | 'C') if !state.is_attached => KeyAction::ClearCache,
@@ -725,15 +796,20 @@ fn handle_key_event(state: &mut DashboardState, key: KeyEvent) -> KeyAction {
 static TUI_PANIC_HOOK_ONCE: Once = Once::new();
 static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// Installs a process-wide panic hook wrapper once that restores raw mode and
-/// leaves the alternate screen before invoking the previous hook, so panic
-/// messages are never erased by unwinding `Drop` guards.
+/// Installs a process-wide panic hook wrapper once that restores raw mode,
+/// disables bracketed paste, and leaves the alternate screen before invoking
+/// the previous hook, so panic messages are never erased by unwinding `Drop` guards.
 pub(crate) fn install_tui_panic_hook() {
     TUI_PANIC_HOOK_ONCE.call_once(|| {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             if TUI_ACTIVE.swap(false, Ordering::AcqRel) {
-                let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+                let _ = execute!(
+                    io::stdout(),
+                    DisableBracketedPaste,
+                    LeaveAlternateScreen,
+                    Show
+                );
                 let _ = terminal::disable_raw_mode();
             }
             prev(info);
@@ -812,8 +888,8 @@ impl EventReaderGuard {
         let (ev_tx, ev_rx) = mpsc::channel::<Event>(32);
 
         let reader_handle = std::thread::spawn(move || {
-            while !reader_flag.load(Ordering::Relaxed) {
-                match event::poll(Duration::from_millis(50)) {
+            while !reader_flag.load(Ordering::Acquire) {
+                match event::poll(Duration::from_millis(15)) {
                     Ok(true) => match event::read() {
                         Ok(ev) => {
                             if ev_tx.blocking_send(ev).is_err() {
@@ -845,7 +921,7 @@ impl EventReaderGuard {
 
 impl Drop for EventReaderGuard {
     fn drop(&mut self) {
-        self.stop_reader.store(true, Ordering::Relaxed);
+        self.stop_reader.store(true, Ordering::Release);
         self.ev_rx = None;
         if let Some(handle) = self.reader_handle.take() {
             let _ = handle.join();
@@ -1132,13 +1208,46 @@ impl AttachedActivityTracker {
             );
         }
 
-        if prev.info.enable_doh != sample.doh {
-            let old_dns = if prev.info.enable_doh { "DoH" } else { "UDP" };
-            let new_dns = if sample.doh { "DoH" } else { "UDP" };
+        let old_dns_addr = normalize_opt_string(prev.info.dns_addr.clone());
+        let new_dns_addr = normalize_opt_string(sample.dns_addr.clone());
+        let prev_effective_doh =
+            effective_dashboard_doh(old_dns_addr.as_deref(), prev.info.enable_doh);
+        let new_effective_doh = effective_dashboard_doh(new_dns_addr.as_deref(), sample.doh);
+
+        if prev_effective_doh != new_effective_doh {
+            let old_dns = if prev_effective_doh { "DoH" } else { "UDP" };
+            let new_dns = if new_effective_doh { "DoH" } else { "UDP" };
             self.push(
                 Level::INFO,
                 format!("DNS transport changed: {old_dns} -> {new_dns}"),
             );
+        }
+
+        if old_dns_addr != new_dns_addr {
+            let (old_tag, _) =
+                format_dashboard_dns_tag(old_dns_addr.as_deref(), prev_effective_doh);
+            let (new_tag, _) = format_dashboard_dns_tag(new_dns_addr.as_deref(), new_effective_doh);
+            match (old_dns_addr.as_deref(), new_dns_addr.as_deref()) {
+                (None, Some("1.1.1.1")) | (Some("1.1.1.1"), None) => {}
+                (_, None) => {
+                    self.push(
+                        Level::INFO,
+                        format!("DNS server reset to default ({new_tag})"),
+                    );
+                }
+                (None, Some(_)) => {
+                    self.push(Level::INFO, format!("DNS server set: {new_tag}"));
+                }
+                (Some(_), Some(_)) if old_tag != new_tag => {
+                    self.push(
+                        Level::INFO,
+                        format!("DNS server changed: {old_tag} -> {new_tag}"),
+                    );
+                }
+                (Some(_), Some(_)) => {
+                    self.push(Level::INFO, format!("DNS server updated: {new_tag}"));
+                }
+            }
         }
 
         if let Some(prev_quic) = self.last_block_quic {
@@ -1293,14 +1402,157 @@ async fn probe_via_http_connect(proxy_addr: SocketAddr, host: &str) -> ProbeStat
     }
 }
 
+const DEFAULT_DOH_PROBE_URL: &str = "https://1.1.1.1/dns-query";
+
+fn normalize_doh_probe_url(raw: &str) -> String {
+    let rest = &raw[8..];
+    match rest.find(['/', '?']) {
+        None => format!("https://{rest}/dns-query"),
+        Some(idx) => {
+            let suffix = &rest[idx..];
+            if suffix.starts_with('?') {
+                format!("https://{}/dns-query{suffix}", &rest[..idx])
+            } else if let Some(query) = suffix.strip_prefix("/?") {
+                format!("https://{}/dns-query?{query}", &rest[..idx])
+            } else {
+                format!("https://{rest}")
+            }
+        }
+    }
+}
+
+fn known_doh_ip_probe_url(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => format!("https://{v4}/dns-query"),
+        IpAddr::V6(v6) => format!("https://[{v6}]/dns-query"),
+    }
+}
+
+fn doh_url_is_redacted_host_only(url: &str) -> bool {
+    let trimmed = url.trim();
+    if !is_valid_doh_url(trimmed) {
+        return false;
+    }
+    let rest = &trimmed[8..];
+    match rest.find(['/', '?', '#']) {
+        None => true,
+        Some(idx) => &rest[idx..] == "/",
+    }
+}
+
+fn doh_authority_match_key(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    if !is_valid_doh_url(trimmed) {
+        return None;
+    }
+    let redacted = vdpi_core::dns::redact_dns_for_display(trimmed);
+    let host = extract_redacted_doh_host(&redacted);
+    if host.is_empty() || host.eq_ignore_ascii_case("<redacted>") {
+        return None;
+    }
+    let lower = host.to_ascii_lowercase();
+    let normalized = lower.strip_suffix(":443").unwrap_or(&lower);
+    Some(normalized.to_string())
+}
+
+fn resolve_tun_doh_probe_url_with_candidates<S: AsRef<str>>(
+    dns_addr: Option<&str>,
+    configured_candidates: &[S],
+) -> String {
+    let Some(raw) = dns_addr.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_DOH_PROBE_URL.to_string();
+    };
+    if is_valid_doh_url(raw) {
+        if doh_url_is_redacted_host_only(raw) {
+            if let Some(target_key) = doh_authority_match_key(raw) {
+                for candidate in configured_candidates {
+                    let Ok(validated) =
+                        vdpi_core::dns::validate_custom_dns_input(candidate.as_ref())
+                    else {
+                        continue;
+                    };
+                    if is_valid_doh_url(&validated)
+                        && !doh_url_is_redacted_host_only(&validated)
+                        && doh_authority_match_key(&validated).as_deref()
+                            == Some(target_key.as_str())
+                    {
+                        return normalize_doh_probe_url(&validated);
+                    }
+                }
+            }
+        }
+        return normalize_doh_probe_url(raw);
+    }
+    if let Some(ip) = parse_known_doh_ip(raw) {
+        return known_doh_ip_probe_url(ip);
+    }
+    DEFAULT_DOH_PROBE_URL.to_string()
+}
+
+fn resolve_tun_doh_probe_url(dns_addr: Option<&str>) -> String {
+    resolve_tun_doh_probe_url_with_candidates::<&str>(dns_addr, &[])
+}
+
+fn load_local_configured_doh_candidates() -> Vec<String> {
+    let mut candidates = Vec::with_capacity(2);
+    for (path, service_mode) in [
+        (vdpi::config_file::system_config_path(), true),
+        (vdpi::config_file::user_config_path(), false),
+    ] {
+        let Ok((_, file_cfg)) = vdpi::config_file::load_file_config(Some(&path), service_mode)
+        else {
+            continue;
+        };
+        let Some(dns) = file_cfg.dns_addr else {
+            continue;
+        };
+        let Ok(validated) = vdpi_core::dns::validate_custom_dns_input(&dns) else {
+            continue;
+        };
+        if is_valid_doh_url(&validated) && !candidates.contains(&validated) {
+            candidates.push(validated);
+        }
+    }
+    candidates
+}
+
+fn resolve_attached_tun_doh_probe_url(dns_addr: Option<&str>) -> String {
+    let Some(raw) = dns_addr.map(str::trim).filter(|s| !s.is_empty()) else {
+        return DEFAULT_DOH_PROBE_URL.to_string();
+    };
+    if is_valid_doh_url(raw) {
+        if !doh_url_is_redacted_host_only(raw) {
+            return normalize_doh_probe_url(raw);
+        }
+        let candidates = load_local_configured_doh_candidates();
+        return resolve_tun_doh_probe_url_with_candidates(Some(raw), candidates.as_slice());
+    }
+    if let Some(ip) = parse_known_doh_ip(raw) {
+        return known_doh_ip_probe_url(ip);
+    }
+    DEFAULT_DOH_PROBE_URL.to_string()
+}
+
+fn redact_url_in_probe_error(msg: &str, url: &str) -> String {
+    let redacted_urls = vdpi_core::dns::redact_urls_in_text(msg);
+    if !url.is_empty() && redacted_urls.contains(url) {
+        let redacted = vdpi_core::dns::redact_dns_for_display(url);
+        redacted_urls.replace(url, &redacted)
+    } else {
+        redacted_urls
+    }
+}
+
 async fn probe_via_tun_direct(
     client: Option<Arc<reqwest::Client>>,
     enable_doh: bool,
+    doh_probe_url: Option<String>,
     idx: usize,
     host: &'static str,
 ) -> ProbeStatus {
     let started = Instant::now();
-    if idx == 0 && !enable_doh {
+    let effective_doh = effective_dashboard_doh(doh_probe_url.as_deref(), enable_doh);
+    if idx == 0 && !effective_doh {
         let result =
             tokio::time::timeout(PROBE_TIMEOUT, tokio::net::lookup_host((host, 443))).await;
         let latency_ms = started.elapsed().as_millis();
@@ -1332,12 +1584,20 @@ async fn probe_via_tun_direct(
 
     let result = tokio::time::timeout(PROBE_TIMEOUT, async move {
         if idx == 0 {
+            let doh_url = resolve_tun_doh_probe_url(doh_probe_url.as_deref());
+            let wire_query = vdpi_core::dns::encode_dns_query(host, 1)
+                .map_err(|e| sanitize_single_line(&e.to_string()))?;
             let resp = client
-                .get("https://1.1.1.1/dns-query?name=one.one.one.one&type=A")
-                .header(reqwest::header::ACCEPT, "application/dns-json")
+                .post(&doh_url)
+                .header(reqwest::header::CONTENT_TYPE, "application/dns-message")
+                .header(reqwest::header::ACCEPT, "application/dns-message")
+                .body(wire_query)
                 .send()
                 .await
-                .map_err(|e| sanitize_single_line(&e.to_string()))?;
+                .map_err(|e| {
+                    let msg = sanitize_single_line(&e.without_url().to_string());
+                    redact_url_in_probe_error(&msg, &doh_url)
+                })?;
             let status = resp.status();
             if status.is_success() {
                 Ok::<String, String>(format!("DoH HTTP {}", status.as_u16()))
@@ -1374,6 +1634,7 @@ fn spawn_attached_diagnostics_probes(
     tasks: &mut JoinSet<()>,
     engine: &DashboardEngine,
     enable_doh: bool,
+    dns_addr: Option<String>,
     diag_state: &Arc<Mutex<DiagnosticsState>>,
     run_id: u64,
     targets: [(usize, &'static str); 4],
@@ -1393,6 +1654,12 @@ fn spawn_attached_diagnostics_probes(
             }
         }
         DashboardEngine::Tun { .. } => {
+            let effective_doh = effective_dashboard_doh(dns_addr.as_deref(), enable_doh);
+            let doh_probe_url = if effective_doh {
+                Some(resolve_attached_tun_doh_probe_url(dns_addr.as_deref()))
+            } else {
+                None
+            };
             let shared_client = reqwest::Client::builder()
                 .https_only(true)
                 .no_proxy()
@@ -1404,8 +1671,14 @@ fn spawn_attached_diagnostics_probes(
             for (idx, host) in targets {
                 let diag = Arc::clone(diag_state);
                 let client = shared_client.clone();
+                let probe_url = if idx == 0 {
+                    doh_probe_url.clone()
+                } else {
+                    None
+                };
                 tasks.spawn(async move {
-                    let status = probe_via_tun_direct(client, enable_doh, idx, host).await;
+                    let status =
+                        probe_via_tun_direct(client, effective_doh, probe_url, idx, host).await;
                     let mut guard = diag.lock().unwrap_or_else(|e| e.into_inner());
                     if guard.run_id == run_id {
                         guard.rows[idx].status = status;
@@ -1504,26 +1777,21 @@ where
 
     let mut tick = tokio::time::interval(TICK_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Consume immediate first tick; initial state was populated above.
+    tick.tick().await;
 
+    let mut dirty = true;
     tokio::pin!(external_shutdown);
 
     let loop_result: io::Result<()> = loop {
-        while state.diag_tasks.try_join_next().is_some() {}
-        let now = Instant::now();
-        state.update_telemetry(ctx.telemetry_snapshot(), now);
-        state.isp_stage = Some(ctx.preferred_stage().label().to_string());
-        if now.saturating_duration_since(last_rss_sample) >= Duration::from_secs(1) {
-            state.rss_kb = vdpi::health::read_self_rss_kb();
-            last_rss_sample = now;
-        }
-        if let Some(ref probe) = tun_meta_probe {
-            state.refresh_tun_meta(probe());
-        }
-        if let Err(err) = guard
-            .terminal
-            .draw(|frame| render_dashboard(frame, &mut state))
-        {
-            break Err(err);
+        if dirty {
+            if let Err(err) = guard
+                .terminal
+                .draw(|frame| render_dashboard(frame, &mut state))
+            {
+                break Err(err);
+            }
+            dirty = false;
         }
 
         tokio::select! {
@@ -1544,6 +1812,7 @@ where
                                     info!("adaptive strategy and DNS caches cleared");
                                 });
                                 state.set_notice("Cache cleared", Instant::now());
+                                dirty = true;
                             }
                             KeyAction::RunDiagnostics => {
                                 let (run_id, targets) = state.begin_diagnostics_run();
@@ -1554,16 +1823,37 @@ where
                                     run_id,
                                     targets,
                                 );
+                                dirty = true;
                             }
-                            KeyAction::Refresh | KeyAction::Redraw | KeyAction::None => {}
+                            KeyAction::Redraw => {
+                                dirty = true;
+                            }
+                            KeyAction::Refresh
+                            | KeyAction::DiagnosticsOffline
+                            | KeyAction::None => {}
                         }
                     }
-                    // Resize and other events simply trigger the next redraw iteration.
+                    Some(Event::Resize(..)) => {
+                        dirty = true;
+                    }
                     Some(_) => {}
                     None => break Ok(()),
                 }
             }
-            _ = tick.tick() => {}
+            _ = tick.tick() => {
+                while state.diag_tasks.try_join_next().is_some() {}
+                let now = Instant::now();
+                state.update_telemetry(ctx.telemetry_snapshot(), now);
+                state.isp_stage = Some(ctx.preferred_stage().label().to_string());
+                if now.saturating_duration_since(last_rss_sample) >= Duration::from_secs(1) {
+                    state.rss_kb = vdpi::health::read_self_rss_kb();
+                    last_rss_sample = now;
+                }
+                if let Some(ref probe) = tun_meta_probe {
+                    state.refresh_tun_meta(probe());
+                }
+                dirty = true;
+            }
         }
     };
 
@@ -1593,6 +1883,10 @@ where
     P: Fn() -> Option<AttachedTelemetry> + Send + Sync + 'static,
     F: Future<Output = ()>,
 {
+    if !is_interactive_tty() {
+        anyhow::bail!("live dashboard requires an interactive terminal (TTY)");
+    }
+
     let color = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
     let mut guard = DashboardGuard::enter()?;
 
@@ -1648,20 +1942,22 @@ where
     let mut reader_guard = EventReaderGuard::spawn();
     let mut tick = tokio::time::interval(TICK_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tick.tick().await;
     let mut manual_refresh_pending = false;
+    let mut poller_alive = true;
+    let mut dirty = true;
 
     tokio::pin!(external_shutdown);
 
     let loop_result: io::Result<()> = loop {
-        while state.diag_tasks.try_join_next().is_some() {}
-        let now = Instant::now();
-        state.tick_reconnecting(now);
-
-        if let Err(err) = guard
-            .terminal
-            .draw(|frame| render_dashboard(frame, &mut state))
-        {
-            break Err(err);
+        if dirty {
+            if let Err(err) = guard
+                .terminal
+                .draw(|frame| render_dashboard(frame, &mut state))
+            {
+                break Err(err);
+            }
+            dirty = false;
         }
 
         tokio::select! {
@@ -1678,27 +1974,42 @@ where
                                 manual_refresh_pending = true;
                                 let _ = refresh_tx.try_send(());
                                 state.set_notice("Refreshing...", Instant::now());
+                                dirty = true;
                             }
                             KeyAction::RunDiagnostics => {
                                 let (run_id, targets) = state.begin_diagnostics_run();
                                 spawn_attached_diagnostics_probes(
                                     &mut state.diag_tasks,
                                     &state.info.engine,
-                                    state.info.enable_doh,
+                                    effective_dashboard_doh(
+                                        state.info.dns_addr.as_deref(),
+                                        state.info.enable_doh,
+                                    ),
+                                    state.info.dns_addr.clone(),
                                     &state.diagnostics,
                                     run_id,
                                     targets,
                                 );
+                                dirty = true;
                             }
-                            KeyAction::ClearCache | KeyAction::Redraw | KeyAction::None => {}
+                            KeyAction::DiagnosticsOffline => {
+                                state.set_notice_warn("Daemon unreachable", Instant::now());
+                                dirty = true;
+                            }
+                            KeyAction::Redraw => {
+                                dirty = true;
+                            }
+                            KeyAction::ClearCache | KeyAction::None => {}
                         }
                     }
-                    // Resize and other events simply trigger the next redraw iteration.
+                    Some(Event::Resize(..)) => {
+                        dirty = true;
+                    }
                     Some(_) => {}
                     None => break Ok(()),
                 }
             }
-            maybe_sample = poll_rx.recv() => {
+            maybe_sample = poll_rx.recv(), if poller_alive => {
                 let sample_now = Instant::now();
                 match maybe_sample {
                     Some(Some(sample)) => {
@@ -1708,22 +2019,34 @@ where
                             manual_refresh_pending = false;
                             state.set_notice("Refreshed", sample_now);
                         }
+                        dirty = true;
                     }
                     Some(None) => {
                         tracker.on_offline(&state);
                         state.mark_reconnecting(sample_now);
                         if manual_refresh_pending {
                             manual_refresh_pending = false;
-                            state.set_notice("Daemon unreachable", sample_now);
+                            state.set_notice_warn("Daemon unreachable", sample_now);
                         }
+                        dirty = true;
                     }
                     None => {
+                        poller_alive = false;
                         tracker.on_offline(&state);
                         state.mark_reconnecting(sample_now);
+                        if manual_refresh_pending {
+                            manual_refresh_pending = false;
+                            state.set_notice_warn("Daemon unreachable", sample_now);
+                        }
+                        dirty = true;
                     }
                 }
             }
-            _ = tick.tick() => {}
+            _ = tick.tick() => {
+                while state.diag_tasks.try_join_next().is_some() {}
+                state.tick_reconnecting(Instant::now());
+                dirty = true;
+            }
         }
     };
 
@@ -1754,49 +2077,87 @@ fn render_dashboard(frame: &mut Frame<'_>, state: &mut DashboardState) {
         return;
     }
 
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    let status_area = outer[0];
+    let body_area = outer[1];
+    let footer_area = outer[2];
+
+    render_status_bar(frame, status_area, state);
+
     let wide = area.width >= SIDE_BY_SIDE_MIN_WIDTH;
     if wide {
-        let mid_height = if area.height >= 18 { 9 } else { 7 };
+        let bh = body_area.height;
+        let mid_height = if bh >= 12 {
+            9
+        } else if bh >= 7 {
+            bh.saturating_sub(3).min(9)
+        } else {
+            bh
+        };
+        let log_height = bh.saturating_sub(mid_height);
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),
                 Constraint::Length(mid_height),
-                Constraint::Min(4),
-                Constraint::Length(1),
+                Constraint::Length(log_height),
             ])
-            .split(area);
-
-        render_status_bar(frame, rows[0], state);
+            .split(body_area);
 
         let mid_cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
-            .split(rows[1]);
-        render_stats_panel(frame, mid_cols[0], state);
+            .split(rows[0]);
+        render_stats_panel(frame, mid_cols[0], state, false);
         render_sparkline_panel(frame, mid_cols[1], state);
 
-        render_activity_log(frame, rows[2], state);
-        render_footer(frame, rows[3], state);
+        if log_height > 0 {
+            render_activity_log(frame, rows[1], state);
+        }
     } else {
-        let (stats_h, spark_h) = if area.height >= 22 { (9, 5) } else { (7, 4) };
+        let bh = body_area.height;
+        let (stats_h, spark_h) = if bh >= 18 {
+            (9u16, 5u16)
+        } else if bh >= 16 {
+            (9, 4)
+        } else if bh == 15 {
+            (9, 3)
+        } else if bh == 14 {
+            (9, 0)
+        } else if bh >= 10 {
+            (bh - 5, 0)
+        } else if bh >= 7 {
+            (bh - 3, 3)
+        } else {
+            (bh, 0)
+        };
+        let spark_h = if spark_h < 3 { 0 } else { spark_h };
+        let log_h = bh.saturating_sub(stats_h.saturating_add(spark_h));
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),
                 Constraint::Length(stats_h),
                 Constraint::Length(spark_h),
-                Constraint::Min(3),
-                Constraint::Length(1),
+                Constraint::Length(log_h),
             ])
-            .split(area);
+            .split(body_area);
 
-        render_status_bar(frame, rows[0], state);
-        render_stats_panel(frame, rows[1], state);
-        render_sparkline_panel(frame, rows[2], state);
-        render_activity_log(frame, rows[3], state);
-        render_footer(frame, rows[4], state);
+        render_stats_panel(frame, rows[0], state, spark_h == 0);
+        if spark_h >= 3 {
+            render_sparkline_panel(frame, rows[1], state);
+        }
+        if log_h > 0 {
+            render_activity_log(frame, rows[2], state);
+        }
     }
+
+    render_footer(frame, footer_area, state);
 
     if state.diagnostics_open {
         render_diagnostics_modal(frame, area, state);
@@ -1848,48 +2209,38 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
     ];
 
     if state.is_attached && state.reconnecting {
-        const RECONNECTING: &str = "Reconnecting…";
-        let reconnecting_len = RECONNECTING.chars().count();
+        let reconnecting_text = if p.color {
+            "Reconnecting…"
+        } else {
+            "! Reconnecting…"
+        };
+        let reconnecting_len = reconnecting_text.chars().count();
         let engine_tag = match &state.info.engine {
             DashboardEngine::Proxy { primary_addr, .. } => primary_addr.to_string(),
             DashboardEngine::Tun { interface, .. } => format!("TUN {interface}"),
         };
         let engine_len = engine_tag.chars().count();
 
-        let full_len =
-            head_len + 3 + reconnecting_len + 3 + engine_len + 3 + "Uptime ".len() + uptime.len();
-        let med_len = head_len + 3 + reconnecting_len + 3 + engine_len + 3 + uptime.len();
-        let compact_len = head_len + 3 + reconnecting_len + 3 + uptime.len();
+        // Hide live uptime while disconnected so it never ticks against an offline daemon.
+        let with_engine_len = head_len + 3 + reconnecting_len + 3 + engine_len;
         let min_len = head_len + 3 + reconnecting_len;
 
-        if w >= full_len {
+        if w >= with_engine_len {
             spans.push(sep.clone());
-            spans.push(Span::styled(RECONNECTING, p.amber));
-            spans.push(sep.clone());
+            spans.push(Span::styled(reconnecting_text, p.amber));
+            spans.push(sep);
             spans.push(Span::styled(engine_tag, p.label));
-            spans.push(sep);
-            spans.push(Span::styled("Uptime ", p.label));
-            spans.push(Span::styled(uptime, p.text));
-        } else if w >= med_len {
-            spans.push(sep.clone());
-            spans.push(Span::styled(RECONNECTING, p.amber));
-            spans.push(sep.clone());
-            spans.push(Span::styled(engine_tag, p.label));
-            spans.push(sep);
-            spans.push(Span::styled(uptime, p.text));
-        } else if w >= compact_len {
-            spans.push(sep.clone());
-            spans.push(Span::styled(RECONNECTING, p.amber));
-            spans.push(sep);
-            spans.push(Span::styled(uptime, p.text));
         } else if w >= min_len {
             spans.push(sep);
-            spans.push(Span::styled(RECONNECTING, p.amber));
+            spans.push(Span::styled(reconnecting_text, p.amber));
         } else {
             let rem = w.saturating_sub(head_len + 3);
             if rem > 0 {
                 spans.push(sep);
-                spans.push(Span::styled(truncate_chars(RECONNECTING, rem), p.amber));
+                spans.push(Span::styled(
+                    truncate_chars(reconnecting_text, rem),
+                    p.amber,
+                ));
             }
         }
 
@@ -2027,7 +2378,13 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(|provider| format!("[VPN: {provider}]"));
+                .map(|provider| {
+                    if p.color {
+                        format!("[VPN: {provider}]")
+                    } else {
+                        format!("! [VPN: {provider}]")
+                    }
+                });
 
             let iface_chars = iface.chars().count();
             let nic_suffix = nic.map(|n| format!(" ({n})"));
@@ -2144,12 +2501,13 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
                     spans.push(Span::styled("TUN ", p.label));
                     spans.push(Span::styled(iface.to_string(), p.text));
                     if let Some(full_badge) = vpn_badge {
+                        let compact_badge = if p.color { "[VPN]" } else { "! [VPN]" };
                         let full_with_badge = base_len + 3 + full_badge.chars().count();
-                        let compact_with_badge = base_len + 3 + "[VPN]".len();
+                        let compact_with_badge = base_len + 3 + compact_badge.len();
                         let chosen_badge = if w >= full_with_badge {
                             Some(full_badge)
                         } else if w >= compact_with_badge {
-                            Some("[VPN]".to_string())
+                            Some(compact_badge.to_string())
                         } else {
                             None
                         };
@@ -2180,7 +2538,44 @@ fn render_status_bar(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) 
     frame.render_widget(Paragraph::new(Line::from(spans)), inner);
 }
 
-fn render_stats_panel(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) {
+fn format_isp_stage_bottom_title(
+    isp_stage: Option<&str>,
+    avail: usize,
+    p: Palette,
+) -> Option<Line<'static>> {
+    let stage = isp_stage.map(str::trim).filter(|s| !s.is_empty())?;
+    let full_len = " ISP Stage ".len() + stage.chars().count() + 1;
+    let short_len = " Stage ".len() + stage.chars().count() + 1;
+    if full_len <= avail {
+        Some(Line::from(vec![
+            Span::styled(" ISP Stage ", p.label),
+            Span::styled(stage.to_string(), p.text),
+            Span::raw(" "),
+        ]))
+    } else if short_len <= avail {
+        Some(Line::from(vec![
+            Span::styled(" Stage ", p.label),
+            Span::styled(stage.to_string(), p.text),
+            Span::raw(" "),
+        ]))
+    } else if avail > " Stage ".len() + 2 {
+        let budget = avail - " Stage ".len() - 1;
+        Some(Line::from(vec![
+            Span::styled(" Stage ", p.label),
+            Span::styled(truncate_chars(stage, budget), p.text),
+            Span::raw(" "),
+        ]))
+    } else {
+        None
+    }
+}
+
+fn render_stats_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &DashboardState,
+    show_isp_stage_bottom: bool,
+) {
     let p = state.palette;
     let avail = area.width.saturating_sub(2) as usize;
     let left_title = " Traffic & Engine ";
@@ -2214,6 +2609,11 @@ fn render_stats_panel(frame: &mut Frame<'_>, area: Rect, state: &DashboardState)
     if let Some(rss) = rss_title {
         block = block.title_top(rss.right_aligned());
     }
+    if show_isp_stage_bottom {
+        if let Some(line) = format_isp_stage_bottom_title(state.isp_stage.as_deref(), avail, p) {
+            block = block.title_bottom(line.left_aligned());
+        }
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -2242,6 +2642,11 @@ fn render_stats_panel(frame: &mut Frame<'_>, area: Rect, state: &DashboardState)
         DashboardEngine::Proxy { system_proxy, .. } => {
             let proxy_val = if *system_proxy { "Active" } else { "Disabled" };
             let proxy_style = if *system_proxy { p.emerald } else { p.label };
+            let heal_val = if !p.color && snap.auto_heal_escalations > 0 {
+                format!("! {}", snap.auto_heal_escalations)
+            } else {
+                snap.auto_heal_escalations.to_string()
+            };
             [
                 ("Download", download_val, p.text),
                 ("Upload", upload_val, p.text),
@@ -2251,11 +2656,7 @@ fn render_stats_panel(frame: &mut Frame<'_>, area: Rect, state: &DashboardState)
                     p.text,
                 ),
                 ("TLS Handshakes", snap.tls_handshakes.to_string(), p.text),
-                (
-                    "Auto-Heal",
-                    snap.auto_heal_escalations.to_string(),
-                    heal_style,
-                ),
+                ("Auto-Heal", heal_val, heal_style),
                 ("Cached Hosts", snap.learned_hosts.to_string(), p.text),
                 ("Proxy", proxy_val.to_string(), proxy_style),
             ]
@@ -2265,7 +2666,11 @@ fn render_stats_panel(frame: &mut Frame<'_>, area: Rect, state: &DashboardState)
             physical_nic,
             vpn_conflict,
         } => {
-            let iface_val = match physical_nic
+            let has_vpn_conflict = vpn_conflict
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty());
+            let base_iface = match physical_nic
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
@@ -2273,14 +2678,20 @@ fn render_stats_panel(frame: &mut Frame<'_>, area: Rect, state: &DashboardState)
                 Some(nic) => format!("{interface} ({nic})"),
                 None => interface.clone(),
             };
-            let iface_style = if vpn_conflict
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|s| !s.is_empty())
-            {
+            let iface_val = if !p.color && has_vpn_conflict {
+                format!("! {base_iface}")
+            } else {
+                base_iface
+            };
+            let iface_style = if has_vpn_conflict {
                 p.amber
             } else {
                 p.emerald
+            };
+            let tls_heal_val = if !p.color && snap.auto_heal_escalations > 0 {
+                format!("{} / ! {}", snap.tls_handshakes, snap.auto_heal_escalations)
+            } else {
+                format!("{} / {}", snap.tls_handshakes, snap.auto_heal_escalations)
             };
             [
                 ("Download", download_val, p.text),
@@ -2295,9 +2706,10 @@ fn render_stats_panel(frame: &mut Frame<'_>, area: Rect, state: &DashboardState)
                 ),
                 ("QUIC Blocked", snap.quic_blocked.to_string(), p.text),
                 (
-                    if state.info.enable_doh
-                        || state.info.dns_addr.as_deref().is_some_and(is_doh_url)
-                    {
+                    if effective_dashboard_doh(
+                        state.info.dns_addr.as_deref(),
+                        state.info.enable_doh,
+                    ) {
                         "DoH Queries"
                     } else {
                         "DNS Queries"
@@ -2305,11 +2717,7 @@ fn render_stats_panel(frame: &mut Frame<'_>, area: Rect, state: &DashboardState)
                     snap.dns_queries.to_string(),
                     p.text,
                 ),
-                (
-                    "TLS / Heal",
-                    format!("{} / {}", snap.tls_handshakes, snap.auto_heal_escalations),
-                    heal_style,
-                ),
+                ("TLS / Heal", tls_heal_val, heal_style),
                 ("Interface", iface_val, iface_style),
             ]
         }
@@ -2326,6 +2734,9 @@ fn render_stats_panel(frame: &mut Frame<'_>, area: Rect, state: &DashboardState)
 }
 
 fn render_sparkline_panel(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) {
+    if area.height < 3 {
+        return;
+    }
     let p = state.palette;
     let cur = format_rate(state.throughput.latest());
     let peak = state.throughput.peak();
@@ -2367,39 +2778,8 @@ fn render_sparkline_panel(frame: &mut Frame<'_>, area: Rect, state: &DashboardSt
     if let Some(right) = right_title {
         block = block.title_top(Line::from(right).style(p.label).right_aligned());
     }
-    if let Some(stage) = state
-        .isp_stage
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        let full_len = " ISP Stage ".len() + stage.chars().count() + 1;
-        let short_len = " Stage ".len() + stage.chars().count() + 1;
-        let bottom = if full_len <= avail {
-            Some(Line::from(vec![
-                Span::styled(" ISP Stage ", p.label),
-                Span::styled(stage.to_string(), p.text),
-                Span::raw(" "),
-            ]))
-        } else if short_len <= avail {
-            Some(Line::from(vec![
-                Span::styled(" Stage ", p.label),
-                Span::styled(stage.to_string(), p.text),
-                Span::raw(" "),
-            ]))
-        } else if avail > " Stage ".len() + 2 {
-            let budget = avail - " Stage ".len() - 1;
-            Some(Line::from(vec![
-                Span::styled(" Stage ", p.label),
-                Span::styled(truncate_chars(stage, budget), p.text),
-                Span::raw(" "),
-            ]))
-        } else {
-            None
-        };
-        if let Some(line) = bottom {
-            block = block.title_bottom(line.left_aligned());
-        }
+    if let Some(line) = format_isp_stage_bottom_title(state.isp_stage.as_deref(), avail, p) {
+        block = block.title_bottom(line.left_aligned());
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -2442,23 +2822,44 @@ fn render_activity_log(frame: &mut Frame<'_>, area: Rect, state: &mut DashboardS
         (total, start, entries)
     };
 
+    let avail = area.width.saturating_sub(2) as usize;
+    let left_title = if avail >= " Activity Log ".len() {
+        Some(" Activity Log ")
+    } else if avail >= " Logs ".len() {
+        Some(" Logs ")
+    } else {
+        None
+    };
+    let left_len = left_title.map_or(0, |t| t.chars().count());
+    let min_gap = usize::from(left_len > 0);
+
     let status_badge = if !state.follow_logs && total > state.log_viewport_rows {
         let end_idx = (start + state.log_viewport_rows).min(total);
-        Line::from(format!(" paused · {end_idx}/{total} "))
-            .style(p.amber)
-            .right_aligned()
+        let full = format!(" paused · {end_idx}/{total} ");
+        let compact = format!(" {end_idx}/{total} ");
+        if left_len + min_gap + full.chars().count() <= avail {
+            Some(Line::from(full).style(p.amber).right_aligned())
+        } else if left_len + min_gap + compact.chars().count() <= avail {
+            Some(Line::from(compact).style(p.amber).right_aligned())
+        } else {
+            None
+        }
     } else {
-        Line::from(format!(" {total}/{MAX_LOG_ENTRIES} "))
-            .style(p.dim)
-            .right_aligned()
+        let full = format!(" {total}/{MAX_LOG_ENTRIES} ");
+        (left_len + min_gap + full.chars().count() <= avail)
+            .then(|| Line::from(full).style(p.dim).right_aligned())
     };
 
-    let block = Block::bordered()
+    let mut block = Block::bordered()
         .border_type(p.border_type)
         .border_style(p.border)
-        .padding(Padding::horizontal(1))
-        .title_top(Line::from(" Activity Log ").style(p.title).left_aligned())
-        .title_top(status_badge);
+        .padding(Padding::horizontal(1));
+    if let Some(left) = left_title {
+        block = block.title_top(Line::from(left).style(p.title).left_aligned());
+    }
+    if let Some(badge) = status_badge {
+        block = block.title_top(badge);
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -2467,7 +2868,10 @@ fn render_activity_log(frame: &mut Frame<'_>, area: Rect, state: &mut DashboardS
     }
 
     if visible_entries.is_empty() {
-        let empty = Line::from(Span::styled("Waiting for engine activity...", p.dim));
+        let empty = Line::from(Span::styled(
+            truncate_chars("Waiting for engine activity...", inner.width as usize),
+            p.dim,
+        ));
         frame.render_widget(Paragraph::new(empty), inner);
         return;
     }
@@ -2501,14 +2905,27 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) {
     }
     let p = state.palette;
 
-    let (legend_area, notice_slot) = if let Some((notice, _)) = &state.notice {
-        let notice_text = format!("{notice} ");
-        let notice_width = (notice_text.chars().count() as u16).min(area.width / 2);
+    let (legend_area, notice_slot) = if let Some((notice, kind, _)) = &state.notice {
+        let raw_notice = if *kind == NoticeKind::Warn && !p.color && !notice.starts_with("! ") {
+            format!("! {notice}")
+        } else {
+            notice.clone()
+        };
+        let desired_width = raw_notice.chars().count().saturating_add(1) as u16;
+        let notice_width = desired_width.min(area.width / 2);
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(0), Constraint::Length(notice_width)])
             .split(area);
-        (cols[0], Some((cols[1], notice_text)))
+        let avail = usize::from(cols[1].width);
+        let display = if avail == 0 {
+            String::new()
+        } else if avail == 1 {
+            truncate_chars(&raw_notice, 1)
+        } else {
+            format!("{} ", truncate_chars(&raw_notice, avail - 1))
+        };
+        (cols[0], Some((cols[1], display, *kind)))
     } else {
         (area, None)
     };
@@ -2621,11 +3038,17 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &DashboardState) {
     };
 
     frame.render_widget(Paragraph::new(legend), legend_area);
-    if let Some((notice_area, notice_text)) = notice_slot {
-        frame.render_widget(
-            Paragraph::new(Line::from(notice_text).style(p.emerald).right_aligned()),
-            notice_area,
-        );
+    if let Some((notice_area, notice_text, kind)) = notice_slot {
+        if !notice_text.is_empty() {
+            let style = match kind {
+                NoticeKind::Info => p.emerald,
+                NoticeKind::Warn => p.amber,
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(notice_text).style(style).right_aligned()),
+                notice_area,
+            );
+        }
     }
 }
 
@@ -2639,16 +3062,35 @@ fn render_diagnostics_modal(frame: &mut Frame<'_>, area: Rect, state: &Dashboard
 
     frame.render_widget(Clear, popup);
 
-    let block = Block::bordered()
+    let avail = popup.width.saturating_sub(2) as usize;
+    let left_title = if avail >= " Diagnostics ".len() {
+        Some(" Diagnostics ")
+    } else if avail >= " Diag ".len() {
+        Some(" Diag ")
+    } else {
+        None
+    };
+    let left_len = left_title.map_or(0, |t| t.chars().count());
+    let min_gap = usize::from(left_len > 0);
+    let running = state.diagnostics_running();
+    let right_title = if running {
+        [" esc close ", " esc "]
+    } else {
+        [" r re-run · esc close ", " r · esc "]
+    }
+    .into_iter()
+    .find(|candidate| left_len + min_gap + candidate.chars().count() <= avail);
+
+    let mut block = Block::bordered()
         .border_type(p.border_type)
         .border_style(p.border)
-        .padding(Padding::horizontal(1))
-        .title_top(Line::from(" Diagnostics ").style(p.title).left_aligned())
-        .title_top(
-            Line::from(" r re-run · esc close ")
-                .style(p.dim)
-                .right_aligned(),
-        );
+        .padding(Padding::horizontal(1));
+    if let Some(left) = left_title {
+        block = block.title_top(Line::from(left).style(p.title).left_aligned());
+    }
+    if let Some(right) = right_title {
+        block = block.title_top(Line::from(right).style(p.dim).right_aligned());
+    }
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
@@ -2693,7 +3135,7 @@ fn render_diagnostics_modal(frame: &mut Frame<'_>, area: Rect, state: &Dashboard
     let mut failed = 0usize;
 
     for row in &snapshot.rows {
-        let label = format!("{:<target_w$}", truncate_chars(row.label, target_w));
+        let label = format!("{:<target_w$}", truncate_chars(&row.label, target_w));
         let (status_text, status_style, latency_text, detail_text) = match &row.status {
             ProbeStatus::Running => (
                 "Running...".to_string(),
@@ -2868,31 +3310,127 @@ fn is_doh_url(addr: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
 }
 
+fn is_valid_doh_url(addr: &str) -> bool {
+    let trimmed = addr.trim();
+    is_doh_url(trimmed) && vdpi_core::dns::is_effective_doh_target(trimmed, false)
+}
+
+fn parse_known_doh_ip(raw: &str) -> Option<IpAddr> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.contains("://") {
+        return None;
+    }
+    if !vdpi_core::dns::is_effective_doh_target(trimmed, true) {
+        return None;
+    }
+    if trimmed.starts_with('[') || trimmed.ends_with(']') {
+        trimmed
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .and_then(|inner| inner.parse::<Ipv6Addr>().ok())
+            .map(IpAddr::V6)
+    } else {
+        trimmed.parse::<IpAddr>().ok()
+    }
+}
+
+fn known_doh_ip_provider_name(ip: IpAddr) -> Option<&'static str> {
+    match ip {
+        IpAddr::V4(v4) => match v4.octets() {
+            [1, 1, 1, 1..=3] | [1, 0, 0, 1..=3] => Some("Cloudflare"),
+            [8, 8, 8, 8] | [8, 8, 4, 4] => Some("Google"),
+            [9, 9, 9, 9] | [149, 112, 112, 112] => Some("Quad9"),
+            [94, 140, 14, 14 | 15 | 140 | 141] | [94, 140, 15, 15 | 16] => Some("AdGuard"),
+            _ => None,
+        },
+        IpAddr::V6(v6) => match v6.segments() {
+            [0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111 | 0x1001 | 0x1112 | 0x1002 | 0x1113 | 0x1003] => {
+                Some("Cloudflare")
+            }
+            [0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888 | 0x8844] => Some("Google"),
+            [0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x00fe | 0x0009] => Some("Quad9"),
+            [0x2a10, 0x50c0, 0, 0, 0, 0, 0x0ad1 | 0x0ad2 | 0xbad1 | 0xbad2 | 0x0001 | 0x0002, 0x00ff] => {
+                Some("AdGuard")
+            }
+            _ => None,
+        },
+    }
+}
+
+fn effective_dashboard_doh(dns_addr: Option<&str>, enable_doh: bool) -> bool {
+    match dns_addr.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(addr) => vdpi_core::dns::is_effective_doh_target(addr, enable_doh),
+        None => enable_doh,
+    }
+}
+
+fn extract_redacted_doh_host(redacted: &str) -> &str {
+    let trimmed = redacted.trim();
+    let without_scheme = trimmed
+        .get(..8)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("https://"))
+        .map(|_| &trimmed[8..])
+        .unwrap_or(trimmed);
+    let authority = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .map(str::trim)
+        .unwrap_or("");
+    authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority)
+        .trim()
+}
+
+fn diagnostics_dns_row_label(dns_addr: Option<&str>, enable_doh: bool) -> String {
+    let trimmed = dns_addr.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(raw) = trimmed.filter(|s| is_valid_doh_url(s)) {
+        let redacted = vdpi_core::dns::redact_dns_for_display(raw);
+        let host = extract_redacted_doh_host(&redacted);
+        if !host.is_empty() {
+            return format!("{host} / DoH");
+        }
+    }
+    if !effective_dashboard_doh(trimmed, enable_doh) {
+        return "UDP DNS Resolution".to_string();
+    }
+    if let Some(ip) = trimmed.and_then(parse_known_doh_ip) {
+        if let Some(provider) = known_doh_ip_provider_name(ip) {
+            return format!("{provider} DoH ({ip})");
+        }
+        return format!("DoH DNS ({ip})");
+    }
+    "Cloudflare DoH (1.1.1.1)".to_string()
+}
+
 fn format_dashboard_dns_tag(dns_addr: Option<&str>, enable_doh: bool) -> (String, &'static str) {
     let trimmed = dns_addr.map(str::trim).filter(|s| !s.is_empty());
-    let doh_url = trimmed.is_some_and(is_doh_url);
-    let short = if enable_doh || doh_url { "DoH" } else { "UDP" };
+    let valid_doh_url = trimmed.is_some_and(is_valid_doh_url);
+    let short = if effective_dashboard_doh(trimmed, enable_doh) {
+        "DoH"
+    } else {
+        "UDP"
+    };
     let Some(raw) = trimmed else {
         return (short.to_string(), short);
     };
     if raw == "1.1.1.1" {
         return (short.to_string(), short);
     }
-    if doh_url {
-        let rest = &raw[8..];
-        let authority = rest
-            .split(['/', '?', '#'])
-            .next()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(rest.trim_end_matches('/'));
-        let compact = truncate_chars(authority, MAX_DASHBOARD_DNS_HOST_CHARS);
+    let redacted = vdpi_core::dns::redact_dns_for_display(raw);
+    if valid_doh_url {
+        let host = extract_redacted_doh_host(&redacted);
+        let compact = truncate_chars(host, MAX_DASHBOARD_DNS_HOST_CHARS);
         if compact.is_empty() {
             return ("DoH".to_string(), "DoH");
         }
         return (format!("DoH ({compact})"), "DoH");
     }
-    let compact = truncate_chars(raw, MAX_DASHBOARD_DNS_HOST_CHARS);
+    let compact = truncate_chars(&redacted, MAX_DASHBOARD_DNS_HOST_CHARS);
+    if compact.is_empty() {
+        return (short.to_string(), short);
+    }
     (format!("{short} ({compact})"), short)
 }
 
@@ -3270,7 +3808,10 @@ mod tests {
 
             let screen = buffer_to_string(terminal.backend());
             assert!(screen.contains("Diagnostics"));
-            assert!(screen.contains("r re-run"));
+            assert!(
+                !screen.contains("r re-run") && !screen.contains("r ·"),
+                "running modal must hide dead re-run hint at {w}x{h}:\n{screen}"
+            );
             assert!(screen.contains("esc close"));
             assert!(screen.contains("discord.com"));
             assert!(screen.contains("gateway.discord.gg"));
@@ -3279,6 +3820,22 @@ mod tests {
             assert!(screen.contains("FAIL"));
             assert!(screen.contains("Running..."));
             assert!(screen.contains("19 ms"));
+        }
+
+        // Once all probes complete, the modal top border advertises 'r re-run · esc close'.
+        state.diagnostics.lock().unwrap().rows[2].status = ProbeStatus::Pass {
+            latency_ms: 31,
+            detail: "162.159.135.234".to_string(),
+        };
+        for (w, h) in [(100u16, 30u16), (60u16, 22u16)] {
+            let backend = TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| render_dashboard(frame, &mut state))
+                .unwrap();
+
+            let screen = buffer_to_string(terminal.backend());
+            assert!(screen.contains("r re-run · esc close"));
         }
     }
 
@@ -3312,12 +3869,22 @@ mod tests {
             KeyAction::None
         );
 
-        // Open diagnostics modal -> Esc closes it without quitting; r re-runs; d closes it.
+        // Open diagnostics modal -> r is ignored while running; once done r re-runs; Esc closes it without quitting.
         assert_eq!(
             handle_key_event(&mut state, press(KeyCode::Char('d'))),
             KeyAction::RunDiagnostics
         );
         assert!(state.diagnostics_open);
+        assert_eq!(
+            handle_key_event(&mut state, press(KeyCode::Char('r'))),
+            KeyAction::None
+        );
+        for row in &mut state.diagnostics.lock().unwrap().rows {
+            row.status = ProbeStatus::Pass {
+                latency_ms: 10,
+                detail: "ok".to_string(),
+            };
+        }
         assert_eq!(
             handle_key_event(&mut state, press(KeyCode::Char('r'))),
             KeyAction::RunDiagnostics
@@ -3701,7 +4268,22 @@ mod tests {
         );
         assert!(!wide_row.contains("pk "));
 
-        let narrow_backend = TestBackend::new(46, 18);
+        // 46x18 (bh == 14) drops the sparkline instead of drawing a 2-row empty border seam
+        // and gives those 2 rows to the Activity Log (3 visible log rows).
+        let narrow_18_backend = TestBackend::new(46, 18);
+        let mut narrow_18_terminal = Terminal::new(narrow_18_backend).unwrap();
+        narrow_18_terminal
+            .draw(|frame| render_dashboard(frame, &mut state))
+            .unwrap();
+        let narrow_18_screen = buffer_to_string(narrow_18_terminal.backend());
+        assert!(
+            !narrow_18_screen.contains("Throughput"),
+            "46x18 must omit empty sparkline border seam:\n{narrow_18_screen}"
+        );
+        assert_eq!(state.log_viewport_rows, 3);
+
+        // 46x19 (bh == 15) gives the sparkline 3 rows (1 inner bar row) and renders compact pk title cleanly.
+        let narrow_backend = TestBackend::new(46, 19);
         let mut narrow_terminal = Terminal::new(narrow_backend).unwrap();
         narrow_terminal
             .draw(|frame| render_dashboard(frame, &mut state))
@@ -3710,14 +4292,14 @@ mod tests {
         let narrow_row = narrow_screen
             .lines()
             .find(|line| line.contains(" Throughput "))
-            .expect("46x18 sparkline border row");
+            .expect("46x19 sparkline border row");
         assert!(
             narrow_row.contains(" Throughput ─"),
-            "46x18 sparkline left title collided: {narrow_row}"
+            "46x19 sparkline left title collided: {narrow_row}"
         );
         assert!(
             narrow_row.contains(" 1023.9 KB/s · pk 1023.9 KB/s "),
-            "46x18 sparkline should render compact pk title cleanly: {narrow_row}"
+            "46x19 sparkline should render compact pk title cleanly: {narrow_row}"
         );
     }
 
@@ -3743,7 +4325,7 @@ mod tests {
             };
         }
 
-        // 46x18: latencies remain unclipped and Detail column is hidden.
+        // 46x18: latencies remain unclipped, Detail column is hidden, and running modal hides 'r re-run'.
         let backend_46 = TestBackend::new(46, 18);
         let mut term_46 = Terminal::new(backend_46).unwrap();
         term_46
@@ -3751,7 +4333,11 @@ mod tests {
             .unwrap();
         let screen_46 = buffer_to_string(term_46.backend());
         assert!(screen_46.contains("Diagnostics"));
-        assert!(screen_46.contains("r re-run · esc close"));
+        assert!(screen_46.contains("esc close"));
+        assert!(
+            !screen_46.contains("r re-run") && !screen_46.contains("r ·"),
+            "46x18 running modal must hide dead re-run hint:\n{screen_46}"
+        );
         assert!(screen_46.contains("Target"));
         assert!(screen_46.contains("Status"));
         assert!(screen_46.contains("Latency"));
@@ -4109,7 +4695,19 @@ mod tests {
         );
         assert!(state.diagnostics_open);
 
-        // While modal is open, 'r' re-runs diagnostics and 'Esc' closes modal without quitting.
+        // While modal is open and probes are still running, 'r' is ignored.
+        assert_eq!(
+            handle_key_event(&mut state, press(KeyCode::Char('r'))),
+            KeyAction::None
+        );
+
+        // Once all probes complete, 'r' re-runs diagnostics and 'Esc' closes modal without quitting.
+        for row in &mut state.diagnostics.lock().unwrap().rows {
+            row.status = ProbeStatus::Pass {
+                latency_ms: 12,
+                detail: "ok".to_string(),
+            };
+        }
         assert_eq!(
             handle_key_event(&mut state, press(KeyCode::Char('r'))),
             KeyAction::RunDiagnostics
@@ -4386,6 +4984,872 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn attached_dns_clear_restart_uptime_warn_notice_and_offline_diagnostics() {
+        let t0 = Instant::now();
+        let logs = new_log_ring();
+        let mut initial_info = sample_info();
+        initial_info.dns_addr = Some("9.9.9.9".to_string());
+        let initial_snap = EngineTelemetrySnapshot {
+            bytes_rx: 100_000,
+            bytes_tx: 50_000,
+            ..Default::default()
+        };
+        let mut tracker = AttachedActivityTracker::new(
+            Arc::clone(&logs),
+            &initial_info,
+            initial_snap,
+            Some("ComboMultiRecord"),
+        );
+        let mut state = DashboardState::new_attached(
+            initial_info,
+            initial_snap,
+            Some(29 * 1024),
+            Some("ComboMultiRecord".to_string()),
+            Arc::clone(&logs),
+            true,
+            t0,
+        );
+        assert_eq!(state.info.dns_addr.as_deref(), Some("9.9.9.9"));
+
+        // Reconnecting hides uptime and blocks 'd' diagnostics with offline action.
+        let t1 = t0 + Duration::from_secs(5);
+        state.mark_reconnecting(t1);
+        state.set_notice_warn("Daemon unreachable", t1);
+        assert_eq!(
+            handle_key_event(&mut state, KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
+            KeyAction::DiagnosticsOffline
+        );
+        assert!(!state.diagnostics_open);
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_dashboard(frame, &mut state))
+            .unwrap();
+        let screen = buffer_to_string(terminal.backend());
+        let status_line = screen.lines().nth(1).unwrap();
+        assert!(status_line.contains("Reconnecting…"));
+        assert!(
+            !status_line.contains("Uptime") && !status_line.contains("00:"),
+            "uptime must be hidden while reconnecting: {status_line}"
+        );
+        let buf = terminal.backend().buffer();
+        let footer_y = 23u16;
+        let warn_x = (0..80u16)
+            .find(|&x| {
+                buf[(x, footer_y)].symbol() == "D"
+                    && x + 5 < 80
+                    && buf[(x + 1, footer_y)].symbol() == "a"
+                    && buf[(x + 2, footer_y)].symbol() == "e"
+            })
+            .expect("Daemon unreachable warn notice in footer");
+        assert_eq!(buf[(warn_x, footer_y)].fg, AMBER_WARN);
+
+        // Long warn notice truncates cleanly on narrow width without overflowing footer.
+        state.set_notice_warn("Daemon unreachable on loopback health port", t1);
+        let narrow_backend = TestBackend::new(36, 18);
+        let mut narrow_term = Terminal::new(narrow_backend).unwrap();
+        narrow_term
+            .draw(|frame| render_dashboard(frame, &mut state))
+            .unwrap();
+        let narrow_screen = buffer_to_string(narrow_term.backend());
+        let narrow_footer = narrow_screen.lines().nth(17).unwrap();
+        assert!(narrow_footer.contains("q back"));
+        assert!(narrow_footer.contains('…'));
+
+        // Reconnecting with counter reset resets started_at and clears custom dns_addr to None.
+        let t2 = t1 + Duration::from_secs(10);
+        let reset_sample = AttachedTelemetry {
+            snap: EngineTelemetrySnapshot {
+                bytes_rx: 1_024,
+                bytes_tx: 512,
+                ..Default::default()
+            },
+            engine: sample_info().engine,
+            mode: DesyncMode::Combo,
+            doh: true,
+            dns_addr: None,
+            block_quic: true,
+            rss_kb: Some(20 * 1024),
+            isp_stage: None,
+            version: Some("0.5.6".to_string()),
+        };
+        tracker.on_sample(&state, &reset_sample, t2);
+        state.apply_attached_sample(reset_sample, t2);
+        assert_eq!(state.started_at, t2);
+        assert_eq!(state.info.dns_addr, None);
+        let messages: Vec<String> = logs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.message.clone())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("DNS server reset to default")),
+            "expected DNS reset log entry, got: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn small_terminals_preserve_footer_key_stats_and_avoid_title_collisions() {
+        let mut state = sample_state(true);
+        for i in 0..20 {
+            push_log_entry(
+                &state.logs,
+                LogEntry {
+                    timestamp: "12:00:05".to_string(),
+                    level: Level::INFO,
+                    message: format!("log-{i}"),
+                },
+            );
+        }
+        state.follow_logs = false;
+        state.log_scroll = 0;
+
+        // 60x20 shows all 7 stats rows, sparkline, activity log, and footer.
+        let backend_60_20 = TestBackend::new(60, 20);
+        let mut term_60_20 = Terminal::new(backend_60_20).unwrap();
+        term_60_20
+            .draw(|frame| render_dashboard(frame, &mut state))
+            .unwrap();
+        let screen_60_20 = buffer_to_string(term_60_20.backend());
+        assert!(screen_60_20.contains("Download"));
+        assert!(screen_60_20.contains("Proxy"));
+        assert!(screen_60_20.contains("Activity Log"));
+        assert!(screen_60_20.lines().nth(19).unwrap().contains("q quit"));
+
+        // Very short terminals still preserve footer and key stats rows without panicking.
+        for (w, h) in [(46u16, 18u16), (46, 14), (46, 12), (28, 12), (80, 10)] {
+            let backend = TestBackend::new(w, h);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|frame| render_dashboard(frame, &mut state))
+                .unwrap();
+            let screen = buffer_to_string(term.backend());
+            let footer_line = screen.lines().nth(usize::from(h - 1)).unwrap();
+            assert!(
+                footer_line.contains("q quit"),
+                "footer vanished at {w}x{h}:\n{screen}"
+            );
+            assert!(
+                screen.contains("Download") && screen.contains("Upload"),
+                "key stats rows vanished at {w}x{h}:\n{screen}"
+            );
+        }
+
+        // Narrow diagnostics modal adapts top titles without colliding.
+        state.diagnostics_open = true;
+        for (w, h) in [(34u16, 16u16), (26, 14)] {
+            let backend = TestBackend::new(w, h);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|frame| render_dashboard(frame, &mut state))
+                .unwrap();
+            let screen = buffer_to_string(term.backend());
+            assert!(screen.contains("Diagnostics"));
+        }
+    }
+
+    #[test]
+    fn no_color_warning_markers_and_key_repeat_and_uppercase_scroll() {
+        // Proxy NO_COLOR Auto-Heal > 0 marker
+        let mut proxy_nc = sample_state(false);
+        let backend = TestBackend::new(100, 30);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|frame| render_dashboard(frame, &mut proxy_nc))
+            .unwrap();
+        let screen = buffer_to_string(term.backend());
+        assert!(screen.contains("! 2"), "expected NO_COLOR Auto-Heal ! marker:\n{screen}");
+
+        // TUN NO_COLOR VPN conflict & TLS / Heal ! markers
+        let mut tun_nc = sample_tun_state(false, Some("WireGuard"));
+        let backend = TestBackend::new(100, 30);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|frame| render_dashboard(frame, &mut tun_nc))
+            .unwrap();
+        let screen = buffer_to_string(term.backend());
+        assert!(screen.contains("! [VPN: WireGuard]"));
+        assert!(screen.contains("28 / ! 2"));
+        assert!(screen.contains("! vdpi0 (Ethernet)"));
+
+        // Attached reconnecting NO_COLOR ! marker
+        let mut rec_nc = sample_attached_state(false, true, false);
+        let backend = TestBackend::new(60, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|frame| render_dashboard(frame, &mut rec_nc))
+            .unwrap();
+        let screen = buffer_to_string(term.backend());
+        assert!(screen.contains("! Reconnecting…"));
+
+        // Ctrl+C Repeat ignored, Press quits; uppercase J/K scroll
+        let mut key_state = sample_state(true);
+        for i in 0..15 {
+            push_log_entry(
+                &key_state.logs,
+                LogEntry {
+                    timestamp: "12:00:00".to_string(),
+                    level: Level::INFO,
+                    message: format!("m-{i}"),
+                },
+            );
+        }
+        key_state.log_viewport_rows = 5;
+        assert_eq!(
+            handle_key_event(
+                &mut key_state,
+                KeyEvent::new_with_kind(
+                    KeyCode::Char('c'),
+                    KeyModifiers::CONTROL,
+                    KeyEventKind::Repeat,
+                ),
+            ),
+            KeyAction::None
+        );
+        assert_eq!(
+            handle_key_event(
+                &mut key_state,
+                KeyEvent::new_with_kind(
+                    KeyCode::Char('K'),
+                    KeyModifiers::SHIFT,
+                    KeyEventKind::Press,
+                ),
+            ),
+            KeyAction::Redraw
+        );
+        assert!(!key_state.follow_logs);
+        assert_eq!(
+            handle_key_event(
+                &mut key_state,
+                KeyEvent::new_with_kind(
+                    KeyCode::Char('J'),
+                    KeyModifiers::SHIFT,
+                    KeyEventKind::Press,
+                ),
+            ),
+            KeyAction::Redraw
+        );
+        assert!(key_state.follow_logs);
+    }
+
+    #[test]
+    fn diagnostics_modal_ignores_r_mash_while_probes_running() {
+        let mut state = sample_state(true);
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let shift_r = KeyEvent::new_with_kind(
+            KeyCode::Char('R'),
+            KeyModifiers::SHIFT,
+            KeyEventKind::Press,
+        );
+
+        assert_eq!(
+            handle_key_event(&mut state, press(KeyCode::Char('d'))),
+            KeyAction::RunDiagnostics
+        );
+        assert!(state.diagnostics_open);
+
+        // All 4 rows running -> both 'r' and 'R' are ignored.
+        assert_eq!(
+            handle_key_event(&mut state, press(KeyCode::Char('r'))),
+            KeyAction::None
+        );
+        assert_eq!(handle_key_event(&mut state, shift_r), KeyAction::None);
+
+        // Partial completion (3 done, 1 still running) -> still ignored.
+        {
+            let mut diag = state.diagnostics.lock().unwrap();
+            diag.rows[0].status = ProbeStatus::Pass {
+                latency_ms: 15,
+                detail: "DoH HTTP 200".to_string(),
+            };
+            diag.rows[1].status = ProbeStatus::Pass {
+                latency_ms: 21,
+                detail: "ok".to_string(),
+            };
+            diag.rows[2].status = ProbeStatus::Fail {
+                latency_ms: 4000,
+                reason: "timed out".to_string(),
+            };
+            diag.rows[3].status = ProbeStatus::Running;
+        }
+        assert_eq!(
+            handle_key_event(&mut state, press(KeyCode::Char('r'))),
+            KeyAction::None
+        );
+        assert_eq!(handle_key_event(&mut state, shift_r), KeyAction::None);
+
+        // Once all 4 probes finish (even with failures), 'r' and 'R' trigger a re-run.
+        {
+            let mut diag = state.diagnostics.lock().unwrap();
+            diag.rows[3].status = ProbeStatus::Fail {
+                latency_ms: 3500,
+                reason: "reset".to_string(),
+            };
+        }
+        assert_eq!(
+            handle_key_event(&mut state, press(KeyCode::Char('r'))),
+            KeyAction::RunDiagnostics
+        );
+        assert_eq!(
+            handle_key_event(&mut state, shift_r),
+            KeyAction::RunDiagnostics
+        );
+    }
+
+    #[test]
+    fn custom_doh_redaction_effective_doh_and_diagnostics_probe_target() {
+        let secret_doh = "https://user:secret@dns.nextdns.io/abc123/my-profile?token=xyz";
+        let valid_custom_doh = "https://dns.nextdns.io/abc123/my-profile?token=secret";
+
+        // Status bar tag redacts path and query for valid custom DoH URLs.
+        assert_eq!(
+            format_dashboard_dns_tag(Some(valid_custom_doh), false),
+            ("DoH (dns.nextdns.io)".to_string(), "DoH")
+        );
+        assert_eq!(
+            format_dashboard_dns_tag(Some("https://dns.quad9.net:8443/dns-query?k=v"), false),
+            ("DoH (dns.quad9.net:8443)".to_string(), "DoH")
+        );
+        // Malformed https:// URLs (empty host, missing host, userinfo) must NOT be treated as DoH
+        // and must never leak secrets.
+        for malformed in ["https://", "https:///secret-token", secret_doh] {
+            let (tag, short) = format_dashboard_dns_tag(Some(malformed), false);
+            assert_eq!(short, "UDP", "malformed URL must not be DoH: {malformed}");
+            assert!(
+                tag.starts_with("UDP ("),
+                "expected UDP tag for malformed URL {malformed}, got {tag:?}"
+            );
+            for leaked in ["user", "secret", "abc123", "my-profile", "token", "xyz"] {
+                assert!(
+                    !tag.contains(leaked),
+                    "malformed URL tag leaked {leaked:?}: {tag:?}"
+                );
+            }
+            assert_eq!(
+                diagnostics_dns_row_label(Some(malformed), true),
+                "UDP DNS Resolution",
+                "malformed URL diagnostics row 0 must not claim DoH: {malformed}"
+            );
+        }
+
+        // DashboardInfo Debug impl redacts userinfo/path/query.
+        let mut info = sample_info();
+        info.enable_doh = false;
+        info.dns_addr = Some(secret_doh.to_string());
+        let debug_out = format!("{info:?}");
+        assert!(debug_out.contains("dns.nextdns.io"), "debug output: {debug_out}");
+        for leaked in ["user", "secret", "abc123", "my-profile", "token", "xyz"] {
+            assert!(
+                !debug_out.contains(leaked),
+                "DashboardInfo Debug leaked '{leaked}': {debug_out}"
+            );
+        }
+
+        // Status bar rendering never leaks path or query for valid custom DoH URLs.
+        let mut state = sample_state(true);
+        state.info.enable_doh = false;
+        state.info.dns_addr = Some(valid_custom_doh.to_string());
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_dashboard(frame, &mut state))
+            .unwrap();
+        let screen = buffer_to_string(terminal.backend());
+        assert!(screen.contains("DoH (dns.nextdns.io)"));
+        for leaked in ["user", "secret", "abc123", "my-profile", "token", "xyz"] {
+            assert!(
+                !screen.contains(leaked),
+                "status bar leaked '{leaked}':\n{screen}"
+            );
+        }
+
+        // AttachedActivityTracker treats https:// dns_addr as effective DoH=true (no bogus DoH -> UDP).
+        let t0 = Instant::now();
+        let logs = new_log_ring();
+        let initial_info = sample_info();
+        let initial_snap = EngineTelemetrySnapshot::default();
+        let mut tracker = AttachedActivityTracker::new(
+            Arc::clone(&logs),
+            &initial_info,
+            initial_snap,
+            None,
+        );
+        let mut attached = DashboardState::new_attached(
+            initial_info,
+            initial_snap,
+            None,
+            None,
+            Arc::clone(&logs),
+            true,
+            t0,
+        );
+        let custom_sample = AttachedTelemetry {
+            snap: initial_snap,
+            engine: sample_info().engine,
+            mode: DesyncMode::Combo,
+            doh: false,
+            dns_addr: Some(valid_custom_doh.to_string()),
+            block_quic: true,
+            rss_kb: None,
+            isp_stage: None,
+            version: None,
+        };
+        let t1 = t0 + Duration::from_secs(1);
+        tracker.on_sample(&attached, &custom_sample, t1);
+        attached.apply_attached_sample(custom_sample, t1);
+
+        let messages: Vec<String> = logs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.message.clone())
+            .collect();
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.contains("DNS transport changed: DoH -> UDP")),
+            "unexpected bogus DoH -> UDP transition log: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("DNS server set: DoH (dns.nextdns.io)")),
+            "expected redacted custom DoH set log, got: {messages:?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.contains("abc123") || m.contains("secret")),
+            "activity log leaked custom DoH path/query: {messages:?}"
+        );
+
+        // Diagnostics row 0 label shows active redacted custom DoH host, provider/IP label for
+        // known public DoH IPs, UDP DNS Resolution when effective DoH is off (bare non-DoH IP,
+        // malformed https://, or --no-doh), and Cloudflare DoH (1.1.1.1) by default.
+        assert_eq!(
+            diagnostics_dns_row_label(None, true),
+            "Cloudflare DoH (1.1.1.1)"
+        );
+        assert_eq!(diagnostics_dns_row_label(None, false), "UDP DNS Resolution");
+        assert_eq!(
+            diagnostics_dns_row_label(Some("1.1.1.1"), true),
+            "Cloudflare DoH (1.1.1.1)"
+        );
+        assert_eq!(
+            diagnostics_dns_row_label(Some("1.1.1.1"), false),
+            "UDP DNS Resolution"
+        );
+        assert_eq!(
+            diagnostics_dns_row_label(Some("9.9.9.9"), true),
+            "Quad9 DoH (9.9.9.9)"
+        );
+        assert_eq!(
+            diagnostics_dns_row_label(Some("8.8.8.8"), true),
+            "Google DoH (8.8.8.8)"
+        );
+        assert_eq!(
+            diagnostics_dns_row_label(Some("94.140.14.14"), true),
+            "AdGuard DoH (94.140.14.14)"
+        );
+        assert_eq!(
+            diagnostics_dns_row_label(Some("2620:fe::fe"), true),
+            "Quad9 DoH (2620:fe::fe)"
+        );
+        assert_eq!(
+            diagnostics_dns_row_label(Some("9.9.9.9"), false),
+            "UDP DNS Resolution"
+        );
+        assert_eq!(
+            diagnostics_dns_row_label(Some("76.76.2.0"), true),
+            "UDP DNS Resolution"
+        );
+        assert_eq!(
+            diagnostics_dns_row_label(Some("10.0.0.53"), true),
+            "UDP DNS Resolution"
+        );
+        assert_eq!(
+            diagnostics_dns_row_label(Some(valid_custom_doh), false),
+            "dns.nextdns.io / DoH"
+        );
+        let _ = state.begin_diagnostics_run();
+        state.diagnostics_open = true;
+        let modal_backend = TestBackend::new(80, 24);
+        let mut modal_term = Terminal::new(modal_backend).unwrap();
+        modal_term
+            .draw(|frame| render_dashboard(frame, &mut state))
+            .unwrap();
+        let modal_screen = buffer_to_string(modal_term.backend());
+        assert!(
+            modal_screen.contains("dns.nextdns.io / DoH"),
+            "expected custom DoH host in diagnostics row 0:\n{modal_screen}"
+        );
+        assert!(!modal_screen.contains("abc123"));
+        assert!(!modal_screen.contains("secret"));
+
+        // TUN DoH probe URL resolution targets configured custom https:// DoH endpoint or
+        // known public DoH IP (never hardcoding 1.1.1.1 for Quad9/Google/AdGuard), and ignores
+        // malformed https:// URLs.
+        assert_eq!(resolve_tun_doh_probe_url(None), "https://1.1.1.1/dns-query");
+        assert_eq!(
+            resolve_tun_doh_probe_url(Some("1.1.1.1")),
+            "https://1.1.1.1/dns-query"
+        );
+        assert_eq!(
+            resolve_tun_doh_probe_url(Some("9.9.9.9")),
+            "https://9.9.9.9/dns-query"
+        );
+        assert_eq!(
+            resolve_tun_doh_probe_url(Some("8.8.8.8")),
+            "https://8.8.8.8/dns-query"
+        );
+        assert_eq!(
+            resolve_tun_doh_probe_url(Some("94.140.14.14")),
+            "https://94.140.14.14/dns-query"
+        );
+        assert_eq!(
+            resolve_tun_doh_probe_url(Some("2620:fe::fe")),
+            "https://[2620:fe::fe]/dns-query"
+        );
+        assert_eq!(
+            resolve_attached_tun_doh_probe_url(Some("9.9.9.9")),
+            "https://9.9.9.9/dns-query"
+        );
+        assert_eq!(
+            resolve_tun_doh_probe_url(Some("https://")),
+            "https://1.1.1.1/dns-query"
+        );
+        assert_eq!(
+            resolve_tun_doh_probe_url(Some("https://dns.nextdns.io/abc123")),
+            "https://dns.nextdns.io/abc123"
+        );
+        assert_eq!(
+            resolve_tun_doh_probe_url(Some("https://dns.quad9.net")),
+            "https://dns.quad9.net/dns-query"
+        );
+        assert_eq!(
+            resolve_tun_doh_probe_url(Some("https://dns.example.com?p=1")),
+            "https://dns.example.com/dns-query?p=1"
+        );
+        assert_eq!(
+            resolve_tun_doh_probe_url(Some("https://dns.example.com/?p=1")),
+            "https://dns.example.com/dns-query?p=1"
+        );
+
+        let redacted_err = redact_url_in_probe_error(
+            &format!("error sending request for url ({valid_custom_doh}): timed out"),
+            valid_custom_doh,
+        );
+        assert!(redacted_err.contains("dns.nextdns.io"));
+        assert!(!redacted_err.contains("abc123"));
+        assert!(!redacted_err.contains("secret"));
+    }
+
+    #[test]
+    fn stacked_layout_at_46x18_displays_all_seven_stats_rows_without_clipping() {
+        // Proxy mode at 46x18: all 7 stats rows visible alongside expanded Activity Log and footer,
+        // without drawing an empty 2-row sparkline border seam.
+        let mut proxy_state = sample_state(true);
+        let backend = TestBackend::new(46, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_dashboard(frame, &mut proxy_state))
+            .unwrap();
+        let proxy_screen = buffer_to_string(terminal.backend());
+        for expected in [
+            "Download",
+            "Upload",
+            "Connections",
+            "TLS Handshakes",
+            "Auto-Heal",
+            "Cached Hosts",
+            "Proxy",
+            "Activity Log",
+            "q quit",
+        ] {
+            assert!(
+                proxy_screen.contains(expected),
+                "missing '{expected}' in 46x18 proxy layout:\n{proxy_screen}"
+            );
+        }
+        assert!(
+            !proxy_screen.contains("Throughput"),
+            "46x18 proxy layout must not draw empty sparkline seam:\n{proxy_screen}"
+        );
+        assert_eq!(proxy_state.log_viewport_rows, 3);
+
+        // TUN mode at 46x18 with custom https:// DoH URL & enable_doh=false: all 7 rows visible,
+        // including DoH Queries (effective DoH) and Interface, with 3 Activity Log rows.
+        let mut tun_state = sample_tun_state(true, None);
+        tun_state.info.enable_doh = false;
+        tun_state.info.dns_addr = Some("https://dns.nextdns.io/abc123".to_string());
+        let tun_backend = TestBackend::new(46, 18);
+        let mut tun_term = Terminal::new(tun_backend).unwrap();
+        tun_term
+            .draw(|frame| render_dashboard(frame, &mut tun_state))
+            .unwrap();
+        let tun_screen = buffer_to_string(tun_term.backend());
+        for expected in [
+            "Download",
+            "Upload",
+            "TCP / UDP",
+            "QUIC Blocked",
+            "DoH Queries",
+            "TLS / Heal",
+            "Interface",
+            "Activity Log",
+            "q quit",
+        ] {
+            assert!(
+                tun_screen.contains(expected),
+                "missing '{expected}' in 46x18 TUN layout:\n{tun_screen}"
+            );
+        }
+        assert!(!tun_screen.contains("DNS Queries"));
+        assert!(
+            !tun_screen.contains("Throughput"),
+            "46x18 TUN layout must not draw empty sparkline seam:\n{tun_screen}"
+        );
+        assert_eq!(tun_state.log_viewport_rows, 3);
+
+        // At 46x19 (bh == 15), sparkline gets 3 rows (1 inner row) and renders alongside stats & log.
+        let backend_19 = TestBackend::new(46, 19);
+        let mut term_19 = Terminal::new(backend_19).unwrap();
+        term_19
+            .draw(|frame| render_dashboard(frame, &mut proxy_state))
+            .unwrap();
+        let screen_19 = buffer_to_string(term_19.backend());
+        assert!(screen_19.contains("Throughput"));
+        assert!(screen_19.contains("Proxy"));
+        assert!(screen_19.contains("Activity Log"));
+        assert_eq!(proxy_state.log_viewport_rows, 1);
+    }
+
+    #[test]
+    fn round3_attached_tun_doh_config_lookup_error_redaction_modal_border_and_bare_ip_display() {
+        // 1. Attached TUN DoH probe URL resolution recovers full path/query from matching local config
+        //    when live /vdpi-health dns_addr is redacted to host-only, without cross-host matching.
+        let candidates = vec![
+            "https://dns.nextdns.io/abc123/my-profile".to_string(),
+            "https://freedns.controld.com/p2".to_string(),
+            "https://dns.quad9.net:8443/custom-path?k=v".to_string(),
+            "https://[2606:4700:4700::1111]/custom-v6".to_string(),
+        ];
+        assert_eq!(
+            resolve_tun_doh_probe_url_with_candidates(
+                Some("https://freedns.controld.com"),
+                candidates.as_slice(),
+            ),
+            "https://freedns.controld.com/p2"
+        );
+        assert_eq!(
+            resolve_tun_doh_probe_url_with_candidates(
+                Some("https://dns.nextdns.io"),
+                candidates.as_slice(),
+            ),
+            "https://dns.nextdns.io/abc123/my-profile"
+        );
+        assert_eq!(
+            resolve_tun_doh_probe_url_with_candidates(
+                Some("https://FREEDNS.CONTROLD.COM"),
+                &["https://freedns.controld.com/CaseToken"][..],
+            ),
+            "https://freedns.controld.com/CaseToken"
+        );
+        assert_eq!(
+            resolve_tun_doh_probe_url_with_candidates(
+                Some("https://dns.quad9.net:8443"),
+                candidates.as_slice(),
+            ),
+            "https://dns.quad9.net:8443/custom-path?k=v"
+        );
+        // Port mismatch must NOT match.
+        assert_eq!(
+            resolve_tun_doh_probe_url_with_candidates(
+                Some("https://dns.quad9.net"),
+                candidates.as_slice(),
+            ),
+            "https://dns.quad9.net/dns-query"
+        );
+        // Different host must NOT match.
+        assert_eq!(
+            resolve_tun_doh_probe_url_with_candidates(
+                Some("https://doh.mullvad.net"),
+                candidates.as_slice(),
+            ),
+            "https://doh.mullvad.net/dns-query"
+        );
+        // IPv6 host matches.
+        assert_eq!(
+            resolve_tun_doh_probe_url_with_candidates(
+                Some("https://[2606:4700:4700::1111]"),
+                candidates.as_slice(),
+            ),
+            "https://[2606:4700:4700::1111]/custom-v6"
+        );
+        // Already-full live URL is kept intact instead of overwritten by config.
+        assert_eq!(
+            resolve_tun_doh_probe_url_with_candidates(
+                Some("https://dns.nextdns.io/live-only"),
+                candidates.as_slice(),
+            ),
+            "https://dns.nextdns.io/live-only"
+        );
+        // UI labels always stay host-only redacted.
+        assert_eq!(
+            diagnostics_dns_row_label(Some("https://freedns.controld.com"), false),
+            "freedns.controld.com / DoH"
+        );
+
+        // 2. Diagnostics modal top border hides 'r re-run' / 'r ·' while running and restores when done.
+        let mut diag_state = sample_state(true);
+        let _ = diag_state.begin_diagnostics_run();
+        diag_state.diagnostics_open = true;
+        for (w, h, expected_hint) in [
+            (80u16, 24u16, " esc close "),
+            (46, 18, " esc close "),
+            (29, 14, " esc "),
+        ] {
+            let backend = TestBackend::new(w, h);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|frame| render_dashboard(frame, &mut diag_state))
+                .unwrap();
+            let screen = buffer_to_string(term.backend());
+            assert!(
+                screen.contains(expected_hint),
+                "expected '{expected_hint}' while running at {w}x{h}:\n{screen}"
+            );
+            assert!(
+                !screen.contains("r re-run") && !screen.contains("r ·"),
+                "running modal must not advertise dead re-run at {w}x{h}:\n{screen}"
+            );
+        }
+        for row in &mut diag_state.diagnostics.lock().unwrap().rows {
+            row.status = ProbeStatus::Pass {
+                latency_ms: 14,
+                detail: "ok".to_string(),
+            };
+        }
+        for (w, h, expected_hint) in [
+            (80u16, 24u16, " r re-run · esc close "),
+            (46, 18, " r re-run · esc close "),
+            (29, 14, " r · esc "),
+        ] {
+            let backend = TestBackend::new(w, h);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|frame| render_dashboard(frame, &mut diag_state))
+                .unwrap();
+            let screen = buffer_to_string(term.backend());
+            assert!(
+                screen.contains(expected_hint),
+                "expected '{expected_hint}' once finished at {w}x{h}:\n{screen}"
+            );
+        }
+
+        // 3. redact_url_in_probe_error uses redact_urls_in_text so case/port normalization never leaks tokens.
+        let case_norm_err = redact_url_in_probe_error(
+            "error sending request for url (https://dns.nextdns.io/abc123/profile?token=secret): timed out",
+            "https://DNS.NEXTDNS.IO:443/abc123/profile?token=secret",
+        );
+        assert!(case_norm_err.contains("https://dns.nextdns.io"));
+        for leaked in ["abc123", "profile", "token", "secret"] {
+            assert!(
+                !case_norm_err.contains(leaked),
+                "probe error leaked '{leaked}': {case_norm_err}"
+            );
+        }
+        let scheme_case_err = redact_url_in_probe_error(
+            "connect failed to HTTPS://user:pw@freedns.controld.com/p2?k=v",
+            "https://freedns.controld.com/p2?k=v",
+        );
+        assert!(scheme_case_err.contains("https://freedns.controld.com"));
+        for leaked in ["user", "pw", "/p2", "k=v"] {
+            assert!(
+                !scheme_case_err.contains(leaked),
+                "probe error leaked '{leaked}': {scheme_case_err}"
+            );
+        }
+
+        // 4. Bare custom non-DoH IPs display as UDP (<ip>) and DNS Queries even when enable_doh=true.
+        assert_eq!(
+            format_dashboard_dns_tag(Some("76.76.2.0"), true),
+            ("UDP (76.76.2.0)".to_string(), "UDP")
+        );
+        assert_eq!(
+            format_dashboard_dns_tag(Some("10.0.0.53"), true),
+            ("UDP (10.0.0.53)".to_string(), "UDP")
+        );
+        assert_eq!(
+            format_dashboard_dns_tag(Some("9.9.9.9"), true),
+            ("DoH (9.9.9.9)".to_string(), "DoH")
+        );
+        assert_eq!(
+            format_dashboard_dns_tag(Some("9.9.9.9"), false),
+            ("UDP (9.9.9.9)".to_string(), "UDP")
+        );
+        assert_eq!(
+            format_dashboard_dns_tag(None, true),
+            ("DoH".to_string(), "DoH")
+        );
+
+        let mut bare_ip_tun = sample_tun_state(true, None);
+        bare_ip_tun.info.enable_doh = true;
+        bare_ip_tun.info.dns_addr = Some("76.76.2.0".to_string());
+        let bare_backend = TestBackend::new(100, 30);
+        let mut bare_term = Terminal::new(bare_backend).unwrap();
+        bare_term
+            .draw(|frame| render_dashboard(frame, &mut bare_ip_tun))
+            .unwrap();
+        let bare_screen = buffer_to_string(bare_term.backend());
+        assert!(
+            bare_screen.contains("UDP (76.76.2.0)"),
+            "expected UDP (76.76.2.0) in status bar:\n{bare_screen}"
+        );
+        assert!(
+            !bare_screen.contains("DoH (76.76.2.0)"),
+            "bare non-DoH IP must not be labeled DoH:\n{bare_screen}"
+        );
+        assert!(
+            bare_screen.contains("DNS Queries") && !bare_screen.contains("DoH Queries"),
+            "bare non-DoH IP must use DNS Queries label:\n{bare_screen}"
+        );
+        let _ = bare_ip_tun.begin_diagnostics_run();
+        bare_ip_tun.diagnostics_open = true;
+        let bare_modal_backend = TestBackend::new(80, 24);
+        let mut bare_modal_term = Terminal::new(bare_modal_backend).unwrap();
+        bare_modal_term
+            .draw(|frame| render_dashboard(frame, &mut bare_ip_tun))
+            .unwrap();
+        let bare_modal_screen = buffer_to_string(bare_modal_term.backend());
+        assert!(
+            bare_modal_screen.contains("UDP DNS Resolution"),
+            "bare non-DoH IP diagnostics row 0 must show UDP DNS Resolution:\n{bare_modal_screen}"
+        );
+        assert!(
+            !bare_modal_screen.contains("1.1.1.1 / DoH DNS Ring")
+                && !bare_modal_screen.contains("Cloudflare DoH"),
+            "bare non-DoH IP diagnostics row 0 must not label Cloudflare DoH:\n{bare_modal_screen}"
+        );
+
+        // 5. Compact stacked heights with spark_h < 3 (46x18, 46x14) omit sparkline and expand Activity Log.
+        let mut compact_state = sample_attached_state(true, false, false);
+        for (w, h) in [(46u16, 18u16), (46, 14)] {
+            let backend = TestBackend::new(w, h);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|frame| render_dashboard(frame, &mut compact_state))
+                .unwrap();
+            let screen = buffer_to_string(term.backend());
+            assert!(
+                !screen.contains("Throughput"),
+                "{w}x{h} must omit sparkline instead of drawing empty border seam:\n{screen}"
+            );
+            assert!(
+                screen.contains("ISP Stage ComboMultiRecord"),
+                "{w}x{h} should preserve ISP Stage on stats panel bottom border:\n{screen}"
+            );
+            assert_eq!(compact_state.log_viewport_rows, 3);
         }
     }
 }

@@ -154,6 +154,32 @@ fn bind_with_port_rotation(
     }))
 }
 
+#[cfg(windows)]
+fn set_exclusive_addr_use(sock: &Socket) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        setsockopt, WSAGetLastError, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+    };
+
+    let enable: i32 = 1;
+    // SAFETY: `sock` owns a valid WinSock handle, and `enable` is a valid 4-byte BOOL option value.
+    let rc = unsafe {
+        setsockopt(
+            sock.as_raw_socket() as usize,
+            SOL_SOCKET,
+            SO_EXCLUSIVEADDRUSE,
+            (&enable as *const i32).cast::<u8>(),
+            std::mem::size_of::<i32>() as i32,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::from_raw_os_error(unsafe {
+            WSAGetLastError()
+        }));
+    }
+    Ok(())
+}
+
 fn bind_reuse_tcp(addr: SocketAddr) -> std::io::Result<TcpListener> {
     let domain = if addr.is_ipv4() {
         Domain::IPV4
@@ -161,6 +187,8 @@ fn bind_reuse_tcp(addr: SocketAddr) -> std::io::Result<TcpListener> {
         Domain::IPV6
     };
     let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    #[cfg(windows)]
+    set_exclusive_addr_use(&sock)?;
     #[cfg(not(windows))]
     sock.set_reuse_address(true)?;
     sock.set_nonblocking(true)?;

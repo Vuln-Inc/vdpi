@@ -429,10 +429,609 @@ jobs:
             dist/vdpi-linux-x86_64.tar.gz
             dist/vdpi-linux-arm64.tar.gz
 
+  test-desktop:
+    name: Test Desktop GUI (${{ matrix.os }})
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.ios_only }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/ui/package-lock.json
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            desktop/src-tauri -> desktop/src-tauri/target
+          shared-key: desktop-test-${{ matrix.os }}
+      - name: Install WebKitGTK & Ayatana AppIndicator Dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            libssl-dev \
+            libxdo-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+      - name: Run Desktop UI Typecheck, Unit Tests & Build
+        working-directory: desktop/ui
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run typecheck
+          npm run test
+          npm run build
+      - name: Run Desktop Tauri Clippy & Unit Tests
+        working-directory: desktop/src-tauri
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+
+  build-desktop-windows:
+    name: Build Desktop GUI (Windows x86_64)
+    needs: [test, test-desktop]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/ui/package-lock.json
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            desktop/src-tauri -> desktop/src-tauri/target
+          shared-key: desktop-windows
+      - name: Download & Verify Wintun 0.14.1
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $wintunUrl = 'https://www.wintun.net/builds/wintun-0.14.1.zip'
+          $expectedZipSha256 = '07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51'
+          $expectedDllSha256 = 'e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce'
+          $stageDir = Join-Path $env:RUNNER_TEMP 'wintun-desktop-0.14.1'
+          $zipPath = Join-Path $stageDir 'wintun-0.14.1.zip'
+          $extractDir = Join-Path $stageDir 'extracted'
+
+          Remove-Item -LiteralPath $stageDir -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+
+          $maxAttempts = 3
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            try {
+              Invoke-WebRequest -Uri $wintunUrl -OutFile $zipPath -TimeoutSec 60
+              break
+            } catch {
+              if ($attempt -eq $maxAttempts) {
+                throw "Failed to download $wintunUrl after $maxAttempts attempts: $($_.Exception.Message)"
+              }
+              Write-Warning "Attempt $attempt/$maxAttempts failed downloading Wintun ($($_.Exception.Message)); retrying..."
+              Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds ($attempt * 3)
+            }
+          }
+
+          $actualZipSha256 = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualZipSha256 -ne $expectedZipSha256) {
+            throw "Wintun archive SHA-256 mismatch: expected $expectedZipSha256, got $actualZipSha256"
+          }
+
+          Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir -Force
+
+          $dllPath = Join-Path $extractDir 'wintun/bin/amd64/wintun.dll'
+          $licensePath = Join-Path $extractDir 'wintun/LICENSE.txt'
+          if (-not (Test-Path -LiteralPath $dllPath)) {
+            throw "Missing extracted Wintun DLL at $dllPath"
+          }
+          if (-not (Test-Path -LiteralPath $licensePath)) {
+            throw "Missing extracted Wintun LICENSE at $licensePath"
+          }
+
+          $actualDllSha256 = (Get-FileHash -LiteralPath $dllPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualDllSha256 -ne $expectedDllSha256) {
+            throw "wintun.dll SHA-256 mismatch: expected $expectedDllSha256, got $actualDllSha256"
+          }
+
+          $sig = Get-AuthenticodeSignature -FilePath $dllPath
+          if ($sig.Status -ne 'Valid') {
+            throw "wintun.dll Authenticode signature invalid: Status=$($sig.Status), Message=$($sig.StatusMessage)"
+          }
+          $subject = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { '' }
+          if ($subject -notmatch 'WireGuard LLC') {
+            throw "wintun.dll Authenticode signer mismatch: expected WireGuard LLC, got '$subject'"
+          }
+
+          $resolvedDllPath = (Resolve-Path -LiteralPath $dllPath).Path
+          $resolvedLicensePath = (Resolve-Path -LiteralPath $licensePath).Path
+          "WINTUN_DLL_PATH=$resolvedDllPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WINTUN_LICENSE_PATH=$resolvedLicensePath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Verified wintun.dll SHA-256 ($actualDllSha256) and Authenticode signer ($subject); staged loose Wintun files for desktop packaging"
+      - name: Build Windows CLI Engine Binary (vdpi.exe)
+        shell: pwsh
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:VDPI_EMBED_WINTUN_DLL) {
+            throw "VDPI_EMBED_WINTUN_DLL must not be set for official Windows release builds"
+          }
+          cargo build --locked --release --target x86_64-pc-windows-msvc --bin vdpi
+          if ($LASTEXITCODE -ne 0) {
+            throw "cargo build vdpi.exe failed with exit code $LASTEXITCODE"
+          }
+      - name: Install Desktop UI Dependencies & Verify Pinned Tauri CLI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm --prefix desktop/ui ci
+          if ($LASTEXITCODE -ne 0) {
+            throw "npm ci failed with exit code $LASTEXITCODE"
+          }
+          npx --prefix desktop/ui tauri --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "tauri --version failed with exit code $LASTEXITCODE"
+          }
+      - name: Stage Bundled Engine & Wintun Resources for NSIS
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedDllSha256 = 'e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce'
+          $cliBin = 'target/x86_64-pc-windows-msvc/release/vdpi.exe'
+          if (-not (Test-Path -LiteralPath $cliBin)) {
+            throw "Missing built CLI binary at $cliBin"
+          }
+          if (-not $env:WINTUN_DLL_PATH -or -not (Test-Path -LiteralPath $env:WINTUN_DLL_PATH)) {
+            throw "WINTUN_DLL_PATH is missing or invalid: '$($env:WINTUN_DLL_PATH)'"
+          }
+          if (-not $env:WINTUN_LICENSE_PATH -or -not (Test-Path -LiteralPath $env:WINTUN_LICENSE_PATH)) {
+            throw "WINTUN_LICENSE_PATH is missing or invalid: '$($env:WINTUN_LICENSE_PATH)'"
+          }
+
+          $resourcesDir = 'desktop/src-tauri/resources'
+          Remove-Item -LiteralPath $resourcesDir -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $resourcesDir | Out-Null
+
+          Copy-Item -LiteralPath $cliBin -Destination (Join-Path $resourcesDir 'vdpi.exe')
+          Copy-Item -LiteralPath $env:WINTUN_DLL_PATH -Destination (Join-Path $resourcesDir 'wintun.dll')
+          Copy-Item -LiteralPath $env:WINTUN_LICENSE_PATH -Destination (Join-Path $resourcesDir 'WINTUN-LICENSE.txt')
+
+          $stagedDllSha256 = (Get-FileHash -LiteralPath (Join-Path $resourcesDir 'wintun.dll') -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($stagedDllSha256 -ne $expectedDllSha256) {
+            throw "Staged wintun.dll SHA-256 mismatch: expected $expectedDllSha256, got $stagedDllSha256"
+          }
+          Write-Host "Staged vdpi.exe, SHA-256-verified wintun.dll, and WINTUN-LICENSE.txt into $resourcesDir"
+      - name: Build Tauri Desktop App & NSIS Installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:VDPI_EMBED_WINTUN_DLL) {
+            throw "VDPI_EMBED_WINTUN_DLL must not be set for official Windows desktop builds"
+          }
+          npm --prefix desktop/ui run build
+          if ($LASTEXITCODE -ne 0) {
+            throw "Desktop UI build failed with exit code $LASTEXITCODE"
+          }
+
+          $bundleConfig = Join-Path $env:RUNNER_TEMP 'tauri-windows-resources.json'
+          @{
+            build = @{
+              beforeBuildCommand = ''
+            }
+            bundle = @{
+              resources = @{
+                'resources/vdpi.exe' = 'vdpi.exe'
+                'resources/wintun.dll' = 'wintun.dll'
+                'resources/WINTUN-LICENSE.txt' = 'WINTUN-LICENSE.txt'
+              }
+            }
+          } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $bundleConfig -Encoding utf8NoBOM
+
+          npx --prefix desktop/ui tauri build --config $bundleConfig --target x86_64-pc-windows-msvc --bundles nsis -- --locked
+          if ($LASTEXITCODE -ne 0) {
+            throw "tauri build failed with exit code $LASTEXITCODE"
+          }
+      - name: Package Windows Desktop NSIS Installer & Portable Zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:WINTUN_DLL_PATH -or -not (Test-Path -LiteralPath $env:WINTUN_DLL_PATH)) {
+            throw "WINTUN_DLL_PATH is missing or invalid: '$($env:WINTUN_DLL_PATH)'"
+          }
+          if (-not $env:WINTUN_LICENSE_PATH -or -not (Test-Path -LiteralPath $env:WINTUN_LICENSE_PATH)) {
+            throw "WINTUN_LICENSE_PATH is missing or invalid: '$($env:WINTUN_LICENSE_PATH)'"
+          }
+
+          $desktopBin = 'desktop/src-tauri/target/x86_64-pc-windows-msvc/release/vdpi-desktop.exe'
+          $cliBin = 'target/x86_64-pc-windows-msvc/release/vdpi.exe'
+          $nsisDir = 'desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis'
+
+          if (-not (Test-Path -LiteralPath $desktopBin)) {
+            throw "Missing built desktop binary at $desktopBin"
+          }
+          if (-not (Test-Path -LiteralPath $cliBin)) {
+            throw "Missing built CLI binary at $cliBin"
+          }
+
+          $nsisSetup = Get-ChildItem -LiteralPath $nsisDir -Filter '*-setup.exe' -File | Select-Object -First 1
+          if (-not $nsisSetup) {
+            throw "Missing NSIS setup installer in $nsisDir"
+          }
+
+          $sevenZipCmd = Get-Command 7z -ErrorAction SilentlyContinue
+          $sevenZip = if ($sevenZipCmd) {
+            $sevenZipCmd.Source
+          } elseif (Test-Path -LiteralPath 'C:\Program Files\7-Zip\7z.exe') {
+            'C:\Program Files\7-Zip\7z.exe'
+          } else {
+            $null
+          }
+          if (-not $sevenZip) {
+            throw "7z executable not found on PATH or at C:\Program Files\7-Zip\7z.exe"
+          }
+          $nsisListing = (& $sevenZip l $nsisSetup.FullName 2>&1) | Out-String
+          if ($LASTEXITCODE -ne 0) {
+            throw "7z l failed inspecting $($nsisSetup.FullName) (exit code $LASTEXITCODE):`n$nsisListing"
+          }
+          foreach ($requiredFile in @('vdpi.exe', 'wintun.dll', 'WINTUN-LICENSE.txt')) {
+            $escaped = [regex]::Escape($requiredFile)
+            if ($nsisListing -notmatch "(?m)(?:^|[\s\\/])$escaped\s*`$") {
+              throw "Expected NSIS installer $($nsisSetup.Name) to contain $requiredFile; 7z l output:`n$nsisListing"
+            }
+          }
+          Write-Host "Verified NSIS installer contents via 7z l ($($nsisSetup.Name): vdpi.exe, wintun.dll, WINTUN-LICENSE.txt)"
+
+          Remove-Item -LiteralPath dist/desktop-win, dist/desktop-win-portable -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path dist/desktop-win, dist/desktop-win-portable | Out-Null
+
+          Copy-Item -LiteralPath $nsisSetup.FullName -Destination dist/desktop-win/vdpi-desktop-windows-x86_64-setup.exe
+          Copy-Item -LiteralPath $desktopBin -Destination dist/desktop-win-portable/vdpi-desktop.exe
+          Copy-Item -LiteralPath $cliBin -Destination dist/desktop-win-portable/vdpi.exe
+          Copy-Item -LiteralPath $env:WINTUN_DLL_PATH -Destination dist/desktop-win-portable/wintun.dll
+          Copy-Item -LiteralPath $env:WINTUN_LICENSE_PATH -Destination dist/desktop-win-portable/WINTUN-LICENSE.txt
+
+          Compress-Archive -Path dist/desktop-win-portable/* -DestinationPath dist/desktop-win/vdpi-desktop-windows-x86_64-portable.zip -Force
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path 'dist/desktop-win/vdpi-desktop-windows-x86_64-portable.zip').Path)
+          try {
+            $entries = @($zip.Entries | ForEach-Object { $_.FullName })
+            $expected = @('vdpi-desktop.exe', 'vdpi.exe', 'wintun.dll', 'WINTUN-LICENSE.txt')
+            $diff = @(Compare-Object -ReferenceObject $expected -DifferenceObject $entries -CaseSensitive)
+            if ($entries.Count -ne $expected.Count -or $diff.Count -ne 0) {
+              throw "Expected vdpi-desktop-windows-x86_64-portable.zip to contain $($expected -join ', '), got: $($entries -join ', ')"
+            }
+          } finally {
+            $zip.Dispose()
+          }
+          Write-Host "Verified Windows desktop NSIS setup and portable archive (vdpi-desktop.exe + vdpi.exe + loose wintun.dll + WINTUN-LICENSE.txt)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-desktop-windows
+          path: |
+            dist/desktop-win/vdpi-desktop-windows-x86_64-setup.exe
+            dist/desktop-win/vdpi-desktop-windows-x86_64-portable.zip
+
+  build-desktop-macos:
+    name: Build Desktop GUI (macOS Universal)
+    needs: [test, test-desktop]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/ui/package-lock.json
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            desktop/src-tauri -> desktop/src-tauri/target
+          shared-key: desktop-macos
+      - name: Build & Stage Universal macOS CLI Engine Binary (vdpi)
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target aarch64-apple-darwin --bin vdpi
+          cargo build --locked --release --target x86_64-apple-darwin --bin vdpi
+          rm -rf desktop/src-tauri/resources
+          mkdir -p desktop/src-tauri/resources
+          lipo -create -output desktop/src-tauri/resources/vdpi \
+            target/aarch64-apple-darwin/release/vdpi \
+            target/x86_64-apple-darwin/release/vdpi
+          chmod 755 desktop/src-tauri/resources/vdpi
+          codesign -fs - desktop/src-tauri/resources/vdpi
+          CLI_ARCHS="$(lipo -archs desktop/src-tauri/resources/vdpi)"
+          echo "Staged universal vdpi CLI architectures: $CLI_ARCHS"
+          printf '%s\n' "$CLI_ARCHS" | grep -q "arm64"
+          printf '%s\n' "$CLI_ARCHS" | grep -q "x86_64"
+      - name: Install Desktop UI Dependencies & Verify Pinned Tauri CLI
+        run: |
+          set -euo pipefail
+          npm --prefix desktop/ui ci
+          npx --prefix desktop/ui tauri --version
+      - name: Build Tauri Desktop Universal App & DMG
+        run: |
+          set -euo pipefail
+          npm --prefix desktop/ui run build
+          BUNDLE_CONFIG="${RUNNER_TEMP}/tauri-macos-resources.json"
+          cat > "$BUNDLE_CONFIG" <<'EOF'
+          {
+            "build": {
+              "beforeBuildCommand": ""
+            },
+            "bundle": {
+              "resources": {
+                "resources/vdpi": "vdpi"
+              }
+            }
+          }
+          EOF
+          npx --prefix desktop/ui tauri build \
+            --config "$BUNDLE_CONFIG" \
+            --target universal-apple-darwin \
+            --bundles app,dmg \
+            -- --locked
+      - name: Verify & Package macOS Universal DMG
+        run: |
+          set -euo pipefail
+          BIN_PATH="desktop/src-tauri/target/universal-apple-darwin/release/vdpi-desktop"
+          APP_DIR="desktop/src-tauri/target/universal-apple-darwin/release/bundle/macos/vdpi Desktop.app"
+          APP_BIN="${APP_DIR}/Contents/MacOS/vdpi-desktop"
+          BUNDLED_CLI="${APP_DIR}/Contents/Resources/vdpi"
+
+          test -f "$BIN_PATH"
+          test -f "$APP_BIN"
+          test -x "$BUNDLED_CLI"
+
+          ARCHS="$(lipo -archs "$BIN_PATH")"
+          echo "Universal desktop binary architectures: $ARCHS"
+          printf '%s\n' "$ARCHS" | grep -q "arm64"
+          printf '%s\n' "$ARCHS" | grep -q "x86_64"
+
+          APP_ARCHS="$(lipo -archs "$APP_BIN")"
+          echo "Bundled app vdpi-desktop architectures: $APP_ARCHS"
+          printf '%s\n' "$APP_ARCHS" | grep -q "arm64"
+          printf '%s\n' "$APP_ARCHS" | grep -q "x86_64"
+
+          BUNDLED_CLI_ARCHS="$(lipo -archs "$BUNDLED_CLI")"
+          echo "Bundled app vdpi CLI architectures: $BUNDLED_CLI_ARCHS"
+          printf '%s\n' "$BUNDLED_CLI_ARCHS" | grep -q "arm64"
+          printf '%s\n' "$BUNDLED_CLI_ARCHS" | grep -q "x86_64"
+
+          DMG_FILE="$(find desktop/src-tauri/target/universal-apple-darwin/release/bundle/dmg -maxdepth 1 -type f -name '*.dmg' | head -n 1)"
+          if [ -z "$DMG_FILE" ] || [ ! -s "$DMG_FILE" ]; then
+            echo "ERROR: Missing universal macOS DMG bundle" >&2
+            exit 1
+          fi
+
+          DMG_STAGE=""
+          MOUNT_DIR=""
+          MOUNTED=0
+          cleanup_macos_dmg() {
+            if [ "$MOUNTED" = "1" ] && [ -n "$MOUNT_DIR" ]; then
+              hdiutil detach "$MOUNT_DIR" -force >/dev/null 2>&1 || true
+            fi
+            if [ -n "$MOUNT_DIR" ]; then
+              rm -rf "$MOUNT_DIR"
+            fi
+            if [ -n "$DMG_STAGE" ]; then
+              rm -rf "$DMG_STAGE"
+            fi
+          }
+          trap cleanup_macos_dmg EXIT
+
+          if [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            codesign --force --deep --sign - "$APP_DIR"
+          fi
+          codesign --verify --deep --strict "$APP_DIR"
+
+          if [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            DMG_STAGE="$(mktemp -d "${RUNNER_TEMP}/vdpi-dmg-stage.XXXXXX")"
+            ditto "$APP_DIR" "${DMG_STAGE}/vdpi Desktop.app"
+            ln -s /Applications "${DMG_STAGE}/Applications"
+            hdiutil create -volname "vdpi Desktop" -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG_FILE"
+          fi
+
+          MOUNT_DIR="$(mktemp -d "${RUNNER_TEMP}/vdpi-dmg-mount.XXXXXX")"
+          hdiutil attach "$DMG_FILE" -readonly -nobrowse -mountpoint "$MOUNT_DIR"
+          MOUNTED=1
+
+          DMG_APP="${MOUNT_DIR}/vdpi Desktop.app"
+          DMG_CLI="${DMG_APP}/Contents/Resources/vdpi"
+          test -d "$DMG_APP"
+          test -x "$DMG_CLI"
+          codesign --verify --deep --strict "$DMG_APP"
+
+          DMG_CLI_ARCHS="$(lipo -archs "$DMG_CLI")"
+          echo "DMG-mounted vdpi CLI architectures: $DMG_CLI_ARCHS"
+          printf '%s\n' "$DMG_CLI_ARCHS" | grep -q "arm64"
+          printf '%s\n' "$DMG_CLI_ARCHS" | grep -q "x86_64"
+
+          hdiutil detach "$MOUNT_DIR" -force
+          MOUNTED=0
+
+          mkdir -p dist/desktop-mac
+          cp "$DMG_FILE" dist/desktop-mac/vdpi-desktop-macos-universal.dmg
+          ls -lh dist/desktop-mac/vdpi-desktop-macos-universal.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-desktop-macos
+          path: dist/desktop-mac/vdpi-desktop-macos-universal.dmg
+
+  build-desktop-linux:
+    name: Build Desktop GUI (Linux x86_64)
+    needs: [test, test-desktop]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/ui/package-lock.json
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            desktop/src-tauri -> desktop/src-tauri/target
+          shared-key: desktop-linux
+      - name: Install WebKitGTK & Tauri System Dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            file \
+            pkg-config \
+            libssl-dev \
+            libxdo-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+      - name: Build & Stage Linux CLI Engine Binary (vdpi)
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target x86_64-unknown-linux-gnu --bin vdpi
+          rm -rf desktop/src-tauri/resources
+          mkdir -p desktop/src-tauri/resources
+          cp target/x86_64-unknown-linux-gnu/release/vdpi desktop/src-tauri/resources/vdpi
+          chmod 755 desktop/src-tauri/resources/vdpi
+          test -x desktop/src-tauri/resources/vdpi
+      - name: Install Desktop UI Dependencies & Verify Pinned Tauri CLI
+        run: |
+          set -euo pipefail
+          npm --prefix desktop/ui ci
+          npx --prefix desktop/ui tauri --version
+      - name: Build Tauri Desktop Packages (.deb & .AppImage)
+        env:
+          NO_STRIP: "true"
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          set -euo pipefail
+          npm --prefix desktop/ui run build
+          BUNDLE_CONFIG="${RUNNER_TEMP}/tauri-linux-resources.json"
+          cat > "$BUNDLE_CONFIG" <<'EOF'
+          {
+            "build": {
+              "beforeBuildCommand": ""
+            },
+            "bundle": {
+              "resources": {
+                "resources/vdpi": "vdpi"
+              }
+            }
+          }
+          EOF
+          npx --prefix desktop/ui tauri build \
+            --config "$BUNDLE_CONFIG" \
+            --target x86_64-unknown-linux-gnu \
+            --bundles deb,appimage \
+            -- --locked
+      - name: Verify & Package Linux Desktop Artifacts
+        run: |
+          set -euo pipefail
+          DEB_FILE="$(find desktop/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb -maxdepth 1 -type f -name '*.deb' | head -n 1)"
+          APPIMAGE_FILE="$(find desktop/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage -maxdepth 1 -type f -name '*.AppImage' | head -n 1)"
+          if [ -z "$DEB_FILE" ] || [ ! -s "$DEB_FILE" ]; then
+            echo "ERROR: Missing Linux .deb bundle" >&2
+            exit 1
+          fi
+          if [ -z "$APPIMAGE_FILE" ] || [ ! -s "$APPIMAGE_FILE" ]; then
+            echo "ERROR: Missing Linux .AppImage bundle" >&2
+            exit 1
+          fi
+
+          DEB_CONTENTS="$(dpkg-deb -c "$DEB_FILE")"
+          if ! printf '%s\n' "$DEB_CONTENTS" | grep -E '[[:space:]]\./usr/lib/vdpi Desktop/vdpi$' >/dev/null; then
+            echo "ERROR: Linux .deb bundle is missing exact './usr/lib/vdpi Desktop/vdpi'" >&2
+            printf '%s\n' "$DEB_CONTENTS" >&2
+            exit 1
+          fi
+          echo "Verified exact './usr/lib/vdpi Desktop/vdpi' in $DEB_FILE"
+
+          DEB_DEPENDS="$(dpkg-deb -f "$DEB_FILE" Depends)"
+          echo "Linux .deb Depends: $DEB_DEPENDS"
+          DEB_DEP_PKGS="$(printf '%s\n' "$DEB_DEPENDS" | tr ',|' '\n' | awk '{print $1}')"
+          for dep in libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3-1 xdg-utils; do
+            if ! printf '%s\n' "$DEB_DEP_PKGS" | grep -Fx "$dep" >/dev/null; then
+              echo "ERROR: Linux .deb Depends is missing required package '$dep': $DEB_DEPENDS" >&2
+              exit 1
+            fi
+          done
+          echo "Verified Linux .deb Depends includes libwebkit2gtk-4.1-0, libgtk-3-0, libayatana-appindicator3-1, and xdg-utils"
+
+          DEB_RECOMMENDS="$(dpkg-deb -f "$DEB_FILE" Recommends)"
+          echo "Linux .deb Recommends: $DEB_RECOMMENDS"
+          if ! printf '%s\n' "$DEB_RECOMMENDS" | grep -E '(^|,)[[:space:]]*pkexec([[:space:]]*\([^)]*\))?[[:space:]]*\|[[:space:]]*policykit-1([[:space:]]*\([^)]*\))?[[:space:]]*(,|$)' >/dev/null; then
+            echo "ERROR: Linux .deb Recommends is missing required 'pkexec | policykit-1': $DEB_RECOMMENDS" >&2
+            exit 1
+          fi
+          echo "Verified Linux .deb Recommends includes pkexec | policykit-1"
+
+          APPIMAGE_ABS="$(realpath "$APPIMAGE_FILE")"
+          chmod 755 "$APPIMAGE_ABS"
+          APPIMAGE_INSPECT_DIR="$(mktemp -d "${RUNNER_TEMP}/vdpi-appimage-inspect.XXXXXX")"
+          trap 'rm -rf "$APPIMAGE_INSPECT_DIR"' EXIT
+          (cd "$APPIMAGE_INSPECT_DIR" && "$APPIMAGE_ABS" --appimage-extract >/dev/null)
+          APPIMAGE_CLI="${APPIMAGE_INSPECT_DIR}/squashfs-root/usr/lib/vdpi Desktop/vdpi"
+          if [ ! -x "$APPIMAGE_CLI" ]; then
+            echo "ERROR: Linux .AppImage is missing executable 'squashfs-root/usr/lib/vdpi Desktop/vdpi'" >&2
+            find "${APPIMAGE_INSPECT_DIR}/squashfs-root/usr/lib" -maxdepth 3 2>/dev/null >&2 || true
+            exit 1
+          fi
+          echo "Verified executable 'squashfs-root/usr/lib/vdpi Desktop/vdpi' in $APPIMAGE_FILE"
+
+          mkdir -p dist/desktop-linux
+          cp "$DEB_FILE" dist/desktop-linux/vdpi-desktop-linux-x86_64.deb
+          cp "$APPIMAGE_FILE" dist/desktop-linux/vdpi-desktop-linux-x86_64.AppImage
+          chmod 755 dist/desktop-linux/vdpi-desktop-linux-x86_64.AppImage
+          ls -lh dist/desktop-linux/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-desktop-linux
+          path: |
+            dist/desktop-linux/vdpi-desktop-linux-x86_64.deb
+            dist/desktop-linux/vdpi-desktop-linux-x86_64.AppImage
+
   publish-release:
     name: Publish GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build-windows, build-macos, build-linux, build-android, build-ios]
+    needs:
+      - build-windows
+      - build-macos
+      - build-linux
+      - build-android
+      - build-ios
+      - build-desktop-windows
+      - build-desktop-macos
+      - build-desktop-linux
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -451,6 +1050,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
           git fetch origin "refs/tags/${TAG}:refs/tags/${TAG}" --force
           TAG_TYPE="$(git cat-file -t "refs/tags/${TAG}" 2>/dev/null || true)"
           RAW_TAG_NOTES=""
@@ -474,7 +1074,20 @@ jobs:
           fi
 
           cd release-assets
-          sha256sum vdpi-windows-x86_64.zip vdpi-macos-universal.tar.gz vdpi-linux-x86_64.tar.gz vdpi-linux-arm64.tar.gz vdpi-android-universal.apk vdpi-ios-unsigned.ipa > SHA256SUMS.txt
+          ASSETS=(
+            vdpi-windows-x86_64.zip
+            vdpi-macos-universal.tar.gz
+            vdpi-linux-x86_64.tar.gz
+            vdpi-linux-arm64.tar.gz
+            vdpi-android-universal.apk
+            vdpi-ios-unsigned.ipa
+            vdpi-desktop-windows-x86_64-setup.exe
+            vdpi-desktop-windows-x86_64-portable.zip
+            vdpi-desktop-macos-universal.dmg
+            vdpi-desktop-linux-x86_64.deb
+            vdpi-desktop-linux-x86_64.AppImage
+          )
+          sha256sum "${ASSETS[@]}" > SHA256SUMS.txt
           PRERELEASE_FLAG=""
           if [[ "$TAG" == *-* ]]; then
             PRERELEASE_FLAG="--prerelease"
@@ -485,23 +1098,13 @@ jobs:
               --title "vdpi $TAG" \
               --notes-file ../release-notes.md
             gh release upload "$TAG" --clobber \
-              vdpi-windows-x86_64.zip \
-              vdpi-macos-universal.tar.gz \
-              vdpi-linux-x86_64.tar.gz \
-              vdpi-linux-arm64.tar.gz \
-              vdpi-android-universal.apk \
-              vdpi-ios-unsigned.ipa \
+              "${ASSETS[@]}" \
               SHA256SUMS.txt
           else
             gh release create "$TAG" \
               $PRERELEASE_FLAG \
               --title "vdpi $TAG" \
               --notes-file ../release-notes.md \
-              vdpi-windows-x86_64.zip \
-              vdpi-macos-universal.tar.gz \
-              vdpi-linux-x86_64.tar.gz \
-              vdpi-linux-arm64.tar.gz \
-              vdpi-android-universal.apk \
-              vdpi-ios-unsigned.ipa \
+              "${ASSETS[@]}" \
               SHA256SUMS.txt
           fi

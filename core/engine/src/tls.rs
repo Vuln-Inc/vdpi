@@ -399,29 +399,54 @@ pub fn extract_http_host_splits(buf: &[u8]) -> Option<(String, usize, usize)> {
         .position(|w| w == b"\r\n\r\n")
         .map(|p| p + 4)
         .unwrap_or(buf.len().min(4096));
-    let head = std::str::from_utf8(&buf[..header_end]).ok()?;
+    let head = &buf[..header_end];
 
     let mut offset = 0usize;
-    for line in head.split("\r\n") {
-        if line.len() >= 5 && line.as_bytes()[..5].eq_ignore_ascii_case(b"host:") {
+    while offset < head.len() {
+        let line_end = head[offset..]
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .map(|p| offset + p)
+            .unwrap_or(head.len());
+        let line = &head[offset..line_end];
+
+        if line.len() >= 5 && line[..5].eq_ignore_ascii_case(b"host:") {
             let after_colon = &line[5..];
-            let ws = after_colon.len() - after_colon.trim_start().len();
-            let trimmed = after_colon.trim();
-            let host_only = trimmed
-                .split(':')
-                .next()
-                .unwrap_or(trimmed)
-                .trim()
-                .to_ascii_lowercase();
-            if !host_only.is_empty() {
-                let header_split = (offset + 2).clamp(1, buf.len().saturating_sub(1));
-                let host_start = offset + 5 + ws;
-                let value_split = (host_start + (host_only.len() / 2).max(1))
-                    .clamp(header_split, buf.len().saturating_sub(1));
-                return Some((host_only, header_split, value_split));
+            let ws = after_colon
+                .iter()
+                .take_while(|b| b.is_ascii_whitespace())
+                .count();
+            let trimmed_end = after_colon
+                .iter()
+                .rposition(|b| !b.is_ascii_whitespace())
+                .map(|p| p + 1)
+                .unwrap_or(ws);
+            if let Ok(trimmed) = std::str::from_utf8(&after_colon[ws..trimmed_end]) {
+                let host_slice = if let Some(after_open) = trimmed.strip_prefix('[') {
+                    if let Some(close) = after_open.find(']') {
+                        &trimmed[..close + 2]
+                    } else {
+                        trimmed
+                    }
+                } else {
+                    trimmed.split(':').next().unwrap_or(trimmed).trim()
+                };
+                let host_only = host_slice.to_ascii_lowercase();
+                if !host_only.is_empty() {
+                    let header_split = (offset + 2).clamp(1, buf.len().saturating_sub(1));
+                    let host_start = offset + 5 + ws;
+                    let value_split = (host_start + (host_only.len() / 2).max(1))
+                        .clamp(header_split, buf.len().saturating_sub(1));
+                    return Some((host_only, header_split, value_split));
+                }
             }
         }
-        offset += line.len() + 2;
+
+        offset = if line_end + 2 <= head.len() {
+            line_end + 2
+        } else {
+            head.len()
+        };
     }
     None
 }
@@ -444,8 +469,8 @@ pub fn is_stun_packet(payload: &[u8]) -> bool {
 }
 
 /// Detects whether a UDP datagram carries a QUIC Long Header Initial packet
-/// (RFC 9000 v1, RFC 9369 v2, IETF draft versions, or RFC 9000 greased versions,
-/// including RFC 9287 greased fixed-bit packets).
+/// (RFC 9000 v1, RFC 9369 v2, IETF draft versions, Meta `mvfst` versions, or RFC 9000
+/// greased versions, including RFC 9287 greased fixed-bit packets).
 ///
 /// Rejects RFC 5389 STUN packets, QUIC Short-Header 1-RTT packets, Version Negotiation,
 /// and non-Initial Long-Header packet types (0-RTT, Handshake, Retry).
@@ -467,6 +492,8 @@ pub fn is_quic_long_header_initial(payload: &[u8]) -> bool {
         0x6b33_43cf => packet_type == 0x01,
         // QUIC v1 (RFC 9000) and IETF QUIC drafts: Initial packet type is 0b00.
         0x0000_0001 | 0xff00_0001..=0xff00_00ff => packet_type == 0x00,
+        // Meta mvfst versions (0xface_b000..=0xface_b0ff): Initial packet type is 0b00.
+        v if (v & 0xffff_ff00) == 0xface_b000 => packet_type == 0x00,
         // RFC 9000 greased versions (0x?a?a?a?a): Initial packet type is 0b00.
         v if (v & 0x0f0f_0f0f) == 0x0a0a_0a0a => packet_type == 0x00,
         _ => false,
@@ -603,6 +630,31 @@ mod tests {
         assert_eq!(host, "www.roblox.com");
         assert!(!req[..split_at].windows(14).any(|w| w == b"www.roblox.com"));
         assert!(!req[split_at..].windows(14).any(|w| w == b"www.roblox.com"));
+
+        // Non-UTF-8 bytes in unrelated headers must not prevent Host extraction.
+        let non_utf8_req =
+            b"GET / HTTP/1.1\r\nX-Legacy: \xff\xfe\x80\r\nHost: Example.COM:8080\r\n\r\n";
+        let (host2, hdr_split2, val_split2) =
+            extract_http_host_splits(non_utf8_req).expect("should extract Host past non-UTF8");
+        assert_eq!(host2, "example.com");
+        assert!(hdr_split2 < val_split2);
+        assert!(!non_utf8_req[..val_split2]
+            .windows(11)
+            .any(|w| w.eq_ignore_ascii_case(b"example.com")));
+
+        // IPv6 literals must preserve `[...]` brackets instead of splitting at the first `:`.
+        let v6_with_port = b"GET / HTTP/1.1\r\nHost: [2001:DB8::1]:8080\r\n\r\n";
+        let (v6_host, _, v6_split) =
+            extract_http_host_splits(v6_with_port).expect("should extract IPv6 Host with port");
+        assert_eq!(v6_host, "[2001:db8::1]");
+        assert!(!v6_with_port[..v6_split]
+            .windows(13)
+            .any(|w| w.eq_ignore_ascii_case(b"[2001:db8::1]")));
+
+        let v6_no_port = b"GET / HTTP/1.1\r\nHost: [::1]\r\n\r\n";
+        let (v6_loop, _, _) =
+            extract_http_host_splits(v6_no_port).expect("should extract IPv6 Host without port");
+        assert_eq!(v6_loop, "[::1]");
     }
 
     #[test]
@@ -699,11 +751,25 @@ mod tests {
         assert!(is_quic_long_header_initial(&v2_initial));
         assert!(is_quic_long_header_initial(&v2_greased));
 
-        // QUIC IETF draft-29 and greased version Initial packets
+        // QUIC IETF draft-29, Meta mvfst, and greased version Initial packets
         let draft_initial = build_quic_long_header(0xc0, 0xff00_001d, &dcid, &[], 64);
         let greased_ver_initial = build_quic_long_header(0xc0, 0x1a2a_3a4a, &dcid, &[], 64);
         assert!(is_quic_long_header_initial(&draft_initial));
         assert!(is_quic_long_header_initial(&greased_ver_initial));
+        for mvfst_ver in [
+            0xface_b001u32,
+            0xface_b002,
+            0xface_b003,
+            0xface_b00e,
+            0xface_b013,
+        ] {
+            let mvfst_init = build_quic_long_header(0xc0, mvfst_ver, &dcid, &scid, 64);
+            let mvfst_hs = build_quic_long_header(0xe0, mvfst_ver, &dcid, &scid, 64);
+            assert!(is_quic_long_header_initial(&mvfst_init));
+            assert!(!is_quic_long_header_initial(&mvfst_hs));
+        }
+        let non_mvfst = build_quic_long_header(0xc0, 0xface_b100, &dcid, &scid, 64);
+        assert!(!is_quic_long_header_initial(&non_mvfst));
 
         // Non-Initial QUIC Long Header packet types must be rejected
         let v1_zero_rtt = build_quic_long_header(0xd0, 0x0000_0001, &dcid, &scid, 64);

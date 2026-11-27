@@ -14,6 +14,9 @@ use super::{AppCategory, DiscoveredApp};
 /// (depth 2 finds both `/Applications/Foo.app` and `/Applications/Utilities/Bar.app`).
 const APP_SCAN_MAX_DEPTH: usize = 2;
 
+/// Magic header prefix for Apple binary property list (`Info.plist`) files.
+const BINARY_PLIST_MAGIC: &[u8] = b"bplist00";
+
 /// Path prefixes belonging to macOS system daemons and frameworks rather than
 /// user-facing applications. (`/System/Applications/` is deliberately excluded
 /// so built-in apps like Safari and Mail remain discoverable.)
@@ -127,17 +130,19 @@ pub(super) fn discover_platform_apps() -> Vec<DiscoveredApp> {
     apps
 }
 
-/// Resolves the owning process command name for `(local_port, is_udp)` using
-/// `/usr/sbin/lsof -nP -F c -iTCP:<port>` (or `-iUDP:<port>`).
+/// Resolves the owning process command name for `(local_ip, local_port, is_udp)`
+/// using `/usr/sbin/lsof -nP +c 0 -F cn -iTCP:<port>` (or `-iUDP:<port>`),
+/// verifying that the local endpoint (never the remote endpoint) matches
+/// `local_port` and normalizing browser/Electron helper process names back to
+/// their parent app.
 ///
 /// Returns `None` if `local_port == 0`, `/usr/sbin/lsof` is unavailable, `lsof`
-/// exits with a non-zero status, or no non-`vdpi` command entry is reported.
+/// exits with a non-zero status, or no non-`vdpi` matching local socket is reported.
 pub(super) fn lookup_local_port_process(
     local_ip: IpAddr,
     local_port: u16,
     is_udp: bool,
 ) -> Option<String> {
-    let _ = local_ip;
     if local_port == 0 {
         return None;
     }
@@ -149,7 +154,7 @@ pub(super) fn lookup_local_port_process(
     };
 
     let output = Command::new("/usr/sbin/lsof")
-        .args(["-nP", "-F", "c", &filter])
+        .args(["-nP", "+c", "0", "-F", "cn", &filter])
         .output()
         .ok()?;
 
@@ -158,7 +163,7 @@ pub(super) fn lookup_local_port_process(
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_lsof_command_output(&stdout)
+    parse_lsof_output(&stdout, local_ip, local_port)
 }
 
 fn default_application_dirs() -> Vec<PathBuf> {
@@ -228,9 +233,7 @@ fn inspect_app_bundle(bundle_path: &Path) -> Option<DiscoveredApp> {
 
     let contents_dir = bundle_path.join("Contents");
     let plist_path = contents_dir.join("Info.plist");
-    let exe_from_plist = fs::read_to_string(&plist_path)
-        .ok()
-        .and_then(|xml| parse_info_plist_executable(&xml));
+    let exe_from_plist = read_info_plist_executable(&plist_path);
 
     let exe_name = exe_from_plist
         .or_else(|| find_first_executable_in_macos_dir(&contents_dir.join("MacOS")))
@@ -278,12 +281,50 @@ fn find_first_executable_in_macos_dir(macos_dir: &Path) -> Option<String> {
     candidates.into_iter().next()
 }
 
+fn is_binary_plist(bytes: &[u8]) -> bool {
+    bytes.starts_with(BINARY_PLIST_MAGIC)
+}
+
+/// Reads `CFBundleExecutable` from a bundle's `Info.plist`.
+///
+/// For binary plists starting with `b"bplist00"`, invokes `/usr/bin/plutil`
+/// (`-extract CFBundleExecutable raw -o - <plist_path>`); for XML plists,
+/// parses `<key>CFBundleExecutable</key><string>...</string>` directly.
+fn read_info_plist_executable(plist_path: &Path) -> Option<String> {
+    let bytes = fs::read(plist_path).ok()?;
+    if is_binary_plist(&bytes) {
+        return extract_binary_plist_executable(plist_path);
+    }
+
+    let xml = String::from_utf8(bytes).ok()?;
+    parse_info_plist_executable(&xml)
+}
+
+fn extract_binary_plist_executable(plist_path: &Path) -> Option<String> {
+    let output = Command::new("/usr/bin/plutil")
+        .args(["-extract", "CFBundleExecutable", "raw", "-o", "-"])
+        .arg(plist_path)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    sanitize_executable_name(&stdout)
+}
+
 /// Extracts `<key>CFBundleExecutable</key><string>...</string>` from an XML
 /// `Info.plist` document.
 ///
 /// Returns `None` for binary plists, malformed XML, missing keys, non-string
 /// values, or empty executable names.
 fn parse_info_plist_executable(plist_xml: &str) -> Option<String> {
+    if is_binary_plist(plist_xml.as_bytes()) {
+        return None;
+    }
+
     let mut cursor = plist_xml;
 
     while let Some(key_start) = cursor.find("<key>") {
@@ -334,7 +375,7 @@ fn unescape_xml_entities(raw: &str) -> String {
 
 fn sanitize_executable_name(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || trimmed.contains(['\n', '\r', '\0']) {
         return None;
     }
     let base = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed).trim();
@@ -439,22 +480,166 @@ fn extract_app_bundle_stem_from_path(path: &str) -> Option<String> {
     }
 }
 
-/// Parses the stdout of `/usr/sbin/lsof -nP -F c -iTCP:<port>` (or `-iUDP:<port>`)
-/// and returns the first non-empty, non-`vdpi` `c<command>` field with `\xHH`
-/// escapes decoded.
-fn parse_lsof_command_output(stdout: &str) -> Option<String> {
+/// Maps macOS browser and Electron helper process names (including 15-character
+/// kernel `p_comm` truncated `lsof` command names) back to their parent
+/// application name so split-tunnel rules targeting the user-facing app match
+/// network-owning helpers.
+fn normalize_macos_helper_process(cmd: &str) -> String {
+    let raw_lower = cmd.to_ascii_lowercase();
+    let trimmed = cmd.trim();
+    let lower = trimmed.to_ascii_lowercase();
+
+    if lower == "com.apple.webkit.networking"
+        || lower.starts_with("com.apple.webkit.")
+        || lower == "com.apple.webki"
+        || lower == "safari web content"
+        || lower.starts_with("safari web cont")
+        || lower == "safaribookmarkssyncagent"
+    {
+        return "Safari".to_string();
+    }
+
+    if lower == "google chrome h" || lower.starts_with("google chrome helper") {
+        return "Google Chrome".to_string();
+    }
+
+    if lower == "brave browser h" || lower.starts_with("brave browser helper") {
+        return "Brave Browser".to_string();
+    }
+
+    // "Microsoft Edge Helper" truncates to 15-char kernel p_comm "Microsoft Edge "
+    // (which trims to "Microsoft Edge"); also match 16-char and full helper names.
+    if raw_lower == "microsoft edge "
+        || lower == "microsoft edge"
+        || lower == "microsoft edge h"
+        || lower.starts_with("microsoft edge helper")
+    {
+        return "Microsoft Edge".to_string();
+    }
+
+    if lower == "firefoxcp"
+        || lower.starts_with("firefoxcp ")
+        || lower == "plugin-container"
+        || lower == "plugin-containe"
+    {
+        return "Firefox".to_string();
+    }
+
+    if lower == "discord ptb hel" || lower.starts_with("discord ptb helper") {
+        return "Discord PTB".to_string();
+    }
+
+    // "Discord Canary Helper" truncates to 15-char kernel p_comm "Discord Canary "
+    // (which trims to "Discord Canary"); also match 16-char and full helper names.
+    if raw_lower == "discord canary "
+        || lower == "discord canary"
+        || lower == "discord canary h"
+        || lower.starts_with("discord canary helper")
+    {
+        return "Discord Canary".to_string();
+    }
+
+    // Generic Electron / Chromium helper suffix (e.g. "Discord Helper",
+    // "Discord Helper (Renderer)", "Slack Helper (GPU)", "Spotify Helper").
+    if let Some(idx) = lower.find(" helper") {
+        let after = &lower[idx + " helper".len()..];
+        if after.is_empty() || after.starts_with(" (") || after.starts_with(' ') {
+            let parent = trimmed[..idx].trim();
+            if !parent.is_empty() {
+                return parent.to_string();
+            }
+        }
+    }
+
+    trimmed.to_string()
+}
+
+/// Extracts `(optional_local_ip, local_port)` from an `lsof -F n` network name
+/// field (`local->remote` or `local`), strictly ignoring any remote endpoint.
+///
+/// Returns `Ok` (`Some((None, port))`) for wildcard binds (`*:port`) and
+/// `Some((Some(ip), port))` for concrete IPv4/IPv6 binds.
+fn parse_lsof_local_endpoint(name_field: &str) -> Option<(Option<IpAddr>, u16)> {
+    let local_with_state = name_field.split("->").next().unwrap_or(name_field).trim();
+    let local_part = local_with_state.split_whitespace().next()?;
+    let (host_raw, port_raw) = local_part.rsplit_once(':')?;
+    let port = port_raw.parse::<u16>().ok()?;
+    let host = host_raw.trim();
+
+    if host == "*" {
+        return Some((None, port));
+    }
+
+    let unwrapped = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    let without_zone = unwrapped.split('%').next().unwrap_or(unwrapped);
+    let ip: IpAddr = without_zone.parse().ok()?;
+    Some((Some(ip.to_canonical()), port))
+}
+
+/// Parses the stdout of `/usr/sbin/lsof -nP +c 0 -F cn -iTCP:<port>` (or `-iUDP:<port>`)
+/// and returns the normalized owning application name for the first entry whose
+/// **local** endpoint matches `(local_ip, local_port)`, preferring an exact IP
+/// match over a wildcard (`*` / `0.0.0.0` / `::`) bind and ignoring sockets that
+/// only match `local_port` on their remote endpoint.
+fn parse_lsof_output(stdout: &str, local_ip: IpAddr, local_port: u16) -> Option<String> {
+    let target_ip = local_ip.to_canonical();
+    let mut current_cmd: Option<String> = None;
+    let mut wildcard_match: Option<String> = None;
+
     for line in stdout.lines() {
-        let Some(raw_cmd) = line.strip_prefix('c') else {
-            continue;
-        };
-        let decoded = unescape_lsof_command(raw_cmd);
-        let cmd = decoded.trim();
-        if cmd.is_empty() || is_self_binary(cmd) {
+        if line.starts_with('p') {
+            current_cmd = None;
             continue;
         }
-        return Some(cmd.to_string());
+        if let Some(raw_cmd) = line.strip_prefix('c') {
+            let decoded = unescape_lsof_command(raw_cmd);
+            let cmd = decoded.trim();
+            if cmd.is_empty() || is_self_binary(cmd) {
+                current_cmd = None;
+            } else {
+                current_cmd = Some(normalize_macos_helper_process(cmd));
+            }
+            continue;
+        }
+        if let Some(raw_name) = line.strip_prefix('n') {
+            let Some(ref cmd) = current_cmd else {
+                continue;
+            };
+            let Some((ep_ip, ep_port)) = parse_lsof_local_endpoint(raw_name) else {
+                continue;
+            };
+            if ep_port != local_port {
+                continue;
+            }
+            if target_ip.is_unspecified() {
+                return Some(cmd.clone());
+            }
+            match ep_ip {
+                Some(ip) if ip == target_ip => return Some(cmd.clone()),
+                None => {
+                    if wildcard_match.is_none() {
+                        wildcard_match = Some(cmd.clone());
+                    }
+                }
+                Some(IpAddr::V4(v4)) if v4.is_unspecified() && target_ip.is_ipv4() => {
+                    if wildcard_match.is_none() {
+                        wildcard_match = Some(cmd.clone());
+                    }
+                }
+                Some(IpAddr::V6(v6)) if v6.is_unspecified() => {
+                    if wildcard_match.is_none() {
+                        wildcard_match = Some(cmd.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
     }
-    None
+
+    wildcard_match
 }
 
 fn hex_nibble(byte: u8) -> Option<u8> {
@@ -565,33 +750,225 @@ mod tests {
     }
 
     #[test]
-    fn parses_lsof_command_output_basic_and_hex_escaped() {
-        let sample = "p12345\ncDiscord\nf14\n";
+    fn parses_lsof_output_local_only_hex_escaped_and_maps_helpers() {
+        let lan_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42));
+        let sample = "p12345\ncDiscord\nf14\nn192.168.1.42:54321->162.159.135.232:443\n";
         assert_eq!(
-            parse_lsof_command_output(sample).as_deref(),
+            parse_lsof_output(sample, lan_ip, 54321).as_deref(),
             Some("Discord")
         );
 
-        let escaped = "p22222\ncGoogle\\x20Chrome\n";
+        let escaped = "p22222\ncGoogle\\x20Chrome\nf15\nn192.168.1.42:54321->142.250.185.78:443\n";
         assert_eq!(
-            parse_lsof_command_output(escaped).as_deref(),
+            parse_lsof_output(escaped, lan_ip, 54321).as_deref(),
             Some("Google Chrome")
+        );
+
+        // Remote port matching local_port must NOT match; only the local endpoint port matches.
+        let remote_only = "\
+p111
+cWrongRemoteApp
+f10
+n192.168.1.42:60000->1.1.1.1:54321
+p222
+cGoogle\\x20Chrome\\x20H
+f11
+n192.168.1.42:54321->142.250.185.78:443
+";
+        assert_eq!(
+            parse_lsof_output(remote_only, lan_ip, 54321).as_deref(),
+            Some("Google Chrome")
+        );
+        assert_eq!(
+            parse_lsof_output(
+                "p111\ncWrongRemoteApp\nf10\nn192.168.1.42:60000->1.1.1.1:54321\n",
+                lan_ip,
+                54321
+            ),
+            None
+        );
+
+        // Wildcard bind fallback (`*:port`) matches when exact IP is not present.
+        let wildcard = "p333\ncDiscord\\x20Helper\nf12\nn*:54321\n";
+        assert_eq!(
+            parse_lsof_output(wildcard, lan_ip, 54321).as_deref(),
+            Some("Discord")
         );
     }
 
     #[test]
-    fn lsof_parser_skips_vdpi_self_and_handles_empty_or_malformed() {
-        let with_self = "p100\ncvdpi\np200\ncRobloxPlayer\n";
+    fn maps_macos_browser_and_electron_helpers_to_parent_apps() {
+        for (helper, expected) in [
+            ("Discord Helper", "Discord"),
+            ("Discord Helper (Renderer)", "Discord"),
+            ("Discord Helper (GPU)", "Discord"),
+            ("Google Chrome H", "Google Chrome"),
+            ("Google Chrome Helper (Renderer)", "Google Chrome"),
+            ("Brave Browser H", "Brave Browser"),
+            ("Brave Browser Helper", "Brave Browser"),
+            ("Brave Browser Helper (Renderer)", "Brave Browser"),
+            ("Microsoft Edge ", "Microsoft Edge"),
+            ("microsoft edge ", "Microsoft Edge"),
+            ("Microsoft Edge H", "Microsoft Edge"),
+            ("Microsoft Edge Helper", "Microsoft Edge"),
+            ("Microsoft Edge Helper (Renderer)", "Microsoft Edge"),
+            ("Discord PTB Hel", "Discord PTB"),
+            ("Discord PTB Helper", "Discord PTB"),
+            ("Discord PTB Helper (Renderer)", "Discord PTB"),
+            ("Discord Canary ", "Discord Canary"),
+            ("discord canary ", "Discord Canary"),
+            ("Discord Canary H", "Discord Canary"),
+            ("Discord Canary Helper", "Discord Canary"),
+            ("Discord Canary Helper (GPU)", "Discord Canary"),
+            ("Safari Web Content", "Safari"),
+            ("Safari Web Cont", "Safari"),
+            ("com.apple.WebKit.Networking", "Safari"),
+            ("com.apple.WebKi", "Safari"),
+            ("FirefoxCP", "Firefox"),
+            ("FirefoxCP Web Content", "Firefox"),
+            ("plugin-container", "Firefox"),
+            ("plugin-containe", "Firefox"),
+            ("Slack Helper (Network)", "Slack"),
+            ("Spotify Helper", "Spotify"),
+            ("RobloxPlayer", "RobloxPlayer"),
+        ] {
+            assert_eq!(
+                normalize_macos_helper_process(helper),
+                expected,
+                "expected helper '{helper}' to map to '{expected}'"
+            );
+        }
+    }
+
+    #[test]
+    fn normalizes_full_and_15_char_p_comm_truncated_helpers_and_lsof_output() {
+        let truncated_15_cases = [
+            ("Google Chrome Helper (Renderer)", "Google Chrome H", "Google Chrome"),
+            ("Brave Browser Helper (Renderer)", "Brave Browser H", "Brave Browser"),
+            ("Microsoft Edge Helper (Renderer)", "Microsoft Edge ", "Microsoft Edge"),
+            ("Discord PTB Helper (Renderer)", "Discord PTB Hel", "Discord PTB"),
+            ("Discord Canary Helper (Renderer)", "Discord Canary ", "Discord Canary"),
+            ("Safari Web Content", "Safari Web Cont", "Safari"),
+            ("com.apple.WebKit.Networking", "com.apple.WebKi", "Safari"),
+            ("FirefoxCP Web Content", "FirefoxCP Web C", "Firefox"),
+            ("plugin-container", "plugin-containe", "Firefox"),
+            ("Discord Helper (Renderer)", "Discord Helper ", "Discord"),
+            ("Slack Helper (Network)", "Slack Helper (N", "Slack"),
+        ];
+
+        for (full, truncated_15, expected) in truncated_15_cases {
+            assert_eq!(
+                truncated_15.len(),
+                15,
+                "kernel p_comm test input '{truncated_15}' must be 15 bytes"
+            );
+            assert_eq!(
+                &full[..15], truncated_15,
+                "'{truncated_15}' must be the 15-byte prefix of '{full}'"
+            );
+            assert_eq!(
+                normalize_macos_helper_process(full),
+                expected,
+                "full helper '{full}' should normalize to '{expected}'"
+            );
+            assert_eq!(
+                normalize_macos_helper_process(truncated_15),
+                expected,
+                "15-char truncated helper '{truncated_15}' should normalize to '{expected}'"
+            );
+        }
+
+        // Verify lowercase 15-char trailing-space prefixes normalize to canonical app names.
+        assert_eq!(normalize_macos_helper_process("microsoft edge "), "Microsoft Edge");
+        assert_eq!(normalize_macos_helper_process("discord canary "), "Discord Canary");
+
+        // Verify lsof +c 0 hex-escaped outputs for both 15-char p_comm and full helper names.
+        let lan_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42));
+        for (lsof_cmd, expected) in [
+            ("Microsoft\\x20Edge\\x20", "Microsoft Edge"),
+            ("Microsoft\\x20Edge\\x20Helper\\x20(Renderer)", "Microsoft Edge"),
+            ("Discord\\x20Canary\\x20", "Discord Canary"),
+            ("Discord\\x20Canary\\x20Helper\\x20(GPU)", "Discord Canary"),
+            ("Discord\\x20PTB\\x20Hel", "Discord PTB"),
+            ("Brave\\x20Browser\\x20H", "Brave Browser"),
+        ] {
+            let sample = format!(
+                "p500\nc{lsof_cmd}\nf10\nn192.168.1.42:54321->1.1.1.1:443\n"
+            );
+            assert_eq!(
+                parse_lsof_output(&sample, lan_ip, 54321).as_deref(),
+                Some(expected),
+                "expected lsof command '{lsof_cmd}' to resolve to '{expected}'"
+            );
+        }
+    }
+
+    #[test]
+    fn binary_plist_detected_and_falls_back_to_macos_dir_when_plutil_unavailable_or_invalid() {
+        assert!(is_binary_plist(b"bplist00\x00\x01payload"));
+        assert!(!is_binary_plist(b"<?xml version=\"1.0\"?>"));
         assert_eq!(
-            parse_lsof_command_output(with_self).as_deref(),
+            parse_info_plist_executable(
+                "bplist00<key>CFBundleExecutable</key><string>Ignored</string>"
+            ),
+            None
+        );
+
+        let root = make_temp_dir("bplist-fallback");
+        let app_contents = root.join("BinaryPlistApp.app").join("Contents");
+        let macos_dir = app_contents.join("MacOS");
+        fs::create_dir_all(&macos_dir).expect("create mock bplist bundle");
+        fs::write(app_contents.join("Info.plist"), b"bplist00\x00\x01corrupt")
+            .expect("write corrupt binary plist");
+
+        let bin_path = macos_dir.join("RealBinary");
+        fs::write(&bin_path, b"#!/bin/sh\n").expect("write mock executable");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&bin_path, fs::Permissions::from_mode(0o755))
+                .expect("chmod mock executable");
+        }
+
+        let app = inspect_app_bundle(&root.join("BinaryPlistApp.app"))
+            .expect("inspect bundle with binary plist fallback");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(app.display_name, "BinaryPlistApp");
+        assert_eq!(app.exe_name, "RealBinary");
+    }
+
+    #[test]
+    fn lsof_parser_skips_vdpi_self_and_handles_empty_or_malformed() {
+        let lan_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42));
+        let with_self = "\
+p100
+cvdpi
+f10
+n192.168.1.42:54321->1.1.1.1:443
+p200
+cRobloxPlayer
+f11
+n192.168.1.42:54321->128.116.1.1:443
+";
+        assert_eq!(
+            parse_lsof_output(with_self, lan_ip, 54321).as_deref(),
             Some("RobloxPlayer")
         );
 
-        assert_eq!(parse_lsof_command_output("p100\ncvdpi\n"), None);
-        assert_eq!(parse_lsof_command_output(""), None);
-        assert_eq!(parse_lsof_command_output("p100\nf4\n"), None);
         assert_eq!(
-            parse_lsof_command_output("p99\ncApp\\xZZName\n").as_deref(),
+            parse_lsof_output("p100\ncvdpi\nf10\nn192.168.1.42:54321->1.1.1.1:443\n", lan_ip, 54321),
+            None
+        );
+        assert_eq!(parse_lsof_output("", lan_ip, 54321), None);
+        assert_eq!(parse_lsof_output("p100\nf4\n", lan_ip, 54321), None);
+        assert_eq!(
+            parse_lsof_output(
+                "p99\ncApp\\xZZName\nf8\nn192.168.1.42:54321->1.1.1.1:443\n",
+                lan_ip,
+                54321
+            )
+            .as_deref(),
             Some("App\\xZZName")
         );
     }

@@ -1,6 +1,6 @@
 use crate::{
-    clear_engine_cache, engine_version, run_doctor_json, snapshot_json, start_tunnel, stop_tunnel,
-    AndroidConfig,
+    clear_engine_cache, engine_version, notify_route_change, run_doctor_json, snapshot_json,
+    start_tunnel, stop_tunnel, AndroidConfig,
 };
 use jni::objects::{JClass, JString};
 use jni::sys::{jint, jstring};
@@ -132,6 +132,14 @@ pub extern "system" fn Java_com_vulninc_vdpi_engine_NativeEngine_nativeClearCach
     _class: JClass,
 ) {
     let _ = catch_unwind(AssertUnwindSafe(clear_engine_cache));
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_vulninc_vdpi_engine_NativeEngine_nativeNotifyRouteChange(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(notify_route_change));
 }
 
 #[no_mangle]

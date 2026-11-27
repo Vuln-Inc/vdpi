@@ -2,24 +2,27 @@
 //! for per-application split tunneling.
 //!
 //! - **Running processes**: `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)` +
-//!   `Process32FirstW`/`Process32NextW`, enriched with full image paths via
-//!   `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` + `QueryFullProcessImageNameW`.
+//!   `Process32FirstW`/`Process32NextW`, enriched solely from known catalog and
+//!   Windows Registry / well-known install metadata (zero `OpenProcess` calls).
 //! - **Installed apps**: Windows Registry `Uninstall` hives (HKLM 64-bit, HKLM
 //!   WOW6432Node, HKCU) plus well-known `%LOCALAPPDATA%` / `%APPDATA%` /
-//!   `%ProgramFiles%` installation layouts (Discord, Roblox, Telegram, Spotify,
+//!   `%ProgramFiles%` / `%ProgramData%\Riot Games\RiotClientInstalls.json`
+//!   installation layouts (Discord, Roblox, Riot Games, Telegram, Spotify,
 //!   browsers, game launchers, etc.).
 //! - **Socket-to-process lookup**: `GetExtendedTcpTable` (`TCP_TABLE_OWNER_PID_ALL`)
 //!   and `GetExtendedUdpTable` (`UDP_TABLE_OWNER_PID`) for both `AF_INET` and
 //!   `AF_INET6`, with bounded `ERROR_INSUFFICIENT_BUFFER` retries and zero handle leaks.
 
 use super::{AppCategory, DiscoveredApp};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS,
-    ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE, NO_ERROR,
+    CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS,
+    HANDLE, INVALID_HANDLE_VALUE, NO_ERROR,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
@@ -33,9 +36,6 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER,
     HKEY_LOCAL_MACHINE, KEY_READ, REG_DWORD, REG_EXPAND_SZ, REG_SZ, REG_VALUE_TYPE,
-};
-use windows_sys::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 /// Maximum retries when `GetExtendedTcpTable`/`GetExtendedUdpTable` grows between
@@ -51,42 +51,92 @@ const MAX_UNINSTALL_SUBKEYS: u32 = 4096;
 /// Upper bound on versioned subdirectories scanned for `%LOCALAPPDATA%` apps.
 const MAX_VERSION_SUBDIRS: usize = 64;
 
-/// Windows OS internals, background hosts, and vdpi binaries excluded from app discovery.
+/// Time-to-live for the cached `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)` PID map
+/// used by `pid_to_exe_name` to resolve socket owners without opening process handles.
+const PID_SNAPSHOT_TTL: Duration = Duration::from_millis(300);
+
+/// Windows OS internals, background hosts, CLI tools, peripheral helpers,
+/// game overlays, and vdpi binaries excluded from app discovery.
 const NOISE_PROCESSES: &[&str] = &[
+    "aggregatorhost.exe",
+    "amdfendrsr.exe",
+    "amdppkgsvc.exe",
+    "appactions.exe",
     "applicationframehost.exe",
     "audiodg.exe",
     "backgroundtaskhost.exe",
+    "bash.exe",
+    "cc_engine_x64.exe",
+    "cefsharp.browsersubprocess.exe",
+    "chxsmartscreen.exe",
+    "cmd.exe",
     "compattelrunner.exe",
     "conhost.exe",
     "consent.exe",
     "crashpad_handler.exe",
+    "crossdeviceresume.exe",
+    "crossdeviceservice.exe",
+    "cscript.exe",
     "csrss.exe",
     "ctfmon.exe",
+    "cut.exe",
+    "cygpath.exe",
     "dashost.exe",
+    "discord_clips.exe",
+    "discordsystemhelper.exe",
     "dllhost.exe",
     "dwm.exe",
+    "epicwebhelper.exe",
     "explorer.exe",
     "fontdrvhost.exe",
     "gamebar.exe",
     "gamebarftserver.exe",
     "gamebarpresencewriter.exe",
+    "gameinputrawinputproxy.exe",
+    "gameinputredistservice.exe",
+    "gameoverlayui.exe",
+    "gamingservices.exe",
+    "gamingservicesnet.exe",
+    "git-credential-manager.exe",
+    "git.exe",
     "googleupdate.exe",
+    "hapticservice.exe",
     "idle",
+    "instupd.exe",
+    "ledkeeper2.exe",
     "lockapp.exe",
     "logonui.exe",
     "lsaiso.exe",
     "lsass.exe",
     "memory compression",
     "microsoftedgeupdate.exe",
+    "microsoftstartfeedprovider.exe",
+    "mintty.exe",
+    "mktemp.exe",
     "mpdefendercoreservice.exe",
     "msedgewebview2.exe",
+    "msi.centralserver.exe",
+    "msi.terminalserver.exe",
     "msiexec.exe",
     "msmpeng.exe",
     "musnotifyicon.exe",
+    "nativedialog.exe",
     "nissrv.exe",
+    "npfinstall.exe",
+    "nvcontainer.exe",
+    "nvdisplay.container.exe",
+    "nvsphelper64.exe",
+    "nvtelemetrycontainer.exe",
+    "oalinst.exe",
     "openconsole.exe",
     "phoneexperiencehost.exe",
+    "powershell.exe",
+    "pwsh.exe",
+    "qtwebengineprocess.exe",
     "registry",
+    "regsvr32.exe",
+    "rtlupd64.exe",
+    "rundll32.exe",
     "runtimebroker.exe",
     "searchapp.exe",
     "searchfilterhost.exe",
@@ -96,8 +146,11 @@ const NOISE_PROCESSES: &[&str] = &[
     "secure system",
     "securityhealthservice.exe",
     "securityhealthsystray.exe",
+    "sed.exe",
+    "sentry-crash.exe",
     "services.exe",
     "sgrmbroker.exe",
+    "sh.exe",
     "shellexperiencehost.exe",
     "sihclient.exe",
     "sihost.exe",
@@ -105,53 +158,98 @@ const NOISE_PROCESSES: &[&str] = &[
     "smss.exe",
     "spoolsv.exe",
     "sppsvc.exe",
+    "ssh-agent.exe",
     "startmenuexperiencehost.exe",
+    "steamwebhelper.exe",
     "svchost.exe",
     "system",
     "system idle process",
+    "tail.exe",
     "taskhostw.exe",
     "textinputhost.exe",
     "tiworker.exe",
     "trustedinstaller.exe",
     "uhssvc.exe",
+    "unrealcefsubprocess.exe",
+    "useroobebroker.exe",
     "usocoreworker.exe",
+    "vctip.exe",
     "vdpi-service.exe",
     "vdpi.exe",
+    "vmware-authd.exe",
+    "vmware-usbarbitrator64.exe",
     "vssvc.exe",
     "waasmedicagent.exe",
+    "wc.exe",
     "werfault.exe",
     "wermgr.exe",
+    "widgetboard.exe",
     "widgets.exe",
     "widgetservice.exe",
     "wininit.exe",
     "winlogon.exe",
     "wmiprvse.exe",
+    "wscript.exe",
+    "wstoastnotification.exe",
     "wuauclt.exe",
     "wudfhost.exe",
 ];
 
-/// Anti-cheat service executables that we avoid opening process handles against
-/// during passive app discovery.
+/// Anti-cheat and anti-cheat-protected executables that must never be probed
+/// with `OpenProcess` (maintained as a defense-in-depth denylist alongside
+/// Toolhelp32-only process discovery and PID resolution).
 const ANTICHEAT_PROCESSES: &[&str] = &[
     "bedaisy.exe",
     "beservice.exe",
+    "eaanticheat.gameservice.exe",
+    "eaanticheat.gameservicelauncher.exe",
     "easyanticheat.exe",
     "easyanticheat_eos.exe",
+    "faceitclient.exe",
+    "faceitservice.exe",
+    "league of legends.exe",
+    "riotclientservices.exe",
+    "robloxplayerbeta.exe",
+    "valorant-win64-shipping.exe",
+    "valorant.exe",
     "vgc.exe",
     "vgtray.exe",
 ];
 
-/// Generic installer/uninstaller/updater executables ignored when parsing Registry
-/// `Uninstall` entries.
+/// Background/kernel anti-cheat service executables hidden from selectable
+/// `[running]` discovery clutter (still resolved safely if configured manually).
+const ANTICHEAT_SERVICE_PROCESSES: &[&str] = &[
+    "bedaisy.exe",
+    "beservice.exe",
+    "eaanticheat.gameservice.exe",
+    "eaanticheat.gameservicelauncher.exe",
+    "easyanticheat.exe",
+    "easyanticheat_eos.exe",
+    "faceitservice.exe",
+    "vgc.exe",
+    "vgtray.exe",
+];
+
+/// Generic installer/uninstaller/updater/helper executables ignored when parsing
+/// Registry `Uninstall` entries or discovering running apps.
 const INSTALLER_EXES: &[&str] = &[
     "crashhandler.exe",
     "crashpad_handler.exe",
+    "crashreportclient.exe",
     "elevate.exe",
+    "elevatedinstaller.exe",
+    "errorreport.exe",
+    "ffmpeg.exe",
     "helper.exe",
     "install.exe",
     "installer.exe",
+    "instupd.exe",
     "maintenancetool.exe",
     "msiexec.exe",
+    "nativedialog.exe",
+    "npfinstall.exe",
+    "oalinst.exe",
+    "rtlupd64.exe",
     "setup.exe",
     "squirrel.exe",
     "unins000.exe",
@@ -175,6 +273,7 @@ const NOISE_DISPLAY_NAME_TOKENS: &[&str] = &[
     "security update for ",
     "update for ",
     "windows app runtime",
+    "windows desktop runtime",
     "windows sdk",
     "windows software development kit",
 ];
@@ -200,7 +299,7 @@ impl Drop for HandleGuard {
     fn drop(&mut self) {
         if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
             // SAFETY: `self.0` is a valid, owned Win32 handle obtained from
-            // `CreateToolhelp32Snapshot` or `OpenProcess` and closed exactly once here.
+            // `CreateToolhelp32Snapshot` and closed exactly once here.
             unsafe {
                 let _ = CloseHandle(self.0);
             }
@@ -251,33 +350,73 @@ fn decode_wide_nul(buf: &[u16]) -> String {
     String::from_utf16_lossy(&buf[..len])
 }
 
+/// Unicode-aware lowercase helper folding Turkish `İ` (`i\u{0307}` -> `i`) and
+/// dotless `ı` (`\u{0131}` -> `i`) for reliable Windows install stem matching.
+fn fold_unicode_lower(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.to_lowercase().chars() {
+        match ch {
+            '\u{0307}' => {}
+            '\u{0131}' => out.push('i'),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Real user applications whose executable names contain generic clutter tokens
+/// (such as `service`) and must remain allowlisted before pattern-based filtering.
+const CLUTTER_EXEMPT_EXES: &[&str] = &["riotclientservices.exe"];
+
+/// Returns `true` for noisy background services, updaters, crash handlers,
+/// peripheral helpers, and Python installer binaries excluded from both
+/// `[running]` and `[installed]` discovery lists.
+fn is_clutter_exe_pattern(lower: &str) -> bool {
+    if CLUTTER_EXEMPT_EXES
+        .iter()
+        .any(|exempt| lower.eq_ignore_ascii_case(exempt))
+        || super::is_popular_app(lower)
+    {
+        return false;
+    }
+    let stem = lower.strip_suffix(".exe").unwrap_or(lower);
+    if stem.is_empty() {
+        return true;
+    }
+    stem.contains("crashhandler")
+        || stem.contains("crashpad")
+        || stem.contains("crashreport")
+        || stem.ends_with("-crash")
+        || stem.ends_with("_crash")
+        || stem.contains("updater")
+        || stem.ends_with("update")
+        || stem.ends_with("autoupdate")
+        || stem.contains("service")
+        || stem.contains("svc")
+        || stem.starts_with("rz")
+        || stem.starts_with("lghub_")
+        || stem.starts_with("python-3.")
+        || stem.starts_with("python-2.")
+}
+
 fn is_noise_process_name(exe_name: &str) -> bool {
     let lower = exe_name.trim().to_ascii_lowercase();
-    if lower.is_empty()
-        || lower.starts_with('[')
-        || lower.ends_with(']')
-        || matches!(
-            lower.as_str(),
-            "aggregatorhost.exe"
-                | "gamingservices.exe"
-                | "gamingservicesnet.exe"
-                | "gameinputrawinputproxy.exe"
-                | "gameinputredistservice.exe"
-                | "crossdeviceservice.exe"
-                | "amdfendrsr.exe"
-                | "amdppkgsvc.exe"
-                | "hapticservice.exe"
-                | "discordsystemhelper.exe"
-        )
-    {
+    if lower.is_empty() || lower.starts_with('[') || lower.ends_with(']') {
         return true;
     }
     NOISE_PROCESSES.contains(&lower.as_str())
+        || INSTALLER_EXES.contains(&lower.as_str())
+        || is_clutter_exe_pattern(&lower)
 }
 
 fn is_anticheat_process_name(exe_name: &str) -> bool {
     let lower = exe_name.trim().to_ascii_lowercase();
     ANTICHEAT_PROCESSES.contains(&lower.as_str())
+}
+
+fn is_anticheat_service_process_name(exe_name: &str) -> bool {
+    let lower = exe_name.trim().to_ascii_lowercase();
+    ANTICHEAT_SERVICE_PROCESSES.contains(&lower.as_str())
 }
 
 fn is_windows_system_path(path: &str) -> bool {
@@ -303,15 +442,44 @@ fn is_windows_system_path(path: &str) -> bool {
         .any(|sub| normalized.starts_with(&format!("{windir}{sub}")))
 }
 
+/// Checks via filesystem metadata alone (zero `OpenProcess` calls) whether
+/// `exe_name` matches a built-in Windows System32/SysWOW64 binary.
+fn is_windows_system_binary(exe_name: &str) -> bool {
+    let trimmed = exe_name.trim();
+    if trimmed.is_empty()
+        || trimmed.contains(['\\', '/'])
+        || super::is_popular_app(trimmed)
+        || is_anticheat_process_name(trimmed)
+    {
+        return false;
+    }
+    let windir = std::env::var_os("WINDIR")
+        .or_else(|| std::env::var_os("SystemRoot"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    windir.join("System32").join(trimmed).is_file()
+        || windir.join("SysWOW64").join(trimmed).is_file()
+}
+
 fn is_installer_or_noise_exe(exe_name: &str) -> bool {
     let lower = exe_name.trim().to_ascii_lowercase();
     if lower.is_empty() || !lower.ends_with(".exe") {
         return true;
     }
-    if NOISE_PROCESSES.contains(&lower.as_str()) || INSTALLER_EXES.contains(&lower.as_str()) {
+    if NOISE_PROCESSES.contains(&lower.as_str())
+        || INSTALLER_EXES.contains(&lower.as_str())
+        || ANTICHEAT_SERVICE_PROCESSES.contains(&lower.as_str())
+        || is_clutter_exe_pattern(&lower)
+    {
         return true;
     }
-    lower.starts_with("unins") || lower.contains("uninstall")
+    let stem = &lower[..lower.len() - 4];
+    stem.starts_with("unins")
+        || stem.starts_with("dpinst")
+        || stem.contains("uninstall")
+        || stem.contains("installer")
+        || stem.contains("setup")
+        || stem.contains("runtime")
 }
 
 fn is_noise_display_name(display_name: &str) -> bool {
@@ -334,45 +502,23 @@ fn default_display_name(exe_name: &str) -> String {
     }
 }
 
-fn query_process_image_path(pid: u32) -> Option<String> {
-    if pid == 0 {
-        return None;
+fn default_display_name_with_path(exe_name: &str, path: Option<&str>) -> String {
+    if exe_name.trim().eq_ignore_ascii_case("opera.exe")
+        && path.is_some_and(|p| p.to_ascii_lowercase().contains("opera gx"))
+    {
+        return "Opera GX".to_string();
     }
-    // SAFETY: `OpenProcess` with `PROCESS_QUERY_LIMITED_INFORMATION` is read-only
-    // metadata access; returned handle is immediately wrapped in `HandleGuard`.
-    let guard =
-        HandleGuard::new(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) })?;
-
-    for &capacity in &[1024usize, 4096usize, 32768usize] {
-        let mut buf = vec![0u16; capacity];
-        let mut len = buf.len() as u32;
-        // SAFETY: `guard.raw()` is a valid process handle, `buf` is writable for `len`
-        // `u16` elements, and `len` is initialized to the buffer capacity in characters.
-        let ok = unsafe {
-            QueryFullProcessImageNameW(guard.raw(), PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len)
-        };
-        if ok != 0 {
-            let actual = (len as usize).min(buf.len());
-            let path = String::from_utf16_lossy(&buf[..actual]);
-            let trimmed = path.trim();
-            return if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            };
-        }
-        // SAFETY: `GetLastError` reads the calling thread's last Win32 error code.
-        if unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
-            break;
-        }
-    }
-    None
+    default_display_name(exe_name)
 }
 
-fn toolhelp_exe_name_for_pid(target_pid: u32) -> Option<String> {
-    if target_pid == 0 {
-        return None;
-    }
+struct PidSnapshotCache {
+    map: HashMap<u32, String>,
+    captured_at: Instant,
+}
+
+static PID_SNAPSHOT_CACHE: OnceLock<Mutex<Option<PidSnapshotCache>>> = OnceLock::new();
+
+fn capture_toolhelp_pid_map() -> Option<HashMap<u32, String>> {
     // SAFETY: `CreateToolhelp32Snapshot` returns a snapshot handle or `INVALID_HANDLE_VALUE`,
     // wrapped in `HandleGuard` so it is always closed.
     let snapshot = HandleGuard::new(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) })?;
@@ -386,44 +532,66 @@ fn toolhelp_exe_name_for_pid(target_pid: u32) -> Option<String> {
         return None;
     }
 
+    let mut map = HashMap::with_capacity(256);
     loop {
-        if entry.th32ProcessID == target_pid {
+        if entry.th32ProcessID != 0 {
             let name = decode_wide_nul(&entry.szExeFile);
             let trimmed = name.trim();
-            return if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            };
+            if !trimmed.is_empty() {
+                map.insert(entry.th32ProcessID, trimmed.to_string());
+            }
         }
         // SAFETY: `snapshot.raw()` is valid and `entry` remains initialized.
         if unsafe { Process32NextW(snapshot.raw(), &mut entry) } == 0 {
             break;
         }
     }
-    None
+    Some(map)
 }
 
 /// Resolves a Windows process ID to its executable filename (e.g. `"Discord.exe"`).
+///
+/// Uses a short-TTL (300ms) `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)` PID map
+/// and refreshes the snapshot on cache miss or expiry. Never calls `OpenProcess`
+/// on any PID — if a PID is absent from a fresh snapshot (e.g. already exited or
+/// kernel-hidden anti-cheat process), returns `None`.
 fn pid_to_exe_name(pid: u32) -> Option<String> {
     if pid == 0 {
         return None;
     }
-    if let Some(full_path) = query_process_image_path(pid) {
-        if let Some(file_name) = Path::new(&full_path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(str::trim)
-            .filter(|n| !n.is_empty())
-        {
-            return Some(file_name.to_string());
+
+    let cache = PID_SNAPSHOT_CACHE.get_or_init(|| Mutex::new(None));
+    {
+        let now = Instant::now();
+        let guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(ref cached) = *guard {
+            if now.saturating_duration_since(cached.captured_at) < PID_SNAPSHOT_TTL {
+                if let Some(name) = cached.map.get(&pid) {
+                    return Some(name.clone());
+                }
+            }
         }
     }
-    // Fallback for elevated/protected processes where `OpenProcess` returns ACCESS_DENIED.
-    toolhelp_exe_name_for_pid(pid)
+
+    let fresh = capture_toolhelp_pid_map()?;
+    let found = fresh.get(&pid).cloned();
+    {
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(PidSnapshotCache {
+            map: fresh,
+            captured_at: Instant::now(),
+        });
+    }
+    found
 }
 
-fn discover_running_processes() -> Vec<DiscoveredApp> {
+fn discover_running_processes(
+    static_metadata: &HashMap<String, (String, Option<String>)>,
+) -> Vec<DiscoveredApp> {
     // SAFETY: `CreateToolhelp32Snapshot` returns a snapshot handle wrapped in `HandleGuard`.
     let Some(snapshot) =
         HandleGuard::new(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) })
@@ -440,17 +608,18 @@ fn discover_running_processes() -> Vec<DiscoveredApp> {
         return Vec::new();
     }
 
-    // Deduplicate by lowercase exe name first so multi-process apps (Chrome, Discord,
-    // Electron) only trigger a single `QueryFullProcessImageNameW` call.
-    let mut by_exe: HashMap<String, (String, u32)> = HashMap::new();
+    // Deduplicate by lowercase exe name strictly from Toolhelp32 `szExeFile`
+    // (never calling `OpenProcess` on running processes).
+    let mut by_exe: HashMap<String, String> = HashMap::new();
     loop {
         let exe_name = decode_wide_nul(&entry.szExeFile);
         let trimmed = exe_name.trim();
-        if !trimmed.is_empty() && !is_noise_process_name(trimmed) {
+        if !trimmed.is_empty()
+            && !is_noise_process_name(trimmed)
+            && !is_anticheat_service_process_name(trimmed)
+        {
             let key = trimmed.to_ascii_lowercase();
-            by_exe
-                .entry(key)
-                .or_insert_with(|| (trimmed.to_string(), entry.th32ProcessID));
+            by_exe.entry(key).or_insert_with(|| trimmed.to_string());
         }
 
         // SAFETY: `snapshot.raw()` is valid and `entry` remains initialized.
@@ -460,20 +629,34 @@ fn discover_running_processes() -> Vec<DiscoveredApp> {
     }
 
     let mut apps = Vec::with_capacity(by_exe.len());
-    for (exe_name, pid) in by_exe.into_values() {
-        let path = if is_anticheat_process_name(&exe_name) {
-            None
-        } else {
-            query_process_image_path(pid)
-        };
-
-        if let Some(ref full_path) = path {
-            if is_windows_system_path(full_path) && !super::is_popular_app(&exe_name) {
-                continue;
-            }
+    for (key, exe_name) in by_exe {
+        if is_windows_system_binary(&exe_name) {
+            continue;
         }
 
-        let display_name = default_display_name(&exe_name);
+        let (display_name, path) =
+            if let Some((meta_display, meta_path)) = static_metadata.get(&key) {
+                let resolved_display = if super::is_popular_app(&exe_name) {
+                    if exe_name.eq_ignore_ascii_case("opera.exe")
+                        && (meta_display.to_ascii_lowercase().contains("opera gx")
+                            || meta_path
+                                .as_deref()
+                                .is_some_and(|p| p.to_ascii_lowercase().contains("opera gx")))
+                    {
+                        meta_display.clone()
+                    } else {
+                        default_display_name_with_path(&exe_name, meta_path.as_deref())
+                    }
+                } else if !meta_display.trim().is_empty() {
+                    meta_display.clone()
+                } else {
+                    default_display_name_with_path(&exe_name, meta_path.as_deref())
+                };
+                (resolved_display, meta_path.clone())
+            } else {
+                (default_display_name(&exe_name), None)
+            };
+
         apps.push(DiscoveredApp {
             display_name,
             exe_name,
@@ -642,7 +825,8 @@ fn find_exe_in_install_location(install_dir: &str, display_name: &str) -> Option
     }
 
     let entries = std::fs::read_dir(dir).ok()?;
-    let display_lower = display_name.trim().to_ascii_lowercase();
+    let display_lower = fold_unicode_lower(display_name.trim());
+    let is_roblox_studio = display_lower.contains("roblox studio");
     let mut candidates: Vec<(String, String)> = Vec::new();
 
     for entry in entries.take(64).flatten() {
@@ -656,8 +840,11 @@ fn find_exe_in_install_location(install_dir: &str, display_name: &str) -> Option
         if is_installer_or_noise_exe(name) {
             continue;
         }
-        let stem = name[..name.len() - 4].to_ascii_lowercase();
+        let stem = fold_unicode_lower(&name[..name.len() - 4]);
         let full = path.to_string_lossy().into_owned();
+        if is_roblox_studio && name.eq_ignore_ascii_case("RobloxStudioBeta.exe") {
+            return Some((name.to_string(), full));
+        }
         if !stem.is_empty()
             && (display_lower == stem
                 || display_lower.contains(&stem)
@@ -666,6 +853,10 @@ fn find_exe_in_install_location(install_dir: &str, display_name: &str) -> Option
             return Some((name.to_string(), full));
         }
         candidates.push((name.to_string(), full));
+    }
+
+    if is_roblox_studio {
+        return None;
     }
 
     if candidates.len() == 1 {
@@ -748,6 +939,15 @@ fn discover_registry_uninstall_apps() -> Vec<DiscoveredApp> {
 
             let Some((exe_name, exe_path)) = resolved else {
                 continue;
+            };
+
+            let display_name = if exe_name.eq_ignore_ascii_case("opera.exe")
+                && (display_name.to_ascii_lowercase().contains("opera gx")
+                    || exe_path.to_ascii_lowercase().contains("opera gx"))
+            {
+                "Opera GX".to_string()
+            } else {
+                display_name
             };
 
             let category = if super::is_popular_app(&exe_name) {
@@ -839,6 +1039,12 @@ fn discover_well_known_apps() -> Vec<DiscoveredApp> {
                 "DiscordCanary.exe",
             ),
             ("Roblox", r"Roblox\Versions", "", "RobloxPlayerBeta.exe"),
+            (
+                "Roblox Studio",
+                r"Roblox\Versions",
+                "",
+                "RobloxStudioBeta.exe",
+            ),
             ("Slack", "slack", "app-", "slack.exe"),
         ] {
             if let Some(path) = find_latest_versioned_exe(&local.join(folder), prefix, exe) {
@@ -848,6 +1054,7 @@ fn discover_well_known_apps() -> Vec<DiscoveredApp> {
 
         // Direct `%LOCALAPPDATA%` user-scope installs.
         for (display, rel, exe) in [
+            ("Bloxstrap", r"Bloxstrap\Bloxstrap.exe", "Bloxstrap.exe"),
             (
                 "Visual Studio Code",
                 r"Programs\Microsoft VS Code\Code.exe",
@@ -863,8 +1070,6 @@ fn discover_well_known_apps() -> Vec<DiscoveredApp> {
                 r"BraveSoftware\Brave-Browser\Application\brave.exe",
                 "brave.exe",
             ),
-            ("Opera", r"Programs\Opera\opera.exe", "opera.exe"),
-            ("Opera GX", r"Programs\Opera GX\opera.exe", "opera.exe"),
             ("Vivaldi", r"Vivaldi\Application\vivaldi.exe", "vivaldi.exe"),
             (
                 "Signal",
@@ -878,6 +1083,23 @@ fn discover_well_known_apps() -> Vec<DiscoveredApp> {
             ),
         ] {
             probe_well_known_app(&mut apps, display, exe, local.join(rel));
+        }
+
+        // Opera and Opera GX share the `opera.exe` binary name on Windows; label
+        // distinctly so Opera GX is never silently collapsed under plain "Opera".
+        let opera_path = local.join(r"Programs\Opera\opera.exe");
+        let opera_gx_path = local.join(r"Programs\Opera GX\opera.exe");
+        match (opera_path.is_file(), opera_gx_path.is_file()) {
+            (true, true) => {
+                probe_well_known_app(&mut apps, "Opera / Opera GX", "opera.exe", opera_path);
+            }
+            (true, false) => {
+                probe_well_known_app(&mut apps, "Opera", "opera.exe", opera_path);
+            }
+            (false, true) => {
+                probe_well_known_app(&mut apps, "Opera GX", "opera.exe", opera_gx_path);
+            }
+            (false, false) => {}
         }
     }
 
@@ -971,22 +1193,331 @@ fn discover_well_known_apps() -> Vec<DiscoveredApp> {
         }
     }
 
-    probe_well_known_app(
-        &mut apps,
-        "Riot Client",
-        "RiotClientServices.exe",
-        PathBuf::from(r"C:\Riot Games\Riot Client\RiotClientServices.exe"),
-    );
+    apps.extend(discover_riot_apps());
 
     apps
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RiotInstallLocations {
+    riot_client_exes: Vec<PathBuf>,
+    game_roots: Vec<PathBuf>,
+}
+
+fn normalize_windows_json_path(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim().trim_matches('"').trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized = trimmed.replace('/', "\\");
+    let stripped = if normalized.len() > 3 {
+        normalized.trim_end_matches('\\')
+    } else {
+        normalized.as_str()
+    };
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(stripped))
+    }
+}
+
+fn push_unique_path(list: &mut Vec<PathBuf>, seen: &mut HashSet<String>, path: PathBuf) {
+    let key = path.to_string_lossy().to_ascii_lowercase();
+    if seen.insert(key) {
+        list.push(path);
+    }
+}
+
+/// Parses Riot's `RiotClientInstalls.json` manifest (usually under
+/// `%ProgramData%\Riot Games\RiotClientInstalls.json`) to locate Riot Client,
+/// Valorant, and League of Legends installations on any drive (`C:\`, `D:\`, `E:\`, ...).
+fn parse_riot_client_installs_json(json_str: &str) -> RiotInstallLocations {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) else {
+        return RiotInstallLocations::default();
+    };
+    let Some(obj) = value.as_object() else {
+        return RiotInstallLocations::default();
+    };
+
+    let mut out = RiotInstallLocations::default();
+    let mut seen_clients: HashSet<String> = HashSet::new();
+    let mut seen_games: HashSet<String> = HashSet::new();
+
+    for key in ["rc_live", "rc_default", "rc_beta"] {
+        if let Some(raw) = obj.get(key).and_then(|v| v.as_str()) {
+            if let Some(path) = normalize_windows_json_path(raw) {
+                push_unique_path(&mut out.riot_client_exes, &mut seen_clients, path);
+            }
+        }
+    }
+
+    if let Some(patchlines) = obj.get("patchlines").and_then(|v| v.as_object()) {
+        for val in patchlines.values() {
+            if let Some(raw) = val.as_str() {
+                if let Some(path) = normalize_windows_json_path(raw) {
+                    push_unique_path(&mut out.riot_client_exes, &mut seen_clients, path);
+                }
+            }
+        }
+    }
+
+    if let Some(associated) = obj.get("associated_client").and_then(|v| v.as_object()) {
+        for (game_root_raw, rc_exe_raw) in associated {
+            if let Some(game_root) = normalize_windows_json_path(game_root_raw) {
+                push_unique_path(&mut out.game_roots, &mut seen_games, game_root);
+            }
+            if let Some(rc_path) = rc_exe_raw.as_str().and_then(normalize_windows_json_path) {
+                push_unique_path(&mut out.riot_client_exes, &mut seen_clients, rc_path);
+            }
+        }
+    }
+
+    out
+}
+
+fn probe_first_existing_app(
+    apps: &mut Vec<DiscoveredApp>,
+    display_name: &str,
+    exe_name: &str,
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> bool {
+    for candidate in candidates {
+        if candidate.is_file() {
+            probe_well_known_app(apps, display_name, exe_name, candidate);
+            return true;
+        }
+    }
+    false
+}
+
+fn discover_riot_apps_from_locations(
+    locations: &RiotInstallLocations,
+    include_default_fallback: bool,
+) -> Vec<DiscoveredApp> {
+    let mut apps = Vec::new();
+    let mut found_riot_client = false;
+    let mut found_valorant = false;
+    let mut found_league = false;
+
+    if probe_first_existing_app(
+        &mut apps,
+        "Riot Client",
+        "RiotClientServices.exe",
+        locations.riot_client_exes.iter().cloned(),
+    ) {
+        found_riot_client = true;
+    }
+
+    for root in &locations.game_roots {
+        if !found_valorant {
+            let valorant_candidates = [
+                root.join(r"ShooterGame\Binaries\Win64\VALORANT-Win64-Shipping.exe"),
+                root.join(r"live\ShooterGame\Binaries\Win64\VALORANT-Win64-Shipping.exe"),
+            ];
+            if probe_first_existing_app(
+                &mut apps,
+                "Valorant",
+                "VALORANT-Win64-Shipping.exe",
+                valorant_candidates,
+            ) {
+                found_valorant = true;
+            }
+        }
+
+        if !found_league {
+            let league_client = root.join("LeagueClient.exe");
+            if league_client.is_file() {
+                probe_well_known_app(
+                    &mut apps,
+                    "League of Legends",
+                    "LeagueClient.exe",
+                    league_client,
+                );
+                found_league = true;
+            } else {
+                let league_game = root.join(r"Game\League of Legends.exe");
+                if league_game.is_file() {
+                    probe_well_known_app(
+                        &mut apps,
+                        "League of Legends",
+                        "League of Legends.exe",
+                        league_game,
+                    );
+                    found_league = true;
+                }
+            }
+        }
+    }
+
+    for rc_exe in &locations.riot_client_exes {
+        let Some(riot_games_dir) = rc_exe.parent().and_then(|p| p.parent()) else {
+            continue;
+        };
+        if !found_valorant {
+            let valorant = riot_games_dir
+                .join(r"VALORANT\live\ShooterGame\Binaries\Win64\VALORANT-Win64-Shipping.exe");
+            if valorant.is_file() {
+                probe_well_known_app(
+                    &mut apps,
+                    "Valorant",
+                    "VALORANT-Win64-Shipping.exe",
+                    valorant,
+                );
+                found_valorant = true;
+            }
+        }
+        if !found_league {
+            let league = riot_games_dir.join(r"League of Legends\LeagueClient.exe");
+            if league.is_file() {
+                probe_well_known_app(&mut apps, "League of Legends", "LeagueClient.exe", league);
+                found_league = true;
+            }
+        }
+    }
+
+    if include_default_fallback {
+        if !found_riot_client {
+            probe_well_known_app(
+                &mut apps,
+                "Riot Client",
+                "RiotClientServices.exe",
+                PathBuf::from(r"C:\Riot Games\Riot Client\RiotClientServices.exe"),
+            );
+        }
+        if !found_valorant {
+            probe_well_known_app(
+                &mut apps,
+                "Valorant",
+                "VALORANT-Win64-Shipping.exe",
+                PathBuf::from(
+                    r"C:\Riot Games\VALORANT\live\ShooterGame\Binaries\Win64\VALORANT-Win64-Shipping.exe",
+                ),
+            );
+        }
+        if !found_league {
+            probe_well_known_app(
+                &mut apps,
+                "League of Legends",
+                "LeagueClient.exe",
+                PathBuf::from(r"C:\Riot Games\League of Legends\LeagueClient.exe"),
+            );
+        }
+    }
+
+    apps
+}
+
+fn discover_riot_apps() -> Vec<DiscoveredApp> {
+    let program_data = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    let manifest_path = program_data.join(r"Riot Games\RiotClientInstalls.json");
+    let locations = std::fs::metadata(&manifest_path)
+        .ok()
+        .filter(|m| m.is_file() && m.len() <= 1_048_576)
+        .and_then(|_| std::fs::read_to_string(&manifest_path).ok())
+        .map(|raw| parse_riot_client_installs_json(&raw))
+        .unwrap_or_default();
+    discover_riot_apps_from_locations(&locations, true)
+}
+
+fn canonical_riot_companion_target(exe_name: &str) -> Option<(&'static str, &'static str)> {
+    match exe_name.trim().to_ascii_lowercase().as_str() {
+        "riotclientservices.exe" | "riotclientux.exe" | "riotclientuxrender.exe" => {
+            Some(("Riot Client", "RiotClientServices.exe"))
+        }
+        "valorant-win64-shipping.exe" | "valorant.exe" => {
+            Some(("Valorant", "VALORANT-Win64-Shipping.exe"))
+        }
+        "leagueclient.exe"
+        | "leagueclientux.exe"
+        | "leagueclientuxrender.exe"
+        | "league of legends.exe" => Some(("League of Legends", "LeagueClient.exe")),
+        _ => None,
+    }
+}
+
+/// Collapses Riot Client (`RiotClientServices` / `RiotClientUx`), Valorant
+/// (`VALORANT-Win64-Shipping` / `VALORANT`), and League of Legends
+/// (`LeagueClient` / `LeagueClientUx` / `League of Legends`) companion processes
+/// into a single canonical row while preserving `is_running` state and the primary
+/// executable path (runtime split tunneling already expands companion binaries via
+/// `companion_executables_for`).
+fn deduplicate_riot_companion_apps(apps: Vec<DiscoveredApp>) -> Vec<DiscoveredApp> {
+    let mut out: Vec<DiscoveredApp> = Vec::with_capacity(apps.len());
+    let mut canonical_indices: HashMap<&'static str, usize> = HashMap::new();
+
+    for mut app in apps {
+        let Some((canonical_display, canonical_exe)) =
+            canonical_riot_companion_target(&app.exe_name)
+        else {
+            out.push(app);
+            continue;
+        };
+
+        let is_primary_exe = app.exe_name.trim().eq_ignore_ascii_case(canonical_exe);
+        let incoming_path = if is_primary_exe {
+            app.path.take().filter(|p| !p.trim().is_empty())
+        } else {
+            None
+        };
+
+        if let Some(&idx) = canonical_indices.get(canonical_exe) {
+            let existing = &mut out[idx];
+            existing.is_running |= app.is_running;
+            if existing.is_running {
+                existing.category = AppCategory::Running;
+            } else if app.category < existing.category {
+                existing.category = app.category;
+            }
+            if existing.path.is_none() && incoming_path.is_some() {
+                existing.path = incoming_path;
+            }
+        } else {
+            let category = if app.is_running {
+                AppCategory::Running
+            } else {
+                AppCategory::Popular
+            };
+            let idx = out.len();
+            canonical_indices.insert(canonical_exe, idx);
+            out.push(DiscoveredApp {
+                display_name: canonical_display.to_string(),
+                exe_name: canonical_exe.to_string(),
+                path: incoming_path,
+                is_running: app.is_running,
+                category,
+            });
+        }
+    }
+
+    out
+}
+
 /// Discovers running user applications and installed desktop applications on Windows.
 pub(super) fn discover_platform_apps() -> Vec<DiscoveredApp> {
-    let mut apps = discover_running_processes();
-    apps.extend(discover_registry_uninstall_apps());
-    apps.extend(discover_well_known_apps());
-    apps
+    let registry_apps = discover_registry_uninstall_apps();
+    let well_known_apps = discover_well_known_apps();
+
+    // Build static exe -> (display_name, path) metadata from registry & well-known
+    // installs so running processes resolve display names and paths strictly from
+    // Toolhelp32 `szExeFile` + static metadata without ever calling `OpenProcess`.
+    let mut static_metadata: HashMap<String, (String, Option<String>)> = HashMap::new();
+    for app in well_known_apps.iter().chain(registry_apps.iter()) {
+        let key = app.exe_name.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            continue;
+        }
+        static_metadata
+            .entry(key)
+            .or_insert_with(|| (app.display_name.clone(), app.path.clone()));
+    }
+
+    let mut apps = discover_running_processes(&static_metadata);
+    apps.extend(registry_apps);
+    apps.extend(well_known_apps);
+    deduplicate_riot_companion_apps(apps)
 }
 
 /// Fetches a variable-length IP Helper table (`GetExtendedTcpTable` or
@@ -1396,5 +1927,565 @@ mod tests {
                 "expected '{real_app}' to be kept"
             );
         }
+    }
+
+    #[test]
+    fn installer_noise_and_anticheat_filters_match_expected_binaries() {
+        for noise in [
+            "MyAppInstaller.exe",
+            "vcredist_setup_x64.exe",
+            "dpinst64.exe",
+            "DotNetRuntimeHelper.exe",
+            "ffmpeg.exe",
+            "errorreport.exe",
+            "unins000.exe",
+        ] {
+            assert!(
+                is_installer_or_noise_exe(noise),
+                "expected '{noise}' to be filtered as installer/noise"
+            );
+        }
+
+        for keep in [
+            "Discord.exe",
+            "Bloxstrap.exe",
+            "VALORANT-Win64-Shipping.exe",
+            "opera.exe",
+        ] {
+            assert!(
+                !is_installer_or_noise_exe(keep),
+                "expected '{keep}' to pass installer/noise filter"
+            );
+        }
+
+        assert!(is_noise_display_name(
+            "Microsoft Windows Desktop Runtime - 8.0.10 (x64)"
+        ));
+
+        for ac in [
+            "vgc.exe",
+            "vgtray.exe",
+            "bedaisy.exe",
+            "beservice.exe",
+            "faceitclient.exe",
+            "faceitservice.exe",
+            "eaanticheat.gameservice.exe",
+            "eaanticheat.gameservicelauncher.exe",
+            "easyanticheat.exe",
+            "easyanticheat_eos.exe",
+            "VALORANT-Win64-Shipping.exe",
+            "VALORANT.exe",
+            "RiotClientServices.exe",
+            "League of Legends.exe",
+            "RobloxPlayerBeta.exe",
+        ] {
+            assert!(
+                is_anticheat_process_name(ac),
+                "expected '{ac}' in ANTICHEAT_PROCESSES"
+            );
+        }
+
+        assert!(is_anticheat_service_process_name("vgc.exe"));
+        assert!(is_anticheat_service_process_name("bedaisy.exe"));
+        assert!(is_anticheat_service_process_name(
+            "eaanticheat.gameservicelauncher.exe"
+        ));
+        assert!(!is_anticheat_service_process_name(
+            "VALORANT-Win64-Shipping.exe"
+        ));
+        assert!(!is_anticheat_service_process_name("RobloxPlayerBeta.exe"));
+
+        assert_eq!(
+            default_display_name_with_path(
+                "opera.exe",
+                Some(r"C:\Users\alice\AppData\Local\Programs\Opera GX\opera.exe"),
+            ),
+            "Opera GX"
+        );
+        assert_eq!(
+            default_display_name_with_path(
+                "opera.exe",
+                Some(r"C:\Users\alice\AppData\Local\Programs\Opera\opera.exe"),
+            ),
+            "Opera"
+        );
+    }
+
+    #[test]
+    fn clutter_filters_block_noisy_services_updaters_cli_and_roblox_nativedialog() {
+        for clutter in [
+            "crashhandler.exe",
+            "crashhandler64.exe",
+            "DiscordCrashHandler.exe",
+            "updater.exe",
+            "SteamUpdater.exe",
+            "opera_autoupdate.exe",
+            "foo_service.exe",
+            "RazerAppEngine_service.exe",
+            "RzSynapse.exe",
+            "RzChromaStreamServer.exe",
+            "nvcontainer.exe",
+            "NVDisplay.Container.exe",
+            "lghub_agent.exe",
+            "lghub_updater.exe",
+            "lghub_system_tray.exe",
+            "bash.exe",
+            "sh.exe",
+            "wc.exe",
+            "git.exe",
+            "npfinstall.exe",
+            "oalinst.exe",
+            "instupd.exe",
+            "rtlupd64.exe",
+            "python-3.12.4-amd64.exe",
+            "python-3.14.0.exe",
+            "NativeDialog.exe",
+        ] {
+            assert!(
+                is_noise_process_name(clutter),
+                "expected '{clutter}' to be filtered from [running]"
+            );
+            assert!(
+                is_installer_or_noise_exe(clutter),
+                "expected '{clutter}' to be filtered from [installed]"
+            );
+        }
+
+        for keep in [
+            "RiotClientServices.exe",
+            "LeagueClient.exe",
+            "VALORANT-Win64-Shipping.exe",
+            "Discord.exe",
+            "RobloxPlayerBeta.exe",
+            "RobloxStudioBeta.exe",
+            "lghub.exe",
+            "python.exe",
+        ] {
+            assert!(
+                !is_noise_process_name(keep),
+                "expected '{keep}' to remain visible in [running]"
+            );
+            assert!(
+                !is_installer_or_noise_exe(keep),
+                "expected '{keep}' to remain visible in [installed]"
+            );
+        }
+
+        // Roblox Studio must never map to NativeDialog.exe via DisplayIcon or InstallLocation.
+        assert_eq!(
+            parse_display_icon_exe(r"C:\Users\alice\AppData\Local\Roblox\Versions\v1\NativeDialog.exe,0"),
+            None
+        );
+
+        let base = std::env::temp_dir().join(format!(
+            "vdpi_test_roblox_studio_{}",
+            std::process::id()
+        ));
+        let only_dialog_dir = base.join("only_dialog");
+        let with_studio_dir = base.join("with_studio");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&only_dialog_dir).expect("create only_dialog dir");
+        std::fs::create_dir_all(&with_studio_dir).expect("create with_studio dir");
+        std::fs::write(only_dialog_dir.join("NativeDialog.exe"), b"").expect("write dialog");
+        std::fs::write(with_studio_dir.join("NativeDialog.exe"), b"").expect("write dialog");
+        std::fs::write(with_studio_dir.join("RobloxStudioBeta.exe"), b"").expect("write studio");
+
+        assert_eq!(
+            find_exe_in_install_location(
+                &only_dialog_dir.to_string_lossy(),
+                "Roblox Studio for Alice",
+            ),
+            None
+        );
+        let resolved_studio = find_exe_in_install_location(
+            &with_studio_dir.to_string_lossy(),
+            "Roblox Studio for Alice",
+        )
+        .expect("should resolve RobloxStudioBeta.exe");
+        assert_eq!(resolved_studio.0, "RobloxStudioBeta.exe");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn riot_client_installs_json_parses_non_c_drives_and_discovers_games() {
+        let sample_json = r#"{
+            "associated_client": {
+                "D:/Riot Games/VALORANT/live/": "D:/Riot Games/Riot Client/RiotClientServices.exe",
+                "E:\\Games\\Riot Games\\League of Legends\\": "D:/Riot Games/Riot Client/RiotClientServices.exe"
+            },
+            "patchlines": {
+                "KeystoneFoundationLiveWin": "D:/Riot Games/Riot Client/RiotClientServices.exe"
+            },
+            "rc_default": "D:/Riot Games/Riot Client/RiotClientServices.exe",
+            "rc_live": "D:/Riot Games/Riot Client/RiotClientServices.exe"
+        }"#;
+
+        let parsed = parse_riot_client_installs_json(sample_json);
+        assert_eq!(
+            parsed.riot_client_exes,
+            vec![PathBuf::from(
+                r"D:\Riot Games\Riot Client\RiotClientServices.exe"
+            )]
+        );
+        assert!(parsed
+            .game_roots
+            .contains(&PathBuf::from(r"D:\Riot Games\VALORANT\live")));
+        assert!(parsed
+            .game_roots
+            .contains(&PathBuf::from(r"E:\Games\Riot Games\League of Legends")));
+
+        // Malformed or non-object JSON degrades cleanly without panicking.
+        assert_eq!(
+            parse_riot_client_installs_json("not valid json"),
+            RiotInstallLocations::default()
+        );
+        assert_eq!(
+            parse_riot_client_installs_json("[]"),
+            RiotInstallLocations::default()
+        );
+
+        // End-to-end discovery against a temporary directory tree simulating a non-C: Riot install.
+        let root = std::env::temp_dir().join(format!(
+            "vdpi_test_riot_installs_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let rc_exe = root.join(r"Riot Client\RiotClientServices.exe");
+        let val_root = root.join(r"VALORANT\live");
+        let val_exe = val_root.join(r"ShooterGame\Binaries\Win64\VALORANT-Win64-Shipping.exe");
+        let lol_root = root.join(r"League of Legends");
+        let lol_exe = lol_root.join("LeagueClient.exe");
+
+        for file in [&rc_exe, &val_exe, &lol_exe] {
+            std::fs::create_dir_all(file.parent().expect("parent")).expect("create riot dir");
+            std::fs::write(file, b"").expect("write dummy riot exe");
+        }
+
+        let rc_json = rc_exe.to_string_lossy().replace('\\', "/");
+        let val_json = format!("{}/", val_root.to_string_lossy().replace('\\', "/"));
+        let lol_json = format!("{}/", lol_root.to_string_lossy().replace('\\', "/"));
+        let mut associated = serde_json::Map::new();
+        associated.insert(val_json, serde_json::Value::String(rc_json.clone()));
+        associated.insert(lol_json, serde_json::Value::String(rc_json.clone()));
+        let mut root_obj = serde_json::Map::new();
+        root_obj.insert("rc_live".to_string(), serde_json::Value::String(rc_json));
+        root_obj.insert(
+            "associated_client".to_string(),
+            serde_json::Value::Object(associated),
+        );
+        let manifest = serde_json::Value::Object(root_obj).to_string();
+
+        let locs = parse_riot_client_installs_json(&manifest);
+        let discovered = discover_riot_apps_from_locations(&locs, false);
+        assert_eq!(discovered.len(), 3);
+        assert!(discovered.iter().any(|a| {
+            a.display_name == "Riot Client"
+                && a.exe_name == "RiotClientServices.exe"
+                && a.path.as_deref() == Some(rc_exe.to_string_lossy().as_ref())
+                && a.category == AppCategory::Popular
+        }));
+        assert!(discovered.iter().any(|a| {
+            a.display_name == "Valorant"
+                && a.exe_name == "VALORANT-Win64-Shipping.exe"
+                && a.path.as_deref() == Some(val_exe.to_string_lossy().as_ref())
+                && a.category == AppCategory::Popular
+        }));
+        assert!(discovered.iter().any(|a| {
+            a.display_name == "League of Legends"
+                && a.exe_name == "LeagueClient.exe"
+                && a.path.as_deref() == Some(lol_exe.to_string_lossy().as_ref())
+                && a.category == AppCategory::Popular
+        }));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn install_location_matching_uses_unicode_turkish_folding() {
+        assert_eq!(fold_unicode_lower("İstanbul"), "istanbul");
+        assert_eq!(fold_unicode_lower("DİSCORD"), "discord");
+        assert_eq!(fold_unicode_lower("Yazılım"), "yazilim");
+        assert_eq!(fold_unicode_lower("YAZILIM"), "yazilim");
+
+        let root = std::env::temp_dir().join(format!(
+            "vdpi_test_unicode_stem_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create unicode test dir");
+        std::fs::write(root.join("istanbul.exe"), b"").expect("write istanbul.exe");
+        std::fs::write(root.join("YAZILIM.exe"), b"").expect("write YAZILIM.exe");
+        std::fs::write(root.join("unrelated.exe"), b"").expect("write unrelated.exe");
+
+        let dir_str = root.to_string_lossy().into_owned();
+        let matched_istanbul = find_exe_in_install_location(&dir_str, "İstanbul App")
+            .expect("should match Turkish dotted İ");
+        assert_eq!(matched_istanbul.0, "istanbul.exe");
+
+        let matched_yazilim = find_exe_in_install_location(&dir_str, "Yazılım")
+            .expect("should match Turkish dotless ı");
+        assert_eq!(matched_yazilim.0, "YAZILIM.exe");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn deduplicate_riot_companion_apps_collapses_duplicate_ux_rows() {
+        let apps = vec![
+            DiscoveredApp {
+                display_name: "Riot Client".to_string(),
+                exe_name: "RiotClientUx.exe".to_string(),
+                path: Some(r"D:\Riot Games\Riot Client\UX\RiotClientUx.exe".to_string()),
+                is_running: true,
+                category: AppCategory::Running,
+            },
+            DiscoveredApp {
+                display_name: "Riot Client".to_string(),
+                exe_name: "RiotClientServices.exe".to_string(),
+                path: Some(r"D:\Riot Games\Riot Client\RiotClientServices.exe".to_string()),
+                is_running: false,
+                category: AppCategory::Popular,
+            },
+            DiscoveredApp {
+                display_name: "League of Legends".to_string(),
+                exe_name: "LeagueClient.exe".to_string(),
+                path: Some(r"D:\Riot Games\League of Legends\LeagueClient.exe".to_string()),
+                is_running: false,
+                category: AppCategory::Popular,
+            },
+            DiscoveredApp {
+                display_name: "League of Legends".to_string(),
+                exe_name: "LeagueClientUx.exe".to_string(),
+                path: None,
+                is_running: true,
+                category: AppCategory::Running,
+            },
+            DiscoveredApp {
+                display_name: "Discord".to_string(),
+                exe_name: "Discord.exe".to_string(),
+                path: None,
+                is_running: true,
+                category: AppCategory::Running,
+            },
+        ];
+
+        let deduped = deduplicate_riot_companion_apps(apps);
+        assert_eq!(deduped.len(), 3);
+
+        let riot = deduped
+            .iter()
+            .find(|a| a.exe_name == "RiotClientServices.exe")
+            .expect("single canonical Riot Client row");
+        assert_eq!(riot.display_name, "Riot Client");
+        assert!(riot.is_running);
+        assert_eq!(riot.category, AppCategory::Running);
+        assert_eq!(
+            riot.path.as_deref(),
+            Some(r"D:\Riot Games\Riot Client\RiotClientServices.exe")
+        );
+
+        let league = deduped
+            .iter()
+            .find(|a| a.exe_name == "LeagueClient.exe")
+            .expect("single canonical League of Legends row");
+        assert_eq!(league.display_name, "League of Legends");
+        assert!(league.is_running);
+        assert_eq!(league.category, AppCategory::Running);
+        assert_eq!(
+            league.path.as_deref(),
+            Some(r"D:\Riot Games\League of Legends\LeagueClient.exe")
+        );
+    }
+
+    #[test]
+    fn round3_clutter_filters_block_suffixed_services_shell_hosts_and_keep_riot_client() {
+        for clutter in [
+            // Suffixed / embedded service and svc background helpers
+            "RtkAudUService64.exe",
+            "GameManagerService3.exe",
+            "nvfvsdksvc_x64.exe",
+            "BlueStacksServices.exe",
+            "Corsair Device Control Service.exe",
+            "Corsair Device Control Service (64-bit).exe",
+            // Crash helpers, MSYS coreutils, game overlays, Windows shell hosts, vendor daemons
+            "sentry-crash.exe",
+            "cut.exe",
+            "sed.exe",
+            "tail.exe",
+            "mktemp.exe",
+            "UserOOBEBroker.exe",
+            "CrossDeviceResume.exe",
+            "ChxSmartScreen.exe",
+            "MicrosoftStartFeedProvider.exe",
+            "WidgetBoard.exe",
+            "WSToastNotification.exe",
+            "AppActions.exe",
+            "vmware-authd.exe",
+            "vmware-usbarbitrator64.exe",
+            "MSI.CentralServer.exe",
+            "MSI.TerminalServer.exe",
+            "LEDKeeper2.exe",
+            "CC_Engine_x64.exe",
+            "vctip.exe",
+            "GameOverlayUI.exe",
+            "discord_clips.exe",
+        ] {
+            assert!(
+                is_noise_process_name(clutter),
+                "expected '{clutter}' to be filtered from [running]"
+            );
+            assert!(
+                is_installer_or_noise_exe(clutter),
+                "expected '{clutter}' to be filtered from [installed]"
+            );
+        }
+
+        // RiotClientServices.exe contains `service` and must stay explicitly allowlisted.
+        for preserved in [
+            "RiotClientServices.exe",
+            "riotclientservices.exe",
+            "VALORANT-Win64-Shipping.exe",
+            "LeagueClient.exe",
+            "Discord.exe",
+            "steam.exe",
+        ] {
+            assert!(
+                !is_clutter_exe_pattern(&preserved.to_ascii_lowercase()),
+                "expected '{preserved}' to bypass clutter pattern filter"
+            );
+            assert!(
+                !is_noise_process_name(preserved),
+                "expected '{preserved}' to stay visible in [running]"
+            );
+            assert!(
+                !is_installer_or_noise_exe(preserved),
+                "expected '{preserved}' to stay visible in [installed]"
+            );
+        }
+    }
+
+    #[test]
+    fn deduplicate_riot_companion_apps_collapses_valorant_and_league_game_exes() {
+        let valorant_path =
+            r"D:\Riot Games\VALORANT\live\ShooterGame\Binaries\Win64\VALORANT-Win64-Shipping.exe";
+        let league_path = r"D:\Riot Games\League of Legends\LeagueClient.exe";
+
+        let apps = vec![
+            DiscoveredApp {
+                display_name: "Valorant".to_string(),
+                exe_name: "VALORANT.exe".to_string(),
+                path: Some(r"D:\Riot Games\VALORANT\live\VALORANT.exe".to_string()),
+                is_running: true,
+                category: AppCategory::Running,
+            },
+            DiscoveredApp {
+                display_name: "Valorant".to_string(),
+                exe_name: "VALORANT-Win64-Shipping.exe".to_string(),
+                path: Some(valorant_path.to_string()),
+                is_running: false,
+                category: AppCategory::Popular,
+            },
+            DiscoveredApp {
+                display_name: "League of Legends".to_string(),
+                exe_name: "League of Legends.exe".to_string(),
+                path: Some(
+                    r"D:\Riot Games\League of Legends\Game\League of Legends.exe".to_string(),
+                ),
+                is_running: true,
+                category: AppCategory::Running,
+            },
+            DiscoveredApp {
+                display_name: "League of Legends".to_string(),
+                exe_name: "LeagueClient.exe".to_string(),
+                path: Some(league_path.to_string()),
+                is_running: false,
+                category: AppCategory::Popular,
+            },
+            DiscoveredApp {
+                display_name: "League of Legends".to_string(),
+                exe_name: "LeagueClientUxRender.exe".to_string(),
+                path: None,
+                is_running: true,
+                category: AppCategory::Running,
+            },
+            DiscoveredApp {
+                display_name: "Discord".to_string(),
+                exe_name: "Discord.exe".to_string(),
+                path: None,
+                is_running: true,
+                category: AppCategory::Running,
+            },
+        ];
+
+        let deduped = deduplicate_riot_companion_apps(apps);
+        assert_eq!(deduped.len(), 3);
+
+        let valorant = deduped
+            .iter()
+            .find(|a| a.exe_name == "VALORANT-Win64-Shipping.exe")
+            .expect("single canonical Valorant row");
+        assert_eq!(valorant.display_name, "Valorant");
+        assert!(valorant.is_running);
+        assert_eq!(valorant.category, AppCategory::Running);
+        assert_eq!(valorant.path.as_deref(), Some(valorant_path));
+
+        let league = deduped
+            .iter()
+            .find(|a| a.exe_name == "LeagueClient.exe")
+            .expect("single canonical League of Legends row");
+        assert_eq!(league.display_name, "League of Legends");
+        assert!(league.is_running);
+        assert_eq!(league.category, AppCategory::Running);
+        assert_eq!(league.path.as_deref(), Some(league_path));
+
+        // Reverse order (installed primary exe first, active game process second) collapses identically.
+        let reverse_apps = vec![
+            DiscoveredApp {
+                display_name: "Valorant".to_string(),
+                exe_name: "VALORANT-Win64-Shipping.exe".to_string(),
+                path: Some(valorant_path.to_string()),
+                is_running: false,
+                category: AppCategory::Popular,
+            },
+            DiscoveredApp {
+                display_name: "Valorant".to_string(),
+                exe_name: "VALORANT.exe".to_string(),
+                path: None,
+                is_running: true,
+                category: AppCategory::Running,
+            },
+            DiscoveredApp {
+                display_name: "League of Legends".to_string(),
+                exe_name: "LeagueClient.exe".to_string(),
+                path: Some(league_path.to_string()),
+                is_running: false,
+                category: AppCategory::Popular,
+            },
+            DiscoveredApp {
+                display_name: "League of Legends".to_string(),
+                exe_name: "League of Legends.exe".to_string(),
+                path: None,
+                is_running: true,
+                category: AppCategory::Running,
+            },
+        ];
+
+        let reverse_deduped = deduplicate_riot_companion_apps(reverse_apps);
+        assert_eq!(reverse_deduped.len(), 2);
+        assert!(reverse_deduped.iter().any(|a| {
+            a.exe_name == "VALORANT-Win64-Shipping.exe"
+                && a.display_name == "Valorant"
+                && a.is_running
+                && a.category == AppCategory::Running
+                && a.path.as_deref() == Some(valorant_path)
+        }));
+        assert!(reverse_deduped.iter().any(|a| {
+            a.exe_name == "LeagueClient.exe"
+                && a.display_name == "League of Legends"
+                && a.is_running
+                && a.category == AppCategory::Running
+                && a.path.as_deref() == Some(league_path)
+        }));
     }
 }

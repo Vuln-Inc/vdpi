@@ -1,0 +1,463 @@
+/* ==========================================================================
+   vdpi Desktop Design Tokens
+   Local Geist / Geist Mono typography + neutral dark/light semantic tokens.
+   Zero neon glows, zero colored shadow halos, zero gradient text.
+   ========================================================================== */
+
+/* --------------------------------------------------------------------------
+   1. Local Font Faces
+   -------------------------------------------------------------------------- */
+
+@font-face {
+  font-family: 'Geist';
+  src: url('/fonts/geist_regular.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Geist';
+  src: url('/fonts/geist_medium.ttf') format('truetype');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Geist';
+  src: url('/fonts/geist_semibold.ttf') format('truetype');
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Geist Mono';
+  src: url('/fonts/geist_mono_regular.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Geist Mono';
+  src: url('/fonts/geist_mono_medium.ttf') format('truetype');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* --------------------------------------------------------------------------
+   2. Theme-Invariant Foundations (Typography, Spacing, Radii, Motion, Layers)
+   -------------------------------------------------------------------------- */
+
+:root {
+  /* Font families */
+  --font-sans: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'Geist Mono', ui-monospace, 'SFMono-Regular', 'Cascadia Code', Consolas, monospace;
+
+  /* Font weights */
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+
+  /* Type scale */
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-base: 13px;
+  --text-md: 14px;
+  --text-lg: 16px;
+  --text-xl: 20px;
+  --text-2xl: 24px;
+
+  /* Line heights */
+  --leading-xs: 16px;
+  --leading-sm: 18px;
+  --leading-base: 20px;
+  --leading-md: 20px;
+  --leading-lg: 22px;
+  --leading-xl: 26px;
+  --leading-2xl: 30px;
+
+  /* Letter spacing */
+  --tracking-tight: -0.02em;
+  --tracking-normal: 0em;
+  --tracking-wide: 0.04em;
+
+  /* Spacing scale (4px base grid) */
+  --space-0: 0px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+
+  /* Crisp radii */
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius-pill: 9999px;
+
+  /* Layout metrics */
+  --sidebar-width: 208px;
+  --topbar-height: 48px;
+  --content-max-width: 1040px;
+
+  /* Focus outline geometry (crisp outline, no colored glow halo) */
+  --focus-ring-width: 2px;
+  --focus-ring-offset: 2px;
+
+  /* Subtle motion */
+  --duration-fast: 100ms;
+  --duration-base: 120ms;
+  --duration-slow: 180ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+
+  --transition-colors:
+    color var(--duration-base) var(--ease-standard),
+    background-color var(--duration-base) var(--ease-standard),
+    border-color var(--duration-base) var(--ease-standard);
+  --transition-opacity: opacity var(--duration-base) var(--ease-standard);
+  --transition-transform: transform var(--duration-base) var(--ease-standard);
+  --transition-interactive:
+    color var(--duration-base) var(--ease-standard),
+    background-color var(--duration-base) var(--ease-standard),
+    border-color var(--duration-base) var(--ease-standard),
+    opacity var(--duration-base) var(--ease-standard);
+
+  /* Z-index layers */
+  --z-base: 1;
+  --z-sticky: 10;
+  --z-dropdown: 20;
+  --z-modal: 1000;
+  --z-toast: 1100;
+}
+
+/* --------------------------------------------------------------------------
+   3. Dark Theme (Default) - Neutral Charcoal
+   -------------------------------------------------------------------------- */
+
+:root,
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* Surface tiers */
+  --bg-canvas: #0B0C0E;
+  --bg-sidebar: #0E1013;
+  --bg-surface: #131518;
+  --bg-surface-subtle: #171A1F;
+  --bg-surface-elevated: #1B1E24;
+  --bg-surface-hover: #21252D;
+  --bg-surface-active: #282D37;
+  --bg-input: #0E1013;
+  --bg-overlay: rgba(5, 6, 8, 0.72);
+  --segmented-track: #0E1013;
+  --segmented-thumb: #2A303C;
+  --segmented-thumb-border: #5B6577;
+  --switch-track-off: #3D4452;
+  --switch-track-off-hover: #4A5364;
+  --switch-border-off: rgba(255, 255, 255, 0.34);
+  --switch-thumb-off: #C7CCD6;
+
+  /* Hairline borders */
+  --border-hairline: rgba(255, 255, 255, 0.07);
+  --border-subtle: rgba(255, 255, 255, 0.10);
+  --border-default: rgba(255, 255, 255, 0.14);
+  --border-strong: rgba(255, 255, 255, 0.22);
+  --border-control: #5E687B;
+
+  /* Ink hierarchy */
+  --ink-primary: #F3F4F6;
+  --ink-secondary: #A1A6B0;
+  --ink-tertiary: #949BA8;
+  --ink-muted: #7D8593;
+  --ink-on-accent: #FFFFFF;
+  --ink-on-status: #0B0C0E;
+
+  /* Functional accent */
+  --accent: #2563EB;
+  --accent-hover: #1D4ED8;
+  --accent-active: #1E40AF;
+  --accent-fg: #60A5FA;
+  --accent-subtle: rgba(59, 130, 246, 0.14);
+  --accent-subtle-hover: rgba(59, 130, 246, 0.20);
+  --accent-border: rgba(59, 130, 246, 0.32);
+  --focus-ring-color: #60A5FA;
+
+  /* Semantic status - Green (connected / pass) */
+  --status-green: #30D158;
+  --status-green-fg: #30D158;
+  --status-green-bg: rgba(48, 209, 88, 0.12);
+  --status-green-border: rgba(48, 209, 88, 0.28);
+
+  /* Semantic status - Amber (degraded / warn / connecting) */
+  --status-amber: #FF9F0A;
+  --status-amber-fg: #FF9F0A;
+  --status-amber-bg: rgba(255, 159, 10, 0.12);
+  --status-amber-border: rgba(255, 159, 10, 0.28);
+
+  /* Semantic status - Crimson (error / fail / danger) */
+  --status-crimson: #FF453A;
+  --status-crimson-fg: #FF6961;
+  --status-crimson-solid: #DC2626;
+  --status-crimson-solid-hover: #B91C1C;
+  --status-crimson-bg: rgba(255, 69, 58, 0.12);
+  --status-crimson-border: rgba(255, 69, 58, 0.28);
+
+  /* Semantic status - Neutral (idle / stopped) */
+  --status-neutral: #949BA8;
+  --status-neutral-fg: #A1A6B0;
+  --status-neutral-bg: rgba(255, 255, 255, 0.06);
+  --status-neutral-border: rgba(255, 255, 255, 0.12);
+
+  /* Semantic intent aliases */
+  --status-success: var(--status-green);
+  --status-success-fg: var(--status-green-fg);
+  --status-success-bg: var(--status-green-bg);
+  --status-success-border: var(--status-green-border);
+
+  --status-warning: var(--status-amber);
+  --status-warning-fg: var(--status-amber-fg);
+  --status-warning-bg: var(--status-amber-bg);
+  --status-warning-border: var(--status-amber-border);
+
+  --status-danger: var(--status-crimson);
+  --status-danger-fg: var(--status-crimson-fg);
+  --status-danger-solid: var(--status-crimson-solid);
+  --status-danger-bg: var(--status-crimson-bg);
+  --status-danger-border: var(--status-crimson-border);
+
+  /* Neutral elevation shadows (strictly achromatic) */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.45);
+  --shadow-lg: 0 12px 28px rgba(0, 0, 0, 0.55);
+
+  /* Scrollbar */
+  --scrollbar-thumb: rgba(255, 255, 255, 0.14);
+  --scrollbar-thumb-hover: rgba(255, 255, 255, 0.24);
+}
+
+/* --------------------------------------------------------------------------
+   4. Light Theme - Crisp Neutral
+   -------------------------------------------------------------------------- */
+
+[data-theme="light"] {
+  color-scheme: light;
+
+  /* Surface tiers */
+  --bg-canvas: #F5F6F8;
+  --bg-sidebar: #ECEEF2;
+  --bg-surface: #FFFFFF;
+  --bg-surface-subtle: #EDF0F4;
+  --bg-surface-elevated: #FFFFFF;
+  --bg-surface-hover: #E9ECF1;
+  --bg-surface-active: #DFE3EA;
+  --bg-input: #FFFFFF;
+  --bg-overlay: rgba(11, 12, 14, 0.36);
+  --segmented-track: #D8DDE6;
+  --segmented-thumb: #FFFFFF;
+  --segmented-thumb-border: #747C8B;
+  --switch-track-off: #8B93A1;
+  --switch-track-off-hover: #757E8F;
+  --switch-border-off: rgba(11, 12, 14, 0.36);
+  --switch-thumb-off: #FFFFFF;
+
+  /* Hairline borders */
+  --border-hairline: rgba(11, 12, 14, 0.07);
+  --border-subtle: rgba(11, 12, 14, 0.10);
+  --border-default: rgba(11, 12, 14, 0.14);
+  --border-strong: rgba(11, 12, 14, 0.24);
+  --border-control: #767E8D;
+
+  /* Ink hierarchy */
+  --ink-primary: #111317;
+  --ink-secondary: #4E5460;
+  --ink-tertiary: #575E6B;
+  --ink-muted: #626976;
+  --ink-on-accent: #FFFFFF;
+  --ink-on-status: #FFFFFF;
+
+  /* Functional accent */
+  --accent: #0066CC;
+  --accent-hover: #0055B3;
+  --accent-active: #004499;
+  --accent-fg: #0066CC;
+  --accent-subtle: rgba(0, 102, 204, 0.10);
+  --accent-subtle-hover: rgba(0, 102, 204, 0.16);
+  --accent-border: rgba(0, 102, 204, 0.28);
+  --focus-ring-color: #0066CC;
+
+  /* Semantic status - Green (connected / pass) */
+  --status-green: #18793A;
+  --status-green-fg: #146932;
+  --status-green-bg: rgba(48, 209, 88, 0.12);
+  --status-green-border: rgba(24, 121, 58, 0.24);
+
+  /* Semantic status - Amber (degraded / warn / connecting) */
+  --status-amber: #C96A00;
+  --status-amber-fg: #924D00;
+  --status-amber-bg: rgba(255, 159, 10, 0.14);
+  --status-amber-border: rgba(146, 77, 0, 0.28);
+
+  /* Semantic status - Crimson (error / fail / danger) */
+  --status-crimson: #C82320;
+  --status-crimson-fg: #C82320;
+  --status-crimson-solid: #DC2626;
+  --status-crimson-solid-hover: #B91C1C;
+  --status-crimson-bg: rgba(255, 69, 58, 0.11);
+  --status-crimson-border: rgba(200, 35, 32, 0.24);
+
+  /* Semantic status - Neutral (idle / stopped) */
+  --status-neutral: #575E6B;
+  --status-neutral-fg: #4E5460;
+  --status-neutral-bg: rgba(11, 12, 14, 0.05);
+  --status-neutral-border: rgba(11, 12, 14, 0.12);
+
+  /* Semantic intent aliases */
+  --status-success: var(--status-green);
+  --status-success-fg: var(--status-green-fg);
+  --status-success-bg: var(--status-green-bg);
+  --status-success-border: var(--status-green-border);
+
+  --status-warning: var(--status-amber);
+  --status-warning-fg: var(--status-amber-fg);
+  --status-warning-bg: var(--status-amber-bg);
+  --status-warning-border: var(--status-amber-border);
+
+  --status-danger: var(--status-crimson);
+  --status-danger-fg: var(--status-crimson-fg);
+  --status-danger-solid: var(--status-crimson-solid);
+  --status-danger-bg: var(--status-crimson-bg);
+  --status-danger-border: var(--status-crimson-border);
+
+  /* Neutral elevation shadows (strictly achromatic) */
+  --shadow-sm: 0 1px 2px rgba(11, 12, 14, 0.05);
+  --shadow-md: 0 4px 12px rgba(11, 12, 14, 0.08);
+  --shadow-lg: 0 12px 28px rgba(11, 12, 14, 0.12);
+
+  /* Scrollbar */
+  --scrollbar-thumb: rgba(11, 12, 14, 0.16);
+  --scrollbar-thumb-hover: rgba(11, 12, 14, 0.28);
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
+
+    /* Surface tiers */
+    --bg-canvas: #F5F6F8;
+    --bg-sidebar: #ECEEF2;
+    --bg-surface: #FFFFFF;
+    --bg-surface-subtle: #EDF0F4;
+    --bg-surface-elevated: #FFFFFF;
+    --bg-surface-hover: #E9ECF1;
+    --bg-surface-active: #DFE3EA;
+    --bg-input: #FFFFFF;
+    --bg-overlay: rgba(11, 12, 14, 0.36);
+    --segmented-track: #D8DDE6;
+    --segmented-thumb: #FFFFFF;
+    --segmented-thumb-border: #747C8B;
+    --switch-track-off: #8B93A1;
+    --switch-track-off-hover: #757E8F;
+    --switch-border-off: rgba(11, 12, 14, 0.36);
+    --switch-thumb-off: #FFFFFF;
+
+    /* Hairline borders */
+    --border-hairline: rgba(11, 12, 14, 0.07);
+    --border-subtle: rgba(11, 12, 14, 0.10);
+    --border-default: rgba(11, 12, 14, 0.14);
+    --border-strong: rgba(11, 12, 14, 0.24);
+    --border-control: #767E8D;
+
+    /* Ink hierarchy */
+    --ink-primary: #111317;
+    --ink-secondary: #4E5460;
+    --ink-tertiary: #575E6B;
+    --ink-muted: #626976;
+    --ink-on-accent: #FFFFFF;
+    --ink-on-status: #FFFFFF;
+
+    /* Functional accent */
+    --accent: #0066CC;
+    --accent-hover: #0055B3;
+    --accent-active: #004499;
+    --accent-fg: #0066CC;
+    --accent-subtle: rgba(0, 102, 204, 0.10);
+    --accent-subtle-hover: rgba(0, 102, 204, 0.16);
+    --accent-border: rgba(0, 102, 204, 0.28);
+    --focus-ring-color: #0066CC;
+
+    /* Semantic status - Green (connected / pass) */
+    --status-green: #18793A;
+    --status-green-fg: #146932;
+    --status-green-bg: rgba(48, 209, 88, 0.12);
+    --status-green-border: rgba(24, 121, 58, 0.24);
+
+    /* Semantic status - Amber (degraded / warn / connecting) */
+    --status-amber: #C96A00;
+    --status-amber-fg: #924D00;
+    --status-amber-bg: rgba(255, 159, 10, 0.14);
+    --status-amber-border: rgba(146, 77, 0, 0.28);
+
+    /* Semantic status - Crimson (error / fail / danger) */
+    --status-crimson: #C82320;
+    --status-crimson-fg: #C82320;
+    --status-crimson-solid: #DC2626;
+    --status-crimson-solid-hover: #B91C1C;
+    --status-crimson-bg: rgba(255, 69, 58, 0.11);
+    --status-crimson-border: rgba(200, 35, 32, 0.24);
+
+    /* Semantic status - Neutral (idle / stopped) */
+    --status-neutral: #575E6B;
+    --status-neutral-fg: #4E5460;
+    --status-neutral-bg: rgba(11, 12, 14, 0.05);
+    --status-neutral-border: rgba(11, 12, 14, 0.12);
+
+    /* Semantic intent aliases */
+    --status-success: var(--status-green);
+    --status-success-fg: var(--status-green-fg);
+    --status-success-bg: var(--status-green-bg);
+    --status-success-border: var(--status-green-border);
+
+    --status-warning: var(--status-amber);
+    --status-warning-fg: var(--status-amber-fg);
+    --status-warning-bg: var(--status-amber-bg);
+    --status-warning-border: var(--status-amber-border);
+
+    --status-danger: var(--status-crimson);
+    --status-danger-fg: var(--status-crimson-fg);
+    --status-danger-solid: var(--status-crimson-solid);
+    --status-danger-bg: var(--status-crimson-bg);
+    --status-danger-border: var(--status-crimson-border);
+
+    /* Neutral elevation shadows (strictly achromatic) */
+    --shadow-sm: 0 1px 2px rgba(11, 12, 14, 0.05);
+    --shadow-md: 0 4px 12px rgba(11, 12, 14, 0.08);
+    --shadow-lg: 0 12px 28px rgba(11, 12, 14, 0.12);
+
+    /* Scrollbar */
+    --scrollbar-thumb: rgba(11, 12, 14, 0.16);
+    --scrollbar-thumb-hover: rgba(11, 12, 14, 0.28);
+  }
+}
+
+/* --------------------------------------------------------------------------
+   5. Reduced Motion Override
+   -------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --duration-fast: 0ms;
+    --duration-base: 0ms;
+    --duration-slow: 0ms;
+    --transition-colors: none;
+    --transition-opacity: none;
+    --transition-transform: none;
+    --transition-interactive: none;
+  }
+}

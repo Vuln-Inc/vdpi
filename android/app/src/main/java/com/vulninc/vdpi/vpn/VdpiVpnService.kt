@@ -13,6 +13,8 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
+import android.net.IpPrefix
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.VpnService
@@ -34,6 +36,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -43,8 +46,11 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
+import java.net.Inet4Address
 import java.net.Inet6Address
+import java.net.InetAddress
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -82,12 +88,19 @@ class VdpiVpnService : VpnService() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val transitionMutex = Mutex()
     private val notificationLock = Any()
+    private val networkStateLock = Any()
     private val sessionGeneration = AtomicLong(0L)
+    private val telemetryWakeChannel = Channel<Unit>(Channel.CONFLATED)
     @Volatile private var transitionJob: Job? = null
     @Volatile private var pollJob: Job? = null
     @Volatile private var networkCallback: ConnectivityManager.NetworkCallback? = null
-    @Volatile private var lastNetworkId: Long? = null
-    @Volatile private var lastHasGlobalIpv6: Boolean? = null
+    @Volatile private var networkChangeJob: Job? = null
+    @Volatile private var activeObservedNetworkId: Long? = null
+    @Volatile private var lastObservedPhysicalNetwork: Network? = null
+    @Volatile private var committedNetworkId: Long? = null
+    @Volatile private var committedIpv4Signature: String? = null
+    @Volatile private var committedIpv6Signature: String? = null
+    @Volatile private var appliedTunIpv6: Boolean = false
     @Volatile private var lastNotification: Notification? = null
     @Volatile private var connectedAtWallMs: Long? = null
     @Volatile private var repostJob: Job? = null
@@ -165,6 +178,14 @@ class VdpiVpnService : VpnService() {
         }
     }
 
+    private val screenOnReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != Intent.ACTION_SCREEN_ON) return
+            if (!serviceActive.get()) return
+            telemetryWakeChannel.trySend(Unit)
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         serviceActive.set(true)
@@ -172,6 +193,12 @@ class VdpiVpnService : VpnService() {
             this,
             dismissReceiver,
             IntentFilter(ACTION_NOTIFICATION_DISMISSED),
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+        ContextCompat.registerReceiver(
+            this,
+            screenOnReceiver,
+            IntentFilter(Intent.ACTION_SCREEN_ON),
             ContextCompat.RECEIVER_NOT_EXPORTED,
         )
     }
@@ -184,7 +211,8 @@ class VdpiVpnService : VpnService() {
                 return START_NOT_STICKY
             }
             ACTION_RECONNECT -> {
-                scheduleStart(startId = startId)
+                val preferred = synchronized(networkStateLock) { lastObservedPhysicalNetwork }
+                scheduleStart(startId = startId, preferredPhysicalNetwork = preferred)
                 return START_NOT_STICKY
             }
             ACTION_START, SERVICE_INTERFACE, null -> {
@@ -221,7 +249,7 @@ class VdpiVpnService : VpnService() {
         }
     }
 
-    private fun scheduleStart(startId: Int) {
+    private fun scheduleStart(startId: Int, preferredPhysicalNetwork: Network? = null) {
         if (!serviceActive.get()) return
         val gen = sessionGeneration.incrementAndGet()
         pollJob?.cancel()
@@ -294,14 +322,20 @@ class VdpiVpnService : VpnService() {
                 pollJob?.cancel()
                 pollJob = null
                 unregisterNetworkMonitor()
+                appliedTunIpv6 = false
                 NativeEngine.stop()
 
                 ensureActive()
                 if (!serviceActive.get() || sessionGeneration.get() != gen) return@withLock
 
                 val settings = SettingsRepository(applicationContext).current()
-                val hasGlobalIpv6 = hasGlobalIpv6Connectivity()
+                val cm = getSystemService(ConnectivityManager::class.java)
+                val activeNetwork = preferredPhysicalNetwork
+                    ?.takeIf { isUsablePhysicalNetwork(cm, it) }
+                    ?: findActivePhysicalNetwork(cm)
+                val hasGlobalIpv6 = activeNetwork != null && hasGlobalIpv6Connectivity(activeNetwork)
                 val effectiveIpv4Only = settings.ipv4Only || !hasGlobalIpv6
+                val tunIpv6Enabled = !effectiveIpv4Only
                 val nativeConfig = settings.toNativeConfig().copy(
                     ipv4Only = effectiveIpv4Only,
                     mtu = TUN_MTU,
@@ -320,7 +354,7 @@ class VdpiVpnService : VpnService() {
                 ensureActive()
                 if (!serviceActive.get() || sessionGeneration.get() != gen) return@withLock
 
-                val vpnInterface = establishVpnInterface(settings, effectiveIpv4Only)
+                val vpnInterface = establishVpnInterface(settings, effectiveIpv4Only, activeNetwork)
                 if (vpnInterface == null) {
                     failAndStop(
                         "VPN permission revoked or interface could not be created",
@@ -337,7 +371,11 @@ class VdpiVpnService : VpnService() {
 
                 // Transfer sole TUN file descriptor ownership to the Rust engine after library/config prep.
                 val tunFd = vpnInterface.detachFd()
-                val startResult = NativeEngine.startWithEncoded(tunFd, preparedConfig.getOrThrow())
+                val startResult = NativeEngine.startWithEncoded(
+                    tunFd = tunFd,
+                    encodedConfig = preparedConfig.getOrThrow(),
+                    vpnService = this@VdpiVpnService,
+                )
                 if (startResult.isFailure) {
                     failAndStop(
                         startResult.exceptionOrNull()?.message ?: "Engine failed to start",
@@ -394,7 +432,9 @@ class VdpiVpnService : VpnService() {
                     return@withLock
                 }
 
-                registerNetworkMonitor()
+                appliedTunIpv6 = tunIpv6Enabled
+                setUnderlyingNetworksSafe(activeNetwork)
+                registerNetworkMonitor(sessionGen = gen, initialActive = activeNetwork)
                 requestTileSync()
                 startTelemetryLoop(
                     sessionGen = gen,
@@ -421,6 +461,7 @@ class VdpiVpnService : VpnService() {
 
     private fun failAndStop(message: String, startId: Int, expectedGen: Long) {
         unregisterNetworkMonitor()
+        appliedTunIpv6 = false
         pollJob?.cancel()
         pollJob = null
         NativeEngine.stop()
@@ -447,54 +488,122 @@ class VdpiVpnService : VpnService() {
         stopSelf(startId)
     }
 
-    private fun hasGlobalIpv6Connectivity(): Boolean {
-        val cm = getSystemService(ConnectivityManager::class.java) ?: return false
-        val candidates = buildList {
-            cm.activeNetwork?.let { add(it) }
-            @Suppress("DEPRECATION")
-            cm.allNetworks.forEach { if (!contains(it)) add(it) }
-        }
-        for (net in candidates) {
-            val caps = cm.getNetworkCapabilities(net) ?: continue
-            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue
-            if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) continue
-            val linkProps = cm.getLinkProperties(net) ?: continue
-            val hasGlobal = linkProps.linkAddresses.any { linkAddr ->
-                val addr = linkAddr.address
-                if (addr !is Inet6Address) return@any false
-                if (addr.isLinkLocalAddress || addr.isLoopbackAddress || addr.isMulticastAddress || addr.isSiteLocalAddress) {
-                    return@any false
-                }
-                val firstByte = addr.address.firstOrNull()?.toInt()?.and(0xFF) ?: return@any false
-                // RFC 4291 Global Unicast IPv6 (2000::/3)
-                (firstByte and 0xE0) == 0x20
-            }
-            if (hasGlobal) return true
-        }
-        return false
+    private fun isUsablePhysicalNetwork(cm: ConnectivityManager?, network: Network): Boolean {
+        val caps = cm?.getNetworkCapabilities(network) ?: return false
+        return !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
     }
 
-    private fun establishVpnInterface(settings: VdpiSettings, effectiveIpv4Only: Boolean) = runCatching {
+    private fun findActivePhysicalNetwork(
+        cm: ConnectivityManager? = getSystemService(ConnectivityManager::class.java),
+    ): Network? {
+        val active = cm?.activeNetwork ?: return null
+        val caps = cm.getNetworkCapabilities(active) ?: return null
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return null
+        return active
+    }
+
+    private fun setUnderlyingNetworksSafe(network: Network?) {
+        runCatching {
+            setUnderlyingNetworks(network?.let { arrayOf(it) })
+        }
+    }
+
+    private fun isGlobalUnicastIpv6(addr: Inet6Address): Boolean {
+        if (addr.isLinkLocalAddress || addr.isLoopbackAddress || addr.isMulticastAddress || addr.isSiteLocalAddress) {
+            return false
+        }
+        val firstByte = addr.address.firstOrNull()?.toInt()?.and(0xFF) ?: return false
+        // RFC 4291 Global Unicast IPv6 (2000::/3)
+        return (firstByte and 0xE0) == 0x20
+    }
+
+    private fun hasGlobalIpv6OnLinkProperties(linkProps: LinkProperties?): Boolean {
+        if (linkProps == null) return false
+        val hasGlobalAddr = linkProps.linkAddresses.any { linkAddr ->
+            val addr = linkAddr.address
+            addr is Inet6Address && isGlobalUnicastIpv6(addr)
+        }
+        if (!hasGlobalAddr) return false
+        return linkProps.routes.any { route ->
+            route.isDefaultRoute && route.destination.address is Inet6Address
+        }
+    }
+
+    private fun ipv4Signature(linkProps: LinkProperties?): String {
+        if (linkProps == null) return ""
+        return linkProps.linkAddresses
+            .asSequence()
+            .map { it.address }
+            .filterIsInstance<Inet4Address>()
+            .filter { !it.isLoopbackAddress && !it.isLinkLocalAddress }
+            .mapNotNull { it.hostAddress }
+            .sorted()
+            .joinToString("|")
+    }
+
+    private fun ipv6Signature(linkProps: LinkProperties?): String {
+        if (linkProps == null) return ""
+        return linkProps.linkAddresses
+            .asSequence()
+            .map { it.address }
+            .filterIsInstance<Inet6Address>()
+            .filter(::isGlobalUnicastIpv6)
+            .mapNotNull { it.hostAddress?.substringBefore('%') }
+            .distinct()
+            .sorted()
+            .joinToString("|")
+    }
+
+    private fun hasGlobalIpv6Connectivity(network: Network? = null): Boolean {
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return false
+        val active = network ?: cm.activeNetwork ?: return false
+        val caps = cm.getNetworkCapabilities(active) ?: return false
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return false
+        if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) return false
+        return hasGlobalIpv6OnLinkProperties(cm.getLinkProperties(active))
+    }
+
+    private fun establishVpnInterface(
+        settings: VdpiSettings,
+        effectiveIpv4Only: Boolean,
+        activeNetwork: Network?,
+    ) = runCatching {
         val builder = Builder()
             .setSession("vdpi")
             .setMtu(TUN_MTU)
             .addAddress(TUN_IPV4_ADDR, 30)
-            .addRoute("0.0.0.0", 0)
             .addDnsServer(TUN_IPV4_DNS)
             .setBlocking(false)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            builder.addRoute("0.0.0.0", 0)
+            EXCLUDED_IPV4_ROUTES.forEach { (addr, prefixLen) ->
+                builder.excludeRoute(IpPrefix(InetAddress.getByName(addr), prefixLen))
+            }
+        } else {
+            PUBLIC_IPV4_ROUTES.forEach { (addr, prefixLen) ->
+                builder.addRoute(addr, prefixLen)
+            }
+        }
 
         if (!effectiveIpv4Only) {
             builder
                 .addAddress(TUN_IPV6_ADDR, 126)
-                .addRoute("::", 0)
+                // Route only Global Unicast IPv6 (2000::/3) plus our virtual TUN DNS so
+                // loopback (::1), ULA LANs (fc00::/7), link-local (fe80::/10), and
+                // multicast (ff00::/8) remain local.
+                .addRoute("2000::", 3)
+                .addRoute(TUN_IPV6_DNS, 128)
                 .addDnsServer(TUN_IPV6_DNS)
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            // Leave underlyingNetworks at default (null) and mark VPN unmetered so Android
-            // dynamically reflects the active Wi-Fi/Cellular network's real meteredness across handoffs.
+            // Always set metered=false so Android dynamically inherits meteredness from
+            // underlying networks instead of hard-locking metered=true across 5G -> Wi-Fi handoffs.
             builder.setMetered(false)
         }
+        builder.setUnderlyingNetworks(activeNetwork?.let { arrayOf(it) })
 
         when (settings.splitTunnelMode) {
             SplitTunnelMode.BYPASS_SELECTED -> {
@@ -512,8 +621,12 @@ class VdpiVpnService : VpnService() {
                     }
                 }
                 if (addedCount == 0) {
-                    // Fall back to excluding self so VPN never enters a self-routing loop.
-                    safeDisallow(builder, packageName)
+                    // Fail closed for unselected apps: allow only vdpi itself (whose outbound
+                    // engine sockets are protected via VpnService.protect) so zero unselected
+                    // apps are tunneled. Abort if self-allow fails.
+                    if (!safeAllow(builder, packageName)) {
+                        return@runCatching null
+                    }
                 }
             }
         }
@@ -539,29 +652,90 @@ class VdpiVpnService : VpnService() {
         }
     }
 
-    private fun registerNetworkMonitor() {
+    private fun registerNetworkMonitor(sessionGen: Long, initialActive: Network?) {
         unregisterNetworkMonitor()
         val cm = getSystemService(ConnectivityManager::class.java) ?: return
-        lastNetworkId = null
-        lastHasGlobalIpv6 = hasGlobalIpv6Connectivity()
+        val initialHandle = initialActive?.networkHandle
+        val initialLinkProps = initialActive?.let { cm.getLinkProperties(it) }
+        val initialIpv4Sig = initialActive?.let { ipv4Signature(initialLinkProps) }
+        val initialIpv6Sig = initialActive?.let { ipv6Signature(initialLinkProps) }
+        synchronized(networkStateLock) {
+            activeObservedNetworkId = initialHandle
+            lastObservedPhysicalNetwork = initialActive
+            committedNetworkId = initialHandle
+            committedIpv4Signature = initialIpv4Sig
+            committedIpv6Signature = initialIpv6Sig
+        }
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                if (!serviceActive.get() || networkCallback !== this) return
+                if (!serviceActive.get() || networkCallback !== this || sessionGeneration.get() != sessionGen) return
+                val caps = cm.getNetworkCapabilities(network)
+                if (caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) return
+                setUnderlyingNetworksSafe(network)
+                scheduleNetworkEvaluation(
+                    cm = cm,
+                    callback = this,
+                    sessionGen = sessionGen,
+                    network = network,
+                    linkProperties = cm.getLinkProperties(network),
+                )
+            }
+
+            override fun onCapabilitiesChanged(
+                network: Network,
+                networkCapabilities: NetworkCapabilities,
+            ) {
+                if (!serviceActive.get() || networkCallback !== this || sessionGeneration.get() != sessionGen) return
+                if (networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return
                 val handle = network.networkHandle
-                val prev = lastNetworkId
-                val prevIpv6 = lastHasGlobalIpv6
-                val nowIpv6 = hasGlobalIpv6Connectivity()
-                lastNetworkId = handle
-                lastHasGlobalIpv6 = nowIpv6
-                if (prev != null && prev != handle && TunnelRuntimeState.state.value.phase == TunnelPhase.CONNECTED) {
-                    val userForcesIpv4Only = TunnelRuntimeState.appliedSettings.value?.ipv4Only == true
-                    if (!userForcesIpv4Only && prevIpv6 != null && prevIpv6 != nowIpv6) {
-                        // Underlying network changed between IPv4-only and IPv6-capable; rebuild TUN routes.
-                        scheduleStart(startId = latestStartId)
+                val isCurrent = synchronized(networkStateLock) {
+                    activeObservedNetworkId == null || activeObservedNetworkId == handle
+                }
+                if (!isCurrent) return
+                setUnderlyingNetworksSafe(network)
+            }
+
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                if (!serviceActive.get() || networkCallback !== this || sessionGeneration.get() != sessionGen) return
+                val caps = cm.getNetworkCapabilities(network)
+                if (caps == null ||
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) ||
+                    !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                ) {
+                    return
+                }
+                scheduleNetworkEvaluation(
+                    cm = cm,
+                    callback = this,
+                    sessionGen = sessionGen,
+                    network = network,
+                    linkProperties = linkProperties,
+                )
+            }
+
+            override fun onLost(network: Network) {
+                if (!serviceActive.get() || networkCallback !== this || sessionGeneration.get() != sessionGen) return
+                val handle = network.networkHandle
+                val wasCurrent = synchronized(networkStateLock) {
+                    if (activeObservedNetworkId != null && activeObservedNetworkId != handle) {
+                        false
                     } else {
-                        scope.launch {
-                            // Refresh cached DNS & adaptive strategy after Wi-Fi <-> cellular switch.
-                            NativeEngine.clearCache()
+                        networkChangeJob?.cancel()
+                        networkChangeJob = null
+                        activeObservedNetworkId = null
+                        lastObservedPhysicalNetwork = null
+                        committedNetworkId = null
+                        committedIpv4Signature = null
+                        committedIpv6Signature = null
+                        true
+                    }
+                }
+                if (!wasCurrent) return
+                setUnderlyingNetworksSafe(null)
+                if (TunnelRuntimeState.state.value.phase == TunnelPhase.CONNECTED) {
+                    scope.launch {
+                        if (serviceActive.get() && sessionGeneration.get() == sessionGen) {
+                            NativeEngine.notifyRouteChange()
                         }
                     }
                 }
@@ -577,13 +751,95 @@ class VdpiVpnService : VpnService() {
         }
     }
 
+    private fun scheduleNetworkEvaluation(
+        cm: ConnectivityManager,
+        callback: ConnectivityManager.NetworkCallback,
+        sessionGen: Long,
+        network: Network,
+        linkProperties: LinkProperties?,
+    ) {
+        val handle = network.networkHandle
+        synchronized(networkStateLock) {
+            if (!serviceActive.get() || networkCallback !== callback || sessionGeneration.get() != sessionGen) {
+                return
+            }
+            activeObservedNetworkId = handle
+            lastObservedPhysicalNetwork = network
+            networkChangeJob?.cancel()
+            networkChangeJob = scope.launch {
+                delay(NETWORK_CHANGE_DEBOUNCE_MS)
+                if (!isActive ||
+                    !serviceActive.get() ||
+                    networkCallback !== callback ||
+                    sessionGeneration.get() != sessionGen ||
+                    TunnelRuntimeState.state.value.phase != TunnelPhase.CONNECTED
+                ) {
+                    return@launch
+                }
+                val caps = cm.getNetworkCapabilities(network)
+                if (caps == null ||
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) ||
+                    !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                ) {
+                    return@launch
+                }
+                val freshLinkProps = cm.getLinkProperties(network) ?: linkProperties
+                val nowIpv6 = hasGlobalIpv6OnLinkProperties(freshLinkProps)
+                val nowIpv4Sig = ipv4Signature(freshLinkProps)
+                val nowIpv6Sig = ipv6Signature(freshLinkProps)
+                var stillCurrent = false
+                var prevHandle: Long? = null
+                var prevIpv4Sig: String? = null
+                var prevIpv6Sig: String? = null
+                synchronized(networkStateLock) {
+                    if (activeObservedNetworkId == handle &&
+                        networkCallback === callback &&
+                        sessionGeneration.get() == sessionGen
+                    ) {
+                        prevHandle = committedNetworkId
+                        prevIpv4Sig = committedIpv4Signature
+                        prevIpv6Sig = committedIpv6Signature
+                        committedNetworkId = handle
+                        committedIpv4Signature = nowIpv4Sig
+                        committedIpv6Signature = nowIpv6Sig
+                        stillCurrent = true
+                    }
+                }
+                if (!stillCurrent) return@launch
+                setUnderlyingNetworksSafe(network)
+
+                val userForcesIpv4Only = TunnelRuntimeState.appliedSettings.value?.ipv4Only == true
+                val desiredTunIpv6 = !userForcesIpv4Only && nowIpv6
+                val ipv4Changed = prevIpv4Sig != null && nowIpv4Sig.isNotEmpty() && prevIpv4Sig != nowIpv4Sig
+                val ipv6Changed = prevIpv6Sig != null && nowIpv6Sig.isNotEmpty() && prevIpv6Sig != nowIpv6Sig
+                if (desiredTunIpv6 != appliedTunIpv6) {
+                    // Underlying network IPv6 capability diverged from the active TUN config; rebuild TUN routes
+                    // with the newly observed physical network so start does not race cm.activeNetwork.
+                    scheduleStart(startId = latestStartId, preferredPhysicalNetwork = network)
+                } else if (prevHandle != handle || ipv4Changed || ipv6Changed) {
+                    // Drain stale UDP NAT sockets and clear DNS cache while preserving learned TLS strategies.
+                    NativeEngine.notifyRouteChange()
+                }
+            }
+        }
+    }
+
     private fun unregisterNetworkMonitor() {
-        val cb = networkCallback ?: return
+        val cb = networkCallback
         networkCallback = null
-        lastNetworkId = null
-        lastHasGlobalIpv6 = null
-        runCatching {
-            getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb)
+        synchronized(networkStateLock) {
+            networkChangeJob?.cancel()
+            networkChangeJob = null
+            activeObservedNetworkId = null
+            lastObservedPhysicalNetwork = null
+            committedNetworkId = null
+            committedIpv4Signature = null
+            committedIpv6Signature = null
+        }
+        if (cb != null) {
+            runCatching {
+                getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb)
+            }
         }
     }
 
@@ -632,6 +888,9 @@ class VdpiVpnService : VpnService() {
                     requestTileSync()
                 }
 
+                // Drain any prior wake signal before sampling isInteractive so an ACTION_SCREEN_ON
+                // arriving after the check stays buffered and wakes the idle sleep immediately.
+                telemetryWakeChannel.tryReceive()
                 val interactive = powerManager?.isInteractive ?: true
                 val wokeUp = interactive && !wasInteractive
                 wasInteractive = interactive
@@ -679,13 +938,20 @@ class VdpiVpnService : VpnService() {
                     }
                 }
                 tick += 1
-                delay(1000L)
+                if (interactive) {
+                    delay(TELEMETRY_POLL_INTERACTIVE_MS)
+                } else {
+                    withTimeoutOrNull(TELEMETRY_POLL_IDLE_MS) {
+                        telemetryWakeChannel.receive()
+                    }
+                }
             }
         }
     }
 
     private fun stopTunnelInternal(startId: Int? = null, expectedGen: Long) {
         unregisterNetworkMonitor()
+        appliedTunIpv6 = false
         pollJob?.cancel()
         pollJob = null
         NativeEngine.stop()
@@ -726,7 +992,9 @@ class VdpiVpnService : VpnService() {
         sessionGeneration.incrementAndGet()
         clearNotificationState()
         runCatching { unregisterReceiver(dismissReceiver) }
+        runCatching { unregisterReceiver(screenOnReceiver) }
         unregisterNetworkMonitor()
+        appliedTunIpv6 = false
         transitionJob?.cancel()
         pollJob?.cancel()
         getSystemService(NotificationManager::class.java)?.cancel(NOTIFICATION_ID)
@@ -904,6 +1172,92 @@ class VdpiVpnService : VpnService() {
         private const val TUN_IPV4_DNS = "198.18.0.1"
         private const val TUN_IPV6_ADDR = "fd00:7664:7069::1"
         private const val TUN_IPV6_DNS = "fd00:7664:7069::2"
+        private const val TELEMETRY_POLL_INTERACTIVE_MS = 1_000L
+        private const val TELEMETRY_POLL_IDLE_MS = 15_000L
+        private const val NETWORK_CHANGE_DEBOUNCE_MS = 400L
+
+        // LAN, loopback, link-local, CGNAT, DS-Lite/464XLAT, multicast, and reserved IPv4 ranges excluded on API 33+.
+        private val EXCLUDED_IPV4_ROUTES: List<Pair<String, Int>> = listOf(
+            "0.0.0.0" to 8,
+            "10.0.0.0" to 8,
+            "100.64.0.0" to 10,
+            "127.0.0.0" to 8,
+            "169.254.0.0" to 16,
+            "172.16.0.0" to 12,
+            "192.0.0.0" to 24,
+            "192.168.0.0" to 16,
+            "224.0.0.0" to 4,
+            "240.0.0.0" to 4,
+        )
+
+        // Exact public IPv4 complement of EXCLUDED_IPV4_ROUTES for API 26-32 (includes 198.18.0.0/30).
+        private val PUBLIC_IPV4_ROUTES: List<Pair<String, Int>> = listOf(
+            "1.0.0.0" to 8,
+            "2.0.0.0" to 7,
+            "4.0.0.0" to 6,
+            "8.0.0.0" to 7,
+            "11.0.0.0" to 8,
+            "12.0.0.0" to 6,
+            "16.0.0.0" to 4,
+            "32.0.0.0" to 3,
+            "64.0.0.0" to 3,
+            "96.0.0.0" to 6,
+            "100.0.0.0" to 10,
+            "100.128.0.0" to 9,
+            "101.0.0.0" to 8,
+            "102.0.0.0" to 7,
+            "104.0.0.0" to 5,
+            "112.0.0.0" to 5,
+            "120.0.0.0" to 6,
+            "124.0.0.0" to 7,
+            "126.0.0.0" to 8,
+            "128.0.0.0" to 3,
+            "160.0.0.0" to 5,
+            "168.0.0.0" to 8,
+            "169.0.0.0" to 9,
+            "169.128.0.0" to 10,
+            "169.192.0.0" to 11,
+            "169.224.0.0" to 12,
+            "169.240.0.0" to 13,
+            "169.248.0.0" to 14,
+            "169.252.0.0" to 15,
+            "169.255.0.0" to 16,
+            "170.0.0.0" to 7,
+            "172.0.0.0" to 12,
+            "172.32.0.0" to 11,
+            "172.64.0.0" to 10,
+            "172.128.0.0" to 9,
+            "173.0.0.0" to 8,
+            "174.0.0.0" to 7,
+            "176.0.0.0" to 4,
+            "192.0.1.0" to 24,
+            "192.0.2.0" to 23,
+            "192.0.4.0" to 22,
+            "192.0.8.0" to 21,
+            "192.0.16.0" to 20,
+            "192.0.32.0" to 19,
+            "192.0.64.0" to 18,
+            "192.0.128.0" to 17,
+            "192.1.0.0" to 16,
+            "192.2.0.0" to 15,
+            "192.4.0.0" to 14,
+            "192.8.0.0" to 13,
+            "192.16.0.0" to 12,
+            "192.32.0.0" to 11,
+            "192.64.0.0" to 10,
+            "192.128.0.0" to 11,
+            "192.160.0.0" to 13,
+            "192.169.0.0" to 16,
+            "192.170.0.0" to 15,
+            "192.172.0.0" to 14,
+            "192.176.0.0" to 12,
+            "192.192.0.0" to 10,
+            "193.0.0.0" to 8,
+            "194.0.0.0" to 7,
+            "196.0.0.0" to 6,
+            "200.0.0.0" to 5,
+            "208.0.0.0" to 4,
+        )
 
         private val serviceActive = AtomicBoolean(false)
 

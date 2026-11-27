@@ -21,8 +21,11 @@ use vdpi_tun::pipeline::{run_tun_pipeline_with_route_watch, TunStats};
 
 /// Hard iOS TUN MTU cap matching `TunnelNetworkSettingsBuilder` (4064 bytes).
 const IOS_MAX_MTU: usize = 4064;
-/// Minimum channel depth for the `NEPacketTunnelFlow` bridge so bursty batches never drop TCP ACKs.
+/// Minimum inbound channel depth for the `NEPacketTunnelFlow` bridge so bursty batches never drop TCP ACKs.
 const PACKET_FLOW_MIN_CHANNEL_CAP: usize = 512;
+/// Bounded outbound TUN TX channel depth (128 packets), matching `fd.rs` and `windows_tun.rs`,
+/// so bulk TCP hits event-driven backpressure instead of queuing 512 TCP packets ahead of UDP preemption.
+const PACKET_FLOW_OUTBOUND_CHANNEL_CAP: usize = 128;
 /// Maximum packets drained per single batched outbound callback invocation.
 const OUTBOUND_BATCH_MAX: usize = 64;
 /// Stack size for the dedicated OS packet writer thread (`vdpi-ios-tx`).
@@ -307,8 +310,8 @@ fn start_packet_flow_tunnel(cfg: IosConfig, callback: PacketWriterCallback) -> R
     let profile = TunProfile::LOW_MEMORY;
     let mtu = cfg.clamped_mtu().min(IOS_MAX_MTU);
     let mode_label = format!("{:?}", cfg.mode);
-    let dns_label = cfg.dns_addr.clone();
-    let doh_enabled = cfg.enable_doh;
+    let dns_label = vdpi_core::dns::redact_dns_for_display(&cfg.dns_addr);
+    let doh_enabled = vdpi_core::dns::is_effective_doh_target(&cfg.dns_addr, cfg.enable_doh);
 
     // Tear down any previous tunnel BEFORE loading `adaptive-cache.json` so the old session
     // flushes newly learned strategies and never overwrites the new session's cache.
@@ -317,9 +320,12 @@ fn start_packet_flow_tunnel(cfg: IosConfig, callback: PacketWriterCallback) -> R
     let ctx = mgr.runtime.block_on(vdpi_tun::build_engine_context(cfg))?;
 
     let tun_stats = Arc::new(TunStats::default());
-    let chan_cap = profile.channel_capacity.max(PACKET_FLOW_MIN_CHANNEL_CAP);
-    let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>(chan_cap);
-    let (outbound_tx, outbound_rx) = mpsc::channel::<Vec<u8>>(chan_cap);
+    let inbound_cap = profile.channel_capacity.max(PACKET_FLOW_MIN_CHANNEL_CAP);
+    let outbound_cap = profile
+        .channel_capacity
+        .clamp(1, PACKET_FLOW_OUTBOUND_CHANNEL_CAP);
+    let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>(inbound_cap);
+    let (outbound_tx, outbound_rx) = mpsc::channel::<Vec<u8>>(outbound_cap);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (route_tx, route_rx) = watch::channel(0u64);
 
@@ -404,8 +410,8 @@ pub fn start_tunnel_fd(owned_fd: std::os::unix::io::OwnedFd, cfg: IosConfig) -> 
     let profile = TunProfile::LOW_MEMORY;
     let mtu = cfg.clamped_mtu().min(IOS_MAX_MTU);
     let mode_label = format!("{:?}", cfg.mode);
-    let dns_label = cfg.dns_addr.clone();
-    let doh_enabled = cfg.enable_doh;
+    let dns_label = vdpi_core::dns::redact_dns_for_display(&cfg.dns_addr);
+    let doh_enabled = vdpi_core::dns::is_effective_doh_target(&cfg.dns_addr, cfg.enable_doh);
 
     // Stop any previous direct-FD session BEFORE registering the new dup(utun) fd and
     // loading `adaptive-cache.json` so two kqueue registrations never race on the same

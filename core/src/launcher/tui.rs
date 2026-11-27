@@ -3,7 +3,10 @@ use super::{
     Choice, LauncherMenu, MenuItem, StatusRow, StatusTone, CUSTOM_DNS_HINT, DNS_PRESETS,
 };
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
@@ -15,10 +18,12 @@ use ratatui::{Frame, Terminal};
 use std::borrow::Cow;
 use std::io;
 use vdpi::server::REPOSITORY_URL;
-use vdpi::service::ControlCenterStatus;
-use vdpi_core::config::SplitTunnelConfig;
+use vdpi::service::{ControlCenterStatus, ServiceState};
+use vdpi_core::config::{EngineMode, SplitTunnelConfig};
 
 const MAX_CARD_WIDTH: u16 = 72;
+const MAX_NOTICE_LINES: usize = 2;
+const WINDOWS_TUN_TIP: &str = "Tip: Switch to TUN mode for Roblox & Discord voice.";
 const VERSION_LABEL: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 const MAX_RULE_COLS: usize = 68;
 const RULE: &str = "────────────────────────────────────────────────────────────────────";
@@ -106,6 +111,7 @@ impl Palette {
             let plain = Style::new();
             let bold = Style::new().add_modifier(Modifier::BOLD);
             let dim = Style::new().add_modifier(Modifier::DIM);
+            let rev = Style::new().add_modifier(Modifier::REVERSED);
             Self {
                 border: plain,
                 divider: dim,
@@ -119,7 +125,7 @@ impl Palette {
                 status_neutral: plain,
                 status_warn_dot: "! ",
                 danger_bold: bold,
-                active_row: Style::new().add_modifier(Modifier::REVERSED),
+                active_row: rev,
                 active_marker: bold,
                 active_badge: bold,
                 active_title: bold,
@@ -127,7 +133,7 @@ impl Palette {
                 inactive_badge: dim,
                 inactive_title: plain,
                 inactive_hint: dim,
-                input_bg: bold,
+                input_bg: rev,
                 footer_key: bold,
                 footer_text: dim,
             }
@@ -166,9 +172,22 @@ struct UiState {
     dns_selected: usize,
     editing_custom_dns: bool,
     custom_dns_input: String,
+    custom_dns_cursor: usize,
     custom_dns_error: Option<String>,
     configured_dns: String,
     split_tunnel: SplitTunnelConfig,
+    show_tun_tip: bool,
+}
+
+fn should_show_tun_tip_for_platform(is_windows: bool, status: &ControlCenterStatus) -> bool {
+    is_windows
+        && status.installed.is_none()
+        && status.service_state == ServiceState::NotInstalled
+        && status
+            .live_engine
+            .as_ref()
+            .map_or(status.configured_engine, |live| live.engine)
+            == EngineMode::Proxy
 }
 
 impl UiState {
@@ -211,9 +230,11 @@ impl UiState {
             dns_selected: dns_preset_index(dns),
             editing_custom_dns: false,
             custom_dns_input: String::new(),
+            custom_dns_cursor: 0,
             custom_dns_error: None,
             configured_dns: dns.to_string(),
             split_tunnel: split_tunnel.clone(),
+            show_tun_tip: should_show_tun_tip_for_platform(cfg!(target_os = "windows"), status),
         }
     }
 
@@ -222,6 +243,7 @@ impl UiState {
         self.selecting_dns = true;
         self.editing_custom_dns = false;
         self.custom_dns_input.clear();
+        self.custom_dns_cursor = 0;
         self.custom_dns_error = None;
     }
 
@@ -237,6 +259,7 @@ impl UiState {
         } else {
             String::new()
         };
+        self.custom_dns_cursor = self.custom_dns_input.chars().count();
         self.custom_dns_error = None;
     }
 }
@@ -255,7 +278,8 @@ enum Density {
 struct LayoutPlan {
     density: Density,
     visible_status_rows: usize,
-    show_notice: bool,
+    show_tun_tip: bool,
+    visible_notice_rows: usize,
     show_footer: bool,
     card_height: u16,
 }
@@ -283,7 +307,7 @@ impl LayoutPlan {
 
     const fn status_divider(self) -> bool {
         !matches!(self.density, Density::CompactMinimal)
-            && (self.visible_status_rows > 0 || self.show_notice)
+            && (self.visible_status_rows > 0 || self.show_tun_tip || self.visible_notice_rows > 0)
     }
 
     const fn bottom_divider(self) -> bool {
@@ -296,12 +320,22 @@ impl LayoutPlan {
         )
     }
 
-    fn compute(area_height: u16, item_count: usize, status_count: usize, has_notice: bool) -> Self {
+    fn compute(
+        area_height: u16,
+        item_count: usize,
+        status_count: usize,
+        notice_rows: usize,
+        has_tip: bool,
+    ) -> Self {
         let n = u16::try_from(item_count).unwrap_or(u16::MAX);
         let s = u16::try_from(status_count).unwrap_or(u16::MAX);
-        let m = u16::from(has_notice);
-        let status_div = u16::from(status_count > 0 || has_notice);
-        let status_block = s.saturating_add(m).saturating_add(status_div);
+        let t = u16::from(has_tip);
+        let m = u16::try_from(notice_rows).unwrap_or(u16::MAX);
+        let status_div = u16::from(status_count > 0 || has_tip || notice_rows > 0);
+        let status_block = s
+            .saturating_add(t)
+            .saturating_add(m)
+            .saturating_add(status_div);
 
         // Tall terminals (>= 28 rows) can expand to show per-item hints for every entry.
         if area_height >= 28 {
@@ -318,7 +352,8 @@ impl LayoutPlan {
                 return Self {
                     density: Density::Spacious,
                     visible_status_rows: status_count,
-                    show_notice: has_notice,
+                    show_tun_tip: has_tip,
+                    visible_notice_rows: notice_rows,
                     show_footer: true,
                     card_height: spacious_h,
                 };
@@ -332,7 +367,8 @@ impl LayoutPlan {
                 return Self {
                     density: Density::Cozy,
                     visible_status_rows: status_count,
-                    show_notice: has_notice,
+                    show_tun_tip: has_tip,
+                    visible_notice_rows: notice_rows,
                     show_footer: true,
                     card_height: cozy_h,
                 };
@@ -349,7 +385,8 @@ impl LayoutPlan {
             return Self {
                 density: Density::CompactActiveHint,
                 visible_status_rows: status_count,
-                show_notice: has_notice,
+                show_tun_tip: has_tip,
+                visible_notice_rows: notice_rows,
                 show_footer: true,
                 card_height: active_hint_h,
             };
@@ -361,7 +398,8 @@ impl LayoutPlan {
             return Self {
                 density: Density::CompactDivided,
                 visible_status_rows: status_count,
-                show_notice: has_notice,
+                show_tun_tip: has_tip,
+                visible_notice_rows: notice_rows,
                 show_footer: true,
                 card_height: compact_divided_h,
             };
@@ -373,19 +411,25 @@ impl LayoutPlan {
             return Self {
                 density: Density::CompactTight,
                 visible_status_rows: status_count,
-                show_notice: has_notice,
+                show_tun_tip: has_tip,
+                visible_notice_rows: notice_rows,
                 show_footer: true,
                 card_height: compact_tight_h,
             };
         }
 
-        // borders(2) + header(1) + status(s) + notice(m) + items(n) + footer(1)
-        let compact_minimal_h = 4u16.saturating_add(s).saturating_add(m).saturating_add(n);
+        // borders(2) + header(1) + status(s) + tip(t) + notice(m) + items(n) + footer(1)
+        let compact_minimal_h = 4u16
+            .saturating_add(s)
+            .saturating_add(t)
+            .saturating_add(m)
+            .saturating_add(n);
         if area_height >= compact_minimal_h {
             return Self {
                 density: Density::CompactMinimal,
                 visible_status_rows: status_count,
-                show_notice: has_notice,
+                show_tun_tip: has_tip,
+                visible_notice_rows: notice_rows,
                 show_footer: true,
                 card_height: compact_minimal_h,
             };
@@ -399,21 +443,29 @@ impl LayoutPlan {
             .saturating_sub(u16::from(show_footer));
         let min_items = n.min(2);
 
-        let (visible_status_rows, show_notice) =
-            if remaining >= s.saturating_add(m).saturating_add(min_items) {
-                (status_count, has_notice)
-            } else if remaining >= s.saturating_add(min_items) {
-                (status_count, false)
-            } else if status_count > 0 && remaining >= 1u16.saturating_add(min_items) {
-                (1, false)
-            } else {
-                (0, false)
-            };
+        let (visible_status_rows, show_tun_tip, visible_notice_rows) = if remaining
+            >= s.saturating_add(t)
+                .saturating_add(m)
+                .saturating_add(min_items)
+        {
+            (status_count, has_tip, notice_rows)
+        } else if remaining >= s.saturating_add(m).saturating_add(min_items) {
+            (status_count, false, notice_rows)
+        } else if notice_rows > 1 && remaining >= s.saturating_add(1).saturating_add(min_items) {
+            (status_count, false, 1)
+        } else if remaining >= s.saturating_add(min_items) {
+            (status_count, false, 0)
+        } else if status_count > 0 && remaining >= 1u16.saturating_add(min_items) {
+            (1, false, 0)
+        } else {
+            (0, false, 0)
+        };
 
         Self {
             density: Density::CompactMinimal,
             visible_status_rows,
-            show_notice,
+            show_tun_tip,
+            visible_notice_rows,
             show_footer,
             card_height: area_height,
         }
@@ -555,9 +607,9 @@ impl TerminalGuard {
         terminal::enable_raw_mode()?;
         crate::tui_dashboard::mark_tui_active(true);
         let mut stdout = io::stdout();
-        if let Err(err) = execute!(stdout, EnterAlternateScreen, Hide) {
+        if let Err(err) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, Hide) {
             if crate::tui_dashboard::take_tui_active() {
-                let _ = execute!(stdout, LeaveAlternateScreen, Show);
+                let _ = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen, Show);
                 let _ = terminal::disable_raw_mode();
             }
             return Err(err);
@@ -567,7 +619,12 @@ impl TerminalGuard {
             Ok(terminal) => terminal,
             Err(err) => {
                 if crate::tui_dashboard::take_tui_active() {
-                    let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+                    let _ = execute!(
+                        io::stdout(),
+                        DisableBracketedPaste,
+                        LeaveAlternateScreen,
+                        Show
+                    );
                     let _ = terminal::disable_raw_mode();
                 }
                 return Err(err);
@@ -582,7 +639,12 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         if crate::tui_dashboard::take_tui_active() {
-            let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen, Show);
+            let _ = execute!(
+                self.terminal.backend_mut(),
+                DisableBracketedPaste,
+                LeaveAlternateScreen,
+                Show
+            );
             let _ = terminal::disable_raw_mode();
         }
     }
@@ -639,6 +701,11 @@ where
         loop {
             match event::read()? {
                 Event::Resize(..) => break,
+                Event::Paste(text) => {
+                    if handle_paste(&mut state, &text) == Action::Redraw {
+                        break;
+                    }
+                }
                 Event::Key(key) => match handle_key(&mut state, key) {
                     Action::Redraw => break,
                     Action::Refresh => {
@@ -669,7 +736,9 @@ fn apply_refresh(state: &mut UiState, latest: &ControlCenterStatus) {
     state.selecting_dns = false;
     state.editing_custom_dns = false;
     state.custom_dns_input.clear();
+    state.custom_dns_cursor = 0;
     state.custom_dns_error = None;
+    state.show_tun_tip = should_show_tun_tip_for_platform(cfg!(target_os = "windows"), latest);
     if state.menu.items.is_empty() {
         state.selected = 0;
     } else {
@@ -677,30 +746,130 @@ fn apply_refresh(state: &mut UiState, latest: &ControlCenterStatus) {
     }
 }
 
+fn is_altgr_char(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(_))
+        && (key.modifiers - KeyModifiers::SHIFT) == (KeyModifiers::CONTROL | KeyModifiers::ALT)
+}
+
+fn first_non_empty_pasted_line(pasted: &str) -> &str {
+    pasted
+        .split(['\r', '\n'])
+        .map(str::trim)
+        .find(|line| line.chars().any(|ch| !ch.is_control()))
+        .unwrap_or("")
+}
+
+fn handle_paste(state: &mut UiState, pasted: &str) -> Action {
+    if !(state.selecting_dns && state.editing_custom_dns) {
+        return Action::Ignore;
+    }
+    let first_line = first_non_empty_pasted_line(pasted);
+    let mut current_len = state.custom_dns_input.chars().count();
+    let mut cursor = state.custom_dns_cursor.min(current_len);
+    let mut byte_idx = char_to_byte_idx(&state.custom_dns_input, cursor);
+    let mut changed = false;
+    for ch in first_line.chars() {
+        if ch.is_control() {
+            continue;
+        }
+        if current_len >= MAX_CUSTOM_DNS_INPUT_CHARS {
+            break;
+        }
+        state.custom_dns_input.insert(byte_idx, ch);
+        byte_idx += ch.len_utf8();
+        cursor += 1;
+        current_len += 1;
+        changed = true;
+    }
+    if changed {
+        state.custom_dns_cursor = cursor;
+        state.custom_dns_error = None;
+        Action::Redraw
+    } else {
+        Action::Ignore
+    }
+}
+
 fn handle_custom_dns_key(state: &mut UiState, key: KeyEvent) -> Action {
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('u' | 'U'))
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+        && matches!(key.code, KeyCode::Char('u' | 'U'))
     {
         if key.kind != KeyEventKind::Press {
             return Action::Ignore;
         }
         if !state.custom_dns_input.is_empty() || state.custom_dns_error.is_some() {
             state.custom_dns_input.clear();
+            state.custom_dns_cursor = 0;
             state.custom_dns_error = None;
             return Action::Redraw;
         }
         return Action::Ignore;
     }
 
-    if key
-        .modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    if !is_altgr_char(&key)
+        && key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
     {
         return Action::Ignore;
     }
 
+    let char_len = state.custom_dns_input.chars().count();
+    let cursor = state.custom_dns_cursor.min(char_len);
+
     match key.code {
+        KeyCode::Left => {
+            if cursor > 0 {
+                state.custom_dns_cursor = cursor - 1;
+                return Action::Redraw;
+            }
+            Action::Ignore
+        }
+        KeyCode::Right => {
+            if cursor < char_len {
+                state.custom_dns_cursor = cursor + 1;
+                return Action::Redraw;
+            }
+            Action::Ignore
+        }
+        KeyCode::Home => {
+            if cursor > 0 {
+                state.custom_dns_cursor = 0;
+                return Action::Redraw;
+            }
+            Action::Ignore
+        }
+        KeyCode::End => {
+            if cursor < char_len {
+                state.custom_dns_cursor = char_len;
+                return Action::Redraw;
+            }
+            Action::Ignore
+        }
         KeyCode::Backspace => {
-            if state.custom_dns_input.pop().is_some() || state.custom_dns_error.is_some() {
+            if cursor > 0 {
+                let byte_idx = char_to_byte_idx(&state.custom_dns_input, cursor - 1);
+                state.custom_dns_input.remove(byte_idx);
+                state.custom_dns_cursor = cursor - 1;
+                state.custom_dns_error = None;
+                return Action::Redraw;
+            }
+            if state.custom_dns_error.is_some() {
+                state.custom_dns_error = None;
+                return Action::Redraw;
+            }
+            Action::Ignore
+        }
+        KeyCode::Delete => {
+            if cursor < char_len {
+                let byte_idx = char_to_byte_idx(&state.custom_dns_input, cursor);
+                state.custom_dns_input.remove(byte_idx);
+                state.custom_dns_cursor = cursor;
+                state.custom_dns_error = None;
+                return Action::Redraw;
+            }
+            if state.custom_dns_error.is_some() {
                 state.custom_dns_error = None;
                 return Action::Redraw;
             }
@@ -722,8 +891,10 @@ fn handle_custom_dns_key(state: &mut UiState, key: KeyEvent) -> Action {
             }
         }
         KeyCode::Char(ch) if !ch.is_control() => {
-            if state.custom_dns_input.chars().count() < MAX_CUSTOM_DNS_INPUT_CHARS {
-                state.custom_dns_input.push(ch);
+            if char_len < MAX_CUSTOM_DNS_INPUT_CHARS {
+                let byte_idx = char_to_byte_idx(&state.custom_dns_input, cursor);
+                state.custom_dns_input.insert(byte_idx, ch);
+                state.custom_dns_cursor = cursor + 1;
                 state.custom_dns_error = None;
                 return Action::Redraw;
             }
@@ -739,11 +910,11 @@ fn handle_dns_picker_key(state: &mut UiState, key: KeyEvent) -> Action {
         state.dns_selected = count.saturating_sub(1);
     }
     match key.code {
-        KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
+        KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k' | 'K') => {
             state.dns_selected = (state.dns_selected + count - 1) % count;
             Action::Redraw
         }
-        KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
+        KeyCode::Down | KeyCode::Tab | KeyCode::Char('j' | 'J') => {
             state.dns_selected = (state.dns_selected + 1) % count;
             Action::Redraw
         }
@@ -790,9 +961,15 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Action {
     if key.kind == KeyEventKind::Release {
         return Action::Ignore;
     }
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c' | 'C'))
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+        && matches!(key.code, KeyCode::Char('c' | 'C'))
     {
-        return Action::Finish(Choice::Cancel);
+        return if key.kind == KeyEventKind::Press {
+            Action::Finish(Choice::Cancel)
+        } else {
+            Action::Ignore
+        };
     }
     if state.selecting_dns && state.editing_custom_dns {
         return handle_custom_dns_key(state, key);
@@ -831,10 +1008,10 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Action {
     }
 
     match key.code {
-        KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k') => {
+        KeyCode::Up | KeyCode::BackTab | KeyCode::Char('k' | 'K') => {
             state.selected = (state.selected + count - 1) % count;
         }
-        KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
+        KeyCode::Down | KeyCode::Tab | KeyCode::Char('j' | 'J') => {
             state.selected = (state.selected + 1) % count;
         }
         KeyCode::Home => state.selected = 0,
@@ -940,24 +1117,96 @@ fn sanitize_inline(text: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-fn truncate_head(text: &str, max_chars: usize) -> Cow<'_, str> {
-    if max_chars == 0 {
+fn char_display_width(ch: char) -> usize {
+    let mut buf = [0u8; 4];
+    let s: &str = ch.encode_utf8(&mut buf);
+    Span::raw(s).width()
+}
+
+fn truncate_head(text: &str, max_cols: usize) -> Cow<'_, str> {
+    if max_cols == 0 {
         return Cow::Borrowed("");
     }
-    let len = text.chars().count();
-    if len <= max_chars {
+    if Span::raw(text).width() <= max_cols {
         return Cow::Borrowed(text);
     }
-    if max_chars == 1 {
-        return Cow::Borrowed("…");
+    if max_cols == 1 {
+        let last = text.chars().next_back().unwrap_or('…');
+        return Cow::Owned(last.to_string());
     }
-    let skip = len - (max_chars - 1);
-    let mut out = String::with_capacity(max_chars + '…'.len_utf8());
+    let budget = max_cols - 1;
+    let mut used = 0usize;
+    let mut start_byte = text.len();
+    for (idx, ch) in text.char_indices().rev() {
+        let w = char_display_width(ch);
+        if used.saturating_add(w) > budget {
+            break;
+        }
+        used += w;
+        start_byte = idx;
+    }
+    let mut out = String::with_capacity('…'.len_utf8() + (text.len() - start_byte));
     out.push('…');
-    for ch in text.chars().skip(skip) {
-        out.push(ch);
-    }
+    out.push_str(&text[start_byte..]);
     Cow::Owned(out)
+}
+
+fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map_or(s.len(), |(byte_idx, _)| byte_idx)
+}
+
+fn truncate_tail_cols(text: &str, max_cols: usize) -> Cow<'_, str> {
+    if max_cols == 0 {
+        return Cow::Borrowed("");
+    }
+    if Span::raw(text).width() <= max_cols {
+        return Cow::Borrowed(text);
+    }
+    if max_cols == 1 {
+        let first = text
+            .chars()
+            .next()
+            .filter(|&ch| char_display_width(ch) <= 1)
+            .unwrap_or('…');
+        return Cow::Owned(first.to_string());
+    }
+    let budget = max_cols - 1;
+    let mut used = 0usize;
+    let mut end_byte = 0usize;
+    for (idx, ch) in text.char_indices() {
+        let w = char_display_width(ch);
+        if used.saturating_add(w) > budget {
+            break;
+        }
+        used += w;
+        end_byte = idx + ch.len_utf8();
+    }
+    let mut out = String::with_capacity(end_byte + '…'.len_utf8());
+    out.push_str(&text[..end_byte]);
+    out.push('…');
+    Cow::Owned(out)
+}
+
+fn window_around_cursor(text: &str, cursor_char: usize, max_cols: usize) -> (String, String) {
+    if max_cols == 0 {
+        return (String::new(), String::new());
+    }
+    let split_byte = char_to_byte_idx(text, cursor_char);
+    let before = &text[..split_byte];
+    let after = &text[split_byte..];
+    let before_w = Span::raw(before).width();
+    let after_w = Span::raw(after).width();
+    if before_w.saturating_add(after_w) <= max_cols {
+        return (before.to_string(), after.to_string());
+    }
+    let target_after = after_w.min(max_cols.saturating_sub(before_w).max(max_cols / 3));
+    let target_before = max_cols.saturating_sub(target_after);
+    let vis_before = truncate_head(before, target_before).into_owned();
+    let remaining_for_after = max_cols.saturating_sub(Span::raw(vis_before.as_str()).width());
+    let vis_after = truncate_tail_cols(after, remaining_for_after).into_owned();
+    (vis_before, vis_after)
 }
 
 fn truncate_text(text: &str, max_chars: usize) -> Cow<'_, str> {
@@ -1153,11 +1402,22 @@ fn render(frame: &mut Frame<'_>, state: &UiState, color: bool) {
         return;
     }
 
+    let pad_len = usize::from(inset);
+    let notice_budget = usize::from(inner_width).saturating_sub(pad_len + 2 + pad_len);
+    let cleaned_notice = menu.notice.as_deref().map(clean_notice);
+    let notice_is_warning = cleaned_notice
+        .as_deref()
+        .is_some_and(is_warning_notice);
+    let notice_lines = cleaned_notice.as_deref().map_or_else(Vec::new, |text| {
+        wrap_notice_lines(text, notice_budget, MAX_NOTICE_LINES)
+    });
+
     let plan = LayoutPlan::compute(
         area.height,
         menu.items.len(),
         menu.status_rows.len(),
-        menu.notice.is_some(),
+        notice_lines.len(),
+        state.show_tun_tip,
     );
     let card_area = centered_rect(area, card_width, plan.card_height);
 
@@ -1199,13 +1459,31 @@ fn render(frame: &mut Frame<'_>, state: &UiState, color: bool) {
         }
     }
 
-    if let Some(notice) = menu
-        .notice
-        .as_deref()
-        .filter(|_| plan.show_notice && y < bottom)
-    {
-        render_notice(frame, row(y), notice, ctx);
+    if plan.show_tun_tip && y < bottom {
+        render_tun_tip(frame, row(y), ctx);
         y = y.saturating_add(1);
+    }
+
+    if plan.visible_notice_rows > 0 && y < bottom {
+        let avail_rows = usize::from(bottom.saturating_sub(y)).min(plan.visible_notice_rows);
+        let rendered_lines: Cow<'_, [String]> = if avail_rows < notice_lines.len() {
+            Cow::Owned(cleaned_notice.as_deref().map_or_else(Vec::new, |text| {
+                wrap_notice_lines(text, notice_budget, avail_rows)
+            }))
+        } else {
+            Cow::Borrowed(notice_lines.as_slice())
+        };
+        let notice_height = u16::try_from(rendered_lines.len()).unwrap_or(0);
+        if notice_height > 0 {
+            render_notice(
+                frame,
+                Rect::new(inner.x, y, inner.width, notice_height),
+                notice_is_warning,
+                &rendered_lines,
+                ctx,
+            );
+            y = y.saturating_add(notice_height);
+        }
     }
 
     if plan.status_divider() && y < bottom {
@@ -1361,9 +1639,19 @@ fn render_status_row(frame: &mut Frame<'_>, area: Rect, row: &StatusRow, ctx: Re
                     badge_tone,
                 ))
             } else if budget >= 18 {
+                let is_vpn_badge = raw_badge
+                    .trim_start_matches('[')
+                    .get(..3)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("vpn"));
+                let compact_badge = if is_vpn_badge {
+                    Cow::Borrowed(COMPACT_VPN_BADGE)
+                } else {
+                    truncate_badge(full_badge, budget.saturating_sub(8).clamp(5, 10))
+                };
+                let value_budget = budget.saturating_sub(2 + compact_badge.chars().count());
                 Some((
-                    truncate_text(&row.value, budget - 7),
-                    Cow::Borrowed(COMPACT_VPN_BADGE),
+                    truncate_text(&row.value, value_budget),
+                    compact_badge,
                     badge_tone,
                 ))
             } else {
@@ -1399,34 +1687,126 @@ fn render_status_row(frame: &mut Frame<'_>, area: Rect, row: &StatusRow, ctx: Re
 
 fn is_warning_notice(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    lower.contains("failed")
-        || lower.contains("error")
-        || lower.contains("issues")
-        || lower.contains("already running")
+    [
+        "wintun.dll",
+        "missing",
+        "no running",
+        "not found",
+        "cancelled",
+        "canceled",
+        "warning",
+        "cannot",
+        "unable",
+        "required",
+        "extract",
+        "only supported",
+        "failed",
+        "error",
+        "issues",
+        "already running",
+    ]
+    .into_iter()
+    .any(|needle| lower.contains(needle))
 }
 
-fn render_notice(frame: &mut Frame<'_>, area: Rect, notice: &str, ctx: RenderCtx) {
+fn clean_notice(notice: &str) -> Cow<'_, str> {
+    let stripped = notice
+        .strip_prefix("✓ ")
+        .or_else(|| notice.strip_prefix("! "))
+        .unwrap_or(notice);
+    sanitize_inline(stripped)
+}
+
+fn wrap_notice_lines(cleaned: &str, max_width: usize, max_lines: usize) -> Vec<String> {
+    if max_width == 0 || max_lines == 0 {
+        return Vec::new();
+    }
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if max_lines == 1 {
+        return vec![truncate_text(trimmed, max_width).into_owned()];
+    }
+    if trimmed.chars().count() <= max_width {
+        return vec![trimmed.to_string()];
+    }
+    let mut wrapped = wrap_words(trimmed, max_width);
+    if wrapped.len() <= max_lines {
+        return wrapped;
+    }
+    let overflow = wrapped.split_off(max_lines - 1);
+    let tail = overflow.join(" ");
+    wrapped.push(truncate_text(&tail, max_width).into_owned());
+    wrapped
+}
+
+fn render_tun_tip(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx) {
     if area.is_empty() {
         return;
     }
     let pad = if ctx.inset { " " } else { "" };
-    let cleaned = notice
-        .strip_prefix("✓ ")
-        .or_else(|| notice.strip_prefix("! "))
-        .unwrap_or(notice);
-    let (prefix, style) = if is_warning_notice(cleaned) {
+    let budget = usize::from(area.width).saturating_sub(pad.len() + 2 + pad.len());
+    if budget == 0 {
+        return;
+    }
+    let tip = truncate_text(WINDOWS_TUN_TIP, budget);
+    let line = if let Some(rest) = tip.strip_prefix("Tip: ") {
+        Line::from(vec![
+            Span::raw(pad),
+            Span::styled("· ", ctx.palette.status_accent),
+            Span::styled("Tip: ", ctx.palette.status_accent),
+            Span::styled(rest, ctx.palette.active_hint),
+        ])
+    } else {
+        Line::from(vec![
+            Span::raw(pad),
+            Span::styled("· ", ctx.palette.status_accent),
+            Span::styled(tip.as_ref(), ctx.palette.active_hint),
+        ])
+    };
+    frame.render_widget(line, area);
+}
+
+fn render_notice(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    is_warning: bool,
+    lines: &[String],
+    ctx: RenderCtx,
+) {
+    if area.is_empty() || lines.is_empty() {
+        return;
+    }
+    let pad = if ctx.inset { " " } else { "" };
+    let (prefix, style) = if is_warning {
         ("! ", ctx.palette.status_warn)
     } else {
         ("✓ ", ctx.palette.status_active)
     };
-    let budget = usize::from(area.width).saturating_sub(pad.len() + 2 + pad.len());
-    let text = truncate_text(cleaned, budget);
-    let line = Line::from(vec![
-        Span::raw(pad),
-        Span::styled(prefix, style),
-        Span::styled(text, style),
-    ]);
-    frame.render_widget(line, area);
+    let max_rows = usize::from(area.height).min(lines.len());
+    for (idx, text) in lines.iter().take(max_rows).enumerate() {
+        let row_area = Rect::new(
+            area.x,
+            area.y.saturating_add(u16::try_from(idx).unwrap_or(0)),
+            area.width,
+            1,
+        );
+        let line = if idx == 0 {
+            Line::from(vec![
+                Span::raw(pad),
+                Span::styled(prefix, style),
+                Span::styled(text.as_str(), style),
+            ])
+        } else {
+            Line::from(vec![
+                Span::raw(pad),
+                Span::raw("  "),
+                Span::styled(text.as_str(), style),
+            ])
+        };
+        frame.render_widget(line, row_area);
+    }
 }
 
 fn render_uninstall_confirm(
@@ -1457,7 +1837,7 @@ fn render_uninstall_confirm(
         let header_text = truncate_text("Confirm uninstall", header_budget);
         let line = Line::from(vec![
             Span::raw(pad),
-            Span::styled("● ", ctx.palette.danger_bold),
+            Span::styled(ctx.palette.status_warn_dot, ctx.palette.danger_bold),
             Span::styled(header_text, ctx.palette.danger_bold),
         ]);
         frame.render_widget(line, Rect::new(area.x, y, area.width, 1));
@@ -1700,17 +2080,22 @@ fn render_custom_dns_editor_card(
     let bottom = inner.y.saturating_add(inner.height);
     let row = |row_y: u16| Rect::new(inner.x, row_y, inner.width, 1);
 
+    let show_footer = inner.height >= 5;
+    let essential_rows = 3u16
+        .saturating_add(err_rows)
+        .saturating_add(u16::from(show_footer));
+    let show_top_divider = inner.height >= essential_rows.saturating_add(1);
+    let show_bot_divider = inner.height >= essential_rows.saturating_add(3);
+
     if y < bottom {
         render_header(frame, row(y), ctx);
         y = y.saturating_add(1);
     }
-    if y + 2 < bottom {
+    if show_top_divider && y < bottom {
         render_divider(frame, row(y), ctx);
         y = y.saturating_add(1);
     }
 
-    let show_footer = inner.height >= 5;
-    let show_bot_divider = inner.height >= 9;
     let footer_reserve = u16::from(show_footer) + u16::from(show_bot_divider);
     let body_bottom = bottom.saturating_sub(footer_reserve).max(y);
     let width = usize::from(inner.width);
@@ -1740,37 +2125,63 @@ fn render_custom_dns_editor_card(
         y = y.saturating_add(1);
     }
 
-    // Inline input row: `Custom DNS: <input>▏`
+    // Inline input row: `Custom DNS: <before>▏<after>` with cursor-centered horizontal scroll.
     if y < body_bottom {
         let prompt = "Custom DNS: ";
         let cursor = "▏";
-        let prompt_cols = prompt.chars().count();
-        let cursor_cols = cursor.chars().count();
+        let prompt_cols = Span::raw(prompt).width();
+        let cursor_cols = Span::raw(cursor).width();
         let bar_width = width.saturating_sub(pad.len() + right_margin);
         let sanitized = sanitize_inline(&state.custom_dns_input);
+        let bg = palette.input_bg;
         let line = if bar_width > prompt_cols + cursor_cols {
             let input_budget = bar_width.saturating_sub(prompt_cols + cursor_cols);
-            let visible_input = truncate_head(&sanitized, input_budget).into_owned();
-            let used = prompt_cols + visible_input.chars().count() + cursor_cols;
+            let (vis_before, vis_after) =
+                window_around_cursor(&sanitized, state.custom_dns_cursor, input_budget);
+            let used = prompt_cols
+                + Span::raw(vis_before.as_str()).width()
+                + cursor_cols
+                + Span::raw(vis_after.as_str()).width();
             let fill = bar_width.saturating_sub(used);
-            let bg = palette.input_bg;
             let mut spans = vec![
                 Span::raw(pad),
                 Span::styled(prompt, bg.patch(palette.active_marker)),
-                Span::styled(visible_input, bg),
+                Span::styled(vis_before, bg),
                 Span::styled(cursor, bg.patch(palette.status_accent)),
             ];
-            if fill > 0 && color {
+            if !vis_after.is_empty() {
+                spans.push(Span::styled(vis_after, bg));
+            }
+            if fill > 0 {
+                spans.push(Span::styled(" ".repeat(fill), bg));
+            }
+            Line::from(spans)
+        } else if bar_width >= cursor_cols {
+            let input_budget = bar_width.saturating_sub(cursor_cols);
+            let (vis_before, vis_after) =
+                window_around_cursor(&sanitized, state.custom_dns_cursor, input_budget);
+            let used = Span::raw(vis_before.as_str()).width()
+                + cursor_cols
+                + Span::raw(vis_after.as_str()).width();
+            let fill = bar_width.saturating_sub(used);
+            let mut spans = vec![
+                Span::raw(pad),
+                Span::styled(vis_before, bg),
+                Span::styled(cursor, bg.patch(palette.status_accent)),
+            ];
+            if !vis_after.is_empty() {
+                spans.push(Span::styled(vis_after, bg));
+            }
+            if fill > 0 {
                 spans.push(Span::styled(" ".repeat(fill), bg));
             }
             Line::from(spans)
         } else {
-            let compact = format!("{prompt}{sanitized}{cursor}");
             Line::from(vec![
                 Span::raw(pad),
                 Span::styled(
-                    truncate_head(&compact, bar_width).into_owned(),
-                    palette.active_marker,
+                    truncate_head(cursor, bar_width).into_owned(),
+                    bg.patch(palette.active_marker),
                 ),
             ])
         };
@@ -1919,6 +2330,9 @@ fn render_dns_picker_card(
     };
     let custom_active = is_custom_dns(&state.configured_dns);
     let prefix_cols = if inset { 3usize } else { 2usize };
+    // Keep 19-col alignment when every preset (including [Active]) fits cleanly;
+    // on compact widths like 46x18, switch to dynamic spacing so IPs never truncate.
+    let align_columns = width >= prefix_cols + 4 + 33 + 9 + right_margin;
 
     for index in (start_index..DNS_PICKER_ITEM_COUNT).take(visible_slots) {
         if y >= list_bottom {
@@ -1967,10 +2381,10 @@ fn render_dns_picker_card(
                 .addr
                 .eq_ignore_ascii_case(state.configured_dns.trim());
             let active_tag = if is_active { " [Active]" } else { "" };
-            let label = format!("{:<19} {}", preset.name, preset.addr);
             let used = prefix_cols + badge.len() + 1 + active_tag.len() + right_margin;
             let budget = width.saturating_sub(used);
-            let display_label = truncate_text(&label, budget).into_owned();
+            let display_label =
+                format_dns_preset_label(preset.name, preset.addr, budget, align_columns);
             spans.push(Span::styled(display_label, title_style));
             if is_active {
                 spans.push(Span::styled(active_tag, palette.status_active));
@@ -1981,9 +2395,7 @@ fn render_dns_picker_card(
             let used = prefix_cols + badge.len() + 1 + active_tag.len() + right_margin;
             let budget = width.saturating_sub(used);
             if custom_active {
-                let short_full =
-                    shorten_custom_dns(&state.configured_dns, budget.saturating_sub(12));
-                if budget >= 20 + short_full.chars().count() || budget >= 42 {
+                if align_columns && budget >= 24 {
                     let val_budget = budget.saturating_sub(20);
                     let display_val = shorten_custom_dns(&state.configured_dns, val_budget);
                     let label = format!("{:<19} {display_val}", "Custom DNS");
@@ -2004,7 +2416,7 @@ fn render_dns_picker_card(
                 } else {
                     palette.inactive_hint
                 };
-                if budget >= 20 + CUSTOM_DNS_PLACEHOLDER.len() || budget >= 42 {
+                if align_columns && budget >= 20 + CUSTOM_DNS_PLACEHOLDER.len() {
                     let val_budget = budget.saturating_sub(20);
                     spans.push(Span::styled(format!("{:<19} ", "Custom DNS"), title_style));
                     spans.push(Span::styled(
@@ -2060,6 +2472,25 @@ fn render_dns_picker_card(
         footer_y = footer_y.saturating_sub(1);
         render_divider(frame, row(footer_y), ctx);
     }
+}
+
+fn format_dns_preset_label(name: &str, addr: &str, budget: usize, align_columns: bool) -> String {
+    let name_len = name.chars().count();
+    let addr_len = addr.chars().count();
+    if align_columns && 20 + addr_len <= budget {
+        return format!("{name:<19} {addr}");
+    }
+    if name_len + 2 + addr_len <= budget {
+        return format!("{name}  {addr}");
+    }
+    if name_len + 1 + addr_len <= budget {
+        return format!("{name} {addr}");
+    }
+    if budget >= addr_len + 5 {
+        let name_budget = budget - addr_len - 1;
+        return format!("{} {addr}", truncate_text(name, name_budget));
+    }
+    truncate_text(&format!("{name} {addr}"), budget).into_owned()
 }
 
 fn render_custom_dns_footer(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx) {
@@ -2425,10 +2856,15 @@ fn render_minimal(
     if state.selecting_dns {
         if area.height >= 2 {
             let text = if state.editing_custom_dns {
-                let prompt = format!("DNS: {}▏", sanitize_inline(&state.custom_dns_input));
+                let sanitized = sanitize_inline(&state.custom_dns_input);
+                let budget = usize::from(area.width).saturating_sub(6);
+                let (vis_before, vis_after) =
+                    window_around_cursor(&sanitized, state.custom_dns_cursor, budget);
+                let prompt = format!("DNS: {vis_before}▏{vis_after}");
                 truncate_head(&prompt, usize::from(area.width)).into_owned()
             } else {
-                truncate_text("Choose DNS [1-7]", usize::from(area.width)).into_owned()
+                let prompt = format!("Choose DNS [{}]", range_label(DNS_PICKER_ITEM_COUNT));
+                truncate_text(&prompt, usize::from(area.width)).into_owned()
             };
             frame.render_widget(
                 Line::styled(text, palette.active_title),
@@ -2463,9 +2899,8 @@ mod tests {
     use ratatui::buffer::Buffer;
     use std::net::{IpAddr, Ipv4Addr};
     use std::path::PathBuf;
-    use vdpi::service::{InstalledInfo, LiveEngineStatus, ServiceState};
+    use vdpi::service::{InstalledInfo, LiveEngineStatus};
     use vdpi::update::VersionRelation;
-    use vdpi_core::config::EngineMode;
 
     fn sample_info(
         installed_version: Option<&str>,
@@ -2498,6 +2933,7 @@ mod tests {
             tun_interface: None,
             physical_nic: None,
             vpn_conflict: None,
+            dns_addr: None,
             udp_flows_active: None,
             quic_blocked: None,
             dns_queries: None,
@@ -2954,9 +3390,11 @@ mod tests {
             dns_selected: 0,
             editing_custom_dns: false,
             custom_dns_input: String::new(),
+            custom_dns_cursor: 0,
             custom_dns_error: None,
             configured_dns: DNS_PRESETS[0].addr.to_string(),
             split_tunnel: SplitTunnelConfig::default(),
+            show_tun_tip: false,
         };
 
         for state in [&paused, &confirm, &empty] {
@@ -3157,9 +3595,11 @@ mod tests {
             dns_selected: 0,
             editing_custom_dns: false,
             custom_dns_input: String::new(),
+            custom_dns_cursor: 0,
             custom_dns_error: None,
             configured_dns: DNS_PRESETS[0].addr.to_string(),
             split_tunnel: SplitTunnelConfig::default(),
+            show_tun_tip: false,
         }
     }
 
@@ -3403,9 +3843,11 @@ mod tests {
             dns_selected: 0,
             editing_custom_dns: false,
             custom_dns_input: String::new(),
+            custom_dns_cursor: 0,
             custom_dns_error: None,
             configured_dns: DNS_PRESETS[0].addr.to_string(),
             split_tunnel: SplitTunnelConfig::default(),
+            show_tun_tip: false,
         };
         let tones_text = buffer_text(&render_state(80, 24, &tones_state, false));
         assert!(tones_text.contains("● Active"));
@@ -3494,9 +3936,11 @@ mod tests {
             dns_selected: 0,
             editing_custom_dns: false,
             custom_dns_input: String::new(),
+            custom_dns_cursor: 0,
             custom_dns_error: None,
             configured_dns: DNS_PRESETS[0].addr.to_string(),
             split_tunnel: SplitTunnelConfig::default(),
+            show_tun_tip: false,
         };
         assert_eq!(
             handle_key(&mut no_switch, press(KeyCode::Char('m'))),
@@ -3806,7 +4250,7 @@ mod tests {
             .expect("[Active] start cell");
         assert_eq!(ip_buf[(active_x, row7_y)].fg, EMERALD_ACTIVE);
 
-        // Active custom DoH URL shows shortened label and pre-fills full URL when editing.
+        // Active custom DoH URL redacts path/token in display and pre-fills full URL when editing.
         let mut doh_state = UiState::new_with_dns(
             &status_running_live(),
             None,
@@ -3820,14 +4264,15 @@ mod tests {
         let doh_buf = render_state(80, 24, &doh_state, true);
         let doh_text = buffer_text(&doh_buf);
         assert!(
-            doh_text.contains("Choose DNS server · Custom (dns.nextdns.io/abc123)"),
+            doh_text.contains("Choose DNS server · Custom (dns.nextdns.io)"),
             "custom DoH header missing:\n{doh_text}"
         );
         assert!(
             doh_text.contains("[7] Custom DNS")
-                && doh_text.contains("dns.nextdns.io/abc123")
+                && doh_text.contains("dns.nextdns.io")
+                && !doh_text.contains("abc123")
                 && doh_text.contains("[Active]"),
-            "custom DoH row missing:\n{doh_text}"
+            "custom DoH row missing or leaked secret path:\n{doh_text}"
         );
 
         // Entering edit mode pre-fills the full active custom DoH URL.
@@ -4200,5 +4645,604 @@ mod tests {
             "narrow 46x18 footer must drop 's split':\n{narrow_text}"
         );
         assert!(narrow_text.contains("r refresh"));
+    }
+
+    #[test]
+    fn round1_custom_dns_tail_scroll_altgr_paste_short_errors_and_badges() {
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        // 1. Ctrl+C ignores Repeat (Press only) and uppercase J/K navigate cleanly.
+        let mut nav = UiState::new(&status_not_installed(), None);
+        assert_eq!(
+            handle_key(
+                &mut nav,
+                KeyEvent::new_with_kind(
+                    KeyCode::Char('c'),
+                    KeyModifiers::CONTROL,
+                    KeyEventKind::Repeat,
+                ),
+            ),
+            Action::Ignore
+        );
+        assert_eq!(
+            handle_key(&mut nav, press(KeyCode::Char('J'))),
+            Action::Redraw
+        );
+        assert_eq!(nav.selected, 1);
+        assert_eq!(
+            handle_key(&mut nav, press(KeyCode::Char('K'))),
+            Action::Redraw
+        );
+        assert_eq!(nav.selected, 0);
+
+        // 2. DNS picker at 46x18 keeps full Cloudflare 1.1.1.1 [Active] without truncating IP.
+        let mut dns = UiState::new_with_dns(&status_running_live(), None, "1.1.1.1");
+        assert_eq!(
+            handle_key(&mut dns, press(KeyCode::Char('d'))),
+            Action::Redraw
+        );
+        assert_eq!(
+            handle_key(&mut dns, press(KeyCode::Char('J'))),
+            Action::Redraw
+        );
+        assert_eq!(dns.dns_selected, 1);
+        assert_eq!(
+            handle_key(&mut dns, press(KeyCode::Char('K'))),
+            Action::Redraw
+        );
+        assert_eq!(dns.dns_selected, 0);
+        let dns_46 = buffer_text(&render_state(46, 18, &dns, true));
+        assert!(
+            dns_46.contains("Cloudflare")
+                && dns_46.contains("1.1.1.1")
+                && dns_46.contains("[Active]"),
+            "46x18 DNS picker must not truncate Cloudflare 1.1.1.1:\n{dns_46}"
+        );
+
+        // 3. Custom DNS AltGr ('[' / ']'), Paste (strips trailing CRLF), and tail-scroll cursor.
+        assert_eq!(
+            handle_key(&mut dns, press(KeyCode::Char('7'))),
+            Action::Redraw
+        );
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        assert_eq!(
+            handle_key(&mut dns, KeyEvent::new(KeyCode::Char('['), altgr)),
+            Action::Redraw
+        );
+        assert_eq!(
+            handle_key(&mut dns, KeyEvent::new(KeyCode::Char(']'), altgr)),
+            Action::Redraw
+        );
+        assert_eq!(dns.custom_dns_input, "[]");
+        assert_eq!(
+            handle_key(
+                &mut dns,
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)
+            ),
+            Action::Redraw
+        );
+        let long_doh = "https://freedns.controld.com/p/abcdefghijklmnop1234567890/my-gaming-pc-tail";
+        assert_eq!(
+            handle_paste(&mut dns, &format!("{long_doh}\r\n")),
+            Action::Redraw
+        );
+        assert_eq!(dns.custom_dns_input, long_doh);
+        assert!(dns.editing_custom_dns);
+
+        for (w, h) in [(80, 24), (60, 24), (46, 18)] {
+            let buf = render_state(w, h, &dns, true);
+            let text = buffer_text(&buf);
+            assert!(
+                text.contains("…") && text.contains("tail▏"),
+                "long DoH URL must tail-scroll and keep cursor ▏ visible at {w}x{h}:\n{text}"
+            );
+        }
+
+        // 4. Short terminals (height = 7..=10) keep custom_dns_error visible.
+        dns.custom_dns_error = Some("Invalid DoH endpoint".to_string());
+        for h in 7..=10 {
+            let text = buffer_text(&render_state(60, h, &dns, true));
+            assert!(
+                text.contains("Invalid DoH endpoint"),
+                "custom_dns_error dropped at 60x{h}:\n{text}"
+            );
+        }
+
+        // 5. Non-VPN compact badge at narrow width truncates real badge instead of "[VPN]".
+        let mut badge_state = tun_vpn_state();
+        badge_state.menu.status_rows[2].badge =
+            Some(("Update available".to_string(), StatusTone::Accent));
+        let narrow_badge_text = buffer_text(&render_state(46, 18, &badge_state, true));
+        assert!(
+            !narrow_badge_text.contains("[VPN]"),
+            "non-VPN badge must not turn into hardcoded [VPN]:\n{narrow_badge_text}"
+        );
+        assert!(
+            narrow_badge_text.contains("[Update"),
+            "non-VPN badge should truncate real badge text:\n{narrow_badge_text}"
+        );
+    }
+
+    #[test]
+    fn round2_warning_notice_classification_and_two_line_wrapping() {
+        for warning in [
+            "wintun.dll not found next to vdpi.exe - extract all files from the zip",
+            "Missing wintun.dll driver file",
+            "No running vdpi service detected.",
+            "Binary not found in PATH",
+            "Elevation cancelled by user (UAC prompt dismissed).",
+            "Install canceled.",
+            "Warning: active VPN detected",
+            "Cannot reach GitHub Releases",
+            "Unable to start background service",
+            "Administrator privileges required",
+            "Please extract all files before running",
+            "TUN mode is only supported on desktop",
+            "Pause failed: access denied",
+            "Dashboard error: timeout",
+            "Diagnostics found 2 issues",
+            "vdpi is already running",
+        ] {
+            assert!(
+                is_warning_notice(warning),
+                "expected warning classification for: {warning}"
+            );
+        }
+
+        for ok in [
+            "Status refreshed.",
+            "Service paused - system proxies restored.",
+            "Service resumed - anti-DPI active.",
+            "vdpi background service uninstalled.",
+            "Switched to TUN mode.",
+            "DNS updated to Cloudflare (1.1.1.1).",
+        ] {
+            assert!(
+                !is_warning_notice(ok),
+                "unexpected warning classification for: {ok}"
+            );
+        }
+
+        // Missing wintun.dll & UAC cancellation notices render amber '!' and wrap cleanly across 2 rows.
+        for notice in [
+            "wintun.dll not found next to vdpi.exe - extract all files from the zip",
+            "Administrator elevation cancelled (UAC prompt dismissed). Retry and click Yes to continue.",
+        ] {
+            let state = UiState::new(&status_paused(), Some(notice));
+            let buf = render_state(80, 24, &state, true);
+            let text = buffer_text(&buf);
+
+            assert!(
+                !text.contains("✓ "),
+                "warning notice must not use green checkmark:\n{text}"
+            );
+            assert!(
+                text.contains("! "),
+                "warning notice must use '!' prefix:\n{text}"
+            );
+            assert!(
+                buf.content()
+                    .iter()
+                    .any(|c| c.symbol() == "!" && c.fg == AMBER_WARN),
+                "warning notice '!' must render in AMBER_WARN:\n{text}"
+            );
+
+            // Reconstruct wrapped notice text from buffer rows and verify zero mid-sentence truncation.
+            let lines: Vec<&str> = text.lines().collect();
+            let first_idx = lines
+                .iter()
+                .position(|line| line.contains("! "))
+                .expect("first wrapped notice row");
+            let combined = format!(
+                "{} {}",
+                lines[first_idx].trim().trim_matches('│').trim(),
+                lines[first_idx + 1].trim().trim_matches('│').trim()
+            );
+            for word in notice.split_whitespace() {
+                assert!(
+                    combined.contains(word),
+                    "wrapped 2-line notice lost word '{word}':\n{text}"
+                );
+            }
+            assert!(
+                !combined.contains('…'),
+                "2-line notice should fit without ellipsis:\n{text}"
+            );
+            // All 9 paused menu items remain visible alongside the 2-line notice at 80x24.
+            for idx in 1..=state.menu.items.len() {
+                assert!(
+                    text.contains(&format!("[{idx}]")),
+                    "missing menu item [{idx}] with 2-line notice:\n{text}"
+                );
+            }
+        }
+
+        // Notices exceeding 2 lines cap at 2 rows with a trailing ellipsis on row 2.
+        let huge = "wintun.dll verification failed: unexpected hash mismatch detected while checking the extracted release archive directory - please re-download and extract all files from the official release zip";
+        let wrapped = wrap_notice_lines(huge, 64, MAX_NOTICE_LINES);
+        assert_eq!(wrapped.len(), 2);
+        assert!(wrapped[1].ends_with('…'));
+        assert!(wrapped[0].chars().count() <= 64);
+        assert!(wrapped[1].chars().count() <= 64);
+
+        // Short terminal fallback degrades gracefully without panicking.
+        let fallback_state = UiState::new(&status_paused(), Some(huge));
+        for (w, h) in [(60, 14), (46, 18), (46, 12), (28, 10)] {
+            let _ = render_state(w, h, &fallback_state, true);
+            let _ = render_state(w, h, &fallback_state, false);
+        }
+    }
+
+    #[test]
+    fn round2_windows_first_run_tun_tip_visibility() {
+        let not_installed_proxy = status_not_installed();
+        let mut not_installed_tun = status_not_installed();
+        not_installed_tun.configured_engine = EngineMode::Tun;
+
+        assert!(should_show_tun_tip_for_platform(true, &not_installed_proxy));
+        assert!(!should_show_tun_tip_for_platform(
+            false,
+            &not_installed_proxy
+        ));
+        assert!(!should_show_tun_tip_for_platform(true, &not_installed_tun));
+        assert!(!should_show_tun_tip_for_platform(
+            true,
+            &status_running_live()
+        ));
+        assert!(!should_show_tun_tip_for_platform(true, &status_paused()));
+
+        let mut state = UiState::new(&not_installed_proxy, None);
+        assert_eq!(state.show_tun_tip, cfg!(target_os = "windows"));
+
+        // Exercise rendering across platforms by explicitly enabling the Windows first-run tip.
+        state.show_tun_tip = true;
+        for color in [true, false] {
+            let buf = render_state(80, 24, &state, color);
+            let text = buffer_text(&buf);
+            assert!(
+                text.contains(WINDOWS_TUN_TIP),
+                "80x24 color={color} must render Windows TUN tip:\n{text}"
+            );
+            let status_y = text
+                .lines()
+                .position(|line| line.contains("Anti-DPI"))
+                .expect("Anti-DPI status row");
+            let tip_y = text
+                .lines()
+                .position(|line| line.contains(WINDOWS_TUN_TIP))
+                .expect("TUN tip row");
+            assert_eq!(
+                tip_y,
+                status_y + 1,
+                "TUN tip should appear directly below the status header:\n{text}"
+            );
+            if !color {
+                assert!(buf
+                    .content()
+                    .iter()
+                    .all(|c| c.fg == Color::Reset && c.bg == Color::Reset));
+            }
+        }
+
+        // Compact 46x18 renders cleanly without overflowing the right border.
+        let narrow_buf = render_state(46, 18, &state, true);
+        let narrow_text = buffer_text(&narrow_buf);
+        let tip_y = u16::try_from(
+            narrow_text
+                .lines()
+                .position(|line| line.contains("Tip: Switch to TUN"))
+                .expect("narrow tip row"),
+        )
+        .expect("tip y fits u16");
+        assert_eq!(narrow_buf[(45, tip_y)].symbol(), "│");
+    }
+
+    #[test]
+    fn round2_no_color_uninstall_header_and_custom_dns_input_bg() {
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        // 1. Uninstall confirmation under NO_COLOR=1 uses ASCII '! ' prefix instead of '● '.
+        let mut confirm_state = UiState::new(&status_running_live(), None);
+        confirm_state.confirming_uninstall = true;
+        let confirm_buf = render_state(80, 24, &confirm_state, false);
+        let confirm_text = buffer_text(&confirm_buf);
+        assert!(
+            confirm_text.contains("! Confirm uninstall"),
+            "NO_COLOR uninstall confirm must use '! ' prefix:\n{confirm_text}"
+        );
+        assert!(
+            !confirm_text.contains("● Confirm uninstall"),
+            "NO_COLOR uninstall confirm must not use filled bullet:\n{confirm_text}"
+        );
+        assert!(confirm_buf
+            .content()
+            .iter()
+            .all(|c| c.fg == Color::Reset && c.bg == Color::Reset));
+        let confirm_y = u16::try_from(
+            confirm_text
+                .lines()
+                .position(|line| line.contains("! Confirm uninstall"))
+                .expect("NO_COLOR confirm header row"),
+        )
+        .expect("confirm y fits u16");
+        let bang_x = (0..confirm_buf.area.width)
+            .find(|&x| confirm_buf[(x, confirm_y)].symbol() == "!")
+            .expect("confirm bang cell");
+        assert!(confirm_buf[(bang_x, confirm_y)]
+            .modifier
+            .contains(Modifier::BOLD));
+
+        // 2. Custom DNS editor under NO_COLOR=1 styles input_bg (including cursor and bar fill) with REVERSED.
+        let mut dns_state = UiState::new_with_dns(&status_running_live(), None, "76.76.2.0");
+        assert_eq!(
+            handle_key(&mut dns_state, press(KeyCode::Char('d'))),
+            Action::Redraw
+        );
+        assert_eq!(
+            handle_key(&mut dns_state, press(KeyCode::Enter)),
+            Action::Redraw
+        );
+        assert!(dns_state.editing_custom_dns);
+
+        let nc_buf = render_state(80, 24, &dns_state, false);
+        let nc_text = buffer_text(&nc_buf);
+        assert!(nc_buf
+            .content()
+            .iter()
+            .all(|c| c.fg == Color::Reset && c.bg == Color::Reset));
+        let input_y = u16::try_from(
+            nc_text
+                .lines()
+                .position(|line| line.contains("Custom DNS: 76.76.2.0▏"))
+                .expect("NO_COLOR custom DNS input row"),
+        )
+        .expect("input y fits u16");
+        let cursor_x = (0..nc_buf.area.width)
+            .find(|&x| nc_buf[(x, input_y)].symbol() == "▏")
+            .expect("NO_COLOR cursor cell");
+        assert!(
+            nc_buf[(cursor_x, input_y)]
+                .modifier
+                .contains(Modifier::REVERSED),
+            "NO_COLOR custom DNS cursor must keep REVERSED input_bg"
+        );
+        assert!(
+            nc_buf[(cursor_x - 1, input_y)]
+                .modifier
+                .contains(Modifier::REVERSED),
+            "NO_COLOR custom DNS text must use REVERSED input_bg"
+        );
+        assert!(
+            nc_buf[(cursor_x + 1, input_y)]
+                .modifier
+                .contains(Modifier::REVERSED),
+            "NO_COLOR custom DNS fill must use REVERSED input_bg"
+        );
+
+        // 3. Narrow fallback cursor branch (width 15 -> bar_width 13 <= prompt+cursor) preserves input_bg.
+        let narrow_color = render_state(15, 10, &dns_state, true);
+        let narrow_color_text = buffer_text(&narrow_color);
+        let nc_y = u16::try_from(
+            narrow_color_text
+                .lines()
+                .position(|line| line.contains('▏'))
+                .expect("narrow color cursor row"),
+        )
+        .expect("narrow color y fits u16");
+        let nc_x = (0..narrow_color.area.width)
+            .find(|&x| narrow_color[(x, nc_y)].symbol() == "▏")
+            .expect("narrow color cursor cell");
+        assert_eq!(narrow_color[(nc_x, nc_y)].fg, ICE_BLUE);
+        assert_eq!(narrow_color[(nc_x, nc_y)].bg, ACTIVE_BG);
+
+        let narrow_nc = render_state(15, 10, &dns_state, false);
+        let narrow_nc_text = buffer_text(&narrow_nc);
+        let nnc_y = u16::try_from(
+            narrow_nc_text
+                .lines()
+                .position(|line| line.contains('▏'))
+                .expect("narrow NO_COLOR cursor row"),
+        )
+        .expect("narrow NO_COLOR y fits u16");
+        let nnc_x = (0..narrow_nc.area.width)
+            .find(|&x| narrow_nc[(x, nnc_y)].symbol() == "▏")
+            .expect("narrow NO_COLOR cursor cell");
+        assert!(narrow_nc[(nnc_x, nnc_y)]
+            .modifier
+            .contains(Modifier::REVERSED));
+        assert!(narrow_nc[(nnc_x, nnc_y)].modifier.contains(Modifier::BOLD));
+        assert!(narrow_nc
+            .content()
+            .iter()
+            .all(|c| c.fg == Color::Reset && c.bg == Color::Reset));
+    }
+
+    #[test]
+    fn round2_custom_dns_inline_cursor_left_right_home_end_delete_editing() {
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let repeat = |code| KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Repeat);
+
+        let mut state = UiState::new_with_dns(&status_running_live(), None, "1.1.1.1");
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('d'))),
+            Action::Redraw
+        );
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('7'))),
+            Action::Redraw
+        );
+
+        // Paste a NextDNS URL with two typos: missing 'e' in nextdns and 'x' instead of 'c'.
+        assert_eq!(
+            handle_paste(&mut state, "https://dns.nxtdns.io/abx123"),
+            Action::Redraw
+        );
+        assert_eq!(state.custom_dns_cursor, 28);
+
+        // Boundary no-ops at end of input.
+        assert_eq!(handle_key(&mut state, press(KeyCode::Right)), Action::Ignore);
+        assert_eq!(handle_key(&mut state, press(KeyCode::End)), Action::Ignore);
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Delete)),
+            Action::Ignore
+        );
+
+        // Home moves cursor to 0; boundary no-ops at start of input.
+        assert_eq!(handle_key(&mut state, press(KeyCode::Home)), Action::Redraw);
+        assert_eq!(state.custom_dns_cursor, 0);
+        assert_eq!(handle_key(&mut state, press(KeyCode::Left)), Action::Ignore);
+        assert_eq!(handle_key(&mut state, press(KeyCode::Home)), Action::Ignore);
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Backspace)),
+            Action::Ignore
+        );
+
+        // Move right 13 positions (including Repeat events) and insert missing 'e'.
+        for i in 0..13 {
+            let ev = if i % 2 == 0 {
+                press(KeyCode::Right)
+            } else {
+                repeat(KeyCode::Right)
+            };
+            assert_eq!(handle_key(&mut state, ev), Action::Redraw);
+        }
+        assert_eq!(state.custom_dns_cursor, 13);
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('e'))),
+            Action::Redraw
+        );
+        assert_eq!(state.custom_dns_input, "https://dns.nextdns.io/abx123");
+        assert_eq!(state.custom_dns_cursor, 14);
+
+        // Jump to End, move Left 4 times to 'x', Delete it, and insert 'c'.
+        assert_eq!(handle_key(&mut state, press(KeyCode::End)), Action::Redraw);
+        assert_eq!(state.custom_dns_cursor, 29);
+        for _ in 0..4 {
+            assert_eq!(
+                handle_key(&mut state, repeat(KeyCode::Left)),
+                Action::Redraw
+            );
+        }
+        assert_eq!(state.custom_dns_cursor, 25);
+        assert_eq!(
+            handle_key(&mut state, repeat(KeyCode::Delete)),
+            Action::Redraw
+        );
+        assert_eq!(state.custom_dns_input, "https://dns.nextdns.io/ab123");
+        assert_eq!(state.custom_dns_cursor, 25);
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('c'))),
+            Action::Redraw
+        );
+        assert_eq!(state.custom_dns_input, "https://dns.nextdns.io/abc123");
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Enter)),
+            Action::Finish(Choice::SetDns("https://dns.nextdns.io/abc123".to_string()))
+        );
+
+        // Inline paste inserts at cursor position.
+        assert_eq!(handle_key(&mut state, press(KeyCode::Home)), Action::Redraw);
+        assert_eq!(handle_key(&mut state, press(KeyCode::Right)), Action::Redraw);
+        assert_eq!(handle_key(&mut state, press(KeyCode::Backspace)), Action::Redraw);
+        assert_eq!(handle_paste(&mut state, "h"), Action::Redraw);
+        assert_eq!(state.custom_dns_input, "https://dns.nextdns.io/abc123");
+
+        // Long DoH URL keeps cursor visible at Home, middle, and End across 80x24 and 46x18.
+        assert_eq!(
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)
+            ),
+            Action::Redraw
+        );
+        let long_doh =
+            "https://freedns.controld.com/p/abcdefghijklmnop1234567890/my-gaming-pc-tail";
+        assert_eq!(handle_paste(&mut state, long_doh), Action::Redraw);
+
+        for (w, h) in [(80, 24), (46, 18)] {
+            // Home: cursor at start with trailing ellipsis.
+            state.custom_dns_cursor = 0;
+            let home_text = buffer_text(&render_state(w, h, &state, true));
+            assert!(
+                home_text.contains("▏https://") && home_text.contains('…'),
+                "Home cursor rendering failed at {w}x{h}:\n{home_text}"
+            );
+
+            // Middle: cursor visible between leading and trailing ellipses.
+            state.custom_dns_cursor = 38;
+            let mid_text = buffer_text(&render_state(w, h, &state, true));
+            let mid_row = mid_text
+                .lines()
+                .find(|line| line.contains('▏'))
+                .expect("middle cursor row");
+            assert_eq!(
+                mid_row.matches('…').count(),
+                2,
+                "middle cursor should show both ellipses at {w}x{h}:\n{mid_text}"
+            );
+
+            // End: cursor at tail with leading ellipsis.
+            state.custom_dns_cursor = long_doh.chars().count();
+            let end_text = buffer_text(&render_state(w, h, &state, true));
+            assert!(
+                end_text.contains('…') && end_text.contains("tail▏"),
+                "End cursor rendering failed at {w}x{h}:\n{end_text}"
+            );
+        }
+    }
+
+    #[test]
+    fn round3_custom_dns_multiline_paste_takes_first_non_empty_line() {
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        let mut state = UiState::new_with_dns(&status_running_live(), None, "1.1.1.1");
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('d'))),
+            Action::Redraw
+        );
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('7'))),
+            Action::Redraw
+        );
+
+        // Simple two-line paste takes only line 1 instead of concatenating both lines.
+        assert_eq!(
+            handle_paste(&mut state, "1.1.1.1\n8.8.8.8"),
+            Action::Redraw
+        );
+        assert_eq!(state.custom_dns_input, "1.1.1.1");
+        assert_eq!(state.custom_dns_cursor, 7);
+
+        // Clear and paste multiline clipboard with leading blank/control lines, whitespace, and CRLF.
+        assert_eq!(
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)
+            ),
+            Action::Redraw
+        );
+        state.custom_dns_error = Some("previous error".to_string());
+        assert_eq!(
+            handle_paste(
+                &mut state,
+                "\r\n   \n\x07\n  https://dns.nextdns.io/abc123  \r\nhttps://1.1.1.1/dns-query\n"
+            ),
+            Action::Redraw
+        );
+        assert_eq!(state.custom_dns_input, "https://dns.nextdns.io/abc123");
+        assert_eq!(state.custom_dns_cursor, 29);
+        assert_eq!(state.custom_dns_error, None);
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Enter)),
+            Action::Finish(Choice::SetDns("https://dns.nextdns.io/abc123".to_string()))
+        );
+
+        // Blank/control-only multiline paste is ignored without modifying existing input.
+        assert_eq!(
+            handle_paste(&mut state, "\r\n   \n\t\x07\r\n"),
+            Action::Ignore
+        );
+        assert_eq!(state.custom_dns_input, "https://dns.nextdns.io/abc123");
+        assert_eq!(state.custom_dns_cursor, 29);
     }
 }

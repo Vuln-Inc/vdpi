@@ -20,6 +20,11 @@ pub mod tui;
 /// Default cache time-to-live for local socket-to-process lookups.
 pub const DEFAULT_SOCKET_CACHE_TTL: Duration = Duration::from_millis(1500);
 
+/// Default cache time-to-live for negative (`None`) local socket lookups so
+/// short-lived or racing sockets are re-checked quickly instead of staying
+/// unclassified for the full positive TTL.
+pub const DEFAULT_NEGATIVE_SOCKET_CACHE_TTL: Duration = Duration::from_millis(100);
+
 /// Default maximum number of entries retained in [`ProcessSocketResolver`].
 pub const DEFAULT_SOCKET_CACHE_MAX_ENTRIES: usize = 1024;
 
@@ -59,15 +64,15 @@ struct PopularAppSeed {
 const POPULAR_APPS: &[PopularAppSeed] = &[
     PopularAppSeed {
         display_name: "Discord",
-        normalized_names: &["discord"],
+        normalized_names: &["discord", "com.discordapp.discord"],
     },
     PopularAppSeed {
         display_name: "Discord PTB",
-        normalized_names: &["discordptb", "discord-ptb"],
+        normalized_names: &["discordptb", "discord-ptb", "discord ptb"],
     },
     PopularAppSeed {
         display_name: "Discord Canary",
-        normalized_names: &["discordcanary", "discord-canary"],
+        normalized_names: &["discordcanary", "discord-canary", "discord canary"],
     },
     PopularAppSeed {
         display_name: "Roblox",
@@ -76,7 +81,12 @@ const POPULAR_APPS: &[PopularAppSeed] = &[
             "robloxplayerlauncher",
             "robloxplayer",
             "sober",
+            "org.vinegarhq.sober",
         ],
+    },
+    PopularAppSeed {
+        display_name: "Bloxstrap",
+        normalized_names: &["bloxstrap"],
     },
     PopularAppSeed {
         display_name: "Google Chrome",
@@ -85,6 +95,7 @@ const POPULAR_APPS: &[PopularAppSeed] = &[
             "google chrome",
             "google-chrome",
             "google-chrome-stable",
+            "com.google.chrome",
         ],
     },
     PopularAppSeed {
@@ -98,11 +109,25 @@ const POPULAR_APPS: &[PopularAppSeed] = &[
     },
     PopularAppSeed {
         display_name: "Mozilla Firefox",
-        normalized_names: &["firefox", "firefox-bin", "firefox-esr"],
+        normalized_names: &[
+            "firefox",
+            "firefox-bin",
+            "firefox-esr",
+            "org.mozilla.firefox",
+        ],
+    },
+    PopularAppSeed {
+        display_name: "Safari",
+        normalized_names: &["safari"],
     },
     PopularAppSeed {
         display_name: "Brave Browser",
-        normalized_names: &["brave", "brave browser", "brave-browser"],
+        normalized_names: &[
+            "brave",
+            "brave browser",
+            "brave-browser",
+            "com.brave.browser",
+        ],
     },
     PopularAppSeed {
         display_name: "Opera",
@@ -114,15 +139,20 @@ const POPULAR_APPS: &[PopularAppSeed] = &[
     },
     PopularAppSeed {
         display_name: "Steam",
-        normalized_names: &["steam", "steam_osx"],
+        normalized_names: &["steam", "steam_osx", "com.valvesoftware.steam"],
     },
     PopularAppSeed {
         display_name: "Telegram",
-        normalized_names: &["telegram", "telegram-desktop", "telegram desktop"],
+        normalized_names: &[
+            "telegram",
+            "telegram-desktop",
+            "telegram desktop",
+            "org.telegram.desktop",
+        ],
     },
     PopularAppSeed {
         display_name: "Spotify",
-        normalized_names: &["spotify"],
+        normalized_names: &["spotify", "com.spotify.client"],
     },
     PopularAppSeed {
         display_name: "Epic Games Launcher",
@@ -142,11 +172,16 @@ const POPULAR_APPS: &[PopularAppSeed] = &[
     },
     PopularAppSeed {
         display_name: "OBS Studio",
-        normalized_names: &["obs64", "obs32", "obs", "obs studio"],
+        normalized_names: &["obs64", "obs32", "obs", "obs studio", "com.obsproject.studio"],
     },
     PopularAppSeed {
         display_name: "Visual Studio Code",
-        normalized_names: &["code", "code-oss", "visual studio code"],
+        normalized_names: &[
+            "code",
+            "code-oss",
+            "visual studio code",
+            "com.visualstudio.code",
+        ],
     },
     PopularAppSeed {
         display_name: "WhatsApp",
@@ -154,15 +189,15 @@ const POPULAR_APPS: &[PopularAppSeed] = &[
     },
     PopularAppSeed {
         display_name: "Slack",
-        normalized_names: &["slack"],
+        normalized_names: &["slack", "com.slack.slack"],
     },
     PopularAppSeed {
         display_name: "Zoom",
-        normalized_names: &["zoom", "zoom.us"],
+        normalized_names: &["zoom", "zoom.us", "us.zoom.zoom"],
     },
     PopularAppSeed {
         display_name: "Signal",
-        normalized_names: &["signal", "signal-desktop"],
+        normalized_names: &["signal", "signal-desktop", "org.signal.signal"],
     },
     PopularAppSeed {
         display_name: "Vivaldi",
@@ -190,11 +225,11 @@ const POPULAR_APPS: &[PopularAppSeed] = &[
     },
     PopularAppSeed {
         display_name: "VLC Media Player",
-        normalized_names: &["vlc"],
+        normalized_names: &["vlc", "org.videolan.vlc"],
     },
     PopularAppSeed {
         display_name: "qBittorrent",
-        normalized_names: &["qbittorrent"],
+        normalized_names: &["qbittorrent", "org.qbittorrent.qbittorrent"],
     },
 ];
 
@@ -222,12 +257,222 @@ pub fn is_popular_app(exe_name: &str) -> bool {
     popular_app_display_name(exe_name).is_some()
 }
 
+/// Symmetric cross-platform companion executable groups (normalized lowercase
+/// names without `.exe` or `.app` suffixes). Selecting any member of a group
+/// expands split-tunnel matching to every other member in the same group.
+const COMPANION_GROUPS: &[&[&str]] = &[
+    // Discord (Windows, macOS, Linux / Flatpak)
+    &[
+        "discord",
+        "discordptb",
+        "discord-ptb",
+        "discord ptb",
+        "discordcanary",
+        "discord-canary",
+        "discord canary",
+        "discord_clips",
+        "discord helper",
+        "com.discordapp.discord",
+    ],
+    // Roblox (Windows, macOS, Linux / Sober Flatpak, Bloxstrap, Fishstrap)
+    &[
+        "robloxplayerbeta",
+        "robloxplayerlauncher",
+        "robloxplayerinstaller",
+        "bloxstrap",
+        "fishstrap",
+        "robloxplayer",
+        "sober",
+        "org.vinegarhq.sober",
+    ],
+    // Riot Client / Valorant / Vanguard / League of Legends
+    &[
+        "riotclientservices",
+        "riotclientux",
+        "riotclientuxrender",
+        "valorant",
+        "valorant-win64-shipping",
+        "vgc",
+        "vgtray",
+        "leagueclient",
+        "leagueclientux",
+        "leagueclientuxrender",
+        "league of legends",
+    ],
+    // Steam (Windows, macOS, Linux / Flatpak)
+    &[
+        "steam",
+        "steam_osx",
+        "steamwebhelper",
+        "steamservice",
+        "gameoverlayui",
+        "com.valvesoftware.steam",
+    ],
+    // Epic Games Launcher & EOS overlay
+    &[
+        "epicgameslauncher",
+        "epic games launcher",
+        "epicwebhelper",
+        "eosoverlayrenderer-win64-shipping",
+    ],
+    // Browser Flatpak bridges
+    &[
+        "firefox",
+        "firefox-bin",
+        "firefox-esr",
+        "org.mozilla.firefox",
+    ],
+    &[
+        "chrome",
+        "google chrome",
+        "google-chrome",
+        "google-chrome-stable",
+        "com.google.chrome",
+    ],
+    &[
+        "chromium",
+        "chromium-browser",
+        "org.chromium.chromium",
+    ],
+];
+
+enum NormalizedApp<'a> {
+    /// Pure-ASCII filename slice with surrounding quotes, path components, and
+    /// any trailing `.exe` suffix stripped; compare case-insensitively.
+    Ascii(&'a str),
+    /// Non-ASCII fallback normalized via [`normalize_exe`].
+    Owned(String),
+}
+
+fn strip_ascii_suffix_ignore_case<'a>(s: &'a str, suffix: &str) -> &'a str {
+    if let Some(prefix_len) = s.len().checked_sub(suffix.len()) {
+        if s.as_bytes()[prefix_len..].eq_ignore_ascii_case(suffix.as_bytes()) {
+            return &s[..prefix_len];
+        }
+    }
+    s
+}
+
+impl<'a> NormalizedApp<'a> {
+    fn from_raw(raw: &'a str) -> Self {
+        let unquoted = raw.trim().trim_matches(['"', '\'']).trim();
+        let file_name = unquoted
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(unquoted)
+            .trim()
+            .trim_matches(['"', '\''])
+            .trim();
+        if file_name.is_ascii() {
+            Self::Ascii(strip_ascii_suffix_ignore_case(file_name, ".exe").trim())
+        } else {
+            Self::Owned(normalize_exe(raw))
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Ascii(s) => s.is_empty(),
+            Self::Owned(s) => s.is_empty(),
+        }
+    }
+
+    fn eq_normalized(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Ascii(a), Self::Ascii(b)) => a.eq_ignore_ascii_case(b),
+            (Self::Ascii(a), Self::Owned(b)) | (Self::Owned(b), Self::Ascii(a)) => {
+                a.eq_ignore_ascii_case(b.as_str())
+            }
+            (Self::Owned(a), Self::Owned(b)) => a == b,
+        }
+    }
+
+    fn eq_lowercase_ascii(&self, target: &str) -> bool {
+        match self {
+            Self::Ascii(s) => s.eq_ignore_ascii_case(target),
+            Self::Owned(s) => s.as_str() == target,
+        }
+    }
+
+    fn stem_eq_lowercase_ascii(&self, target: &str) -> bool {
+        match self {
+            Self::Ascii(s) => strip_ascii_suffix_ignore_case(s, ".app").eq_ignore_ascii_case(target),
+            Self::Owned(s) => s.strip_suffix(".app").unwrap_or(s.as_str()) == target,
+        }
+    }
+}
+
+/// Returns the symmetric companion executable group (normalized names) that
+/// belongs to the same user-facing application as `exe_name`, so split-tunnel
+/// matching covers multi-process launchers, overlays, helpers, and Flatpak
+/// app IDs bidirectionally across Windows, macOS, and Linux.
+pub fn companion_executables_for(exe_name: &str) -> &'static [&'static str] {
+    let norm = NormalizedApp::from_raw(exe_name);
+    if norm.is_empty() {
+        return &[];
+    }
+    COMPANION_GROUPS
+        .iter()
+        .copied()
+        .find(|group| {
+            group
+                .iter()
+                .any(|&member| norm.stem_eq_lowercase_ascii(member))
+        })
+        .unwrap_or(&[])
+}
+
+fn strip_cli_args_after_extension(s: &str) -> &str {
+    const EXTENSIONS: &[&str] = &[".exe", ".app", ".appimage", ".bat", ".cmd"];
+    let lower = s.to_ascii_lowercase();
+    let mut earliest_end: Option<usize> = None;
+
+    for ext in EXTENSIONS {
+        let mut search_from = 0;
+        while let Some(rel) = lower[search_from..].find(ext) {
+            let ext_start = search_from + rel;
+            let ext_end = ext_start + ext.len();
+            let preceded_by_name = ext_start > 0
+                && !matches!(lower.as_bytes()[ext_start - 1], b'/' | b'\\' | b' ' | b'\t');
+            let followed_by_ws = lower[ext_end..]
+                .chars()
+                .next()
+                .is_some_and(char::is_whitespace);
+            if preceded_by_name && followed_by_ws {
+                earliest_end = Some(earliest_end.map_or(ext_end, |prev| prev.min(ext_end)));
+                break;
+            }
+            search_from = ext_end;
+        }
+    }
+
+    if let Some(end) = earliest_end {
+        return &s[..end];
+    }
+
+    // Fallback for unquoted extensionless command lines (e.g. `/usr/bin/firefox --new-window`).
+    let bytes = s.as_bytes();
+    for idx in 1..bytes.len().saturating_sub(3) {
+        if bytes[idx].is_ascii_whitespace()
+            && bytes[idx + 1] == b'-'
+            && bytes[idx + 2] == b'-'
+            && bytes[idx + 3].is_ascii_alphanumeric()
+        {
+            return s[..idx].trim_end();
+        }
+    }
+
+    s
+}
+
 /// Cleans and validates a user-entered custom application string.
 ///
-/// Trims whitespace, strips matching surrounding single or double quotes,
-/// extracts the trailing filename component if a filesystem path was pasted
-/// (supporting both `/` and `\` separators), and rejects empty strings,
-/// whitespace-only inputs, control characters, and non-executable path markers.
+/// Trims whitespace, unwraps leading single/double-quoted tokens (discarding
+/// any trailing shortcut CLI arguments after the closing quote), strips
+/// trailing CLI arguments after executable extensions or `--` flags, extracts
+/// the trailing filename component if a filesystem path was pasted (supporting
+/// both `/` and `\` separators), and rejects empty strings, whitespace-only
+/// inputs, control characters, and non-executable path markers.
 pub fn canonical_exe_entry(raw: &str) -> Option<String> {
     if raw.chars().any(char::is_control) {
         return None;
@@ -235,19 +480,23 @@ pub fn canonical_exe_entry(raw: &str) -> Option<String> {
 
     let mut cleaned = raw.trim();
     loop {
-        let unwrapped = cleaned
-            .strip_prefix('"')
-            .and_then(|s| s.strip_suffix('"'))
-            .or_else(|| {
-                cleaned
-                    .strip_prefix('\'')
-                    .and_then(|s| s.strip_suffix('\''))
-            });
-        match unwrapped {
-            Some(inner) => cleaned = inner.trim(),
-            None => break,
+        let mut chars = cleaned.chars();
+        let Some(quote @ ('"' | '\'')) = chars.next() else {
+            break;
+        };
+        let rest_after_open = chars.as_str();
+        let Some(close_idx) = rest_after_open.find(quote) else {
+            break;
+        };
+        let after_close = &rest_after_open[close_idx + quote.len_utf8()..];
+        if after_close.is_empty() || after_close.starts_with(char::is_whitespace) {
+            cleaned = rest_after_open[..close_idx].trim();
+        } else {
+            break;
         }
     }
+
+    cleaned = strip_cli_args_after_extension(cleaned).trim();
 
     if cleaned.is_empty() {
         return None;
@@ -287,6 +536,10 @@ fn to_lower_chars(input: &str) -> Vec<LowerChar> {
     let mut prev: Option<char> = None;
 
     for ch in input.chars() {
+        // Normalize decomposed/Turkish `İ` (`i\u{0307}`) and dotless `ı` (`\u{0131}`) to ASCII `'i'`.
+        if ch == '\u{0307}' {
+            continue;
+        }
         let boundary_here = match prev {
             None => true,
             Some(p) => {
@@ -295,7 +548,12 @@ fn to_lower_chars(input: &str) -> Vec<LowerChar> {
                     || (p.is_ascii_alphabetic() && ch.is_ascii_digit())
             }
         };
-        for (idx, lc) in ch.to_lowercase().enumerate() {
+        for (idx, lc) in ch
+            .to_lowercase()
+            .filter(|&c| c != '\u{0307}')
+            .map(|c| if c == '\u{0131}' { 'i' } else { c })
+            .enumerate()
+        {
             out.push(LowerChar {
                 ch: lc,
                 is_boundary: idx == 0 && boundary_here,
@@ -307,8 +565,25 @@ fn to_lower_chars(input: &str) -> Vec<LowerChar> {
     out
 }
 
+fn score_fuzzy_positions(cand: &[LowerChar], positions: &[usize]) -> i32 {
+    let q_len = positions.len() as i32;
+    let consecutive = positions.windows(2).filter(|w| w[1] == w[0] + 1).count() as i32;
+    let boundary_hits = positions
+        .iter()
+        .filter(|&&pos| cand[pos].is_boundary)
+        .count() as i32;
+    let span = (positions[positions.len() - 1] - positions[0] + 1) as i32;
+    let gaps = span - q_len;
+
+    let consecutive_bonus = (consecutive * 25).min(150);
+    let boundary_bonus = (boundary_hits * 15).min(60);
+    let span_bonus = (60 - gaps * 5).max(0);
+    let bonus = (consecutive_bonus + boundary_bonus + span_bonus).min(250);
+    200 + bonus
+}
+
 fn score_candidate(query_chars: &[char], candidate_orig: &str) -> Option<i32> {
-    if candidate_orig.is_empty() {
+    if candidate_orig.is_empty() || query_chars.is_empty() {
         return None;
     }
 
@@ -347,51 +622,93 @@ fn score_candidate(query_chars: &[char], candidate_orig: &str) -> Option<i32> {
         }
     }
 
-    // Ordered subsequence (fuzzy) match: evaluate every valid start position of
-    // `query_chars[0]` to avoid greedy traps and reward consecutive runs,
-    // word-boundary hits, and tight spans (capped strictly below 500).
+    if q_len < 2 {
+        return None;
+    }
+
+    // Tightened ordered subsequence (fuzzy) match (capped strictly below 500):
+    // 1. Word-boundary / acronym chain: starts on a word boundary and every
+    //    subsequent character is either consecutive or on a word boundary.
+    // 2. Tight boundary-anchored subsequence: starts on a word boundary with
+    //    bounded gaps (`gaps <= q_len`, `max_gap <= 3`) and at least one
+    //    consecutive pair or second word boundary, preventing short queries
+    //    like `vgc` or `riot` from matching unrelated long names.
     let mut best_fuzzy: Option<i32> = None;
     let mut positions = Vec::with_capacity(q_len);
 
     for start in 0..c_len {
-        if cand[start].ch != query_chars[0] {
+        if !cand[start].is_boundary || cand[start].ch != query_chars[0] {
             continue;
         }
+
+        // Strategy 1: boundary/consecutive acronym chain (e.g. "dsc" -> "Data Sync Console").
         positions.clear();
         positions.push(start);
-
         let mut cursor = start + 1;
-        let mut matched_all = true;
+        let mut matched_acronym = true;
+        for &q_ch in &query_chars[1..] {
+            if cursor < c_len && cand[cursor].ch == q_ch {
+                positions.push(cursor);
+                cursor += 1;
+            } else if let Some(rel) = cand[cursor..]
+                .iter()
+                .position(|c| c.is_boundary && c.ch == q_ch)
+            {
+                let pos = cursor + rel;
+                positions.push(pos);
+                cursor = pos + 1;
+            } else {
+                matched_acronym = false;
+                break;
+            }
+        }
+        if matched_acronym && positions[q_len - 1] - positions[0] < 32 {
+            let score = score_fuzzy_positions(&cand, &positions);
+            best_fuzzy = Some(best_fuzzy.map_or(score, |prev| prev.max(score)));
+        }
+
+        // Strategy 2: tight boundary-anchored subsequence (e.g. "dsc" -> "Discord").
+        positions.clear();
+        positions.push(start);
+        let mut cursor = start + 1;
+        let mut matched_tight = true;
         for &q_ch in &query_chars[1..] {
             if let Some(rel) = cand[cursor..].iter().position(|c| c.ch == q_ch) {
                 let pos = cursor + rel;
                 positions.push(pos);
                 cursor = pos + 1;
             } else {
-                matched_all = false;
+                matched_tight = false;
                 break;
             }
         }
-
-        if !matched_all {
+        if !matched_tight {
             continue;
         }
 
-        let consecutive = positions.windows(2).filter(|w| w[1] == w[0] + 1).count() as i32;
+        let span = positions[q_len - 1] - positions[0] + 1;
+        let gaps = span - q_len;
+        let max_gap = positions
+            .windows(2)
+            .map(|w| w[1] - w[0] - 1)
+            .max()
+            .unwrap_or(0);
+        let consecutive = positions.windows(2).filter(|w| w[1] == w[0] + 1).count();
         let boundary_hits = positions
             .iter()
             .filter(|&&pos| cand[pos].is_boundary)
-            .count() as i32;
-        let span = (positions[q_len - 1] - positions[0] + 1) as i32;
-        let gaps = span - (q_len as i32);
+            .count();
 
-        let consecutive_bonus = (consecutive * 25).min(150);
-        let boundary_bonus = (boundary_hits * 15).min(60);
-        let span_bonus = (60 - gaps * 5).max(0);
-        let bonus = (consecutive_bonus + boundary_bonus + span_bonus).min(250);
-        let score = 200 + bonus;
+        let tight_enough = if q_len == 2 {
+            gaps <= 1
+        } else {
+            gaps <= q_len && max_gap <= 3 && (consecutive >= 1 || boundary_hits >= 2)
+        };
 
-        best_fuzzy = Some(best_fuzzy.map_or(score, |prev| prev.max(score)));
+        if tight_enough {
+            let score = score_fuzzy_positions(&cand, &positions);
+            best_fuzzy = Some(best_fuzzy.map_or(score, |prev| prev.max(score)));
+        }
     }
 
     best_fuzzy
@@ -414,7 +731,7 @@ pub fn fuzzy_score(query: &str, app: &DiscoveredApp) -> Option<i32> {
         return Some(0);
     }
 
-    let query_chars: Vec<char> = trimmed.to_lowercase().chars().collect();
+    let query_chars: Vec<char> = to_lower_chars(trimmed).into_iter().map(|c| c.ch).collect();
     if query_chars.is_empty() {
         return Some(0);
     }
@@ -432,13 +749,30 @@ pub fn fuzzy_score(query: &str, app: &DiscoveredApp) -> Option<i32> {
         .max()
 }
 
-/// Filters `apps` by `query` and sorts results by match relevance, falling back
-/// to `(is_running desc, category asc, display_name lowercase asc)` on ties
-/// (and when `query` is empty).
+/// Filters `apps` by `query` and sorts results by match relevance (boosting
+/// actively running prefix/exact matches above non-running exact matches),
+/// falling back to `(is_running desc, category asc, display_name lowercase asc)`
+/// on ties (and when `query` is empty).
 pub fn filter_and_rank_apps<'a>(apps: &'a [DiscoveredApp], query: &str) -> Vec<&'a DiscoveredApp> {
+    let has_query = !query.trim().is_empty();
     let mut scored: Vec<(i32, &'a DiscoveredApp)> = apps
         .iter()
-        .filter_map(|app| fuzzy_score(query, app).map(|score| (score, app)))
+        .filter_map(|app| {
+            fuzzy_score(query, app).map(|base_score| {
+                let rank_score = if has_query && app.is_running {
+                    if base_score >= 800 {
+                        base_score + 250
+                    } else if base_score >= 500 {
+                        base_score + 100
+                    } else {
+                        base_score
+                    }
+                } else {
+                    base_score
+                };
+                (rank_score, app)
+            })
+        })
         .collect();
 
     scored.sort_by(|(score_a, a), (score_b, b)| {
@@ -463,6 +797,14 @@ fn display_name_quality(name: &str, exe_name: &str, popular_name: Option<&str>) 
         return 0;
     }
     if let Some(pop) = popular_name {
+        if pop == "Opera" {
+            if trimmed == "Opera / Opera GX" {
+                return 6;
+            }
+            if trimmed == "Opera GX" {
+                return 5;
+            }
+        }
         if trimmed == pop {
             return 4;
         }
@@ -693,6 +1035,7 @@ type SocketLookupFn = dyn Fn(IpAddr, u16, bool) -> Option<String> + Send + Sync;
 pub struct ProcessSocketResolver {
     cache: Mutex<HashMap<SocketCacheKey, SocketCacheEntry>>,
     ttl: Duration,
+    negative_ttl: Duration,
     max_entries: usize,
     lookup_fn: Box<SocketLookupFn>,
 }
@@ -702,6 +1045,7 @@ impl fmt::Debug for ProcessSocketResolver {
         let len = self.len();
         f.debug_struct("ProcessSocketResolver")
             .field("ttl", &self.ttl)
+            .field("negative_ttl", &self.negative_ttl)
             .field("max_entries", &self.max_entries)
             .field("cached_entries", &len)
             .finish()
@@ -715,8 +1059,8 @@ impl Default for ProcessSocketResolver {
 }
 
 impl ProcessSocketResolver {
-    /// Creates a resolver with the default 1500ms TTL and 1024-entry capacity
-    /// backed by the host platform socket table lookup.
+    /// Creates a resolver with the default 1500ms positive TTL, 100ms negative TTL,
+    /// and 1024-entry capacity backed by the host platform socket table lookup.
     pub fn new() -> Self {
         Self::with_config(DEFAULT_SOCKET_CACHE_TTL, DEFAULT_SOCKET_CACHE_MAX_ENTRIES)
     }
@@ -734,8 +1078,17 @@ impl ProcessSocketResolver {
         Self {
             cache: Mutex::new(HashMap::new()),
             ttl,
+            negative_ttl: ttl.min(DEFAULT_NEGATIVE_SOCKET_CACHE_TTL),
             max_entries,
             lookup_fn: Box::new(lookup_fn),
+        }
+    }
+
+    fn entry_ttl(&self, entry: &SocketCacheEntry) -> Duration {
+        if entry.app_name.is_some() {
+            self.ttl
+        } else {
+            self.negative_ttl
         }
     }
 
@@ -756,7 +1109,7 @@ impl ProcessSocketResolver {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(entry) = guard.get(&key) {
-                if now.saturating_duration_since(entry.cached_at) < self.ttl {
+                if now.saturating_duration_since(entry.cached_at) < self.entry_ttl(entry) {
                     return entry.app_name.clone();
                 }
             }
@@ -772,7 +1125,15 @@ impl ProcessSocketResolver {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if !guard.contains_key(&key) && guard.len() >= self.max_entries {
                 let ttl = self.ttl;
-                guard.retain(|_, entry| cached_at.saturating_duration_since(entry.cached_at) < ttl);
+                let negative_ttl = self.negative_ttl;
+                guard.retain(|_, entry| {
+                    let entry_ttl = if entry.app_name.is_some() {
+                        ttl
+                    } else {
+                        negative_ttl
+                    };
+                    cached_at.saturating_duration_since(entry.cached_at) < entry_ttl
+                });
                 if guard.len() >= self.max_entries {
                     if let Some(oldest_key) = guard
                         .iter()
@@ -831,22 +1192,119 @@ pub fn resolve_local_app(local_ip: IpAddr, local_port: u16, is_udp: bool) -> Opt
     global_resolver().resolve(local_ip, local_port, is_udp)
 }
 
-/// Builds an optional per-flow TUN bypass hook from `split` for desktop TUN
-/// sessions. Returns `None` when split tunneling is in `All` mode so the TUN
-/// hot path incurs zero overhead.
-pub fn build_tun_app_bypass_hook(
+/// Expands a [`vdpi_core::config::SplitTunnelConfig`] with companion helper/launcher
+/// executables (via [`companion_executables_for`]) for runtime matching without
+/// mutating the user's persisted app list.
+pub fn expand_split_tunnel_companions(
     split: &vdpi_core::config::SplitTunnelConfig,
-) -> Option<vdpi_tun::config::AppBypassHook> {
+) -> vdpi_core::config::SplitTunnelConfig {
+    let mut expanded = split.clone();
+    let mut seen: std::collections::HashSet<String> = expanded
+        .apps
+        .iter()
+        .map(|app| normalize_exe(app))
+        .filter(|n| !n.is_empty())
+        .collect();
+
+    for app in &split.apps {
+        for &companion in companion_executables_for(app) {
+            let norm = normalize_exe(companion);
+            if !norm.is_empty() && seen.insert(norm) {
+                expanded.apps.push(companion.to_string());
+            }
+        }
+    }
+
+    expanded
+}
+
+fn matches_split_app_with_companions(
+    split: &vdpi_core::config::SplitTunnelConfig,
+    exe_name: Option<&str>,
+) -> bool {
+    let Some(exe) = exe_name else {
+        return false;
+    };
+    if split.apps.is_empty() {
+        return false;
+    }
+    let target = NormalizedApp::from_raw(exe);
+    if target.is_empty() {
+        return false;
+    }
+
+    // Fast path: direct normalized match against `split.apps`.
+    if split
+        .apps
+        .iter()
+        .any(|app| NormalizedApp::from_raw(app).eq_normalized(&target))
+    {
+        return true;
+    }
+
+    // Companion path: `expand_split_tunnel_companions` appends bare companion
+    // names from `COMPANION_GROUPS` (without `.app`), so `target` itself must
+    // match a group member directly and some configured entry's companion stem
+    // (with optional `.app` stripped) must belong to that same group.
+    let Some(target_group) = COMPANION_GROUPS.iter().copied().find(|group| {
+        group
+            .iter()
+            .any(|&member| target.eq_lowercase_ascii(member))
+    }) else {
+        return false;
+    };
+
+    split.apps.iter().any(|app| {
+        let configured = NormalizedApp::from_raw(app);
+        target_group
+            .iter()
+            .any(|&member| configured.stem_eq_lowercase_ascii(member))
+    })
+}
+
+/// Evaluates split-tunnel bypass policy for `exe_name` with companion executable
+/// expansion applied, without allocating on the hot path.
+pub fn should_bypass_app_with_companions(
+    split: &vdpi_core::config::SplitTunnelConfig,
+    exe_name: Option<&str>,
+) -> bool {
+    match split.mode {
+        vdpi_core::config::SplitTunnelMode::All => false,
+        vdpi_core::config::SplitTunnelMode::Exclude => {
+            matches_split_app_with_companions(split, exe_name)
+        }
+        vdpi_core::config::SplitTunnelMode::Include => {
+            !matches_split_app_with_companions(split, exe_name)
+        }
+    }
+}
+
+fn build_tun_app_bypass_hook_with_resolver<F>(
+    split: &vdpi_core::config::SplitTunnelConfig,
+    resolver: F,
+) -> Option<vdpi_tun::config::AppBypassHook>
+where
+    F: Fn(IpAddr, u16, bool) -> Option<String> + Send + Sync + 'static,
+{
     if !split.is_active() {
         return None;
     }
     let cfg = split.clone();
     Some(vdpi_tun::config::AppBypassHook::new(
         move |src_ip, src_port, is_udp| {
-            let app = resolve_local_app(src_ip, src_port, is_udp);
-            cfg.should_bypass_app(app.as_deref())
+            let app = resolver(src_ip, src_port, is_udp);
+            should_bypass_app_with_companions(&cfg, app.as_deref())
         },
     ))
+}
+
+/// Builds an optional per-flow TUN bypass hook from `split` for desktop TUN
+/// sessions. Returns `None` when split tunneling is in `All` mode so the TUN
+/// hot path incurs zero overhead.
+pub fn build_tun_app_bypass_hook(
+    split: &vdpi_core::config::SplitTunnelConfig,
+) -> Option<vdpi_tun::config::AppBypassHook> {
+    build_tun_app_bypass_hook_with_resolver(split, resolve_local_app)
 }
 
 #[cfg(test)]
@@ -1254,5 +1712,549 @@ mod tests {
         // Explicit clear empties cache
         resolver.clear();
         assert!(resolver.is_empty());
+    }
+
+    #[test]
+    fn negative_socket_cache_expires_faster_than_positive_hits() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_ref = Arc::clone(&calls);
+
+        let resolver = ProcessSocketResolver::with_lookup(
+            Duration::from_millis(1500),
+            16,
+            move |_ip, port, _is_udp| {
+                calls_ref.fetch_add(1, Ordering::SeqCst);
+                if port == 40000 {
+                    None
+                } else {
+                    Some("discord.exe".to_string())
+                }
+            },
+        );
+
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert_eq!(resolver.resolve(ip, 40000, false), None);
+        assert_eq!(resolver.resolve(ip, 40001, false).as_deref(), Some("discord.exe"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // Within 100ms both stay cached
+        assert_eq!(resolver.resolve(ip, 40000, false), None);
+        assert_eq!(resolver.resolve(ip, 40001, false).as_deref(), Some("discord.exe"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // After 130ms (> 100ms negative TTL, < 1500ms positive TTL), only None expires
+        thread::sleep(Duration::from_millis(130));
+        assert_eq!(resolver.resolve(ip, 40001, false).as_deref(), Some("discord.exe"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        assert_eq!(resolver.resolve(ip, 40000, false), None);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn companion_executables_expand_bidirectionally_across_platforms() {
+        assert!(companion_executables_for("unknown.exe").is_empty());
+        assert!(companion_executables_for("").is_empty());
+
+        // Every member in every companion group must resolve symmetrically to its full group.
+        for &group in COMPANION_GROUPS {
+            assert!(group.len() >= 2);
+            for &member in group {
+                let resolved = companion_executables_for(member);
+                assert_eq!(
+                    resolved, group,
+                    "companion_executables_for({member:?}) must be symmetric"
+                );
+                let with_exe = format!("{member}.exe");
+                assert_eq!(companion_executables_for(&with_exe), group);
+                let with_app = format!("{member}.app");
+                assert_eq!(companion_executables_for(&with_app), group);
+            }
+        }
+
+        // Discord group bidirectional expansion (Windows, macOS, Linux/Flatpak)
+        let discord_from_flatpak = vdpi_core::config::SplitTunnelConfig {
+            mode: vdpi_core::config::SplitTunnelMode::Exclude,
+            apps: vec!["com.discordapp.Discord".to_string()],
+        };
+        for member in [
+            "Discord.exe",
+            "DiscordPTB.exe",
+            "DiscordCanary.exe",
+            "discord_clips.exe",
+            "Discord Helper",
+            "com.discordapp.Discord",
+        ] {
+            assert!(
+                should_bypass_app_with_companions(&discord_from_flatpak, Some(member)),
+                "expected Discord Flatpak selection to cover {member}"
+            );
+        }
+        let discord_from_helper = vdpi_core::config::SplitTunnelConfig {
+            mode: vdpi_core::config::SplitTunnelMode::Exclude,
+            apps: vec!["Discord Helper".to_string()],
+        };
+        assert!(should_bypass_app_with_companions(
+            &discord_from_helper,
+            Some("Discord.exe")
+        ));
+        assert!(should_bypass_app_with_companions(
+            &discord_from_helper,
+            Some("com.discordapp.Discord")
+        ));
+
+        // Roblox group bidirectional expansion (Windows, macOS, Sober Flatpak, Bloxstrap, Fishstrap)
+        let roblox_from_fishstrap = vdpi_core::config::SplitTunnelConfig {
+            mode: vdpi_core::config::SplitTunnelMode::Exclude,
+            apps: vec!["Fishstrap.exe".to_string()],
+        };
+        for member in [
+            "RobloxPlayerBeta.exe",
+            "RobloxPlayerLauncher.exe",
+            "RobloxPlayerInstaller.exe",
+            "Bloxstrap.exe",
+            "Fishstrap.exe",
+            "RobloxPlayer",
+            "org.vinegarhq.Sober",
+        ] {
+            assert!(
+                should_bypass_app_with_companions(&roblox_from_fishstrap, Some(member)),
+                "expected Fishstrap selection to cover {member}"
+            );
+        }
+        let roblox_from_sober = vdpi_core::config::SplitTunnelConfig {
+            mode: vdpi_core::config::SplitTunnelMode::Exclude,
+            apps: vec!["org.vinegarhq.Sober".to_string()],
+        };
+        assert!(should_bypass_app_with_companions(
+            &roblox_from_sober,
+            Some("RobloxPlayerBeta.exe")
+        ));
+
+        // Riot / Valorant / Vanguard / League bidirectional expansion
+        let riot_from_valorant = vdpi_core::config::SplitTunnelConfig {
+            mode: vdpi_core::config::SplitTunnelMode::Exclude,
+            apps: vec!["VALORANT-Win64-Shipping.exe".to_string()],
+        };
+        for member in [
+            "RiotClientServices.exe",
+            "RiotClientUx.exe",
+            "RiotClientUxRender.exe",
+            "VALORANT.exe",
+            "VALORANT-Win64-Shipping.exe",
+            "vgc.exe",
+            "vgtray.exe",
+            "LeagueClient.exe",
+            "LeagueClientUx.exe",
+            "LeagueClientUxRender.exe",
+            "League of Legends.exe",
+        ] {
+            assert!(
+                should_bypass_app_with_companions(&riot_from_valorant, Some(member)),
+                "expected VALORANT selection to cover {member}"
+            );
+        }
+        let riot_from_vgc = vdpi_core::config::SplitTunnelConfig {
+            mode: vdpi_core::config::SplitTunnelMode::Include,
+            apps: vec!["vgc.exe".to_string()],
+        };
+        // Include mode: Riot companions stay included (not bypassed), unrelated apps bypass.
+        assert!(!should_bypass_app_with_companions(
+            &riot_from_vgc,
+            Some("RiotClientServices.exe")
+        ));
+        assert!(!should_bypass_app_with_companions(
+            &riot_from_vgc,
+            Some("League of Legends.exe")
+        ));
+        assert!(should_bypass_app_with_companions(
+            &riot_from_vgc,
+            Some("chrome.exe")
+        ));
+
+        // Steam group bidirectional expansion
+        let steam_from_overlay = vdpi_core::config::SplitTunnelConfig {
+            mode: vdpi_core::config::SplitTunnelMode::Exclude,
+            apps: vec!["GameOverlayUI.exe".to_string()],
+        };
+        for member in [
+            "steam.exe",
+            "steam_osx",
+            "steamwebhelper.exe",
+            "steamservice.exe",
+            "GameOverlayUI.exe",
+            "com.valvesoftware.Steam",
+        ] {
+            assert!(
+                should_bypass_app_with_companions(&steam_from_overlay, Some(member)),
+                "expected GameOverlayUI selection to cover {member}"
+            );
+        }
+
+        // Epic group bidirectional expansion
+        let epic_from_eos = vdpi_core::config::SplitTunnelConfig {
+            mode: vdpi_core::config::SplitTunnelMode::Exclude,
+            apps: vec!["EOSOverlayRenderer-Win64-Shipping.exe".to_string()],
+        };
+        assert!(should_bypass_app_with_companions(
+            &epic_from_eos,
+            Some("EpicGamesLauncher.exe")
+        ));
+        assert!(should_bypass_app_with_companions(
+            &epic_from_eos,
+            Some("EpicWebHelper.exe")
+        ));
+
+        // Browser Flatpak bridges (bidirectional)
+        let firefox_flatpak = vdpi_core::config::SplitTunnelConfig {
+            mode: vdpi_core::config::SplitTunnelMode::Exclude,
+            apps: vec!["org.mozilla.firefox".to_string()],
+        };
+        assert!(should_bypass_app_with_companions(
+            &firefox_flatpak,
+            Some("firefox.exe")
+        ));
+        let chrome_native = vdpi_core::config::SplitTunnelConfig {
+            mode: vdpi_core::config::SplitTunnelMode::Exclude,
+            apps: vec!["google-chrome".to_string()],
+        };
+        assert!(should_bypass_app_with_companions(
+            &chrome_native,
+            Some("com.google.Chrome")
+        ));
+        assert!(should_bypass_app_with_companions(
+            &chrome_native,
+            Some("chrome.exe")
+        ));
+        let chromium_flatpak = vdpi_core::config::SplitTunnelConfig {
+            mode: vdpi_core::config::SplitTunnelMode::Exclude,
+            apps: vec!["org.chromium.Chromium".to_string()],
+        };
+        assert!(should_bypass_app_with_companions(
+            &chromium_flatpak,
+            Some("chromium")
+        ));
+        assert!(!should_bypass_app_with_companions(
+            &chromium_flatpak,
+            Some("firefox")
+        ));
+    }
+
+    #[test]
+    fn canonical_exe_entry_strips_shortcut_cli_arguments() {
+        assert_eq!(
+            canonical_exe_entry(
+                r#""C:\Riot Games\Riot Client\RiotClientServices.exe" --launch-product=valorant --launch-patchline=live"#
+            ),
+            Some("RiotClientServices.exe".to_string())
+        );
+        assert_eq!(
+            canonical_exe_entry(
+                r#""C:\Program Files\Discord\Discord.exe" --profile="Work Profile""#
+            ),
+            Some("Discord.exe".to_string())
+        );
+        assert_eq!(
+            canonical_exe_entry("'/usr/bin/firefox' --new-window --private-window"),
+            Some("firefox".to_string())
+        );
+        assert_eq!(
+            canonical_exe_entry(
+                r"C:\Riot Games\Riot Client\RiotClientServices.exe --launch-product=valorant"
+            ),
+            Some("RiotClientServices.exe".to_string())
+        );
+        assert_eq!(
+            canonical_exe_entry("Discord.exe --start-minimized"),
+            Some("Discord.exe".to_string())
+        );
+        assert_eq!(
+            canonical_exe_entry(r"C:\Games\VALORANT.EXE /silent"),
+            Some("VALORANT.EXE".to_string())
+        );
+        assert_eq!(
+            canonical_exe_entry("/Applications/Google Chrome.app --incognito"),
+            Some("Google Chrome.app".to_string())
+        );
+        assert_eq!(
+            canonical_exe_entry("/usr/bin/firefox --new-window"),
+            Some("firefox".to_string())
+        );
+        assert_eq!(
+            canonical_exe_entry("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            Some("Google Chrome".to_string())
+        );
+        assert_eq!(
+            canonical_exe_entry("League of Legends"),
+            Some("League of Legends".to_string())
+        );
+        assert_eq!(
+            canonical_exe_entry(r#""" --launch-product=valorant"#),
+            None
+        );
+    }
+
+    #[test]
+    fn search_ranking_boosts_running_prefix_and_rejects_noisy_fuzzy_and_handles_turkish_i() {
+        let apps = vec![
+            make_app("Discord", "Discord.exe", None, false, AppCategory::Popular),
+            make_app(
+                "Discord PTB",
+                "DiscordPTB.exe",
+                None,
+                true,
+                AppCategory::Running,
+            ),
+        ];
+        let ranked = filter_and_rank_apps(&apps, "discord");
+        assert_eq!(ranked[0].exe_name, "DiscordPTB.exe");
+        assert_eq!(ranked[1].exe_name, "Discord.exe");
+
+        let nvidia = make_app(
+            "NVIDIA GeForce NOW",
+            "GeForceNOW.exe",
+            None,
+            false,
+            AppCategory::Installed,
+        );
+        let dotnet = make_app(
+            ".NET Windows Desktop Runtime",
+            "dotnet.exe",
+            None,
+            false,
+            AppCategory::Installed,
+        );
+        let ms_dotnet = make_app(
+            "Microsoft Windows Desktop Runtime",
+            "dotnet.exe",
+            None,
+            false,
+            AppCategory::Installed,
+        );
+        assert_eq!(fuzzy_score("vgc", &nvidia), None);
+        assert_eq!(fuzzy_score("riot", &dotnet), None);
+        assert_eq!(fuzzy_score("riot", &ms_dotnet), None);
+
+        // Turkish capital dotted İ (`i\u{0307}`) and dotless ı (`\u{0131}`) normalize to ASCII `i`
+        let turkish_app = make_app("İstanbul App", "istanbul.exe", None, false, AppCategory::Installed);
+        assert_eq!(fuzzy_score("istanbul app", &turkish_app), Some(1000));
+        assert_eq!(fuzzy_score("İSTANBUL APP", &turkish_app), Some(1000));
+        let discord = make_app("Discord", "Discord.exe", None, false, AppCategory::Popular);
+        assert_eq!(fuzzy_score("DİSCORD", &discord), Some(1000));
+        assert_eq!(fuzzy_score("dıscord", &discord), Some(1000));
+
+        let riot = make_app(
+            "Riot Client",
+            "RiotClientServices.exe",
+            None,
+            false,
+            AppCategory::Popular,
+        );
+        assert_eq!(fuzzy_score("rıot", &riot), Some(800));
+
+        let bank = make_app(
+            "Garanti Bankası",
+            "garanti.exe",
+            None,
+            false,
+            AppCategory::Installed,
+        );
+        assert_eq!(fuzzy_score("bankasi", &bank), Some(650));
+        assert_eq!(fuzzy_score("bankası", &bank), Some(650));
+
+        let bank_exact = make_app("Bankası", "bank.exe", None, false, AppCategory::Installed);
+        assert_eq!(fuzzy_score("bankasi", &bank_exact), Some(1000));
+    }
+
+    #[test]
+    fn should_bypass_app_with_companions_matches_expanded_config_exactly() {
+        let mut seen_members = std::collections::HashSet::new();
+        for &group in COMPANION_GROUPS {
+            for &member in group {
+                assert!(!member.is_empty());
+                assert!(member.is_ascii());
+                assert_eq!(normalize_exe(member), member);
+                assert!(!member.ends_with(".app"));
+                assert!(
+                    seen_members.insert(member),
+                    "duplicate companion member {member:?} across COMPANION_GROUPS"
+                );
+            }
+        }
+
+        let mut app_lists: Vec<Vec<&str>> = vec![
+            vec![],
+            vec!["", "   ", ".exe", "\"\"", "' '", r"C:\dir\"],
+            vec![".app"],
+            vec!["Discord.exe"],
+            vec!["Discord.app"],
+            vec!["Discord.APP"],
+            vec!["Discord.app.exe"],
+            vec!["Discord.exe.app"],
+            vec!["Discord .exe"],
+            vec!["Discord .app"],
+            vec!["DİSCORD.EXE"],
+            vec!["dıscord.exe"],
+            vec!["DİSCORD.APP"],
+            vec![r#" "C:\Program Files\Discord\Discord.exe" "#],
+            vec![r"C:\Users\İstanbul\Discord.exe"],
+            vec!["com.discordapp.Discord"],
+            vec!["Fishstrap.exe"],
+            vec!["VALORANT-Win64-Shipping.exe"],
+            vec!["RİOTCLİENTSERVİCES.EXE"],
+            vec!["GameOverlayUI.exe"],
+            vec!["EOSOverlayRenderer-Win64-Shipping.exe"],
+            vec!["'/usr/bin/firefox'"],
+            vec!["Google Chrome.app"],
+            vec!["org.chromium.Chromium"],
+            vec!["customapp.exe"],
+            vec!["İstanbul.exe"],
+            vec!["ΜΟΥΣΙΚΗ.exe"],
+            vec!["Discord.exe", "customapp.exe", "   ", "org.mozilla.firefox"],
+        ];
+        for &group in COMPANION_GROUPS {
+            for &member in group {
+                app_lists.push(vec![member]);
+            }
+        }
+
+        let mut probes: Vec<Option<&str>> = vec![
+            None,
+            Some(""),
+            Some("   "),
+            Some(".exe"),
+            Some("\"\""),
+            Some(".app"),
+            Some(r"C:\dir\"),
+            Some("Discord.exe"),
+            Some("DISCORD.EXE"),
+            Some("Discord .exe"),
+            Some("Discord.app"),
+            Some("Discord.APP"),
+            Some("DiscordPTB.exe"),
+            Some("DiscordPTB.app"),
+            Some("Discord.app.exe"),
+            Some("Discord.exe.app"),
+            Some("Discord .app"),
+            Some("DİSCORD.EXE"),
+            Some("dıscordptb.exe"),
+            Some("DİSCORD.APP"),
+            Some(r#" 'C:\Users\Alice\AppData\Local\DiscordPTB\DiscordPTB.exe' "#),
+            Some(r"C:\Users\İstanbul\DiscordPTB.exe"),
+            Some("RobloxPlayerBeta.exe"),
+            Some("org.vinegarhq.Sober"),
+            Some("RiotClientServices.exe"),
+            Some("League of Legends.exe"),
+            Some("steamwebhelper.exe"),
+            Some("EpicGamesLauncher.exe"),
+            Some("firefox.exe"),
+            Some("Google Chrome"),
+            Some("Google Chrome.app"),
+            Some("com.google.Chrome"),
+            Some("chromium"),
+            Some("customapp.exe"),
+            Some("CUSTOMAPP"),
+            Some("İstanbul.exe"),
+            Some("istanbul.exe"),
+            Some("ΜΟΥΣΙΚΗ.exe"),
+            Some("μουσικη.exe"),
+            Some("notepad.exe"),
+            Some("spotify.exe"),
+        ];
+        for &group in COMPANION_GROUPS {
+            for &member in group {
+                probes.push(Some(member));
+            }
+        }
+
+        let modes = [
+            vdpi_core::config::SplitTunnelMode::All,
+            vdpi_core::config::SplitTunnelMode::Exclude,
+            vdpi_core::config::SplitTunnelMode::Include,
+        ];
+
+        for mode in modes {
+            for apps in &app_lists {
+                let cfg = vdpi_core::config::SplitTunnelConfig {
+                    mode,
+                    apps: apps.iter().map(|s| (*s).to_string()).collect(),
+                };
+                let expanded = expand_split_tunnel_companions(&cfg);
+                for &exe in &probes {
+                    let expected = expanded.should_bypass_app(exe);
+                    let actual = should_bypass_app_with_companions(&cfg, exe);
+                    assert_eq!(
+                        actual, expected,
+                        "mismatch for mode={mode:?}, apps={apps:?}, exe={exe:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn build_tun_app_bypass_hook_uses_companion_policy_and_skips_all_mode() {
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+        let all_cfg = vdpi_core::config::SplitTunnelConfig {
+            mode: vdpi_core::config::SplitTunnelMode::All,
+            apps: vec!["Discord.exe".to_string()],
+        };
+        assert!(build_tun_app_bypass_hook(&all_cfg).is_none());
+
+        let exclude_cfg = vdpi_core::config::SplitTunnelConfig {
+            mode: vdpi_core::config::SplitTunnelMode::Exclude,
+            apps: vec!["Discord.exe".to_string()],
+        };
+        let exclude_hook = build_tun_app_bypass_hook_with_resolver(&exclude_cfg, |_ip, port, _| {
+            match port {
+                1000 => Some("Discord.exe".to_string()),
+                1001 => Some("DiscordPTB.exe".to_string()),
+                1002 => Some("chrome.exe".to_string()),
+                _ => None,
+            }
+        })
+        .expect("exclude mode should produce hook");
+        assert!(exclude_hook.should_bypass(ip, 1000, false));
+        assert!(exclude_hook.should_bypass(ip, 1001, true));
+        assert!(!exclude_hook.should_bypass(ip, 1002, false));
+        assert!(!exclude_hook.should_bypass(ip, 1003, false));
+
+        let include_cfg = vdpi_core::config::SplitTunnelConfig {
+            mode: vdpi_core::config::SplitTunnelMode::Include,
+            apps: vec!["vgc.exe".to_string()],
+        };
+        let include_hook = build_tun_app_bypass_hook_with_resolver(&include_cfg, |_ip, port, _| {
+            match port {
+                2000 => Some("RiotClientServices.exe".to_string()),
+                2001 => Some("chrome.exe".to_string()),
+                _ => None,
+            }
+        })
+        .expect("include mode should produce hook");
+        assert!(!include_hook.should_bypass(ip, 2000, false));
+        assert!(include_hook.should_bypass(ip, 2001, false));
+        assert!(include_hook.should_bypass(ip, 2002, true));
+    }
+
+    #[test]
+    fn popular_apps_and_companions_include_macos_discord_variants_and_safari() {
+        assert_eq!(popular_app_display_name("Discord PTB.app"), Some("Discord PTB"));
+        assert_eq!(
+            popular_app_display_name("Discord Canary.app"),
+            Some("Discord Canary")
+        );
+        assert_eq!(popular_app_display_name("Safari.app"), Some("Safari"));
+        assert!(is_popular_app("safari"));
+
+        let cfg = vdpi_core::config::SplitTunnelConfig {
+            mode: vdpi_core::config::SplitTunnelMode::Exclude,
+            apps: vec!["Discord".to_string()],
+        };
+        assert!(should_bypass_app_with_companions(&cfg, Some("Discord PTB")));
+        assert!(should_bypass_app_with_companions(
+            &cfg,
+            Some("Discord Canary")
+        ));
     }
 }

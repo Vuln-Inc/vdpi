@@ -128,9 +128,7 @@ public enum VdpiAppGroup {
         return defaultExtensionBundleId
     }
 
-    public static var defaults: UserDefaults {
-        UserDefaults(suiteName: suiteName) ?? .standard
-    }
+    public static let defaults: UserDefaults = UserDefaults(suiteName: suiteName) ?? .standard
 
     public static func loadSettings(from storage: UserDefaults = defaults) -> VdpiSettings {
         guard let data = storage.data(forKey: settingsKey),

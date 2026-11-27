@@ -1,6 +1,8 @@
-use anyhow::{Context, Result};
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use anyhow::Context;
+use anyhow::Result;
 use std::env;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -85,21 +87,21 @@ pub(super) fn is_custom_dns(addr: &str) -> bool {
             .any(|p| p.addr.eq_ignore_ascii_case(trimmed))
 }
 
+fn redact_custom_dns_display(addr: &str) -> String {
+    let redacted = vdpi_core::dns::redact_dns_for_display(addr);
+    if let Some(host) = redacted.strip_prefix("https://") {
+        return host.to_string();
+    }
+    redacted
+}
+
 pub(super) fn shorten_custom_dns(addr: &str, max_chars: usize) -> String {
     let trimmed = addr.trim();
-    let stripped = if trimmed
-        .get(..8)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
-    {
-        &trimmed[8..]
-    } else {
-        trimmed
-    }
-    .trim_end_matches('/');
-    let display = if stripped.is_empty() {
+    let redacted = redact_custom_dns_display(trimmed);
+    let display = if redacted.is_empty() {
         trimmed
     } else {
-        stripped
+        redacted.as_str()
     };
     if max_chars == 0 {
         return String::new();
@@ -336,7 +338,7 @@ fn format_rss_mb(rss_kb: Option<u64>) -> Option<String> {
     Some(format!("{mb} MB"))
 }
 
-fn build_anti_dpi_row(live: &LiveEngineStatus) -> StatusRow {
+fn build_anti_dpi_row(live: &LiveEngineStatus, configured_dns: &str) -> StatusRow {
     let mut parts: Vec<String> = Vec::new();
     if let Some(mode) = live
         .mode
@@ -347,7 +349,18 @@ fn build_anti_dpi_row(live: &LiveEngineStatus) -> StatusRow {
         parts.push(format_mode_label(mode).to_string());
     }
     if let Some(doh) = live.doh {
-        let label = if doh { "DoH on" } else { "DoH off" };
+        let dns_addr = live
+            .dns_addr
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| configured_dns.trim());
+        let is_doh = if dns_addr.is_empty() {
+            doh
+        } else {
+            vdpi_core::dns::is_effective_doh_target(dns_addr, doh)
+        };
+        let label = if is_doh { "DoH on" } else { "DoH off" };
         parts.push(label.to_string());
     }
     if let Some(block_quic) = live.block_quic {
@@ -436,9 +449,9 @@ fn build_engine_row(status: &ControlCenterStatus) -> StatusRow {
     .with_badge(badge)
 }
 
-fn build_status_rows(status: &ControlCenterStatus) -> Vec<StatusRow> {
+fn build_status_rows(status: &ControlCenterStatus, configured_dns: &str) -> Vec<StatusRow> {
     let anti_dpi_row = if let Some(live) = status.live_engine.as_ref() {
-        build_anti_dpi_row(live)
+        build_anti_dpi_row(live, configured_dns)
     } else if status.service_state == ServiceState::Running {
         StatusRow::new(
             "Anti-DPI",
@@ -480,7 +493,15 @@ fn uninstall_item() -> MenuItem {
     MenuItem::new(
         Choice::Uninstall,
         "Uninstall vdpi",
-        "Stops service, removes files & PATH, restores routes & proxies.",
+        "Removes service and restores network settings.",
+    )
+}
+
+fn doctor_item() -> MenuItem {
+    MenuItem::new(
+        Choice::Doctor,
+        "Run diagnostics",
+        "Tests DNS and bypass connectivity.",
     )
 }
 
@@ -491,17 +512,22 @@ fn active_or_configured_engine(status: &ControlCenterStatus) -> EngineMode {
         .map_or(status.configured_engine, |live| live.engine)
 }
 
+#[cfg(target_os = "macos")]
+const TUN_IFACE_LABEL: &str = "utun";
+#[cfg(not(target_os = "macos"))]
+const TUN_IFACE_LABEL: &str = "vdpi0";
+
 fn switch_engine_item(current: EngineMode) -> MenuItem {
     match current {
         EngineMode::Proxy => MenuItem::new(
             Choice::SwitchEngine(EngineMode::Tun),
             "Switch to TUN mode",
-            "Transparent system-wide anti-DPI via vdpi0 - no proxy setup or browser restarts.",
+            format!("All apps, Roblox & Discord voice via {TUN_IFACE_LABEL} (requires Admin)."),
         ),
         EngineMode::Tun => MenuItem::new(
             Choice::SwitchEngine(EngineMode::Proxy),
             "Switch to Proxy mode",
-            "Classic local HTTP/SOCKS5 proxy - lightweight, no virtual adapter, VPN-friendly.",
+            "Browsers & apps - no Admin, lightweight, VPN-friendly.",
         ),
     }
 }
@@ -540,11 +566,7 @@ fn build_same_version_items(
                 switch_engine_item(current_engine),
                 dns_server_item(configured_dns),
                 split_tunnel_item(split_tunnel),
-                MenuItem::new(
-                    Choice::Doctor,
-                    "Run diagnostics",
-                    "Tests DNS ring and anti-DPI bypass connectivity.",
-                ),
+                doctor_item(),
                 MenuItem::new(
                     Choice::Update,
                     "Check for updates online",
@@ -576,11 +598,7 @@ fn build_same_version_items(
                 ));
             }
             items.extend([
-                MenuItem::new(
-                    Choice::Doctor,
-                    "Run diagnostics",
-                    "Tests DNS ring and anti-DPI bypass connectivity.",
-                ),
+                doctor_item(),
                 MenuItem::new(
                     Choice::Update,
                     "Check for updates online",
@@ -612,11 +630,7 @@ fn build_same_version_items(
                 ));
             }
             items.extend([
-                MenuItem::new(
-                    Choice::Doctor,
-                    "Run diagnostics",
-                    "Tests DNS ring and anti-DPI bypass connectivity.",
-                ),
+                doctor_item(),
                 MenuItem::new(
                     Choice::Update,
                     "Check for updates online",
@@ -655,7 +669,7 @@ pub(super) fn build_menu_with_options(
     configured_dns: &str,
     split_tunnel: &SplitTunnelConfig,
 ) -> LauncherMenu {
-    let status_rows = build_status_rows(status);
+    let status_rows = build_status_rows(status, configured_dns);
     let notice = notice
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -683,11 +697,7 @@ pub(super) fn build_menu_with_options(
                 ),
                 dns_server_item(configured_dns),
                 split_tunnel_item(split_tunnel),
-                MenuItem::new(
-                    Choice::Doctor,
-                    "Run diagnostics",
-                    "Tests DNS ring and anti-DPI bypass connectivity.",
-                ),
+                doctor_item(),
                 quit_item(),
             ]);
             items
@@ -718,11 +728,13 @@ pub(super) fn build_menu_with_options(
                 items.push(switch_engine_item(current_engine));
                 items.push(dns_server_item(configured_dns));
                 items.push(split_tunnel_item(split_tunnel));
-                items.push(MenuItem::new(
-                    Choice::Run,
-                    "Run directly without updating",
-                    "Active while this terminal is open.",
-                ));
+                if service_state != ServiceState::Running && !has_live_engine {
+                    items.push(MenuItem::new(
+                        Choice::Run,
+                        "Run directly without updating",
+                        "Active while this terminal is open.",
+                    ));
+                }
                 items.push(uninstall_item());
                 items.push(quit_item());
                 items
@@ -741,11 +753,13 @@ pub(super) fn build_menu_with_options(
                 if has_live_engine {
                     items.push(dashboard_item());
                 }
-                items.push(MenuItem::new(
-                    Choice::Run,
-                    "Run directly",
-                    format!("Keep installed v{inst} untouched."),
-                ));
+                if service_state != ServiceState::Running && !has_live_engine {
+                    items.push(MenuItem::new(
+                        Choice::Run,
+                        "Run directly",
+                        format!("Keep installed v{inst} untouched."),
+                    ));
+                }
                 if let Some(toggle) = pause_or_resume_item(service_state) {
                     items.push(toggle);
                 }
@@ -778,11 +792,13 @@ pub(super) fn build_menu_with_options(
                 items.push(switch_engine_item(current_engine));
                 items.push(dns_server_item(configured_dns));
                 items.push(split_tunnel_item(split_tunnel));
-                items.push(MenuItem::new(
-                    Choice::Run,
-                    "Run directly",
-                    "Active while this terminal is open.",
-                ));
+                if service_state != ServiceState::Running && !has_live_engine {
+                    items.push(MenuItem::new(
+                        Choice::Run,
+                        "Run directly",
+                        "Active while this terminal is open.",
+                    ));
+                }
                 items.push(uninstall_item());
                 items.push(quit_item());
                 items
@@ -797,15 +813,22 @@ pub(super) fn build_menu_with_options(
     }
 }
 
+/// Legacy v0.5.x builds wrote a `run-directly` marker next to the binary to skip
+/// the launcher on subsequent double-clicks. Control Center is now always the
+/// interactive entry point, so remove any stale marker on sight (best-effort)
+/// and never bypass Control Center.
+fn migrate_legacy_preference_at(marker_path: Option<&Path>) {
+    if let Some(path) = marker_path.filter(|p| p.is_file()) {
+        let _ = fs::remove_file(path);
+    }
+}
+
 fn should_auto_run(
-    explicit: bool,
-    marker_path: Option<&Path>,
-    status: &ControlCenterStatus,
+    _explicit: bool,
+    _marker_path: Option<&Path>,
+    _status: &ControlCenterStatus,
 ) -> bool {
-    !explicit
-        && marker_path.is_some_and(Path::is_file)
-        && status.installed.is_none()
-        && status.service_state == ServiceState::NotInstalled
+    false
 }
 
 #[allow(dead_code)]
@@ -841,17 +864,12 @@ where
     F: FnMut() -> ControlCenterStatus,
 {
     let state = preference_path();
+    migrate_legacy_preference_at(state.as_deref());
     if should_auto_run(explicit, state.as_deref(), status) {
         return Ok(Choice::Run);
     }
 
-    let mut latest_status = status.clone();
     let selected = if io::stdin().is_terminal() && io::stdout().is_terminal() {
-        let mut tracked_refresh = || {
-            let refreshed = refresh();
-            latest_status = refreshed.clone();
-            refreshed
-        };
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             if env::var("TERM").as_deref() == Ok("dumb") {
@@ -862,7 +880,7 @@ where
                     notice,
                     configured_dns,
                     split_tunnel,
-                    &mut tracked_refresh,
+                    &mut refresh,
                 )?
             } else {
                 let color = env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
@@ -872,7 +890,7 @@ where
                     notice,
                     configured_dns,
                     split_tunnel,
-                    &mut tracked_refresh,
+                    &mut refresh,
                 ) {
                     Ok(choice) => choice,
                     Err(_) => read_choice_with_options(
@@ -882,7 +900,7 @@ where
                         notice,
                         configured_dns,
                         split_tunnel,
-                        &mut tracked_refresh,
+                        &mut refresh,
                     )
                     .context("running the terminal launcher")?,
                 }
@@ -897,7 +915,7 @@ where
                 notice,
                 configured_dns,
                 split_tunnel,
-                &mut tracked_refresh,
+                &mut refresh,
             )?
         }
     } else if explicit {
@@ -907,23 +925,45 @@ where
         return Ok(Choice::Unattended);
     };
 
-    if selected == Choice::Run
-        && latest_status.installed.is_none()
-        && latest_status.service_state == ServiceState::NotInstalled
-    {
-        if let Err(e) = state
-            .context("could not locate the vdpi executable directory")
-            .and_then(|p| remember_run(&p))
-        {
-            eprintln!("vdpi could not save your choice: {e:#}");
-        }
-    }
     Ok(selected)
 }
 
 pub fn print_run_notice() {
     eprintln!("  Run directly  |  {RUN_NOTICE}");
     eprintln!("  GitHub        |  {REPOSITORY_URL}");
+}
+
+#[cfg(any(windows, test))]
+#[allow(dead_code)]
+fn write_pause_prompt(
+    mut input: impl BufRead,
+    mut output: impl Write,
+    msg: &str,
+) -> io::Result<()> {
+    let trimmed = msg.trim();
+    writeln!(output)?;
+    if !trimmed.is_empty() {
+        for line in trimmed.lines() {
+            writeln!(output, "  {line}")?;
+        }
+    }
+    writeln!(output, "  Press Enter to close this window.")?;
+    output.flush()?;
+    let _ = input.read_line(&mut String::new())?;
+    Ok(())
+}
+
+/// Pauses before exit when running in a dedicated Windows console window
+/// (such as a double-clicked `vdpi.exe`), printing `msg` if non-empty so fatal
+/// errors remain visible before the window closes.
+#[allow(dead_code)]
+pub fn pause_on_own_console(msg: &str) {
+    #[cfg(not(windows))]
+    let _ = msg;
+    #[cfg(windows)]
+    if io::stdin().is_terminal() && has_own_console() {
+        let _ = write_pause_prompt(io::stdin().lock(), io::stderr().lock(), msg);
+    }
 }
 
 #[allow(dead_code)]
@@ -935,15 +975,14 @@ pub fn install_finished(result: &Result<()>, installed_before: Option<&Installed
     let _ = installed_before;
     #[cfg(windows)]
     if io::stdin().is_terminal() && has_own_console() {
-        match result {
-            Ok(()) => {
-                eprintln!("\n  {}", install_success_message(installed_before));
-                eprintln!("  GitHub: {REPOSITORY_URL}");
-            }
-            Err(error) => eprintln!("\n  Installation did not finish: {error:#}"),
-        }
-        eprintln!("  Press Enter to close this window.");
-        let _ = io::stdin().read_line(&mut String::new());
+        let msg = match result {
+            Ok(()) => format!(
+                "{}\nGitHub: {REPOSITORY_URL}",
+                install_success_message(installed_before)
+            ),
+            Err(error) => format!("Installation did not finish: {error:#}"),
+        };
+        pause_on_own_console(&msg);
     }
 }
 
@@ -965,15 +1004,11 @@ pub fn update_finished(result: &Result<()>) {
     }
     #[cfg(windows)]
     if io::stdin().is_terminal() && has_own_console() {
-        match result {
-            Ok(()) => {
-                eprintln!("\n  Update completed.");
-                eprintln!("  GitHub: {REPOSITORY_URL}");
-            }
-            Err(error) => eprintln!("\n  Update did not finish: {error:#}"),
-        }
-        eprintln!("  Press Enter to close this window.");
-        let _ = io::stdin().read_line(&mut String::new());
+        let msg = match result {
+            Ok(()) => format!("Update completed.\nGitHub: {REPOSITORY_URL}"),
+            Err(error) => format!("Update did not finish: {error:#}"),
+        };
+        pause_on_own_console(&msg);
     }
 }
 
@@ -984,15 +1019,13 @@ pub fn uninstall_finished(result: &Result<()>) {
     }
     #[cfg(windows)]
     if io::stdin().is_terminal() && has_own_console() {
-        match result {
-            Ok(()) => {
-                eprintln!("\n  vdpi has been uninstalled and routes & proxies restored.");
-                eprintln!("  GitHub: {REPOSITORY_URL}");
-            }
-            Err(error) => eprintln!("\n  Uninstall did not finish: {error:#}"),
-        }
-        eprintln!("  Press Enter to close this window.");
-        let _ = io::stdin().read_line(&mut String::new());
+        let msg = match result {
+            Ok(()) => format!(
+                "vdpi has been uninstalled and routes & proxies restored.\nGitHub: {REPOSITORY_URL}"
+            ),
+            Err(error) => format!("Uninstall did not finish: {error:#}"),
+        };
+        pause_on_own_console(&msg);
     }
 }
 
@@ -1008,9 +1041,16 @@ pub fn wait_for_continue_if_interactive() {
 #[allow(dead_code)]
 fn has_own_console() -> bool {
     let mut processes = [0; 2];
-    // The array is writable for two process IDs for the duration of the call.
+    // SAFETY: `processes` is writable for two process IDs; `GetConsoleWindow` and
+    // `IsWindowVisible` are safe Win32 queries when `hwnd` is non-null.
     unsafe {
-        windows_sys::Win32::System::Console::GetConsoleProcessList(processes.as_mut_ptr(), 2) == 1
+        if windows_sys::Win32::System::Console::GetConsoleProcessList(processes.as_mut_ptr(), 2)
+            != 1
+        {
+            return false;
+        }
+        let hwnd = windows_sys::Win32::System::Console::GetConsoleWindow();
+        !hwnd.is_null() && windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd) != 0
     }
 }
 
@@ -1026,15 +1066,6 @@ pub fn clear_preference() {
 
 fn preference_path() -> Option<PathBuf> {
     Some(env::current_exe().ok()?.parent()?.join("run-directly"))
-}
-
-fn remember_run(path: &Path) -> Result<()> {
-    // An empty marker is sufficient; create_new publishes it atomically.
-    match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists && path.is_file() => Ok(()),
-        Err(e) => Err(e).with_context(|| format!("saving {}", path.display())),
-    }
 }
 
 fn print_console_menu(output: &mut impl Write, menu: &LauncherMenu) -> io::Result<()> {
@@ -1152,7 +1183,7 @@ fn read_dns_choice(
             output,
             "  {custom_slot}  {:<18} {} [active]",
             "Custom DNS",
-            configured_dns.trim()
+            redact_custom_dns_display(configured_dns)
         )?;
     } else {
         writeln!(
@@ -1350,6 +1381,7 @@ mod tests {
             tun_interface: None,
             physical_nic: None,
             vpn_conflict: None,
+            dns_addr: None,
             udp_flows_active: None,
             quic_blocked: None,
             dns_queries: None,
@@ -1378,6 +1410,7 @@ mod tests {
             tun_interface: Some("vdpi0".to_string()),
             physical_nic: Some("Ethernet".to_string()),
             vpn_conflict: None,
+            dns_addr: None,
             udp_flows_active: Some(12),
             quic_blocked: Some(42),
             dns_queries: Some(89),
@@ -1406,6 +1439,7 @@ mod tests {
             tun_interface: None,
             physical_nic: None,
             vpn_conflict: None,
+            dns_addr: None,
             udp_flows_active: None,
             quic_blocked: None,
             dns_queries: None,
@@ -1455,7 +1489,7 @@ mod tests {
         assert_eq!(menu.items[1].title, "Switch to TUN mode");
         assert_eq!(
             menu.items[1].hint,
-            "Transparent system-wide anti-DPI via vdpi0 - no proxy setup or browser restarts."
+            format!("All apps, Roblox & Discord voice via {TUN_IFACE_LABEL} (requires Admin).")
         );
         assert_eq!(menu.items[2].choice, Choice::Install);
         assert_eq!(menu.items[2].title, "Install for automatic startup");
@@ -1473,6 +1507,7 @@ mod tests {
         );
         assert_eq!(menu.items[5].choice, Choice::Doctor);
         assert_eq!(menu.items[5].title, "Run diagnostics");
+        assert_eq!(menu.items[5].hint, "Tests DNS and bypass connectivity.");
         assert_eq!(menu.items[6].choice, Choice::Cancel);
         assert_eq!(menu.items[6].title, "Quit");
 
@@ -1490,7 +1525,7 @@ mod tests {
         assert_eq!(tun_menu.items[1].title, "Switch to Proxy mode");
         assert_eq!(
             tun_menu.items[1].hint,
-            "Classic local HTTP/SOCKS5 proxy - lightweight, no virtual adapter, VPN-friendly."
+            "Browsers & apps - no Admin, lightweight, VPN-friendly."
         );
     }
 
@@ -1636,7 +1671,7 @@ mod tests {
             MenuItem::new(
                 Choice::SwitchEngine(EngineMode::Proxy),
                 "Switch to Proxy mode",
-                "Classic local HTTP/SOCKS5 proxy - lightweight, no virtual adapter, VPN-friendly.",
+                "Browsers & apps - no Admin, lightweight, VPN-friendly.",
             )
         );
 
@@ -1791,7 +1826,6 @@ mod tests {
                 Choice::SwitchEngine(EngineMode::Tun),
                 Choice::SelectDns,
                 Choice::SplitTunnel,
-                Choice::Run,
                 Choice::Uninstall,
                 Choice::Cancel,
             ]
@@ -1818,6 +1852,7 @@ mod tests {
             stopped_menu.items[2].choice,
             Choice::SwitchEngine(EngineMode::Proxy)
         );
+        assert!(stopped_menu.items.iter().any(|i| i.choice == Choice::Run));
 
         let older = ControlCenterStatus {
             installed: Some(sample_info(Some("0.6.0"), "0.5.0", VersionRelation::Older)),
@@ -1835,7 +1870,6 @@ mod tests {
                 .map(|i| i.choice.clone())
                 .collect::<Vec<_>>(),
             vec![
-                Choice::Run,
                 Choice::PauseService,
                 Choice::SwitchEngine(EngineMode::Tun),
                 Choice::SelectDns,
@@ -1845,6 +1879,16 @@ mod tests {
                 Choice::Cancel,
             ]
         );
+
+        let older_stopped = ControlCenterStatus {
+            installed: Some(sample_info(Some("0.6.0"), "0.5.0", VersionRelation::Older)),
+            service_state: ServiceState::Stopped,
+            live_engine: None,
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: None,
+        };
+        let older_stopped_menu = build_menu(&older_stopped, None);
+        assert_eq!(older_stopped_menu.items[0].choice, Choice::Run);
 
         let unknown = ControlCenterStatus {
             installed: Some(sample_info(None, "0.5.0", VersionRelation::Unknown)),
@@ -1872,6 +1916,19 @@ mod tests {
                 Choice::Cancel,
             ]
         );
+
+        let unknown_running = ControlCenterStatus {
+            installed: Some(sample_info(None, "0.5.0", VersionRelation::Unknown)),
+            service_state: ServiceState::Running,
+            live_engine: None,
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: None,
+        };
+        let unknown_running_menu = build_menu(&unknown_running, None);
+        assert!(!unknown_running_menu
+            .items
+            .iter()
+            .any(|i| i.choice == Choice::Run));
 
         let unregistered = ControlCenterStatus {
             installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
@@ -2031,13 +2088,13 @@ mod tests {
     }
 
     #[test]
-    fn auto_run_marker_only_applies_when_not_installed_and_not_explicit() {
+    fn legacy_run_directly_marker_never_bypasses_control_center_and_is_migrated() {
         let dir =
             env::temp_dir().join(format!("vdpi-launcher-autorun-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir(&dir).unwrap();
         let marker = dir.join("run-directly");
-        remember_run(&marker).unwrap();
+        fs::write(&marker, b"").unwrap();
 
         let fresh = fresh_status();
         let installed_running = ControlCenterStatus {
@@ -2069,13 +2126,22 @@ mod tests {
             vpn_conflict: None,
         };
 
-        assert!(should_auto_run(false, Some(&marker), &fresh));
+        // Even with a pre-existing v0.5.x `run-directly` marker on disk,
+        // Control Center is never bypassed.
+        assert!(!should_auto_run(false, Some(&marker), &fresh));
         assert!(!should_auto_run(true, Some(&marker), &fresh));
         assert!(!should_auto_run(false, None, &fresh));
         assert!(!should_auto_run(false, Some(&marker), &installed_running));
         assert!(!should_auto_run(false, Some(&marker), &installed_stopped));
         assert!(!should_auto_run(false, Some(&marker), &service_without_bin));
         assert!(!should_auto_run(false, Some(&marker), &bin_without_service));
+        assert!(marker.is_file());
+
+        // Migration removes the stale legacy marker cleanly and is idempotent.
+        migrate_legacy_preference_at(Some(&marker));
+        assert!(!marker.exists());
+        migrate_legacy_preference_at(Some(&marker));
+        migrate_legacy_preference_at(None);
 
         fs::remove_dir_all(dir).unwrap();
     }
@@ -2119,21 +2185,6 @@ mod tests {
         assert_eq!(format_mode_label("chunk"), "Fragment");
         assert_eq!(format_mode_label("split"), "Split");
         assert_eq!(format_mode_label("custom-mode"), "custom-mode");
-    }
-
-    #[test]
-    fn run_preference_survives_reopening_and_repeat_saves() {
-        let dir = env::temp_dir().join(format!("vdpi-launcher-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir(&dir).unwrap();
-        let marker = dir.join("run-directly");
-        let result = (|| {
-            remember_run(&marker)?;
-            remember_run(&marker)?;
-            Ok::<_, anyhow::Error>(marker.is_file())
-        })();
-        fs::remove_dir_all(dir).unwrap();
-        assert!(result.unwrap());
     }
 
     #[test]
@@ -2191,7 +2242,11 @@ mod tests {
             .iter()
             .find(|item| item.choice == Choice::Uninstall)
             .expect("uninstall item");
-        assert!(uninstall_item.hint.contains("routes & proxies"));
+        assert_eq!(
+            uninstall_item.hint,
+            "Removes service and restores network settings."
+        );
+        assert!(uninstall_item.hint.chars().count() <= 60);
 
         // Live proxy with live.vpn_conflict = None falls back to status.vpn_conflict.
         let proxy_fallback = ControlCenterStatus {
@@ -2257,6 +2312,7 @@ mod tests {
         assert!(newer_menu.items.len() <= 9);
         assert_eq!(newer_menu.items[0].choice, Choice::Install);
         assert_eq!(newer_menu.items[1].choice, Choice::Dashboard);
+        assert!(!newer_menu.items.iter().any(|i| i.choice == Choice::Run));
 
         let older_running = ControlCenterStatus {
             installed: Some(sample_info(Some("0.6.0"), "0.5.0", VersionRelation::Older)),
@@ -2268,7 +2324,8 @@ mod tests {
         let older_menu = build_menu(&older_running, None);
         assert!(older_menu.items.len() <= 9);
         assert_eq!(older_menu.items[0].choice, Choice::Dashboard);
-        assert_eq!(older_menu.items[1].choice, Choice::Run);
+        assert_eq!(older_menu.items[1].choice, Choice::PauseService);
+        assert!(!older_menu.items.iter().any(|i| i.choice == Choice::Run));
 
         let unknown_running = ControlCenterStatus {
             installed: Some(sample_info(None, "0.5.0", VersionRelation::Unknown)),
@@ -2281,6 +2338,7 @@ mod tests {
         assert!(unknown_menu.items.len() <= 9);
         assert_eq!(unknown_menu.items[0].choice, Choice::Dashboard);
         assert_eq!(unknown_menu.items[1].choice, Choice::Install);
+        assert!(!unknown_menu.items.iter().any(|i| i.choice == Choice::Run));
 
         let running_daemon_no_install = ControlCenterStatus {
             installed: None,
@@ -2443,6 +2501,26 @@ mod tests {
                         .find(|item| item.choice == Choice::SplitTunnel)
                         .expect("every menu branch must include Choice::SplitTunnel");
                     assert_eq!(split.title, "Split tunneling · Exclude (2 apps)");
+                    for item in &menu.items {
+                        assert!(
+                            item.hint.chars().count() <= 60,
+                            "hint exceeds 60-col card budget ({} chars): '{}'",
+                            item.hint.chars().count(),
+                            item.hint
+                        );
+                        assert!(
+                            !item.hint.contains("DNS ring"),
+                            "hint must not contain 'DNS ring' jargon: '{}'",
+                            item.hint
+                        );
+                    }
+                    if service_state == ServiceState::Running {
+                        assert!(
+                            !menu.items.iter().any(|item| item.choice == Choice::Run),
+                            "running service branch ({installed:?}, live={}) must not offer Run directly",
+                            live_engine.is_some()
+                        );
+                    }
                 }
             }
         }
@@ -2469,7 +2547,11 @@ mod tests {
         assert_eq!(format_dns_label("76.76.2.0"), "Custom (76.76.2.0)");
         assert_eq!(
             format_dns_label("https://dns.nextdns.io/abc123"),
-            "Custom (dns.nextdns.io/abc123)"
+            "Custom (dns.nextdns.io)"
+        );
+        assert_eq!(
+            format_dns_label("https://user:secret@dns.nextdns.io/abc123/my-pc?token=xyz"),
+            "Custom (dns.nextdns.io)"
         );
 
         let fresh = fresh_status();
@@ -2509,10 +2591,251 @@ mod tests {
         let doh_out = String::from_utf8(doh_out).unwrap();
         assert!(doh_out.contains("76.76.2.0 [active]"));
 
+        // Console DNS picker redacts active https:// DoH URL paths/tokens.
+        let mut redacted_out = Vec::new();
+        assert_eq!(
+            read_choice_with_options(
+                &b"d\nb\nq\n"[..],
+                &mut redacted_out,
+                &fresh,
+                None,
+                "https://dns.nextdns.io/secret-profile-id?token=topsecret",
+                &SplitTunnelConfig::default(),
+                fresh_status
+            )
+            .unwrap(),
+            Choice::Cancel
+        );
+        let redacted_out = String::from_utf8(redacted_out).unwrap();
+        assert!(redacted_out.contains("dns.nextdns.io [active]"));
+        assert!(!redacted_out.contains("secret-profile-id"));
+        assert!(!redacted_out.contains("topsecret"));
+
         // Pressing 'b' in custom DNS prompt returns to DNS list where a preset can be chosen.
         assert_eq!(
             read_choice(&b"d\n7\nb\n2\n"[..], Vec::new(), &fresh, None, fresh_status).unwrap(),
             Choice::SetDns("8.8.8.8".to_string())
+        );
+    }
+
+    #[test]
+    fn malformed_doh_urls_fail_closed_and_never_leak_secrets() {
+        let cases = [
+            ("https:///secret", "<redacted>", "Custom (<redacted>)"),
+            (
+                r"https://dns.nextdns.io\secret",
+                "dns.nextdns.io",
+                "Custom (dns.nextdns.io)",
+            ),
+            ("https://user:secret@", "<redacted>", "Custom (<redacted>)"),
+            ("https://bad_host/secret", "<redacted>", "Custom (<redacted>)"),
+            (
+                "https://[2606:4700:4700::1111]/secret",
+                "[2606:4700:4700::1111]",
+                "Custom ([2606:4700:4700::1111])",
+            ),
+        ];
+
+        let fresh = fresh_status();
+        for (raw, expected_display, expected_label) in cases {
+            let redacted = redact_custom_dns_display(raw);
+            assert_eq!(redacted, expected_display, "raw={raw}");
+            assert_eq!(shorten_custom_dns(raw, 28), expected_display, "raw={raw}");
+            assert_eq!(format_dns_label(raw), expected_label, "raw={raw}");
+            assert!(!redacted.contains("secret"), "leaked secret for raw={raw}");
+            assert!(!redacted.contains("user"), "leaked user for raw={raw}");
+
+            let mut out = Vec::new();
+            assert_eq!(
+                read_choice_with_options(
+                    &b"d\nb\nq\n"[..],
+                    &mut out,
+                    &fresh,
+                    None,
+                    raw,
+                    &SplitTunnelConfig::default(),
+                    fresh_status
+                )
+                .unwrap(),
+                Choice::Cancel
+            );
+            let out = String::from_utf8(out).unwrap();
+            assert!(
+                out.contains(&format!("{expected_display} [active]")),
+                "missing expected display '{expected_display}' for raw={raw}:\n{out}"
+            );
+            assert!(!out.contains("secret"), "console picker leaked secret for raw={raw}:\n{out}");
+            assert!(!out.contains("user"), "console picker leaked user for raw={raw}:\n{out}");
+        }
+    }
+
+    #[test]
+    fn anti_dpi_row_uses_effective_doh_for_custom_doh_urls() {
+        let mut live = sample_live_proxy_engine();
+        live.doh = Some(false);
+        live.dns_addr = Some("https://dns.nextdns.io/abc123".to_string());
+        let status = ControlCenterStatus {
+            installed: Some(sample_info(Some("0.5.0"), "0.5.0", VersionRelation::Same)),
+            service_state: ServiceState::Running,
+            live_engine: Some(live),
+            configured_engine: EngineMode::Proxy,
+            vpn_conflict: None,
+        };
+        let menu = build_menu_with_dns(&status, None, "1.1.1.1");
+        assert_eq!(
+            menu.status_rows[2],
+            StatusRow::new(
+                "Anti-DPI",
+                "Active · Combo · DoH on · QUIC blocked",
+                StatusTone::Active
+            )
+        );
+
+        // When live telemetry omits dns_addr, fall back to configured_dns.
+        let mut live_no_dns = sample_live_proxy_engine();
+        live_no_dns.doh = Some(false);
+        live_no_dns.dns_addr = None;
+        let fallback_status = ControlCenterStatus {
+            live_engine: Some(live_no_dns),
+            ..status.clone()
+        };
+        let fallback_doh_menu =
+            build_menu_with_dns(&fallback_status, None, "https://dns.nextdns.io/abc123");
+        assert_eq!(
+            fallback_doh_menu.status_rows[2],
+            StatusRow::new(
+                "Anti-DPI",
+                "Active · Combo · DoH on · QUIC blocked",
+                StatusTone::Active
+            )
+        );
+        let fallback_udp_menu = build_menu_with_dns(&fallback_status, None, "1.1.1.1");
+        assert_eq!(
+            fallback_udp_menu.status_rows[2],
+            StatusRow::new(
+                "Anti-DPI",
+                "Active · Combo · DoH off · QUIC blocked",
+                StatusTone::Active
+            )
+        );
+
+        // Live plain IP takes precedence over a configured https:// URL.
+        let mut live_ip = sample_live_proxy_engine();
+        live_ip.doh = Some(false);
+        live_ip.dns_addr = Some("1.1.1.1".to_string());
+        let live_ip_status = ControlCenterStatus {
+            live_engine: Some(live_ip),
+            ..status.clone()
+        };
+        let live_ip_menu =
+            build_menu_with_dns(&live_ip_status, None, "https://dns.nextdns.io/abc123");
+        assert_eq!(
+            live_ip_menu.status_rows[2],
+            StatusRow::new(
+                "Anti-DPI",
+                "Active · Combo · DoH off · QUIC blocked",
+                StatusTone::Active
+            )
+        );
+
+        // Bare custom non-DoH IPs (e.g. ControlD bare IP or LAN resolver) report DoH off even when live.doh=true.
+        for custom_ip in ["76.76.2.0", "10.0.0.53"] {
+            let mut live_custom = sample_live_proxy_engine();
+            live_custom.doh = Some(true);
+            live_custom.dns_addr = Some(custom_ip.to_string());
+            let custom_status = ControlCenterStatus {
+                live_engine: Some(live_custom),
+                ..status.clone()
+            };
+            let custom_menu = build_menu_with_dns(&custom_status, None, "1.1.1.1");
+            assert_eq!(
+                custom_menu.status_rows[2],
+                StatusRow::new(
+                    "Anti-DPI",
+                    "Active · Combo · DoH off · QUIC blocked",
+                    StatusTone::Active
+                )
+            );
+        }
+
+        // Configured bare non-DoH IP fallback when live telemetry omits dns_addr also reports DoH off.
+        let mut live_fallback_custom = sample_live_proxy_engine();
+        live_fallback_custom.doh = Some(true);
+        live_fallback_custom.dns_addr = None;
+        let fallback_custom_status = ControlCenterStatus {
+            live_engine: Some(live_fallback_custom),
+            ..status.clone()
+        };
+        let fallback_custom_menu = build_menu_with_dns(&fallback_custom_status, None, "76.76.2.0");
+        assert_eq!(
+            fallback_custom_menu.status_rows[2],
+            StatusRow::new(
+                "Anti-DPI",
+                "Active · Combo · DoH off · QUIC blocked",
+                StatusTone::Active
+            )
+        );
+
+        // Known public DoH IP reports DoH on when enabled and DoH off when disabled.
+        let mut live_quad9 = sample_live_proxy_engine();
+        live_quad9.doh = Some(true);
+        live_quad9.dns_addr = Some("9.9.9.9".to_string());
+        let quad9_on_menu = build_menu_with_dns(
+            &ControlCenterStatus {
+                live_engine: Some(live_quad9.clone()),
+                ..status.clone()
+            },
+            None,
+            "1.1.1.1",
+        );
+        assert_eq!(
+            quad9_on_menu.status_rows[2],
+            StatusRow::new(
+                "Anti-DPI",
+                "Active · Combo · DoH on · QUIC blocked",
+                StatusTone::Active
+            )
+        );
+        live_quad9.doh = Some(false);
+        let quad9_off_menu = build_menu_with_dns(
+            &ControlCenterStatus {
+                live_engine: Some(live_quad9),
+                ..status
+            },
+            None,
+            "1.1.1.1",
+        );
+        assert_eq!(
+            quad9_off_menu.status_rows[2],
+            StatusRow::new(
+                "Anti-DPI",
+                "Active · Combo · DoH off · QUIC blocked",
+                StatusTone::Active
+            )
+        );
+    }
+
+    #[test]
+    fn write_pause_prompt_formats_single_multiline_and_empty_messages() {
+        let mut out = Vec::new();
+        write_pause_prompt(&b"\n"[..], &mut out, "Fatal: port 8080 in use").unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\n  Fatal: port 8080 in use\n  Press Enter to close this window.\n"
+        );
+
+        let mut multi_out = Vec::new();
+        write_pause_prompt(&b"\n"[..], &mut multi_out, "Line 1\nLine 2").unwrap();
+        assert_eq!(
+            String::from_utf8(multi_out).unwrap(),
+            "\n  Line 1\n  Line 2\n  Press Enter to close this window.\n"
+        );
+
+        let mut empty_out = Vec::new();
+        write_pause_prompt(&b"\n"[..], &mut empty_out, "   ").unwrap();
+        assert_eq!(
+            String::from_utf8(empty_out).unwrap(),
+            "\n  Press Enter to close this window.\n"
         );
     }
 }

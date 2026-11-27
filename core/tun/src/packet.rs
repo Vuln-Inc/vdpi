@@ -2,6 +2,7 @@ use etherparse::{SlicedPacket, TransportSlice};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const IP_PROTO_ICMP: u8 = 1;
+const IP_PROTO_TCP: u8 = 6;
 const IP_PROTO_UDP: u8 = 17;
 const IP_PROTO_ICMPV6: u8 = 58;
 const IPV6_NEXT_HOP_BY_HOP: u8 = 0;
@@ -16,7 +17,68 @@ const ICMPV6_CODE_PORT_UNREACHABLE: u8 = 4;
 const IPV4_ICMP_MAX_UDP_PAYLOAD_QUOTE: usize = 64;
 const IPV6_MIN_MTU: usize = 1280;
 const STUN_MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xA4, 0x42];
+const TUN_GATEWAY_IPV6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x7664, 0x7069, 0, 0, 0, 0, 2);
 pub(crate) const MAX_IPV6_EXT_HEADERS: usize = 8;
+
+/// Walks bounded IPv6 extension headers (`0`, `43`, `44`, `60`) up to `MAX_IPV6_EXT_HEADERS`
+/// and returns the upper-layer payload slice when the final `next_header` matches `target_proto`.
+fn ipv6_upper_layer_payload(pkt: &[u8], target_proto: u8) -> Option<&[u8]> {
+    if pkt.len() < 40 || (pkt[0] >> 4) != 6 {
+        return None;
+    }
+    let payload_len = usize::from(u16::from_be_bytes([pkt[4], pkt[5]]));
+    if payload_len == 0 {
+        return None;
+    }
+    let end = 40usize.checked_add(payload_len)?;
+    let body = pkt.get(..end)?;
+
+    let mut next_header = body[6];
+    let mut offset = 40usize;
+    for _ in 0..MAX_IPV6_EXT_HEADERS {
+        if next_header == target_proto {
+            break;
+        }
+        match next_header {
+            // RFC 8200 Section 4.1: Hop-by-Hop Options may only appear immediately
+            // after the fixed 40-byte IPv6 header.
+            IPV6_NEXT_HOP_BY_HOP if offset != 40 => return None,
+            IPV6_NEXT_HOP_BY_HOP | IPV6_NEXT_ROUTING | IPV6_NEXT_DEST_OPTS => {
+                let hdr = body.get(offset..offset.checked_add(2)?)?;
+                let hdr_len = (usize::from(hdr[1]) + 1).checked_mul(8)?;
+                let next_offset = offset.checked_add(hdr_len)?;
+                if next_offset > end {
+                    return None;
+                }
+                next_header = hdr[0];
+                offset = next_offset;
+            }
+            IPV6_NEXT_FRAGMENT => {
+                let hdr = body.get(offset..offset.checked_add(8)?)?;
+                let frag_field = u16::from_be_bytes([hdr[2], hdr[3]]);
+                // Only atomic fragments (fragment offset == 0 and M == 0) carry a
+                // complete upper-layer segment.
+                if (frag_field & 0xfff9) != 0 {
+                    return None;
+                }
+                next_header = hdr[0];
+                offset = offset.checked_add(8)?;
+            }
+            _ => return None,
+        }
+    }
+
+    if next_header != target_proto {
+        return None;
+    }
+    body.get(offset..end)
+}
+
+/// Extracts the TCP segment slice from an IPv6 packet, walking bounded IPv6 extension
+/// headers (`0`, `43`, `44`, `60`) up to `MAX_IPV6_EXT_HEADERS`.
+pub(crate) fn ipv6_tcp_payload(pkt: &[u8]) -> Option<&[u8]> {
+    ipv6_upper_layer_payload(pkt, IP_PROTO_TCP)
+}
 
 /// Parsed metadata and payload view for a validated inbound IPv4 or IPv6 UDP datagram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,68 +139,17 @@ pub fn inspect_inbound_udp(pkt: &[u8]) -> Option<InboundUdpPacket<'_>> {
             })
         }
         6 => {
-            if pkt.len() < 40 {
-                return None;
-            }
-            let payload_len = usize::from(u16::from_be_bytes([pkt[4], pkt[5]]));
-            if payload_len == 0 {
-                return None;
-            }
-            let end = 40usize.checked_add(payload_len)?;
-            let body = pkt.get(..end)?;
-
-            let mut next_header = body[6];
-            let mut offset = 40usize;
-            for _ in 0..MAX_IPV6_EXT_HEADERS {
-                if next_header == IP_PROTO_UDP {
-                    break;
-                }
-                match next_header {
-                    // RFC 8200 Section 4.1: Hop-by-Hop Options may only appear immediately
-                    // after the fixed 40-byte IPv6 header.
-                    IPV6_NEXT_HOP_BY_HOP if offset != 40 => return None,
-                    IPV6_NEXT_HOP_BY_HOP | IPV6_NEXT_ROUTING | IPV6_NEXT_DEST_OPTS => {
-                        let hdr = body.get(offset..offset.checked_add(2)?)?;
-                        let hdr_len = (usize::from(hdr[1]) + 1).checked_mul(8)?;
-                        let next_offset = offset.checked_add(hdr_len)?;
-                        if next_offset > end {
-                            return None;
-                        }
-                        next_header = hdr[0];
-                        offset = next_offset;
-                    }
-                    IPV6_NEXT_FRAGMENT => {
-                        let hdr = body.get(offset..offset.checked_add(8)?)?;
-                        let frag_field = u16::from_be_bytes([hdr[2], hdr[3]]);
-                        // Only atomic fragments (fragment offset == 0 and M == 0) carry a
-                        // complete UDP datagram.
-                        if (frag_field & 0xfff9) != 0 {
-                            return None;
-                        }
-                        next_header = hdr[0];
-                        offset = offset.checked_add(8)?;
-                    }
-                    _ => return None,
-                }
-            }
-
-            if next_header != IP_PROTO_UDP {
-                return None;
-            }
-
-            let udp_hdr = body.get(offset..offset.checked_add(8)?)?;
+            let upper = ipv6_upper_layer_payload(pkt, IP_PROTO_UDP)?;
+            let udp_hdr = upper.get(..8)?;
             let src_port = u16::from_be_bytes([udp_hdr[0], udp_hdr[1]]);
             let dst_port = u16::from_be_bytes([udp_hdr[2], udp_hdr[3]]);
             let udp_len = usize::from(u16::from_be_bytes([udp_hdr[4], udp_hdr[5]]));
-            let remaining = end.checked_sub(offset)?;
-            if udp_len < 8 || udp_len != remaining {
+            if udp_len < 8 || udp_len != upper.len() {
                 return None;
             }
-            let payload_start = offset.checked_add(8)?;
-            let payload_end = offset.checked_add(udp_len)?;
-            let payload = body.get(payload_start..payload_end)?;
-            let src_bytes: [u8; 16] = body.get(8..24)?.try_into().ok()?;
-            let dst_bytes: [u8; 16] = body.get(24..40)?.try_into().ok()?;
+            let payload = upper.get(8..udp_len)?;
+            let src_bytes: [u8; 16] = pkt.get(8..24)?.try_into().ok()?;
+            let dst_bytes: [u8; 16] = pkt.get(24..40)?.try_into().ok()?;
             Some(InboundUdpPacket {
                 src_ip: IpAddr::V6(Ipv6Addr::from(src_bytes)),
                 dst_ip: IpAddr::V6(Ipv6Addr::from(dst_bytes)),
@@ -272,19 +283,36 @@ pub fn is_stun_packet(payload: &[u8]) -> bool {
     payload.len() >= 20 && (payload[0] & 0xC0) == 0 && payload[4..8] == STUN_MAGIC_COOKIE
 }
 
+/// Returns `true` if `payload` starts with a DTLS 1.0 / 1.2 / 1.3 record header
+/// (`0x14..=0x19` with version `0xfe 0xff` / `0xfe 0xfd` / `0xfe 0xfe` and at least
+/// the 13-byte RFC 6347 DTLSPlaintext header).
+pub fn is_dtls_packet(payload: &[u8]) -> bool {
+    payload.len() >= 13
+        && (0x14..=0x19).contains(&payload[0])
+        && payload[1] == 0xfe
+        && matches!(payload[2], 0xfd..=0xff)
+}
+
+/// Returns `true` if `payload` matches an RFC 9147 Section 4.2.3 DTLS 1.3 unified-header
+/// `DTLSCiphertext` packet (`(payload[0] & 0xe0) == 0x20`, i.e. top 3 bits `001` /
+/// `0x20..=0x3f`, and at least 13 bytes).
+pub fn is_dtls13_ciphertext_packet(payload: &[u8]) -> bool {
+    payload.len() >= 13 && (payload[0] & 0xe0) == 0x20
+}
+
 /// Detects whether a UDP/443 payload looks like QUIC traffic (including RFC 9000 Long Header
 /// `0xc0`, RFC 9287 Greased Fixed-Bit Long Header `0x80`, and Short-Header 1-RTT packets).
 /// When `block_quic` is enabled on a mobile TUN, dropping *all* non-empty UDP/443 datagrams for
 /// desync-eligible hosts prevents half-open or migrated QUIC sessions that otherwise trigger
 /// Chrome `ERR_QUIC_PROTOCOL_ERROR` instead of a clean TCP/TLS fallback.
 ///
-/// RFC 5389 STUN packets (`(payload[0] & 0xC0) == 0`, length >= 20, magic cookie `0x2112A442`
-/// at bytes `4..8`) are explicitly exempted so WebRTC TURN-over-UDP/443 is never broken.
+/// RFC 5389 STUN packets and DTLS 1.0/1.2/1.3 records are explicitly exempted so WebRTC
+/// TURN/DTLS-over-UDP/443 is never broken.
 pub fn is_blocked_quic_udp(dst_port: u16, payload: &[u8]) -> bool {
     if dst_port != 443 || payload.is_empty() {
         return false;
     }
-    if is_stun_packet(payload) {
+    if is_stun_packet(payload) || is_dtls_packet(payload) {
         return false;
     }
     true
@@ -428,9 +456,13 @@ fn build_icmpv6_dest_unreachable(
     body: &[u8],
     orig_src: Ipv6Addr,
     orig_dst: Ipv6Addr,
+    outer_src: Ipv6Addr,
     code: u8,
 ) -> Option<Vec<u8>> {
-    if is_invalid_icmpv6_addr(orig_src) || is_invalid_icmpv6_addr(orig_dst) {
+    if is_invalid_icmpv6_addr(orig_src)
+        || is_invalid_icmpv6_addr(orig_dst)
+        || is_invalid_icmpv6_addr(outer_src)
+    {
         return None;
     }
 
@@ -448,7 +480,7 @@ fn build_icmpv6_dest_unreachable(
     out[4..6].copy_from_slice(&icmp_len_u16.to_be_bytes());
     out[6] = IP_PROTO_ICMPV6;
     out[7] = 64;
-    out[8..24].copy_from_slice(&orig_dst.octets());
+    out[8..24].copy_from_slice(&outer_src.octets());
     out[24..40].copy_from_slice(&orig_src.octets());
 
     // RFC 4443 Section 3.1: ICMPv6 Destination Unreachable (Type 1)
@@ -456,7 +488,7 @@ fn build_icmpv6_dest_unreachable(
     out[41] = code;
     out[48..].copy_from_slice(quote);
 
-    let icmp_cksum = icmpv6_checksum(orig_dst, orig_src, &out[40..]);
+    let icmp_cksum = icmpv6_checksum(outer_src, orig_src, &out[40..]);
     out[42..44].copy_from_slice(&icmp_cksum.to_be_bytes());
 
     Some(out)
@@ -606,15 +638,22 @@ pub fn build_icmp_port_unreachable(invoking_pkt: &[u8]) -> Option<Vec<u8>> {
             let payload_len = usize::from(u16::from_be_bytes([invoking_pkt[4], invoking_pkt[5]]));
             let end = 40usize.checked_add(payload_len)?;
             let body = invoking_pkt.get(..end)?;
-            build_icmpv6_dest_unreachable(body, orig_src, orig_dst, ICMPV6_CODE_PORT_UNREACHABLE)
+            build_icmpv6_dest_unreachable(
+                body,
+                orig_src,
+                orig_dst,
+                orig_dst,
+                ICMPV6_CODE_PORT_UNREACHABLE,
+            )
         }
         _ => None,
     }
 }
 
 /// Synthesizes an RFC 4443 ICMPv6 Destination Unreachable / No Route to Destination
-/// (Type 1, Code 0) packet for an invoking IPv6 packet, triggering instant Happy Eyeballs
-/// IPv4 fallback on IPv4-only ISPs.
+/// (Type 1, Code 0) packet for an invoking IPv6 packet, using the TUN gateway IPv6
+/// address (`fd00:7664:7069::2`) as the outer source IP so strict OS stacks accept it
+/// and trigger instant Happy Eyeballs IPv4 fallback on IPv4-only ISPs.
 pub fn build_icmpv6_no_route(invoking_pkt: &[u8]) -> Option<Vec<u8>> {
     if invoking_pkt.len() < 40 || (invoking_pkt[0] >> 4) != 6 {
         return None;
@@ -632,7 +671,13 @@ pub fn build_icmpv6_no_route(invoking_pkt: &[u8]) -> Option<Vec<u8>> {
     let dst_bytes: [u8; 16] = body.get(24..40)?.try_into().ok()?;
     let orig_src = Ipv6Addr::from(src_bytes);
     let orig_dst = Ipv6Addr::from(dst_bytes);
-    build_icmpv6_dest_unreachable(body, orig_src, orig_dst, ICMPV6_CODE_NO_ROUTE)
+    build_icmpv6_dest_unreachable(
+        body,
+        orig_src,
+        orig_dst,
+        TUN_GATEWAY_IPV6,
+        ICMPV6_CODE_NO_ROUTE,
+    )
 }
 
 /// RFC 9715 / DNS Flag Day 2020 maximum safe internet UDP DNS payload size (1232 bytes),
@@ -1134,19 +1179,20 @@ mod tests {
     fn icmpv6_no_route_builds_valid_type1_code0_and_rejects_invalid_packets() {
         let orig_src = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 10);
         let orig_dst = Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111);
+        let expected_gateway: Ipv6Addr = "fd00:7664:7069::2".parse().unwrap();
 
         let tcp_syn = build_ipv6_tcp_syn(orig_src, orig_dst, 0);
         let icmp = build_icmpv6_no_route(&tcp_syn).expect("expected ICMPv6 No Route for TCP SYN");
         assert_eq!(icmp.len(), 40 + 8 + tcp_syn.len());
         assert_eq!(icmp[0] >> 4, 6);
         assert_eq!(icmp[6], IP_PROTO_ICMPV6);
-        assert_eq!(&icmp[8..24], orig_dst.octets().as_slice());
+        assert_eq!(&icmp[8..24], expected_gateway.octets().as_slice());
         assert_eq!(&icmp[24..40], orig_src.octets().as_slice());
         assert_eq!(icmp[40], ICMPV6_TYPE_DEST_UNREACHABLE);
         assert_eq!(icmp[41], ICMPV6_CODE_NO_ROUTE);
         assert_eq!(&icmp[44..48], [0u8; 4].as_slice());
         assert_eq!(&icmp[48..], tcp_syn.as_slice());
-        assert_eq!(icmpv6_checksum(orig_dst, orig_src, &icmp[40..]), 0);
+        assert_eq!(icmpv6_checksum(expected_gateway, orig_src, &icmp[40..]), 0);
         assert!(SlicedPacket::from_ip(&icmp).is_ok());
         assert!(is_valid_inbound_tun_packet(&icmp));
 
@@ -1155,7 +1201,10 @@ mod tests {
         let large_icmp =
             build_icmpv6_no_route(&large_v6).expect("expected truncated ICMPv6 No Route");
         assert_eq!(large_icmp.len(), IPV6_MIN_MTU);
-        assert_eq!(icmpv6_checksum(orig_dst, orig_src, &large_icmp[40..]), 0);
+        assert_eq!(
+            icmpv6_checksum(expected_gateway, orig_src, &large_icmp[40..]),
+            0
+        );
 
         // Must not generate ICMPv6 error in response to an ICMPv6 error message.
         assert!(build_icmpv6_no_route(&icmp).is_none());
@@ -1428,5 +1477,134 @@ mod tests {
 
         max_payload.push(0);
         assert!(build_udp_packet(src_v4, dst_v4, &max_payload).is_none());
+    }
+
+    #[test]
+    fn dtls_detector_exempts_dtls_10_12_13_on_udp_443_without_exempting_quic() {
+        for content_type in 0x14u8..=0x19 {
+            for minor in [0xfdu8, 0xfe, 0xff] {
+                let mut rec = [0u8; 16];
+                rec[0] = content_type;
+                rec[1] = 0xfe;
+                rec[2] = minor;
+                assert!(
+                    is_dtls_packet(&rec),
+                    "expected DTLS detection for type=0x{content_type:02x} version=0xfe{minor:02x}"
+                );
+                assert!(
+                    !is_blocked_quic_udp(443, &rec),
+                    "DTLS on UDP/443 must never be blocked as QUIC"
+                );
+            }
+        }
+
+        // Truncated (< 13 bytes) or non-DTLS versions must not match.
+        let short = [0x16u8, 0xfe, 0xfd, 0, 0, 0, 0, 0];
+        assert!(!is_dtls_packet(&short));
+        assert!(is_blocked_quic_udp(443, &short));
+
+        let mut bad_ver = [0u8; 20];
+        bad_ver[0] = 0x16;
+        bad_ver[1] = 0x03;
+        bad_ver[2] = 0x03;
+        assert!(!is_dtls_packet(&bad_ver));
+        assert!(is_blocked_quic_udp(443, &bad_ver));
+
+        // QUIC Initial / Short-Header must remain blocked.
+        assert!(!is_dtls_packet(&[0xc0u8; 64]));
+        assert!(is_blocked_quic_udp(443, &[0xc0u8; 64]));
+    }
+
+    #[test]
+    fn dtls13_ciphertext_detector_matches_unified_header_without_matching_quic_or_stun() {
+        // RFC 9147 Section 4.2.3 unified header: top 3 bits 001 (0x20..=0x3f), len >= 13.
+        for first_byte in 0x20u8..=0x3f {
+            let mut min_pkt = [0u8; 13];
+            min_pkt[0] = first_byte;
+            assert!(
+                is_dtls13_ciphertext_packet(&min_pkt),
+                "expected DTLS 1.3 ciphertext detection for leading byte 0x{first_byte:02x}"
+            );
+            assert!(
+                !is_dtls_packet(&min_pkt),
+                "DTLS 1.3 ciphertext byte 0x{first_byte:02x} must not match plaintext is_dtls_packet"
+            );
+
+            let mut larger_pkt = [0xaau8; 64];
+            larger_pkt[0] = first_byte;
+            assert!(is_dtls13_ciphertext_packet(&larger_pkt));
+        }
+
+        // Empty and undersized (< 13 bytes) payloads must not match.
+        assert!(!is_dtls13_ciphertext_packet(&[]));
+        assert!(!is_dtls13_ciphertext_packet(&[0x20u8; 12]));
+        assert!(!is_dtls13_ciphertext_packet(&[0x3fu8; 12]));
+
+        // Boundary bytes immediately outside 0x20..=0x3f must not match.
+        assert!(!is_dtls13_ciphertext_packet(&[0x1fu8; 16]));
+        assert!(!is_dtls13_ciphertext_packet(&[0x40u8; 16]));
+
+        // Plaintext DTLS 1.0/1.2/1.3 records stay handled by is_dtls_packet only.
+        for content_type in 0x14u8..=0x19 {
+            for minor in [0xfdu8, 0xfe, 0xff] {
+                let mut rec = [0u8; 16];
+                rec[0] = content_type;
+                rec[1] = 0xfe;
+                rec[2] = minor;
+                assert!(is_dtls_packet(&rec));
+                assert!(!is_dtls13_ciphertext_packet(&rec));
+            }
+        }
+
+        // Must not false-match QUIC Long Header (standard 0xc0 / RFC 9287 greased 0x80)
+        // or QUIC Short Header with fixed bit set (0x40).
+        assert!(!is_dtls13_ciphertext_packet(&[0xc0u8; 64]));
+        assert!(!is_dtls13_ciphertext_packet(&[0x80u8; 64]));
+        assert!(!is_dtls13_ciphertext_packet(&[0x40u8; 64]));
+
+        // Must not false-match STUN (0x00 / 0x01).
+        let mut stun_req = [0u8; 20];
+        stun_req[0..2].copy_from_slice(&[0x00, 0x01]);
+        stun_req[4..8].copy_from_slice(&STUN_MAGIC_COOKIE);
+        assert!(is_stun_packet(&stun_req));
+        assert!(!is_dtls13_ciphertext_packet(&stun_req));
+
+        let mut stun_resp = [0u8; 20];
+        stun_resp[0..2].copy_from_slice(&[0x01, 0x01]);
+        stun_resp[4..8].copy_from_slice(&STUN_MAGIC_COOKIE);
+        assert!(is_stun_packet(&stun_resp));
+        assert!(!is_dtls13_ciphertext_packet(&stun_resp));
+
+        assert!(!is_dtls13_ciphertext_packet(&[0x00u8; 20]));
+        assert!(!is_dtls13_ciphertext_packet(&[0x01u8; 20]));
+    }
+
+    #[test]
+    fn ipv6_tcp_payload_walks_bounded_extension_headers() {
+        let src = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let dst = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+
+        // Hop-by-Hop (8 bytes) -> Destination Options (8 bytes) -> TCP (20 bytes)
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&[IPV6_NEXT_DEST_OPTS, 0, 1, 4, 0, 0, 0, 0]);
+        ext.extend_from_slice(&[IP_PROTO_TCP, 0, 1, 4, 0, 0, 0, 0]);
+        let mut tcp = [0u8; 20];
+        tcp[0..2].copy_from_slice(&50000u16.to_be_bytes());
+        tcp[2..4].copy_from_slice(&443u16.to_be_bytes());
+        tcp[12] = 0x50;
+        tcp[13] = 0x02;
+
+        let payload_len = (ext.len() + tcp.len()) as u16;
+        let mut pkt = Vec::with_capacity(40 + usize::from(payload_len));
+        pkt.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]);
+        pkt.extend_from_slice(&payload_len.to_be_bytes());
+        pkt.push(IPV6_NEXT_HOP_BY_HOP);
+        pkt.push(64);
+        pkt.extend_from_slice(&src.octets());
+        pkt.extend_from_slice(&dst.octets());
+        pkt.extend_from_slice(&ext);
+        pkt.extend_from_slice(&tcp);
+
+        assert_eq!(ipv6_tcp_payload(&pkt), Some(tcp.as_slice()));
     }
 }

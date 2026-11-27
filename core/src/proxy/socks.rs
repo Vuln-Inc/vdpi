@@ -1,12 +1,20 @@
-use super::{check_split_tunnel_bypass_stream, relay_direct_tunnel, HANDSHAKE_TIMEOUT};
+use super::{
+    check_split_tunnel_bypass_stream, is_forbidden_proxy_host, is_forbidden_remote_addr,
+    relay_direct_tunnel, HANDSHAKE_TIMEOUT,
+};
 use crate::desync::EngineContext;
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
+use socket2::{Domain, Protocol, SockRef, Socket, Type};
+use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tracing::debug;
+use vdpi_core::binder::OutboundBinder;
+use vdpi_core::bypass::BypassPolicy;
 
 const SOCKS5_VER: u8 = 0x05;
 const SOCKS4_VER: u8 = 0x04;
@@ -18,6 +26,86 @@ const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_IPV6: u8 = 0x04;
 
+enum CheckedConnectError {
+    Forbidden(SocketAddr),
+    Connect(anyhow::Error),
+}
+
+/// Validates resolved IP candidates against SSRF and self-reflection rules BEFORE TCP `connect()`.
+fn validate_resolved_connect_targets(
+    ips: &[IpAddr],
+    port: u16,
+    is_loopback_peer: bool,
+    local_addr: Option<SocketAddr>,
+) -> std::result::Result<Vec<SocketAddr>, SocketAddr> {
+    let mut targets = Vec::with_capacity(ips.len());
+    for &ip in ips {
+        let target = SocketAddr::new(normalize_ip(ip), port);
+        if is_forbidden_remote_addr(is_loopback_peer, target, local_addr) {
+            return Err(target);
+        }
+        targets.push(target);
+    }
+    Ok(targets)
+}
+
+async fn connect_target_checked(
+    ctx: &EngineContext,
+    host: &str,
+    port: u16,
+    is_loopback_peer: bool,
+    local_addr: Option<SocketAddr>,
+) -> std::result::Result<(TcpStream, SocketAddr), CheckedConnectError> {
+    if is_loopback_peer {
+        let (remote, remote_addr) = ctx
+            .connect_target(host, port)
+            .await
+            .map_err(CheckedConnectError::Connect)?;
+        if is_forbidden_remote_addr(true, remote_addr, local_addr) {
+            drop(remote);
+            return Err(CheckedConnectError::Forbidden(remote_addr));
+        }
+        return Ok((remote, remote_addr));
+    }
+
+    // For non-loopback peers, resolve first and verify every resolved candidate BEFORE
+    // issuing any TCP connect(), preventing internal port-scanning and DNS-rebinding TOCTOU.
+    let ips = ctx.dns.resolve(host).await.map_err(|e| {
+        CheckedConnectError::Connect(anyhow!("DNS resolution failed for {host}: {e}"))
+    })?;
+    if ips.is_empty() {
+        return Err(CheckedConnectError::Connect(anyhow!(
+            "no addresses returned for {host}"
+        )));
+    }
+
+    let targets = validate_resolved_connect_targets(&ips, port, false, local_addr)
+        .map_err(CheckedConnectError::Forbidden)?;
+
+    let total = targets.len();
+    let mut last_err = None;
+    for (idx, target) in targets.into_iter().enumerate() {
+        let attempt_timeout = if idx + 1 < total {
+            ctx.config.connect_timeout.min(Duration::from_secs(3))
+        } else {
+            ctx.config.connect_timeout
+        };
+        match tokio::time::timeout(attempt_timeout, ctx.connect_upstream_addr(target)).await {
+            Ok(Ok(stream)) => return Ok((stream, target)),
+            Ok(Err(e)) => last_err = Some(e),
+            Err(_) => {
+                last_err = Some(anyhow!(
+                    "connect {target} timed out after {attempt_timeout:?}"
+                ));
+            }
+        }
+    }
+
+    Err(CheckedConnectError::Connect(last_err.unwrap_or_else(|| {
+        anyhow!("failed to connect to {host}:{port}")
+    })))
+}
+
 /// Handles a SOCKS5 (`CONNECT` and `UDP ASSOCIATE`) client connection.
 pub async fn handle_socks5_client(mut client: TcpStream, ctx: EngineContext) -> Result<()> {
     let _ = client.set_nodelay(true);
@@ -25,11 +113,31 @@ pub async fn handle_socks5_client(mut client: TcpStream, ctx: EngineContext) -> 
     let (cmd, (target_host, known_domain, target_port)) =
         tokio::time::timeout(HANDSHAKE_TIMEOUT, read_socks5_request(&mut client)).await??;
 
+    let peer_addr = client.peer_addr().ok();
+    let is_loopback_peer = peer_addr.is_some_and(|p| p.ip().to_canonical().is_loopback());
+    let local_addr = client.local_addr().ok();
+
     match cmd {
         CMD_CONNECT => {
-            let split_bypass = check_split_tunnel_bypass_stream(&ctx, &client);
+            if is_forbidden_proxy_host(is_loopback_peer, &target_host, target_port, local_addr) {
+                let reply = encode_socks5_reply(
+                    0x02,
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+                );
+                let _ = client.write_all(&reply).await;
+                bail!("forbidden SOCKS5 CONNECT target '{target_host}:{target_port}'");
+            }
+            let split_bypass = check_split_tunnel_bypass_stream(&ctx, &client).await;
             debug!(host = %target_host, port = target_port, "SOCKS5 CONNECT");
-            match ctx.connect_target(&target_host, target_port).await {
+            match connect_target_checked(
+                &ctx,
+                &target_host,
+                target_port,
+                is_loopback_peer,
+                local_addr,
+            )
+            .await
+            {
                 Ok((remote, remote_addr)) => {
                     let reply = encode_socks5_reply(
                         0x00,
@@ -44,7 +152,15 @@ pub async fn handle_socks5_client(mut client: TcpStream, ctx: EngineContext) -> 
                     ctx.relay_tunnel(client, remote, known_domain.as_deref(), remote_addr)
                         .await
                 }
-                Err(e) => {
+                Err(CheckedConnectError::Forbidden(remote_addr)) => {
+                    let reply = encode_socks5_reply(
+                        0x02,
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+                    );
+                    let _ = client.write_all(&reply).await;
+                    bail!("forbidden resolved SOCKS5 CONNECT target '{remote_addr}'");
+                }
+                Err(CheckedConnectError::Connect(e)) => {
                     debug!(host = %target_host, port = target_port, error = %e, "SOCKS5 CONNECT failed");
                     let reply = encode_socks5_reply(
                         0x04,
@@ -56,12 +172,16 @@ pub async fn handle_socks5_client(mut client: TcpStream, ctx: EngineContext) -> 
             }
         }
         CMD_UDP_ASSOCIATE => {
-            let split_bypass = check_split_tunnel_bypass_stream(&ctx, &client);
+            let split_bypass = check_split_tunnel_bypass_stream(&ctx, &client).await;
             let bind_ip = client
                 .local_addr()
                 .map(|a| normalize_ip(a.ip()))
                 .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
-            let client_udp = Arc::new(UdpSocket::bind(SocketAddr::new(bind_ip, 0)).await?);
+            let client_udp = Arc::new(bind_socks_udp_socket(
+                SocketAddr::new(bind_ip, 0),
+                None,
+                false,
+            )?);
             let relay_local_addr = client_udp.local_addr()?;
 
             debug!(relay_addr = %relay_local_addr, "SOCKS5 UDP ASSOCIATE established");
@@ -76,7 +196,9 @@ pub async fn handle_socks5_client(mut client: TcpStream, ctx: EngineContext) -> 
                 false
             };
 
-            run_udp_associate_session(client, client_udp, ctx, split_bypassed).await
+            let client_pin =
+                UdpClientPin::from_request(peer_addr.map(|p| p.ip()), &target_host, target_port);
+            run_udp_associate_session(client, client_udp, ctx, split_bypassed, client_pin).await
         }
         other => {
             let reply =
@@ -119,9 +241,18 @@ pub async fn handle_socks4_client(mut client: TcpStream, ctx: EngineContext) -> 
     let (host, known_domain, port) =
         tokio::time::timeout(HANDSHAKE_TIMEOUT, read_socks4_request(&mut client)).await??;
 
-    let split_bypass = check_split_tunnel_bypass_stream(&ctx, &client);
+    let peer_addr = client.peer_addr().ok();
+    let is_loopback_peer = peer_addr.is_some_and(|p| p.ip().to_canonical().is_loopback());
+    let local_addr = client.local_addr().ok();
+
+    if is_forbidden_proxy_host(is_loopback_peer, &host, port, local_addr) {
+        let _ = client.write_all(&[0x00, 0x5b, 0, 0, 0, 0, 0, 0]).await;
+        bail!("forbidden SOCKS4 target '{host}:{port}'");
+    }
+
+    let split_bypass = check_split_tunnel_bypass_stream(&ctx, &client).await;
     debug!(host = %host, port = port, "SOCKS4/4a CONNECT");
-    match ctx.connect_target(&host, port).await {
+    match connect_target_checked(&ctx, &host, port, is_loopback_peer, local_addr).await {
         Ok((remote, remote_addr)) => {
             client.write_all(&[0x00, 0x5a, 0, 0, 0, 0, 0, 0]).await?;
             client.flush().await?;
@@ -132,7 +263,11 @@ pub async fn handle_socks4_client(mut client: TcpStream, ctx: EngineContext) -> 
             ctx.relay_tunnel(client, remote, known_domain.as_deref(), remote_addr)
                 .await
         }
-        Err(e) => {
+        Err(CheckedConnectError::Forbidden(remote_addr)) => {
+            let _ = client.write_all(&[0x00, 0x5b, 0, 0, 0, 0, 0, 0]).await;
+            bail!("forbidden resolved SOCKS4 target '{remote_addr}'");
+        }
+        Err(CheckedConnectError::Connect(e)) => {
             let _ = client.write_all(&[0x00, 0x5b, 0, 0, 0, 0, 0, 0]).await;
             Err(e)
         }
@@ -175,7 +310,33 @@ fn normalize_ip(ip: IpAddr) -> IpAddr {
 }
 
 #[cfg(windows)]
-fn disable_udp_connreset(sock: &UdpSocket) {
+fn set_exclusive_addr_use(sock: &Socket) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        setsockopt, WSAGetLastError, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+    };
+
+    let enable: i32 = 1;
+    // SAFETY: `sock` owns a valid WinSock handle, and `enable` is a valid 4-byte BOOL option value.
+    let rc = unsafe {
+        setsockopt(
+            sock.as_raw_socket() as usize,
+            SOL_SOCKET,
+            SO_EXCLUSIVEADDRUSE,
+            (&enable as *const i32).cast::<u8>(),
+            std::mem::size_of::<i32>() as i32,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::from_raw_os_error(unsafe {
+            WSAGetLastError()
+        }));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn disable_udp_connreset(sock: &Socket) {
     use std::ffi::c_void;
     use std::os::windows::io::AsRawSocket;
 
@@ -213,6 +374,431 @@ fn disable_udp_connreset(sock: &UdpSocket) {
     }
 }
 
+const STUN_MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xA4, 0x42];
+const MAX_STUN_FLOWS: usize = 256;
+const STUN_FLOW_TTL: Duration = Duration::from_secs(120);
+const STUN_FLOW_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_ALLOWED_UDP_DESTS: usize = 1024;
+const ALLOWED_UDP_DEST_TTL: Duration = Duration::from_secs(300);
+const ALLOWED_UDP_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const UDP_SOCKET_BUF_BYTES: usize = 256 * 1024;
+
+/// Binds a SOCKS5 UDP socket with Windows `SO_EXCLUSIVEADDRUSE` + `SIO_UDP_CONNRESET`
+/// disabled, 256 KiB send/receive buffers, and optional `OutboundBinder` routing.
+fn bind_socks_udp_socket(
+    bind_addr: SocketAddr,
+    outbound_binder: Option<&dyn OutboundBinder>,
+    only_v6: bool,
+) -> std::io::Result<UdpSocket> {
+    let domain = if bind_addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    if only_v6 && bind_addr.is_ipv6() {
+        let _ = sock.set_only_v6(true);
+    }
+    #[cfg(windows)]
+    set_exclusive_addr_use(&sock)?;
+    if let Some(binder) = outbound_binder {
+        binder.bind_socket(SockRef::from(&sock), bind_addr.is_ipv4())?;
+    }
+    #[cfg(windows)]
+    disable_udp_connreset(&sock);
+    let _ = sock.set_recv_buffer_size(UDP_SOCKET_BUF_BYTES);
+    let _ = sock.set_send_buffer_size(UDP_SOCKET_BUF_BYTES);
+    sock.bind(&bind_addr.into())?;
+    sock.set_nonblocking(true)?;
+    let std_sock: std::net::UdpSocket = sock.into();
+    UdpSocket::from_std(std_sock)
+}
+
+/// Returns `true` if `payload` matches an RFC 5389 STUN header:
+/// first 2 bits zero, minimum length 20 bytes, magic cookie `0x2112A442` at bytes `4..8`.
+fn is_stun_packet(payload: &[u8]) -> bool {
+    payload.len() >= 20 && (payload[0] & 0xC0) == 0 && payload[4..8] == STUN_MAGIC_COOKIE
+}
+
+/// Returns `true` if `payload` matches a DTLS 1.0/1.2/1.3 plaintext record header
+/// (`ContentType` in `0x14..=0x19` and version `0xfe 0xfd`..=`0xfe 0xff`, minimum 13-byte header).
+fn is_dtls_packet(payload: &[u8]) -> bool {
+    payload.len() >= 13
+        && matches!(payload[0], 0x14..=0x19)
+        && payload[1] == 0xfe
+        && matches!(payload[2], 0xfd..=0xff)
+}
+
+/// Returns `true` if `payload` matches an RFC 9147 §4.2.3 DTLS 1.3 unified-header
+/// `DTLSCiphertext` packet (`(payload[0] & 0xe0) == 0x20` and minimum length 13 bytes).
+fn is_dtls13_ciphertext_packet(payload: &[u8]) -> bool {
+    payload.len() >= 13 && (payload[0] & 0xe0) == 0x20
+}
+
+/// Returns `true` for transient per-peer UDP receive errors that must not terminate
+/// an active SOCKS5 UDP ASSOCIATE session.
+fn is_transient_udp_recv_error(err: &std::io::Error) -> bool {
+    if matches!(
+        err.kind(),
+        ErrorKind::Interrupted
+            | ErrorKind::WouldBlock
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::HostUnreachable
+            | ErrorKind::NetworkUnreachable
+    ) {
+        return true;
+    }
+    #[cfg(windows)]
+    if matches!(err.raw_os_error(), Some(10051 | 10054 | 10065)) {
+        return true;
+    }
+    // Windows WSAEMSGSIZE (10040): datagram larger than recv buffer; drop datagram and continue.
+    err.raw_os_error() == Some(10040)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StunFlowAuth {
+    /// Authenticated via RFC 5389 STUN (exempts WebRTC/Discord Voice SRTP, TURN, and DTLS 1.3).
+    Stun,
+    /// Authenticated via DTLS 1.0/1.2/1.3 plaintext record header (exempts subsequent
+    /// DTLS plaintext records and RFC 9147 DTLS 1.3 unified-header ciphertext packets).
+    Dtls,
+}
+
+#[derive(Default)]
+struct SessionStunFlows {
+    entries: HashMap<SocketAddr, (Instant, StunFlowAuth)>,
+}
+
+impl SessionStunFlows {
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn record(&mut self, dst: SocketAddr, auth: StunFlowAuth, now: Instant) {
+        if let Some((ts, existing_auth)) = self.entries.get_mut(&dst) {
+            *ts = now;
+            if auth == StunFlowAuth::Stun {
+                *existing_auth = StunFlowAuth::Stun;
+            }
+            return;
+        }
+        if self.entries.len() >= MAX_STUN_FLOWS {
+            self.entries
+                .retain(|_, (ts, _)| now.saturating_duration_since(*ts) < STUN_FLOW_TTL);
+            if self.entries.len() >= MAX_STUN_FLOWS {
+                let oldest = self
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, (ts, _))| *ts)
+                    .map(|(k, _)| *k);
+                if let Some(oldest) = oldest {
+                    self.entries.remove(&oldest);
+                }
+            }
+        }
+        self.entries.insert(dst, (now, auth));
+    }
+
+    fn is_authenticated_and_refresh(
+        &mut self,
+        dst: SocketAddr,
+        payload: &[u8],
+        now: Instant,
+    ) -> bool {
+        if let Some((ts, auth)) = self.entries.get_mut(&dst) {
+            if now.saturating_duration_since(*ts) < STUN_FLOW_TTL {
+                let permitted = match *auth {
+                    StunFlowAuth::Stun => true,
+                    StunFlowAuth::Dtls => is_dtls13_ciphertext_packet(payload),
+                };
+                if permitted {
+                    *ts = now;
+                    return true;
+                }
+                return false;
+            }
+            self.entries.remove(&dst);
+        }
+        false
+    }
+
+    fn refresh_on_inbound(&mut self, src: SocketAddr, payload: &[u8], now: Instant) -> bool {
+        if is_stun_packet(payload) {
+            self.record(src, StunFlowAuth::Stun, now);
+            return true;
+        }
+        if is_dtls_packet(payload) {
+            self.record(src, StunFlowAuth::Dtls, now);
+            return true;
+        }
+        if let Some((ts, _)) = self.entries.get_mut(&src) {
+            if now.saturating_duration_since(*ts) < STUN_FLOW_TTL {
+                *ts = now;
+                return true;
+            }
+            self.entries.remove(&src);
+        }
+        false
+    }
+}
+
+fn stun_flows_is_empty(flows: &RwLock<SessionStunFlows>) -> bool {
+    flows.read().ok().is_none_or(|guard| guard.is_empty())
+}
+
+fn is_stun_flow_authenticated_and_refresh(
+    flows: &RwLock<SessionStunFlows>,
+    dst: SocketAddr,
+    payload: &[u8],
+    now: Instant,
+) -> bool {
+    let quick_check = flows.read().ok().map(|guard| match guard.entries.get(&dst) {
+        None => (false, false),
+        Some(&(ts, auth)) => {
+            let age = now.saturating_duration_since(ts);
+            if age >= STUN_FLOW_TTL {
+                (false, true)
+            } else {
+                let permitted = match auth {
+                    StunFlowAuth::Stun => true,
+                    StunFlowAuth::Dtls => is_dtls13_ciphertext_packet(payload),
+                };
+                if !permitted {
+                    (false, false)
+                } else {
+                    (true, age >= STUN_FLOW_REFRESH_INTERVAL)
+                }
+            }
+        }
+    });
+    match quick_check {
+        Some((permitted, false)) => permitted,
+        Some((_, true)) => flows
+            .write()
+            .ok()
+            .is_some_and(|mut guard| guard.is_authenticated_and_refresh(dst, payload, now)),
+        None => false,
+    }
+}
+
+/// Evaluates whether an outbound UDP/443 packet belongs to an exempt STUN/DTLS/WebRTC flow,
+/// recording/refreshing `dst` in `flows` (including on `is_dtls_packet` matches without
+/// short-circuiting) and allowing subsequent RFC 9147 DTLS 1.3 ciphertext packets.
+fn allow_and_track_udp_443_outbound(
+    flows: &RwLock<SessionStunFlows>,
+    dst: SocketAddr,
+    payload: &[u8],
+    now: Instant,
+) -> bool {
+    if is_stun_packet(payload) {
+        if let Ok(mut guard) = flows.write() {
+            guard.record(dst, StunFlowAuth::Stun, now);
+        }
+        return true;
+    }
+    if is_dtls_packet(payload) {
+        if let Ok(mut guard) = flows.write() {
+            guard.record(dst, StunFlowAuth::Dtls, now);
+        }
+        return true;
+    }
+    is_stun_flow_authenticated_and_refresh(flows, dst, payload, now)
+}
+
+/// Refreshes active UDP/443 STUN/DTLS flows on inbound replies so muted/listen-only
+/// Discord Voice/WebRTC sessions remain authenticated past `STUN_FLOW_TTL`.
+fn refresh_inbound_stun_flow(
+    flows: &RwLock<SessionStunFlows>,
+    src: SocketAddr,
+    payload: &[u8],
+    now: Instant,
+) -> bool {
+    if src.port() != 443 {
+        return false;
+    }
+    let is_stun = is_stun_packet(payload);
+    let is_dtls = !is_stun && is_dtls_packet(payload);
+    let action = flows.read().ok().map(|guard| match guard.entries.get(&src) {
+        None => (false, is_stun || is_dtls),
+        Some(&(ts, auth)) => {
+            let upgrade_to_stun = is_stun && auth != StunFlowAuth::Stun;
+            let age = now.saturating_duration_since(ts);
+            if upgrade_to_stun || age >= STUN_FLOW_REFRESH_INTERVAL {
+                (true, true)
+            } else {
+                (true, false)
+            }
+        }
+    });
+    match action {
+        Some((active, false)) => active,
+        Some((_, true)) => flows
+            .write()
+            .ok()
+            .is_some_and(|mut guard| guard.refresh_on_inbound(src, payload, now)),
+        None => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UdpClientPin {
+    expected_ip: Option<IpAddr>,
+    pinned_ip: Option<IpAddr>,
+    pinned_port: Option<u16>,
+}
+
+impl UdpClientPin {
+    /// Captures the TCP control peer IP alongside any non-zero RFC 1928 §4 client
+    /// `DST.ADDR`/`DST.PORT` pin declared in the `UDP ASSOCIATE` request.
+    fn from_request(tcp_peer_ip: Option<IpAddr>, req_host: &str, req_port: u16) -> Self {
+        let expected_ip = tcp_peer_ip.map(normalize_ip);
+        let pinned_ip = req_host
+            .parse::<IpAddr>()
+            .ok()
+            .map(normalize_ip)
+            .filter(|ip| !ip.is_unspecified());
+        let pinned_port = (req_port != 0).then_some(req_port);
+        Self {
+            expected_ip,
+            pinned_ip,
+            pinned_port,
+        }
+    }
+
+    /// Returns the pre-bound client UDP endpoint when the client pinned a non-zero port
+    /// (and any non-zero pinned IP agrees with the TCP control peer IP).
+    fn initial_client_peer(&self) -> Option<SocketAddr> {
+        let port = self.pinned_port?;
+        let ip = match (self.expected_ip, self.pinned_ip) {
+            (Some(exp), Some(pin)) if exp == pin => pin,
+            (Some(_), Some(_)) => return None,
+            (Some(exp), None) => exp,
+            (None, Some(pin)) => pin,
+            (None, None) => return None,
+        };
+        Some(SocketAddr::new(ip, port))
+    }
+
+    /// Returns `true` when `src_peer` satisfies the TCP peer IP and RFC 1928 pin constraints.
+    fn accepts(&self, src_peer: SocketAddr) -> bool {
+        let src_ip = normalize_ip(src_peer.ip());
+        if self.expected_ip.is_some_and(|exp| src_ip != exp) {
+            return false;
+        }
+        if self.pinned_ip.is_some_and(|pin| src_ip != pin) {
+            return false;
+        }
+        if self.pinned_port.is_some_and(|port| src_peer.port() != port) {
+            return false;
+        }
+        true
+    }
+}
+
+/// Tracks outbound UDP destinations for inbound anti-amplification filtering.
+///
+/// - For loopback-only SOCKS5 UDP ASSOCIATE clients (`full_cone == true`), enables true
+///   RFC 3489 Full-Cone NAT inbound replies once the local client has sent at least one
+///   outbound UDP packet on the session (`has_sent_outbound == true`), allowing P2P
+///   Full-Cone NAT checks and asymmetric ICE/WebRTC peer probes from any IP/port.
+/// - For all non-loopback clients (`full_cone == false`), enforces strict `(IP, port)`
+///   anti-amplification filtering with TTL expiry and bounded capacity.
+#[derive(Default)]
+struct AllowedUdpDestinations {
+    full_cone: bool,
+    has_sent_outbound: bool,
+    entries: HashMap<SocketAddr, Instant>,
+}
+
+impl AllowedUdpDestinations {
+    fn new(full_cone: bool) -> Self {
+        Self {
+            full_cone,
+            has_sent_outbound: false,
+            entries: HashMap::new(),
+        }
+    }
+
+    fn key_for(addr: SocketAddr) -> SocketAddr {
+        SocketAddr::new(normalize_ip(addr.ip()), addr.port())
+    }
+
+    fn record(&mut self, dst: SocketAddr, now: Instant) {
+        self.has_sent_outbound = true;
+        if self.full_cone {
+            return;
+        }
+        let key = Self::key_for(dst);
+        if self.entries.len() >= MAX_ALLOWED_UDP_DESTS && !self.entries.contains_key(&key) {
+            self.entries
+                .retain(|_, ts| now.saturating_duration_since(*ts) < ALLOWED_UDP_DEST_TTL);
+            if self.entries.len() >= MAX_ALLOWED_UDP_DESTS {
+                let oldest = self
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, ts)| **ts)
+                    .map(|(k, _)| *k);
+                if let Some(oldest) = oldest {
+                    self.entries.remove(&oldest);
+                }
+            }
+        }
+        self.entries.insert(key, now);
+    }
+
+    /// Returns `Some(needs_refresh)` when `src` is permitted to send inbound UDP to the client,
+    /// or `None` if unsolicited/expired.
+    fn check(&self, src: SocketAddr, now: Instant) -> Option<bool> {
+        if self.full_cone {
+            return self.has_sent_outbound.then_some(false);
+        }
+        let key = Self::key_for(src);
+        let ts = self.entries.get(&key)?;
+        let age = now.saturating_duration_since(*ts);
+        if age >= ALLOWED_UDP_DEST_TTL {
+            None
+        } else {
+            Some(age >= ALLOWED_UDP_REFRESH_INTERVAL)
+        }
+    }
+
+    fn refresh_if_present(&mut self, src: SocketAddr, now: Instant) {
+        if self.full_cone {
+            return;
+        }
+        let key = Self::key_for(src);
+        if let Some(ts) = self.entries.get_mut(&key) {
+            let age = now.saturating_duration_since(*ts);
+            if age < ALLOWED_UDP_DEST_TTL {
+                *ts = now;
+            }
+        }
+    }
+}
+
+fn is_allowed_inbound_source(
+    allowed: &RwLock<AllowedUdpDestinations>,
+    src: SocketAddr,
+    now: Instant,
+) -> bool {
+    let check = allowed
+        .read()
+        .ok()
+        .and_then(|guard| guard.check(src, now));
+    match check {
+        Some(false) => true,
+        Some(true) => {
+            if let Ok(mut guard) = allowed.write() {
+                guard.refresh_if_present(src, now);
+            }
+            true
+        }
+        None => false,
+    }
+}
+
 fn is_self_udp_target(
     target_ip: IpAddr,
     dst_port: u16,
@@ -229,13 +815,23 @@ async fn run_udp_associate_session(
     client_udp: Arc<UdpSocket>,
     ctx: EngineContext,
     split_bypassed: bool,
+    client_pin: UdpClientPin,
 ) -> Result<()> {
-    #[cfg(windows)]
-    disable_udp_connreset(&client_udp);
-
-    let expected_client_ip = tcp_control.peer_addr().ok().map(|a| normalize_ip(a.ip()));
-    let outbound_v4 = Arc::new(ctx.bind_outbound_udp(true, 0)?);
-    let outbound_v6 = ctx.bind_outbound_udp(false, 0).ok().map(Arc::new);
+    let is_loopback_peer = client_pin
+        .expected_ip
+        .is_some_and(|ip| ip.to_canonical().is_loopback());
+    let outbound_v4 = Arc::new(bind_socks_udp_socket(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        ctx.outbound_binder.as_deref(),
+        false,
+    )?);
+    let outbound_v6 = bind_socks_udp_socket(
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+        ctx.outbound_binder.as_deref(),
+        true,
+    )
+    .ok()
+    .map(Arc::new);
     let own_ports: Vec<u16> = [
         client_udp.local_addr().ok().map(|a| a.port()),
         outbound_v4.local_addr().ok().map(|a| a.port()),
@@ -262,33 +858,34 @@ async fn run_udp_associate_session(
     own_local_ips.sort_unstable();
     own_local_ips.dedup();
 
-    let last_client_peer: Arc<tokio::sync::RwLock<Option<SocketAddr>>> =
-        Arc::new(tokio::sync::RwLock::new(None));
+    let initial_peer = client_pin.initial_client_peer();
+    let last_client_peer: Arc<RwLock<Option<SocketAddr>>> = Arc::new(RwLock::new(initial_peer));
+    let allowed_dests: Arc<RwLock<AllowedUdpDestinations>> =
+        Arc::new(RwLock::new(AllowedUdpDestinations::new(is_loopback_peer)));
+    let stun_flows: Arc<RwLock<SessionStunFlows>> =
+        Arc::new(RwLock::new(SessionStunFlows::default()));
 
     let c2r_client_udp = Arc::clone(&client_udp);
     let c2r_out_v4 = Arc::clone(&outbound_v4);
     let c2r_out_v6 = outbound_v6.clone();
     let c2r_peer = Arc::clone(&last_client_peer);
+    let c2r_allowed = Arc::clone(&allowed_dests);
+    let c2r_stun_flows = Arc::clone(&stun_flows);
     let c2r_ctx = ctx.clone();
 
     let client_to_remote = async move {
         let mut buf = vec![0u8; 65535];
+        let mut cached_client_peer: Option<SocketAddr> = initial_peer;
+        let mut last_recorded_dest: Option<(SocketAddr, Instant)> = None;
+        let mut recorded_full_cone = false;
+
         loop {
             let (n, src_peer) = match c2r_client_udp.recv_from(&mut buf).await {
                 Ok(pair) => pair,
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        ErrorKind::ConnectionReset | ErrorKind::WouldBlock | ErrorKind::Interrupted
-                    ) =>
-                {
-                    continue;
-                }
+                Err(e) if is_transient_udp_recv_error(&e) => continue,
                 Err(e) => break Err::<(), std::io::Error>(e),
             };
-            if expected_client_ip
-                .is_some_and(|expected_ip| normalize_ip(src_peer.ip()) != expected_ip)
-            {
+            if !client_pin.accepts(src_peer) {
                 continue;
             }
 
@@ -299,17 +896,73 @@ async fn run_udp_associate_session(
             if dst_port == 0 {
                 continue;
             }
-            {
-                let mut guard = c2r_peer.write().await;
-                *guard = Some(src_peer);
+            if cached_client_peer != Some(src_peer) {
+                cached_client_peer = Some(src_peer);
+                if let Ok(mut guard) = c2r_peer.write() {
+                    *guard = Some(src_peer);
+                }
             }
 
-            // If QUIC blocking is enabled, drop all UDP/443 datagrams (including RFC 9287
-            // greased and short-header QUIC) for non-bypassed targets so applications cleanly
-            // fall back to DPI-bypassed TCP/443 TLS.
-            if !split_bypassed
+            // Fast-path IP literals without calling `dns.resolve`.
+            let target_ip = if let Ok(ip) = dst_host.parse::<IpAddr>() {
+                let normalized = normalize_ip(ip);
+                if normalized.is_ipv6() && c2r_out_v6.is_none() {
+                    continue;
+                }
+                normalized
+            } else {
+                // Reject forbidden hostnames from non-loopback peers before DNS resolution.
+                if !is_loopback_peer && is_forbidden_proxy_host(false, &dst_host, dst_port, None) {
+                    continue;
+                }
+                // Drop unauthenticated domain-targeted QUIC UDP/443 before DNS resolution.
+                if !split_bypassed
+                    && c2r_ctx.config.block_quic
+                    && dst_port == 443
+                    && !payload.is_empty()
+                    && !is_stun_packet(payload)
+                    && !is_dtls_packet(payload)
+                    && stun_flows_is_empty(&c2r_stun_flows)
+                    && c2r_ctx.bypass.should_desync(Some(dst_host.as_str()), None)
+                {
+                    c2r_ctx.inc_quic_blocked();
+                    debug!(host = %dst_host, "dropping QUIC UDP:443 packet to force DPI-bypassed TCP fallback");
+                    continue;
+                }
+                let Ok(ips) = c2r_ctx.dns.resolve(&dst_host).await else {
+                    continue;
+                };
+                let Some(ip) = ips
+                    .iter()
+                    .copied()
+                    .map(normalize_ip)
+                    .find(|ip| ip.is_ipv4() || c2r_out_v6.is_some())
+                else {
+                    continue;
+                };
+                ip
+            };
+
+            // Enforce SSRF protection: non-loopback peers cannot relay UDP to private/link-local/loopback targets.
+            if !is_loopback_peer && BypassPolicy::is_non_public_ip(target_ip) {
+                continue;
+            }
+            // Reject unspecified targets and self-reflection back into our own UDP relay sockets.
+            if is_self_udp_target(target_ip, dst_port, &own_ports, &own_local_ips) {
+                continue;
+            }
+
+            let dst_sa = SocketAddr::new(target_ip, dst_port);
+            let now = Instant::now();
+
+            // If QUIC blocking is enabled, drop UDP/443 QUIC datagrams (including RFC 9287
+            // greased and short-header QUIC) for non-bypassed targets, while exempting
+            // RFC 5389 STUN, DTLS 1.0/1.2/1.3 (including RFC 9147 unified-header ciphertext
+            // on authenticated flows), and STUN/DTLS-authenticated WebRTC/Discord Voice flows.
+            if dst_port == 443
+                && !allow_and_track_udp_443_outbound(&c2r_stun_flows, dst_sa, payload, now)
+                && !split_bypassed
                 && c2r_ctx.config.block_quic
-                && dst_port == 443
                 && !payload.is_empty()
                 && c2r_ctx.bypass.should_desync(
                     if is_domain {
@@ -317,29 +970,34 @@ async fn run_udp_associate_session(
                     } else {
                         None
                     },
-                    dst_host.parse::<IpAddr>().ok(),
+                    Some(target_ip),
                 )
             {
-                debug!(host = %dst_host, "dropping QUIC UDP:443 packet to force DPI-bypassed TCP fallback");
+                c2r_ctx.inc_quic_blocked();
+                debug!(host = %dst_host, dst = %dst_sa, "dropping QUIC UDP:443 packet to force DPI-bypassed TCP fallback");
                 continue;
             }
 
-            let Ok(ips) = c2r_ctx.dns.resolve(&dst_host).await else {
-                continue;
-            };
-            let target_ip = ips
-                .iter()
-                .copied()
-                .map(normalize_ip)
-                .find(|ip| ip.is_ipv4() || c2r_out_v6.is_some());
-            let Some(target_ip) = target_ip else {
-                continue;
-            };
-            // Reject unspecified targets and self-reflection back into our own UDP relay sockets.
-            if is_self_udp_target(target_ip, dst_port, &own_ports, &own_local_ips) {
-                continue;
+            // Record outbound activity / destination for inbound filtering (avoid lock churn on steady flows).
+            if is_loopback_peer {
+                if !recorded_full_cone {
+                    if let Ok(mut guard) = c2r_allowed.write() {
+                        guard.record(dst_sa, now);
+                        recorded_full_cone = true;
+                    }
+                }
+            } else if !matches!(
+                last_recorded_dest,
+                Some((prev_dst, prev_ts))
+                    if prev_dst == dst_sa
+                        && now.saturating_duration_since(prev_ts)
+                            < ALLOWED_UDP_REFRESH_INTERVAL
+            ) {
+                if let Ok(mut guard) = c2r_allowed.write() {
+                    guard.record(dst_sa, now);
+                }
+                last_recorded_dest = Some((dst_sa, now));
             }
-            let dst_sa = SocketAddr::new(target_ip, dst_port);
 
             match dst_sa {
                 SocketAddr::V4(_) => {
@@ -357,24 +1015,27 @@ async fn run_udp_associate_session(
     let r2c_client_udp = Arc::clone(&client_udp);
     let r2c_out_v4 = Arc::clone(&outbound_v4);
     let r2c_peer = Arc::clone(&last_client_peer);
+    let r2c_allowed = Arc::clone(&allowed_dests);
+    let r2c_stun_flows = Arc::clone(&stun_flows);
 
     let remote_v4_to_client = async move {
         let mut buf = vec![0u8; 65535];
         loop {
             let (n, remote_src) = match r2c_out_v4.recv_from(&mut buf).await {
                 Ok(pair) => pair,
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        ErrorKind::ConnectionReset | ErrorKind::WouldBlock | ErrorKind::Interrupted
-                    ) =>
-                {
-                    continue;
-                }
+                Err(e) if is_transient_udp_recv_error(&e) => continue,
                 Err(e) => break Err::<(), std::io::Error>(e),
             };
-            if let Some(client_peer) = *r2c_peer.read().await {
-                let pkt = encode_socks5_udp_packet(remote_src, &buf[..n]);
+            let normalized_src = SocketAddr::new(normalize_ip(remote_src.ip()), remote_src.port());
+            let now = Instant::now();
+            if !is_allowed_inbound_source(&r2c_allowed, normalized_src, now) {
+                continue;
+            }
+            if normalized_src.port() == 443 {
+                let _ = refresh_inbound_stun_flow(&r2c_stun_flows, normalized_src, &buf[..n], now);
+            }
+            if let Some(client_peer) = r2c_peer.read().ok().and_then(|g| *g) {
+                let pkt = encode_socks5_udp_packet(normalized_src, &buf[..n]);
                 let _ = r2c_client_udp.send_to(&pkt, client_peer).await;
             }
         }
@@ -382,32 +1043,37 @@ async fn run_udp_associate_session(
 
     let r2c6_client_udp = Arc::clone(&client_udp);
     let r2c6_peer = Arc::clone(&last_client_peer);
+    let r2c6_allowed = Arc::clone(&allowed_dests);
+    let r2c6_stun_flows = Arc::clone(&stun_flows);
     let remote_v6_to_client = async move {
         if let Some(v6_sock) = outbound_v6 {
             let mut buf = vec![0u8; 65535];
             loop {
                 let (n, remote_src) = match v6_sock.recv_from(&mut buf).await {
                     Ok(pair) => pair,
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            ErrorKind::ConnectionReset
-                                | ErrorKind::WouldBlock
-                                | ErrorKind::Interrupted
-                        ) =>
-                    {
-                        continue;
+                    Err(e) if is_transient_udp_recv_error(&e) => continue,
+                    Err(e) => {
+                        debug!(error = %e, "SOCKS5 UDP IPv6 recv failed; disabling IPv6 inbound relay while preserving IPv4 session");
+                        break;
                     }
-                    Err(e) => break Err(e),
                 };
-                if let Some(client_peer) = *r2c6_peer.read().await {
-                    let pkt = encode_socks5_udp_packet(remote_src, &buf[..n]);
+                let normalized_src =
+                    SocketAddr::new(normalize_ip(remote_src.ip()), remote_src.port());
+                let now = Instant::now();
+                if !is_allowed_inbound_source(&r2c6_allowed, normalized_src, now) {
+                    continue;
+                }
+                if normalized_src.port() == 443 {
+                    let _ =
+                        refresh_inbound_stun_flow(&r2c6_stun_flows, normalized_src, &buf[..n], now);
+                }
+                if let Some(client_peer) = r2c6_peer.read().ok().and_then(|g| *g) {
+                    let pkt = encode_socks5_udp_packet(normalized_src, &buf[..n]);
                     let _ = r2c6_client_udp.send_to(&pkt, client_peer).await;
                 }
             }
-        } else {
-            std::future::pending::<Result<(), std::io::Error>>().await
         }
+        std::future::pending::<()>().await
     };
 
     let tcp_eof = async move {
@@ -633,5 +1299,453 @@ mod tests {
             &own_ports,
             &own_local_ips
         ));
+    }
+
+    #[test]
+    fn stun_and_dtls_detection_exempts_webrtc_while_blocking_quic() {
+        let mut stun = [0u8; 20];
+        stun[0] = 0x00;
+        stun[1] = 0x01; // Binding Request
+        stun[4..8].copy_from_slice(&STUN_MAGIC_COOKIE);
+        assert!(is_stun_packet(&stun));
+        assert!(!is_dtls_packet(&stun));
+
+        // Short STUN (<20 bytes) or QUIC long header with STUN cookie must NOT match STUN.
+        assert!(!is_stun_packet(&stun[..19]));
+        let mut spoofed_quic = stun;
+        spoofed_quic[0] = 0xC0;
+        assert!(!is_stun_packet(&spoofed_quic));
+
+        // DTLS 1.2 Handshake & DTLS 1.0 ApplicationData
+        let mut dtls12 = [0u8; 13];
+        dtls12[0] = 0x16;
+        dtls12[1] = 0xfe;
+        dtls12[2] = 0xfd;
+        assert!(is_dtls_packet(&dtls12));
+
+        let mut dtls10 = [0u8; 16];
+        dtls10[0] = 0x17;
+        dtls10[1] = 0xfe;
+        dtls10[2] = 0xff;
+        assert!(is_dtls_packet(&dtls10));
+
+        // Invalid DTLS version or length < 13
+        let mut bad_dtls = dtls12;
+        bad_dtls[2] = 0xfc;
+        assert!(!is_dtls_packet(&bad_dtls));
+        assert!(!is_dtls_packet(&dtls12[..12]));
+    }
+
+    #[test]
+    fn transient_udp_recv_errors_cover_peer_unreachable_and_wsaemsgsize() {
+        for kind in [
+            ErrorKind::Interrupted,
+            ErrorKind::WouldBlock,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::HostUnreachable,
+            ErrorKind::NetworkUnreachable,
+        ] {
+            assert!(is_transient_udp_recv_error(&std::io::Error::new(
+                kind,
+                "transient"
+            )));
+        }
+        assert!(is_transient_udp_recv_error(
+            &std::io::Error::from_raw_os_error(10040)
+        ));
+        assert!(!is_transient_udp_recv_error(&std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            "fatal"
+        )));
+    }
+
+    #[test]
+    fn allowed_udp_destinations_blocks_unsolicited_inbound_sources() {
+        let allowed = RwLock::new(AllowedUdpDestinations::default());
+        let known: SocketAddr = "162.159.137.234:50001".parse().unwrap();
+        let unknown: SocketAddr = "198.51.100.9:53".parse().unwrap();
+        let now = Instant::now();
+
+        assert!(!is_allowed_inbound_source(&allowed, known, now));
+        allowed.write().unwrap().record(known, now);
+        assert!(is_allowed_inbound_source(&allowed, known, now));
+        assert!(!is_allowed_inbound_source(&allowed, unknown, now));
+    }
+
+    #[test]
+    fn socks_ssrf_blocks_non_loopback_peer_targeting_private_and_link_local() {
+        let local: SocketAddr = "192.168.1.50:1080".parse().unwrap();
+        assert!(is_forbidden_proxy_host(false, "127.0.0.1", 80, Some(local)));
+        assert!(is_forbidden_proxy_host(
+            false,
+            "169.254.169.254",
+            80,
+            Some(local)
+        ));
+        assert!(is_forbidden_proxy_host(false, "10.0.0.1", 443, Some(local)));
+        assert!(is_forbidden_proxy_host(
+            false,
+            "fe80::1",
+            443,
+            Some(local)
+        ));
+        assert!(is_forbidden_remote_addr(
+            false,
+            "169.254.169.254:80".parse().unwrap(),
+            Some(local)
+        ));
+        assert!(!is_forbidden_proxy_host(
+            true,
+            "192.168.1.1",
+            80,
+            Some(local)
+        ));
+        assert!(!is_forbidden_proxy_host(
+            false,
+            "1.1.1.1",
+            443,
+            Some(local)
+        ));
+    }
+
+    #[test]
+    fn shared_stun_flows_inbound_refresh_keeps_listen_only_flow_alive_past_ttl() {
+        let flows = Arc::new(RwLock::new(SessionStunFlows::default()));
+        let voice_v4: SocketAddr = "162.159.137.234:443".parse().unwrap();
+        let voice_v6: SocketAddr = "[2606:4700::1]:443".parse().unwrap();
+        let non_443: SocketAddr = "162.159.137.234:50001".parse().unwrap();
+
+        let mut stun = [0u8; 20];
+        stun[0] = 0x00;
+        stun[1] = 0x01;
+        stun[4..8].copy_from_slice(&STUN_MAGIC_COOKIE);
+        let srtp = [0x80u8; 32];
+        let t0 = Instant::now();
+
+        // Without inbound refresh, a flow expires after STUN_FLOW_TTL (120s).
+        assert!(allow_and_track_udp_443_outbound(&flows, voice_v4, &stun, t0));
+        assert!(!allow_and_track_udp_443_outbound(
+            &flows,
+            voice_v4,
+            &srtp,
+            t0 + STUN_FLOW_TTL + Duration::from_secs(1)
+        ));
+
+        // With inbound UDP/443 replies while muted / listen-only, the shared RwLock flow
+        // stays authenticated well past 120s without any outbound packets.
+        let r2c_flows = Arc::clone(&flows);
+        assert!(allow_and_track_udp_443_outbound(&flows, voice_v4, &stun, t0));
+        assert!(refresh_inbound_stun_flow(
+            &r2c_flows,
+            voice_v4,
+            &srtp,
+            t0 + Duration::from_secs(80)
+        ));
+        assert!(refresh_inbound_stun_flow(
+            &r2c_flows,
+            voice_v4,
+            &srtp,
+            t0 + Duration::from_secs(150)
+        ));
+        assert!(allow_and_track_udp_443_outbound(
+            &flows,
+            voice_v4,
+            &srtp,
+            t0 + Duration::from_secs(210)
+        ));
+
+        // Non-443 inbound packets never touch SessionStunFlows.
+        assert!(!refresh_inbound_stun_flow(
+            &r2c_flows,
+            non_443,
+            &stun,
+            t0 + Duration::from_secs(10)
+        ));
+
+        // IPv6 inbound STUN/443 reply also authenticates/refreshes the shared flow table.
+        assert!(refresh_inbound_stun_flow(
+            &r2c_flows,
+            voice_v6,
+            &stun,
+            t0 + Duration::from_secs(10)
+        ));
+        assert!(allow_and_track_udp_443_outbound(
+            &flows,
+            voice_v6,
+            &srtp,
+            t0 + Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn dtls_flow_auth_records_flow_and_allows_dtls13_unified_ciphertext() {
+        let flows = Arc::new(RwLock::new(SessionStunFlows::default()));
+        let peer: SocketAddr = "198.51.100.42:443".parse().unwrap();
+        let t0 = Instant::now();
+
+        let mut dtls_hello = [0u8; 24];
+        dtls_hello[0] = 0x16;
+        dtls_hello[1] = 0xfe;
+        dtls_hello[2] = 0xfd;
+
+        let mut dtls13_cipher = [0u8; 16];
+        dtls13_cipher[0] = 0x2f; // top 3 bits 001 (0x20..=0x3f), RFC 9147 unified header
+        let short_dtls13 = [0x20u8; 12];
+        let quic_long = [0xc0u8; 64];
+        let srtp = [0x80u8; 32];
+
+        // RFC 9147 unified-header detector boundary checks.
+        for b in 0x20u8..=0x3fu8 {
+            assert!(is_dtls13_ciphertext_packet(&[b; 13]));
+        }
+        assert!(!is_dtls13_ciphertext_packet(&short_dtls13));
+        assert!(!is_dtls13_ciphertext_packet(&[0x1fu8; 16]));
+        assert!(!is_dtls13_ciphertext_packet(&[0x40u8; 16]));
+        assert!(!is_dtls13_ciphertext_packet(&quic_long));
+
+        // Unauthenticated DTLS 1.3 ciphertext must NOT bypass QUIC blocking.
+        assert!(!allow_and_track_udp_443_outbound(
+            &flows,
+            peer,
+            &dtls13_cipher,
+            t0
+        ));
+
+        // Plaintext DTLS record header must record the flow instead of short-circuiting.
+        assert!(allow_and_track_udp_443_outbound(
+            &flows,
+            peer,
+            &dtls_hello,
+            t0
+        ));
+        assert!(!stun_flows_is_empty(&flows));
+
+        // Subsequent DTLS 1.3 unified-header ciphertext packets on the authenticated flow pass,
+        // while short/QUIC packets on a DTLS-only flow remain blocked.
+        assert!(allow_and_track_udp_443_outbound(
+            &flows,
+            peer,
+            &dtls13_cipher,
+            t0 + Duration::from_secs(5)
+        ));
+        assert!(!allow_and_track_udp_443_outbound(
+            &flows,
+            peer,
+            &short_dtls13,
+            t0 + Duration::from_secs(5)
+        ));
+        assert!(!allow_and_track_udp_443_outbound(
+            &flows,
+            peer,
+            &quic_long,
+            t0 + Duration::from_secs(5)
+        ));
+
+        // Inbound DTLS 1.3 ciphertext reply refreshes the flow past 120s.
+        assert!(refresh_inbound_stun_flow(
+            &flows,
+            peer,
+            &dtls13_cipher,
+            t0 + Duration::from_secs(90)
+        ));
+        assert!(allow_and_track_udp_443_outbound(
+            &flows,
+            peer,
+            &dtls13_cipher,
+            t0 + Duration::from_secs(160)
+        ));
+
+        // STUN upgrades a DTLS flow so subsequent WebRTC SRTP packets are also permitted.
+        let mut stun = [0u8; 20];
+        stun[0] = 0x00;
+        stun[1] = 0x01;
+        stun[4..8].copy_from_slice(&STUN_MAGIC_COOKIE);
+        assert!(allow_and_track_udp_443_outbound(
+            &flows,
+            peer,
+            &stun,
+            t0 + Duration::from_secs(165)
+        ));
+        assert!(allow_and_track_udp_443_outbound(
+            &flows,
+            peer,
+            &srtp,
+            t0 + Duration::from_secs(170)
+        ));
+    }
+
+    #[test]
+    fn allowed_udp_destinations_loopback_full_cone_vs_non_loopback_strict_port() {
+        let now = Instant::now();
+        let sent_dst: SocketAddr = "162.159.137.234:50001".parse().unwrap();
+        let mapped_v6_same_port: SocketAddr = "[::ffff:162.159.137.234]:50001".parse().unwrap();
+        let same_ip_diff_port: SocketAddr = "162.159.137.234:50002".parse().unwrap();
+        let mapped_v6_diff_port: SocketAddr = "[::ffff:162.159.137.234]:50099".parse().unwrap();
+        let other_ip: SocketAddr = "198.51.100.9:3479".parse().unwrap();
+        let other_v6: SocketAddr = "[2001:db8::42]:55555".parse().unwrap();
+
+        // Loopback client: blocks all inbound until at least one outbound UDP packet is sent,
+        // then permits true RFC 3489 Full-Cone NAT replies from any IP/port for the session.
+        let loopback_allowed = RwLock::new(AllowedUdpDestinations::new(true));
+        assert!(!is_allowed_inbound_source(&loopback_allowed, sent_dst, now));
+        assert!(!is_allowed_inbound_source(&loopback_allowed, other_ip, now));
+        assert!(!is_allowed_inbound_source(&loopback_allowed, other_v6, now));
+
+        loopback_allowed.write().unwrap().record(sent_dst, now);
+        assert!(loopback_allowed.read().unwrap().has_sent_outbound);
+        assert!(loopback_allowed.read().unwrap().entries.is_empty());
+        assert!(is_allowed_inbound_source(&loopback_allowed, sent_dst, now));
+        assert!(is_allowed_inbound_source(
+            &loopback_allowed,
+            same_ip_diff_port,
+            now
+        ));
+        assert!(is_allowed_inbound_source(
+            &loopback_allowed,
+            mapped_v6_diff_port,
+            now
+        ));
+        assert!(is_allowed_inbound_source(&loopback_allowed, other_ip, now));
+        assert!(is_allowed_inbound_source(&loopback_allowed, other_v6, now));
+        assert!(is_allowed_inbound_source(
+            &loopback_allowed,
+            other_ip,
+            now + ALLOWED_UDP_DEST_TTL + Duration::from_secs(1)
+        ));
+
+        // Non-loopback client: strict (IP, port) anti-amplification filtering with TTL expiry.
+        let remote_allowed = RwLock::new(AllowedUdpDestinations::new(false));
+        assert!(!is_allowed_inbound_source(&remote_allowed, sent_dst, now));
+        remote_allowed.write().unwrap().record(sent_dst, now);
+        assert!(is_allowed_inbound_source(&remote_allowed, sent_dst, now));
+        assert!(is_allowed_inbound_source(
+            &remote_allowed,
+            mapped_v6_same_port,
+            now
+        ));
+        assert!(!is_allowed_inbound_source(
+            &remote_allowed,
+            same_ip_diff_port,
+            now
+        ));
+        assert!(!is_allowed_inbound_source(
+            &remote_allowed,
+            mapped_v6_diff_port,
+            now
+        ));
+        assert!(!is_allowed_inbound_source(&remote_allowed, other_ip, now));
+        assert!(!is_allowed_inbound_source(&remote_allowed, other_v6, now));
+        assert!(!is_allowed_inbound_source(
+            &remote_allowed,
+            sent_dst,
+            now + ALLOWED_UDP_DEST_TTL + Duration::from_secs(1)
+        ));
+
+        // Inbound refresh extends active non-loopback (IP, port) entry past initial TTL.
+        remote_allowed.write().unwrap().record(sent_dst, now);
+        let refresh_t = now + ALLOWED_UDP_REFRESH_INTERVAL + Duration::from_secs(1);
+        assert!(is_allowed_inbound_source(
+            &remote_allowed,
+            sent_dst,
+            refresh_t
+        ));
+        assert!(is_allowed_inbound_source(
+            &remote_allowed,
+            sent_dst,
+            now + ALLOWED_UDP_DEST_TTL + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn udp_client_pin_honors_rfc1928_nonzero_addr_and_port() {
+        let tcp_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+        // Unspecified 0.0.0.0:0 leaves port unpinned while enforcing TCP peer IP.
+        let unpinned = UdpClientPin::from_request(Some(tcp_ip), "0.0.0.0", 0);
+        assert_eq!(unpinned.initial_client_peer(), None);
+        assert!(unpinned.accepts("127.0.0.1:41000".parse().unwrap()));
+        assert!(!unpinned.accepts("192.168.1.9:41000".parse().unwrap()));
+
+        // Non-zero DST.ADDR + DST.PORT pins client peer and blocks rebinding from other ports.
+        let pinned = UdpClientPin::from_request(Some(tcp_ip), "127.0.0.1", 45000);
+        assert_eq!(
+            pinned.initial_client_peer(),
+            Some("127.0.0.1:45000".parse().unwrap())
+        );
+        assert!(pinned.accepts("127.0.0.1:45000".parse().unwrap()));
+        assert!(!pinned.accepts("127.0.0.1:45001".parse().unwrap()));
+        assert!(!pinned.accepts("10.0.0.2:45000".parse().unwrap()));
+
+        // Zero DST.ADDR + non-zero DST.PORT pins port against TCP peer IP.
+        let port_only = UdpClientPin::from_request(Some(tcp_ip), "0.0.0.0", 45000);
+        assert_eq!(
+            port_only.initial_client_peer(),
+            Some("127.0.0.1:45000".parse().unwrap())
+        );
+        assert!(port_only.accepts("127.0.0.1:45000".parse().unwrap()));
+        assert!(!port_only.accepts("127.0.0.1:45002".parse().unwrap()));
+
+        // Conflicting DST.ADDR cannot reflect traffic to another host.
+        let lan_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
+        let spoofed = UdpClientPin::from_request(Some(lan_ip), "192.168.1.99", 45000);
+        assert_eq!(spoofed.initial_client_peer(), None);
+        assert!(!spoofed.accepts("192.168.1.10:45000".parse().unwrap()));
+        assert!(!spoofed.accepts("192.168.1.99:45000".parse().unwrap()));
+    }
+
+    #[test]
+    fn pre_connect_ssrf_validation_rejects_forbidden_resolved_targets() {
+        let local: SocketAddr = "192.168.1.50:1080".parse().unwrap();
+
+        assert!(validate_resolved_connect_targets(
+            &[IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))],
+            80,
+            false,
+            Some(local)
+        )
+        .is_err());
+        assert!(validate_resolved_connect_targets(
+            &[
+                IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            ],
+            443,
+            false,
+            Some(local)
+        )
+        .is_err());
+        assert!(validate_resolved_connect_targets(
+            &[IpAddr::V6("::ffff:169.254.169.254".parse().unwrap())],
+            80,
+            false,
+            Some(local)
+        )
+        .is_err());
+
+        let public_ok = validate_resolved_connect_targets(
+            &[IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+            443,
+            false,
+            Some(local),
+        )
+        .unwrap();
+        assert_eq!(public_ok, vec!["1.1.1.1:443".parse().unwrap()]);
+
+        // Loopback peer may reach private LAN hosts, but still cannot reflect into local_addr.
+        assert!(validate_resolved_connect_targets(
+            &[IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))],
+            80,
+            true,
+            Some(local)
+        )
+        .is_ok());
+        assert!(validate_resolved_connect_targets(
+            &[IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50))],
+            1080,
+            true,
+            Some(local)
+        )
+        .is_err());
     }
 }

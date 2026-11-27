@@ -125,13 +125,23 @@ impl fmt::Display for SplitTunnelMode {
 
 /// Normalize an application executable path or name for split-tunnel matching.
 ///
-/// Trims whitespace, takes the filename component after any `/` or `\`, lowercases it,
-/// and strips a trailing `.exe` suffix so `"C:\\Users\\x\\Discord.exe"`, `"discord.exe"`,
-/// and `"Discord"` all normalize to `"discord"`.
+/// Trims whitespace and surrounding quotes (`"`/`'`), takes the filename component after any `/`
+/// or `\`, lowercases it (normalizing Turkish `'İ'` by stripping U+0307 and folding dotless `'ı'`
+/// U+0131 to `'i'`), and strips a trailing `.exe` suffix so `"\"C:\\Users\\x\\Discord.exe\""`,
+/// `"DİSCORD.EXE"`, `"dıscord.exe"`, `"discord.exe"`, and `"Discord"` all normalize to `"discord"`.
 pub fn normalize_split_app_name(raw: &str) -> String {
-    let trimmed = raw.trim();
-    let file_name = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed).trim();
-    let lowered = file_name.to_lowercase();
+    let unquoted = raw.trim().trim_matches(['"', '\'']).trim();
+    let file_name = unquoted
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(unquoted)
+        .trim()
+        .trim_matches(['"', '\''])
+        .trim();
+    let lowered = file_name
+        .to_lowercase()
+        .replace('\u{0307}', "")
+        .replace('\u{0131}', "i");
     lowered
         .strip_suffix(".exe")
         .unwrap_or(&lowered)
@@ -158,10 +168,11 @@ impl SplitTunnelConfig {
     /// - `All`: always returns `false` (all apps use desync).
     /// - `Exclude`: returns `true` only when `exe_name` normalizes to a non-empty name
     ///   matching an entry in `self.apps`.
-    /// - `Include`: when `self.apps` has no non-empty entries, returns `false` so an empty
-    ///   include list never accidentally disables desync for all traffic. Otherwise, returns
-    ///   `false` for matching apps and `true` for non-matching or unidentified (`None` / empty)
-    ///   apps (strict include semantics).
+    /// - `Include`: strict include semantics - returns `false` only when `exe_name` normalizes to
+    ///   a non-empty name matching a non-empty entry in `self.apps`. When `self.apps` is empty or
+    ///   has no non-empty entries, returns `true` (bypass everything / desync nothing) so enabling
+    ///   include mode before adding apps never silently applies DPI desync to unlisted apps.
+    ///   Unidentified (`None` / empty) apps also return `true`.
     pub fn should_bypass_app(&self, exe_name: Option<&str>) -> bool {
         match self.mode {
             SplitTunnelMode::All => false,
@@ -175,7 +186,7 @@ impl SplitTunnelConfig {
                     .iter()
                     .any(|a| !normalize_split_app_name(a).is_empty());
                 if !has_targets {
-                    return false;
+                    return true;
                 }
                 match exe_name
                     .map(normalize_split_app_name)
@@ -312,6 +323,52 @@ mod tests {
         assert_eq!(normalize_split_app_name("   "), "");
         assert_eq!(normalize_split_app_name(".exe"), "");
         assert_eq!(normalize_split_app_name(r"C:\trailing\"), "");
+        assert_eq!(
+            normalize_split_app_name(r#""C:\Program Files\Discord\Discord.exe""#),
+            "discord"
+        );
+        assert_eq!(
+            normalize_split_app_name("'/usr/bin/Firefox.exe'"),
+            "firefox"
+        );
+        assert_eq!(normalize_split_app_name("\"\"  ''"), "");
+        assert_eq!(normalize_split_app_name("DİSCORD.EXE"), "discord");
+        assert_eq!(
+            normalize_split_app_name(r#""C:\Oyunlar\İSTANBUL.exe""#),
+            "istanbul"
+        );
+        assert_eq!(normalize_split_app_name("FİREFOX"), "firefox");
+    }
+
+    #[test]
+    fn normalize_app_name_folds_turkish_dotless_i() {
+        assert_eq!(normalize_split_app_name("d\u{0131}scord.exe"), "discord");
+        assert_eq!(normalize_split_app_name("f\u{0131}refox"), "firefox");
+        assert_eq!(
+            normalize_split_app_name("v\u{0131}vald\u{0131}.exe"),
+            "vivaldi"
+        );
+        assert_eq!(
+            normalize_split_app_name(r#""C:\Oyunlar\Dıscord.EXE""#),
+            "discord"
+        );
+        assert_eq!(
+            normalize_split_app_name("İSTANBUL_\u{0131}stanbul.exe"),
+            "istanbul_istanbul"
+        );
+
+        let exclude = SplitTunnelConfig {
+            mode: SplitTunnelMode::Exclude,
+            apps: vec!["d\u{0131}scord.exe".to_string()],
+        };
+        assert!(exclude.should_bypass_app(Some("Discord.exe")));
+        assert!(exclude.should_bypass_app(Some("DİSCORD.EXE")));
+
+        let include = SplitTunnelConfig {
+            mode: SplitTunnelMode::Include,
+            apps: vec!["discord.exe".to_string()],
+        };
+        assert!(!include.should_bypass_app(Some("d\u{0131}scord.exe")));
     }
 
     #[test]
@@ -359,21 +416,45 @@ mod tests {
     }
 
     #[test]
-    fn split_tunnel_include_empty_list_does_not_bypass_everything() {
+    fn split_tunnel_include_empty_list_bypasses_everything() {
         let empty = SplitTunnelConfig {
             mode: SplitTunnelMode::Include,
             apps: Vec::new(),
         };
         assert!(empty.is_active());
-        assert!(!empty.should_bypass_app(Some("chrome.exe")));
-        assert!(!empty.should_bypass_app(None));
+        assert!(empty.should_bypass_app(Some("chrome.exe")));
+        assert!(empty.should_bypass_app(None));
 
         let blank_only = SplitTunnelConfig {
             mode: SplitTunnelMode::Include,
             apps: vec!["  ".to_string(), ".exe".to_string()],
         };
-        assert!(!blank_only.should_bypass_app(Some("chrome.exe")));
-        assert!(!blank_only.should_bypass_app(None));
+        assert!(blank_only.should_bypass_app(Some("chrome.exe")));
+        assert!(blank_only.should_bypass_app(None));
+    }
+
+    #[test]
+    fn split_tunnel_include_empty_never_desyncs_unlisted_apps_regression() {
+        // Switching to `vdpi split mode include` before adding apps must fail closed
+        // (bypass everything / desync nothing), never silently desyncing games or banking.
+        let mut cfg = SplitTunnelConfig {
+            mode: SplitTunnelMode::Include,
+            apps: Vec::new(),
+        };
+        assert!(cfg.should_bypass_app(Some("VALORANT-Win64-Shipping.exe")));
+        assert!(cfg.should_bypass_app(Some("vgc.exe")));
+        assert!(cfg.should_bypass_app(Some("banking.exe")));
+        assert!(cfg.should_bypass_app(Some("discord.exe")));
+        assert!(cfg.should_bypass_app(Some("")));
+        assert!(cfg.should_bypass_app(None));
+
+        // Once an app is explicitly included, only that app is desynced (bypass == false).
+        cfg.apps.push("discord.exe".to_string());
+        assert!(!cfg.should_bypass_app(Some("discord.exe")));
+        assert!(cfg.should_bypass_app(Some("VALORANT-Win64-Shipping.exe")));
+        assert!(cfg.should_bypass_app(Some("vgc.exe")));
+        assert!(cfg.should_bypass_app(Some("banking.exe")));
+        assert!(cfg.should_bypass_app(None));
     }
 
     #[test]

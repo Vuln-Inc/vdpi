@@ -46,8 +46,8 @@ vpn_coexistence = "auto-yield"
 
 Desktop TUN mode keeps all private, link-local, loopback, CGNAT, multicast, and container/VM networks on their native kernel routes using platform-native routing isolation:
 
-- **Windows:** Installs **51 non-overlapping public IPv4 complement CIDRs** on the `vdpi0` Wintun adapter (an exact complement of `0.0.0.0/0` minus RFC 1918, CGNAT, loopback, link-local, multicast, and reserved ranges), never claiming `0.0.0.0/0`.
-- **macOS:** Installs split default routes (`0.0.0.0/1`, `128.0.0.0/1`) on `utun` paired with explicit physical-gateway LAN and link-local exclusion routes (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `224.0.0.0/4`), while more-specific native overlay routes (such as Tailscale) keep priority.
+- **Windows:** Installs **65 non-overlapping public IPv4 complement CIDRs** on the `vdpi0` Wintun adapter (an exact complement of `0.0.0.0/0` minus RFC 1918, CGNAT, `192.0.0.0/24`, loopback, link-local, multicast, and reserved ranges), never claiming `0.0.0.0/0`.
+- **macOS:** Installs **8 non-zero-anchor IPv4 split routes** (`1.0.0.0/8`, `2.0.0.0/7`, `4.0.0.0/6`, `8.0.0.0/5`, `16.0.0.0/4`, `32.0.0.0/3`, `64.0.0.0/2`, `128.0.0.0/1`) on `utun` (leaving `0.0.0.0/8` untouched for `IP_BOUND_IF`), paired with `-ifscope` physical default routes, explicit LAN/CGNAT/link-local exclusion routes (`10.0.0.0/8`, `100.64.0.0/10`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16`, `224.0.0.0/4`, `240.0.0.0/4`), and session-scoped `SCDynamicStore` DNS, while more-specific native overlay routes (such as Tailscale) keep priority.
 - **Linux:** Uses `SO_MARK` (`0x5644`) policy routing (`ip rule`) with `lookup main suppress_prefixlength 0` and `iif lo lookup 202`, so all non-default routes in `main` (LAN, Docker bridges, link-local, Tailscale, split-tunnel WireGuard) and forwarded container/VM traffic stay native.
 
 | Tool / Traffic Class | Subnets / Domains Left Untouched | Notes |
@@ -69,12 +69,13 @@ Strict banking WAFs, payment processors, government TLS endpoints, game antichea
 | Category | Built-In Default Patterns |
 | :--- | :--- |
 | **Local LANs & mesh** | `localhost`, `*.local`, `*.lan`, `*.internal`, `*.home.arpa`, `*.ts.net`, plus all loopback, RFC 1918, CGNAT (`100.64.0.0/10`), link-local, IETF protocol (`192.0.0.0/24`), benchmark (`198.18.0.0/15`), ULA, multicast, and reserved/broadcast/unspecified IPs |
+| **OS captive-portal probes** | `captive.apple.com`, `www.msftconnecttest.com`, `msftncsi.com`, `dns.msftncsi.com`, `ipv6.msftconnecttest.com`, `detectportal.firefox.com`, `connectivitycheck.gstatic.com`, `connectivitycheck.android.com`, `clients3.google.com`, `nmcheck.gnome.org`, `networkcheck.kde.org`, `neverssl.com` |
 | **Government & public portals** | `*.gov`, `*.mil`, `*.int`, `*.gov.uk`, `*.gov.tr`, `*.bel.tr`, `*.pol.tr`, `*.tsk.tr`, `*.kep.tr`, `*.edu.tr`, `*.org.tr`, `*.osym.gov.tr`, `*.edevlet.gov.tr`, `*.turkiye.gov.tr`, `*.turktelekom.com.tr`, `*.pttavm.com` |
-| **Turkish banks** | `*.halkbank.com.tr`, `*.isbank.com.tr`, `*.akbank.com`, `*.akbank.com.tr`, `*.garanti.com.tr`, `*.garantibbva.com.tr`, `*.ziraatbank.com.tr`, `*.yapikredi.com.tr`, `*.vakifbank.com.tr`, `*.qnb.com.tr`, `*.qnbfinansbank.com`, `*.qnbfinansbank.com.tr`, `*.denizbank.com`, `*.enpara.com`, `*.ing.com.tr`, `*.teb.com.tr`, `*.kuveytturk.com.tr`, `*.albaraka.com.tr`, `*.odeabank.com.tr` |
+| **Turkish banks & telecoms** | `*.halkbank.com.tr`, `*.isbank.com.tr`, `*.akbank.com`, `*.akbank.com.tr`, `*.garanti.com.tr`, `*.garantibbva.com.tr`, `*.ziraatbank.com.tr`, `*.yapikredi.com.tr`, `*.vakifbank.com.tr`, `*.qnb.com.tr`, `*.qnbfinansbank.com`, `*.qnbfinansbank.com.tr`, `*.denizbank.com`, `*.enpara.com`, `*.ing.com.tr`, `*.teb.com.tr`, `*.kuveytturk.com.tr`, `*.albaraka.com.tr`, `*.odeabank.com.tr`, plus additional Turkish bank/payment/telecom portals (`DEFAULT_BYPASS_PATTERNS`) |
 | **Payment gateways & marketplaces** | `*.bkm.com.tr`, `*.paratika.com.tr`, `*.iyzico.com`, `*.iyzipay.com`, `*.paytr.com`, `*.papara.com`, `*.sahibinden.com`, `*.shbdn.com` |
 | **Riot / Valorant** | `*.riotgames.com`, `*.riotcdn.net`, `*.playvalorant.com`, `*.pvp.net`, `*.rgpub.io` (strict TLS and anticheat/game handshakes pass through unmodified) |
 
-In **TUN mode**, bypassed hosts pass through unmodified without TLS fragmentation or QUIC blocking. In **Proxy mode**, bypassed domains are also exported to OS proxy bypass lists (Windows `ProxyOverride` and `NO_PROXY`, macOS `networksetup -setproxybypassdomains`, and Linux `gsettings` `ignore-hosts` / `NO_PROXY`).
+In **TUN mode**, bypassed hosts pass through unmodified without TLS fragmentation or QUIC blocking. In **Proxy mode**, the fail-open `/vdpi.pac` script routes localhost, single-label LAN hostnames, private LAN/CGNAT/IPv6 ULA ranges (`10.*`, `100.64.0.0/10`, `127.*`, `169.254.*`, `172.16.0.0/12`, `192.168.*`, `fc00::/7`, `fe80::/10`), local/mesh namespaces (`*.local`, `*.localhost`, `*.localdomain`, `*.lan`, `*.internal`, `*.home.arpa`, `*.ts.net`, `lvh.me`/`nip.io`/`sslip.io`/`localtest.me`), captive-portal probes, and custom `bypass_domains` (including IPv4 CIDRs) directly (`DIRECT`). macOS and Linux GNOME/KDE also keep OS proxy bypass lists synchronized, and any bypassed public domain, wildcard, CIDR, or IP that reaches the proxy passes through unmodified via `BypassPolicy`.
 
 ---
 
@@ -84,16 +85,15 @@ In **TUN mode**, bypassed hosts pass through unmodified without TLS fragmentatio
 
 `vdpi` evaluates every connection against `BypassPolicy` in this order:
 
-1. **Non-public IP check:** Any loopback, RFC 1918, CGNAT, link-local, benchmark (`198.18.0.0/15`), multicast, reserved, or ULA IP literal (or resolved IP) is always bypassed.
-2. **Bypass rules (`bypass_domains` / `--bypass`):** Built-in defaults plus your custom entries. If matched, the connection passes through unmodified.
+1. **Non-public IP & local LAN check:** Any loopback, RFC 1918, CGNAT, link-local, benchmark (`198.18.0.0/15`), multicast, reserved, or ULA IP literal (or resolved IP), and local LAN namespaces (`localhost`, `*.local`, `*.lan`, `*.home.arpa`, `*.internal`, `*.ts.net`, single-label hostnames) are always bypassed.
+2. **User bypass rules (`bypass_domains` / `--bypass`):** Your explicit custom entries always take precedence over `include_domains`.
    - Exact domain (`example.com`) matches both `example.com` and any subdomain (`*.example.com`).
    - Leading wildcard (`*.example.com`) matches `example.com` and all subdomains.
    - General wildcard (`*bank.com.tr`) matches any suffix containing that wildcard pattern.
-   - CIDR prefixes (such as `203.0.113.0/24` or `2001:db8::/32`) and IP literals (such as `198.51.100.7`) are parsed and matched directly by `BypassPolicy` against destination and resolved IPs (including IPv4-mapped IPv6) in **both TUN and Proxy modes** (and also exported into `NO_PROXY` / OS proxy bypass lists in Proxy mode).
+   - CIDR prefixes (such as `203.0.113.0/24` or `2001:db8::/32`) and IP literals (such as `198.51.100.7`) are parsed and matched directly by `BypassPolicy` against destination and resolved IPs (including IPv4-mapped IPv6) in **both TUN and Proxy modes**.
 3. **Include rules (`include_domains` / `--include`):** Optional allowlist of regular expressions.
-   - When **empty** (default), all non-bypassed public hosts receive adaptive DPI desync.
-   - When **non-empty**, `vdpi` switches to **allowlist mode**: only hostnames matching at least one regex receive DPI desync; all other hosts pass through unmodified.
-   - Bypass rules and non-public IPs always take precedence over `include_domains`.
+   - When **empty** (default), all non-bypassed public hosts (excluding `DEFAULT_BYPASS_PATTERNS`) receive adaptive DPI desync.
+   - When **non-empty**, `vdpi` switches to **allowlist mode**: hostnames matching an include regex receive DPI desync (overriding built-in `DEFAULT_BYPASS_PATTERNS` such as `*.org.tr`, while `LocalLan` and explicit user `--bypass` rules still win); all other hosts pass through unmodified.
 
 ### Configuring in `config.toml`
 
@@ -133,3 +133,36 @@ vdpi start --include '(discord|roblox)\.(com|gg|media)$'
 # Combine custom bypass rules with a background service install
 vdpi install --tun --bypass "*.corp.example.com" --bypass "vpn.example.org"
 ```
+
+---
+
+## Per-App Split Tunneling
+
+Per-app split tunneling lets you control which desktop applications receive anti-DPI TLS desync and UDP/443 QUIC blocking in **both TUN and Proxy modes** (via local socket-to-process resolution), as well as on Android.
+
+| Mode (`split_tunnel_mode`) | Behavior |
+| :--- | :--- |
+| `all` *(default)* | Protect all applications (subject to domain/IP bypass rules). |
+| `exclude` | Bypass applications in `split_tunnel_apps` so their traffic passes through unmodified without TLS fragmentation or QUIC blocking. |
+| `include` | Apply anti-DPI desync **only** to applications listed in `split_tunnel_apps`; all other apps pass through unmodified. |
+
+### Interactive Picker, CLI, and `config.toml`
+
+- **Interactive TUI:** Run `vdpi split` (alias `vdpi apps`) or press **`s`** in the Control Center TUI to search running and installed apps, toggle selections, and switch between `all`, `exclude`, and `include`.
+- **CLI:**
+  ```sh
+  vdpi split mode exclude
+  vdpi split add steam.exe obs64.exe
+  vdpi split list firefox
+  vdpi split status --json
+  vdpi split remove obs64.exe
+  vdpi split clear
+
+  # One-off session override
+  vdpi start --tun --split-mode include --split-app Discord.exe --split-app RobloxPlayerBeta.exe
+  ```
+- **`config.toml`:**
+  ```toml
+  split_tunnel_mode = "exclude"
+  split_tunnel_apps = ["steam.exe", "obs64.exe"]
+  ```

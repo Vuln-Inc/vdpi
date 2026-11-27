@@ -87,8 +87,9 @@ public struct NativeEngineConfig: Codable, Equatable, Sendable {
         self.mode = mode
         self.chunkSize = max(1, min(64, chunkSize))
         let trimmedDns = dnsAddr.trimmingCharacters(in: .whitespacesAndNewlines)
-        self.dnsAddr = trimmedDns.isEmpty ? "1.1.1.1" : trimmedDns
-        self.enableDoh = enableDoh
+        let normalizedDns = trimmedDns.isEmpty ? "1.1.1.1" : trimmedDns
+        self.dnsAddr = normalizedDns
+        self.enableDoh = enableDoh || normalizedDns.lowercased().hasPrefix("https://")
         self.ipv4Only = ipv4Only
         self.blockQuic = blockQuic
         self.timeoutMs = timeoutMs
@@ -221,8 +222,14 @@ public struct VdpiSettings: Codable, Equatable, Sendable {
         self.desyncMode = try c.decodeIfPresent(DesyncMode.self, forKey: .desyncMode) ?? .combo
         let rawChunk = try c.decodeIfPresent(Int.self, forKey: .chunkSize) ?? 10
         self.chunkSize = max(1, min(64, rawChunk))
-        self.dnsAddr = try c.decodeIfPresent(String.self, forKey: .dnsAddr) ?? "1.1.1.1"
-        self.enableDoh = try c.decodeIfPresent(Bool.self, forKey: .enableDoh) ?? true
+        let decodedDnsAddr = try c.decodeIfPresent(String.self, forKey: .dnsAddr) ?? "1.1.1.1"
+        self.dnsAddr = decodedDnsAddr
+        let decodedEnableDoh = try c.decodeIfPresent(Bool.self, forKey: .enableDoh) ?? true
+        let requiresDoh = decodedDnsAddr
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .hasPrefix("https://")
+        self.enableDoh = requiresDoh || decodedEnableDoh
         self.ipv4Only = try c.decodeIfPresent(Bool.self, forKey: .ipv4Only) ?? false
         self.blockQuic = try c.decodeIfPresent(Bool.self, forKey: .blockQuic) ?? true
 
@@ -395,6 +402,7 @@ public struct TelemetrySnapshot: Codable, Equatable, Sendable {
     public var dnsQueries: UInt64
     public var quicBlocked: UInt64
     public var udpFlowsActive: UInt64
+    public var droppedPackets: UInt64
     public var learnedHosts: Int
     public var stageNumber: UInt8
     public var stageLabel: String
@@ -414,6 +422,7 @@ public struct TelemetrySnapshot: Codable, Equatable, Sendable {
         case dnsQueries = "dns_queries"
         case quicBlocked = "quic_blocked"
         case udpFlowsActive = "udp_flows_active"
+        case droppedPackets = "dropped_packets"
         case learnedHosts = "learned_hosts"
         case stageNumber = "stage_number"
         case stageLabel = "stage_label"
@@ -434,6 +443,7 @@ public struct TelemetrySnapshot: Codable, Equatable, Sendable {
         dnsQueries: UInt64,
         quicBlocked: UInt64,
         udpFlowsActive: UInt64,
+        droppedPackets: UInt64 = 0,
         learnedHosts: Int,
         stageNumber: UInt8,
         stageLabel: String,
@@ -452,6 +462,7 @@ public struct TelemetrySnapshot: Codable, Equatable, Sendable {
         self.dnsQueries = dnsQueries
         self.quicBlocked = quicBlocked
         self.udpFlowsActive = udpFlowsActive
+        self.droppedPackets = droppedPackets
         self.learnedHosts = learnedHosts
         self.stageNumber = stageNumber
         self.stageLabel = stageLabel
@@ -473,6 +484,7 @@ public struct TelemetrySnapshot: Codable, Equatable, Sendable {
         self.dnsQueries = try c.decodeIfPresent(UInt64.self, forKey: .dnsQueries) ?? 0
         self.quicBlocked = try c.decodeIfPresent(UInt64.self, forKey: .quicBlocked) ?? 0
         self.udpFlowsActive = try c.decodeIfPresent(UInt64.self, forKey: .udpFlowsActive) ?? 0
+        self.droppedPackets = try c.decodeIfPresent(UInt64.self, forKey: .droppedPackets) ?? 0
         self.learnedHosts = try c.decodeIfPresent(Int.self, forKey: .learnedHosts) ?? 0
         self.stageNumber = try c.decodeIfPresent(UInt8.self, forKey: .stageNumber) ?? 1
         self.stageLabel = try c.decodeIfPresent(String.self, forKey: .stageLabel) ?? "ComboMultiRecord"
@@ -493,6 +505,7 @@ public struct TelemetrySnapshot: Codable, Equatable, Sendable {
         dnsQueries: 0,
         quicBlocked: 0,
         udpFlowsActive: 0,
+        droppedPackets: 0,
         learnedHosts: 0,
         stageNumber: 1,
         stageLabel: "ComboMultiRecord",

@@ -80,15 +80,18 @@ pub struct TunProfile {
 
 impl TunProfile {
     /// Tuned for gigabit desktop virtual TUN adapters (Wintun / utun / `/dev/net/tun`):
-    /// 1 MiB smoltcp TCP buffers (enabling RFC 7323 TCP Window Scaling), 4096-deep queues,
-    /// 512 TCP sessions / 512 UDP flows, 256 KiB TCP relay & UDP socket buffers, and
-    /// 128-packet I/O bursts paired with `DESKTOP_MTU = 16384`.
+    /// 448 KiB smoltcp TCP buffers (458_752 bytes, safely below Windows NT Heap's 508 KiB
+    /// `VirtualMemoryThreshold` so `TcpSocketBuffer` allocations never trigger
+    /// `VirtualAlloc`/`VirtualFree` cross-core TLB shootdowns that cause VoiceMeeter audio
+    /// crackles, while still enabling RFC 7323 TCP Window Scaling and 1 Gbps+ throughput over
+    /// local <0.2ms TUN RTT), 4096-deep queues, 512 TCP sessions / 512 UDP flows, 256 KiB TCP
+    /// relay & UDP socket buffers, and 128-packet I/O bursts paired with `DESKTOP_MTU = 16384`.
     pub const DESKTOP: Self = Self {
         stack_buffer_size: 4096,
         tcp_buffer_size: 1024,
         udp_buffer_size: 1024,
-        tcp_recv_buffer_size: 1024 * 1024,
-        tcp_send_buffer_size: 1024 * 1024,
+        tcp_recv_buffer_size: 448 * 1024,
+        tcp_send_buffer_size: 448 * 1024,
         max_tcp_sessions: 512,
         max_udp_flows: 512,
         max_dns_inflight: 256,
@@ -102,6 +105,9 @@ impl TunProfile {
         emit_quic_icmp_reject: true,
     };
 
+    /// Tuned for Android (`VpnService`) with moderate heap headroom and immediate ICMP Port
+    /// Unreachable on QUIC UDP/443 drops so clients fall back to TCP without waiting for QUIC
+    /// handshake timeouts.
     pub const STANDARD: Self = Self {
         stack_buffer_size: 512,
         tcp_buffer_size: 256,
@@ -118,7 +124,7 @@ impl TunProfile {
         packet_pool_size: 256,
         batch_size: 32,
         udp_socket_buf_bytes: 128 * 1024,
-        emit_quic_icmp_reject: false,
+        emit_quic_icmp_reject: true,
     };
 
     /// Tuned for iOS `NEPacketTunnelProvider` (~50 MB hard Jetsam memory ceiling and 256 RLIMIT_NOFILE).
@@ -327,7 +333,7 @@ mod tests {
         assert!(low.batch_size <= std.batch_size);
         assert_eq!(low.udp_socket_buf_bytes, 0);
         assert!(low.emit_quic_icmp_reject);
-        assert!(!std.emit_quic_icmp_reject);
+        assert!(std.emit_quic_icmp_reject);
         // iOS 256 RLIMIT_NOFILE headroom: 128 TCP + 48 UDP + 24 DNS = 200 (+ ~30 OS FDs < 256).
         assert!(low.max_tcp_sessions + low.max_udp_flows + low.max_dns_inflight <= 208);
         // Real worst-case dynamic RSS budget (smoltcp + decoupled 16 KiB control rings +
@@ -353,8 +359,11 @@ mod tests {
         assert_eq!(desk.udp_buffer_size, 1024);
         assert!(desk.tcp_buffer_size > std.tcp_buffer_size);
         assert!(desk.udp_buffer_size > std.udp_buffer_size);
-        assert_eq!(desk.tcp_recv_buffer_size, 1024 * 1024);
-        assert_eq!(desk.tcp_send_buffer_size, 1024 * 1024);
+        assert_eq!(desk.tcp_recv_buffer_size, 448 * 1024);
+        assert_eq!(desk.tcp_send_buffer_size, 448 * 1024);
+        // Stay safely below Windows NT Heap's 508 KiB VirtualMemoryThreshold.
+        assert!(desk.tcp_recv_buffer_size < 508 * 1024);
+        assert!(desk.tcp_send_buffer_size < 508 * 1024);
         assert_eq!(desk.max_tcp_sessions, 512);
         assert_eq!(std.max_tcp_sessions, 128);
         assert_eq!(desk.max_udp_flows, 512);
@@ -377,11 +386,12 @@ mod tests {
         assert_eq!(desk.udp_socket_buf_bytes, 256 * 1024);
         assert_eq!(std.udp_socket_buf_bytes, 128 * 1024);
         assert!(desk.emit_quic_icmp_reject);
+        assert!(std.emit_quic_icmp_reject);
 
-        // Worst-case desktop smoltcp TCP buffer footprint: 512 sessions * (1 MiB + 1 MiB) = 1 GiB.
+        // Worst-case desktop smoltcp TCP buffer footprint: 512 sessions * (448 KiB + 448 KiB) = 448 MiB.
         let max_tcp_mem = desk.max_tcp_sessions
             * (desk.tcp_recv_buffer_size as usize + desk.tcp_send_buffer_size as usize);
-        assert_eq!(max_tcp_mem, 1024 * 1024 * 1024);
+        assert_eq!(max_tcp_mem, 448 * 1024 * 1024);
         // Android STANDARD FD budget stays well under the 1024 FD ceiling.
         assert!(std.max_tcp_sessions + std.max_udp_flows <= 256);
 

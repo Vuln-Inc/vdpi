@@ -2,8 +2,8 @@ use crate::config::{TunProfile, MAX_MTU, MIN_MTU};
 use crate::events::EventRing;
 use crate::netstack::{spawn_tcp_netstack, TunNetstackTcpStream};
 use crate::packet::{
-    build_icmp_port_unreachable, build_truncated_dns_reply, max_dns_udp_payload_for_mtu,
-    max_udp_payload_for_mtu,
+    build_icmp_port_unreachable, build_icmpv6_no_route, build_truncated_dns_reply,
+    ipv6_tcp_payload, max_dns_udp_payload_for_mtu, max_udp_payload_for_mtu,
 };
 use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
@@ -12,9 +12,9 @@ use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::task::{Context as TaskContext, Poll};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch, Semaphore};
@@ -24,22 +24,29 @@ use vdpi_core::desync::{EngineContext, EngineTelemetry, LearnedStrategy};
 
 pub use crate::config::{AppBypassFn, AppBypassHook};
 pub use crate::packet::{
-    build_udp_packet, inspect_inbound_udp, is_blocked_quic_udp, is_stun_packet,
+    build_udp_packet, inspect_inbound_udp, is_blocked_quic_udp, is_dtls_packet, is_stun_packet,
     is_valid_inbound_tun_packet, InboundUdpPacket,
 };
 
-const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const UDP_REAPER_INTERVAL: Duration = Duration::from_secs(15);
+const SLEEP_WAKE_DRIFT_THRESHOLD: Duration = Duration::from_secs(15);
 const MAX_QUIC_ICMP_PER_SEC: u64 = 64;
 const TCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const TCP_SLOT_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(250);
 const PASSTHROUGH_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const REVERSE_DNS_TTL_SECS: u64 = 300;
 const STUN_FLOW_MAX_ENTRIES: usize = 256;
 const STUN_FLOW_TTL_SECS: u64 = 120;
 const UDP_APP_BYPASS_CACHE_MAX_ENTRIES: usize = 512;
-const UDP_APP_BYPASS_CACHE_TTL_SECS: u64 = 5;
+const UDP_APP_BYPASS_POSITIVE_TTL: Duration = Duration::from_secs(3);
+const UDP_APP_BYPASS_NEGATIVE_TTL: Duration = Duration::from_millis(500);
+const MAX_APP_BYPASS_INFLIGHT: usize = 64;
+const UDP_TELEMETRY_BATCH_BYTES: u64 = 64 * 1024;
+const UDP_TELEMETRY_FLUSH_INTERVAL_SECS: u64 = 1;
 const MIN_PASSTHROUGH_COPY_BUF: usize = 16 * 1024;
 const MAX_PASSTHROUGH_COPY_BUF: usize = 512 * 1024;
+#[cfg(not(windows))]
 const TCP_KERNEL_BUF_MIN_OPT_BYTES: usize = 256 * 1024;
 
 /// Wraps `TunNetstackTcpStream` so `poll_shutdown` flushes buffered writes and
@@ -163,7 +170,7 @@ impl Drop for ActiveTcpGuard {
 #[derive(Debug)]
 struct ReverseDnsCache {
     max_entries: usize,
-    map: RwLock<HashMap<IpAddr, String>>,
+    map: RwLock<HashMap<IpAddr, (String, u64)>>,
 }
 
 impl ReverseDnsCache {
@@ -174,33 +181,63 @@ impl ReverseDnsCache {
         }
     }
 
+    fn clear(&self) {
+        self.map
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
     fn insert(&self, ip: IpAddr, domain: String) {
+        self.insert_at(ip, domain, now_secs());
+    }
+
+    fn insert_at(&self, ip: IpAddr, domain: String, now: u64) {
         let mut guard = self
             .map
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if guard.len() >= self.max_entries && !guard.contains_key(&ip) {
-            if let Some(victim) = guard.keys().next().copied() {
-                guard.remove(&victim);
+            guard.retain(|_, (_, ts)| now.saturating_sub(*ts) < REVERSE_DNS_TTL_SECS);
+            if guard.len() >= self.max_entries {
+                if let Some(victim) = guard
+                    .iter()
+                    .min_by_key(|(_, (_, ts))| *ts)
+                    .map(|(k, _)| *k)
+                {
+                    guard.remove(&victim);
+                }
             }
         }
-        guard.insert(ip, domain);
+        guard.insert(ip, (domain, now));
     }
 
     fn lookup(&self, ip: IpAddr) -> Option<String> {
+        self.lookup_at(ip, now_secs())
+    }
+
+    fn lookup_at(&self, ip: IpAddr, now: u64) -> Option<String> {
         self.map
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&ip)
-            .cloned()
+            .and_then(|(domain, ts)| {
+                (now.saturating_sub(*ts) < REVERSE_DNS_TTL_SECS).then(|| domain.clone())
+            })
     }
 
     fn should_desync_dst(&self, ip: IpAddr, ctx: &EngineContext) -> bool {
+        self.should_desync_dst_at(ip, ctx, now_secs())
+    }
+
+    fn should_desync_dst_at(&self, ip: IpAddr, ctx: &EngineContext, now: u64) -> bool {
         let guard = self
             .map
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let known_host = guard.get(&ip).map(String::as_str);
+        let known_host = guard.get(&ip).and_then(|(domain, ts)| {
+            (now.saturating_sub(*ts) < REVERSE_DNS_TTL_SECS).then_some(domain.as_str())
+        });
         ctx.bypass.should_desync(known_host, Some(ip))
     }
 }
@@ -252,8 +289,9 @@ impl IcmpRateLimiter {
 }
 
 /// Bounded TTL cache of `(src_addr, dst_addr)` UDP/443 flows authenticated by an
-/// RFC 5389 STUN packet, allowing subsequent WebRTC TURN ChannelData / DTLS / SRTP
-/// datagrams on the same 4-tuple to pass through QUIC UDP/443 blocking.
+/// RFC 5389 STUN or DTLS 1.0/1.2/1.3 record, allowing subsequent WebRTC TURN ChannelData,
+/// RFC 9147 DTLS 1.3 unified-header ciphertext, and SRTP datagrams on the same 4-tuple
+/// to pass through QUIC UDP/443 blocking.
 #[derive(Debug, Default)]
 struct StunFlowCache {
     entries: HashMap<(SocketAddr, SocketAddr), u64>,
@@ -296,55 +334,356 @@ impl StunFlowCache {
     }
 }
 
-/// Task-local, lock-free TTL cache of UDP app-bypass verdicts keyed by `(src_ip, src_port)`.
-/// Prevents UDP/443 QUIC bursts from repeatedly acquiring `ProcessSocketResolver`'s lock or
-/// invoking OS socket-table scans inside the `tun_to_stack` packet demux loop.
+/// Thread-safe wrapper around [`StunFlowCache`] shared between TUN ingress (`tun_to_stack`)
+/// and Cone-NAT UDP reply reader tasks so inbound UDP/443 replies refresh active WebRTC/Discord
+/// flows even while the local client is muted / listen-only.
+#[derive(Debug, Default)]
+struct SharedStunFlowCache {
+    inner: RwLock<StunFlowCache>,
+}
+
+impl SharedStunFlowCache {
+    fn new() -> Self {
+        Self {
+            inner: RwLock::new(StunFlowCache::new()),
+        }
+    }
+
+    fn record(&self, flow: (SocketAddr, SocketAddr), now: u64) {
+        self.inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(flow, now);
+    }
+
+    fn is_authenticated_and_refresh(&self, flow: (SocketAddr, SocketAddr), now: u64) -> bool {
+        {
+            let guard = self
+                .inner
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match guard.entries.get(&flow) {
+                None => return false,
+                Some(&ts) if ts == now => return true,
+                _ => {}
+            }
+        }
+        self.inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_authenticated_and_refresh(flow, now)
+    }
+
+    fn refresh_on_inbound_reply(
+        &self,
+        local_client: SocketAddr,
+        remote_peer: SocketAddr,
+        payload: &[u8],
+        now: u64,
+    ) {
+        if remote_peer.port() != 443 {
+            return;
+        }
+        let flow = (local_client, remote_peer);
+        if is_stun_packet(payload) || is_dtls_packet(payload) {
+            let needs_write = {
+                let guard = self
+                    .inner
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.entries.get(&flow).copied() != Some(now)
+            };
+            if needs_write {
+                self.record(flow, now);
+            }
+            return;
+        }
+        let _ = self.is_authenticated_and_refresh(flow, now);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UdpBypassCacheEntry {
+    bypass: bool,
+    cached_at: Instant,
+    ttl: Duration,
+}
+
+impl UdpBypassCacheEntry {
+    #[inline]
+    fn is_fresh(self, now: Instant) -> bool {
+        now.saturating_duration_since(self.cached_at) < self.ttl
+    }
+}
+
+enum UdpBypassLookupState {
+    Hit(bool),
+    Start(watch::Sender<Option<bool>>),
+    InFlight(watch::Receiver<Option<bool>>),
+    Saturated,
+}
+
+/// Thread-safe, non-blocking TTL cache of UDP app-bypass verdicts keyed by `(src_ip, src_port)`
+/// with per-key in-flight deduplication. `tun_to_stack` ONLY performs a fast read-only `peek`;
+/// cache misses offload `AppBypassHook::should_bypass` to `tokio::task::spawn_blocking` so OS
+/// socket-table scans (Win32 `GetExtendedUdpTable` / macOS `lsof`) never stall TUN demuxing.
+type InFlightBypassMap = HashMap<(IpAddr, u16), watch::Receiver<Option<bool>>>;
+
 #[derive(Debug, Default)]
 struct UdpAppBypassCache {
-    entries: HashMap<(IpAddr, u16), (bool, u64)>,
+    entries: RwLock<HashMap<(IpAddr, u16), UdpBypassCacheEntry>>,
+    in_flight: Mutex<InFlightBypassMap>,
 }
 
 impl UdpAppBypassCache {
     fn new() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: RwLock::new(HashMap::new()),
+            in_flight: Mutex::new(HashMap::new()),
         }
     }
 
-    fn should_bypass(
-        &mut self,
+    #[inline]
+    fn peek(&self, src_ip: IpAddr, src_port: u16, now: Instant) -> Option<bool> {
+        let key = (src_ip, src_port);
+        let guard = self
+            .entries
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .get(&key)
+            .copied()
+            .filter(|entry| entry.is_fresh(now))
+            .map(|entry| entry.bypass)
+    }
+
+    /// Caches a resolved app-bypass verdict. Verdicts matching `default_unknown_verdict`
+    /// (`split_tunnel.should_bypass_app(None)`) may come from an unresolved racing socket
+    /// (e.g., `bypass=false` in Exclude mode or `bypass=true` in Include mode) and use the
+    /// shorter 500ms TTL; verdicts opposing `default_unknown_verdict` are guaranteed explicit
+    /// listed-app matches and use the 3s TTL.
+    fn insert(
+        &self,
         src_ip: IpAddr,
         src_port: u16,
-        now: u64,
-        hook: &AppBypassHook,
-    ) -> bool {
-        let key = (src_ip, src_port);
-        if let Some(&(bypass, cached_at)) = self.entries.get(&key) {
-            if now.saturating_sub(cached_at) < UDP_APP_BYPASS_CACHE_TTL_SECS {
-                return bypass;
-            }
-            self.entries.remove(&key);
-        }
+        bypass: bool,
+        default_unknown_verdict: bool,
+        now: Instant,
+    ) {
+        let ttl = if bypass != default_unknown_verdict {
+            UDP_APP_BYPASS_POSITIVE_TTL
+        } else {
+            UDP_APP_BYPASS_NEGATIVE_TTL
+        };
+        self.insert_with_ttl(src_ip, src_port, bypass, ttl, now);
+    }
 
-        let bypass = hook.should_bypass(src_ip, src_port, true);
-        if self.entries.len() >= UDP_APP_BYPASS_CACHE_MAX_ENTRIES
-            && !self.entries.contains_key(&key)
-        {
-            self.entries
-                .retain(|_, (_, ts)| now.saturating_sub(*ts) < UDP_APP_BYPASS_CACHE_TTL_SECS);
-            if self.entries.len() >= UDP_APP_BYPASS_CACHE_MAX_ENTRIES {
-                if let Some(oldest) = self
-                    .entries
+    fn insert_unknown(&self, src_ip: IpAddr, src_port: u16, fallback_bypass: bool, now: Instant) {
+        self.insert_with_ttl(
+            src_ip,
+            src_port,
+            fallback_bypass,
+            UDP_APP_BYPASS_NEGATIVE_TTL,
+            now,
+        );
+    }
+
+    fn insert_with_ttl(
+        &self,
+        src_ip: IpAddr,
+        src_port: u16,
+        bypass: bool,
+        ttl: Duration,
+        now: Instant,
+    ) {
+        let key = (src_ip, src_port);
+        let mut guard = self
+            .entries
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.len() >= UDP_APP_BYPASS_CACHE_MAX_ENTRIES && !guard.contains_key(&key) {
+            guard.retain(|_, entry| entry.is_fresh(now));
+            if guard.len() >= UDP_APP_BYPASS_CACHE_MAX_ENTRIES {
+                if let Some(oldest) = guard
                     .iter()
-                    .min_by_key(|(_, (_, ts))| *ts)
+                    .min_by_key(|(_, entry)| entry.cached_at)
                     .map(|(k, _)| *k)
                 {
-                    self.entries.remove(&oldest);
+                    guard.remove(&oldest);
                 }
             }
         }
-        self.entries.insert(key, (bypass, now));
-        bypass
+        guard.insert(
+            key,
+            UdpBypassCacheEntry {
+                bypass,
+                cached_at: now,
+                ttl,
+            },
+        );
+    }
+
+    fn begin_lookup(&self, src_ip: IpAddr, src_port: u16, now: Instant) -> UdpBypassLookupState {
+        let key = (src_ip, src_port);
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(rx) = in_flight.get(&key) {
+            return UdpBypassLookupState::InFlight(rx.clone());
+        }
+        if let Some(bypass) = self.peek(src_ip, src_port, now) {
+            return UdpBypassLookupState::Hit(bypass);
+        }
+        if in_flight.len() >= MAX_APP_BYPASS_INFLIGHT {
+            return UdpBypassLookupState::Saturated;
+        }
+        let (tx, rx) = watch::channel(None);
+        in_flight.insert(key, rx);
+        UdpBypassLookupState::Start(tx)
+    }
+
+    fn finish_lookup(&self, src_ip: IpAddr, src_port: u16) {
+        let key = (src_ip, src_port);
+        self.in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&key);
+    }
+}
+
+/// RAII guard ensuring a key is always removed from `UdpAppBypassCache::in_flight` even if
+/// the spawned lookup task is aborted on shutdown or panics.
+struct InFlightBypassGuard {
+    cache: Arc<UdpAppBypassCache>,
+    src_ip: IpAddr,
+    src_port: u16,
+    tx: Option<watch::Sender<Option<bool>>>,
+}
+
+impl InFlightBypassGuard {
+    fn new(
+        cache: Arc<UdpAppBypassCache>,
+        src_ip: IpAddr,
+        src_port: u16,
+        tx: watch::Sender<Option<bool>>,
+    ) -> Self {
+        Self {
+            cache,
+            src_ip,
+            src_port,
+            tx: Some(tx),
+        }
+    }
+
+    fn complete(mut self, bypass: bool) {
+        self.cache.finish_lookup(self.src_ip, self.src_port);
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(Some(bypass));
+        }
+    }
+}
+
+impl Drop for InFlightBypassGuard {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            self.cache.finish_lookup(self.src_ip, self.src_port);
+            drop(tx);
+        }
+    }
+}
+
+/// Batches UDP telemetry byte counter updates (64 KiB threshold or periodic flush)
+/// instead of issuing per-datagram atomic `fetch_add` ops under high PPS loads.
+/// Flushes immediately on the first datagram and on `Drop`.
+struct UdpByteBatcher {
+    telemetry: Arc<EngineTelemetry>,
+    pending_tx: u64,
+    pending_rx: u64,
+    last_flush_sec: u64,
+    flushed_once: bool,
+}
+
+impl UdpByteBatcher {
+    fn new(telemetry: Arc<EngineTelemetry>) -> Self {
+        Self {
+            telemetry,
+            pending_tx: 0,
+            pending_rx: 0,
+            last_flush_sec: now_secs(),
+            flushed_once: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_at(telemetry: Arc<EngineTelemetry>, now_sec: u64) -> Self {
+        Self {
+            telemetry,
+            pending_tx: 0,
+            pending_rx: 0,
+            last_flush_sec: now_sec,
+            flushed_once: false,
+        }
+    }
+
+    #[inline]
+    fn has_pending(&self) -> bool {
+        self.pending_tx > 0 || self.pending_rx > 0
+    }
+
+    #[inline]
+    fn record_tx(&mut self, bytes: u64, now_sec: u64) {
+        if bytes == 0 {
+            return;
+        }
+        self.pending_tx = self.pending_tx.saturating_add(bytes);
+        if !self.flushed_once
+            || self.pending_tx >= UDP_TELEMETRY_BATCH_BYTES
+            || now_sec.saturating_sub(self.last_flush_sec) >= UDP_TELEMETRY_FLUSH_INTERVAL_SECS
+        {
+            self.flush(now_sec);
+        }
+    }
+
+    #[inline]
+    fn record_rx(&mut self, bytes: u64, now_sec: u64) {
+        if bytes == 0 {
+            return;
+        }
+        self.pending_rx = self.pending_rx.saturating_add(bytes);
+        if !self.flushed_once
+            || self.pending_rx >= UDP_TELEMETRY_BATCH_BYTES
+            || now_sec.saturating_sub(self.last_flush_sec) >= UDP_TELEMETRY_FLUSH_INTERVAL_SECS
+        {
+            self.flush(now_sec);
+        }
+    }
+
+    #[inline]
+    fn flush(&mut self, now_sec: u64) {
+        if self.pending_tx > 0 {
+            let n = std::mem::take(&mut self.pending_tx);
+            self.telemetry.bytes_tx.fetch_add(n, Ordering::Relaxed);
+        }
+        if self.pending_rx > 0 {
+            let n = std::mem::take(&mut self.pending_rx);
+            self.telemetry.bytes_rx.fetch_add(n, Ordering::Relaxed);
+        }
+        self.last_flush_sec = now_sec;
+        self.flushed_once = true;
+    }
+}
+
+impl Drop for UdpByteBatcher {
+    fn drop(&mut self) {
+        if self.pending_tx > 0 {
+            let n = std::mem::take(&mut self.pending_tx);
+            self.telemetry.bytes_tx.fetch_add(n, Ordering::Relaxed);
+        }
+        if self.pending_rx > 0 {
+            let n = std::mem::take(&mut self.pending_rx);
+            self.telemetry.bytes_rx.fetch_add(n, Ordering::Relaxed);
+        }
     }
 }
 
@@ -352,9 +691,25 @@ impl UdpAppBypassCache {
 fn is_fast_tcp_packet(pkt: &[u8]) -> bool {
     match pkt.first().map(|b| b >> 4) {
         Some(4) => pkt.len() >= 20 && pkt[9] == 6,
-        Some(6) => pkt.len() >= 40 && pkt[6] == 6,
+        Some(6) => {
+            if pkt.len() < 40 {
+                return false;
+            }
+            if pkt[6] == 6 {
+                return true;
+            }
+            ipv6_tcp_payload(pkt).is_some()
+        }
         _ => false,
     }
+}
+
+#[inline]
+fn is_ipv6_tcp_port_53(pkt: &[u8]) -> bool {
+    let Some(tcp) = ipv6_tcp_payload(pkt) else {
+        return false;
+    };
+    tcp.len() >= 4 && u16::from_be_bytes([tcp[2], tcp[3]]) == 53
 }
 
 #[inline]
@@ -368,17 +723,25 @@ fn tune_upstream_tcp_socket(
     send_buf_bytes: usize,
 ) {
     let _ = stream.set_nodelay(true);
-    // Only enlarge kernel TCP socket buffers on desktop-class profiles (>= 256 KiB) so
-    // mobile/LOW_MEMORY profiles never shrink OS auto-tuned receive/send buffers.
-    if recv_buf_bytes >= TCP_KERNEL_BUF_MIN_OPT_BYTES
-        || send_buf_bytes >= TCP_KERNEL_BUF_MIN_OPT_BYTES
+    // On Windows, calling post-connect SO_RCVBUF / SO_SNDBUF disables TCP Receive Window
+    // Auto-Tuning and caps single-stream gigabit throughput on 50ms+ RTT links. Keep
+    // `TCP_NODELAY` (and keepalive set during connect) intact while letting Windows auto-tune.
+    #[cfg(windows)]
+    let _ = (recv_buf_bytes, send_buf_bytes);
+    #[cfg(not(windows))]
     {
-        let sock_ref = socket2::SockRef::from(stream);
-        if recv_buf_bytes >= TCP_KERNEL_BUF_MIN_OPT_BYTES {
-            let _ = sock_ref.set_recv_buffer_size(recv_buf_bytes);
-        }
-        if send_buf_bytes >= TCP_KERNEL_BUF_MIN_OPT_BYTES {
-            let _ = sock_ref.set_send_buffer_size(send_buf_bytes);
+        // Only enlarge kernel TCP socket buffers on desktop-class profiles (>= 256 KiB) so
+        // mobile/LOW_MEMORY profiles never shrink OS auto-tuned receive/send buffers.
+        if recv_buf_bytes >= TCP_KERNEL_BUF_MIN_OPT_BYTES
+            || send_buf_bytes >= TCP_KERNEL_BUF_MIN_OPT_BYTES
+        {
+            let sock_ref = socket2::SockRef::from(stream);
+            if recv_buf_bytes >= TCP_KERNEL_BUF_MIN_OPT_BYTES {
+                let _ = sock_ref.set_recv_buffer_size(recv_buf_bytes);
+            }
+            if send_buf_bytes >= TCP_KERNEL_BUF_MIN_OPT_BYTES {
+                let _ = sock_ref.set_send_buffer_size(send_buf_bytes);
+            }
         }
     }
 }
@@ -416,10 +779,16 @@ fn store_udp_flows_active(count: u64, stats: &TunStats, ctx: &EngineContext) {
         .store(count, Ordering::Relaxed);
 }
 
-fn drain_udp_nat(udp_nat: &UdpNatTable, stats: &TunStats, ctx: &EngineContext) -> usize {
+fn drain_udp_nat(
+    udp_nat: &UdpNatTable,
+    route_gen: &AtomicU64,
+    stats: &TunStats,
+    ctx: &EngineContext,
+) -> usize {
     let mut guard = udp_nat
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    route_gen.fetch_add(1, Ordering::AcqRel);
     let drained = guard.len();
     for (_, entry) in guard.drain() {
         entry.abort.abort();
@@ -428,23 +797,212 @@ fn drain_udp_nat(udp_nat: &UdpNatTable, stats: &TunStats, ctx: &EngineContext) -
     drained
 }
 
+/// Returns `true` only when a UDP send error indicates the entire outbound interface/route
+/// is dead (`ENETUNREACH` / Windows `10051`). Single-peer `EHOSTUNREACH` / `EINVAL`
+/// (Windows `10022` / `10065`) must NOT evict the shared Cone-NAT UDP socket.
 fn is_fatal_udp_send_error(err: &std::io::Error) -> bool {
-    if matches!(
-        err.kind(),
-        ErrorKind::NetworkUnreachable | ErrorKind::HostUnreachable | ErrorKind::InvalidInput
-    ) {
+    if err.kind() == ErrorKind::NetworkUnreachable {
+        return true;
+    }
+    #[cfg(unix)]
+    if err.raw_os_error() == Some(libc::ENETUNREACH) {
+        return true;
+    }
+    #[cfg(windows)]
+    if err.raw_os_error() == Some(10051) {
+        return true;
+    }
+    false
+}
+
+#[inline]
+fn is_unroutable_udp_dst(dst_addr: SocketAddr) -> bool {
+    if dst_addr.port() == 0 {
+        return true;
+    }
+    match dst_addr.ip() {
+        IpAddr::V4(v4) => v4.is_broadcast() || v4.is_unspecified(),
+        IpAddr::V6(v6) => v6.is_unspecified(),
+    }
+}
+
+fn is_ipv6_unreachable_error(err: &std::io::Error) -> bool {
+    if err.kind() == ErrorKind::NetworkUnreachable {
         return true;
     }
     #[cfg(unix)]
     if matches!(
         err.raw_os_error(),
-        Some(libc::ENETUNREACH | libc::EHOSTUNREACH | libc::EINVAL)
+        Some(libc::ENETUNREACH | libc::EAFNOSUPPORT | libc::EADDRNOTAVAIL)
     ) {
         return true;
     }
     #[cfg(windows)]
-    if matches!(err.raw_os_error(), Some(10022 | 10051 | 10065)) {
+    if matches!(err.raw_os_error(), Some(10047 | 10049 | 10051)) {
         return true;
+    }
+    false
+}
+
+fn is_outbound_ipv6_unavailable(ctx: &EngineContext) -> bool {
+    match bind_udp_socket_strict(ctx, false, 0) {
+        Ok(_) => false,
+        Err(err) => is_ipv6_unreachable_error(&err),
+    }
+}
+
+/// Detects S3 sleep/wake transitions by checking whether wall-clock `SystemTime` jumped
+/// ahead of monotonic `Instant` by more than `SLEEP_WAKE_DRIFT_THRESHOLD` (15s).
+fn detect_sleep_wake_jump(
+    prev_wall: SystemTime,
+    curr_wall: SystemTime,
+    prev_mono: Instant,
+    curr_mono: Instant,
+) -> Option<Duration> {
+    let wall_delta = curr_wall.duration_since(prev_wall).ok()?;
+    let mono_delta = curr_mono.saturating_duration_since(prev_mono);
+    let drift = wall_delta.checked_sub(mono_delta)?;
+    (drift > SLEEP_WAKE_DRIFT_THRESHOLD).then_some(drift)
+}
+
+#[inline]
+fn try_emit_icmpv6_no_route(
+    invoking_pkt: &[u8],
+    limiter: &IcmpRateLimiter,
+    outbound_tx: &mpsc::Sender<Vec<u8>>,
+) {
+    if limiter.allow() {
+        if let Some(icmp_pkt) = build_icmpv6_no_route(invoking_pkt) {
+            let _ = outbound_tx.try_send(icmp_pkt);
+        }
+    }
+}
+
+#[inline]
+fn maybe_handle_ipv6_udp_unreachable(
+    dst_addr: SocketAddr,
+    err: &std::io::Error,
+    invoking_v6_pkt: Option<&[u8]>,
+    ipv6_unavailable: &AtomicBool,
+    icmp_no_route_limiter: &IcmpRateLimiter,
+    outbound_tx: &mpsc::Sender<Vec<u8>>,
+) {
+    if !dst_addr.is_ipv4() && is_ipv6_unreachable_error(err) {
+        ipv6_unavailable.store(true, Ordering::Relaxed);
+        if let Some(raw_pkt) = invoking_v6_pkt {
+            try_emit_icmpv6_no_route(raw_pkt, icmp_no_route_limiter, outbound_tx);
+        }
+    }
+}
+
+/// Fair UDP burst quota for `run_priority_tun_writer`: voice/game UDP replies
+/// immediately preempt bulk TCP up to this many consecutive packets before
+/// yielding at least 1 queued TCP segment so sustained heavy UDP floods
+/// (unblocked QUIC / uTP) can never starve TCP ACKs.
+const MAX_CONSECUTIVE_UDP_PACKETS: usize = 16;
+
+/// Priority TUN egress multiplexer: drains `udp_outbound_rx` (UDP Cone-NAT replies,
+/// DNS replies, ICMP rejects) ahead of bulk TCP segments on `tcp_outbound_rx` using
+/// `biased; tokio::select!`, acquiring a downstream `outbound_tx` permit first via
+/// pure event-driven `outbound_tx.reserve().await` backpressure (zero timer-wheel
+/// sleeps) so 1 Gbps TCP downloads run at full line rate while keeping strict UDP
+/// preemption bounded by `outbound_tx`'s channel capacity. Enforces a fair UDP burst
+/// quota (`MAX_CONSECUTIVE_UDP_PACKETS`) so sustained UDP floods yield at least 1
+/// queued TCP packet every 16 UDP packets and can never starve TCP ACKs.
+/// Returns `true` if downstream `outbound_tx` closed unexpectedly (not due to shutdown).
+async fn run_priority_tun_writer(
+    mut udp_outbound_rx: mpsc::Receiver<Vec<u8>>,
+    mut tcp_outbound_rx: mpsc::Receiver<Vec<u8>>,
+    outbound_tx: mpsc::Sender<Vec<u8>>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> bool {
+    let mut udp_open = true;
+    let mut tcp_open = true;
+    let mut consecutive_udp: usize = 0;
+
+    while udp_open || tcp_open {
+        let permit = tokio::select! {
+            biased;
+            _ = wait_shutdown(shutdown_rx) => return false,
+            res = outbound_tx.reserve() => match res {
+                Ok(permit) => permit,
+                Err(_) => return true,
+            },
+        };
+
+        // Fair UDP burst quota: after MAX_CONSECUTIVE_UDP_PACKETS uninterrupted
+        // UDP packets, yield 1 queued TCP packet if ready so sustained UDP floods
+        // (unblocked QUIC / uTP) can never starve TCP ACKs.
+        if udp_open && tcp_open && consecutive_udp >= MAX_CONSECUTIVE_UDP_PACKETS {
+            match tcp_outbound_rx.try_recv() {
+                Ok(pkt) => {
+                    consecutive_udp = 0;
+                    permit.send(pkt);
+                    continue;
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    tcp_open = false;
+                    consecutive_udp = 0;
+                    continue;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+        }
+
+        let (pkt, is_udp) = if udp_open {
+            match udp_outbound_rx.try_recv() {
+                Ok(pkt) => (pkt, true),
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    udp_open = false;
+                    consecutive_udp = 0;
+                    continue;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    // UDP queue drained; reset burst counter so the next voice/game
+                    // UDP burst gets immediate full preemption quota.
+                    consecutive_udp = 0;
+                    tokio::select! {
+                        biased;
+                        _ = wait_shutdown(shutdown_rx) => return false,
+                        _ = outbound_tx.closed() => return true,
+                        maybe_udp = udp_outbound_rx.recv() => match maybe_udp {
+                            Some(pkt) => (pkt, true),
+                            None => {
+                                udp_open = false;
+                                continue;
+                            }
+                        },
+                        maybe_tcp = tcp_outbound_rx.recv(), if tcp_open => match maybe_tcp {
+                            Some(pkt) => (pkt, false),
+                            None => {
+                                tcp_open = false;
+                                continue;
+                            }
+                        },
+                    }
+                }
+            }
+        } else {
+            tokio::select! {
+                biased;
+                _ = wait_shutdown(shutdown_rx) => return false,
+                _ = outbound_tx.closed() => return true,
+                maybe_tcp = tcp_outbound_rx.recv() => match maybe_tcp {
+                    Some(pkt) => (pkt, false),
+                    None => {
+                        tcp_open = false;
+                        continue;
+                    }
+                },
+            }
+        };
+
+        if is_udp {
+            consecutive_udp = consecutive_udp.saturating_add(1);
+        } else {
+            consecutive_udp = 0;
+        }
+        permit.send(pkt);
     }
     false
 }
@@ -465,48 +1023,20 @@ fn is_transient_udp_recv_error(err: &std::io::Error) -> bool {
     err.raw_os_error() == Some(10040)
 }
 
-/// Evaluates whether an inbound UDP/443 datagram should be dropped as QUIC, exempting
-/// RFC 5389 STUN packets, subsequent TURN ChannelData / DTLS / SRTP packets on
-/// STUN-authenticated `(src_addr, dst_addr)` flows, and app-bypassed flows. Optionally emits
-/// a rate-limited ICMP Port Unreachable reply for sub-50ms browser TCP/TLS fallback.
-#[allow(clippy::too_many_arguments)]
-fn should_drop_inbound_quic(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuicCheckOutcome {
+    Allow,
+    Drop,
+    DeferAppBypassLookup,
+}
+
+fn record_quic_drop(
     pkt: &[u8],
-    udp: &InboundUdpPacket<'_>,
-    src_addr: SocketAddr,
-    dst_addr: SocketAddr,
     ctx: &EngineContext,
-    rdns: &ReverseDnsCache,
     stats: &TunStats,
     events: &EventRing,
-    stun_flows: &mut StunFlowCache,
-    app_bypass_cache: &mut UdpAppBypassCache,
     icmp_reject: Option<(&IcmpRateLimiter, &mpsc::Sender<Vec<u8>>)>,
-    app_bypass: Option<&AppBypassHook>,
-) -> bool {
-    if udp.dst_port != 443 {
-        return false;
-    }
-    let now = now_secs();
-    if is_stun_packet(udp.payload) {
-        stun_flows.record((src_addr, dst_addr), now);
-        return false;
-    }
-    if stun_flows.is_authenticated_and_refresh((src_addr, dst_addr), now) {
-        return false;
-    }
-    if !ctx.config.block_quic || !is_blocked_quic_udp(udp.dst_port, udp.payload) {
-        return false;
-    }
-    if !rdns.should_desync_dst(udp.dst_ip, ctx) {
-        return false;
-    }
-    if let Some(hook) = app_bypass {
-        if app_bypass_cache.should_bypass(udp.src_ip, udp.src_port, now, hook) {
-            return false;
-        }
-    }
-
+) {
     let count = stats.quic_blocked.fetch_add(1, Ordering::Relaxed) + 1;
     ctx.telemetry.quic_blocked.fetch_add(1, Ordering::Relaxed);
     if count == 1 || count.is_multiple_of(50) {
@@ -524,7 +1054,60 @@ fn should_drop_inbound_quic(
             }
         }
     }
-    true
+}
+
+/// Evaluates whether an inbound UDP/443 datagram should be dropped as QUIC, exempting
+/// RFC 5389 STUN packets, DTLS 1.0/1.2/1.3 records (recording the flow so subsequent
+/// RFC 9147 DTLS 1.3 unified-header ciphertext and SRTP/DTLS packets pass through),
+/// subsequent TURN ChannelData / DTLS / SRTP packets on authenticated `(src_addr, dst_addr)`
+/// flows, and app-bypassed flows (via fast non-blocking cache peek only).
+/// Optionally emits a rate-limited ICMP Port Unreachable reply for sub-50ms browser TCP/TLS fallback.
+#[allow(clippy::too_many_arguments)]
+fn should_drop_inbound_quic(
+    pkt: &[u8],
+    udp: &InboundUdpPacket<'_>,
+    src_addr: SocketAddr,
+    dst_addr: SocketAddr,
+    ctx: &EngineContext,
+    rdns: &ReverseDnsCache,
+    stats: &TunStats,
+    events: &EventRing,
+    stun_flows: &SharedStunFlowCache,
+    app_bypass_cache: &UdpAppBypassCache,
+    icmp_reject: Option<(&IcmpRateLimiter, &mpsc::Sender<Vec<u8>>)>,
+    has_app_bypass: bool,
+) -> QuicCheckOutcome {
+    if udp.dst_port != 443 {
+        return QuicCheckOutcome::Allow;
+    }
+    let now = now_secs();
+    if is_stun_packet(udp.payload) {
+        stun_flows.record((src_addr, dst_addr), now);
+        return QuicCheckOutcome::Allow;
+    }
+    if stun_flows.is_authenticated_and_refresh((src_addr, dst_addr), now) {
+        return QuicCheckOutcome::Allow;
+    }
+    if is_dtls_packet(udp.payload) {
+        stun_flows.record((src_addr, dst_addr), now);
+        return QuicCheckOutcome::Allow;
+    }
+    if !ctx.config.block_quic || !is_blocked_quic_udp(udp.dst_port, udp.payload) {
+        return QuicCheckOutcome::Allow;
+    }
+    if !rdns.should_desync_dst(udp.dst_ip, ctx) {
+        return QuicCheckOutcome::Allow;
+    }
+    if has_app_bypass {
+        match app_bypass_cache.peek(udp.src_ip, udp.src_port, Instant::now()) {
+            Some(true) => return QuicCheckOutcome::Allow,
+            Some(false) => {}
+            None => return QuicCheckOutcome::DeferAppBypassLookup,
+        }
+    }
+
+    record_quic_drop(pkt, ctx, stats, events, icmp_reject);
+    QuicCheckOutcome::Drop
 }
 
 /// Runs the pure-Rust userspace TUN packet pipeline (TCP via `vdpi_core` 7-stage desync + TCP/53 DNS,
@@ -618,9 +1201,32 @@ pub async fn run_tun_pipeline_with_app_bypass(
     // so smoltcp TCP backpressure never freezes zero-lag DNS/UDP demuxing (TCP retransmits).
     let (tcp_in_tx, tcp_in_rx) = mpsc::channel::<Vec<u8>>(profile.channel_capacity.max(64));
 
+    // Dedicated priority egress queues: low-latency UDP/DNS/ICMP replies travel over
+    // `udp_outbound_tx` (bounded by `profile.udp_reply_capacity`) and are drained strictly
+    // ahead of bulk TCP segments on `tcp_outbound_tx` in the TUN writer multiplexer.
+    let (tcp_outbound_tx, tcp_outbound_rx) =
+        mpsc::channel::<Vec<u8>>(profile.channel_capacity.max(64));
+    let (udp_outbound_tx, udp_outbound_rx) =
+        mpsc::channel::<Vec<u8>>(profile.udp_reply_capacity.max(1));
+
+    let mut stop_writer = internal_stop_rx.clone();
+    let writer_stop_tx = internal_stop_tx.clone();
+    let outbound_writer_task = tokio::spawn(async move {
+        if run_priority_tun_writer(
+            udp_outbound_rx,
+            tcp_outbound_rx,
+            outbound_tx,
+            &mut stop_writer,
+        )
+        .await
+        {
+            let _ = writer_stop_tx.send(true);
+        }
+    });
+
     let (mut tcp_stream_rx, netstack_handle) = spawn_tcp_netstack(
         tcp_in_rx,
-        outbound_tx.clone(),
+        tcp_outbound_tx,
         clamped_mtu,
         profile.tcp_recv_buffer_size as usize,
         profile.tcp_send_buffer_size as usize,
@@ -642,38 +1248,67 @@ pub async fn run_tun_pipeline_with_app_bypass(
     let udp_slow_slots = Arc::new(Semaphore::new(profile.max_udp_flows.max(16)));
     let udp_nat: UdpNatTable = Arc::new(RwLock::new(HashMap::new()));
     let udp_lru_seq = Arc::new(AtomicU64::new(0));
+    let route_gen = Arc::new(AtomicU64::new(0));
     let observed_stage = Arc::new(AtomicU8::new(ctx.preferred_stage() as u8));
+    let stun_flows = Arc::new(SharedStunFlowCache::new());
+    let udp_app_bypass_cache = Arc::new(UdpAppBypassCache::new());
+    let ipv6_unavailable = Arc::new(AtomicBool::new(is_outbound_ipv6_unavailable(&ctx)));
+    let icmp_no_route_limiter = Arc::new(IcmpRateLimiter::new(MAX_QUIC_ICMP_PER_SEC));
+    let quic_icmp_limiter = Arc::new(IcmpRateLimiter::new(MAX_QUIC_ICMP_PER_SEC));
 
     // Task 1: Zero-lag TUN ingress demux — inspect UDP ONCE and bypass smoltcp completely
-    // for DNS/53, QUIC/443 (with STUN/TURN pass-through), and Cone-NAT UDP; hand TCP
+    // for DNS/53, QUIC/443 (with STUN/TURN/DTLS pass-through), and Cone-NAT UDP; hand TCP
     // packets to smoltcp via non-blocking `try_send` so TCP congestion never stalls DNS/UDP.
     let in_ctx = ctx.clone();
     let in_rdns = Arc::clone(&reverse_dns);
     let in_stats = Arc::clone(&tun_stats);
     let in_events = Arc::clone(&events);
-    let in_outbound_tx = outbound_tx.clone();
+    let in_udp_outbound_tx = udp_outbound_tx;
     let in_dns_slots = Arc::clone(&dns_slots);
     let in_udp_slow_slots = Arc::clone(&udp_slow_slots);
     let in_udp_nat = Arc::clone(&udp_nat);
     let in_udp_lru_seq = Arc::clone(&udp_lru_seq);
+    let in_route_gen = Arc::clone(&route_gen);
+    let in_stun_flows = Arc::clone(&stun_flows);
+    let in_app_bypass_cache = Arc::clone(&udp_app_bypass_cache);
+    let in_ipv6_unavailable = Arc::clone(&ipv6_unavailable);
+    let in_icmp_no_route_limiter = Arc::clone(&icmp_no_route_limiter);
+    let in_quic_icmp_limiter = Arc::clone(&quic_icmp_limiter);
     let in_app_bypass = app_bypass.clone();
     let in_stop_root = internal_stop_rx.clone();
     let emit_quic_icmp_reject = profile.emit_quic_icmp_reject;
     let max_udp_flows = profile.max_udp_flows;
     let udp_socket_buf_bytes = profile.udp_socket_buf_bytes;
     let demux_batch_size = profile.batch_size.max(1);
-    let quic_icmp_limiter = IcmpRateLimiter::new(MAX_QUIC_ICMP_PER_SEC);
     let mut stop_in = internal_stop_rx.clone();
     let in_stop_tx = internal_stop_tx.clone();
     let tun_to_stack = tokio::spawn(async move {
-        let mut stun_flows = StunFlowCache::new();
-        let mut app_bypass_cache = UdpAppBypassCache::new();
+        let mut udp_tx_batcher = UdpByteBatcher::new(Arc::clone(&in_ctx.telemetry));
+        let tx_flush_sleep =
+            tokio::time::sleep(Duration::from_secs(UDP_TELEMETRY_FLUSH_INTERVAL_SECS));
+        tokio::pin!(tx_flush_sleep);
+        let mut tx_flush_armed = false;
         let mut pkt_batch: Vec<Vec<u8>> = Vec::with_capacity(demux_batch_size);
         'demux: loop {
+            if udp_tx_batcher.has_pending() && !tx_flush_armed {
+                tx_flush_sleep.as_mut().reset(
+                    tokio::time::Instant::now()
+                        + Duration::from_secs(UDP_TELEMETRY_FLUSH_INTERVAL_SECS),
+                );
+                tx_flush_armed = true;
+            } else if !udp_tx_batcher.has_pending() {
+                tx_flush_armed = false;
+            }
+
             let received = tokio::select! {
                 biased;
                 _ = wait_shutdown(&mut stop_in) => break,
                 n = inbound_rx.recv_many(&mut pkt_batch, demux_batch_size) => n,
+                _ = &mut tx_flush_sleep, if tx_flush_armed => {
+                    udp_tx_batcher.flush(now_secs());
+                    tx_flush_armed = false;
+                    continue;
+                }
             };
             if received == 0 {
                 let _ = in_stop_tx.send(true);
@@ -683,6 +1318,17 @@ pub async fn run_tun_pipeline_with_app_bypass(
             for pkt in pkt_batch.drain(..) {
                 // Hot-path shortcut: IPv4/IPv6 TCP frames bypass UDP header inspection completely.
                 if is_fast_tcp_packet(&pkt) {
+                    if pkt[0] >> 4 == 6
+                        && in_ipv6_unavailable.load(Ordering::Relaxed)
+                        && !is_ipv6_tcp_port_53(&pkt)
+                    {
+                        try_emit_icmpv6_no_route(
+                            &pkt,
+                            &in_icmp_no_route_limiter,
+                            &in_udp_outbound_tx,
+                        );
+                        continue;
+                    }
                     match tcp_in_tx.try_send(pkt) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -702,15 +1348,16 @@ pub async fn run_tun_pipeline_with_app_bypass(
                     let src_addr = SocketAddr::new(udp.src_ip, udp.src_port);
                     let dst_addr = SocketAddr::new(udp.dst_ip, udp.dst_port);
 
-                    // 1. UDP/53 DNS -> bounded DoH handler synthesizing raw IP+UDP reply onto outbound_tx
+                    // 1. UDP/53 DNS -> bounded DoH handler synthesizing raw IP+UDP reply onto udp_outbound_tx
                     if udp.dst_port == 53 {
                         let Ok(permit) = in_dns_slots.clone().try_acquire_owned() else {
+                            in_stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
                             continue;
                         };
                         let query = udp.payload.to_vec();
                         let dns_ctx = in_ctx.clone();
                         let rdns = Arc::clone(&in_rdns);
-                        let reply_out_tx = in_outbound_tx.clone();
+                        let reply_out_tx = in_udp_outbound_tx.clone();
                         let mut dns_stop = in_stop_root.clone();
                         tokio::spawn(async move {
                             let _permit = permit;
@@ -755,10 +1402,21 @@ pub async fn run_tun_pipeline_with_app_bypass(
                         continue;
                     }
 
-                    // 2. UDP/443 QUIC block (exempting RFC 5389 STUN and STUN-authenticated TURN/DTLS/SRTP flows)
-                    let icmp_reject =
-                        emit_quic_icmp_reject.then_some((&quic_icmp_limiter, &in_outbound_tx));
-                    if should_drop_inbound_quic(
+                    // 1.5. When outbound IPv6 is unavailable, emit ICMPv6 No Route so apps
+                    //      immediately Happy-Eyeballs fall back to IPv4 without stalling.
+                    if !dst_addr.is_ipv4() && in_ipv6_unavailable.load(Ordering::Relaxed) {
+                        try_emit_icmpv6_no_route(
+                            &pkt,
+                            &in_icmp_no_route_limiter,
+                            &in_udp_outbound_tx,
+                        );
+                        continue;
+                    }
+
+                    // 2. UDP/443 QUIC block (exempting RFC 5389 STUN, DTLS, and authenticated TURN/DTLS/SRTP flows)
+                    let icmp_reject = emit_quic_icmp_reject
+                        .then_some((in_quic_icmp_limiter.as_ref(), &in_udp_outbound_tx));
+                    match should_drop_inbound_quic(
                         &pkt,
                         &udp,
                         src_addr,
@@ -767,18 +1425,215 @@ pub async fn run_tun_pipeline_with_app_bypass(
                         &in_rdns,
                         &in_stats,
                         &in_events,
-                        &mut stun_flows,
-                        &mut app_bypass_cache,
+                        &in_stun_flows,
+                        &in_app_bypass_cache,
                         icmp_reject,
-                        in_app_bypass.as_ref(),
+                        in_app_bypass.is_some(),
                     ) {
-                        continue;
+                        QuicCheckOutcome::Drop => continue,
+                        QuicCheckOutcome::Allow => {}
+                        QuicCheckOutcome::DeferAppBypassLookup => {
+                            if let Some(hook) = in_app_bypass.clone() {
+                                let Ok(permit) = in_udp_slow_slots.clone().try_acquire_owned()
+                                else {
+                                    in_stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                };
+                                let src_ip = udp.src_ip;
+                                let src_port = udp.src_port;
+                                match in_app_bypass_cache.begin_lookup(
+                                    src_ip,
+                                    src_port,
+                                    Instant::now(),
+                                ) {
+                                    UdpBypassLookupState::Hit(true) => {
+                                        drop(permit);
+                                    }
+                                    UdpBypassLookupState::Hit(false) => {
+                                        drop(permit);
+                                        record_quic_drop(
+                                            &pkt,
+                                            &in_ctx,
+                                            &in_stats,
+                                            &in_events,
+                                            icmp_reject,
+                                        );
+                                        continue;
+                                    }
+                                    UdpBypassLookupState::Saturated => {
+                                        drop(permit);
+                                        in_stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                                        continue;
+                                    }
+                                    ticket @ (UdpBypassLookupState::Start(_)
+                                    | UdpBypassLookupState::InFlight(_)) => {
+                                        let payload = udp.payload.to_vec();
+                                        let cache = Arc::clone(&in_app_bypass_cache);
+                                        let nat = Arc::clone(&in_udp_nat);
+                                        let lru_seq = Arc::clone(&in_udp_lru_seq);
+                                        let slow_route_gen = Arc::clone(&in_route_gen);
+                                        let slow_stun_flows = Arc::clone(&in_stun_flows);
+                                        let slow_ipv6_unavailable =
+                                            Arc::clone(&in_ipv6_unavailable);
+                                        let slow_icmp_limiter =
+                                            Arc::clone(&in_icmp_no_route_limiter);
+                                        let slow_quic_limiter =
+                                            Arc::clone(&in_quic_icmp_limiter);
+                                        let reply_out_tx = in_udp_outbound_tx.clone();
+                                        let udp_ctx = in_ctx.clone();
+                                        let udp_stats = Arc::clone(&in_stats);
+                                        let udp_events = Arc::clone(&in_events);
+                                        let udp_stop_root = in_stop_root.clone();
+                                        let mut udp_stop = in_stop_root.clone();
+                                        tokio::spawn(async move {
+                                            let _permit = permit;
+                                            let bypass = match ticket {
+                                                UdpBypassLookupState::Start(tx) => {
+                                                    let guard = InFlightBypassGuard::new(
+                                                        Arc::clone(&cache),
+                                                        src_ip,
+                                                        src_port,
+                                                        tx,
+                                                    );
+                                                    let lookup_res = tokio::select! {
+                                                        biased;
+                                                        _ = wait_shutdown(&mut udp_stop) => return,
+                                                        res = tokio::task::spawn_blocking(move || {
+                                                            hook.should_bypass(src_ip, src_port, true)
+                                                        }) => res,
+                                                    };
+                                                    let default_unknown_verdict = udp_ctx
+                                                        .config
+                                                        .split_tunnel
+                                                        .should_bypass_app(None);
+                                                    let verdict = match lookup_res {
+                                                        Ok(v) => {
+                                                            cache.insert(
+                                                                src_ip,
+                                                                src_port,
+                                                                v,
+                                                                default_unknown_verdict,
+                                                                Instant::now(),
+                                                            );
+                                                            v
+                                                        }
+                                                        Err(_) => {
+                                                            cache.insert_unknown(
+                                                                src_ip,
+                                                                src_port,
+                                                                default_unknown_verdict,
+                                                                Instant::now(),
+                                                            );
+                                                            default_unknown_verdict
+                                                        }
+                                                    };
+                                                    guard.complete(verdict);
+                                                    verdict
+                                                }
+                                                UdpBypassLookupState::InFlight(mut rx) => {
+                                                    let wait_res = tokio::select! {
+                                                        biased;
+                                                        _ = wait_shutdown(&mut udp_stop) => return,
+                                                        res = rx.wait_for(|v| v.is_some()) => {
+                                                            res.ok().and_then(|v| *v)
+                                                        }
+                                                    };
+                                                    match wait_res {
+                                                        Some(v) => v,
+                                                        None => cache
+                                                            .peek(src_ip, src_port, Instant::now())
+                                                            .unwrap_or_else(|| {
+                                                                udp_ctx
+                                                                    .config
+                                                                    .split_tunnel
+                                                                    .should_bypass_app(None)
+                                                            }),
+                                                    }
+                                                }
+                                                UdpBypassLookupState::Hit(_)
+                                                | UdpBypassLookupState::Saturated => unreachable!(),
+                                            };
+
+                                            if !bypass {
+                                                let deferred_icmp = emit_quic_icmp_reject
+                                                    .then_some((
+                                                        slow_quic_limiter.as_ref(),
+                                                        &reply_out_tx,
+                                                    ));
+                                                record_quic_drop(
+                                                    &pkt,
+                                                    &udp_ctx,
+                                                    &udp_stats,
+                                                    &udp_events,
+                                                    deferred_icmp,
+                                                );
+                                                return;
+                                            }
+
+                                            match try_forward_udp_fast(
+                                                &payload,
+                                                src_addr,
+                                                dst_addr,
+                                                &nat,
+                                                &lru_seq,
+                                                &udp_ctx,
+                                                &udp_stats,
+                                                max_udp_flows,
+                                            ) {
+                                                UdpFastPath::Sent(bytes) => {
+                                                    udp_ctx.add_udp_bytes(bytes as u64, 0);
+                                                }
+                                                UdpFastPath::Done => {}
+                                                UdpFastPath::Ipv6Unreachable => {
+                                                    slow_ipv6_unavailable
+                                                        .store(true, Ordering::Relaxed);
+                                                    try_emit_icmpv6_no_route(
+                                                        &pkt,
+                                                        &slow_icmp_limiter,
+                                                        &reply_out_tx,
+                                                    );
+                                                }
+                                                UdpFastPath::NeedsSlowPath(existing) => {
+                                                    let invoking_v6_pkt =
+                                                        (!dst_addr.is_ipv4()).then_some(pkt);
+                                                    tokio::select! {
+                                                        biased;
+                                                        _ = wait_shutdown(&mut udp_stop) => {}
+                                                        _ = forward_udp_cone_nat_slow(
+                                                            payload,
+                                                            invoking_v6_pkt,
+                                                            src_addr,
+                                                            dst_addr,
+                                                            existing,
+                                                            nat,
+                                                            lru_seq,
+                                                            slow_route_gen,
+                                                            slow_stun_flows,
+                                                            slow_ipv6_unavailable,
+                                                            slow_icmp_limiter,
+                                                            reply_out_tx,
+                                                            udp_ctx,
+                                                            udp_stats,
+                                                            udp_stop_root,
+                                                            clamped_mtu,
+                                                            max_udp_flows,
+                                                            udp_socket_buf_bytes,
+                                                        ) => {}
+                                                    }
+                                                }
+                                            }
+                                        });
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     // 3. Direct Cone-NAT UDP relay: synchronous non-blocking fast path inline;
                     //    socket bind / WouldBlock slow paths run on bounded spawned tasks so
                     //    UDP bursts never stall DNS or TCP demuxing.
-                    if let UdpFastPath::NeedsSlowPath(existing) = try_forward_udp_fast(
+                    match try_forward_udp_fast(
                         udp.payload,
                         src_addr,
                         dst_addr,
@@ -788,45 +1643,77 @@ pub async fn run_tun_pipeline_with_app_bypass(
                         &in_stats,
                         max_udp_flows,
                     ) {
-                        let Ok(permit) = in_udp_slow_slots.clone().try_acquire_owned() else {
-                            in_stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        };
-                        let payload = udp.payload.to_vec();
-                        let nat = Arc::clone(&in_udp_nat);
-                        let lru_seq = Arc::clone(&in_udp_lru_seq);
-                        let reply_out_tx = in_outbound_tx.clone();
-                        let udp_ctx = in_ctx.clone();
-                        let udp_stats = Arc::clone(&in_stats);
-                        let udp_stop_root = in_stop_root.clone();
-                        let mut udp_stop = in_stop_root.clone();
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            tokio::select! {
-                                biased;
-                                _ = wait_shutdown(&mut udp_stop) => {}
-                                _ = forward_udp_cone_nat_slow(
-                                    payload,
-                                    src_addr,
-                                    dst_addr,
-                                    existing,
-                                    nat,
-                                    lru_seq,
-                                    reply_out_tx,
-                                    udp_ctx,
-                                    udp_stats,
-                                    udp_stop_root,
-                                    clamped_mtu,
-                                    max_udp_flows,
-                                    udp_socket_buf_bytes,
-                                ) => {}
-                            }
-                        });
+                        UdpFastPath::Sent(bytes) => {
+                            udp_tx_batcher.record_tx(bytes as u64, now_secs());
+                        }
+                        UdpFastPath::Done => {}
+                        UdpFastPath::Ipv6Unreachable => {
+                            in_ipv6_unavailable.store(true, Ordering::Relaxed);
+                            try_emit_icmpv6_no_route(
+                                &pkt,
+                                &in_icmp_no_route_limiter,
+                                &in_udp_outbound_tx,
+                            );
+                        }
+                        UdpFastPath::NeedsSlowPath(existing) => {
+                            let Ok(permit) = in_udp_slow_slots.clone().try_acquire_owned() else {
+                                in_stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            };
+                            let payload = udp.payload.to_vec();
+                            let invoking_v6_pkt = (!dst_addr.is_ipv4()).then_some(pkt);
+                            let nat = Arc::clone(&in_udp_nat);
+                            let lru_seq = Arc::clone(&in_udp_lru_seq);
+                            let slow_route_gen = Arc::clone(&in_route_gen);
+                            let slow_stun_flows = Arc::clone(&in_stun_flows);
+                            let slow_ipv6_unavailable = Arc::clone(&in_ipv6_unavailable);
+                            let slow_icmp_limiter = Arc::clone(&in_icmp_no_route_limiter);
+                            let reply_out_tx = in_udp_outbound_tx.clone();
+                            let udp_ctx = in_ctx.clone();
+                            let udp_stats = Arc::clone(&in_stats);
+                            let udp_stop_root = in_stop_root.clone();
+                            let mut udp_stop = in_stop_root.clone();
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                tokio::select! {
+                                    biased;
+                                    _ = wait_shutdown(&mut udp_stop) => {}
+                                    _ = forward_udp_cone_nat_slow(
+                                        payload,
+                                        invoking_v6_pkt,
+                                        src_addr,
+                                        dst_addr,
+                                        existing,
+                                        nat,
+                                        lru_seq,
+                                        slow_route_gen,
+                                        slow_stun_flows,
+                                        slow_ipv6_unavailable,
+                                        slow_icmp_limiter,
+                                        reply_out_tx,
+                                        udp_ctx,
+                                        udp_stats,
+                                        udp_stop_root,
+                                        clamped_mtu,
+                                        max_udp_flows,
+                                        udp_socket_buf_bytes,
+                                    ) => {}
+                                }
+                            });
+                        }
                     }
                     continue;
                 }
 
                 if !matches!(pkt.first().map(|b| b >> 4), Some(4 | 6)) {
+                    continue;
+                }
+                if pkt[0] >> 4 == 6 && in_ipv6_unavailable.load(Ordering::Relaxed) {
+                    try_emit_icmpv6_no_route(
+                        &pkt,
+                        &in_icmp_no_route_limiter,
+                        &in_udp_outbound_tx,
+                    );
                     continue;
                 }
                 match tcp_in_tx.try_send(pkt) {
@@ -929,6 +1816,7 @@ pub async fn run_tun_pipeline_with_app_bypass(
                     _ = wait_shutdown(&mut conn_stop) => {}
                     _ = async {
                         let known_host = rdns.lookup(dst.ip());
+                        let bypass_fallback = conn_ctx.config.split_tunnel.should_bypass_app(None);
                         let bypass_fut = async {
                             if let Some(hook) = conn_app_bypass {
                                 let src_ip = src.ip();
@@ -937,7 +1825,7 @@ pub async fn run_tun_pipeline_with_app_bypass(
                                     hook.should_bypass(src_ip, src_port, false)
                                 })
                                 .await
-                                .unwrap_or(false)
+                                .unwrap_or(bypass_fallback)
                             } else {
                                 false
                             }
@@ -1019,32 +1907,68 @@ pub async fn run_tun_pipeline_with_app_bypass(
         }
     });
 
-    // Task 4: Shared 15s UDP Cone NAT idle reaper (replaces per-packet Tokio timers)
+    // Task 4: Shared 15s UDP Cone NAT idle reaper + S3 sleep/wake clock-jump detector
     let reaper_nat = Arc::clone(&udp_nat);
+    let reaper_route_gen = Arc::clone(&route_gen);
+    let reaper_rdns = Arc::clone(&reverse_dns);
+    let reaper_ipv6_unavailable = Arc::clone(&ipv6_unavailable);
     let reaper_stats = Arc::clone(&tun_stats);
     let reaper_ctx = ctx.clone();
+    let reaper_events = Arc::clone(&events);
     let mut stop_reaper = internal_stop_rx.clone();
     let udp_reaper_task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(UDP_REAPER_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await;
+        let mut last_wall = SystemTime::now();
+        let mut last_mono = Instant::now();
         loop {
             tokio::select! {
                 biased;
                 _ = wait_shutdown(&mut stop_reaper) => break,
                 _ = ticker.tick() => {
-                    let now = now_secs();
-                    let mut guard = reaper_nat
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let active_count = reap_idle_udp_nat(
-                        &mut guard,
-                        now,
-                        UDP_IDLE_TIMEOUT.as_secs(),
-                        |e| e.last_active_secs.load(Ordering::Relaxed),
-                        |evicted| evicted.abort.abort(),
-                    ) as u64;
-                    store_udp_flows_active(active_count, &reaper_stats, &reaper_ctx);
+                    let curr_wall = SystemTime::now();
+                    let curr_mono = Instant::now();
+                    let sleep_jump = detect_sleep_wake_jump(last_wall, curr_wall, last_mono, curr_mono);
+                    last_wall = curr_wall;
+                    last_mono = curr_mono;
+
+                    if let Some(drift) = sleep_jump {
+                        let drained = drain_udp_nat(
+                            &reaper_nat,
+                            &reaper_route_gen,
+                            &reaper_stats,
+                            &reaper_ctx,
+                        );
+                        reaper_ctx.dns.clear_cache().await;
+                        reaper_rdns.clear();
+                        reaper_ipv6_unavailable.store(
+                            is_outbound_ipv6_unavailable(&reaper_ctx),
+                            Ordering::Relaxed,
+                        );
+                        reaper_events.push(
+                            "info",
+                            "udp",
+                            format!(
+                                "system wake detected (+{}s clock jump): drained {} UDP NAT flows and cleared DNS/rDNS cache",
+                                drift.as_secs(),
+                                drained
+                            ),
+                        );
+                    } else {
+                        let now = now_secs();
+                        let mut guard = reaper_nat
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let active_count = reap_idle_udp_nat(
+                            &mut guard,
+                            now,
+                            UDP_IDLE_TIMEOUT.as_secs(),
+                            |e| e.last_active_secs.load(Ordering::Relaxed),
+                            |evicted| evicted.abort.abort(),
+                        ) as u64;
+                        store_udp_flows_active(active_count, &reaper_stats, &reaper_ctx);
+                    }
                 }
             }
         }
@@ -1053,6 +1977,7 @@ pub async fn run_tun_pipeline_with_app_bypass(
     let _abort_guard = PipelineAbortGuard {
         handles: vec![
             stop_bridge.abort_handle(),
+            outbound_writer_task.abort_handle(),
             tun_to_stack.abort_handle(),
             tcp_accept_task.abort_handle(),
             udp_reaper_task.abort_handle(),
@@ -1074,13 +1999,16 @@ pub async fn run_tun_pipeline_with_app_bypass(
                     route_rx = None;
                     continue;
                 }
-                let route_gen = route_rx.as_ref().map(|rx| *rx.borrow()).unwrap_or(0);
-                let drained = drain_udp_nat(&udp_nat, &tun_stats, &ctx);
+                let watch_route_gen = route_rx.as_ref().map(|rx| *rx.borrow()).unwrap_or(0);
+                let drained = drain_udp_nat(&udp_nat, &route_gen, &tun_stats, &ctx);
+                ctx.dns.clear_cache().await;
+                reverse_dns.clear();
+                ipv6_unavailable.store(is_outbound_ipv6_unavailable(&ctx), Ordering::Relaxed);
                 if drained > 0 {
                     events.push(
                         "info",
                         "udp",
-                        format!("route change (gen {route_gen}): rebound {drained} UDP NAT flows"),
+                        format!("route change (gen {watch_route_gen}): rebound {drained} UDP NAT flows"),
                     );
                 }
             }
@@ -1088,13 +2016,14 @@ pub async fn run_tun_pipeline_with_app_bypass(
     }
 
     stop_bridge.abort();
+    outbound_writer_task.abort();
     tun_to_stack.abort();
     tcp_accept_task.abort();
     udp_reaper_task.abort();
     runner_handle.abort();
 
     // Abort every Cone NAT reader task cleanly before clearing table.
-    let _ = drain_udp_nat(&udp_nat, &tun_stats, &ctx);
+    let _ = drain_udp_nat(&udp_nat, &route_gen, &tun_stats, &ctx);
 
     crate::flush_engine_cache(&ctx).await;
 
@@ -1184,9 +2113,10 @@ impl AsyncRead for PassthroughCountingStream<'_> {
                     this.flush_rx();
                 }
             }
-            Poll::Pending | Poll::Ready(Err(_)) => {
+            Poll::Ready(Err(_)) => {
                 this.flush_rx();
             }
+            Poll::Pending => {}
         }
         poll
     }
@@ -1208,16 +2138,19 @@ impl AsyncWrite for PassthroughCountingStream<'_> {
                     this.flush_tx();
                 }
             }
-            Poll::Pending | Poll::Ready(Ok(_)) | Poll::Ready(Err(_)) => {
+            Poll::Ready(Ok(_)) | Poll::Ready(Err(_)) => {
                 this.flush_tx();
             }
+            Poll::Pending => {}
         }
         poll
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        this.flush_tx();
+        if this.pending_tx >= this.batch_bytes {
+            this.flush_tx();
+        }
         Pin::new(&mut this.inner).poll_flush(cx)
     }
 
@@ -1428,7 +2361,9 @@ where
 type UdpNatHandle = (Arc<UdpSocket>, Arc<AtomicU64>, Arc<AtomicU64>);
 
 enum UdpFastPath {
+    Sent(usize),
     Done,
+    Ipv6Unreachable,
     NeedsSlowPath(Option<UdpNatHandle>),
 }
 
@@ -1456,6 +2391,26 @@ fn evict_udp_nat_entry(
     store_udp_flows_active(guard.len() as u64, stats, ctx);
 }
 
+/// Updates a UDP Cone-NAT entry's activity timestamp and monotonic LRU sequence number
+/// at most once per second per flow so high-PPS traffic (e.g. 100k PPS) does not bounce
+/// the shared global `udp_lru_seq` cache line on every packet.
+#[inline]
+fn touch_udp_nat_activity(
+    last_active_secs: &AtomicU64,
+    last_seq: &AtomicU64,
+    lru_seq: &AtomicU64,
+    now: u64,
+) {
+    if last_active_secs.load(Ordering::Relaxed) != now
+        && last_active_secs.swap(now, Ordering::Relaxed) != now
+    {
+        last_seq.store(
+            lru_seq.fetch_add(1, Ordering::Relaxed) + 1,
+            Ordering::Relaxed,
+        );
+    }
+}
+
 /// Non-blocking inline fast path for established UDP Cone-NAT flows.
 /// Returns `UdpFastPath::NeedsSlowPath` whenever socket binding/eviction or a bounded
 /// `WouldBlock` await is needed so `tun_to_stack` never stalls DNS or TCP demuxing.
@@ -1470,12 +2425,12 @@ fn try_forward_udp_fast(
     stats: &TunStats,
     max_udp_flows: usize,
 ) -> UdpFastPath {
-    if src_addr.is_ipv4() != dst_addr.is_ipv4() {
+    if src_addr.is_ipv4() != dst_addr.is_ipv4() || is_unroutable_udp_dst(dst_addr) {
         return UdpFastPath::Done;
     }
 
     let key = (src_addr, dst_addr.is_ipv4());
-    let fatal_evict = {
+    let (fatal_evict, ipv6_unreach) = {
         let guard = nat
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1490,16 +2445,13 @@ fn try_forward_udp_fast(
         // Arc::drop atomic refcount ops per UDP datagram on the hot path.
         match entry.socket.try_send_to(payload, dst_addr) {
             Ok(_) => {
-                let now = now_secs();
-                if entry.last_active_secs.load(Ordering::Relaxed) != now {
-                    entry.last_active_secs.store(now, Ordering::Relaxed);
-                }
-                entry.last_seq.store(
-                    lru_seq.fetch_add(1, Ordering::Relaxed) + 1,
-                    Ordering::Relaxed,
+                touch_udp_nat_activity(
+                    &entry.last_active_secs,
+                    &entry.last_seq,
+                    lru_seq,
+                    now_secs(),
                 );
-                ctx.add_udp_bytes(payload.len() as u64, 0);
-                return UdpFastPath::Done;
+                return UdpFastPath::Sent(payload.len());
             }
             Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
                 return UdpFastPath::NeedsSlowPath(Some((
@@ -1509,27 +2461,46 @@ fn try_forward_udp_fast(
                 )));
             }
             Err(e) if is_fatal_udp_send_error(&e) => {
+                stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
                 debug!(%dst_addr, error = %e, "evicting dead UDP NAT entry after fatal send error");
-                Some(Arc::clone(&entry.socket))
+                (
+                    Some(Arc::clone(&entry.socket)),
+                    !dst_addr.is_ipv4() && is_ipv6_unreachable_error(&e),
+                )
             }
-            Err(_) => return UdpFastPath::Done,
+            Err(e) => {
+                stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                if !dst_addr.is_ipv4() && is_ipv6_unreachable_error(&e) {
+                    return UdpFastPath::Ipv6Unreachable;
+                }
+                return UdpFastPath::Done;
+            }
         }
     };
 
     if let Some(outbound) = fatal_evict {
         evict_udp_nat_entry(nat, key, &outbound, stats, ctx);
     }
-    UdpFastPath::Done
+    if ipv6_unreach {
+        UdpFastPath::Ipv6Unreachable
+    } else {
+        UdpFastPath::Done
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn forward_udp_cone_nat_slow(
     payload: Vec<u8>,
+    invoking_v6_pkt: Option<Vec<u8>>,
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
     existing: Option<UdpNatHandle>,
     nat: UdpNatTable,
     lru_seq: Arc<AtomicU64>,
+    route_gen: Arc<AtomicU64>,
+    stun_flows: Arc<SharedStunFlowCache>,
+    ipv6_unavailable: Arc<AtomicBool>,
+    icmp_no_route_limiter: Arc<IcmpRateLimiter>,
     outbound_tx: mpsc::Sender<Vec<u8>>,
     ctx: EngineContext,
     stats: Arc<TunStats>,
@@ -1538,6 +2509,9 @@ async fn forward_udp_cone_nat_slow(
     max_udp_flows: usize,
     udp_socket_buf_bytes: usize,
 ) {
+    if is_unroutable_udp_dst(dst_addr) {
+        return;
+    }
     let key = (src_addr, dst_addr.is_ipv4());
 
     let (outbound, last_active_secs, last_seq, already_would_block) = if let Some((
@@ -1607,17 +2581,36 @@ async fn forward_udp_cone_nat_slow(
                     // Give aborted reader task(s) a scheduling turn to drop their Arc<UdpSocket> FDs.
                     tokio::task::yield_now().await;
                 }
+                // Capture route generation BEFORE binding so a concurrent uplink switch
+                // can never race a stale socket into `udp_nat`.
+                let bind_gen = route_gen.load(Ordering::Acquire);
                 // Bind outside the write lock to avoid blocking concurrent UDP lookups.
-                let Ok(bound) =
-                    bind_udp_socket_strict(&ctx, dst_addr.is_ipv4(), udp_socket_buf_bytes)
-                else {
-                    return;
-                };
+                let bound =
+                    match bind_udp_socket_strict(&ctx, dst_addr.is_ipv4(), udp_socket_buf_bytes) {
+                        Ok(sock) => sock,
+                        Err(err) => {
+                            stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                            maybe_handle_ipv6_udp_unreachable(
+                                dst_addr,
+                                &err,
+                                invoking_v6_pkt.as_deref(),
+                                &ipv6_unavailable,
+                                &icmp_no_route_limiter,
+                                &outbound_tx,
+                            );
+                            return;
+                        }
+                    };
 
                 let mut guard = nat
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if *shutdown_rx.borrow() {
+                if *shutdown_rx.borrow() || route_gen.load(Ordering::Acquire) != bind_gen {
+                    debug!(
+                        %dst_addr,
+                        bind_gen,
+                        "aborting stale UDP NAT insertion after route change or shutdown"
+                    );
                     return;
                 }
                 if let Some(entry) = guard.get(&key) {
@@ -1647,6 +2640,7 @@ async fn forward_udp_cone_nat_slow(
                     let rx_last = Arc::clone(&last_active);
                     let rx_last_seq = Arc::clone(&entry_seq);
                     let rx_lru_seq = Arc::clone(&lru_seq);
+                    let rx_stun_flows = Arc::clone(&stun_flows);
                     let rx_outbound_tx = outbound_tx.clone();
                     let rx_nat = Arc::clone(&nat);
                     let rx_stats = Arc::clone(&stats);
@@ -1658,7 +2652,23 @@ async fn forward_udp_cone_nat_slow(
 
                     let handle = tokio::spawn(async move {
                         let mut buf = vec![0u8; recv_buf_len];
+                        let mut rx_batcher = UdpByteBatcher::new(Arc::clone(&rx_ctx.telemetry));
+                        let rx_flush_sleep = tokio::time::sleep(Duration::from_secs(
+                            UDP_TELEMETRY_FLUSH_INTERVAL_SECS,
+                        ));
+                        tokio::pin!(rx_flush_sleep);
+                        let mut rx_flush_armed = false;
                         loop {
+                            if rx_batcher.has_pending() && !rx_flush_armed {
+                                rx_flush_sleep.as_mut().reset(
+                                    tokio::time::Instant::now()
+                                        + Duration::from_secs(UDP_TELEMETRY_FLUSH_INTERVAL_SECS),
+                                );
+                                rx_flush_armed = true;
+                            } else if !rx_batcher.has_pending() {
+                                rx_flush_armed = false;
+                            }
+
                             tokio::select! {
                                 biased;
                                 _ = wait_shutdown(&mut rx_stop) => break,
@@ -1667,20 +2677,34 @@ async fn forward_udp_cone_nat_slow(
                                         Ok((n, remote_src)) if n > 0 => {
                                             let canonical_ip = remote_src.ip().to_canonical();
                                             if canonical_ip.is_ipv4() != expect_ipv4 || n > max_reply {
+                                                rx_stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
                                                 continue;
                                             }
                                             let clean_src = SocketAddr::new(canonical_ip, remote_src.port());
-                                            rx_last.store(now_secs(), Ordering::Relaxed);
-                                            rx_last_seq.store(
-                                                rx_lru_seq.fetch_add(1, Ordering::Relaxed) + 1,
-                                                Ordering::Relaxed,
+                                            let now = now_secs();
+                                            touch_udp_nat_activity(
+                                                &rx_last,
+                                                &rx_last_seq,
+                                                &rx_lru_seq,
+                                                now,
                                             );
-                                            rx_ctx.add_udp_bytes(0, n as u64);
+                                            rx_stun_flows.refresh_on_inbound_reply(
+                                                src_addr,
+                                                clean_src,
+                                                &buf[..n],
+                                                now,
+                                            );
+                                            rx_batcher.record_rx(n as u64, now);
                                             if let Some(raw_pkt) = build_udp_packet(clean_src, src_addr, &buf[..n]) {
                                                 match rx_outbound_tx.try_send(raw_pkt) {
-                                                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                                                    Ok(()) => {}
+                                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                                        rx_stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                                                    }
                                                     Err(mpsc::error::TrySendError::Closed(_)) => break,
                                                 }
+                                            } else {
+                                                rx_stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
                                             }
                                         }
                                         Ok(_) => continue,
@@ -1688,8 +2712,13 @@ async fn forward_udp_cone_nat_slow(
                                         Err(_) => break,
                                     }
                                 }
+                                _ = &mut rx_flush_sleep, if rx_flush_armed => {
+                                    rx_batcher.flush(now_secs());
+                                    rx_flush_armed = false;
+                                }
                             }
                         }
+                        drop(rx_batcher);
                         let mut guard = rx_nat
                             .write()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1757,18 +2786,33 @@ async fn forward_udp_cone_nat_slow(
 
     match send_res {
         Ok(_) => {
-            last_active_secs.store(now_secs(), Ordering::Relaxed);
-            last_seq.store(
-                lru_seq.fetch_add(1, Ordering::Relaxed) + 1,
-                Ordering::Relaxed,
-            );
+            touch_udp_nat_activity(&last_active_secs, &last_seq, &lru_seq, now_secs());
             ctx.add_udp_bytes(payload.len() as u64, 0);
         }
         Err(e) if is_fatal_udp_send_error(&e) => {
+            stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
             debug!(%dst_addr, error = %e, "evicting dead UDP NAT entry after fatal send error");
             evict_udp_nat_entry(&nat, key, &outbound, &stats, &ctx);
+            maybe_handle_ipv6_udp_unreachable(
+                dst_addr,
+                &e,
+                invoking_v6_pkt.as_deref(),
+                &ipv6_unavailable,
+                &icmp_no_route_limiter,
+                &outbound_tx,
+            );
         }
-        Err(_) => {}
+        Err(e) => {
+            stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+            maybe_handle_ipv6_udp_unreachable(
+                dst_addr,
+                &e,
+                invoking_v6_pkt.as_deref(),
+                &ipv6_unavailable,
+                &icmp_no_route_limiter,
+                &outbound_tx,
+            );
+        }
     }
 }
 
@@ -2012,11 +3056,12 @@ mod tests {
 
     #[test]
     fn udp_nat_reaper_sweeps_only_idle_flows() {
-        let mut flows: HashMap<u32, u64> = HashMap::from([(1, 10), (2, 40), (3, 95), (4, 100)]);
+        assert_eq!(UDP_IDLE_TIMEOUT, Duration::from_secs(120));
+        let mut flows: HashMap<u32, u64> = HashMap::from([(1, 10), (2, 80), (3, 140), (4, 200)]);
         let mut evicted = Vec::new();
         let remaining = reap_idle_udp_nat(
             &mut flows,
-            100,
+            200,
             UDP_IDLE_TIMEOUT.as_secs(),
             |ts| *ts,
             |ts| evicted.push(ts),
@@ -2025,7 +3070,7 @@ mod tests {
         assert!(flows.contains_key(&3));
         assert!(flows.contains_key(&4));
         evicted.sort_unstable();
-        assert_eq!(evicted, vec![10, 40]);
+        assert_eq!(evicted, vec![10, 80]);
     }
 
     #[test]
@@ -2211,10 +3256,18 @@ mod tests {
             ))
             .await
             .unwrap();
-        let reply_raw = tokio::time::timeout(Duration::from_secs(3), out_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        // Drain any prior ICMP Port Unreachable frames emitted for the 2 blocked QUIC packets
+        // (TunProfile::STANDARD now enables emit_quic_icmp_reject for instant TCP fallback).
+        let reply_raw = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let pkt = out_rx.recv().await.expect("out_rx closed");
+                if inspect_inbound_udp(&pkt).is_some() {
+                    break pkt;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for raw IPv4+UDP echo reply");
         echo_task.await.unwrap();
         let parsed_reply = inspect_inbound_udp(&reply_raw).expect("expected raw IPv4+UDP reply");
         assert_eq!(parsed_reply.src_port, echo_port);
@@ -2358,7 +3411,17 @@ mod tests {
         assert_eq!(tun_stats.quic_blocked.load(Ordering::Relaxed), 1);
         assert_eq!(ctx.telemetry.quic_blocked.load(Ordering::Relaxed), 1);
 
-        let calls = observed.lock().unwrap().clone();
+        let hook_deadline = Instant::now() + Duration::from_secs(2);
+        while observed.lock().unwrap().len() < 2 {
+            assert!(
+                Instant::now() < hook_deadline,
+                "timed out waiting for async app_bypass hook calls (got {:?})",
+                *observed.lock().unwrap(),
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let mut calls = observed.lock().unwrap().clone();
+        calls.sort_by_key(|&(_, port, _)| port);
         assert_eq!(
             calls,
             vec![
@@ -2513,8 +3576,20 @@ mod tests {
         )
         .await;
         assert_eq!(ctx.telemetry.tls_handshakes.load(Ordering::Relaxed), 0);
-        assert!(ctx.telemetry.bytes_tx.load(Ordering::Relaxed) >= client_hello.len() as u64);
-        assert!(ctx.telemetry.bytes_rx.load(Ordering::Relaxed) >= 2);
+        // PassthroughCountingStream flushes sub-threshold bytes on EOF/drop rather than
+        // Poll::Pending, so allow the closing passthrough task a brief turn to flush.
+        let flush_deadline = Instant::now() + Duration::from_secs(2);
+        while ctx.telemetry.bytes_tx.load(Ordering::Relaxed) < client_hello.len() as u64
+            || ctx.telemetry.bytes_rx.load(Ordering::Relaxed) < 2
+        {
+            assert!(
+                Instant::now() < flush_deadline,
+                "timed out waiting for passthrough telemetry flush (tx={}, rx={})",
+                ctx.telemetry.bytes_tx.load(Ordering::Relaxed),
+                ctx.telemetry.bytes_rx.load(Ordering::Relaxed),
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
 
         // 2. Non-bypassed port 58001 -> enters normal EngineContext::relay_stream; tls_handshakes becomes 1.
         run_raw_tcp_exchange(
@@ -2592,35 +3667,1235 @@ mod tests {
 
     #[test]
     fn udp_app_bypass_cache_deduplicates_hook_calls_and_enforces_ttl_and_cap() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let calls_hook = Arc::clone(&calls);
-        let hook = AppBypassHook::new(move |_ip, port, is_udp| {
-            calls_hook.fetch_add(1, Ordering::Relaxed);
-            is_udp && port == 60000
+        let cache = Arc::new(UdpAppBypassCache::new());
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let t0 = Instant::now();
+
+        // 1. Cold peek misses without blocking; begin_lookup deduplicates concurrent in-flight keys.
+        assert_eq!(cache.peek(ip, 60000, t0), None);
+        let tx = match cache.begin_lookup(ip, 60000, t0) {
+            UdpBypassLookupState::Start(tx) => tx,
+            _ => panic!("expected Start for initial cache miss"),
+        };
+        let rx_dup = match cache.begin_lookup(ip, 60000, t0) {
+            UdpBypassLookupState::InFlight(rx) => rx,
+            _ => panic!("expected InFlight deduplication for duplicate key"),
+        };
+
+        let guard = InFlightBypassGuard::new(Arc::clone(&cache), ip, 60000, tx);
+        cache.insert(ip, 60000, true, false, t0);
+        guard.complete(true);
+        assert_eq!(*rx_dup.borrow(), Some(true));
+
+        // 2. Exclude mode (default_unknown=false): bypass=true is a guaranteed listed-app match
+        //    (3s TTL), while bypass=false may be an unresolved racing socket (500ms TTL).
+        assert_eq!(
+            cache.peek(ip, 60000, t0 + Duration::from_millis(2999)),
+            Some(true)
+        );
+        assert_eq!(cache.peek(ip, 60000, t0 + UDP_APP_BYPASS_POSITIVE_TTL), None);
+
+        cache.insert(ip, 60001, false, false, t0);
+        assert_eq!(
+            cache.peek(ip, 60001, t0 + Duration::from_millis(499)),
+            Some(false)
+        );
+        assert_eq!(cache.peek(ip, 60001, t0 + UDP_APP_BYPASS_NEGATIVE_TTL), None);
+
+        // 3. Include mode (default_unknown=true): bypass=false is a confirmed included app
+        //    (3s TTL), while bypass=true may be an unresolved racing socket (500ms TTL).
+        cache.insert(ip, 60004, false, true, t0);
+        assert_eq!(
+            cache.peek(ip, 60004, t0 + Duration::from_millis(2999)),
+            Some(false)
+        );
+        assert_eq!(cache.peek(ip, 60004, t0 + UDP_APP_BYPASS_POSITIVE_TTL), None);
+
+        cache.insert(ip, 60005, true, true, t0);
+        assert_eq!(
+            cache.peek(ip, 60005, t0 + Duration::from_millis(499)),
+            Some(true)
+        );
+        assert_eq!(cache.peek(ip, 60005, t0 + UDP_APP_BYPASS_NEGATIVE_TTL), None);
+
+        cache.insert_unknown(ip, 60002, true, t0);
+        assert_eq!(
+            cache.peek(ip, 60002, t0 + Duration::from_millis(499)),
+            Some(true)
+        );
+        assert_eq!(cache.peek(ip, 60002, t0 + UDP_APP_BYPASS_NEGATIVE_TTL), None);
+
+        // 4. Dropping InFlightBypassGuard without complete clears in_flight cleanly.
+        {
+            let tx_abort = match cache.begin_lookup(ip, 60003, t0) {
+                UdpBypassLookupState::Start(tx) => tx,
+                _ => panic!("expected Start for 60003"),
+            };
+            let _guard = InFlightBypassGuard::new(Arc::clone(&cache), ip, 60003, tx_abort);
+        }
+        assert!(matches!(
+            cache.begin_lookup(ip, 60003, t0),
+            UdpBypassLookupState::Start(_)
+        ));
+        cache.finish_lookup(ip, 60003);
+
+        // 5. Capacity stays strictly bounded at UDP_APP_BYPASS_CACHE_MAX_ENTRIES.
+        let t_cap = t0 + Duration::from_secs(10);
+        for idx in 0..(UDP_APP_BYPASS_CACHE_MAX_ENTRIES + 32) {
+            cache.insert(
+                ip,
+                10_000 + idx as u16,
+                true,
+                false,
+                t_cap + Duration::from_millis((idx % 3) as u64),
+            );
+        }
+        assert_eq!(
+            cache.entries.read().unwrap().len(),
+            UDP_APP_BYPASS_CACHE_MAX_ENTRIES
+        );
+    }
+
+    #[test]
+    fn udp_send_error_classifier_and_unroutable_dst_and_sleep_jump_detector() {
+        // Only whole-interface NetworkUnreachable evicts the shared Cone-NAT UDP socket;
+        // single-peer HostUnreachable / InvalidInput must NOT evict it.
+        assert!(is_fatal_udp_send_error(&std::io::Error::from(
+            ErrorKind::NetworkUnreachable
+        )));
+        assert!(!is_fatal_udp_send_error(&std::io::Error::from(
+            ErrorKind::HostUnreachable
+        )));
+        assert!(!is_fatal_udp_send_error(&std::io::Error::from(
+            ErrorKind::InvalidInput
+        )));
+        #[cfg(windows)]
+        {
+            assert!(is_fatal_udp_send_error(&std::io::Error::from_raw_os_error(
+                10051
+            )));
+            assert!(!is_fatal_udp_send_error(&std::io::Error::from_raw_os_error(
+                10022
+            )));
+            assert!(!is_fatal_udp_send_error(&std::io::Error::from_raw_os_error(
+                10065
+            )));
+        }
+
+        assert!(is_unroutable_udp_dst(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            0
+        )));
+        assert!(is_unroutable_udp_dst(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::BROADCAST),
+            443
+        )));
+        assert!(is_unroutable_udp_dst(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            443
+        )));
+        assert!(!is_unroutable_udp_dst(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            443
+        )));
+
+        // SharedStunFlowCache inbound UDP/443 reply refresh keeps listen-only flows alive >120s.
+        let shared_stun = SharedStunFlowCache::new();
+        let client = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 55000);
+        let peer_443 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(162, 159, 135, 232)), 443);
+        shared_stun.record((client, peer_443), 100);
+        shared_stun.refresh_on_inbound_reply(client, peer_443, &[0x80, 0x6f, 0, 1], 210);
+        assert!(shared_stun.is_authenticated_and_refresh((client, peer_443), 320));
+
+        // S3 sleep/wake clock-jump detector triggers only when wall-clock exceeds monotonic by >15s.
+        let base_wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let base_mono = Instant::now();
+        assert!(detect_sleep_wake_jump(
+            base_wall,
+            base_wall + Duration::from_secs(15),
+            base_mono,
+            base_mono
+        )
+        .is_none());
+        assert_eq!(
+            detect_sleep_wake_jump(
+                base_wall,
+                base_wall + Duration::from_secs(45),
+                base_mono,
+                base_mono
+            ),
+            Some(Duration::from_secs(45))
+        );
+        assert!(detect_sleep_wake_jump(
+            base_wall,
+            base_wall - Duration::from_secs(30),
+            base_mono,
+            base_mono
+        )
+        .is_none());
+
+        // IPv6 TCP packet with extension headers is recognized by is_fast_tcp_packet.
+        let mut v6_ext_tcp = vec![0u8; 68];
+        v6_ext_tcp[0] = 0x60;
+        v6_ext_tcp[4..6].copy_from_slice(&28u16.to_be_bytes());
+        v6_ext_tcp[6] = 0; // Hop-by-Hop
+        v6_ext_tcp[40] = 6; // Next Header = TCP
+        v6_ext_tcp[41] = 0; // 8-byte Hop-by-Hop
+        assert!(is_fast_tcp_packet(&v6_ext_tcp));
+    }
+
+    #[tokio::test]
+    async fn ipv6_unavailable_emits_icmpv6_no_route_from_tun_gateway_for_happy_eyeballs() {
+        #[derive(Debug)]
+        struct Ipv4OnlyBinder;
+
+        impl vdpi_core::binder::OutboundBinder for Ipv4OnlyBinder {
+            fn bind_socket(
+                &self,
+                _sock: socket2::SockRef<'_>,
+                is_ipv4: bool,
+            ) -> std::io::Result<()> {
+                if is_ipv4 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::from(ErrorKind::NetworkUnreachable))
+                }
+            }
+        }
+
+        let cfg = TunnelConfig {
+            enable_doh: false,
+            block_quic: true,
+            ..Default::default()
+        };
+        let ctx = EngineContext::new_with_binder(
+            cfg.into_runtime_config(),
+            Some(Arc::new(Ipv4OnlyBinder)),
+        )
+        .unwrap();
+        let tun_stats = Arc::new(TunStats::default());
+        let events = Arc::new(EventRing::new());
+
+        let (in_tx, in_rx) = mpsc::channel(64);
+        let (out_tx, mut out_rx) = mpsc::channel(64);
+        let (stop_tx, stop_rx) = watch::channel(false);
+
+        let pipeline = tokio::spawn(run_tun_pipeline(
+            in_rx,
+            out_tx,
+            ctx,
+            Arc::clone(&tun_stats),
+            Arc::clone(&events),
+            1500,
+            TunProfile::STANDARD,
+            stop_rx,
+        ));
+
+        let src_v6: std::net::Ipv6Addr = "fd00:7664:7069::1".parse().unwrap();
+        let dst_v6: std::net::Ipv6Addr = "2606:4700:4700::1111".parse().unwrap();
+        let gateway_v6: std::net::Ipv6Addr = "fd00:7664:7069::2".parse().unwrap();
+
+        // 1. IPv6 TCP SYN -> immediate ICMPv6 Type 1 Code 0 (No Route) sourced from fd00:7664:7069::2.
+        let mut syn_v6 = Vec::new();
+        PacketBuilder::ipv6(src_v6.octets(), dst_v6.octets(), 64)
+            .tcp(52000, 443, 1, 65535)
+            .syn()
+            .write(&mut syn_v6, &[])
+            .unwrap();
+        in_tx.send(syn_v6).await.unwrap();
+
+        let icmp_tcp = tokio::time::timeout(Duration::from_secs(3), out_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(icmp_tcp[0] >> 4, 6);
+        assert_eq!(icmp_tcp[6], 58); // ICMPv6
+        assert_eq!(&icmp_tcp[8..24], gateway_v6.octets().as_slice());
+        assert_eq!(&icmp_tcp[24..40], src_v6.octets().as_slice());
+        assert_eq!(icmp_tcp[40], 1); // Destination Unreachable
+        assert_eq!(icmp_tcp[41], 0); // No Route
+
+        // 2. IPv6 non-53 UDP -> immediate ICMPv6 Type 1 Code 0 (No Route).
+        let udp_v6 = build_udp_packet(
+            SocketAddr::new(IpAddr::V6(src_v6), 52001),
+            SocketAddr::new(IpAddr::V6(dst_v6), 443),
+            &[0xc0; 32],
+        )
+        .unwrap();
+        in_tx.send(udp_v6).await.unwrap();
+
+        let icmp_udp = tokio::time::timeout(Duration::from_secs(3), out_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(icmp_udp[0] >> 4, 6);
+        assert_eq!(icmp_udp[6], 58);
+        assert_eq!(&icmp_udp[8..24], gateway_v6.octets().as_slice());
+        assert_eq!(icmp_udp[40], 1);
+        assert_eq!(icmp_udp[41], 0);
+
+        stop_tx.send(true).unwrap();
+        pipeline.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn slow_app_bypass_hook_never_stalls_tun_demux_and_deduplicates_inflight() {
+        let cfg = TunnelConfig {
+            enable_doh: false,
+            block_quic: true,
+            ..Default::default()
+        };
+        let ctx = EngineContext::new(cfg.into_runtime_config()).unwrap();
+        let tun_stats = Arc::new(TunStats::default());
+        let events = Arc::new(EventRing::new());
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let hook_entered = Arc::new(AtomicBool::new(false));
+        let hook_calls_clone = Arc::clone(&hook_calls);
+        let hook_entered_clone = Arc::clone(&hook_entered);
+        let hook = AppBypassHook::new(move |_ip, _port, _is_udp| {
+            hook_calls_clone.fetch_add(1, Ordering::Relaxed);
+            hook_entered_clone.store(true, Ordering::Release);
+            let _ = release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3));
+            false
         });
 
-        let mut cache = UdpAppBypassCache::new();
+        let (in_tx, in_rx) = mpsc::channel(64);
+        let (out_tx, mut out_rx) = mpsc::channel(64);
+        let (stop_tx, stop_rx) = watch::channel(false);
+
+        let pipeline = tokio::spawn(run_tun_pipeline_with_app_bypass(
+            in_rx,
+            out_tx,
+            ctx.clone(),
+            Arc::clone(&tun_stats),
+            Arc::clone(&events),
+            1500,
+            TunProfile::DESKTOP,
+            stop_rx,
+            None,
+            Some(hook),
+        ));
+
+        let client_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let public_quic = Ipv4Addr::new(162, 159, 135, 232);
+
+        // Send a 4-packet QUIC burst on the same source port while the blocking hook is parked.
+        for _ in 0..4 {
+            in_tx
+                .send(build_ipv4_udp(
+                    client_ip,
+                    57100,
+                    public_quic,
+                    443,
+                    &[0xc0u8; 1200],
+                ))
+                .await
+                .unwrap();
+        }
+
+        // Immediately send a UDP/53 DNS query; it MUST complete while the hook is still blocked.
+        let mut dns_q = encode_dns_query("localhost", 1).unwrap();
+        dns_q[0] = 0x55;
+        dns_q[1] = 0xaa;
+        in_tx
+            .send(build_ipv4_udp(
+                client_ip,
+                53100,
+                Ipv4Addr::new(10, 0, 0, 2),
+                53,
+                &dns_q,
+            ))
+            .await
+            .unwrap();
+
+        let dns_reply = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
+            .await
+            .expect("DNS reply must not stall behind slow app_bypass hook")
+            .unwrap();
+        let parsed_dns = inspect_inbound_udp(&dns_reply).expect("expected UDP/53 DNS reply");
+        assert_eq!(parsed_dns.src_port, 53);
+        assert_eq!(parsed_dns.dst_port, 53100);
+        assert_eq!(&parsed_dns.payload[0..2], &[0x55, 0xaa]);
+
+        // Wait until the single deduplicated blocking lookup has entered, then unblock it.
+        let enter_deadline = Instant::now() + Duration::from_secs(2);
+        while !hook_entered.load(Ordering::Acquire) {
+            assert!(Instant::now() < enter_deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let _ = release_tx.send(());
+
+        let block_deadline = Instant::now() + Duration::from_secs(2);
+        while tun_stats.quic_blocked.load(Ordering::Relaxed) < 4 {
+            assert!(
+                Instant::now() < block_deadline,
+                "timed out waiting for deferred QUIC burst drops (got {})",
+                tun_stats.quic_blocked.load(Ordering::Relaxed),
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            hook_calls.load(Ordering::Relaxed),
+            1,
+            "in-flight deduplication must invoke app_bypass hook exactly once per key"
+        );
+
+        stop_tx.send(true).unwrap();
+        pipeline.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn route_change_during_udp_bind_aborts_stale_nat_insertion() {
+        #[derive(Debug)]
+        struct RouteRacingBinder(Arc<AtomicU64>);
+
+        impl vdpi_core::binder::OutboundBinder for RouteRacingBinder {
+            fn bind_socket(
+                &self,
+                _sock: socket2::SockRef<'_>,
+                _is_ipv4: bool,
+            ) -> std::io::Result<()> {
+                // Simulate a route_rx uplink switch completing while the UDP socket is binding.
+                self.0.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            }
+        }
+
+        let route_gen = Arc::new(AtomicU64::new(0));
+        let cfg = TunnelConfig {
+            enable_doh: false,
+            block_quic: true,
+            ..Default::default()
+        };
+        let ctx = EngineContext::new_with_binder(
+            cfg.into_runtime_config(),
+            Some(Arc::new(RouteRacingBinder(Arc::clone(&route_gen)))),
+        )
+        .unwrap();
+        let nat: UdpNatTable = Arc::new(RwLock::new(HashMap::new()));
+        let lru_seq = Arc::new(AtomicU64::new(0));
+        let stun_flows = Arc::new(SharedStunFlowCache::new());
+        let ipv6_unavailable = Arc::new(AtomicBool::new(false));
+        let icmp_limiter = Arc::new(IcmpRateLimiter::new(MAX_QUIC_ICMP_PER_SEC));
+        let stats = Arc::new(TunStats::default());
+        let (out_tx, _out_rx) = mpsc::channel(16);
+        let (_stop_tx, stop_rx) = watch::channel(false);
+
+        forward_udp_cone_nat_slow(
+            b"stale-route-probe".to_vec(),
+            None,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 50100),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50101),
+            None,
+            Arc::clone(&nat),
+            lru_seq,
+            Arc::clone(&route_gen),
+            stun_flows,
+            ipv6_unavailable,
+            icmp_limiter,
+            out_tx,
+            ctx.clone(),
+            Arc::clone(&stats),
+            stop_rx,
+            1500,
+            16,
+            0,
+        )
+        .await;
+
+        assert_eq!(route_gen.load(Ordering::Acquire), 1);
+        assert!(
+            nat.read().unwrap().is_empty(),
+            "stale socket bound before route_gen change must NOT be inserted into udp_nat"
+        );
+        assert_eq!(stats.udp_flows_active.load(Ordering::Relaxed), 0);
+        assert_eq!(ctx.telemetry.udp_flows_active.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn dtls_udp_443_authenticates_flow_for_dtls13_ciphertext_and_srtp() {
+        let cfg = TunnelConfig {
+            enable_doh: false,
+            block_quic: true,
+            ..Default::default()
+        };
+        let ctx = EngineContext::new(cfg.into_runtime_config()).unwrap();
+        let rdns = ReverseDnsCache::new(64);
+        let stats = TunStats::default();
+        let events = EventRing::new();
+        let stun_flows = SharedStunFlowCache::new();
+        let app_bypass_cache = UdpAppBypassCache::new();
+
+        let client_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let peer_ip = Ipv4Addr::new(198, 51, 100, 20);
+        let src_dtls = SocketAddr::new(IpAddr::V4(client_ip), 56200);
+        let dst_443 = SocketAddr::new(IpAddr::V4(peer_ip), 443);
+
+        // 1. Outbound DTLS 1.2/1.3 ClientHello on UDP/443 records the 4-tuple in stun_flows.
+        let mut dtls_hello = [0u8; 20];
+        dtls_hello[0] = 0x16;
+        dtls_hello[1] = 0xfe;
+        dtls_hello[2] = 0xfd;
+        let dtls_pkt = build_ipv4_udp(client_ip, 56200, peer_ip, 443, &dtls_hello);
+        let dtls_udp = inspect_inbound_udp(&dtls_pkt).unwrap();
+        assert_eq!(
+            should_drop_inbound_quic(
+                &dtls_pkt,
+                &dtls_udp,
+                src_dtls,
+                dst_443,
+                &ctx,
+                &rdns,
+                &stats,
+                &events,
+                &stun_flows,
+                &app_bypass_cache,
+                None,
+                false,
+            ),
+            QuicCheckOutcome::Allow
+        );
+        assert!(stun_flows.is_authenticated_and_refresh((src_dtls, dst_443), now_secs()));
+
+        // 2. Subsequent RFC 9147 DTLS 1.3 unified-header ciphertext (0x2f..) and SRTP (0x80..)
+        //    on the authenticated 4-tuple pass through without QUIC blocking.
+        for payload in [
+            [0x2fu8, 0x00, 0x01, 0x00, 0x10, 0xde, 0xad, 0xbe, 0xef].as_slice(),
+            [0x80u8, 0x6f, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00].as_slice(),
+        ] {
+            let pkt = build_ipv4_udp(client_ip, 56200, peer_ip, 443, payload);
+            let udp = inspect_inbound_udp(&pkt).unwrap();
+            assert_eq!(
+                should_drop_inbound_quic(
+                    &pkt,
+                    &udp,
+                    src_dtls,
+                    dst_443,
+                    &ctx,
+                    &rdns,
+                    &stats,
+                    &events,
+                    &stun_flows,
+                    &app_bypass_cache,
+                    None,
+                    false,
+                ),
+                QuicCheckOutcome::Allow
+            );
+        }
+        assert_eq!(stats.quic_blocked.load(Ordering::Relaxed), 0);
+
+        // 3. Unauthenticated QUIC Initial on a different source port is still dropped.
+        let quic_src = SocketAddr::new(IpAddr::V4(client_ip), 56201);
+        let quic_pkt = build_ipv4_udp(client_ip, 56201, peer_ip, 443, &[0xc0u8; 1200]);
+        let quic_udp = inspect_inbound_udp(&quic_pkt).unwrap();
+        assert_eq!(
+            should_drop_inbound_quic(
+                &quic_pkt,
+                &quic_udp,
+                quic_src,
+                dst_443,
+                &ctx,
+                &rdns,
+                &stats,
+                &events,
+                &stun_flows,
+                &app_bypass_cache,
+                None,
+                false,
+            ),
+            QuicCheckOutcome::Drop
+        );
+        assert_eq!(stats.quic_blocked.load(Ordering::Relaxed), 1);
+
+        // 4. Inbound server DTLS reply on UDP/443 also authenticates/refreshes the flow.
+        let src_inbound = SocketAddr::new(IpAddr::V4(client_ip), 56202);
+        stun_flows.refresh_on_inbound_reply(src_inbound, dst_443, &dtls_hello, 500);
+        assert!(stun_flows.is_authenticated_and_refresh((src_inbound, dst_443), 560));
+    }
+
+    #[tokio::test]
+    async fn priority_tun_writer_drains_udp_replies_ahead_of_bulk_tcp() {
+        let (udp_tx, udp_rx) = mpsc::channel::<Vec<u8>>(16);
+        let (tcp_tx, tcp_rx) = mpsc::channel::<Vec<u8>>(32);
+        let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(1);
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+
+        for i in 0u8..16 {
+            tcp_tx.send(vec![0x45, 6, i]).await.unwrap();
+        }
+        for i in 0u8..4 {
+            udp_tx.send(vec![0x45, 17, i]).await.unwrap();
+        }
+        drop(udp_tx);
+        drop(tcp_tx);
+
+        let writer = tokio::spawn(async move {
+            run_priority_tun_writer(udp_rx, tcp_rx, out_tx, &mut stop_rx).await
+        });
+
+        let mut received = Vec::new();
+        while let Some(pkt) = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
+            .await
+            .unwrap()
+        {
+            received.push(pkt);
+        }
+
+        assert_eq!(received.len(), 20);
+        assert!(
+            received[..4].iter().all(|pkt| pkt[1] == 17),
+            "all queued priority UDP replies must drain ahead of bulk TCP segments: {received:?}"
+        );
+        assert!(received[4..].iter().all(|pkt| pkt[1] == 6));
+
+        let _ = stop_tx.send(true);
+        assert!(!writer.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn dropped_packets_counted_on_bind_failure_oversized_reply_and_saturated_dns() {
+        // 1. Socket bind failure increments TunStats::dropped_packets.
+        #[derive(Debug)]
+        struct AlwaysFailBinder;
+
+        impl vdpi_core::binder::OutboundBinder for AlwaysFailBinder {
+            fn bind_socket(
+                &self,
+                _sock: socket2::SockRef<'_>,
+                _is_ipv4: bool,
+            ) -> std::io::Result<()> {
+                Err(std::io::Error::from(ErrorKind::PermissionDenied))
+            }
+        }
+
+        let fail_cfg = TunnelConfig {
+            enable_doh: false,
+            block_quic: true,
+            ..Default::default()
+        };
+        let fail_ctx = EngineContext::new_with_binder(
+            fail_cfg.into_runtime_config(),
+            Some(Arc::new(AlwaysFailBinder)),
+        )
+        .unwrap();
+        let bind_stats = Arc::new(TunStats::default());
+        let (bind_out_tx, _bind_out_rx) = mpsc::channel(8);
+        let (_bind_stop_tx, bind_stop_rx) = watch::channel(false);
+        forward_udp_cone_nat_slow(
+            b"bind-fail".to_vec(),
+            None,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 50200),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50201),
+            None,
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(SharedStunFlowCache::new()),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(IcmpRateLimiter::new(MAX_QUIC_ICMP_PER_SEC)),
+            bind_out_tx,
+            fail_ctx,
+            Arc::clone(&bind_stats),
+            bind_stop_rx,
+            1500,
+            16,
+            0,
+        )
+        .await;
+        assert_eq!(bind_stats.dropped_packets.load(Ordering::Relaxed), 1);
+
+        // 2. Saturated DNS slots (max_dns_inflight = 0) and oversized inbound UDP reply (> MTU).
+        let cfg = TunnelConfig {
+            enable_doh: false,
+            block_quic: true,
+            ..Default::default()
+        };
+        let ctx = EngineContext::new(cfg.into_runtime_config()).unwrap();
+        let tun_stats = Arc::new(TunStats::default());
+        let events = Arc::new(EventRing::new());
+        let profile = TunProfile {
+            max_dns_inflight: 0,
+            ..TunProfile::STANDARD
+        };
+        let (in_tx, in_rx) = mpsc::channel(32);
+        let (out_tx, _out_rx) = mpsc::channel(32);
+        let (stop_tx, stop_rx) = watch::channel(false);
+
+        let pipeline = tokio::spawn(run_tun_pipeline(
+            in_rx,
+            out_tx,
+            ctx,
+            Arc::clone(&tun_stats),
+            Arc::clone(&events),
+            MIN_MTU,
+            profile,
+            stop_rx,
+        ));
+
+        let client_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let dns_q = encode_dns_query("localhost", 1).unwrap();
+        in_tx
+            .send(build_ipv4_udp(
+                client_ip,
+                53200,
+                Ipv4Addr::new(10, 0, 0, 2),
+                53,
+                &dns_q,
+            ))
+            .await
+            .unwrap();
+
+        let dns_deadline = Instant::now() + Duration::from_secs(2);
+        while tun_stats.dropped_packets.load(Ordering::Relaxed) < 1 {
+            assert!(Instant::now() < dns_deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(tun_stats.dropped_packets.load(Ordering::Relaxed), 1);
+
+        // Echo server responds with 1400 bytes > max_udp_payload_for_mtu(MIN_MTU=1280, true) = 1252.
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo.local_addr().unwrap().port();
+        let echo_task = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            let (_, peer) = echo.recv_from(&mut buf).await.unwrap();
+            let oversized = vec![0xabu8; 1400];
+            echo.send_to(&oversized, peer).await.unwrap();
+        });
+        in_tx
+            .send(build_ipv4_udp(
+                client_ip,
+                55200,
+                Ipv4Addr::LOCALHOST,
+                echo_port,
+                b"trigger-oversized",
+            ))
+            .await
+            .unwrap();
+        echo_task.await.unwrap();
+
+        let oversize_deadline = Instant::now() + Duration::from_secs(2);
+        while tun_stats.dropped_packets.load(Ordering::Relaxed) < 2 {
+            assert!(Instant::now() < oversize_deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(tun_stats.dropped_packets.load(Ordering::Relaxed), 2);
+
+        stop_tx.send(true).unwrap();
+        pipeline.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn reverse_dns_cache_enforces_300s_ttl_and_clears_cleanly() {
+        let cfg = TunnelConfig {
+            enable_doh: false,
+            bypass_domains: vec!["cdn.bypass.example".to_string()],
+            ..Default::default()
+        };
+        let ctx = EngineContext::new(cfg.into_runtime_config()).unwrap();
+        let cache = ReverseDnsCache::new(64);
+        let shared_cdn_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 42));
+
+        cache.insert_at(shared_cdn_ip, "cdn.bypass.example".to_string(), 1000);
+        assert_eq!(
+            cache.lookup_at(shared_cdn_ip, 1000 + REVERSE_DNS_TTL_SECS - 1),
+            Some("cdn.bypass.example".to_string())
+        );
+        assert!(
+            !cache.should_desync_dst_at(shared_cdn_ip, &ctx, 1000 + REVERSE_DNS_TTL_SECS - 1),
+            "fresh reverse-DNS entry must honor domain bypass"
+        );
+
+        // At 300s TTL expiry, stale shared-CDN entry expires cleanly.
+        assert_eq!(
+            cache.lookup_at(shared_cdn_ip, 1000 + REVERSE_DNS_TTL_SECS),
+            None
+        );
+        assert!(
+            cache.should_desync_dst_at(shared_cdn_ip, &ctx, 1000 + REVERSE_DNS_TTL_SECS),
+            "expired reverse-DNS entry must not suppress desync indefinitely"
+        );
+
+        // Explicit clear() (invoked on sleep/wake jump and route change) empties cache immediately.
+        cache.insert_at(shared_cdn_ip, "cdn.bypass.example".to_string(), 2000);
+        assert!(cache.lookup_at(shared_cdn_ip, 2005).is_some());
+        cache.clear();
+        assert_eq!(cache.lookup_at(shared_cdn_ip, 2005), None);
+    }
+
+    #[test]
+    fn ipv6_udp_send_enetunreach_flips_flag_and_emits_icmpv6_no_route() {
+        let src_v6: std::net::Ipv6Addr = "fd00:7664:7069::1".parse().unwrap();
+        let dst_v6: std::net::Ipv6Addr = "2606:4700:4700::1111".parse().unwrap();
+        let gateway_v6: std::net::Ipv6Addr = "fd00:7664:7069::2".parse().unwrap();
+        let dst_addr = SocketAddr::new(IpAddr::V6(dst_v6), 443);
+        let invoking = build_udp_packet(
+            SocketAddr::new(IpAddr::V6(src_v6), 52100),
+            dst_addr,
+            b"v6-udp-probe",
+        )
+        .unwrap();
+
+        let ipv6_unavailable = AtomicBool::new(false);
+        let limiter = IcmpRateLimiter::new(MAX_QUIC_ICMP_PER_SEC);
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+
+        // Single-peer HostUnreachable must NOT flip ipv6_unavailable or emit ICMPv6 No Route.
+        maybe_handle_ipv6_udp_unreachable(
+            dst_addr,
+            &std::io::Error::from(ErrorKind::HostUnreachable),
+            Some(&invoking),
+            &ipv6_unavailable,
+            &limiter,
+            &out_tx,
+        );
+        assert!(!ipv6_unavailable.load(Ordering::Relaxed));
+        assert!(out_rx.try_recv().is_err());
+
+        // ENETUNREACH / NetworkUnreachable flips ipv6_unavailable and emits ICMPv6 Type 1 Code 0.
+        maybe_handle_ipv6_udp_unreachable(
+            dst_addr,
+            &std::io::Error::from(ErrorKind::NetworkUnreachable),
+            Some(&invoking),
+            &ipv6_unavailable,
+            &limiter,
+            &out_tx,
+        );
+        assert!(ipv6_unavailable.load(Ordering::Relaxed));
+        let icmp = out_rx
+            .try_recv()
+            .expect("expected ICMPv6 No Route after IPv6 ENETUNREACH");
+        assert_eq!(icmp[0] >> 4, 6);
+        assert_eq!(icmp[6], 58); // ICMPv6
+        assert_eq!(&icmp[8..24], gateway_v6.octets().as_slice());
+        assert_eq!(&icmp[24..40], src_v6.octets().as_slice());
+        assert_eq!(icmp[40], 1); // Destination Unreachable
+        assert_eq!(icmp[41], 0); // No Route
+    }
+
+    #[test]
+    fn udp_byte_batcher_batches_until_64k_or_interval_and_flushes_on_drop() {
+        let cfg = TunnelConfig {
+            enable_doh: false,
+            ..Default::default()
+        };
+        let ctx = EngineContext::new(cfg.into_runtime_config()).unwrap();
+        let telemetry = Arc::clone(&ctx.telemetry);
+
+        {
+            let mut batcher = UdpByteBatcher::new_at(Arc::clone(&telemetry), 10);
+
+            // First datagram flushes immediately so single-packet flows are visible at once.
+            batcher.record_tx(100, 10);
+            assert_eq!(telemetry.bytes_tx.load(Ordering::Relaxed), 100);
+            assert!(!batcher.has_pending());
+
+            // Subsequent sub-64 KiB datagrams in the same second stay buffered (zero atomics).
+            for _ in 0..60 {
+                batcher.record_tx(1000, 10);
+            }
+            assert_eq!(telemetry.bytes_tx.load(Ordering::Relaxed), 100);
+            assert!(batcher.has_pending());
+
+            // Crossing the 64 KiB threshold flushes the entire batch in one fetch_add.
+            batcher.record_tx(6000, 10);
+            assert_eq!(telemetry.bytes_tx.load(Ordering::Relaxed), 66_100);
+            assert!(!batcher.has_pending());
+
+            // Sub-threshold RX buffers within the same second, then flushes on interval advance.
+            batcher.record_rx(500, 10);
+            assert_eq!(telemetry.bytes_rx.load(Ordering::Relaxed), 0);
+            batcher.record_rx(200, 10 + UDP_TELEMETRY_FLUSH_INTERVAL_SECS);
+            assert_eq!(telemetry.bytes_rx.load(Ordering::Relaxed), 700);
+
+            // Remaining pending bytes flush cleanly on Drop.
+            batcher.record_rx(300, 10 + UDP_TELEMETRY_FLUSH_INTERVAL_SECS);
+            assert_eq!(telemetry.bytes_rx.load(Ordering::Relaxed), 700);
+        }
+        assert_eq!(telemetry.bytes_rx.load(Ordering::Relaxed), 1000);
+    }
+
+    #[tokio::test]
+    async fn include_mode_inflight_waiter_fallback_uses_split_tunnel_unknown_verdict() {
+        use vdpi_core::config::{SplitTunnelConfig, SplitTunnelMode};
+
+        let include_cfg = {
+            let mut rt = TunnelConfig {
+                enable_doh: false,
+                block_quic: true,
+                ..Default::default()
+            }
+            .into_runtime_config();
+            rt.split_tunnel = SplitTunnelConfig {
+                mode: SplitTunnelMode::Include,
+                apps: vec!["chrome.exe".to_string()],
+            };
+            rt
+        };
+        let include_ctx = EngineContext::new(include_cfg).unwrap();
+        assert!(include_ctx.config.split_tunnel.should_bypass_app(None));
+
+        let exclude_cfg = {
+            let mut rt = TunnelConfig {
+                enable_doh: false,
+                block_quic: true,
+                ..Default::default()
+            }
+            .into_runtime_config();
+            rt.split_tunnel = SplitTunnelConfig {
+                mode: SplitTunnelMode::Exclude,
+                apps: vec!["discord.exe".to_string()],
+            };
+            rt
+        };
+        let exclude_ctx = EngineContext::new(exclude_cfg).unwrap();
+        assert!(!exclude_ctx.config.split_tunnel.should_bypass_app(None));
+
+        let cache = Arc::new(UdpAppBypassCache::new());
         let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let t0 = Instant::now();
 
-        // Repeated UDP/443 QUIC packets on the same flow hit cache without re-invoking OS lookup.
-        for _ in 0..64 {
-            assert!(cache.should_bypass(ip, 60000, 100, &hook));
-            assert!(!cache.should_bypass(ip, 60001, 100, &hook));
+        let tx = match cache.begin_lookup(ip, 61000, t0) {
+            UdpBypassLookupState::Start(tx) => tx,
+            _ => panic!("expected Start"),
+        };
+        let mut rx = match cache.begin_lookup(ip, 61000, t0) {
+            UdpBypassLookupState::InFlight(rx) => rx,
+            _ => panic!("expected InFlight"),
+        };
+        let guard = InFlightBypassGuard::new(Arc::clone(&cache), ip, 61000, tx);
+        drop(guard);
+
+        let wait_res = rx.wait_for(|v| v.is_some()).await.ok().and_then(|v| *v);
+        assert_eq!(wait_res, None);
+
+        let include_fallback = cache
+            .peek(ip, 61000, Instant::now())
+            .unwrap_or_else(|| include_ctx.config.split_tunnel.should_bypass_app(None));
+        assert!(
+            include_fallback,
+            "Include-mode InFlight waiter fallback must bypass unknown apps"
+        );
+
+        let exclude_fallback = cache
+            .peek(ip, 61000, Instant::now())
+            .unwrap_or_else(|| exclude_ctx.config.split_tunnel.should_bypass_app(None));
+        assert!(
+            !exclude_fallback,
+            "Exclude-mode InFlight waiter fallback must keep desync/block for unknown apps"
+        );
+    }
+
+    #[tokio::test]
+    async fn priority_tun_writer_caps_bulk_tcp_queue_at_64_for_low_latency_udp() {
+        const OUTBOUND_CAP: usize = 64;
+        const TCP_TOTAL: usize = 128;
+        const UDP_TOTAL: usize = 3;
+
+        let (udp_tx, udp_rx) = mpsc::channel::<Vec<u8>>(16);
+        let (tcp_tx, tcp_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_CAP);
+        let out_tx_probe = out_tx.clone();
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+
+        for i in 0u8..(TCP_TOTAL as u8) {
+            tcp_tx.send(vec![0x45, 6, i]).await.unwrap();
         }
-        assert_eq!(calls.load(Ordering::Relaxed), 2);
 
-        // Within TTL (100 + 4 < 105): still cached.
-        assert!(cache.should_bypass(ip, 60000, 104, &hook));
-        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        let writer = tokio::spawn(async move {
+            run_priority_tun_writer(udp_rx, tcp_rx, out_tx, &mut stop_rx).await
+        });
 
-        // At TTL expiry (100 + 5 == 105): refreshes once.
-        assert!(cache.should_bypass(ip, 60000, 100 + UDP_APP_BYPASS_CACHE_TTL_SECS, &hook));
-        assert_eq!(calls.load(Ordering::Relaxed), 3);
-
-        // Capacity stays strictly bounded at UDP_APP_BYPASS_CACHE_MAX_ENTRIES.
-        for idx in 0..(UDP_APP_BYPASS_CACHE_MAX_ENTRIES + 32) {
-            let _ = cache.should_bypass(ip, 10_000 + idx as u16, 200 + (idx % 3) as u64, &hook);
+        // Wait for the writer to saturate the bounded outbound channel via event-driven reserve().
+        let cap_deadline = Instant::now() + Duration::from_secs(2);
+        while out_tx_probe.capacity() > 0
+            || tcp_tx.max_capacity().saturating_sub(tcp_tx.capacity()) > TCP_TOTAL - OUTBOUND_CAP
+        {
+            assert!(Instant::now() < cap_deadline);
+            tokio::task::yield_now().await;
         }
-        assert_eq!(cache.entries.len(), UDP_APP_BYPASS_CACHE_MAX_ENTRIES);
+        assert_eq!(out_tx_probe.capacity(), 0);
+        assert_eq!(
+            tcp_tx.max_capacity().saturating_sub(tcp_tx.capacity()),
+            TCP_TOTAL - OUTBOUND_CAP,
+            "bulk TCP must block on bounded outbound_tx capacity ({OUTBOUND_CAP}) via reserve()"
+        );
+        drop(tcp_tx);
+
+        // Enqueue high-priority UDP replies while outbound_tx is full and parked on reserve().
+        for i in 0u8..(UDP_TOTAL as u8) {
+            udp_tx.send(vec![0x45, 17, i]).await.unwrap();
+        }
+        drop(udp_tx);
+
+        // Free one downstream slot and verify immediate zero-sleep event-driven wakeup.
+        let drain_start = Instant::now();
+        let first = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first[1], 6);
+
+        let wakeup_start = Instant::now();
+        let wakeup_deadline = wakeup_start + Duration::from_secs(2);
+        while out_tx_probe.capacity() > 0 {
+            assert!(Instant::now() < wakeup_deadline);
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            wakeup_start.elapsed() < Duration::from_millis(200),
+            "reserve() must wake immediately when a downstream slot opens without timer sleep"
+        );
+        drop(out_tx_probe);
+
+        let mut received = Vec::with_capacity(TCP_TOTAL + UDP_TOTAL);
+        received.push(first);
+        while let Some(pkt) = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
+            .await
+            .unwrap()
+        {
+            received.push(pkt);
+        }
+        let drain_elapsed = drain_start.elapsed();
+
+        assert_eq!(received.len(), TCP_TOTAL + UDP_TOTAL);
+        assert!(received[..OUTBOUND_CAP].iter().all(|pkt| pkt[1] == 6));
+        assert!(
+            received[OUTBOUND_CAP..OUTBOUND_CAP + UDP_TOTAL]
+                .iter()
+                .all(|pkt| pkt[1] == 17),
+            "UDP replies arriving during saturated TCP must preempt remaining TCP backlog"
+        );
+        assert!(received[OUTBOUND_CAP + UDP_TOTAL..]
+            .iter()
+            .all(|pkt| pkt[1] == 6));
+        assert!(
+            drain_elapsed < Duration::from_millis(500),
+            "event-driven reserve() backpressure must not stall on timer-wheel sleeps (took {drain_elapsed:?})"
+        );
+
+        let _ = stop_tx.send(true);
+        assert!(!writer.await.unwrap());
+    }
+
+    #[test]
+    fn touch_udp_nat_activity_bumps_lru_seq_at_most_once_per_second() {
+        let last_active = AtomicU64::new(100);
+        let last_seq = AtomicU64::new(1);
+        let lru_seq = AtomicU64::new(1);
+
+        for _ in 0..1000 {
+            touch_udp_nat_activity(&last_active, &last_seq, &lru_seq, 100);
+        }
+        assert_eq!(last_active.load(Ordering::Relaxed), 100);
+        assert_eq!(last_seq.load(Ordering::Relaxed), 1);
+        assert_eq!(lru_seq.load(Ordering::Relaxed), 1);
+
+        for _ in 0..100 {
+            touch_udp_nat_activity(&last_active, &last_seq, &lru_seq, 101);
+        }
+        assert_eq!(last_active.load(Ordering::Relaxed), 101);
+        assert_eq!(last_seq.load(Ordering::Relaxed), 2);
+        assert_eq!(lru_seq.load(Ordering::Relaxed), 2);
+
+        touch_udp_nat_activity(&last_active, &last_seq, &lru_seq, 102);
+        assert_eq!(last_active.load(Ordering::Relaxed), 102);
+        assert_eq!(last_seq.load(Ordering::Relaxed), 3);
+        assert_eq!(lru_seq.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn passthrough_counting_stream_poll_flush_batches_until_threshold_and_flushes_on_shutdown_and_drop(
+    ) {
+        let cfg = TunnelConfig {
+            enable_doh: false,
+            ..Default::default()
+        };
+        let ctx = EngineContext::new(cfg.into_runtime_config()).unwrap();
+        let telemetry = Arc::clone(&ctx.telemetry);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sink_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut drain = Vec::new();
+                let _ = sock.read_to_end(&mut drain).await;
+            }
+        });
+
+        let active = AtomicBool::new(false);
+
+        {
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut counted = PassthroughCountingStream::new(stream, &telemetry, &active, 1024);
+
+            counted.write_all(&[0x41u8; 100]).await.unwrap();
+            counted.flush().await.unwrap();
+            assert_eq!(
+                telemetry.bytes_tx.load(Ordering::Relaxed),
+                0,
+                "poll_flush must not flush sub-threshold pending_tx"
+            );
+
+            counted.write_all(&[0x42u8; 1000]).await.unwrap();
+            assert_eq!(telemetry.bytes_tx.load(Ordering::Relaxed), 1100);
+
+            counted.write_all(&[0x43u8; 50]).await.unwrap();
+            counted.flush().await.unwrap();
+            assert_eq!(telemetry.bytes_tx.load(Ordering::Relaxed), 1100);
+
+            counted.shutdown().await.unwrap();
+            assert_eq!(telemetry.bytes_tx.load(Ordering::Relaxed), 1150);
+        }
+
+        {
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut counted = PassthroughCountingStream::new(stream, &telemetry, &active, 1024);
+            counted.write_all(&[0x44u8; 75]).await.unwrap();
+            counted.flush().await.unwrap();
+            assert_eq!(telemetry.bytes_tx.load(Ordering::Relaxed), 1150);
+        }
+        assert_eq!(telemetry.bytes_tx.load(Ordering::Relaxed), 1225);
+
+        sink_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn priority_tun_writer_fair_udp_quota_prevents_tcp_starvation_and_preempts_bulk_tcp() {
+        // 1. Continuous UDP flood must yield at least 1 TCP packet every MAX_CONSECUTIVE_UDP_PACKETS
+        //    so TCP ACKs can never be starved by unblocked QUIC / uTP traffic.
+        const UDP_FLOOD: usize = MAX_CONSECUTIVE_UDP_PACKETS * 4;
+        const TCP_ACKS: usize = 8;
+
+        let (udp_tx, udp_rx) = mpsc::channel::<Vec<u8>>(UDP_FLOOD);
+        let (tcp_tx, tcp_rx) = mpsc::channel::<Vec<u8>>(TCP_ACKS);
+        let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(1);
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+
+        for i in 0..UDP_FLOOD {
+            udp_tx.send(vec![0x45, 17, i as u8]).await.unwrap();
+        }
+        for i in 0..TCP_ACKS {
+            tcp_tx.send(vec![0x45, 6, i as u8]).await.unwrap();
+        }
+        drop(udp_tx);
+        drop(tcp_tx);
+
+        let writer = tokio::spawn(async move {
+            run_priority_tun_writer(udp_rx, tcp_rx, out_tx, &mut stop_rx).await
+        });
+
+        let mut received = Vec::with_capacity(UDP_FLOOD + TCP_ACKS);
+        while let Some(pkt) = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
+            .await
+            .unwrap()
+        {
+            received.push(pkt);
+        }
+
+        assert_eq!(received.len(), UDP_FLOOD + TCP_ACKS);
+
+        let mut max_udp_run = 0usize;
+        let mut current_udp_run = 0usize;
+        let mut udp_seq = Vec::with_capacity(UDP_FLOOD);
+        let mut tcp_seq = Vec::with_capacity(TCP_ACKS);
+        let mut tcp_seen_before_udp_done = 0usize;
+
+        for pkt in &received {
+            if pkt[1] == 17 {
+                current_udp_run += 1;
+                max_udp_run = max_udp_run.max(current_udp_run);
+                udp_seq.push(pkt[2]);
+            } else {
+                assert_eq!(pkt[1], 6);
+                current_udp_run = 0;
+                if udp_seq.len() < UDP_FLOOD {
+                    tcp_seen_before_udp_done += 1;
+                }
+                tcp_seq.push(pkt[2]);
+            }
+        }
+
+        assert_eq!(
+            max_udp_run, MAX_CONSECUTIVE_UDP_PACKETS,
+            "continuous UDP flood must yield to TCP after exactly {MAX_CONSECUTIVE_UDP_PACKETS} packets"
+        );
+        assert_eq!(
+            tcp_seen_before_udp_done, 3,
+            "TCP ACKs must make steady progress during a 64-packet UDP flood"
+        );
+        assert_eq!(
+            received[MAX_CONSECUTIVE_UDP_PACKETS][1], 6,
+            "first TCP ACK must be yielded right after the first {MAX_CONSECUTIVE_UDP_PACKETS} UDP packets"
+        );
+        assert_eq!(udp_seq, (0..UDP_FLOOD as u8).collect::<Vec<_>>());
+        assert_eq!(tcp_seq, (0..TCP_ACKS as u8).collect::<Vec<_>>());
+
+        let _ = stop_tx.send(true);
+        assert!(!writer.await.unwrap());
+
+        // 2. Voice/game UDP bursts arriving under bulk TCP load must still preempt queued TCP immediately.
+        const OUTBOUND_CAP: usize = 4;
+        const BULK_TCP: usize = 32;
+        const VOICE_UDP: usize = 4;
+
+        let (udp_tx, udp_rx) = mpsc::channel::<Vec<u8>>(16);
+        let (tcp_tx, tcp_rx) = mpsc::channel::<Vec<u8>>(BULK_TCP);
+        let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_CAP);
+        let out_tx_probe = out_tx.clone();
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+
+        for i in 0..BULK_TCP {
+            tcp_tx.send(vec![0x45, 6, i as u8]).await.unwrap();
+        }
+
+        let writer = tokio::spawn(async move {
+            run_priority_tun_writer(udp_rx, tcp_rx, out_tx, &mut stop_rx).await
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while out_tx_probe.capacity() > 0
+            || tcp_tx.max_capacity().saturating_sub(tcp_tx.capacity()) > BULK_TCP - OUTBOUND_CAP
+        {
+            assert!(Instant::now() < deadline);
+            tokio::task::yield_now().await;
+        }
+        drop(out_tx_probe);
+        drop(tcp_tx);
+
+        for i in 0..VOICE_UDP {
+            udp_tx.send(vec![0x45, 17, i as u8]).await.unwrap();
+        }
+        drop(udp_tx);
+
+        let mut preempted = Vec::with_capacity(BULK_TCP + VOICE_UDP);
+        while let Some(pkt) = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
+            .await
+            .unwrap()
+        {
+            preempted.push(pkt);
+        }
+
+        assert_eq!(preempted.len(), BULK_TCP + VOICE_UDP);
+        assert!(preempted[..OUTBOUND_CAP].iter().all(|pkt| pkt[1] == 6));
+        assert!(
+            preempted[OUTBOUND_CAP..OUTBOUND_CAP + VOICE_UDP]
+                .iter()
+                .all(|pkt| pkt[1] == 17),
+            "voice/game UDP burst must immediately preempt remaining bulk TCP backlog: {preempted:?}"
+        );
+        assert!(preempted[OUTBOUND_CAP + VOICE_UDP..]
+            .iter()
+            .all(|pkt| pkt[1] == 6));
+
+        let _ = stop_tx.send(true);
+        assert!(!writer.await.unwrap());
     }
 }

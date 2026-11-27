@@ -86,7 +86,7 @@ public final class TunnelManager: ObservableObject {
                 return trimmed
             }
         }
-        return "0.5.8"
+        return "0.6.0"
     }
 
     private static let providerConfigSettingsKey = "vdpiSettingsJSON"
@@ -94,7 +94,7 @@ public final class TunnelManager: ObservableObject {
     private static let updateCheckCooldownSeconds: TimeInterval = 6 * 60 * 60
     private static let lastUpdateCheckTimestampKey = "vdpi_last_update_check_ts_v1"
     private static let dismissedUpdateVersionKey = "vdpi_dismissed_update_version_v1"
-    private static let validSettingsKeys: Set<String> = [
+    private nonisolated static let validSettingsKeys: Set<String> = [
         "desyncMode",
         "chunkSize",
         "dnsAddr",
@@ -825,6 +825,18 @@ public final class TunnelManager: ObservableObject {
     }
 
     public func importSettingsJSON(_ rawJSON: String) throws {
+        let normalized = try Self.parseImportedSettings(rawJSON)
+
+        if normalized != settings {
+            updateSettings { $0 = normalized }
+        } else {
+            VdpiAppGroup.saveSettings(normalized)
+            recomputePendingReconnect(revealPopup: false)
+        }
+        showToast("Imported settings")
+    }
+
+    nonisolated static func parseImportedSettings(_ rawJSON: String) throws -> VdpiSettings {
         let trimmed = rawJSON.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             throw SettingsImportError.emptyPayload
@@ -871,11 +883,15 @@ public final class TunnelManager: ObservableObject {
         }
         normalizedBypass.sort()
 
-        let normalized = VdpiSettings(
+        let normalizedEnableDoh = normalizedDns.lowercased().hasPrefix("https://")
+            ? true
+            : decoded.enableDoh
+
+        return VdpiSettings(
             desyncMode: decoded.desyncMode,
             chunkSize: decoded.clampedChunkSize,
             dnsAddr: normalizedDns,
-            enableDoh: decoded.enableDoh,
+            enableDoh: normalizedEnableDoh,
             ipv4Only: decoded.ipv4Only,
             blockQuic: decoded.blockQuic,
             mtu: decoded.clampedMtu,
@@ -883,24 +899,21 @@ public final class TunnelManager: ObservableObject {
             onDemandEnabled: decoded.onDemandEnabled,
             theme: decoded.theme
         )
-
-        if normalized != settings {
-            updateSettings { $0 = normalized }
-        } else {
-            VdpiAppGroup.saveSettings(normalized)
-            recomputePendingReconnect(revealPopup: false)
-        }
-        showToast("Imported settings")
     }
 
     public func formattedDiagnosticsReport() -> String {
+        let effectiveDoh = settings.enableDoh
+            || settings.dnsAddr
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+                .hasPrefix("https://")
         var lines: [String] = [
             "vdpi Diagnostics Report",
             "App Version: \(appVersion)",
             "Engine Version: \(engineVersion)",
             "Status: \(phase.label)",
             "Mode: \(settings.desyncMode.label) (\(settings.clampedChunkSize) B)",
-            "DNS: \(Self.redactedDnsSummary(settings.dnsAddr)) (DoH: \(settings.enableDoh ? "On" : "Off"))",
+            "DNS: \(Self.redactedDnsSummary(settings.dnsAddr)) (DoH: \(effectiveDoh ? "On" : "Off"))",
             "QUIC Blocking: \(settings.blockQuic ? "On" : "Off")",
             "IPv4 Only: \(settings.ipv4Only ? "On" : "Off")",
             "MTU: \(settings.clampedMtu)",
@@ -911,7 +924,7 @@ public final class TunnelManager: ObservableObject {
         if doctorState.running {
             lines.append("Diagnostics Probes: Running...")
         } else if let error = doctorState.error, !error.isEmpty {
-            lines.append("Diagnostics Probes: Error - \(error)")
+            lines.append("Diagnostics Probes: Error - \(Self.redactHttpsUrls(in: error))")
         } else if let report = doctorState.report, !report.checks.isEmpty {
             let passedCount = report.checks.filter(\.passed).count
             lines.append("Diagnostics Probes (\(passedCount)/\(report.checks.count) passed):")
@@ -922,7 +935,7 @@ public final class TunnelManager: ObservableObject {
                     entry += " · \(Self.redactedDnsSummary(check.target))"
                 }
                 if !check.detail.isEmpty {
-                    entry += " - \(check.detail)"
+                    entry += " - \(Self.redactHttpsUrls(in: check.detail))"
                 }
                 lines.append(entry)
             }
@@ -1328,34 +1341,97 @@ public final class TunnelManager: ObservableObject {
         }
     }
 
-    private static func redactedDnsSummary(_ raw: String) -> String {
+    nonisolated static func redactedDnsSummary(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "1.1.1.1" }
         if let arrowRange = trimmed.range(of: " -> ") {
             let leading = String(trimmed[..<arrowRange.lowerBound])
             let trailing = String(trimmed[arrowRange.upperBound...])
             let redactedLeading = redactSingleDnsEndpoint(leading)
-            return "\(redactedLeading) -> \(trailing)"
+            let trimmedTrailing = trailing.trimmingCharacters(in: .whitespacesAndNewlines)
+            let redactedTrailing = trimmedTrailing.lowercased().hasPrefix("https://")
+                ? redactSingleDnsEndpoint(trimmedTrailing)
+                : trailing
+            return "\(redactedLeading) -> \(redactedTrailing)"
         }
         return redactSingleDnsEndpoint(trimmed)
     }
 
-    private static func redactSingleDnsEndpoint(_ raw: String) -> String {
+    nonisolated static func redactHttpsUrls(in text: String) -> String {
+        guard text.range(of: "https://", options: .caseInsensitive) != nil,
+              let regex = try? NSRegularExpression(
+                  pattern: #"https://[^\s"'<>]+"#,
+                  options: [.caseInsensitive]
+              )
+        else {
+            return text
+        }
+        let mutable = NSMutableString(string: text)
+        let fullRange = NSRange(location: 0, length: mutable.length)
+        let matches = regex.matches(in: text, options: [], range: fullRange)
+        guard !matches.isEmpty else { return text }
+
+        for match in matches.reversed() {
+            let rawToken = mutable.substring(with: match.range)
+            var urlPart = rawToken
+            var trailing = ""
+            while let last = urlPart.last {
+                if last == "." || last == "," || last == ";" || last == ":" {
+                    trailing.insert(last, at: trailing.startIndex)
+                    urlPart.removeLast()
+                } else if last == "]" {
+                    let openCount = urlPart.filter { $0 == "[" }.count
+                    let closeCount = urlPart.filter { $0 == "]" }.count
+                    if closeCount > openCount {
+                        trailing.insert(last, at: trailing.startIndex)
+                        urlPart.removeLast()
+                    } else {
+                        break
+                    }
+                } else if last == ")" {
+                    let openCount = urlPart.filter { $0 == "(" }.count
+                    let closeCount = urlPart.filter { $0 == ")" }.count
+                    if closeCount > openCount {
+                        trailing.insert(last, at: trailing.startIndex)
+                        urlPart.removeLast()
+                    } else {
+                        break
+                    }
+                } else {
+                    break
+                }
+            }
+            let replacement = redactSingleDnsEndpoint(urlPart) + trailing
+            mutable.replaceCharacters(in: match.range, with: replacement)
+        }
+        return mutable as String
+    }
+
+    private nonisolated static func redactSingleDnsEndpoint(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.lowercased().hasPrefix("https://"),
-              let components = URLComponents(string: trimmed),
+        guard !trimmed.isEmpty else { return "1.1.1.1" }
+        guard trimmed.lowercased().hasPrefix("https://") else {
+            return trimmed
+        }
+        guard let components = URLComponents(string: trimmed),
               let host = components.host,
               !host.isEmpty
         else {
-            return trimmed.isEmpty ? "1.1.1.1" : trimmed
+            return "Custom DoH"
+        }
+        let formattedHost: String
+        if host.contains(":") && !(host.hasPrefix("[") && host.hasSuffix("]")) {
+            formattedHost = "[\(host)]"
+        } else {
+            formattedHost = host
         }
         let portSuffix = components.port.map { ":\($0)" } ?? ""
         let path = components.path
         let hasSensitiveQueryOrFragment = (components.query != nil) || (components.fragment != nil)
         if !hasSensitiveQueryOrFragment && (path.isEmpty || path == "/" || path == "/dns-query") {
-            return "https://\(host)\(portSuffix)\(path)"
+            return "https://\(formattedHost)\(portSuffix)\(path)"
         }
-        return "https://\(host)\(portSuffix)/[redacted]"
+        return "https://\(formattedHost)\(portSuffix)/[redacted]"
     }
 
     private static func timeoutSeconds(for message: ProviderMessage) -> TimeInterval {

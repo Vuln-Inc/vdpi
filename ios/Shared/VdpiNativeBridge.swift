@@ -104,14 +104,19 @@ public enum VdpiNativeBridge {
                 offsetBy: pushBatchChunkSize,
                 limitedBy: packets.endIndex
             ) ?? packets.endIndex
+            let chunkCount = packets.distance(from: chunkStart, to: chunkEnd)
             ptrs.removeAll(keepingCapacity: true)
             lens.removeAll(keepingCapacity: true)
-            totalAccepted += pushChunk(
+            let accepted = pushChunk(
                 packets[chunkStart..<chunkEnd],
                 cursor: chunkStart,
                 ptrs: &ptrs,
                 lens: &lens
             )
+            totalAccepted += accepted
+            if accepted < chunkCount {
+                break
+            }
             chunkStart = chunkEnd
         }
         return totalAccepted
@@ -198,6 +203,6 @@ public enum VdpiNativeBridge {
         if let native = takeOwnedString(vdpi_ios_version()), !native.isEmpty {
             return native
         }
-        return (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "0.5.8"
+        return (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "0.6.0"
     }
 }

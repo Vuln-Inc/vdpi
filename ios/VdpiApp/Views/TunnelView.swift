@@ -306,7 +306,7 @@ struct TunnelView: View {
                 .fixedSize(horizontal: false, vertical: true)
         } else if isConnected {
             let t = manager.telemetry
-            let resolver = t.dohEnabled ? "\(t.dnsAddr) DoH" : t.dnsAddr
+            let resolver = Self.displayDnsLabel(t.dnsAddr, dohEnabled: t.dohEnabled, parenthesizedDoh: false)
             Text("\(resolver) · \(VdpiFormatters.formatUptime(t.uptimeSecs))")
                 .font(.subheadline)
                 .monospacedDigit()
@@ -469,7 +469,7 @@ struct TunnelView: View {
 
     private var connectionSection: some View {
         let t = manager.telemetry
-        let dnsValue = t.dohEnabled ? "\(t.dnsAddr) (DoH)" : t.dnsAddr
+        let dnsValue = Self.displayDnsLabel(t.dnsAddr, dohEnabled: t.dohEnabled, parenthesizedDoh: true)
         let effectiveBlockQuic = manager.appliedConfig?.blockQuic ?? manager.settings.blockQuic
         let quicValue = effectiveBlockQuic ? "\(t.quicBlocked)" : "Allowed"
 
@@ -504,7 +504,7 @@ struct TunnelView: View {
 
     private var profileSection: some View {
         let s = manager.settings
-        let dnsValue = s.enableDoh ? "\(s.dnsAddr) (DoH)" : s.dnsAddr
+        let dnsValue = Self.displayDnsLabel(s.dnsAddr, dohEnabled: s.enableDoh, parenthesizedDoh: true)
 
         return VStack(alignment: .leading, spacing: 8) {
             SectionHeader(title: "Profile")
@@ -575,6 +575,36 @@ struct TunnelView: View {
     }
 
     // MARK: - Helpers
+
+    private static func displayDnsLabel(
+        _ raw: String,
+        dohEnabled: Bool,
+        parenthesizedDoh: Bool
+    ) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let effective = trimmed.isEmpty ? "1.1.1.1" : trimmed
+        if effective.lowercased().hasPrefix("https://") {
+            if let components = URLComponents(string: effective),
+               let host = components.host,
+               !host.isEmpty
+            {
+                let formattedHost: String
+                if host.contains(":") && !(host.hasPrefix("[") && host.hasSuffix("]")) {
+                    formattedHost = "[\(host)]"
+                } else {
+                    formattedHost = host
+                }
+                let portSuffix = components.port.map { ":\($0)" } ?? ""
+                let hostLabel = "\(formattedHost)\(portSuffix)"
+                return parenthesizedDoh ? "\(hostLabel) (DoH)" : "\(hostLabel) DoH"
+            }
+            return "Custom DoH"
+        }
+        if dohEnabled {
+            return parenthesizedDoh ? "\(effective) (DoH)" : "\(effective) DoH"
+        }
+        return effective
+    }
 
     private func numericMetricRow<V: Equatable>(_ title: String, value: String, trigger: V) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 12) {
