@@ -93,8 +93,9 @@ fn schedule_macos_delayed_minimize_check(app: &AppHandle, wake: &StatusPollerWak
             {
                 return;
             }
-            if let Some(main_window) = app_for_main.get_window(tray::MAIN_WINDOW_LABEL) {
-                handle_minimize_to_tray_if_minimized(&main_window, &wake_clone);
+            if let Some(main_window) = app_for_main.get_webview_window(tray::MAIN_WINDOW_LABEL) {
+                let win = AsRef::<tauri::Webview>::as_ref(&main_window).window();
+                handle_minimize_to_tray_if_minimized(&win, &wake_clone);
             }
         }) {
             debug!(

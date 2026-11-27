@@ -424,15 +424,14 @@ impl DnsResolver {
             .collect()
     }
 
+    #[cfg(test)]
     fn is_udp_port53(&self, server: SocketAddr) -> bool {
-        if server.port() == 53 {
-            return true;
-        }
-        #[cfg(test)]
-        if self.test_port53_servers.contains(&server) {
-            return true;
-        }
-        false
+        server.port() == 53 || self.test_port53_servers.contains(&server)
+    }
+
+    #[cfg(not(test))]
+    fn is_udp_port53(&self, server: SocketAddr) -> bool {
+        server.port() == 53
     }
 
     fn maybe_promote_udp_server(&self, idx: usize) {
