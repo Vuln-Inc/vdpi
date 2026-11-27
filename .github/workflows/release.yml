@@ -969,12 +969,12 @@ jobs:
           fi
 
           DEB_CONTENTS="$(dpkg-deb -c "$DEB_FILE")"
-          if ! printf '%s\n' "$DEB_CONTENTS" | grep -E '[[:space:]]\./usr/lib/vdpi Desktop/vdpi$' >/dev/null; then
-            echo "ERROR: Linux .deb bundle is missing exact './usr/lib/vdpi Desktop/vdpi'" >&2
+          if ! printf '%s\n' "$DEB_CONTENTS" | grep -E '[[:space:]](\./)?usr/lib/vdpi Desktop/vdpi$' >/dev/null; then
+            echo "ERROR: Linux .deb bundle is missing exact 'usr/lib/vdpi Desktop/vdpi'" >&2
             printf '%s\n' "$DEB_CONTENTS" >&2
             exit 1
           fi
-          echo "Verified exact './usr/lib/vdpi Desktop/vdpi' in $DEB_FILE"
+          echo "Verified exact 'usr/lib/vdpi Desktop/vdpi' in $DEB_FILE"
 
           DEB_DEPENDS="$(dpkg-deb -f "$DEB_FILE" Depends)"
           echo "Linux .deb Depends: $DEB_DEPENDS"

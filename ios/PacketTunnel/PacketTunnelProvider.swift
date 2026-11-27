@@ -159,7 +159,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let settings = self.loadEffectiveSettings(options: options, overrideJSON: nil)
             let initialNetworkPath = self.currentPhysicalNetworkPath()
             let primaryIface = Self.resolvePrimaryPhysicalInterface(
-                for: self.defaultPath,
+                for: self.currentDefaultPathInfo,
                 networkPath: initialNetworkPath
             )
             let effectiveIpv4Only = settings.ipv4Only
@@ -317,7 +317,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         lifecycleQueue.async { [weak self] in
             guard let self, self.isRunning else { return }
             VdpiNativeBridge.notifyRouteChange()
-            self.evaluateDefaultPathChange(self.defaultPath, forceNotify: false)
+            self.evaluateDefaultPathChange(self.currentDefaultPathInfo, forceNotify: false)
         }
     }
 
@@ -361,7 +361,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 preferAppGroupWhenProviderConfigUnchanged: true
             )
             let primaryIface = Self.resolvePrimaryPhysicalInterface(
-                for: self.defaultPath,
+                for: self.currentDefaultPathInfo,
                 networkPath: self.currentPhysicalNetworkPath()
             )
             let effectiveIpv4Only = settings.ipv4Only
@@ -743,16 +743,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             self.stateLock.lock()
             self.latestNetworkPath = networkPath
             self.stateLock.unlock()
-            self.handleDefaultPathChange(self.defaultPath)
+            self.handleDefaultPathChange(self.currentDefaultPathInfo)
         }
 
-        let initialPath = defaultPath
+        let initialPath = currentDefaultPathInfo
         let resolvedNetworkPath = initialNetworkPath ?? currentPhysicalNetworkPath()
-        let initialSignature: String? = (initialPath?.status == .satisfied)
+        let initialSignature: String? = (initialPath?.isSatisfied == true)
             ? Self.pathSignature(for: initialPath, networkPath: resolvedNetworkPath)
             : nil
         let observation = observe(\.defaultPath, options: [.new]) { [weak self] provider, _ in
-            self?.handleDefaultPathChange(provider.defaultPath)
+            self?.handleDefaultPathChange(provider.currentDefaultPathInfo)
         }
 
         stateLock.lock()
@@ -830,14 +830,31 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         return result
     }
 
-    private func handleDefaultPathChange(_ path: NetworkExtension.NWPath?) {
+    private struct DefaultPathInfo {
+        let isSatisfied: Bool
+        let statusRawValue: Int
+        let isExpensive: Bool
+        let isConstrained: Bool
+    }
+
+    private var currentDefaultPathInfo: DefaultPathInfo? {
+        guard let path = defaultPath else { return nil }
+        return DefaultPathInfo(
+            isSatisfied: path.status == .satisfied,
+            statusRawValue: path.status.rawValue,
+            isExpensive: path.isExpensive,
+            isConstrained: path.isConstrained
+        )
+    }
+
+    private func handleDefaultPathChange(_ path: DefaultPathInfo?) {
         guard isRunning else { return }
         evaluateDefaultPathChange(path, forceNotify: false)
     }
 
-    private func evaluateDefaultPathChange(_ path: NetworkExtension.NWPath?, forceNotify: Bool) {
+    private func evaluateDefaultPathChange(_ path: DefaultPathInfo?, forceNotify: Bool) {
         guard isRunning else { return }
-        guard let path, path.status == .satisfied else {
+        guard let path, path.isSatisfied else {
             stateLock.lock()
             let pending = pathUpdateWorkItem
             pathUpdateWorkItem = nil
@@ -865,8 +882,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         let workItem = DispatchWorkItem { [weak self] in
             guard let self, self.isRunning else { return }
-            let latestPath = self.defaultPath
-            guard let latestPath, latestPath.status == .satisfied else { return }
+            let latestPath = self.currentDefaultPathInfo
+            guard let latestPath, latestPath.isSatisfied else { return }
             let currentNetworkPath = self.cachedNetworkPath()
             let latestSignature = Self.pathSignature(for: latestPath, networkPath: currentNetworkPath)
 
@@ -910,7 +927,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private static func pathSignature(
-        for path: NetworkExtension.NWPath?,
+        for path: DefaultPathInfo?,
         networkPath: Network.NWPath?
     ) -> String {
         guard let path else { return "none" }
@@ -923,11 +940,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             .map { $0.filter { !$0.contains(":") }.sorted().joined(separator: "|") }
             ?? ""
         let hasV6 = TunnelNetworkSettingsBuilder.hasGlobalIpv6(onInterface: primaryIface)
-        return "\(path.status.rawValue):exp=\(path.isExpensive):con=\(path.isConstrained):if=\(primaryIface ?? "none"):v4=\(primaryIpv4s):v6=\(hasV6)"
+        return "\(path.statusRawValue):exp=\(path.isExpensive):con=\(path.isConstrained):if=\(primaryIface ?? "none"):v4=\(primaryIpv4s):v6=\(hasV6)"
     }
 
     private static func resolvePrimaryPhysicalInterface(
-        for path: NetworkExtension.NWPath?,
+        for path: DefaultPathInfo?,
         networkPath: Network.NWPath?
     ) -> String? {
         let snapshot = activePhysicalInterfacesSnapshot()
@@ -943,11 +960,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private static func selectPrimaryInterface(
         from snapshot: PhysicalInterfacesSnapshot,
-        path: NetworkExtension.NWPath?,
+        path: DefaultPathInfo?,
         networkPath: Network.NWPath?
     ) -> String? {
         if let path {
-            guard path.status == .satisfied else {
+            guard path.isSatisfied else {
                 return nil
             }
         }
