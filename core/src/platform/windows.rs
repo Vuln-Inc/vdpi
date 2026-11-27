@@ -7,25 +7,23 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(test)]
 use std::os::windows::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(test)]
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 use vdpi_core::config::VpnCoexistence;
 use windows_sys::Win32::Foundation::{
     CloseHandle, FreeLibrary, FILETIME, HANDLE, HMODULE, INVALID_HANDLE_VALUE,
 };
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
-};
 use windows_sys::Win32::System::LibraryLoader::{
     GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
-};
-use windows_sys::Win32::System::Threading::{
-    GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 pub mod foreground;
@@ -33,12 +31,48 @@ pub mod foreground;
 pub const VDPI_PAC_PATH: &str = "/vdpi.pac";
 pub const WINDOWS_PROXY_STATE_FILENAME: &str = "windows-proxy-state.json";
 
+#[cfg(test)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const INTERNET_SETTINGS_SUBKEY: &str =
     r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 const USER_ENV_SUBKEY: &str = "Environment";
 const SYSTEM_ENV_SUBKEY: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
 const SYSTEM_ENV_KEY: &str = r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
+const WINHTTP_CONNECTIONS_SUBKEY: &str =
+    r"SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\Connections";
+const WINHTTP_CONNECTIONS_WOW64_SUBKEY: &str =
+    r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Internet Settings\Connections";
+
+const WININET_BLOB_VERSION_V60: u32 = 0x3C;
+const WININET_BLOB_VERSION_V70: u32 = 0x46;
+const WININET_FLAG_DIRECT: u32 = 0x01;
+const WININET_FLAG_PROXY: u32 = 0x02;
+const WININET_FLAG_AUTO_PROXY_URL: u32 = 0x04;
+const WININET_CONNECTION_BLOB_VALUES: [&str; 2] =
+    ["DefaultConnectionSettings", "SavedLegacySettings"];
+
+const WINHTTP_ACCESS_TYPE_NO_PROXY: u32 = 1;
+const WINHTTP_ACCESS_TYPE_NAMED_PROXY: u32 = 3;
+
+const PROXY_ENV_VARS: [&str; 6] = [
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+];
+const NO_PROXY_ENV_VARS: [&str; 2] = ["NO_PROXY", "no_proxy"];
+const ALL_RESET_ENV_VARS: [&str; 8] = [
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+];
 
 const INTERNET_OPTION_SETTINGS_CHANGED: u32 = 39;
 const INTERNET_OPTION_REFRESH: u32 = 37;
@@ -119,7 +153,6 @@ pub fn is_running_as_service() -> bool {
 
 #[link(name = "kernel32")]
 extern "system" {
-    fn GetSystemDirectoryW(lp_buffer: *mut u16, u_size: u32) -> u32;
     fn GetFileAttributesW(lp_file_name: *const u16) -> u32;
     fn CreateDirectoryW(
         lp_path_name: *const u16,
@@ -144,6 +177,43 @@ extern "system" {
         dw_flags: u32,
     ) -> i32;
     fn LocalFree(h_mem: *mut c_void) -> *mut c_void;
+    fn GlobalFree(h_mem: *mut c_void) -> *mut c_void;
+}
+
+#[cfg(test)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetSystemDirectoryW(lp_buffer: *mut u16, u_size: u32) -> u32;
+}
+
+#[repr(C)]
+struct WinHttpProxyInfo {
+    dw_access_type: u32,
+    lpsz_proxy: *mut u16,
+    lpsz_proxy_bypass: *mut u16,
+}
+
+struct WinHttpProxyInfoGuard(WinHttpProxyInfo);
+
+impl Drop for WinHttpProxyInfoGuard {
+    fn drop(&mut self) {
+        // SAFETY: `lpsz_proxy` and `lpsz_proxy_bypass` were allocated by
+        // `WinHttpGetDefaultProxyConfiguration` and must be freed via `GlobalFree`.
+        unsafe {
+            if !self.0.lpsz_proxy.is_null() {
+                let _ = GlobalFree(self.0.lpsz_proxy.cast::<c_void>());
+            }
+            if !self.0.lpsz_proxy_bypass.is_null() {
+                let _ = GlobalFree(self.0.lpsz_proxy_bypass.cast::<c_void>());
+            }
+        }
+    }
+}
+
+#[link(name = "winhttp")]
+extern "system" {
+    fn WinHttpGetDefaultProxyConfiguration(p_proxy_info: *mut WinHttpProxyInfo) -> i32;
+    fn WinHttpSetDefaultProxyConfiguration(p_proxy_info: *mut WinHttpProxyInfo) -> i32;
 }
 
 #[link(name = "advapi32")]
@@ -246,6 +316,7 @@ impl Drop for CoTaskMemGuard {
     }
 }
 
+#[cfg(test)]
 fn windows_system32_dir() -> PathBuf {
     let mut buf = vec![0u16; 260];
     loop {
@@ -269,9 +340,21 @@ fn windows_system32_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32"))
 }
 
+#[cfg(test)]
 fn system32_exe(name: &str) -> PathBuf {
     static SYSTEM32_DIR: OnceLock<PathBuf> = OnceLock::new();
     SYSTEM32_DIR.get_or_init(windows_system32_dir).join(name)
+}
+
+/// # Safety
+/// `ptr` must point to a valid NUL-terminated UTF-16 string.
+unsafe fn wide_ptr_to_string(ptr: *const u16) -> String {
+    let mut len = 0usize;
+    while *ptr.add(len) != 0 {
+        len += 1;
+    }
+    let slice = std::slice::from_raw_parts(ptr, len);
+    String::from_utf16_lossy(slice)
 }
 
 /// Best-effort call to `DnsFlushResolverCache()` in `dnsapi.dll` (loaded strictly from System32).
@@ -311,10 +394,17 @@ pub fn flush_dns_resolver_cache() {
 }
 
 fn is_vdpi_owned_wininet_endpoint(endpoint: &str) -> bool {
-    let port = endpoint
+    let trimmed = endpoint.trim().trim_end_matches('/');
+    let stripped = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("https://"))
+        .unwrap_or(trimmed);
+    let port = stripped
         .strip_prefix("127.0.0.1:")
-        .or_else(|| endpoint.strip_prefix("[::1]:"))
-        .or_else(|| endpoint.strip_prefix("localhost:"));
+        .or_else(|| stripped.strip_prefix("[::1]:"))
+        .or_else(|| stripped.strip_prefix("localhost:"))
+        .or_else(|| stripped.strip_prefix("0.0.0.0:"))
+        .or_else(|| stripped.strip_prefix("[::]:"));
     port.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
@@ -337,7 +427,9 @@ pub fn is_vdpi_owned_wininet_server(s: &str) -> bool {
         };
         let scheme = scheme.trim();
         let endpoint = endpoint.trim();
-        if !matches!(scheme, "http" | "https") || !is_vdpi_owned_wininet_endpoint(endpoint) {
+        if !matches!(scheme, "http" | "https" | "socks")
+            || !is_vdpi_owned_wininet_endpoint(endpoint)
+        {
             return false;
         }
         matched = true;
@@ -1566,6 +1658,102 @@ pub fn clear_all_windows_proxies() -> Result<()> {
     clear_all_windows_proxies_with_fallback(None, true)
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct WindowsProxyResetOutcome {
+    pub wininet_changed: bool,
+    pub env_changed: bool,
+    pub winhttp_changed: bool,
+    pub winhttp_skipped_privileges: bool,
+    pub errors: Vec<String>,
+}
+
+pub fn reset_windows_proxies_to_defaults(elevated: bool) -> WindowsProxyResetOutcome {
+    let mut outcome = WindowsProxyResetOutcome::default();
+
+    let mut roots = vec!["HKCU".to_string()];
+    if elevated {
+        for sid_root in enumerate_interactive_hku_roots() {
+            if !roots.iter().any(|r| r.eq_ignore_ascii_case(&sid_root)) {
+                roots.push(sid_root);
+            }
+        }
+        let default_root = r"HKU\.DEFAULT".to_string();
+        if !roots.iter().any(|r| r.eq_ignore_ascii_case(&default_root)) {
+            roots.push(default_root);
+        }
+    }
+
+    for root in &roots {
+        let inet_key = internet_settings_key(root);
+        let was_enabled = query_reg_dword_native(&inet_key, "ProxyEnable").is_some_and(|v| v != 0);
+        match set_reg_dword_existing_key(&inet_key, "ProxyEnable", 0) {
+            Ok(true) if was_enabled => outcome.wininet_changed = true,
+            Ok(_) => {}
+            Err(err) => outcome
+                .errors
+                .push(format!("failed to disable ProxyEnable in {inet_key}: {err}")),
+        }
+
+        for value_name in ["AutoConfigURL", "ProxyServer", "ProxyOverride"] {
+            match delete_reg_value_checked(&inet_key, value_name) {
+                Ok(true) => outcome.wininet_changed = true,
+                Ok(false) => {}
+                Err(err) => outcome
+                    .errors
+                    .push(format!("failed to delete {inet_key}\\{value_name}: {err}")),
+            }
+        }
+
+        let conn_key = format!(r"{inet_key}\Connections");
+        for value_name in WININET_CONNECTION_BLOB_VALUES {
+            match delete_reg_value_checked(&conn_key, value_name) {
+                Ok(true) => outcome.wininet_changed = true,
+                Ok(false) => {}
+                Err(err) => outcome
+                    .errors
+                    .push(format!("failed to delete {conn_key}\\{value_name}: {err}")),
+            }
+        }
+
+        let env_key = user_env_key(root);
+        for env_name in ALL_RESET_ENV_VARS {
+            match delete_reg_value_checked(&env_key, env_name) {
+                Ok(true) => outcome.env_changed = true,
+                Ok(false) => {}
+                Err(err) => outcome
+                    .errors
+                    .push(format!("failed to delete {env_key}\\{env_name}: {err}")),
+            }
+        }
+    }
+
+    if elevated {
+        // Delete proxy env vars from machine Environment only - never touch `Path`.
+        for env_name in ALL_RESET_ENV_VARS {
+            match delete_reg_value_checked(SYSTEM_ENV_KEY, env_name) {
+                Ok(true) => outcome.env_changed = true,
+                Ok(false) => {}
+                Err(err) => outcome.errors.push(format!(
+                    "failed to delete {SYSTEM_ENV_KEY}\\{env_name}: {err}"
+                )),
+            }
+        }
+
+        match reset_winhttp_proxy_unconditional() {
+            Ok(changed) => outcome.winhttp_changed |= changed,
+            Err(err) => outcome.errors.push(err),
+        }
+    } else if query_winhttp_proxy_server().is_some() {
+        outcome.winhttp_skipped_privileges = true;
+    }
+
+    remove_saved_windows_proxy_state_files();
+    notify_wininet_refresh();
+    broadcast_environment_change();
+
+    outcome
+}
+
 fn clear_all_windows_proxies_with_fallback(
     fallback_saved: Option<&SavedWindowsProxyState>,
     remove_state_files: bool,
@@ -1594,7 +1782,7 @@ fn clear_all_windows_proxies_with_fallback(
     if remove_state_files {
         remove_saved_windows_proxy_state_files();
     }
-    if wininet_changed {
+    if wininet_changed || !is_running_as_service() {
         notify_wininet_refresh();
     }
     if env_changed {
@@ -1603,51 +1791,254 @@ fn clear_all_windows_proxies_with_fallback(
     Ok(())
 }
 
-fn execute_wininet_restore_plan(inet_key: &str, plan: &WininetRestorePlan) -> bool {
-    let mut changed = false;
+fn read_blob_u32_le(blob: &[u8], pos: &mut usize) -> Option<u32> {
+    let end = pos.checked_add(4)?;
+    let bytes: [u8; 4] = blob.get(*pos..end)?.try_into().ok()?;
+    *pos = end;
+    Some(u32::from_le_bytes(bytes))
+}
 
-    match &plan.auto_config {
-        AutoConfigAction::Keep => {}
-        AutoConfigAction::Delete => {
-            if run_reg(&["delete", inet_key, "/v", "AutoConfigURL", "/f"]).is_ok() {
-                changed = true;
-            }
+fn read_blob_len_prefixed<'a>(blob: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
+    let len = usize::try_from(read_blob_u32_le(blob, pos)?).ok()?;
+    let end = pos.checked_add(len)?;
+    let data = blob.get(*pos..end)?;
+    *pos = end;
+    Some(data)
+}
+
+struct ParsedWininetBlob<'a> {
+    version: u32,
+    counter: u32,
+    flags: u32,
+    proxy_bytes: &'a [u8],
+    bypass_bytes: &'a [u8],
+    pac_bytes: &'a [u8],
+    trailing: &'a [u8],
+}
+
+fn parse_wininet_connection_blob(blob: &[u8]) -> Option<ParsedWininetBlob<'_>> {
+    let mut pos = 0usize;
+    let version = read_blob_u32_le(blob, &mut pos)?;
+    if version != WININET_BLOB_VERSION_V70 && version != WININET_BLOB_VERSION_V60 {
+        return None;
+    }
+    let counter = read_blob_u32_le(blob, &mut pos)?;
+    let flags = read_blob_u32_le(blob, &mut pos)?;
+    let proxy_bytes = read_blob_len_prefixed(blob, &mut pos)?;
+    let bypass_bytes = read_blob_len_prefixed(blob, &mut pos)?;
+    let pac_bytes = read_blob_len_prefixed(blob, &mut pos)?;
+    let trailing = blob.get(pos..)?;
+    Some(ParsedWininetBlob {
+        version,
+        counter,
+        flags,
+        proxy_bytes,
+        bypass_bytes,
+        pac_bytes,
+        trailing,
+    })
+}
+
+fn encode_wininet_connection_blob(parsed: &ParsedWininetBlob<'_>) -> Option<Vec<u8>> {
+    let proxy_len = u32::try_from(parsed.proxy_bytes.len()).ok()?;
+    let bypass_len = u32::try_from(parsed.bypass_bytes.len()).ok()?;
+    let pac_len = u32::try_from(parsed.pac_bytes.len()).ok()?;
+
+    let mut out = Vec::with_capacity(
+        24 + parsed.proxy_bytes.len()
+            + parsed.bypass_bytes.len()
+            + parsed.pac_bytes.len()
+            + parsed.trailing.len(),
+    );
+    out.extend_from_slice(&parsed.version.to_le_bytes());
+    out.extend_from_slice(&parsed.counter.to_le_bytes());
+    out.extend_from_slice(&parsed.flags.to_le_bytes());
+    out.extend_from_slice(&proxy_len.to_le_bytes());
+    out.extend_from_slice(parsed.proxy_bytes);
+    out.extend_from_slice(&bypass_len.to_le_bytes());
+    out.extend_from_slice(parsed.bypass_bytes);
+    out.extend_from_slice(&pac_len.to_le_bytes());
+    out.extend_from_slice(parsed.pac_bytes);
+    out.extend_from_slice(parsed.trailing);
+    Some(out)
+}
+
+pub(crate) fn patch_wininet_connection_blob(
+    blob: &[u8],
+    clear_pac: bool,
+    clear_manual: bool,
+    set_pac_url: Option<&str>,
+) -> Option<Vec<u8>> {
+    let mut parsed = parse_wininet_connection_blob(blob)?;
+    parsed.counter = parsed.counter.wrapping_add(1);
+
+    if clear_manual {
+        parsed.flags &= !WININET_FLAG_PROXY;
+        parsed.proxy_bytes = &[];
+        parsed.bypass_bytes = &[];
+    }
+    if clear_pac {
+        parsed.flags &= !WININET_FLAG_AUTO_PROXY_URL;
+        parsed.pac_bytes = &[];
+        if (parsed.flags & (WININET_FLAG_PROXY | WININET_FLAG_AUTO_PROXY_URL)) == 0 {
+            parsed.flags |= WININET_FLAG_DIRECT;
         }
-        AutoConfigAction::Set(prev_url) => {
-            if run_reg(&[
-                "add",
-                inet_key,
-                "/v",
-                "AutoConfigURL",
-                "/t",
-                "REG_SZ",
-                "/d",
-                prev_url,
-                "/f",
-            ])
-            .is_ok()
-            {
-                changed = true;
+    }
+    if let Some(url) = set_pac_url {
+        parsed.flags |= WININET_FLAG_AUTO_PROXY_URL | WININET_FLAG_DIRECT;
+        parsed.flags &= !WININET_FLAG_PROXY;
+        parsed.pac_bytes = url.as_bytes();
+    }
+    if clear_manual && (parsed.flags & (WININET_FLAG_PROXY | WININET_FLAG_AUTO_PROXY_URL)) == 0 {
+        parsed.flags |= WININET_FLAG_DIRECT;
+    }
+
+    encode_wininet_connection_blob(&parsed)
+}
+
+fn patch_wininet_connection_blob_restore_manual(
+    blob: &[u8],
+    clear_pac: bool,
+    set_pac_url: Option<&str>,
+    server: &str,
+    override_list: Option<&str>,
+) -> Option<Vec<u8>> {
+    let mut parsed = parse_wininet_connection_blob(blob)?;
+    parsed.counter = parsed.counter.wrapping_add(1);
+    parsed.flags |= WININET_FLAG_PROXY | WININET_FLAG_DIRECT;
+    parsed.proxy_bytes = server.as_bytes();
+    if let Some(ov) = override_list {
+        parsed.bypass_bytes = ov.as_bytes();
+    }
+    if clear_pac {
+        parsed.flags &= !WININET_FLAG_AUTO_PROXY_URL;
+        parsed.pac_bytes = &[];
+    }
+    if let Some(url) = set_pac_url {
+        parsed.flags |= WININET_FLAG_AUTO_PROXY_URL;
+        parsed.pac_bytes = url.as_bytes();
+    }
+    encode_wininet_connection_blob(&parsed)
+}
+
+pub(crate) fn sync_wininet_connection_blobs(
+    inet_key: &str,
+    clear_pac: bool,
+    clear_manual: bool,
+    set_pac_url: Option<&str>,
+    delete_if_malformed: bool,
+) -> bool {
+    let conn_key = format!(r"{inet_key}\Connections");
+    let mut changed = false;
+    for value_name in WININET_CONNECTION_BLOB_VALUES {
+        let Some(blob) = query_reg_binary_native(&conn_key, value_name) else {
+            continue;
+        };
+        match patch_wininet_connection_blob(&blob, clear_pac, clear_manual, set_pac_url) {
+            Some(patched) => {
+                if set_reg_binary_native(&conn_key, value_name, &patched).is_ok() {
+                    changed = true;
+                }
+            }
+            None => {
+                if delete_if_malformed && delete_reg_value_native(&conn_key, value_name) {
+                    changed = true;
+                }
             }
         }
     }
+    changed
+}
+
+pub(crate) fn sync_wininet_connection_blobs_restore_manual(
+    inet_key: &str,
+    clear_pac: bool,
+    set_pac_url: Option<&str>,
+    server: &str,
+    override_list: Option<&str>,
+) -> bool {
+    let conn_key = format!(r"{inet_key}\Connections");
+    let mut changed = false;
+    for value_name in WININET_CONNECTION_BLOB_VALUES {
+        let Some(blob) = query_reg_binary_native(&conn_key, value_name) else {
+            continue;
+        };
+        let Some(patched) = patch_wininet_connection_blob_restore_manual(
+            &blob,
+            clear_pac,
+            set_pac_url,
+            server,
+            override_list,
+        ) else {
+            continue;
+        };
+        if set_reg_binary_native(&conn_key, value_name, &patched).is_ok() {
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn delete_vdpi_owned_manual_proxy_values(inet_key: &str) -> bool {
+    let Some(server) = query_reg_sz_native(inet_key, "ProxyServer") else {
+        return false;
+    };
+    if !is_vdpi_owned_wininet_server(&server) {
+        return false;
+    }
+    let deleted_server = delete_reg_value_native(inet_key, "ProxyServer");
+    let deleted_override = delete_reg_value_native(inet_key, "ProxyOverride");
+    deleted_server || deleted_override
+}
+
+fn execute_wininet_restore_plan(inet_key: &str, plan: &WininetRestorePlan) -> bool {
+    let mut changed = false;
+
+    let (clear_pac, set_pac_url) = match &plan.auto_config {
+        AutoConfigAction::Keep => (false, None),
+        AutoConfigAction::Delete => {
+            if delete_reg_value_native(inet_key, "AutoConfigURL") {
+                changed = true;
+            }
+            (true, None)
+        }
+        AutoConfigAction::Set(prev_url) => {
+            if set_reg_sz_native(inet_key, "AutoConfigURL", prev_url).is_ok() {
+                changed = true;
+            }
+            (false, Some(prev_url.as_str()))
+        }
+    };
 
     match &plan.manual_proxy {
-        ManualProxyAction::Keep => {}
-        ManualProxyAction::Disable => {
-            if run_reg(&[
-                "add",
-                inet_key,
-                "/v",
-                "ProxyEnable",
-                "/t",
-                "REG_DWORD",
-                "/d",
-                "0",
-                "/f",
-            ])
-            .is_ok()
+        ManualProxyAction::Keep => {
+            let proxy_disabled =
+                query_reg_dword_native(inet_key, "ProxyEnable").is_none_or(|v| v == 0);
+            let cleared_stale_manual =
+                proxy_disabled && delete_vdpi_owned_manual_proxy_values(inet_key);
+            if cleared_stale_manual {
+                changed = true;
+            }
+            if (clear_pac || set_pac_url.is_some() || cleared_stale_manual)
+                && sync_wininet_connection_blobs(
+                    inet_key,
+                    clear_pac,
+                    cleared_stale_manual,
+                    set_pac_url,
+                    clear_pac || cleared_stale_manual,
+                )
             {
+                changed = true;
+            }
+        }
+        ManualProxyAction::Disable => {
+            if set_reg_dword_native(inet_key, "ProxyEnable", 0).is_ok() {
+                changed = true;
+            }
+            if delete_vdpi_owned_manual_proxy_values(inet_key) {
+                changed = true;
+            }
+            if sync_wininet_connection_blobs(inet_key, clear_pac, true, set_pac_url, true) {
                 changed = true;
             }
         }
@@ -1655,44 +2046,20 @@ fn execute_wininet_restore_plan(inet_key: &str, plan: &WininetRestorePlan) -> bo
             server,
             override_list,
         } => {
-            let mut restored = run_reg(&[
-                "add",
-                inet_key,
-                "/v",
-                "ProxyServer",
-                "/t",
-                "REG_SZ",
-                "/d",
-                server,
-                "/f",
-            ])
-            .is_ok();
+            let mut restored = set_reg_sz_native(inet_key, "ProxyServer", server).is_ok();
             if let Some(ov) = override_list {
-                let _ = run_reg(&[
-                    "add",
-                    inet_key,
-                    "/v",
-                    "ProxyOverride",
-                    "/t",
-                    "REG_SZ",
-                    "/d",
-                    ov,
-                    "/f",
-                ]);
+                let _ = set_reg_sz_native(inet_key, "ProxyOverride", ov);
             }
-            if run_reg(&[
-                "add",
+            if set_reg_dword_native(inet_key, "ProxyEnable", 1).is_ok() {
+                restored = true;
+            }
+            if sync_wininet_connection_blobs_restore_manual(
                 inet_key,
-                "/v",
-                "ProxyEnable",
-                "/t",
-                "REG_DWORD",
-                "/d",
-                "1",
-                "/f",
-            ])
-            .is_ok()
-            {
+                clear_pac,
+                set_pac_url,
+                server,
+                override_list.as_deref(),
+            ) {
                 restored = true;
             }
             if restored {
@@ -1704,19 +2071,94 @@ fn execute_wininet_restore_plan(inet_key: &str, plan: &WininetRestorePlan) -> bo
     changed
 }
 
-fn query_winhttp_proxy_server() -> Option<String> {
-    let out = Command::new(system32_exe("netsh.exe"))
-        .creation_flags(CREATE_NO_WINDOW)
-        .args(["winhttp", "show", "proxy"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
+pub fn query_winhttp_proxy_server() -> Option<String> {
+    let mut guard = WinHttpProxyInfoGuard(WinHttpProxyInfo {
+        dw_access_type: 0,
+        lpsz_proxy: std::ptr::null_mut(),
+        lpsz_proxy_bypass: std::ptr::null_mut(),
+    });
+    // SAFETY: `guard.0` is initialized and any allocated buffers are freed on drop via `GlobalFree`.
+    let ok = unsafe { WinHttpGetDefaultProxyConfiguration(&mut guard.0) };
+    if ok == 0 {
         return None;
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    parse_winhttp_proxy_server(&text)
+    if guard.0.dw_access_type != WINHTTP_ACCESS_TYPE_NAMED_PROXY || guard.0.lpsz_proxy.is_null() {
+        return None;
+    }
+    // SAFETY: `lpsz_proxy` is a non-null NUL-terminated UTF-16 string returned by WinHTTP.
+    let proxy = unsafe { wide_ptr_to_string(guard.0.lpsz_proxy) };
+    let trimmed = proxy.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
+fn has_non_direct_winhttp_proxy() -> bool {
+    let mut guard = WinHttpProxyInfoGuard(WinHttpProxyInfo {
+        dw_access_type: 0,
+        lpsz_proxy: std::ptr::null_mut(),
+        lpsz_proxy_bypass: std::ptr::null_mut(),
+    });
+    // SAFETY: `guard.0` is initialized and any allocated buffers are freed on drop via `GlobalFree`.
+    let ok = unsafe { WinHttpGetDefaultProxyConfiguration(&mut guard.0) };
+    if ok == 0 {
+        return false;
+    }
+    let has_proxy = !guard.0.lpsz_proxy.is_null()
+        && !unsafe { wide_ptr_to_string(guard.0.lpsz_proxy) }
+            .trim()
+            .is_empty();
+    let has_bypass = !guard.0.lpsz_proxy_bypass.is_null()
+        && !unsafe { wide_ptr_to_string(guard.0.lpsz_proxy_bypass) }
+            .trim()
+            .is_empty();
+    guard.0.dw_access_type != WINHTTP_ACCESS_TYPE_NO_PROXY || has_proxy || has_bypass
+}
+
+fn reset_winhttp_32bit_wow64() -> Result<bool, String> {
+    use windows_sys::Win32::System::Registry::KEY_WOW64_32KEY;
+
+    let mut deleted = delete_reg_value_checked_with_sam(
+        RegHive::LocalMachine,
+        WINHTTP_CONNECTIONS_SUBKEY,
+        "WinHttpSettings",
+        KEY_WOW64_32KEY,
+    )
+    .map_err(|e| format!("failed to reset 32-bit WOW64 WinHTTP settings: {e}"))?;
+
+    if !deleted {
+        deleted = delete_reg_value_checked_with_sam(
+            RegHive::LocalMachine,
+            WINHTTP_CONNECTIONS_WOW64_SUBKEY,
+            "WinHttpSettings",
+            KEY_WOW64_32KEY,
+        )
+        .map_err(|e| format!("failed to reset WOW6432Node WinHTTP settings: {e}"))?;
+    }
+
+    Ok(deleted)
+}
+
+pub fn reset_winhttp_proxy_unconditional() -> Result<bool, String> {
+    let had_64bit_proxy = has_non_direct_winhttp_proxy();
+    let mut info = WinHttpProxyInfo {
+        dw_access_type: WINHTTP_ACCESS_TYPE_NO_PROXY,
+        lpsz_proxy: std::ptr::null_mut(),
+        lpsz_proxy_bypass: std::ptr::null_mut(),
+    };
+    // SAFETY: `info` is a valid `WINHTTP_PROXY_INFO` requesting direct (no proxy) access.
+    let ok = unsafe { WinHttpSetDefaultProxyConfiguration(&mut info) };
+    if ok == 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(format!("WinHttpSetDefaultProxyConfiguration failed: {err}"));
+    }
+    let wow64_changed = reset_winhttp_32bit_wow64()?;
+    Ok(had_64bit_proxy || wow64_changed)
+}
+
+#[cfg(test)]
 fn parse_winhttp_proxy_server(text: &str) -> Option<String> {
     let mut fallback_value: Option<String> = None;
     for line in text.lines() {
@@ -1746,10 +2188,9 @@ fn reset_winhttp_proxy_if_vdpi() {
         .as_deref()
         .is_some_and(is_vdpi_owned_winhttp_proxy)
     {
-        let _ = Command::new(system32_exe("netsh.exe"))
-            .creation_flags(CREATE_NO_WINDOW)
-            .args(["winhttp", "reset", "proxy"])
-            .output();
+        if let Err(err) = reset_winhttp_proxy_unconditional() {
+            debug!(error = %err, "failed to reset vdpi-owned WinHTTP proxy");
+        }
     }
 }
 
@@ -1757,8 +2198,9 @@ pub fn print_windows_proxy_status() {
     let inet_key = internet_settings_key("HKCU");
     let env_key = user_env_key("HKCU");
     let current = query_current_wininet_state(&inet_key);
-    let override_val = query_reg_sz(&inet_key, "ProxyOverride").unwrap_or_else(|| "<unset>".into());
-    let https_env = query_reg_sz(&env_key, "HTTPS_PROXY").unwrap_or_else(|| "<unset>".into());
+    let override_val =
+        query_reg_sz_native(&inet_key, "ProxyOverride").unwrap_or_else(|| "<unset>".into());
+    let https_env = query_reg_sz_native(&env_key, "HTTPS_PROXY").unwrap_or_else(|| "<unset>".into());
     let auto_config_url = current
         .auto_config_url
         .as_deref()
@@ -1792,34 +2234,53 @@ pub fn print_windows_proxy_status() {
 }
 
 pub fn enumerate_interactive_hku_roots() -> Vec<String> {
-    let Ok(out) = Command::new(system32_exe("reg.exe"))
-        .creation_flags(CREATE_NO_WINDOW)
-        .args(["query", "HKU"])
-        .output()
-    else {
-        return Vec::new();
+    use windows_sys::Win32::Foundation::{
+        ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS as WIN32_ERROR_SUCCESS,
     };
-    if !out.status.success() {
-        return Vec::new();
-    }
+    use windows_sys::Win32::System::Registry::{RegEnumKeyExW, HKEY_USERS};
 
-    let text = String::from_utf8_lossy(&out.stdout);
     let mut roots = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        let Some(sid) = trimmed
-            .strip_prefix(r"HKEY_USERS\")
-            .or_else(|| trimmed.strip_prefix(r"HKU\"))
-        else {
-            continue;
+    let mut index: u32 = 0;
+    let mut buf_cap: usize = 260;
+
+    loop {
+        let mut name_buf = vec![0u16; buf_cap];
+        let mut name_len = name_buf.len() as u32;
+        // SAFETY: `HKEY_USERS` is a predefined root handle and `name_buf` holds `name_len` UTF-16 units.
+        let rc = unsafe {
+            RegEnumKeyExW(
+                HKEY_USERS,
+                index,
+                name_buf.as_mut_ptr(),
+                &mut name_len,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
         };
-        if sid.contains('\\') {
-            continue;
-        }
-        let is_user_sid = sid.starts_with("S-1-5-21-") || sid.starts_with("S-1-12-1-");
-        let is_classes = sid.to_ascii_lowercase().ends_with("_classes");
-        if is_user_sid && !is_classes {
-            roots.push(format!(r"HKU\{sid}"));
+        match rc {
+            WIN32_ERROR_SUCCESS => {
+                let sid = String::from_utf16_lossy(&name_buf[..name_len as usize]);
+                let is_user_sid = sid.starts_with("S-1-5-21-") || sid.starts_with("S-1-12-1-");
+                let is_classes = sid.to_ascii_lowercase().ends_with("_classes");
+                if is_user_sid && !is_classes {
+                    roots.push(format!(r"HKU\{sid}"));
+                }
+                index = index.saturating_add(1);
+            }
+            ERROR_MORE_DATA => {
+                if buf_cap >= 4096 {
+                    index = index.saturating_add(1);
+                } else {
+                    buf_cap *= 2;
+                }
+            }
+            ERROR_NO_MORE_ITEMS => break,
+            other => {
+                debug!(error = other, index, "RegEnumKeyExW(HKEY_USERS) stopped");
+                break;
+            }
         }
     }
     roots
@@ -1845,7 +2306,7 @@ fn all_cleanup_roots() -> Vec<String> {
     }
 }
 
-fn internet_settings_key(root: &str) -> String {
+pub(crate) fn internet_settings_key(root: &str) -> String {
     format!(r"{root}\{INTERNET_SETTINGS_SUBKEY}")
 }
 
@@ -1854,30 +2315,18 @@ fn user_env_key(root: &str) -> String {
 }
 
 fn apply_wininet_pac_proxy(inet_key: &str, pac_url: &str) -> Result<()> {
-    run_reg(&[
-        "add",
-        inet_key,
-        "/v",
-        "AutoConfigURL",
-        "/t",
-        "REG_SZ",
-        "/d",
-        pac_url,
-        "/f",
-    ])?;
+    set_reg_sz_native(inet_key, "AutoConfigURL", pac_url)?;
     // Explicitly disable manual ProxyEnable so Windows evaluates the fail-open PAC
     // (`PROXY 127.0.0.1:<port>; DIRECT`) and automatically falls back to DIRECT if vdpi exits.
-    run_reg(&[
-        "add",
+    set_reg_dword_native(inet_key, "ProxyEnable", 0)?;
+    let cleared_vdpi_manual = delete_vdpi_owned_manual_proxy_values(inet_key);
+    let _ = sync_wininet_connection_blobs(
         inet_key,
-        "/v",
-        "ProxyEnable",
-        "/t",
-        "REG_DWORD",
-        "/d",
-        "0",
-        "/f",
-    ])?;
+        false,
+        cleared_vdpi_manual,
+        Some(pac_url),
+        false,
+    );
     Ok(())
 }
 
@@ -1952,35 +2401,51 @@ fn is_vdpi_owned_proxy_env(val: &str) -> bool {
     is_loopback_authority_str(first_token) || is_loopback_host_str(first_token)
 }
 
+pub(crate) fn is_vdpi_owned_no_proxy_env(val: &str) -> bool {
+    let lower = val.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    let has_cgnat_or_ula = (lower.contains("100.64.0.0/10") || lower.contains("100.64.*"))
+        && (lower.contains("fc00::/7")
+            || lower.contains("fe80::/10")
+            || lower.contains("home.arpa")
+            || lower.contains(".ts.net"));
+    let has_tr_markers = lower.contains("paratika.com.tr")
+        || (lower.contains(".gov.tr") && lower.contains(".bel.tr") && lower.contains(".ts.net"));
+    has_cgnat_or_ula || has_tr_markers
+}
+
 fn unset_windows_user_env(env_key: &str) -> bool {
-    let mut owned = false;
-    for key in ["HTTP_PROXY", "HTTPS_PROXY"] {
-        if query_reg_sz(env_key, key)
+    let mut proxy_matched = false;
+    let mut changed = false;
+    for key in PROXY_ENV_VARS {
+        if query_reg_sz_native(env_key, key)
             .as_deref()
             .is_some_and(is_vdpi_owned_proxy_env)
         {
-            owned = true;
-            let _ = run_reg(&["delete", env_key, "/v", key, "/f"]);
+            proxy_matched = true;
+            if delete_reg_value_native(env_key, key) {
+                changed = true;
+            }
         }
     }
-    if owned {
-        let _ = run_reg(&["delete", env_key, "/v", "NO_PROXY", "/f"]);
+    for key in NO_PROXY_ENV_VARS {
+        let should_delete = proxy_matched
+            || query_reg_sz_native(env_key, key)
+                .as_deref()
+                .is_some_and(is_vdpi_owned_no_proxy_env);
+        if should_delete && delete_reg_value_native(env_key, key) {
+            changed = true;
+        }
     }
-    if query_reg_sz(env_key, "ALL_PROXY")
-        .as_deref()
-        .is_some_and(is_vdpi_owned_proxy_env)
-    {
-        owned = true;
-        let _ = run_reg(&["delete", env_key, "/v", "ALL_PROXY", "/f"]);
-    }
-    owned
+    changed
 }
 
 fn query_current_wininet_state(inet_key: &str) -> CurrentWininetState {
-    let enabled_raw = query_reg_sz(inet_key, "ProxyEnable").unwrap_or_default();
-    let proxy_enable = enabled_raw == "0x1" || enabled_raw == "1";
-    let proxy_server = query_reg_sz(inet_key, "ProxyServer").unwrap_or_default();
-    let auto_config_url = query_reg_sz(inet_key, "AutoConfigURL");
+    let proxy_enable = query_reg_dword_native(inet_key, "ProxyEnable").is_some_and(|v| v != 0);
+    let proxy_server = query_reg_sz_native(inet_key, "ProxyServer").unwrap_or_default();
+    let auto_config_url = query_reg_sz_native(inet_key, "AutoConfigURL");
     CurrentWininetState {
         proxy_enable,
         proxy_server,
@@ -1990,7 +2455,7 @@ fn query_current_wininet_state(inet_key: &str) -> CurrentWininetState {
 
 fn capture_wininet_state(inet_key: &str) -> SavedWininetHiveState {
     let current = query_current_wininet_state(inet_key);
-    let proxy_override = query_reg_sz(inet_key, "ProxyOverride");
+    let proxy_override = query_reg_sz_native(inet_key, "ProxyOverride");
     SavedWininetHiveState {
         proxy_enable: current.proxy_enable,
         proxy_server: (!current.proxy_server.trim().is_empty()).then_some(current.proxy_server),
@@ -1999,44 +2464,346 @@ fn capture_wininet_state(inet_key: &str) -> SavedWininetHiveState {
     }
 }
 
-pub fn query_reg_sz(key: &str, value_name: &str) -> Option<String> {
-    let out = Command::new(system32_exe("reg.exe"))
-        .creation_flags(CREATE_NO_WINDOW)
-        .args(["query", key, "/v", value_name])
-        .output()
-        .ok()?;
-    if !out.status.success() {
+fn encode_wide_str_nul(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn query_reg_value_raw(key: &str, value_name: &str) -> Option<(u32, Vec<u8>)> {
+    use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS as WIN32_ERROR_SUCCESS};
+    use windows_sys::Win32::System::Registry::{
+        RegOpenKeyExW, RegQueryValueExW, HKEY, KEY_QUERY_VALUE, REG_VALUE_TYPE,
+    };
+
+    let (hive, subkey) = split_reg_key_path(key).ok()?;
+    let wide_subkey = encode_wide_str_nul(subkey);
+    let mut raw_hkey: HKEY = std::ptr::null_mut();
+    // SAFETY: `wide_subkey` is NUL-terminated UTF-16 and `raw_hkey` is a valid out-pointer.
+    let open_rc = unsafe {
+        RegOpenKeyExW(
+            hive.as_hkey(),
+            wide_subkey.as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &mut raw_hkey,
+        )
+    };
+    if open_rc != WIN32_ERROR_SUCCESS {
         return None;
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    for line in text.lines() {
-        let trimmed = line.trim();
-        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
-        if tokens.len() >= 3 && tokens[0].eq_ignore_ascii_case(value_name) {
-            let after_name = &trimmed[tokens[0].len()..];
-            let idx = after_name.find(tokens[1])? + tokens[1].len();
-            let val = after_name[idx..].trim();
-            return Some(val.to_string());
+    let guard = RegKeyGuard(raw_hkey);
+
+    let wide_name = encode_wide_str_nul(value_name);
+    let mut reg_type: REG_VALUE_TYPE = 0;
+    let mut cb_data: u32 = 0;
+
+    for _ in 0..8 {
+        // SAFETY: `guard.0` is an open registry key and `wide_name` is NUL-terminated UTF-16.
+        let size_rc = unsafe {
+            RegQueryValueExW(
+                guard.0,
+                wide_name.as_ptr(),
+                std::ptr::null(),
+                &mut reg_type,
+                std::ptr::null_mut(),
+                &mut cb_data,
+            )
+        };
+        if size_rc != WIN32_ERROR_SUCCESS {
+            return None;
+        }
+        if cb_data == 0 {
+            return Some((reg_type, Vec::new()));
+        }
+
+        let mut data = vec![0u8; cb_data as usize];
+        // SAFETY: `data` has capacity/length `cb_data` bytes.
+        let read_rc = unsafe {
+            RegQueryValueExW(
+                guard.0,
+                wide_name.as_ptr(),
+                std::ptr::null(),
+                &mut reg_type,
+                data.as_mut_ptr(),
+                &mut cb_data,
+            )
+        };
+        match read_rc {
+            WIN32_ERROR_SUCCESS => {
+                data.truncate(cb_data as usize);
+                return Some((reg_type, data));
+            }
+            ERROR_MORE_DATA => continue,
+            _ => return None,
         }
     }
     None
 }
 
-pub fn run_reg(args: &[&str]) -> Result<String> {
-    let out = Command::new(system32_exe("reg.exe"))
-        .creation_flags(CREATE_NO_WINDOW)
-        .args(args)
-        .output()
-        .with_context(|| format!("failed to execute reg.exe {args:?}"))?;
-    if !out.status.success() {
+pub fn query_reg_sz_native(key: &str, value_name: &str) -> Option<String> {
+    use windows_sys::Win32::System::Registry::{REG_DWORD, REG_EXPAND_SZ, REG_SZ};
+
+    let (reg_type, data) = query_reg_value_raw(key, value_name)?;
+    match reg_type {
+        REG_SZ | REG_EXPAND_SZ => decode_reg_utf16_bytes(&data).ok(),
+        REG_DWORD => {
+            let bytes: [u8; 4] = data.as_slice().try_into().ok()?;
+            Some(u32::from_le_bytes(bytes).to_string())
+        }
+        _ => None,
+    }
+}
+
+pub fn query_reg_sz(key: &str, value_name: &str) -> Option<String> {
+    query_reg_sz_native(key, value_name)
+}
+
+fn query_reg_dword_native(key: &str, value_name: &str) -> Option<u32> {
+    use windows_sys::Win32::System::Registry::{REG_DWORD, REG_EXPAND_SZ, REG_SZ};
+
+    let (reg_type, data) = query_reg_value_raw(key, value_name)?;
+    match reg_type {
+        REG_DWORD => {
+            let bytes: [u8; 4] = data.as_slice().try_into().ok()?;
+            Some(u32::from_le_bytes(bytes))
+        }
+        REG_SZ | REG_EXPAND_SZ => {
+            let text = decode_reg_utf16_bytes(&data).ok()?;
+            let trimmed = text.trim();
+            if let Some(hex) = trimmed
+                .strip_prefix("0x")
+                .or_else(|| trimmed.strip_prefix("0X"))
+            {
+                u32::from_str_radix(hex, 16).ok()
+            } else {
+                trimmed.parse::<u32>().ok()
+            }
+        }
+        _ => None,
+    }
+}
+
+fn query_reg_binary_native(key: &str, value_name: &str) -> Option<Vec<u8>> {
+    use windows_sys::Win32::System::Registry::REG_BINARY;
+
+    let (reg_type, data) = query_reg_value_raw(key, value_name)?;
+    (reg_type == REG_BINARY).then_some(data)
+}
+
+fn set_reg_sz_native(key: &str, value_name: &str, value: &str) -> Result<()> {
+    let (hive, subkey) = split_reg_key_path(key)?;
+    set_reg_string_value(hive, subkey, value_name, value, RegStringKind::Sz)
+}
+
+fn set_reg_dword_native(key: &str, value_name: &str, value: u32) -> Result<()> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS as WIN32_ERROR_SUCCESS;
+    use windows_sys::Win32::System::Registry::{
+        RegOpenKeyExW, RegSetValueExW, HKEY, KEY_SET_VALUE, REG_DWORD,
+    };
+
+    let (hive, subkey) = split_reg_key_path(key)?;
+    let hive_label = hive.label();
+    let wide_subkey = encode_wide_str_nul(subkey);
+    let mut raw_hkey: HKEY = std::ptr::null_mut();
+    // SAFETY: `wide_subkey` is NUL-terminated UTF-16 and `raw_hkey` is a valid out-pointer.
+    let open_rc = unsafe {
+        RegOpenKeyExW(
+            hive.as_hkey(),
+            wide_subkey.as_ptr(),
+            0,
+            KEY_SET_VALUE,
+            &mut raw_hkey,
+        )
+    };
+    if open_rc != WIN32_ERROR_SUCCESS {
         anyhow::bail!(
-            "reg.exe {:?} exited {}: {}",
-            args,
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
+            "RegOpenKeyExW({hive_label}\\{subkey}, KEY_SET_VALUE) failed with Win32 error {open_rc}"
         );
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    let guard = RegKeyGuard(raw_hkey);
+
+    let wide_name = encode_wide_str_nul(value_name);
+    let bytes = value.to_le_bytes();
+    // SAFETY: `guard.0` is an open registry handle with `KEY_SET_VALUE`, and `bytes` is 4 bytes.
+    let set_rc = unsafe {
+        RegSetValueExW(
+            guard.0,
+            wide_name.as_ptr(),
+            0,
+            REG_DWORD,
+            bytes.as_ptr(),
+            bytes.len() as u32,
+        )
+    };
+    if set_rc != WIN32_ERROR_SUCCESS {
+        anyhow::bail!(
+            "RegSetValueExW({hive_label}\\{subkey}\\{value_name}) failed with Win32 error {set_rc}"
+        );
+    }
+    Ok(())
+}
+
+fn set_reg_dword_existing_key(key: &str, value_name: &str, value: u32) -> Result<bool> {
+    use windows_sys::Win32::Foundation::{
+        ERROR_FILE_NOT_FOUND as WIN32_ERROR_FILE_NOT_FOUND,
+        ERROR_PATH_NOT_FOUND as WIN32_ERROR_PATH_NOT_FOUND,
+        ERROR_SUCCESS as WIN32_ERROR_SUCCESS,
+    };
+    use windows_sys::Win32::System::Registry::{
+        RegOpenKeyExW, RegSetValueExW, HKEY, KEY_SET_VALUE, REG_DWORD,
+    };
+
+    let (hive, subkey) = split_reg_key_path(key)?;
+    let hive_label = hive.label();
+    let wide_subkey = encode_wide_str_nul(subkey);
+    let mut raw_hkey: HKEY = std::ptr::null_mut();
+    // SAFETY: `wide_subkey` is NUL-terminated UTF-16 and `raw_hkey` is a valid out-pointer.
+    let open_rc = unsafe {
+        RegOpenKeyExW(
+            hive.as_hkey(),
+            wide_subkey.as_ptr(),
+            0,
+            KEY_SET_VALUE,
+            &mut raw_hkey,
+        )
+    };
+    if open_rc == WIN32_ERROR_FILE_NOT_FOUND || open_rc == WIN32_ERROR_PATH_NOT_FOUND {
+        return Ok(false);
+    }
+    if open_rc != WIN32_ERROR_SUCCESS {
+        anyhow::bail!(
+            "RegOpenKeyExW({hive_label}\\{subkey}, KEY_SET_VALUE) failed with Win32 error {open_rc}"
+        );
+    }
+    let guard = RegKeyGuard(raw_hkey);
+
+    let wide_name = encode_wide_str_nul(value_name);
+    let bytes = value.to_le_bytes();
+    // SAFETY: `guard.0` is an open registry handle with `KEY_SET_VALUE`, and `bytes` is 4 bytes.
+    let set_rc = unsafe {
+        RegSetValueExW(
+            guard.0,
+            wide_name.as_ptr(),
+            0,
+            REG_DWORD,
+            bytes.as_ptr(),
+            bytes.len() as u32,
+        )
+    };
+    if set_rc != WIN32_ERROR_SUCCESS {
+        anyhow::bail!(
+            "RegSetValueExW({hive_label}\\{subkey}\\{value_name}) failed with Win32 error {set_rc}"
+        );
+    }
+    Ok(true)
+}
+
+fn set_reg_binary_native(key: &str, value_name: &str, data: &[u8]) -> Result<()> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS as WIN32_ERROR_SUCCESS;
+    use windows_sys::Win32::System::Registry::{
+        RegOpenKeyExW, RegSetValueExW, HKEY, KEY_SET_VALUE, REG_BINARY,
+    };
+
+    let (hive, subkey) = split_reg_key_path(key)?;
+    let hive_label = hive.label();
+    let wide_subkey = encode_wide_str_nul(subkey);
+    let mut raw_hkey: HKEY = std::ptr::null_mut();
+    // SAFETY: `wide_subkey` is NUL-terminated UTF-16 and `raw_hkey` is a valid out-pointer.
+    let open_rc = unsafe {
+        RegOpenKeyExW(
+            hive.as_hkey(),
+            wide_subkey.as_ptr(),
+            0,
+            KEY_SET_VALUE,
+            &mut raw_hkey,
+        )
+    };
+    if open_rc != WIN32_ERROR_SUCCESS {
+        anyhow::bail!(
+            "RegOpenKeyExW({hive_label}\\{subkey}, KEY_SET_VALUE) failed with Win32 error {open_rc}"
+        );
+    }
+    let guard = RegKeyGuard(raw_hkey);
+
+    let wide_name = encode_wide_str_nul(value_name);
+    let cb_data = u32::try_from(data.len()).with_context(|| {
+        format!("registry binary value {hive_label}\\{subkey}\\{value_name} exceeds u32 byte length")
+    })?;
+    // SAFETY: `guard.0` is an open registry handle with `KEY_SET_VALUE`, and `data` has `cb_data` bytes.
+    let set_rc = unsafe {
+        RegSetValueExW(
+            guard.0,
+            wide_name.as_ptr(),
+            0,
+            REG_BINARY,
+            data.as_ptr(),
+            cb_data,
+        )
+    };
+    if set_rc != WIN32_ERROR_SUCCESS {
+        anyhow::bail!(
+            "RegSetValueExW({hive_label}\\{subkey}\\{value_name}) failed with Win32 error {set_rc}"
+        );
+    }
+    Ok(())
+}
+
+fn delete_reg_value_checked_with_sam(
+    hive: RegHive,
+    subkey: &str,
+    value_name: &str,
+    extra_sam: u32,
+) -> Result<bool> {
+    use windows_sys::Win32::Foundation::{
+        ERROR_FILE_NOT_FOUND as WIN32_ERROR_FILE_NOT_FOUND,
+        ERROR_PATH_NOT_FOUND as WIN32_ERROR_PATH_NOT_FOUND,
+        ERROR_SUCCESS as WIN32_ERROR_SUCCESS,
+    };
+    use windows_sys::Win32::System::Registry::{
+        RegDeleteValueW, RegOpenKeyExW, HKEY, KEY_SET_VALUE,
+    };
+
+    let hive_label = hive.label();
+    let wide_subkey = encode_wide_str_nul(subkey);
+    let mut raw_hkey: HKEY = std::ptr::null_mut();
+    // SAFETY: `wide_subkey` is NUL-terminated UTF-16 and `raw_hkey` is a valid out-pointer.
+    let open_rc = unsafe {
+        RegOpenKeyExW(
+            hive.as_hkey(),
+            wide_subkey.as_ptr(),
+            0,
+            KEY_SET_VALUE | extra_sam,
+            &mut raw_hkey,
+        )
+    };
+    if open_rc == WIN32_ERROR_FILE_NOT_FOUND || open_rc == WIN32_ERROR_PATH_NOT_FOUND {
+        return Ok(false);
+    }
+    if open_rc != WIN32_ERROR_SUCCESS {
+        anyhow::bail!(
+            "RegOpenKeyExW({hive_label}\\{subkey}, KEY_SET_VALUE) failed with Win32 error {open_rc}"
+        );
+    }
+    let guard = RegKeyGuard(raw_hkey);
+
+    let wide_name = encode_wide_str_nul(value_name);
+    // SAFETY: `guard.0` is an open registry handle with `KEY_SET_VALUE` and `wide_name` is NUL-terminated.
+    let del_rc = unsafe { RegDeleteValueW(guard.0, wide_name.as_ptr()) };
+    match del_rc {
+        WIN32_ERROR_SUCCESS => Ok(true),
+        WIN32_ERROR_FILE_NOT_FOUND | WIN32_ERROR_PATH_NOT_FOUND => Ok(false),
+        other => anyhow::bail!(
+            "RegDeleteValueW({hive_label}\\{subkey}\\{value_name}) failed with Win32 error {other}"
+        ),
+    }
+}
+
+fn delete_reg_value_checked(key: &str, value_name: &str) -> Result<bool> {
+    let (hive, subkey) = split_reg_key_path(key)?;
+    delete_reg_value_checked_with_sam(hive, subkey, value_name, 0)
+}
+
+pub fn delete_reg_value_native(key: &str, value_name: &str) -> bool {
+    delete_reg_value_checked(key, value_name).unwrap_or(false)
 }
 
 pub fn notify_wininet_refresh() {
@@ -2613,6 +3380,7 @@ pub fn build_windows_proxy_override(extra: &[String]) -> String {
     entries.join(";")
 }
 
+#[cfg(test)]
 const STALE_BROWSER_EXES: &[&str] = &[
     "chrome.exe",
     "msedge.exe",
@@ -2622,7 +3390,9 @@ const STALE_BROWSER_EXES: &[&str] = &[
     "vivaldi.exe",
 ];
 
+#[cfg(test)]
 const WINDOWS_TO_UNIX_EPOCH_SECS: u64 = 11_644_473_600;
+#[cfg(test)]
 const FILETIME_TICKS_PER_SEC: u64 = 10_000_000;
 
 struct HandleGuard(HANDLE);
@@ -2637,6 +3407,7 @@ impl Drop for HandleGuard {
     }
 }
 
+#[cfg(test)]
 fn canonical_stale_browser_name(exe_name: &str) -> Option<&'static str> {
     STALE_BROWSER_EXES
         .iter()
@@ -2644,92 +3415,17 @@ fn canonical_stale_browser_name(exe_name: &str) -> Option<&'static str> {
         .find(|candidate| exe_name.eq_ignore_ascii_case(candidate))
 }
 
+#[cfg(test)]
 fn filetime_to_unix_secs(ft: FILETIME) -> Option<u64> {
     let ticks = (u64::from(ft.dwHighDateTime) << 32) | u64::from(ft.dwLowDateTime);
     (ticks / FILETIME_TICKS_PER_SEC).checked_sub(WINDOWS_TO_UNIX_EPOCH_SECS)
 }
 
-/// Detects allowlisted desktop browser processes started before `since_unix_secs`
-/// so proxy-mode users can be advised to restart browsers that cached pre-proxy settings.
-///
-/// Uses only `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)` +
-/// `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` + `GetProcessTimes`, and NEVER opens
-/// handles to games, anti-cheat drivers, or any non-browser process.
-pub fn detect_stale_browsers(since_unix_secs: u64) -> Vec<String> {
-    let raw_snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-    if raw_snapshot.is_null() || raw_snapshot == INVALID_HANDLE_VALUE {
-        return Vec::new();
-    }
-    let _snapshot = HandleGuard(raw_snapshot);
-
-    // SAFETY: `PROCESSENTRY32W` is a plain C struct; `dwSize` is initialized before FFI use.
-    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
-    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-
-    if unsafe { Process32FirstW(raw_snapshot, &mut entry) } == 0 {
-        return Vec::new();
-    }
-
-    let mut stale: Vec<&'static str> = Vec::new();
-    loop {
-        let exe_len = entry
-            .szExeFile
-            .iter()
-            .position(|&c| c == 0)
-            .unwrap_or(entry.szExeFile.len());
-        let exe_name = String::from_utf16_lossy(&entry.szExeFile[..exe_len]);
-
-        if let Some(browser) =
-            canonical_stale_browser_name(&exe_name).filter(|b| !stale.contains(b))
-        {
-            let proc_handle =
-                unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, entry.th32ProcessID) };
-            if !proc_handle.is_null() && proc_handle != INVALID_HANDLE_VALUE {
-                let _proc_guard = HandleGuard(proc_handle);
-                let mut creation = FILETIME {
-                    dwLowDateTime: 0,
-                    dwHighDateTime: 0,
-                };
-                let mut exit = FILETIME {
-                    dwLowDateTime: 0,
-                    dwHighDateTime: 0,
-                };
-                let mut kernel = FILETIME {
-                    dwLowDateTime: 0,
-                    dwHighDateTime: 0,
-                };
-                let mut user = FILETIME {
-                    dwLowDateTime: 0,
-                    dwHighDateTime: 0,
-                };
-                let ok = unsafe {
-                    GetProcessTimes(
-                        proc_handle,
-                        &mut creation,
-                        &mut exit,
-                        &mut kernel,
-                        &mut user,
-                    )
-                };
-                if ok != 0
-                    && filetime_to_unix_secs(creation)
-                        .is_some_and(|created| created < since_unix_secs)
-                {
-                    stale.push(browser);
-                    if stale.len() == STALE_BROWSER_EXES.len() {
-                        break;
-                    }
-                }
-            }
-        }
-
-        if unsafe { Process32NextW(raw_snapshot, &mut entry) } == 0 {
-            break;
-        }
-    }
-
-    stale.sort_unstable();
-    stale.into_iter().map(str::to_string).collect()
+/// Kept as a no-op returning an empty list: scanning running desktop browsers with
+/// `OpenProcess` triggers Windows Defender behavioral heuristics and anti-cheat telemetry,
+/// while WinINET fail-open PAC refresh updates active sessions without process inspection.
+pub fn detect_stale_browsers(_since_unix_secs: u64) -> Vec<String> {
+    Vec::new()
 }
 
 #[cfg(test)]
@@ -2767,16 +3463,29 @@ mod tests {
         assert!(is_vdpi_owned_wininet_server("localhost:8080"));
         assert!(is_vdpi_owned_wininet_server(" LOCALHOST:8080 "));
         assert!(is_vdpi_owned_wininet_server("LocalHost:18080"));
+        assert!(is_vdpi_owned_wininet_server("0.0.0.0:8080"));
+        assert!(is_vdpi_owned_wininet_server("[::]:8080"));
+        assert!(is_vdpi_owned_wininet_server("http://127.0.0.1:8080"));
+        assert!(is_vdpi_owned_wininet_server("https://127.0.0.1:8443"));
+        assert!(is_vdpi_owned_wininet_server("http://localhost:8080"));
+        assert!(is_vdpi_owned_wininet_server("https://[::1]:8080/"));
+        assert!(is_vdpi_owned_wininet_server("http://0.0.0.0:8080"));
+        assert!(is_vdpi_owned_wininet_server("https://[::]:8443"));
         assert!(is_vdpi_owned_wininet_server("http=localhost:8080"));
         assert!(is_vdpi_owned_wininet_server("https=localhost:8080"));
+        assert!(is_vdpi_owned_wininet_server("socks=127.0.0.1:1080"));
+        assert!(is_vdpi_owned_wininet_server("SOCKS=localhost:1080"));
         assert!(is_vdpi_owned_wininet_server(
-            "HTTP=LOCALHOST:8080;HTTPS=LOCALHOST:8080"
+            "HTTP=LOCALHOST:8080;HTTPS=LOCALHOST:8080;SOCKS=127.0.0.1:1080"
         ));
         assert!(is_vdpi_owned_wininet_server(
             "http=127.0.0.1:8080;https=127.0.0.1:8080"
         ));
         assert!(is_vdpi_owned_wininet_server(
             "http=[::1]:8080;https=[::1]:8080"
+        ));
+        assert!(is_vdpi_owned_wininet_server(
+            "http=0.0.0.0:8080;https=[::]:8443"
         ));
         assert!(!is_vdpi_owned_wininet_server("proxy.corp.local:3128"));
         assert!(!is_vdpi_owned_wininet_server("localhost.corp.local:8080"));
@@ -2786,11 +3495,148 @@ mod tests {
         assert!(!is_vdpi_owned_wininet_server(
             "http=proxy.corp.local:3128;https=localhost:8080"
         ));
+        assert!(!is_vdpi_owned_wininet_server("socks=proxy.corp.local:1080"));
+        assert!(!is_vdpi_owned_wininet_server("http://proxy.corp.local:3128"));
+        assert!(!is_vdpi_owned_wininet_server(
+            "https://proxy.corp.local:3128"
+        ));
         assert!(!is_vdpi_owned_wininet_server("localhost:"));
+        assert!(!is_vdpi_owned_wininet_server("0.0.0.0:"));
+        assert!(!is_vdpi_owned_wininet_server("[::]:"));
         assert!(!is_vdpi_owned_wininet_server("::1:8080"));
-        assert!(!is_vdpi_owned_wininet_server("http://127.0.0.1:8080"));
-        assert!(!is_vdpi_owned_wininet_server("http://localhost:8080"));
         assert!(!is_vdpi_owned_wininet_server(""));
+    }
+
+    fn build_test_wininet_blob(
+        version: u32,
+        counter: u32,
+        flags: u32,
+        proxy: &[u8],
+        bypass: &[u8],
+        pac: &[u8],
+        trailing: &[u8],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&version.to_le_bytes());
+        out.extend_from_slice(&counter.to_le_bytes());
+        out.extend_from_slice(&flags.to_le_bytes());
+        out.extend_from_slice(&(proxy.len() as u32).to_le_bytes());
+        out.extend_from_slice(proxy);
+        out.extend_from_slice(&(bypass.len() as u32).to_le_bytes());
+        out.extend_from_slice(bypass);
+        out.extend_from_slice(&(pac.len() as u32).to_le_bytes());
+        out.extend_from_slice(pac);
+        out.extend_from_slice(trailing);
+        out
+    }
+
+    #[test]
+    fn patch_wininet_connection_blob_handles_set_pac_clear_pac_clear_manual_and_malformed() {
+        let trailing = [0xAAu8; 32];
+
+        // 1. Set PAC URL on a v0x46 blob that had manual proxy enabled (0x01 | 0x02):
+        //    sets 0x04, clears 0x02, preserves 0x01 and trailing bytes, increments counter.
+        let initial = build_test_wininet_blob(
+            WININET_BLOB_VERSION_V70,
+            7,
+            WININET_FLAG_DIRECT | WININET_FLAG_PROXY,
+            b"proxy.corp.local:3128",
+            b"*.corp.local;<local>",
+            b"",
+            &trailing,
+        );
+        let with_pac = patch_wininet_connection_blob(
+            &initial,
+            false,
+            false,
+            Some("http://127.0.0.1:8080/vdpi.pac"),
+        )
+        .expect("valid v0x46 blob should patch for PAC");
+        let parsed = parse_wininet_connection_blob(&with_pac).expect("patched blob parses");
+        assert_eq!(parsed.version, WININET_BLOB_VERSION_V70);
+        assert_eq!(parsed.counter, 8);
+        assert_eq!(parsed.flags, WININET_FLAG_DIRECT | WININET_FLAG_AUTO_PROXY_URL);
+        assert_eq!(parsed.proxy_bytes, b"proxy.corp.local:3128");
+        assert_eq!(parsed.bypass_bytes, b"*.corp.local;<local>");
+        assert_eq!(parsed.pac_bytes, b"http://127.0.0.1:8080/vdpi.pac");
+        assert_eq!(parsed.trailing, &trailing);
+
+        // 2. Clear PAC URL on a blob with AUTO_PROXY_URL | AUTO_DETECT (0x04 | 0x08):
+        //    clears 0x04, empties pac_bytes, ensures 0x01 (DIRECT) is set, preserves 0x08.
+        let pac_and_wpad = build_test_wininet_blob(
+            WININET_BLOB_VERSION_V70,
+            12,
+            WININET_FLAG_AUTO_PROXY_URL | 0x08,
+            b"",
+            b"",
+            b"http://127.0.0.1:8080/vdpi.pac",
+            &trailing,
+        );
+        let cleared_pac = patch_wininet_connection_blob(&pac_and_wpad, true, false, None)
+            .expect("clear PAC should succeed");
+        let parsed_clear = parse_wininet_connection_blob(&cleared_pac).expect("parsed");
+        assert_eq!(parsed_clear.counter, 13);
+        assert_eq!(parsed_clear.flags, WININET_FLAG_DIRECT | 0x08);
+        assert!(parsed_clear.pac_bytes.is_empty());
+        assert_eq!(parsed_clear.trailing, &trailing);
+
+        // 3. Clear manual proxy on a v0x3C blob with wrapping counter (u32::MAX -> 0):
+        //    clears 0x02, empties proxy_bytes and bypass_bytes, sets 0x01, preserves version 0x3C.
+        let legacy_manual = build_test_wininet_blob(
+            WININET_BLOB_VERSION_V60,
+            u32::MAX,
+            WININET_FLAG_PROXY,
+            b"127.0.0.1:8080",
+            b"localhost;<local>",
+            b"",
+            &trailing[..8],
+        );
+        let cleared_manual = patch_wininet_connection_blob(&legacy_manual, false, true, None)
+            .expect("clear manual should succeed");
+        let parsed_manual = parse_wininet_connection_blob(&cleared_manual).expect("parsed");
+        assert_eq!(parsed_manual.version, WININET_BLOB_VERSION_V60);
+        assert_eq!(parsed_manual.counter, 0);
+        assert_eq!(parsed_manual.flags, WININET_FLAG_DIRECT);
+        assert!(parsed_manual.proxy_bytes.is_empty());
+        assert!(parsed_manual.bypass_bytes.is_empty());
+        assert_eq!(parsed_manual.trailing, &trailing[..8]);
+
+        // 4. Malformed blobs return None safely without panicking.
+        assert!(patch_wininet_connection_blob(&[], true, true, None).is_none());
+        assert!(patch_wininet_connection_blob(&[0x46, 0, 0, 0, 1, 0, 0, 0], true, false, None)
+            .is_none());
+        let bad_version = build_test_wininet_blob(0x99, 1, 1, b"", b"", b"", &[]);
+        assert!(patch_wininet_connection_blob(&bad_version, true, false, None).is_none());
+        let mut overflow_len = Vec::new();
+        overflow_len.extend_from_slice(&WININET_BLOB_VERSION_V70.to_le_bytes());
+        overflow_len.extend_from_slice(&1u32.to_le_bytes());
+        overflow_len.extend_from_slice(&WININET_FLAG_PROXY.to_le_bytes());
+        overflow_len.extend_from_slice(&u32::MAX.to_le_bytes());
+        overflow_len.extend_from_slice(&[0u8; 16]);
+        assert!(patch_wininet_connection_blob(&overflow_len, true, true, None).is_none());
+        let mut truncated_pac = build_test_wininet_blob(
+            WININET_BLOB_VERSION_V70,
+            1,
+            WININET_FLAG_AUTO_PROXY_URL,
+            b"",
+            b"",
+            b"http://127.0.0.1:8080/vdpi.pac",
+            &[],
+        );
+        truncated_pac.truncate(truncated_pac.len() - 5);
+        assert!(patch_wininet_connection_blob(&truncated_pac, true, false, None).is_none());
+    }
+
+    #[test]
+    fn no_proxy_ownership_detects_vdpi_baseline_markers_only() {
+        assert!(is_vdpi_owned_no_proxy_env(
+            "localhost,127.0.0.1,100.64.0.0/10,fc00::/7,fe80::/10,.home.arpa"
+        ));
+        assert!(is_vdpi_owned_no_proxy_env(
+            "localhost;100.64.*;*.ts.net;paratika.com.tr"
+        ));
+        assert!(!is_vdpi_owned_no_proxy_env("localhost,127.0.0.1,.corp.local"));
+        assert!(!is_vdpi_owned_no_proxy_env(""));
     }
 
     #[test]

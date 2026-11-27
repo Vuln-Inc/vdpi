@@ -81,6 +81,15 @@ pub const LINUX_TUN_LOCK_PATH: &str = "/run/vdpi/tun.lock";
 pub const LINUX_TUN_PERSIST_DIR: &str = "/var/lib/vdpi";
 /// Ephemeral NetworkManager drop-in path used when NetworkManager manages DNS.
 pub const NM_DNS_CONF_PATH: &str = "/run/NetworkManager/conf.d/99-vdpi-dns.conf";
+/// Persistent NetworkManager drop-in path checked for vdpi marker during full network reset.
+pub const ETC_NM_DNS_CONF_PATH: &str = "/etc/NetworkManager/conf.d/99-vdpi-dns.conf";
+/// Default `systemd-resolved` stub resolver path used for stateless `/etc/resolv.conf` recovery.
+pub const SYSTEMD_RESOLVED_STUB_RESOLV_PATH: &str = "/run/systemd/resolve/stub-resolv.conf";
+/// Default NetworkManager runtime resolver path used for stateless `/etc/resolv.conf` recovery.
+pub const NM_RESOLV_CONF_PATH: &str = "/run/NetworkManager/resolv.conf";
+/// Emergency fallback `/etc/resolv.conf` written only when no backup, `systemd-resolved` stub,
+/// or clean NetworkManager `resolv.conf` is available so DNS is never left bricked on `198.18.0.2`.
+pub const EMERGENCY_FALLBACK_RESOLV_CONF: &str = "nameserver 1.1.1.1\nnameserver 8.8.8.8\n";
 /// System resolver configuration path used by the direct `/etc/resolv.conf` fallback backend.
 pub const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
 /// Name Service Switch configuration path checked for active `nss-resolve` (`systemd-resolved`).
@@ -1035,6 +1044,230 @@ pub fn restore_resolv_conf_at(
     }
 }
 
+fn is_vdpi_dns_ip(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed == LINUX_TUN_DNS_V4 || trimmed.eq_ignore_ascii_case(LINUX_TUN_DNS_V6) {
+        return true;
+    }
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        let v4 = LINUX_TUN_DNS_V4.parse::<IpAddr>().ok();
+        let v6 = LINUX_TUN_DNS_V6.parse::<IpAddr>().ok();
+        return Some(ip) == v4 || Some(ip) == v6;
+    }
+    false
+}
+
+/// Returns `true` if any active `nameserver` entry in `contents` points to `vdpi`'s virtual DNS
+/// addresses (`198.18.0.2` or `fd00:7664:7069::2`).
+pub fn resolv_conf_contains_vdpi_dns(contents: &str) -> bool {
+    contents.lines().any(|line| {
+        let uncommented = line.split(['#', ';']).next().unwrap_or("").trim();
+        let mut parts = uncommented.split_whitespace();
+        parts.next() == Some("nameserver") && parts.next().is_some_and(is_vdpi_dns_ip)
+    })
+}
+
+/// Returns `true` when `contents` has at least one active `nameserver` entry and every active
+/// `nameserver` entry points exclusively to `vdpi`'s virtual DNS addresses (`198.18.0.2` /
+/// `fd00:7664:7069::2`).
+pub fn resolv_conf_points_only_to_vdpi_dns(contents: &str) -> bool {
+    let mut saw_any = false;
+    for line in contents.lines() {
+        let uncommented = line.split(['#', ';']).next().unwrap_or("").trim();
+        let mut parts = uncommented.split_whitespace();
+        if parts.next() == Some("nameserver") {
+            let Some(addr) = parts.next() else {
+                continue;
+            };
+            saw_any = true;
+            if !is_vdpi_dns_ip(addr) {
+                return false;
+            }
+        }
+    }
+    saw_any
+}
+
+/// Returns `true` when `/etc/resolv.conf` carries [`RESOLV_CONF_MARKER`] or points exclusively
+/// to `vdpi`'s virtual DNS addresses (`198.18.0.2` / `fd00:7664:7069::2`).
+pub fn resolv_conf_needs_stateless_recovery(contents: &str) -> bool {
+    is_vdpi_managed_resolv_conf(contents) || resolv_conf_points_only_to_vdpi_dns(contents)
+}
+
+/// Outcome of stateless `/etc/resolv.conf` recovery when backup restoration did not replace a
+/// vdpi-bricked resolver file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatelessResolvRecovery {
+    /// `/etc/resolv.conf` was already clean or absent.
+    NotNeeded,
+    /// Symlinked `/etc/resolv.conf` to `/run/systemd/resolve/stub-resolv.conf`.
+    SymlinkedSystemdStub,
+    /// Symlinked `/etc/resolv.conf` to `/run/NetworkManager/resolv.conf`.
+    SymlinkedNetworkManager,
+    /// Wrote emergency public resolvers (`1.1.1.1`, `8.8.8.8`) so DNS is never bricked.
+    WroteEmergencyFallback,
+}
+
+/// Applies stateless recovery to `resolv_path` if it still contains [`RESOLV_CONF_MARKER`] or
+/// only `198.18.0.2` / `fd00:7664:7069::2` nameservers.
+///
+/// Recovery priority:
+/// 1. Symlink to `systemd_stub_path` when `systemd_resolved_active` and `systemd_stub_path` exists.
+/// 2. Symlink to `nm_resolv_path` when it exists and does not contain vdpi's virtual DNS or marker.
+/// 3. Write [`EMERGENCY_FALLBACK_RESOLV_CONF`] (`1.1.1.1`, `8.8.8.8`).
+pub fn recover_bricked_resolv_conf_at(
+    resolv_path: &Path,
+    systemd_stub_path: &Path,
+    systemd_resolved_active: bool,
+    nm_resolv_path: &Path,
+) -> Result<StatelessResolvRecovery> {
+    let contents = match fs::read_to_string(resolv_path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(StatelessResolvRecovery::NotNeeded);
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", resolv_path.display()));
+        }
+    };
+
+    if !resolv_conf_needs_stateless_recovery(&contents) {
+        return Ok(StatelessResolvRecovery::NotNeeded);
+    }
+
+    #[cfg(unix)]
+    if systemd_resolved_active && systemd_stub_path.exists() {
+        replace_with_symlink_atomic(resolv_path, systemd_stub_path)?;
+        return Ok(StatelessResolvRecovery::SymlinkedSystemdStub);
+    }
+    #[cfg(not(unix))]
+    let _ = (systemd_stub_path, systemd_resolved_active);
+
+    #[cfg(unix)]
+    if nm_resolv_path.exists()
+        && fs::read_to_string(nm_resolv_path).ok().is_some_and(|text| {
+            !is_vdpi_managed_resolv_conf(&text) && !resolv_conf_contains_vdpi_dns(&text)
+        })
+    {
+        replace_with_symlink_atomic(resolv_path, nm_resolv_path)?;
+        return Ok(StatelessResolvRecovery::SymlinkedNetworkManager);
+    }
+    #[cfg(not(unix))]
+    let _ = nm_resolv_path;
+
+    write_file_atomic(resolv_path, EMERGENCY_FALLBACK_RESOLV_CONF, 0o644)
+        .with_context(|| format!("failed to write emergency {}", resolv_path.display()))?;
+    Ok(StatelessResolvRecovery::WroteEmergencyFallback)
+}
+
+/// Parsed policy rule entry from `ip -4 rule show` / `ip -6 rule show` matching vdpi's fwmark,
+/// routing table, or suppress_prefixlength rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchedIpRule {
+    pub priority: u32,
+    pub fwmark_token: Option<String>,
+    pub lookup_table: Option<String>,
+    pub iif: Option<String>,
+    pub suppress_prefixlength_zero: bool,
+}
+
+fn parse_fwmark_value(token: &str) -> Option<u32> {
+    let value_part = token.split('/').next()?.trim();
+    if let Some(hex) = value_part
+        .strip_prefix("0x")
+        .or_else(|| value_part.strip_prefix("0X"))
+    {
+        u32::from_str_radix(hex, 16).ok()
+    } else {
+        value_part.parse::<u32>().ok()
+    }
+}
+
+/// Parses `ip -4 rule show` / `ip -6 rule show` output and returns every policy rule matching
+/// `fwmark` (`0x5644`), `lookup <route_table>` (`202`), or `vdpi`'s `PRIO_SUPPRESS_MAIN`
+/// (`5490`) `lookup main suppress_prefixlength 0` rule.
+pub fn parse_vdpi_ip_rules_from_show(
+    output: &str,
+    fwmark: u32,
+    route_table: u32,
+) -> Vec<MatchedIpRule> {
+    let table_str = route_table.to_string();
+    let mut matched = Vec::new();
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        let Some((prio_raw, rest)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let Ok(priority) = prio_raw.trim().parse::<u32>() else {
+            continue;
+        };
+
+        let tokens: Vec<&str> = rest.split_whitespace().collect();
+        let mut fwmark_token: Option<String> = None;
+        let mut lookup_table: Option<String> = None;
+        let mut iif: Option<String> = None;
+        let mut suppress_zero = false;
+        let mut lookup_main = false;
+
+        let mut idx = 0;
+        while idx < tokens.len() {
+            match tokens[idx] {
+                "fwmark" => {
+                    if let Some(&val) = tokens.get(idx + 1) {
+                        if parse_fwmark_value(val) == Some(fwmark) {
+                            fwmark_token = Some(val.to_string());
+                        }
+                        idx += 2;
+                        continue;
+                    }
+                }
+                "lookup" | "table" => {
+                    if let Some(&tbl) = tokens.get(idx + 1) {
+                        if tbl == table_str {
+                            lookup_table = Some(tbl.to_string());
+                        } else if tbl == "main" {
+                            lookup_main = true;
+                        }
+                        idx += 2;
+                        continue;
+                    }
+                }
+                "iif" => {
+                    if let Some(&dev) = tokens.get(idx + 1) {
+                        iif = Some(dev.to_string());
+                        idx += 2;
+                        continue;
+                    }
+                }
+                "suppress_prefixlength" if tokens.get(idx + 1).copied() == Some("0") => {
+                    suppress_zero = true;
+                    idx += 2;
+                    continue;
+                }
+                _ => {}
+            }
+            idx += 1;
+        }
+
+        let is_vdpi_suppress = priority == PRIO_SUPPRESS_MAIN && lookup_main && suppress_zero;
+        if fwmark_token.is_some() || lookup_table.is_some() || is_vdpi_suppress {
+            let entry = MatchedIpRule {
+                priority,
+                fwmark_token,
+                lookup_table,
+                iif,
+                suppress_prefixlength_zero: is_vdpi_suppress,
+            };
+            if !matched.contains(&entry) {
+                matched.push(entry);
+            }
+        }
+    }
+
+    matched
+}
+
 fn remove_file_if_exists(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -1333,20 +1566,24 @@ mod imp {
         build_policy_rules_for_families, compute_desired_ipv6_active, detect_wake_or_time_jump,
         fallback_user_runtime_dir, is_relevant_route_monitor_line, is_valid_resolv_symlink_target,
         is_valid_state_nm_conf_path, is_valid_state_resolv_backup_path,
-        needs_resolv_conf_override_with_systemd_resolved, nm_config_disables_dns_management,
-        parse_default_route_dev_and_gateway, parse_local_unicast_ipv4_addrs,
-        parse_local_unicast_ipv6_addrs, plan_uplink_transition_with_resync,
+        is_vdpi_managed_resolv_conf, needs_resolv_conf_override_with_systemd_resolved,
+        nm_config_disables_dns_management, parse_default_route_dev_and_gateway,
+        parse_local_unicast_ipv4_addrs, parse_local_unicast_ipv6_addrs,
+        parse_vdpi_ip_rules_from_show, plan_uplink_transition_with_resync,
         prepare_resolv_conf_backup, proc_status_has_cap_net_admin, read_symlink_target_if_link,
-        reassert_managed_resolv_conf_at, remove_file_if_exists, render_nm_dns_conf,
-        render_resolv_conf_preserving, resolv_conf_uses_systemd_resolved, restore_resolv_conf_at,
-        should_install_ipv4_routing, validate_tun_iface_name, write_file_atomic,
-        FamilyRoutingAction, LinuxDnsBackend, LinuxTunState, LinuxUplinkSignature,
-        ResolvBackupMeta, ALL_RP_FILTER_PATH, LINUX_IFNAMSIZ, LINUX_ROUTE_IDLE_POLL_INTERVAL,
+        reassert_managed_resolv_conf_at, recover_bricked_resolv_conf_at, remove_file_if_exists,
+        render_nm_dns_conf, render_resolv_conf_preserving, resolv_conf_needs_stateless_recovery,
+        resolv_conf_uses_systemd_resolved, restore_resolv_conf_at, should_install_ipv4_routing,
+        validate_tun_iface_name, write_file_atomic, FamilyRoutingAction, LinuxDnsBackend,
+        LinuxTunState, LinuxUplinkSignature, MatchedIpRule, ResolvBackupMeta,
+        StatelessResolvRecovery, ALL_RP_FILTER_PATH, ETC_NM_DNS_CONF_PATH,
+        LEGACY_RESOLV_CONF_BACKUP_PATH, LINUX_IFNAMSIZ, LINUX_ROUTE_IDLE_POLL_INTERVAL,
         LINUX_TUN_DNS_V4, LINUX_TUN_DNS_V6, LINUX_TUN_IFACE, LINUX_TUN_IPV4_CIDR,
         LINUX_TUN_IPV6_CIDR, LINUX_TUN_LOCK_PATH, LINUX_TUN_MTU, LINUX_TUN_PRIVILEGE_ERROR,
         LINUX_TUN_STATE_DIR, LINUX_TUN_STATE_PATH, LINUX_TUN_TXQUEUELEN_LADDER, NM_DNS_CONF_PATH,
-        NSSWITCH_CONF_PATH, RESOLV_CONF_BACKUP_PATH, RESOLV_CONF_META_PATH, RESOLV_CONF_PATH,
-        TRUSTED_BIN_PREFIXES, VDPI_ROUTE_TABLE, VDPI_SO_MARK,
+        NM_RESOLV_CONF_PATH, NSSWITCH_CONF_PATH, RESOLV_CONF_BACKUP_PATH, RESOLV_CONF_META_PATH,
+        RESOLV_CONF_PATH, SYSTEMD_RESOLVED_STUB_RESOLV_PATH, TRUSTED_BIN_PREFIXES,
+        VDPI_ROUTE_TABLE, VDPI_SO_MARK,
     };
     use crate::binder::{DynamicOutboundBinder, OutboundTarget};
     use anyhow::{anyhow, bail, Context, Result};
@@ -3556,10 +3793,338 @@ mod imp {
         }
         Ok(())
     }
+
+    fn is_systemd_resolved_service_active() -> bool {
+        if let Some(systemctl) = resolve_trusted_bin("systemctl") {
+            if Command::new(systemctl)
+                .args(["is-active", "--quiet", "systemd-resolved"])
+                .output()
+                .is_ok_and(|out| out.status.success())
+            {
+                return true;
+            }
+        }
+        resolve_trusted_bin("resolvectl").is_some_and(|resolvectl| {
+            Command::new(resolvectl)
+                .arg("status")
+                .output()
+                .is_ok_and(|out| out.status.success())
+        })
+    }
+
+    fn is_network_manager_running() -> bool {
+        resolve_trusted_bin("nmcli").is_some_and(|nmcli| {
+            Command::new(nmcli)
+                .args(["-t", "-f", "RUNNING", "general", "status"])
+                .output()
+                .is_ok_and(|out| {
+                    out.status.success()
+                        && String::from_utf8_lossy(&out.stdout)
+                            .trim()
+                            .eq_ignore_ascii_case("running")
+                })
+        })
+    }
+
+    fn list_vdpi_ip_rules(ip_bin: &Path, ipv6: bool) -> Vec<MatchedIpRule> {
+        let family = if ipv6 { "-6" } else { "-4" };
+        let Ok(out) = Command::new(ip_bin).args([family, "rule", "show"]).output() else {
+            return Vec::new();
+        };
+        if !out.status.success() {
+            return Vec::new();
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        parse_vdpi_ip_rules_from_show(&stdout, VDPI_SO_MARK, VDPI_ROUTE_TABLE)
+    }
+
+    fn route_table_has_entries(ip_bin: &Path, route_table: u32, ipv6: bool) -> bool {
+        let family = if ipv6 { "-6" } else { "-4" };
+        let table_str = route_table.to_string();
+        Command::new(ip_bin)
+            .args([family, "route", "show", "table", &table_str])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .is_some_and(|out| !String::from_utf8_lossy(&out.stdout).trim().is_empty())
+    }
+
+    fn file_has_vdpi_marker(path: &Path) -> bool {
+        fs::read_to_string(path)
+            .ok()
+            .is_some_and(|text| is_vdpi_managed_resolv_conf(&text))
+    }
+
+    fn delete_matched_ip_rule(ip_bin: &Path, rule: &MatchedIpRule, ipv6: bool) -> Result<bool> {
+        let family = if ipv6 { "-6" } else { "-4" };
+        let prio_str = rule.priority.to_string();
+        let mut args: Vec<&str> = vec![family, "rule", "del", "priority", &prio_str];
+        if let Some(ref mark) = rule.fwmark_token {
+            args.push("fwmark");
+            args.push(mark.as_str());
+        } else if let Some(ref tbl) = rule.lookup_table {
+            if let Some(ref dev) = rule.iif {
+                args.push("iif");
+                args.push(dev.as_str());
+            }
+            args.push("lookup");
+            args.push(tbl.as_str());
+        } else if rule.suppress_prefixlength_zero {
+            args.extend(["lookup", "main", "suppress_prefixlength", "0"]);
+        }
+
+        let mut deleted_any = false;
+        for _ in 0..8 {
+            if run_ip_cleanup(ip_bin, &args, ipv6)? {
+                deleted_any = true;
+            } else {
+                break;
+            }
+        }
+        Ok(deleted_any)
+    }
+
+    fn has_orphan_linux_tun_or_dns_artifacts() -> bool {
+        if Path::new(LINUX_TUN_STATE_PATH).exists()
+            || Path::new(LINUX_TUN_LOCK_PATH).exists()
+            || Path::new(RESOLV_CONF_BACKUP_PATH).exists()
+            || Path::new(RESOLV_CONF_META_PATH).exists()
+            || Path::new(NM_DNS_CONF_PATH).exists()
+            || file_has_vdpi_marker(Path::new(ETC_NM_DNS_CONF_PATH))
+            || Path::new("/sys/class/net").join(LINUX_TUN_IFACE).exists()
+        {
+            return true;
+        }
+        if fs::read_to_string(RESOLV_CONF_PATH)
+            .ok()
+            .is_some_and(|c| resolv_conf_needs_stateless_recovery(&c))
+        {
+            return true;
+        }
+        if let Some(ip_bin) = resolve_trusted_bin("ip") {
+            if !list_vdpi_ip_rules(&ip_bin, false).is_empty()
+                || !list_vdpi_ip_rules(&ip_bin, true).is_empty()
+                || route_table_has_entries(&ip_bin, VDPI_ROUTE_TABLE, false)
+                || route_table_has_entries(&ip_bin, VDPI_ROUTE_TABLE, true)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Resets Linux TUN interfaces, policy routing rules (`fwmark 0x5644` / `lookup 202`),
+    /// route table `202`, NetworkManager drop-ins, `/etc/resolv.conf` (including stateless
+    /// recovery so DNS is never left bricked on `198.18.0.2`), `systemd-resolved`, and stale
+    /// runtime state files back to clean defaults.
+    ///
+    /// Returns `(tun_changed, dns_changed, skipped_privileges, errors)`.
+    pub fn reset_linux_tun_and_dns_defaults() -> (bool, bool, bool, Vec<String>) {
+        // SAFETY: `geteuid(2)` is always safe to call and never fails.
+        if unsafe { libc::geteuid() } != 0 {
+            return (
+                false,
+                false,
+                has_orphan_linux_tun_or_dns_artifacts(),
+                Vec::new(),
+            );
+        }
+
+        let mut tun_changed = false;
+        let mut dns_changed = false;
+        let mut errors: Vec<String> = Vec::new();
+
+        let ip_bin = resolve_trusted_bin("ip");
+        let had_tun_iface = Path::new("/sys/class/net").join(LINUX_TUN_IFACE).exists();
+        let had_rules = ip_bin.as_deref().is_some_and(|bin| {
+            !list_vdpi_ip_rules(bin, false).is_empty() || !list_vdpi_ip_rules(bin, true).is_empty()
+        });
+        let had_table_routes = ip_bin.as_deref().is_some_and(|bin| {
+            route_table_has_entries(bin, VDPI_ROUTE_TABLE, false)
+                || route_table_has_entries(bin, VDPI_ROUTE_TABLE, true)
+        });
+        let had_nm_run_conf = Path::new(NM_DNS_CONF_PATH).exists();
+        let had_bricked_resolv = fs::read_to_string(RESOLV_CONF_PATH)
+            .ok()
+            .is_some_and(|c| resolv_conf_needs_stateless_recovery(&c));
+
+        // 1. Run standard cleanup plus stateless sweep of ip -4/-6 rules, table 202, and vdpi0.
+        if let Err(err) = cleanup_linux_tun_state() {
+            errors.push(format!("{err:#}"));
+        }
+
+        if let Some(ref bin) = ip_bin {
+            for ipv6 in [false, true] {
+                for rule in list_vdpi_ip_rules(bin, ipv6) {
+                    match delete_matched_ip_rule(bin, &rule, ipv6) {
+                        Ok(true) => {
+                            tun_changed = true;
+                        }
+                        Ok(false) => {}
+                        Err(err) => {
+                            errors.push(format!("{err:#}"));
+                        }
+                    }
+                }
+
+                let had_entries = route_table_has_entries(bin, VDPI_ROUTE_TABLE, ipv6);
+                match flush_route_table(VDPI_ROUTE_TABLE, ipv6) {
+                    Ok(()) => {
+                        if had_entries {
+                            tun_changed = true;
+                        }
+                    }
+                    Err(err) => {
+                        errors.push(format!("{err:#}"));
+                    }
+                }
+            }
+
+            match run_ip_cleanup(bin, &["link", "del", "dev", LINUX_TUN_IFACE], false) {
+                Ok(true) => {
+                    tun_changed = true;
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    errors.push(format!("{err:#}"));
+                }
+            }
+        } else {
+            errors.push("required system binary 'ip' not found in trusted paths".to_string());
+        }
+
+        if (had_tun_iface && !Path::new("/sys/class/net").join(LINUX_TUN_IFACE).exists())
+            || (had_rules
+                && ip_bin.as_deref().is_some_and(|bin| {
+                    list_vdpi_ip_rules(bin, false).is_empty()
+                        && list_vdpi_ip_rules(bin, true).is_empty()
+                }))
+            || (had_table_routes
+                && ip_bin.as_deref().is_some_and(|bin| {
+                    !route_table_has_entries(bin, VDPI_ROUTE_TABLE, false)
+                        && !route_table_has_entries(bin, VDPI_ROUTE_TABLE, true)
+                }))
+        {
+            tun_changed = true;
+        }
+
+        // 2. Remove /run and /etc NetworkManager drop-ins (marker-checked for /etc) and reload NM.
+        let mut removed_nm_conf = false;
+        match fs::remove_file(NM_DNS_CONF_PATH) {
+            Ok(()) => {
+                removed_nm_conf = true;
+                dns_changed = true;
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                if had_nm_run_conf {
+                    dns_changed = true;
+                }
+            }
+            Err(err) => {
+                errors.push(format!("failed to remove {NM_DNS_CONF_PATH}: {err}"));
+            }
+        }
+
+        let etc_nm_path = Path::new(ETC_NM_DNS_CONF_PATH);
+        if file_has_vdpi_marker(etc_nm_path) {
+            match fs::remove_file(etc_nm_path) {
+                Ok(()) => {
+                    removed_nm_conf = true;
+                    dns_changed = true;
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    errors.push(format!("failed to remove {ETC_NM_DNS_CONF_PATH}: {err}"));
+                }
+            }
+        }
+
+        if removed_nm_conf && is_network_manager_running() {
+            if let Err(err) = reload_network_manager_dns() {
+                errors.push(format!("{err:#}"));
+            }
+        }
+
+        // 3. Stateless /etc/resolv.conf recovery if still bricked after backup restoration.
+        let resolv_path = Path::new(RESOLV_CONF_PATH);
+        let still_bricked_before_stateless = fs::read_to_string(resolv_path)
+            .ok()
+            .is_some_and(|c| resolv_conf_needs_stateless_recovery(&c));
+        if had_bricked_resolv && !still_bricked_before_stateless {
+            dns_changed = true;
+        }
+        if still_bricked_before_stateless {
+            let resolved_active = is_systemd_resolved_service_active();
+            match recover_bricked_resolv_conf_at(
+                resolv_path,
+                Path::new(SYSTEMD_RESOLVED_STUB_RESOLV_PATH),
+                resolved_active,
+                Path::new(NM_RESOLV_CONF_PATH),
+            ) {
+                Ok(StatelessResolvRecovery::NotNeeded) => {}
+                Ok(outcome) => {
+                    info!(
+                        ?outcome,
+                        path = RESOLV_CONF_PATH,
+                        "applied stateless /etc/resolv.conf recovery"
+                    );
+                    dns_changed = true;
+                }
+                Err(err) => {
+                    errors.push(format!("{err:#}"));
+                }
+            }
+        }
+
+        // 4. Revert vdpi0 on systemd-resolved and flush resolver caches.
+        if let Some(resolvectl) = resolve_trusted_bin("resolvectl") {
+            let _ = Command::new(&resolvectl)
+                .args(["revert", LINUX_TUN_IFACE])
+                .output();
+            let _ = Command::new(&resolvectl).arg("flush-caches").output();
+        }
+
+        // 5. Clean stale runtime files and (only after /etc/resolv.conf is recovered) persistent
+        //    resolv backup/metadata files.
+        for path in [LINUX_TUN_STATE_PATH, LINUX_TUN_LOCK_PATH] {
+            match fs::remove_file(path) {
+                Ok(()) => {
+                    tun_changed = true;
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    errors.push(format!("failed to remove {path}: {err}"));
+                }
+            }
+        }
+
+        let resolv_recovered = !fs::read_to_string(resolv_path)
+            .ok()
+            .is_some_and(|c| resolv_conf_needs_stateless_recovery(&c));
+        if resolv_recovered {
+            for path in [
+                RESOLV_CONF_BACKUP_PATH,
+                RESOLV_CONF_META_PATH,
+                LEGACY_RESOLV_CONF_BACKUP_PATH,
+            ] {
+                match fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        errors.push(format!("failed to remove {path}: {err}"));
+                    }
+                }
+            }
+        }
+
+        (tun_changed, dns_changed, false, errors)
+    }
 }
 
 #[cfg(target_os = "linux")]
-pub use imp::{cleanup_linux_tun_state, open_tun_device, LinuxTunSession};
+pub use imp::{
+    cleanup_linux_tun_state, open_tun_device, reset_linux_tun_and_dns_defaults, LinuxTunSession,
+};
 
 #[cfg(test)]
 mod tests {
@@ -4889,5 +5454,110 @@ default via fe80::0001 dev wlan0 proto ra metric 600 pref medium
         assert!(!offline_wake.desired_ipv4_active && offline_wake.desired_ipv6_active);
         assert_eq!(offline_wake.ipv4_action, FamilyRoutingAction::Keep);
         assert_eq!(offline_wake.ipv6_action, FamilyRoutingAction::Keep);
+    }
+
+    #[test]
+    fn parses_vdpi_ip_rules_from_ip_rule_show_output() {
+        let sample = "\
+0:\tfrom all lookup local
+5210:\tfrom all fwmark 0x80000/0xff0000 lookup main
+5480:\tfrom all fwmark 0x5644/0xffff lookup main
+5485:\tfrom all fwmark 0x5644/0xffff unreachable
+5490:\tfrom all lookup main suppress_prefixlength 0
+5500:\tfrom all iif lo lookup 202
+9999:\tfrom all fwmark 0x5644 lookup main
+10000:\tfrom all lookup 202
+32766:\tfrom all lookup main
+32767:\tfrom all lookup default
+";
+        let rules = parse_vdpi_ip_rules_from_show(sample, VDPI_SO_MARK, VDPI_ROUTE_TABLE);
+        assert_eq!(rules.len(), 6);
+        assert_eq!(rules[0].priority, 5480);
+        assert_eq!(rules[0].fwmark_token.as_deref(), Some("0x5644/0xffff"));
+        assert_eq!(rules[1].priority, 5485);
+        assert_eq!(rules[1].fwmark_token.as_deref(), Some("0x5644/0xffff"));
+        assert_eq!(rules[2].priority, 5490);
+        assert!(rules[2].suppress_prefixlength_zero);
+        assert_eq!(rules[3].priority, 5500);
+        assert_eq!(rules[3].iif.as_deref(), Some("lo"));
+        assert_eq!(rules[3].lookup_table.as_deref(), Some("202"));
+        assert_eq!(rules[4].priority, 9999);
+        assert_eq!(rules[4].fwmark_token.as_deref(), Some("0x5644"));
+        assert_eq!(rules[5].priority, 10000);
+        assert_eq!(rules[5].lookup_table.as_deref(), Some("202"));
+    }
+
+    #[test]
+    fn stateless_resolv_conf_recovery_handles_marker_vdpi_only_and_fallbacks() {
+        assert!(resolv_conf_points_only_to_vdpi_dns("nameserver 198.18.0.2\n"));
+        assert!(resolv_conf_points_only_to_vdpi_dns(
+            "nameserver 198.18.0.2\nnameserver fd00:7664:7069::2\n"
+        ));
+        assert!(!resolv_conf_points_only_to_vdpi_dns(
+            "nameserver 198.18.0.2\nnameserver 1.1.1.1\n"
+        ));
+        assert!(resolv_conf_contains_vdpi_dns(
+            "nameserver 198.18.0.2\nnameserver 1.1.1.1\n"
+        ));
+        assert!(!resolv_conf_points_only_to_vdpi_dns("# empty\n"));
+        assert!(resolv_conf_needs_stateless_recovery(
+            "# Managed by vdpi TUN mode\nnameserver 1.1.1.1\n"
+        ));
+
+        let dir = unique_test_dir("stateless-resolv");
+        let resolv = dir.join("resolv.conf");
+        let stub = dir.join("stub-resolv.conf");
+        let nm = dir.join("nm-resolv.conf");
+
+        // Clean resolv.conf is never overwritten.
+        fs::write(&resolv, "nameserver 9.9.9.9\n").unwrap();
+        assert_eq!(
+            recover_bricked_resolv_conf_at(&resolv, &stub, true, &nm).unwrap(),
+            StatelessResolvRecovery::NotNeeded
+        );
+        assert_eq!(fs::read_to_string(&resolv).unwrap(), "nameserver 9.9.9.9\n");
+
+        // Bricked resolv.conf with no systemd stub or NM file gets emergency 1.1.1.1 / 8.8.8.8.
+        fs::write(&resolv, "nameserver 198.18.0.2\n").unwrap();
+        assert_eq!(
+            recover_bricked_resolv_conf_at(&resolv, &stub, false, &nm).unwrap(),
+            StatelessResolvRecovery::WroteEmergencyFallback
+        );
+        assert_eq!(
+            fs::read_to_string(&resolv).unwrap(),
+            EMERGENCY_FALLBACK_RESOLV_CONF
+        );
+
+        #[cfg(unix)]
+        {
+            // Poisoned NM resolv.conf containing 198.18.0.2 is skipped in favor of emergency fallback.
+            fs::write(&nm, "nameserver 198.18.0.2\n").unwrap();
+            fs::write(&resolv, "nameserver 198.18.0.2\n").unwrap();
+            assert_eq!(
+                recover_bricked_resolv_conf_at(&resolv, &stub, false, &nm).unwrap(),
+                StatelessResolvRecovery::WroteEmergencyFallback
+            );
+
+            // Clean NM resolv.conf is symlinked when systemd-resolved is inactive.
+            fs::write(&nm, "nameserver 192.168.1.1\n").unwrap();
+            fs::write(&resolv, "# Managed by vdpi TUN mode\nnameserver 198.18.0.2\n").unwrap();
+            assert_eq!(
+                recover_bricked_resolv_conf_at(&resolv, &stub, false, &nm).unwrap(),
+                StatelessResolvRecovery::SymlinkedNetworkManager
+            );
+            assert_eq!(fs::read_link(&resolv).unwrap(), nm);
+
+            // Active systemd-resolved stub takes priority over NetworkManager.
+            fs::write(&stub, "nameserver 127.0.0.53\n").unwrap();
+            let _ = fs::remove_file(&resolv);
+            fs::write(&resolv, "nameserver fd00:7664:7069::2\n").unwrap();
+            assert_eq!(
+                recover_bricked_resolv_conf_at(&resolv, &stub, true, &nm).unwrap(),
+                StatelessResolvRecovery::SymlinkedSystemdStub
+            );
+            assert_eq!(fs::read_link(&resolv).unwrap(), stub);
+        }
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -37,7 +37,7 @@ export const STATUS_EVENT = "vdpi://status";
 
 export type AppFolderTarget = "config" | "logs" | "app";
 
-const APP_VERSION = "0.6.1";
+const APP_VERSION = "0.6.2";
 const READ_IPC_TIMEOUT_MS = 15_000;
 const APP_ICONS_TIMEOUT_MS = 10_000;
 const UPDATE_IPC_TIMEOUT_MS = 25_000;
@@ -1009,7 +1009,7 @@ export function resetMockIpcState(): void {
 }
 
 // ============================================================================
-// Typed IPC Commands (15 Backend Commands + File Picker + Status Subscription)
+// Typed IPC Commands (19 Backend Commands + File Picker + Status Subscription)
 // ============================================================================
 
 export async function getStatus(
@@ -1751,6 +1751,28 @@ export async function uninstallService(): Promise<ActionResult> {
   return {
     ok: true,
     message: "Background service uninstalled.",
+    snapshot: cloneSnapshot(mockStore),
+  };
+}
+
+export async function resetNetworkSettings(): Promise<ActionResult> {
+  if (isTauriRuntime()) {
+    return invokeWithTimeout<ActionResult>(
+      "reset_network_settings",
+      SERVICE_ACTION_TIMEOUT_MS,
+    );
+  }
+
+  if (mockStore.serviceState === "running") {
+    mockStore.serviceState = "stopped";
+  }
+  mockStore.live = null;
+  emitMockStatus();
+
+  return {
+    ok: true,
+    message: "Network settings reset to defaults.",
+    code: undefined,
     snapshot: cloneSnapshot(mockStore),
   };
 }

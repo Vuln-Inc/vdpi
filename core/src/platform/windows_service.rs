@@ -341,7 +341,7 @@ enum StopReason {
 }
 
 fn should_deactivate_proxy_on_stop(reason: StopReason) -> bool {
-    matches!(reason, StopReason::Stop)
+    matches!(reason, StopReason::Stop | StopReason::Shutdown)
 }
 
 fn should_fallback_upgrade_control(win32_err: Dword) -> bool {
@@ -1338,8 +1338,17 @@ async fn run_tun_service_runtime(
             } => {
                 if changed.is_ok() {
                     let event_flags = reconcile_events.swap(0, Ordering::SeqCst);
+                    let is_session_logon = (event_flags & RECONCILE_EVENT_SESSION_LOGON) != 0;
                     let is_power_resume = (event_flags & RECONCILE_EVENT_POWER_RESUME) != 0;
                     let is_session_unlock = (event_flags & RECONCILE_EVENT_SESSION_UNLOCK) != 0;
+                    if is_session_logon {
+                        // A user hive may have just loaded after boot-before-logon startup;
+                        // clear any stale vdpi AutoConfigURL/proxy entries once on logon.
+                        debug!(
+                            "WTS_SESSION_LOGON received in TUN mode; clearing any stale vdpi proxy entries"
+                        );
+                        let _ = tokio::task::spawn_blocking(clear_all_windows_proxies).await;
+                    }
                     if is_power_resume || is_session_unlock {
                         supervisor.ctx.dns.clear_cache().await;
                     }
@@ -1656,12 +1665,16 @@ async fn run_proxy_service_runtime(
 
     if should_deactivate_proxy_on_stop(reason) {
         if let Some(session) = proxy_session {
-            let _ = tokio::task::spawn_blocking(move || session.deactivate()).await;
+            let _ = tokio::task::spawn_blocking(move || {
+                session.deactivate();
+                crate::platform::windows::flush_dns_resolver_cache();
+            })
+            .await;
         }
     } else {
         info!(
             ?reason,
-            "preserving Windows proxy settings across stop/upgrade"
+            "preserving Windows proxy settings across upgrade"
         );
     }
 
@@ -2540,7 +2553,7 @@ mod tests {
     #[test]
     fn proxy_stop_deactivation_and_upgrade_fallback_rules() {
         assert!(should_deactivate_proxy_on_stop(StopReason::Stop));
-        assert!(!should_deactivate_proxy_on_stop(StopReason::Shutdown));
+        assert!(should_deactivate_proxy_on_stop(StopReason::Shutdown));
         assert!(!should_deactivate_proxy_on_stop(StopReason::Upgrade));
 
         assert!(should_fallback_upgrade_control(

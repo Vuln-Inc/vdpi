@@ -79,6 +79,8 @@ const en = {
     actionOpenSettings: "Open Settings",
     actionOpenAppFolder: "Open App Folder",
     actionOpenLogs: "Open Logs",
+    actionResetNetwork: "Reset Network",
+    actionResettingNetwork: "Resetting...",
     runningCardTitle: "Running diagnostics...",
     runningCardDescWin:
       "Probing VPN coexistence, Wintun driver, DNS/DoH, Discord, Roblox, and runtime hygiene. This is read-only and will not interrupt active connections.",
@@ -187,6 +189,8 @@ const tr: Record<DiagnosticsStringKey, string> = {
     actionOpenSettings: "Ayarları Aç",
     actionOpenAppFolder: "Uygulama Klasörünü Aç",
     actionOpenLogs: "Günlükleri Aç",
+    actionResetNetwork: "Ağı Sıfırla",
+    actionResettingNetwork: "Sıfırlanıyor...",
     runningCardTitle: "Tanılama çalıştırılıyor...",
     runningCardDescWin:
       "VPN uyumluluğu, Wintun sürücüsü, DNS/DoH, Discord, Roblox ve çalışma durumu test ediliyor. Bu işlem salt okunurdur ve etkin bağlantıları kesmez.",

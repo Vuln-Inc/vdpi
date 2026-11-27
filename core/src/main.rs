@@ -104,7 +104,12 @@ fn run_main() -> Result<()> {
 
     let resilient_admin_cmd = matches!(
         cli.command,
-        Some(Command::Uninstall { .. } | Command::Pause | Command::Resume)
+        Some(
+            Command::Uninstall { .. }
+                | Command::Pause
+                | Command::Resume
+                | Command::ResetNetwork { .. }
+        )
     );
     let effective_service_mode =
         cli.service || (cli.config_path.is_none() && has_installed_system_service());
@@ -684,6 +689,11 @@ fn run_main() -> Result<()> {
                     explicit_launcher = true;
                     continue;
                 }
+                launcher::Choice::ResetNetwork => {
+                    notice = Some(run_control_center_reset_network());
+                    explicit_launcher = true;
+                    continue;
+                }
                 launcher::Choice::Uninstall => {
                     match uninstall_service_quiet() {
                         Ok(()) => {
@@ -776,6 +786,10 @@ fn run_main() -> Result<()> {
         }
         Some(Command::Dashboard) => handle_dashboard_command(&cfg),
         Some(Command::Split { .. }) => unreachable!("handled by split command"),
+        Some(Command::ResetNetwork { json, no_elevate }) => {
+            init_tracing(&cfg);
+            handle_reset_network_command(json, no_elevate)
+        }
         Some(Command::Status { .. }) | Some(Command::Doctor) | Some(Command::Update { .. }) => {
             init_tracing(&cfg);
             let rt = build_cli_runtime()?;
@@ -801,7 +815,17 @@ fn run_main() -> Result<()> {
             #[cfg(target_os = "windows")]
             if cfg.engine == EngineMode::Tun {
                 if let Err(msg) = preflight_windows_wintun_dll() {
-                    let _ = vdpi::platform::windows_tun::cleanup_orphan_wintun_adapter();
+                    if vdpi::platform::windows_service::is_elevated() {
+                        if vdpi::platform::windows_tun::cleanup_orphan_wintun_adapter() {
+                            eprintln!(
+                                "Removed orphaned Windows TUN adapter (vdpi0) after wintun.dll preflight failure."
+                            );
+                        }
+                    } else {
+                        eprintln!(
+                            "Note: if a leftover vdpi0 adapter is blocking connectivity, run `vdpi reset-network`."
+                        );
+                    }
                     return Err(desktop_tun::format_tun_start_error(anyhow::anyhow!(
                         "{msg}"
                     )));
@@ -857,6 +881,184 @@ fn run_internal_macos_tun_guard() -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     {
         anyhow::bail!("--internal-macos-tun-guard is only supported on macOS")
+    }
+}
+
+fn emit_reset_network_report(
+    report: &vdpi::platform::NetworkResetReport,
+    json: bool,
+    lang: vdpi::i18n::Lang,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+    } else {
+        println!("{}", report.format_cli_summary(lang));
+    }
+    Ok(())
+}
+
+fn handle_reset_network_command(json: bool, no_elevate: bool) -> Result<()> {
+    let lang = vdpi::i18n::active_lang();
+    if no_elevate {
+        let report = vdpi::platform::reset_network_defaults(vdpi::platform::ResetScope::UserOnly);
+        return emit_reset_network_report(&report, json, lang);
+    }
+
+    if is_process_elevated() {
+        let report = vdpi::platform::reset_network_defaults(vdpi::platform::ResetScope::Full);
+        return emit_reset_network_report(&report, json, lang);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let child_args = vec!["reset-network".to_string()];
+        match vdpi::platform::windows_service::relaunch_elevated_and_wait(&child_args) {
+            Ok(()) => {
+                // Over-the-shoulder UAC may run under a separate admin account's HKCU;
+                // also run a current-user pass in this interactive session to clean HKCU
+                // and refresh WinINET/environment state.
+                let user_report =
+                    vdpi::platform::reset_network_defaults(vdpi::platform::ResetScope::UserOnly);
+                if !json {
+                    let note = vdpi::i18n::tr_for(
+                        lang,
+                        "Elevated Administrator reset completed; current-user cleanup summary:",
+                        "Yönetici ağ sıfırlama tamamlandı; geçerli kullanıcı temizlik özeti:",
+                    );
+                    println!("{note}");
+                }
+                emit_reset_network_report(&user_report, json, lang)
+            }
+            Err(err) => {
+                if !json {
+                    let prefix = vdpi::i18n::tr_for(
+                        lang,
+                        "Note: Administrator elevation unavailable",
+                        "Not: Yönetici yükseltmesi kullanılamadı",
+                    );
+                    let suffix = vdpi::i18n::tr_for(
+                        lang,
+                        "running current-user network reset (privileged items will be skipped).",
+                        "geçerli kullanıcı ağ sıfırlaması çalıştırılıyor (yönetici adımları atlanacak).",
+                    );
+                    eprintln!("{prefix} ({err:#}); {suffix}");
+                }
+                let report =
+                    vdpi::platform::reset_network_defaults(vdpi::platform::ResetScope::UserOnly);
+                emit_reset_network_report(&report, json, lang)
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let mut child_args = vec!["reset-network".to_string()];
+        if json {
+            child_args.push("--json".to_string());
+        }
+        match vdpi::service::relaunch_unix_sudo_and_wait(
+            &child_args,
+            "reset OS network settings to defaults",
+        ) {
+            Ok(()) => {
+                // Clean any user-session desktop proxy state (e.g. GNOME/KDE/systemd --user)
+                // that sudo may not reach when DBUS_SESSION_BUS_ADDRESS is stripped.
+                let _ =
+                    vdpi::platform::reset_network_defaults(vdpi::platform::ResetScope::UserOnly);
+                Ok(())
+            }
+            Err(err) => {
+                if !json {
+                    let prefix = vdpi::i18n::tr_for(
+                        lang,
+                        "Note: root elevation unavailable",
+                        "Not: root yükseltmesi kullanılamadı",
+                    );
+                    let suffix = vdpi::i18n::tr_for(
+                        lang,
+                        "running current-user network reset (privileged items will be skipped).",
+                        "geçerli kullanıcı ağ sıfırlaması çalıştırılıyor (yönetici adımları atlanacak).",
+                    );
+                    eprintln!("{prefix} ({err:#}); {suffix}");
+                }
+                let report =
+                    vdpi::platform::reset_network_defaults(vdpi::platform::ResetScope::UserOnly);
+                emit_reset_network_report(&report, json, lang)
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let report = vdpi::platform::reset_network_defaults(vdpi::platform::ResetScope::UserOnly);
+        emit_reset_network_report(&report, json, lang)
+    }
+}
+
+fn run_control_center_reset_network() -> String {
+    let lang = launcher::active_lang();
+    if is_process_elevated() {
+        let report = vdpi::platform::reset_network_defaults(vdpi::platform::ResetScope::Full);
+        return sanitize_notice(&report.format_short_summary(lang));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let child_args = vec!["reset-network".to_string()];
+        match vdpi::platform::windows_service::relaunch_elevated_and_wait(&child_args) {
+            Ok(()) => {
+                let user_report =
+                    vdpi::platform::reset_network_defaults(vdpi::platform::ResetScope::UserOnly);
+                if user_report.has_failures() {
+                    sanitize_notice(&user_report.format_short_summary(lang))
+                } else {
+                    launcher::tr(
+                        "Network settings reset to defaults.",
+                        "Ağ ayarları varsayılanlara sıfırlandı.",
+                    )
+                    .to_string()
+                }
+            }
+            Err(_) => {
+                let report =
+                    vdpi::platform::reset_network_defaults(vdpi::platform::ResetScope::UserOnly);
+                sanitize_notice(&report.format_short_summary(lang))
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let child_args = vec!["reset-network".to_string()];
+        match vdpi::service::relaunch_unix_sudo_and_wait(
+            &child_args,
+            "reset OS network settings to defaults",
+        ) {
+            Ok(()) => {
+                let user_report =
+                    vdpi::platform::reset_network_defaults(vdpi::platform::ResetScope::UserOnly);
+                if user_report.has_failures() {
+                    sanitize_notice(&user_report.format_short_summary(lang))
+                } else {
+                    launcher::tr(
+                        "Network settings reset to defaults.",
+                        "Ağ ayarları varsayılanlara sıfırlandı.",
+                    )
+                    .to_string()
+                }
+            }
+            Err(_) => {
+                let report =
+                    vdpi::platform::reset_network_defaults(vdpi::platform::ResetScope::UserOnly);
+                sanitize_notice(&report.format_short_summary(lang))
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let report = vdpi::platform::reset_network_defaults(vdpi::platform::ResetScope::UserOnly);
+        sanitize_notice(&report.format_short_summary(lang))
     }
 }
 
@@ -2887,11 +3089,8 @@ impl ForegroundProxySpec {
                 self.env_proxy,
                 &self.bypass_domains,
             )?;
-            let summary = if self.env_proxy {
-                "active (WinINET + HTTP_PROXY/HTTPS_PROXY with auto-cleanup)".to_string()
-            } else {
-                "active (WinINET proxy with auto-cleanup)".to_string()
-            };
+            let summary =
+                "active (WinINET fail-open PAC AutoConfigURL with auto-cleanup)".to_string();
             Ok((session, summary))
         }
     }
@@ -2937,6 +3136,18 @@ async fn run_daemon(
                 "desktop TUN mode is not supported on {} CLI; use --proxy instead",
                 platform_name()
             );
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    if vdpi::platform::windows_service::is_elevated() {
+        let cleaned = tokio::task::spawn_blocking(
+            vdpi::platform::windows_tun::cleanup_orphan_wintun_adapter,
+        )
+        .await
+        .unwrap_or(false);
+        if cleaned {
+            info!("cleaned up orphaned Windows Wintun adapter before starting foreground Proxy mode");
         }
     }
 
@@ -5154,9 +5365,9 @@ fn print_startup_banner(
         proxy_summary.unwrap_or("disabled (--no-system-proxy)")
     );
     #[cfg(windows)]
-    if cfg.system_proxy && cfg.env_proxy {
+    if cfg.system_proxy {
         println!(
-            "  Desktop Apps Note   : Restart any already-open browser once if launching games (e.g. Roblox) from it,\n                        or run `vdpi install` so HTTPS_PROXY is inherited automatically at login.\n"
+            "  Desktop Apps Note   : Proxy mode uses fail-open WinINET PAC for browsers; switch to TUN mode (`vdpi --tun`)\n                        for games and desktop apps like Roblox or Discord voice.\n"
         );
     }
 }

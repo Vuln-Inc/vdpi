@@ -120,6 +120,11 @@ const en = {
     "Exit the desktop window and remove any tray icon immediately.",
   btnQuitting: "Quitting...",
   btnQuitGui: "Quit GUI",
+  resetNetworkLabel: "Reset network to defaults",
+  resetNetworkDesc:
+    "Stops vdpi and clears OS proxy/PAC, WinHTTP, orphan TUN routes, and DNS cache if your connection got stuck after a crash or antivirus removal.",
+  btnResetNetwork: "Reset Network",
+  btnResettingNetwork: "Resetting...",
 
   // Uninstall confirm dialog
   uninstallTitle: "Uninstall background service?",
@@ -265,6 +270,11 @@ const tr: SettingsDict = {
     "Masaüstü penceresinden çıkın ve sistem tepsisi simgesini hemen kaldırın.",
   btnQuitting: "Çıkılıyor...",
   btnQuitGui: "Arayüzden Çık",
+  resetNetworkLabel: "Ağ ayarlarını sıfırla",
+  resetNetworkDesc:
+    "Çökme veya antivirüs kaldırması sonrası bağlantı takılırsa vdpi'yi durdurur; OS proxy/PAC, WinHTTP, sahipsiz TUN yollarını ve DNS önbelleğini temizler.",
+  btnResetNetwork: "Ağı Sıfırla",
+  btnResettingNetwork: "Sıfırlanıyor...",
 
   // Uninstall confirm dialog
   uninstallTitle: "Arka plan servisi kaldırılsın mı?",

@@ -132,6 +132,9 @@ const en = {
   uninstallCancelled: "Service uninstall cancelled.",
   uninstallFailed: "Failed to uninstall background service.",
   uninstallSuccess: "Background service uninstalled.",
+  resetNetworkSuccess: "Network settings reset to defaults.",
+  resetNetworkCancelled: "Network reset was cancelled.",
+  resetNetworkFailed: "Failed to reset network settings.",
   actionBusy: "Another service operation is already in progress.",
   actionShuttingDown: "The desktop app is shutting down.",
   checkUpdatesFailed: "Could not check for updates.",
@@ -182,6 +185,11 @@ const en = {
   switchToTunAdminMac:
     " A macOS administrator prompt may appear to restart the background service.",
   switchToTunConfirm: "Switch to Full-PC (TUN)",
+  resetNetworkConfirmTitle: "Reset network settings to defaults",
+  resetNetworkConfirmBody:
+    "This stops vdpi if running and resets OS proxy/PAC, WinHTTP, proxy environment variables, orphan TUN adapters & routes, and the DNS cache to OS defaults. Your vdpi configuration is kept.",
+  resetNetworkConfirmAction: "Reset Network",
+  resetNetworkCancelAction: "Cancel",
 } as const;
 
 export type ShellStringKey = keyof typeof en;
@@ -317,6 +325,9 @@ const tr: ShellDict = {
   uninstallCancelled: "Servis kaldırma işlemi iptal edildi.",
   uninstallFailed: "Arka plan servisi kaldırılamadı.",
   uninstallSuccess: "Arka plan servisi kaldırıldı.",
+  resetNetworkSuccess: "Ağ ayarları varsayılanlara sıfırlandı.",
+  resetNetworkCancelled: "Ağ sıfırlama iptal edildi.",
+  resetNetworkFailed: "Ağ ayarları sıfırlanamadı.",
   actionBusy: "Başka bir servis işlemi zaten devam ediyor.",
   actionShuttingDown: "Masaüstü uygulaması kapatılıyor.",
   checkUpdatesFailed: "Güncellemeler denetlenemedi.",
@@ -367,6 +378,11 @@ const tr: ShellDict = {
   switchToTunAdminMac:
     " Arka plan servisini yeniden başlatmak için macOS yönetici onayı istenebilir.",
   switchToTunConfirm: "Tam PC (TUN) Moduna Geç",
+  resetNetworkConfirmTitle: "Ağ ayarlarını varsayılanlara sıfırla",
+  resetNetworkConfirmBody:
+    "Çalışıyorsa vdpi'yi durdurur; işletim sistemi proxy/PAC, WinHTTP, proxy ortam değişkenleri, sahipsiz TUN bağdaştırıcıları ve yolları ile DNS önbelleğini varsayılanlara sıfırlar. vdpi yapılandırmanız korunur.",
+  resetNetworkConfirmAction: "Ağı Sıfırla",
+  resetNetworkCancelAction: "İptal",
 };
 
 export const SHELL_STRINGS: {
@@ -390,6 +406,13 @@ const KNOWN_ACTION_MESSAGES_TR: Record<string, string> = {
     "Servis onarımı zaten devam ediyor.",
   "Service uninstall is already in progress.":
     "Servis kaldırma işlemi zaten devam ediyor.",
+  "Network reset is already in progress.":
+    "Ağ sıfırlama zaten devam ediyor.",
+  "Network settings reset to defaults.":
+    "Ağ ayarları varsayılanlara sıfırlandı.",
+  "Network reset was cancelled.": "Ağ sıfırlama iptal edildi.",
+  "User network settings reset to defaults (Administrator/root items skipped).":
+    "Kullanıcı ağ ayarları varsayılanlara sıfırlandı (Yönetici/root öğeleri atlandı).",
   "A protection toggle is already in progress.":
     "Koruma durumu değişikliği zaten devam ediyor.",
   "An engine switch is already in progress.":
@@ -868,9 +891,19 @@ export function localizeActionMessage(
     return "wintun.dll eksik - vdpi Desktop uygulamasını yeniden kurun, zip arşivindeki tüm dosyaları çıkarın veya Windows Defender karantinasını kontrol edin.";
   }
 
+  const resetNetworkWithDetail =
+    /^Network settings reset to defaults\s*\((.+)\)\.?$/i.exec(message);
+  if (resetNetworkWithDetail) {
+    return `Ağ ayarları varsayılanlara sıfırlandı (${resetNetworkWithDetail[1]}).`;
+  }
+
   const failedPrefixPatterns: ReadonlyArray<
     readonly [RegExp, (match: RegExpExecArray) => string]
   > = [
+    [
+      /^Failed to reset network settings:\s*(.+)$/i,
+      (m) => `Ağ ayarları sıfırlanamadı: ${m[1]}`,
+    ],
     [
       /^Failed to enable protection: (.+)$/,
       (m) => `Koruma etkinleştirilemedi: ${m[1]}`,

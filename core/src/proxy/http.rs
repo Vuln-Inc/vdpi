@@ -678,13 +678,81 @@ fn render_pac_bypass_clauses(bypass_domains: &[String]) -> String {
     clauses
 }
 
-#[allow(dead_code)]
+const PAC_DEFAULT_DIRECT_DOMAINS: &[&str] = &[
+    // Riot / Valorant (strict TLS & anti-cheat)
+    "riotgames.com",
+    "riotgames.net",
+    "riotcdn.net",
+    "playvalorant.com",
+    "valorant.com",
+    "pvp.net",
+    "rgpub.io",
+    "rdatasrv.net",
+    "leagueoflegends.com",
+    // Third-party VPN control-plane, auth & bootstrap APIs
+    "mullvad.net",
+    "protonvpn.com",
+    "proton.me",
+    "nordvpn.com",
+    "surfshark.com",
+    "cloudflareclient.com",
+    "tailscale.com",
+    "expressvpn.com",
+    "expressvpn.net",
+    "expressapisv2.net",
+    "xvnet.net",
+    "xvtel.com",
+    "windscribe.com",
+    "cyberghostvpn.com",
+    "privateinternetaccess.com",
+    "pia-dns.com",
+    "ipvanish.com",
+    "tunnelbear.com",
+    "adguard-vpn.com",
+    "hotspotshield.com",
+    "warp.plus",
+];
+
+#[cfg(test)]
 fn render_pac_script(proxy_authority: &str) -> String {
     render_pac_script_with_bypass(proxy_authority, &[])
 }
 
+#[cfg(test)]
 fn render_pac_script_with_bypass(proxy_authority: &str, bypass_domains: &[String]) -> String {
-    let extra_clauses = render_pac_bypass_clauses(bypass_domains);
+    render_pac_script_with_policy(proxy_authority, bypass_domains, &[])
+}
+
+fn render_pac_script_with_policy(
+    proxy_authority: &str,
+    bypass_domains: &[String],
+    include_domains: &[String],
+) -> String {
+    let default_direct = vdpi_core::bypass::filter_pac_default_bypass_domains(
+        PAC_DEFAULT_DIRECT_DOMAINS,
+        include_domains,
+    );
+    let mut combined_bypass = Vec::with_capacity(default_direct.len() + bypass_domains.len());
+    for domain in &default_direct {
+        combined_bypass.push((*domain).to_string());
+    }
+    for entry in bypass_domains {
+        let trimmed = entry.trim();
+        let stripped = trimmed
+            .strip_prefix("*.")
+            .or_else(|| trimmed.strip_prefix('.'))
+            .unwrap_or(trimmed)
+            .trim_end_matches('.');
+        let is_default_dup = !trimmed.contains('/')
+            && !stripped.contains('*')
+            && default_direct
+                .iter()
+                .any(|domain| domain.eq_ignore_ascii_case(stripped));
+        if !is_default_dup {
+            combined_bypass.push(entry.clone());
+        }
+    }
+    let extra_clauses = render_pac_bypass_clauses(&combined_bypass);
     let ipv6_helpers = if extra_clauses.contains("isInNetV6(") {
         PAC_IPV6_CIDR_HELPERS
     } else {
@@ -796,9 +864,13 @@ async fn handle_pac_http_request(
     }
 
     let proxy_authority = resolve_pac_proxy_authority(client.local_addr().ok(), ctx);
-    let body = render_pac_script_with_bypass(&proxy_authority, &ctx.config.bypass_domains);
+    let body = render_pac_script_with_policy(
+        &proxy_authority,
+        &ctx.config.bypass_domains,
+        &ctx.config.patterns,
+    );
     let headers = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig; charset=utf-8\r\nCache-Control: max-age=30, private\r\nX-Content-Type-Options: nosniff\r\nCross-Origin-Resource-Policy: same-origin\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig; charset=utf-8\r\nCache-Control: no-store, max-age=0\r\nX-Content-Type-Options: nosniff\r\nCross-Origin-Resource-Policy: same-origin\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     if is_head {
@@ -1431,7 +1503,7 @@ mod tests {
         assert!(
             headers.contains("Content-Type: application/x-ns-proxy-autoconfig; charset=utf-8\r\n")
         );
-        assert!(headers.contains("Cache-Control: max-age=30, private\r\n"));
+        assert!(headers.contains("Cache-Control: no-store, max-age=0\r\n"));
         assert!(headers.contains("X-Content-Type-Options: nosniff\r\n"));
         assert!(headers.contains("Cross-Origin-Resource-Policy: same-origin\r\n"));
         assert!(headers.contains(&format!("Content-Length: {}\r\n", body.len())));
@@ -2234,5 +2306,121 @@ mod tests {
             !accepted.load(Ordering::SeqCst),
             "forbidden target must be blocked before initiating TCP connect"
         );
+    }
+
+    #[tokio::test]
+    async fn pac_endpoint_uses_no_store_cache_and_bypasses_riot_and_vpn_bootstrap_domains() {
+        let mut cfg = CliArgs::parse_from_iter(["vdpi", "--no-system-proxy"])
+            .unwrap()
+            .into_runtime_config();
+        // Duplicate of a built-in PAC bypass should not be emitted twice.
+        cfg.bypass_domains = vec!["*.riotgames.com".to_string()];
+        let ctx = EngineContext::new(cfg).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            handle_http_client(sock, ctx).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "GET /vdpi.pac HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+            addr.port()
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        server.await.unwrap().unwrap();
+
+        let resp_str = String::from_utf8(resp).unwrap();
+        let (headers, body) = resp_str.split_once("\r\n\r\n").unwrap();
+        assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(headers.contains("Cache-Control: no-store, max-age=0\r\n"));
+        assert!(!headers.contains("max-age=30"));
+
+        let direct_branch = body
+            .split_once("return \"DIRECT\";")
+            .expect("PAC script must contain DIRECT return")
+            .0;
+
+        for domain in [
+            "riotgames.com",
+            "riotgames.net",
+            "riotcdn.net",
+            "playvalorant.com",
+            "valorant.com",
+            "pvp.net",
+            "rgpub.io",
+            "rdatasrv.net",
+            "leagueoflegends.com",
+            "mullvad.net",
+            "protonvpn.com",
+            "proton.me",
+            "nordvpn.com",
+            "surfshark.com",
+            "cloudflareclient.com",
+            "tailscale.com",
+        ] {
+            let exact = format!("h === \"{domain}\"");
+            let suffix = format!("\".{domain}\"");
+            assert!(
+                direct_branch.contains(&exact),
+                "missing PAC exact DIRECT clause for {domain}"
+            );
+            assert!(
+                direct_branch.contains(&suffix),
+                "missing PAC subdomain DIRECT clause for {domain}"
+            );
+        }
+
+        // Built-in + user duplicate `*.riotgames.com` must only appear once.
+        assert_eq!(body.matches("h === \"riotgames.com\"").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn pac_endpoint_respects_include_domain_overrides_for_riot_and_vpn_defaults() {
+        let mut cfg = CliArgs::parse_from_iter(["vdpi", "--no-system-proxy"])
+            .unwrap()
+            .into_runtime_config();
+        cfg.patterns = vec![
+            "auth.riotgames.com".to_string(),
+            "*.proton.me".to_string(),
+            r"\.mullvad\.net$".to_string(),
+        ];
+        // Explicit user bypass still wins over include_domains.
+        cfg.bypass_domains = vec!["mullvad.net".to_string()];
+        let ctx = EngineContext::new(cfg).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            handle_http_client(sock, ctx).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "GET /vdpi.pac HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+            addr.port()
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        server.await.unwrap().unwrap();
+
+        let resp_str = String::from_utf8(resp).unwrap();
+        let (_, body) = resp_str.split_once("\r\n\r\n").unwrap();
+
+        // Overridden defaults are omitted so included targets reach the proxy.
+        assert!(!body.contains("h === \"riotgames.com\""));
+        assert!(!body.contains("h === \"proton.me\""));
+        // Explicit user bypass still remains DIRECT.
+        assert!(body.contains("h === \"mullvad.net\""));
+        // Unrelated Riot and VPN bootstrap domains stay DIRECT.
+        assert!(body.contains("h === \"valorant.com\""));
+        assert!(body.contains("h === \"tailscale.com\""));
+        assert!(body.contains("h === \"nordvpn.com\""));
     }
 }

@@ -76,6 +76,16 @@ pub enum Command {
         #[arg(long, default_value_t = false)]
         force: bool,
     },
+    /// Stop vdpi if running and reset OS proxy, PAC, WinHTTP, orphan TUN/routes, and DNS settings to defaults
+    #[command(visible_alias = "fix-network")]
+    ResetNetwork {
+        /// Emit itemized reset report as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Only reset current-user settings without requesting Administrator/root elevation
+        #[arg(long, default_value_t = false)]
+        no_elevate: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
@@ -1678,6 +1688,62 @@ mod tests {
                     mode: SplitTunnelMode::Exclude,
                     apps: vec!["-hyphen-app.exe".to_string()],
                 })
+            })
+        );
+    }
+
+    #[test]
+    fn parses_reset_network_subcommand_alias_and_flags() {
+        <CliArgs as clap::CommandFactory>::command().debug_assert();
+
+        let reset = CliArgs::parse_from_iter(["vdpi", "reset-network"])
+            .expect("valid reset-network subcommand");
+        assert_eq!(
+            reset.command,
+            Some(Command::ResetNetwork {
+                json: false,
+                no_elevate: false,
+            })
+        );
+
+        let alias =
+            CliArgs::parse_from_iter(["vdpi", "fix-network"]).expect("valid fix-network alias");
+        assert_eq!(
+            alias.command,
+            Some(Command::ResetNetwork {
+                json: false,
+                no_elevate: false,
+            })
+        );
+
+        let reset_json = CliArgs::parse_from_iter(["vdpi", "reset-network", "--json"])
+            .expect("valid reset-network --json");
+        assert_eq!(
+            reset_json.command,
+            Some(Command::ResetNetwork {
+                json: true,
+                no_elevate: false,
+            })
+        );
+
+        let reset_no_elevate = CliArgs::parse_from_iter(["vdpi", "reset-network", "--no-elevate"])
+            .expect("valid reset-network --no-elevate");
+        assert_eq!(
+            reset_no_elevate.command,
+            Some(Command::ResetNetwork {
+                json: false,
+                no_elevate: true,
+            })
+        );
+
+        let alias_both =
+            CliArgs::parse_from_iter(["vdpi", "fix-network", "--json", "--no-elevate"])
+                .expect("valid fix-network --json --no-elevate");
+        assert_eq!(
+            alias_both.command,
+            Some(Command::ResetNetwork {
+                json: true,
+                no_elevate: true,
             })
         );
     }

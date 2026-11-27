@@ -230,6 +230,11 @@ const en = {
   btnOpenConfigFolderAria: "Open Folder - Configuration",
   btnOpenLogsFolderAria: "Open Folder - Logs",
   btnAppFolder: "App Folder",
+  networkRecoveryLabel: "Network recovery",
+  networkRecoveryDesc:
+    "Reset OS proxy/PAC, WinHTTP, orphan TUN routes, and DNS cache to defaults (works even if antivirus removed vdpi.exe).",
+  btnResetNetwork: "Reset Network",
+  btnResettingNetwork: "Resetting...",
 
   // Confirm dialogs
   repairDialogTitle: "Repair / Reinstall background service?",
@@ -479,6 +484,11 @@ const tr: InstallationDict = {
   btnOpenConfigFolderAria: "Klasörü Aç - Yapılandırma",
   btnOpenLogsFolderAria: "Klasörü Aç - Günlükler",
   btnAppFolder: "Uygulama Klasörü",
+  networkRecoveryLabel: "Ağ kurtarma",
+  networkRecoveryDesc:
+    "OS proxy/PAC, WinHTTP, sahipsiz TUN yollarını ve DNS önbelleğini varsayılanlara sıfırlayın (antivirüs vdpi.exe dosyasını silse bile çalışır).",
+  btnResetNetwork: "Ağı Sıfırla",
+  btnResettingNetwork: "Sıfırlanıyor...",
 
   // Confirm dialogs
   repairDialogTitle: "Arka plan servisi onarılsın mı?",

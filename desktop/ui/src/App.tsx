@@ -45,6 +45,7 @@ import {
   openAppFolder,
   openExternalUrl,
   repairService,
+  resetNetworkSettings,
   switchEngine,
   toggleProtection,
   uninstallService,
@@ -747,6 +748,7 @@ function AppShellContent({
   const [dnsDirty, setDnsDirty] = useState(false);
   const [pendingTab, setPendingTab] = useState<NavTab | null>(null);
   const [confirmSwitchToTunOpen, setConfirmSwitchToTunOpen] = useState(false);
+  const [confirmResetNetworkOpen, setConfirmResetNetworkOpen] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<UpdateCheckPayload | null>(null);
   const [checkingUpdates, setCheckingUpdates] = useState(false);
   const [updatePromptDismissed, setUpdatePromptDismissed] = useState(false);
@@ -979,6 +981,9 @@ function AppShellContent({
   }, [ingestActionSnapshot, pushToast]);
 
   const effectiveBusyAction = busyAction ?? status?.pendingOperation ?? null;
+  const resetNetworkBusy =
+    effectiveBusyAction === "reset-network" ||
+    effectiveBusyAction === "resetting_network";
   const activeEngine: EngineMode =
     status?.live?.engine ??
     effectiveSettings?.engine ??
@@ -1037,6 +1042,7 @@ function AppShellContent({
     status !== null &&
     pendingTab === null &&
     !confirmSwitchToTunOpen &&
+    !confirmResetNetworkOpen &&
     !foreignModalOpen &&
     !hasForeignAriaModal() &&
     (updatePromptUpgrading || effectiveBusyAction === null);
@@ -1058,6 +1064,9 @@ function AppShellContent({
       setActiveTab(tab);
       setPendingTab(null);
       setConfirmSwitchToTunOpen(false);
+      if (busyActionRef.current === null) {
+        setConfirmResetNetworkOpen(false);
+      }
       if (tab === "installation") {
         setUpdatePromptDismissed(true);
         setUpdatePromptFeedback(null);
@@ -1158,6 +1167,12 @@ function AppShellContent({
   }, []);
 
   const handleCloseModal = useCallback(() => {
+    if (confirmResetNetworkOpen) {
+      if (!resetNetworkBusy) {
+        setConfirmResetNetworkOpen(false);
+      }
+      return;
+    }
     if (confirmSwitchToTunOpen) {
       setConfirmSwitchToTunOpen(false);
       return;
@@ -1176,9 +1191,11 @@ function AppShellContent({
       setUpdatePromptDismissed(true);
     }
   }, [
+    confirmResetNetworkOpen,
     confirmSwitchToTunOpen,
     effectiveBusyAction,
     pendingTab,
+    resetNetworkBusy,
     updatePromptOpen,
     updatePromptUpgrading,
   ]);
@@ -1186,7 +1203,10 @@ function AppShellContent({
   useKeyboardShortcuts({
     onSelectTab: handleProgrammaticNavigate,
     hasOpenModal:
-      pendingTab !== null || confirmSwitchToTunOpen || updatePromptOpen,
+      pendingTab !== null ||
+      confirmSwitchToTunOpen ||
+      confirmResetNetworkOpen ||
+      updatePromptOpen,
     onCloseModal: handleCloseModal,
   });
 
@@ -2017,6 +2037,94 @@ function AppShellContent({
     }
   }, [pushToast, setBusy, syncAfterServiceMutation]);
 
+  const handleRequestResetNetwork = useCallback(() => {
+    if (effectiveBusyAction) {
+      return;
+    }
+    setConfirmResetNetworkOpen(true);
+  }, [effectiveBusyAction]);
+
+  const handleCancelResetNetwork = useCallback(() => {
+    if (!resetNetworkBusy) {
+      setConfirmResetNetworkOpen(false);
+    }
+  }, [resetNetworkBusy]);
+
+  const handleConfirmResetNetwork = useCallback(async () => {
+    if (busyActionRef.current !== null || effectiveBusyAction !== null) {
+      return;
+    }
+
+    setBusy("reset-network");
+    try {
+      const result = await resetNetworkSettings();
+      if (!mountedRef.current) {
+        return;
+      }
+
+      await syncAfterServiceMutation(result.snapshot);
+      if (!mountedRef.current) {
+        return;
+      }
+
+      const currentLang = langRef.current;
+      if (result.cancelled) {
+        pushToast(
+          "info",
+          safeActionMessage(
+            currentLang,
+            result.message,
+            tShell(currentLang, "resetNetworkCancelled"),
+          ),
+        );
+      } else if (!result.ok && isCalmTransientCode(result.code)) {
+        pushToast(
+          "info",
+          resolveActionResultMessage(
+            currentLang,
+            result,
+            tShell(currentLang, "actionBusy"),
+          ),
+        );
+      } else if (!result.ok) {
+        pushToast(
+          "error",
+          resolveActionResultMessage(
+            currentLang,
+            result,
+            tShell(currentLang, "resetNetworkFailed"),
+          ),
+        );
+      } else {
+        setInstallError(null);
+        pushToast(
+          "success",
+          safeActionMessage(
+            currentLang,
+            result.message,
+            tShell(currentLang, "resetNetworkSuccess"),
+          ),
+        );
+      }
+    } catch (err) {
+      if (mountedRef.current) {
+        pushToast(
+          "error",
+          getLocalizedErrorMessage(
+            langRef.current,
+            err,
+            tShell(langRef.current, "resetNetworkFailed"),
+          ),
+        );
+      }
+    } finally {
+      setBusy(null);
+      if (mountedRef.current) {
+        setConfirmResetNetworkOpen(false);
+      }
+    }
+  }, [effectiveBusyAction, pushToast, setBusy, syncAfterServiceMutation]);
+
   const handleUpdatePromptAction = useCallback(() => {
     if (updatePromptKind === "engine") {
       if (updatePromptUpgrading || busyActionRef.current !== null) {
@@ -2174,6 +2282,7 @@ function AppShellContent({
     setDnsDirty(false);
     setPendingTab(null);
     setConfirmSwitchToTunOpen(false);
+    setConfirmResetNetworkOpen(false);
     setInstallError(null);
     setActiveTab("overview");
     if (mainContentRef.current) {
@@ -2368,6 +2477,7 @@ function AppShellContent({
                 onStartProtection={handleStartProtection}
                 onInstallService={handleInstallService}
                 onOpenAppFolder={handleOpenAppFolder}
+                onResetNetwork={handleRequestResetNetwork}
               />
             ) : null}
 
@@ -2384,6 +2494,7 @@ function AppShellContent({
                 onUpgradeService={handleUpgradeService}
                 onRepairService={handleRepairService}
                 onUninstallService={handleUninstallService}
+                onResetNetwork={handleRequestResetNetwork}
                 onCheckUpdates={handleCheckUpdates}
                 onOpenReleaseUrl={handleOpenReleaseUrl}
                 onOpenAppFolder={handleOpenAppFolder}
@@ -2407,6 +2518,7 @@ function AppShellContent({
                 onInstallService={handleInstallService}
                 onUpgradeService={handleUpgradeService}
                 onUninstallService={handleUninstallService}
+                onResetNetwork={handleRequestResetNetwork}
                 onCheckUpdates={handleCheckUpdates}
                 onOpenReleaseUrl={handleOpenReleaseUrl}
                 onNavigate={handleProgrammaticNavigate}
@@ -2459,6 +2571,19 @@ function AppShellContent({
         cancelLabel={tShell(lang, "cancel")}
         onConfirm={handleConfirmSwitchToTun}
         onCancel={handleCancelSwitchToTun}
+      />
+
+      <ConfirmDialog
+        open={confirmResetNetworkOpen}
+        title={tShell(lang, "resetNetworkConfirmTitle")}
+        description={tShell(lang, "resetNetworkConfirmBody")}
+        confirmLabel={tShell(lang, "resetNetworkConfirmAction")}
+        cancelLabel={tShell(lang, "resetNetworkCancelAction")}
+        busy={resetNetworkBusy}
+        onConfirm={() => {
+          void handleConfirmResetNetwork();
+        }}
+        onCancel={handleCancelResetNetwork}
       />
 
       <ToastStack

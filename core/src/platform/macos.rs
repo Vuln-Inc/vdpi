@@ -15,11 +15,23 @@ pub const PAC_PATH: &str = "/vdpi.pac";
 const ENV_KEYS: &[&str] = &[
     "HTTP_PROXY",
     "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
     "http_proxy",
     "https_proxy",
-    "NO_PROXY",
+    "all_proxy",
     "no_proxy",
 ];
+
+const DEFAULT_MACOS_BYPASS_DOMAINS: &[&str] = &["*.local", "169.254/16"];
+
+#[derive(Debug, Clone, Default)]
+pub struct UnixProxyResetOutcome {
+    pub proxy_changed: bool,
+    pub env_changed: bool,
+    pub skipped_privileges: bool,
+    pub errors: Vec<String>,
+}
 
 fn normalize_proxy_addr(addr: IpAddr) -> IpAddr {
     match addr.to_canonical() {
@@ -477,6 +489,42 @@ fn resolve_elevated_user() -> Option<ElevatedUser> {
         home: std::env::var_os("HOME").map(PathBuf::from),
     };
     resolve_elevated_user_from(&env, lookup_passwd_by_uid, lookup_passwd_by_name)
+}
+
+#[cfg(unix)]
+fn resolve_console_desktop_user() -> Option<ElevatedUser> {
+    use std::os::unix::fs::MetadataExt;
+
+    let uid = fs::metadata("/dev/console").ok()?.uid();
+    if uid == 0 {
+        return None;
+    }
+    let entry = lookup_passwd_by_uid(uid);
+    let gid = entry.as_ref().map(|e| e.gid).unwrap_or(libc::gid_t::MAX);
+    let home_dir = entry.map(|e| e.home_dir);
+    Some(ElevatedUser { uid, gid, home_dir })
+}
+
+#[cfg(unix)]
+fn resolve_target_desktop_user() -> Option<ElevatedUser> {
+    // SAFETY: `geteuid(2)` is always safe to call and never fails.
+    let euid = unsafe { libc::geteuid() };
+    if euid == 0 {
+        return resolve_elevated_user().or_else(resolve_console_desktop_user);
+    }
+    let entry = lookup_passwd_by_uid(euid);
+    let gid = entry.as_ref().map(|e| e.gid).unwrap_or_else(|| {
+        // SAFETY: `getegid(2)` is always safe to call and never fails.
+        unsafe { libc::getegid() }
+    });
+    let home_dir = entry
+        .map(|e| e.home_dir)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+    Some(ElevatedUser {
+        uid: euid,
+        gid,
+        home_dir,
+    })
 }
 
 #[cfg(unix)]
@@ -1469,6 +1517,248 @@ pub fn clear_all_macos_proxies() -> Result<()> {
     unset_stale_loopback_launchd_proxy_env();
     remove_state_file(&state_path);
     Ok(())
+}
+
+fn bypass_domains_match_default(domains: &[String]) -> bool {
+    domains.len() == DEFAULT_MACOS_BYPASS_DOMAINS.len()
+        && domains
+            .iter()
+            .zip(DEFAULT_MACOS_BYPASS_DOMAINS.iter())
+            .all(|(actual, expected)| actual.trim().eq_ignore_ascii_case(expected))
+}
+
+fn service_proxy_needs_reset(st: &NetworkServiceProxyStatus, bypass: Option<&[String]>) -> bool {
+    st.auto_proxy_enabled
+        || !st.auto_proxy_url.trim().is_empty()
+        || st.web_enabled
+        || st.secure_enabled
+        || st.socks_enabled
+        || bypass.is_some_and(|domains| !bypass_domains_match_default(domains))
+}
+
+fn is_macos_privilege_error(err_text: &str) -> bool {
+    let lower = err_text.to_ascii_lowercase();
+    lower.contains("permission denied")
+        || lower.contains("operation not permitted")
+        || lower.contains("not permitted")
+        || lower.contains("not authorized")
+        || lower.contains("authorization")
+        || lower.contains("administrator")
+        || lower.contains("requires root")
+        || lower.contains("must be root")
+        || lower.contains("privileges")
+        || lower.contains("-60005")
+        || lower.contains("-60006")
+        || lower.contains("-60007")
+        || lower.contains("-60008")
+}
+
+fn collect_macos_proxy_state_paths(target_user: Option<&ElevatedUser>) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::with_capacity(4);
+    let mut push_unique = |p: PathBuf| {
+        if !p.as_os_str().is_empty() && !paths.iter().any(|existing| existing == &p) {
+            paths.push(p);
+        }
+    };
+    if let Some(home) = target_user.and_then(|u| u.home_dir.as_deref()) {
+        push_unique(home.join(".vdpi").join("macos-proxy-state.json"));
+    }
+    push_unique(macos_proxy_state_path());
+    push_unique(PathBuf::from(
+        "/Library/Application Support/vdpi/macos-proxy-state.json",
+    ));
+    push_unique(PathBuf::from("/var/root/.vdpi/macos-proxy-state.json"));
+    paths
+}
+
+fn read_launchd_env_for_uid(uid: Option<libc::uid_t>, key: &str) -> Option<String> {
+    let mut cmd = Command::new("/bin/launchctl");
+    if let Some(u) = uid {
+        cmd.args(["asuser", &u.to_string(), "/bin/launchctl", "getenv", key]);
+    } else {
+        cmd.args(["getenv", key]);
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if val.is_empty() {
+        None
+    } else {
+        Some(val)
+    }
+}
+
+fn unset_launchd_env_for_uid(uid: Option<libc::uid_t>, errors: &mut Vec<String>) -> bool {
+    let mut changed = false;
+    for key in ENV_KEYS {
+        let was_set = read_launchd_env_for_uid(uid, key).is_some();
+        let mut cmd = Command::new("/bin/launchctl");
+        if let Some(u) = uid {
+            cmd.args(["asuser", &u.to_string(), "/bin/launchctl", "unsetenv", key]);
+        } else {
+            cmd.args(["unsetenv", key]);
+        }
+        match cmd.output() {
+            Ok(out) if out.status.success() => {
+                if was_set {
+                    changed = true;
+                }
+            }
+            Ok(out) => {
+                if was_set {
+                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    errors.push(format!(
+                        "launchctl unsetenv {key} exited {}: {stderr}",
+                        out.status
+                    ));
+                }
+            }
+            Err(err) => {
+                if was_set {
+                    errors.push(format!("failed to execute launchctl unsetenv {key}: {err}"));
+                }
+            }
+        }
+    }
+    changed
+}
+
+fn remove_macos_proxy_state_file_guarded(
+    path: &Path,
+    home_guard: Option<&Path>,
+    is_root: bool,
+    outcome: &mut UnixProxyResetOutcome,
+) {
+    if let Some(home_dir) = home_guard {
+        if let Err(err) = ensure_no_intermediate_symlink_under_home(path, home_dir) {
+            warn!(
+                path = %path.display(),
+                error = %err,
+                "refusing to remove macOS proxy state file through unsafe path"
+            );
+            return;
+        }
+        if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            warn!(
+                path = %path.display(),
+                "refusing to remove symlinked macOS proxy state file under user home"
+            );
+            return;
+        }
+    }
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) if !is_root && err.kind() == std::io::ErrorKind::PermissionDenied => {
+            outcome.skipped_privileges = true;
+        }
+        Err(err) => {
+            outcome.errors.push(format!(
+                "failed to remove {}: {err}",
+                path.display()
+            ));
+        }
+    }
+}
+
+/// Resets macOS network service proxies, proxy bypass domains, launchd proxy environment
+/// variables, and saved proxy state files back to clean factory defaults.
+pub fn reset_macos_proxies_to_defaults() -> UnixProxyResetOutcome {
+    let mut outcome = UnixProxyResetOutcome::default();
+    // SAFETY: `geteuid(2)` is always safe to call and never fails.
+    let is_root = unsafe { libc::geteuid() == 0 };
+    let target_user = resolve_target_desktop_user();
+    let user_home = target_user.as_ref().and_then(|u| u.home_dir.as_deref());
+    let state_paths = collect_macos_proxy_state_paths(target_user.as_ref());
+
+    let mut services: Vec<String> = match list_configurable_network_services() {
+        Ok(svcs) => svcs,
+        Err(err) => {
+            let msg = format!("{err:#}");
+            if !is_root && is_macos_privilege_error(&msg) {
+                outcome.skipped_privileges = true;
+            } else {
+                outcome.errors.push(msg);
+            }
+            Vec::new()
+        }
+    };
+
+    for path in &state_paths {
+        let guard_home = if is_root {
+            user_home.filter(|home| path.starts_with(home))
+        } else {
+            None
+        };
+        if let Ok(Some(saved)) = load_from_path_with_home_guard(path, guard_home) {
+            for entry in saved.services {
+                if !entry.service.trim().is_empty()
+                    && !services.iter().any(|existing| existing == &entry.service)
+                {
+                    services.push(entry.service);
+                }
+            }
+        }
+    }
+
+    'services: for svc in &services {
+        let status = inspect_single_service_proxy(svc);
+        let bypass = get_proxy_bypass_domains(svc).ok();
+        let needs_reset = service_proxy_needs_reset(&status, bypass.as_deref());
+
+        let reset_cmds: [&[&str]; 6] = [
+            &["-setautoproxyurl", svc, ""],
+            &["-setautoproxystate", svc, "off"],
+            &["-setwebproxystate", svc, "off"],
+            &["-setsecurewebproxystate", svc, "off"],
+            &["-setsocksfirewallproxystate", svc, "off"],
+            &[
+                "-setproxybypassdomains",
+                svc,
+                DEFAULT_MACOS_BYPASS_DOMAINS[0],
+                DEFAULT_MACOS_BYPASS_DOMAINS[1],
+            ],
+        ];
+
+        let mut any_succeeded = false;
+        for args in reset_cmds {
+            match run_networksetup(args) {
+                Ok(_) => {
+                    any_succeeded = true;
+                }
+                Err(err) => {
+                    let msg = format!("{err:#}");
+                    if !is_root && is_macos_privilege_error(&msg) {
+                        outcome.skipped_privileges = true;
+                        break 'services;
+                    }
+                    outcome
+                        .errors
+                        .push(format!("networksetup {} failed: {msg}", args.join(" ")));
+                }
+            }
+        }
+
+        if any_succeeded && (needs_reset || bypass.is_none()) {
+            outcome.proxy_changed = true;
+        }
+    }
+
+    if is_root {
+        if let Some(uid) = target_user.as_ref().map(|u| u.uid).filter(|&uid| uid != 0) {
+            outcome.env_changed |= unset_launchd_env_for_uid(Some(uid), &mut outcome.errors);
+        }
+    }
+    outcome.env_changed |= unset_launchd_env_for_uid(None, &mut outcome.errors);
+
+    for path in &state_paths {
+        let guard_home = user_home.filter(|home| path.starts_with(home));
+        remove_macos_proxy_state_file_guarded(path, guard_home, is_root, &mut outcome);
+    }
+
+    outcome
 }
 
 pub fn print_macos_proxy_status() {
@@ -3221,6 +3511,90 @@ ProtonVPN
                 vec!["-setautoproxyurl", "Thunderbolt Ethernet", pac_url],
             ]
         );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn macos_proxy_reset_helpers_classify_defaults_privileges_and_guard_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        assert!(bypass_domains_match_default(&[
+            "*.local".to_string(),
+            "169.254/16".to_string()
+        ]));
+        assert!(!bypass_domains_match_default(&[
+            "*.local".to_string(),
+            "169.254/16".to_string(),
+            "localhost".to_string()
+        ]));
+        assert!(!bypass_domains_match_default(&[]));
+
+        let clean = NetworkServiceProxyStatus {
+            service: "Wi-Fi".to_string(),
+            auto_proxy_enabled: false,
+            auto_proxy_url: String::new(),
+            web_enabled: false,
+            web_server: String::new(),
+            web_port: String::new(),
+            secure_enabled: false,
+            secure_server: String::new(),
+            secure_port: String::new(),
+            socks_enabled: false,
+            socks_server: String::new(),
+            socks_port: String::new(),
+        };
+        let default_bypass = vec!["*.local".to_string(), "169.254/16".to_string()];
+        assert!(!service_proxy_needs_reset(&clean, Some(&default_bypass)));
+
+        let mut dirty = clean.clone();
+        dirty.auto_proxy_url = "http://127.0.0.1:8080/vdpi.pac".to_string();
+        assert!(service_proxy_needs_reset(&dirty, Some(&default_bypass)));
+        assert!(service_proxy_needs_reset(
+            &clean,
+            Some(&["localhost".to_string()])
+        ));
+
+        assert!(is_macos_privilege_error("Error: (-60005) Authorization failed"));
+        assert!(is_macos_privilege_error("Operation not permitted"));
+        assert!(!is_macos_privilege_error("Wi-Fi is not a recognized network service"));
+
+        let user = ElevatedUser {
+            uid: 501,
+            gid: 20,
+            home_dir: Some(PathBuf::from("/Users/alice")),
+        };
+        let paths = collect_macos_proxy_state_paths(Some(&user));
+        assert!(paths.contains(&PathBuf::from("/Users/alice/.vdpi/macos-proxy-state.json")));
+        assert!(paths.contains(&PathBuf::from(
+            "/Library/Application Support/vdpi/macos-proxy-state.json"
+        )));
+        assert!(paths.contains(&PathBuf::from("/var/root/.vdpi/macos-proxy-state.json")));
+
+        let base = std::env::temp_dir().join(format!(
+            "vdpi-macos-reset-symlink-guard-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let fake_home = base.join("home");
+        let outside = base.join("outside");
+        fs::create_dir_all(fake_home.join(".vdpi")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        let real_state = fake_home.join(".vdpi").join("macos-proxy-state.json");
+        fs::write(&real_state, "{}").unwrap();
+        let mut outcome = UnixProxyResetOutcome::default();
+        remove_macos_proxy_state_file_guarded(&real_state, Some(&fake_home), true, &mut outcome);
+        assert!(!real_state.exists());
+        assert!(outcome.errors.is_empty());
+
+        let victim = outside.join("victim.json");
+        fs::write(&victim, "{}").unwrap();
+        let sym_state = fake_home.join(".vdpi").join("macos-proxy-state.json");
+        symlink(&victim, &sym_state).unwrap();
+        remove_macos_proxy_state_file_guarded(&sym_state, Some(&fake_home), true, &mut outcome);
+        assert!(fs::symlink_metadata(&sym_state).is_ok());
+        assert!(victim.exists());
 
         let _ = fs::remove_dir_all(&base);
     }

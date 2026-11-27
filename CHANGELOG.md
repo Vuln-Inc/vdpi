@@ -6,6 +6,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-11-27
+
+### Added
+- **One-click "Reset Network to Defaults" recovery across CLI, TUI, and Desktop GUI (Windows, macOS, Linux)**:
+  - **CLI**: `vdpi reset-network` (alias `vdpi fix-network`) with `--json` and `--no-elevate` flags stops `vdpi` and unconditionally resets OS proxy/PAC, `DefaultConnectionSettings`, 64-bit & 32-bit WinHTTP, proxy environment variables, orphan TUN adapters & routes, stuck DNS overrides, and OS DNS caches.
+  - **Control Center TUI**: press `n` -> `y` / `e` for instant 2-keypress network recovery from any state (installed, paused, or not installed) while preserving your `vdpi` config.
+  - **Desktop GUI**: available in Settings, Diagnostics, and the Installation tab (including the antivirus-quarantine banner) - runs directly from the self-elevated `vdpi-desktop` binary so it still recovers your system even if Windows Defender deleted or quarantined `vdpi.exe` and `wintun.dll`.
+- **Proxy mode clarity for desktop games**: added a clear Overview hint explaining that Proxy mode covers browsers while native desktop games like Roblox and Discord voice require TUN mode.
+
+### Fixed
+- **Valorant `VAL 29`, third-party VPN failures (including ExpressVPN), and stuck Windows networking after crash or Windows Defender removal**:
+  - Synchronized Windows `Connections\DefaultConnectionSettings` and `SavedLegacySettings` binary blobs alongside flat `AutoConfigURL`/`ProxyEnable` writes and cleared stale `ProxyServer`/`ProxyOverride`/`ALL_PROXY`/`NO_PROXY` entries so stopped or removed `vdpi` never triggers WinHTTP error `12167` (`ERROR_WINHTTP_UNABLE_TO_DOWNLOAD_SCRIPT`).
+  - Added Riot/Valorant (`*.riotgames.net`, `*.valorant.com`, `*.rdatasrv.net`, `*.leagueoflegends.com`, plus `riotclientcrashhandler` & `vgm` companions) and major third-party VPN control-plane APIs (`*.expressvpn.com`, `*.expressapisv2.net`, `*.xvnet.net`, `*.mullvad.net`, `*.protonvpn.com`, `*.nordvpn.com`, `*.surfshark.com`, `*.cloudflareclient.com`, `*.tailscale.com`, and more) to built-in bypasses and `/vdpi.pac` `DIRECT` rules, and switched `/vdpi.pac` to `Cache-Control: no-store, max-age=0`.
+  - Replaced locale-dependent `netsh.exe winhttp` parsing (which broke on Turkish Windows) with native `winhttp.dll` calls plus 32-bit `WOW6432Node` WinHTTP cleanup, and cleared proxy settings on Windows shutdown/reboot.
+  - Hardened Windows TUN teardown and orphan recovery (`DeleteIpForwardEntry2`, `SetInterfaceDnsSettings(empty)`, residual `Tcpip{,6}\Parameters\Interfaces` key cleanup, `WintunDeleteDriver`, unconditional DNS cache flush) and added macOS/Linux stateless TUN/DNS recovery.
+- **Reduced Windows Defender false-positive triggers**:
+  - Replaced all production `reg.exe`, `netsh.exe`, `cmd.exe`, `ping.exe`, and `taskkill.exe` shell-outs with native Win32 APIs (`Advapi32`, `WinHTTP`, `MoveFileExW`, `TerminateProcess`), removed browser `OpenProcess` scanning, added an embedded Windows `RT_MANIFEST`, and switched updater elevation working directory to `System32`.
+- **Clearer Releases & README download guide**: updated `.github/workflows/release.yml`, `README.md`, and `README.tr.md` with a clear Desktop App (GUI) vs Terminal TUI/CLI vs Mobile download table and `CHANGELOG.md`-sourced release notes.
+
 ## [0.6.1] - 2026-11-27
 
 ### Added
@@ -229,7 +248,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Configured `CODE_SIGN_ENTITLEMENTS` in iOS `project.yml` so XcodeGen preserves `.entitlements` files.
 - Fixed release workflow entitlement verification and restricted automatic release runs to version tags and manual dispatch.
 
-[Unreleased]: https://github.com/Vuln-Inc/vdpi/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/Vuln-Inc/vdpi/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/Vuln-Inc/vdpi/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/Vuln-Inc/vdpi/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.8...v0.6.0
 [0.5.8]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.7...v0.5.8

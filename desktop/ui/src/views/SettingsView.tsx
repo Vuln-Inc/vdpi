@@ -63,6 +63,7 @@ export interface SettingsViewProps {
   onInstallService?: (engine?: EngineMode) => void | Promise<void>;
   onUpgradeService?: () => void | Promise<void>;
   onUninstallService?: () => void | Promise<void>;
+  onResetNetwork?: () => void | Promise<void>;
   onNavigate?: (tab: NavTab) => void;
   onPushToast: (tone: ToastTone, message: string) => void;
 }
@@ -545,6 +546,7 @@ function SettingsViewComponent({
   onInstallService,
   onUpgradeService,
   onUninstallService,
+  onResetNetwork,
   onNavigate,
   onPushToast,
 }: SettingsViewProps) {
@@ -683,9 +685,14 @@ function SettingsViewComponent({
     serviceBusy === "uninstall" ||
     normalizedBusy === "uninstall-service" ||
     status?.pendingOperation === "uninstalling";
+  const isResettingNetwork =
+    normalizedBusy === "reset-network" ||
+    normalizedBusy === "resetting_network" ||
+    status?.pendingOperation === "resetting_network";
   const anyServiceBusy =
     serviceBusy !== null ||
     isCentralBusy ||
+    isResettingNetwork ||
     Boolean(status?.pendingOperation);
   const showUpgradeAction = Boolean(
     onUpgradeService &&
@@ -1767,6 +1774,41 @@ function SettingsViewComponent({
             </div>
           </div>
 
+          {onResetNetwork ? (
+            <div className="settings-row">
+              <div className="settings-row__copy">
+                <span className="settings-row__label">
+                  {tSettings(lang, "resetNetworkLabel")}
+                </span>
+                <p className="settings-row__desc">
+                  {tSettings(lang, "resetNetworkDesc")}
+                </p>
+              </div>
+              <div className="settings-row__control">
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  disabled={anyServiceBusy}
+                  aria-busy={isResettingNetwork}
+                  onClick={() => {
+                    void onResetNetwork();
+                  }}
+                >
+                  {isResettingNetwork ? (
+                    <span className="settings-spinner" aria-hidden="true" />
+                  ) : (
+                    <IconRefresh size={14} />
+                  )}
+                  <span>
+                    {isResettingNetwork
+                      ? tSettings(lang, "btnResettingNetwork")
+                      : tSettings(lang, "btnResetNetwork")}
+                  </span>
+                </button>
+              </div>
+            </div>
+          ) : null}
+
           <div className="settings-row">
             <div className="settings-row__copy">
               <span className="settings-row__label">
@@ -1847,6 +1889,7 @@ function areSettingsPropsEqual(
     prev.onInstallService !== next.onInstallService ||
     prev.onUpgradeService !== next.onUpgradeService ||
     prev.onUninstallService !== next.onUninstallService ||
+    prev.onResetNetwork !== next.onResetNetwork ||
     prev.onNavigate !== next.onNavigate ||
     prev.onPushToast !== next.onPushToast
   ) {

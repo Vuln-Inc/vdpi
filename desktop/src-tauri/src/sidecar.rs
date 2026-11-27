@@ -70,6 +70,21 @@ pub enum SidecarOutcome {
     Err(String),
 }
 
+/// Result of running a self-elevated network reset without depending on `vdpi.exe`
+/// or `wintun.dll` being present on disk.
+#[derive(Debug)]
+pub enum SelfResetOutcome {
+    /// Network reset completed (either in-process or via elevated self-invocation).
+    Ok(vdpi::platform::NetworkResetReport),
+    /// User cancelled the OS elevation prompt (UAC, macOS authorization dialog, or Polkit).
+    Cancelled,
+    /// Elevation was unavailable or failed before completing the elevated reset; caller
+    /// should fall back to an in-process `ResetScope::UserOnly` pass.
+    ElevationUnavailable(String),
+    /// Unrecoverable error while running network reset; contains URL-redacted detail.
+    Err(String),
+}
+
 #[derive(Debug, Clone)]
 struct CapturedOutput {
     exit_code: Option<i32>,
@@ -2597,7 +2612,9 @@ fn user_config_dir() -> Result<PathBuf, String> {
 }
 
 fn is_stale_apply_temp_filename(name: &str) -> bool {
-    name.starts_with(".vdpi-apply-") && (name.ends_with(".toml") || name.ends_with(".tmp"))
+    (name.starts_with(".vdpi-apply-") && (name.ends_with(".toml") || name.ends_with(".tmp")))
+        || (name.starts_with(".vdpi-netreset-")
+            && (name.ends_with(".json") || name.ends_with(".tmp")))
 }
 
 fn sweep_stale_temp_files_in(dir: &Path) -> usize {
@@ -2722,9 +2739,10 @@ fn sweep_stale_linux_runtime_dirs() {
     let _ = sweep_stale_staged_exec_dirs_in(Path::new("/tmp"), "vdpi-exec-", Some(current_uid));
 }
 
-/// Removes any orphaned `.vdpi-apply-*.toml` and `.vdpi-apply-*.tmp` temporary
-/// config handoff files left behind in the user's configuration directory after
-/// an unexpected crash or termination. Intended to be called on startup and exit.
+/// Removes any orphaned `.vdpi-apply-*.toml`, `.vdpi-apply-*.tmp`, and
+/// `.vdpi-netreset-*.json` temporary handoff files left behind in the user's
+/// configuration directory after an unexpected crash or termination. Intended to
+/// be called on startup and exit.
 pub fn sweep_stale_temp_files() {
     if let Ok(dir) = user_config_dir() {
         let _ = sweep_stale_temp_files_in(&dir);
@@ -2948,6 +2966,426 @@ pub fn apply_config_via_temp_file(
             run_vdpi_cli(args, timeout_secs)
         }
     })
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
+fn validate_self_exe_for_elevation(exe: &Path) -> Result<PathBuf, String> {
+    let clean = strip_windows_verbatim_prefix(exe);
+    if clean.as_os_str().is_empty() {
+        return Err("Current executable path is empty.".to_string());
+    }
+    let Some(raw) = clean.to_str() else {
+        return Err("Current executable path is not valid UTF-8.".to_string());
+    };
+    if raw.contains('\0') || raw.chars().any(char::is_control) {
+        return Err("Current executable path contains invalid characters.".to_string());
+    }
+    #[cfg(target_os = "windows")]
+    if !is_local_drive_absolute(&clean) || has_windows_parent_traversal(&clean) {
+        return Err("Current executable path must be a local absolute drive path.".to_string());
+    }
+    #[cfg(not(target_os = "windows"))]
+    if !clean.is_absolute() || clean.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err("Current executable path must be an absolute path without '..'.".to_string());
+    }
+    if !verify_all_path_components_no_symlink_or_reparse(&clean) {
+        return Err(
+            "Refusing to self-elevate executable containing a symlink or reparse point."
+                .to_string(),
+        );
+    }
+    let meta = fs::symlink_metadata(&clean)
+        .map_err(|err| format!("Failed to inspect current executable: {err}"))?;
+    if is_symlink_or_reparse(&meta) || !meta.is_file() {
+        return Err("Current executable is not a regular file.".to_string());
+    }
+    Ok(clean)
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+fn resolve_self_exe_for_elevation() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe()
+        .map_err(|err| format!("Failed to locate current executable: {err}"))?;
+    validate_self_exe_for_elevation(&exe)
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
+fn parse_network_reset_report_json(raw: &str) -> Option<vdpi::platform::NetworkResetReport> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(report) = serde_json::from_str::<vdpi::platform::NetworkResetReport>(trimmed) {
+        return Some(report);
+    }
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    if start < end {
+        serde_json::from_str::<vdpi::platform::NetworkResetReport>(&trimmed[start..=end]).ok()
+    } else {
+        None
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn create_exclusive_netreset_result_file(dir: &Path) -> Result<TempFileGuard, String> {
+    reject_parent_dir_traversal(dir).map_err(|err| redact_urls_in_text(&err))?;
+
+    let roots = user_home_and_config_roots();
+    check_ancestors_under_roots(dir, &roots).map_err(|err| redact_urls_in_text(&err))?;
+
+    let is_root_dir = is_filesystem_or_known_root(dir, &roots);
+    let dir_existed = if is_root_dir {
+        dir.is_dir()
+    } else {
+        platform_fs::verify_dir_not_symlink(dir).map_err(|err| redact_urls_in_text(&err))?
+    };
+
+    if !dir_existed {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            builder.create(dir).map_err(|err| {
+                redact_urls_in_text(&format!(
+                    "Failed to create configuration directory {}: {err}",
+                    dir.display()
+                ))
+            })?;
+            check_ancestors_under_roots(dir, &roots).map_err(|err| redact_urls_in_text(&err))?;
+            if !is_root_dir {
+                let exists_now = platform_fs::verify_dir_not_symlink(dir)
+                    .map_err(|err| redact_urls_in_text(&err))?;
+                if !exists_now {
+                    return Err(redact_urls_in_text(&format!(
+                        "Configuration directory disappeared after creation: {}",
+                        dir.display()
+                    )));
+                }
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|err| {
+                    redact_urls_in_text(&format!(
+                        "Failed to set 0700 permissions on configuration directory {}: {err}",
+                        dir.display()
+                    ))
+                })?;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            fs::create_dir_all(dir).map_err(|err| {
+                redact_urls_in_text(&format!(
+                    "Failed to create configuration directory {}: {err}",
+                    dir.display()
+                ))
+            })?;
+            check_ancestors_under_roots(dir, &roots).map_err(|err| redact_urls_in_text(&err))?;
+            if !is_root_dir {
+                let exists_now = platform_fs::verify_dir_not_symlink(dir)
+                    .map_err(|err| redact_urls_in_text(&err))?;
+                if !exists_now {
+                    return Err(redact_urls_in_text(&format!(
+                        "Configuration directory disappeared after creation: {}",
+                        dir.display()
+                    )));
+                }
+            }
+        }
+    }
+
+    let pid = std::process::id();
+    let ts_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+
+    for _ in 0..16 {
+        let seq = TEMP_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let token = unique_temp_token(pid, seq, ts_nanos);
+        let result_path = dir.join(format!(".vdpi-netreset-{token}.json"));
+
+        let mut open_opts = OpenOptions::new();
+        open_opts.write(true).create_new(true);
+        platform_fs::configure_temp_open_options(&mut open_opts);
+
+        let file = match open_opts.open(&result_path) {
+            Ok(f) => f,
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(redact_urls_in_text(&format!(
+                    "Failed to create temporary network reset result file {}: {err}",
+                    result_path.display()
+                )));
+            }
+        };
+
+        let guard = TempFileGuard::new(result_path.clone());
+        platform_fs::verify_opened_regular_file(&file, &result_path)
+            .map_err(|err| redact_urls_in_text(&err))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|err| {
+                    redact_urls_in_text(&format!(
+                        "Failed to set 0600 permissions on temporary network reset result file {}: {err}",
+                        result_path.display()
+                    ))
+                })?;
+        }
+
+        drop(file);
+        return Ok(guard);
+    }
+
+    Err(format!(
+        "Failed to allocate a unique temporary network reset result file in {}.",
+        dir.display()
+    ))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn read_network_reset_report_file(path: &Path) -> Option<vdpi::platform::NetworkResetReport> {
+    let mut open_opts = OpenOptions::new();
+    open_opts.read(true);
+    platform_fs::configure_temp_open_options(&mut open_opts);
+    let file = open_opts.open(path).ok()?;
+    platform_fs::verify_opened_regular_file(&file, path).ok()?;
+
+    let mut buf = Vec::new();
+    file.take((MAX_CAPTURE_BYTES as u64) + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    if buf.is_empty() || buf.len() > MAX_CAPTURE_BYTES {
+        return None;
+    }
+    let text = std::str::from_utf8(&buf).ok()?;
+    parse_network_reset_report_json(text)
+}
+
+/// Resets OS network settings to defaults using direct in-process execution when
+/// already elevated, or by self-elevating `vdpi-desktop --internal-reset-network`
+/// so recovery succeeds even if antivirus quarantined or deleted `vdpi.exe` and
+/// `wintun.dll`.
+pub fn run_self_elevated_reset_network(timeout_secs: u64) -> SelfResetOutcome {
+    #[cfg(target_os = "windows")]
+    {
+        if vdpi::platform::windows_service::is_elevated() {
+            let report = vdpi::platform::reset_network_defaults(vdpi::platform::ResetScope::Full);
+            return SelfResetOutcome::Ok(report);
+        }
+
+        let current_exe = match resolve_self_exe_for_elevation() {
+            Ok(path) => path,
+            Err(err) => return SelfResetOutcome::ElevationUnavailable(redact_urls_in_text(&err)),
+        };
+
+        let dir = match user_config_dir() {
+            Ok(dir) => dir,
+            Err(err) => return SelfResetOutcome::ElevationUnavailable(redact_urls_in_text(&err)),
+        };
+        let result_guard = match create_exclusive_netreset_result_file(&dir) {
+            Ok(guard) => guard,
+            Err(err) => return SelfResetOutcome::ElevationUnavailable(redact_urls_in_text(&err)),
+        };
+        let clean_res_path = strip_windows_verbatim_prefix(result_guard.path());
+        let Some(res_path_str) = clean_res_path.to_str() else {
+            return SelfResetOutcome::ElevationUnavailable(
+                "Temporary network reset result file path is not valid UTF-8.".to_string(),
+            );
+        };
+
+        let outcome = win_elevate::run_elevated(
+            &current_exe,
+            &["--internal-reset-network", "--result-file", res_path_str],
+            timeout_secs,
+            false,
+        );
+
+        let parsed_report = read_network_reset_report_file(result_guard.path());
+        drop(result_guard);
+
+        match outcome {
+            SidecarOutcome::Ok(_) => {
+                // Run a UserOnly pass in the invoking desktop session so over-the-shoulder
+                // UAC still resets HKCU WinINET/PAC and triggers a user-session refresh.
+                let user_pass =
+                    vdpi::platform::reset_network_defaults(vdpi::platform::ResetScope::UserOnly);
+                let report = match parsed_report {
+                    Some(mut report) => {
+                        report.merge_user_pass(user_pass);
+                        report
+                    }
+                    None => user_pass,
+                };
+                SelfResetOutcome::Ok(report)
+            }
+            SidecarOutcome::Cancelled => SelfResetOutcome::Cancelled,
+            SidecarOutcome::Err(msg) | SidecarOutcome::SavedNeedsRestart(msg) => {
+                if let Some(mut report) = parsed_report {
+                    let user_pass = vdpi::platform::reset_network_defaults(
+                        vdpi::platform::ResetScope::UserOnly,
+                    );
+                    report.merge_user_pass(user_pass);
+                    SelfResetOutcome::Ok(report)
+                } else {
+                    SelfResetOutcome::ElevationUnavailable(msg)
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: POSIX `geteuid(2)` is always safe to call and never fails.
+        if unsafe { libc::geteuid() } == 0 {
+            let report = vdpi::platform::reset_network_defaults(vdpi::platform::ResetScope::Full);
+            return SelfResetOutcome::Ok(report);
+        }
+
+        let current_exe = match resolve_self_exe_for_elevation() {
+            Ok(path) => path,
+            Err(err) => return SelfResetOutcome::ElevationUnavailable(redact_urls_in_text(&err)),
+        };
+        let script = match build_osascript_elevation_script(
+            &current_exe,
+            &["--internal-reset-network"],
+        ) {
+            Ok(script) => script,
+            Err(err) => return SelfResetOutcome::ElevationUnavailable(redact_urls_in_text(&err)),
+        };
+        let mut cmd = Command::new("/usr/bin/osascript");
+        cmd.arg("-e").arg(&script);
+        let timeout = Duration::from_secs(timeout_secs.max(1));
+        let output = match run_command_with_timeout(&mut cmd, timeout) {
+            Ok(out) => out,
+            Err(err) => return SelfResetOutcome::ElevationUnavailable(redact_urls_in_text(&err)),
+        };
+
+        match classify_osascript_outcome(&output, false) {
+            SidecarOutcome::Ok(_) => {
+                let report = parse_network_reset_report_json(&output.stdout).unwrap_or_else(|| {
+                    vdpi::platform::reset_network_defaults(vdpi::platform::ResetScope::UserOnly)
+                });
+                SelfResetOutcome::Ok(report)
+            }
+            SidecarOutcome::Cancelled => SelfResetOutcome::Cancelled,
+            SidecarOutcome::Err(msg) | SidecarOutcome::SavedNeedsRestart(msg) => {
+                if let Some(report) = parse_network_reset_report_json(&output.stdout) {
+                    SelfResetOutcome::Ok(report)
+                } else {
+                    SelfResetOutcome::ElevationUnavailable(msg)
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: POSIX `geteuid(2)` is always safe to call and never fails.
+        if unsafe { libc::geteuid() } == 0 {
+            let report = vdpi::platform::reset_network_defaults(vdpi::platform::ResetScope::Full);
+            return SelfResetOutcome::Ok(report);
+        }
+
+        let pkexec_candidates: Vec<PathBuf> = PKEXEC_CANDIDATES.iter().map(PathBuf::from).collect();
+        let pkexec = match resolve_pkexec_from_candidates(&pkexec_candidates) {
+            Ok(path) => path,
+            Err(err) => return SelfResetOutcome::ElevationUnavailable(err),
+        };
+
+        let current_exe = resolve_self_exe_for_elevation();
+        let appdir = std::env::var_os("APPDIR")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .filter(|dir| {
+                current_exe_is_inside_appdir(current_exe.as_deref().ok(), Some(dir.as_path()))
+            });
+        let in_appimage = current_exe
+            .as_ref()
+            .is_ok_and(|exe| is_appimage_fuse_path(exe, appdir.as_deref()));
+
+        let _staged_guard;
+        let (exec_bin, args): (PathBuf, &[&str]) = if in_appimage {
+            match resolve_vdpi_cli_binary_for_elevation(true) {
+                Ok(cli_bin) => {
+                    let bin_to_run = if !is_verified_system_cli_candidate(&cli_bin)
+                        && is_appimage_fuse_path(&cli_bin, appdir.as_deref())
+                    {
+                        match stage_appimage_binary_for_pkexec(&cli_bin, appdir.as_deref()) {
+                            Ok(guard) => {
+                                let staged = guard.path().to_path_buf();
+                                _staged_guard = Some(guard);
+                                staged
+                            }
+                            Err(err) => {
+                                return SelfResetOutcome::ElevationUnavailable(
+                                    redact_urls_in_text(&err),
+                                );
+                            }
+                        }
+                    } else {
+                        _staged_guard = None;
+                        cli_bin
+                    };
+                    (bin_to_run, &["reset-network", "--json"])
+                }
+                Err(err) => {
+                    return SelfResetOutcome::ElevationUnavailable(redact_urls_in_text(&err));
+                }
+            }
+        } else {
+            _staged_guard = None;
+            match current_exe {
+                Ok(exe) => (exe, &["--internal-reset-network"]),
+                Err(err) => {
+                    return SelfResetOutcome::ElevationUnavailable(redact_urls_in_text(&err));
+                }
+            }
+        };
+
+        let mut cmd = build_pkexec_command(&pkexec, &exec_bin, args);
+        let timeout = Duration::from_secs(timeout_secs.max(1));
+        let output = match run_command_with_timeout(&mut cmd, timeout) {
+            Ok(out) => out,
+            Err(err) => return SelfResetOutcome::ElevationUnavailable(redact_urls_in_text(&err)),
+        };
+
+        match classify_pkexec_outcome(&output, false) {
+            SidecarOutcome::Ok(_) => {
+                let user_pass =
+                    vdpi::platform::reset_network_defaults(vdpi::platform::ResetScope::UserOnly);
+                let report = match parse_network_reset_report_json(&output.stdout) {
+                    Some(mut report) => {
+                        report.merge_user_pass(user_pass);
+                        report
+                    }
+                    None => user_pass,
+                };
+                SelfResetOutcome::Ok(report)
+            }
+            SidecarOutcome::Cancelled => SelfResetOutcome::Cancelled,
+            SidecarOutcome::Err(msg) | SidecarOutcome::SavedNeedsRestart(msg) => {
+                if let Some(mut report) = parse_network_reset_report_json(&output.stdout) {
+                    let user_pass = vdpi::platform::reset_network_defaults(
+                        vdpi::platform::ResetScope::UserOnly,
+                    );
+                    report.merge_user_pass(user_pass);
+                    SelfResetOutcome::Ok(report)
+                } else {
+                    SelfResetOutcome::ElevationUnavailable(msg)
+                }
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let _ = timeout_secs;
+        let report = vdpi::platform::reset_network_defaults(vdpi::platform::ResetScope::Full);
+        SelfResetOutcome::Ok(report)
+    }
 }
 
 #[cfg(test)]
@@ -4771,5 +5209,68 @@ mod tests {
             apply_res,
             SidecarOutcome::SavedNeedsRestart("restart pending".to_string())
         );
+    }
+
+    #[test]
+    fn netreset_temp_file_sweep_creation_and_self_exe_validation() {
+        let dir = TestDir::new("netreset-helpers");
+
+        // `sweep_stale_temp_files_in` removes orphaned `.vdpi-netreset-*.json` and `.tmp` files.
+        let stale_json = dir.path().join(".vdpi-netreset-123.0.deadbeef.json");
+        let stale_tmp = dir.path().join(".vdpi-netreset-123.0.deadbeef.tmp");
+        let keep_json = dir.path().join("gui-prefs.json");
+        fs::write(&stale_json, b"{}").expect("write stale netreset json");
+        fs::write(&stale_tmp, b"tmp").expect("write stale netreset tmp");
+        fs::write(&keep_json, b"{}").expect("write normal json");
+
+        let removed = sweep_stale_temp_files_in(dir.path());
+        assert_eq!(removed, 2);
+        assert!(!stale_json.exists());
+        assert!(!stale_tmp.exists());
+        assert!(keep_json.is_file());
+
+        // Exclusive result file creation creates an empty `.vdpi-netreset-*.json` file
+        // that `TempFileGuard` removes on drop, and empty/malformed contents yield `None`.
+        let guard = create_exclusive_netreset_result_file(dir.path())
+            .expect("create exclusive netreset result file");
+        let res_path = guard.path().to_path_buf();
+        let res_name = res_path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .expect("utf-8 filename");
+        assert!(res_name.starts_with(".vdpi-netreset-"));
+        assert!(res_name.ends_with(".json"));
+        assert_eq!(
+            fs::symlink_metadata(&res_path)
+                .expect("stat result file")
+                .len(),
+            0
+        );
+        assert!(read_network_reset_report_file(&res_path).is_none());
+
+        fs::write(&res_path, b"not valid json").expect("write malformed json");
+        assert!(read_network_reset_report_file(&res_path).is_none());
+
+        drop(guard);
+        assert!(!res_path.exists());
+
+        // `validate_self_exe_for_elevation` accepts regular files and rejects directories/missing/traversal.
+        let fake_exe = dir.path().join("vdpi-desktop.exe");
+        fs::write(&fake_exe, b"bin").expect("write fake exe");
+        assert_eq!(
+            validate_self_exe_for_elevation(&fake_exe).expect("valid regular file"),
+            strip_windows_verbatim_prefix(&fake_exe)
+        );
+        assert!(validate_self_exe_for_elevation(dir.path()).is_err());
+        assert!(validate_self_exe_for_elevation(&dir.path().join("missing.exe")).is_err());
+        assert!(validate_self_exe_for_elevation(&dir.path().join("..").join("vdpi-desktop.exe")).is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let link_exe = dir.path().join("link-desktop");
+            symlink(&fake_exe, &link_exe).expect("create symlink exe");
+            assert!(validate_self_exe_for_elevation(&link_exe).is_err());
+        }
     }
 }

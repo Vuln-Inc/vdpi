@@ -7,7 +7,7 @@
 Rust ile yazılmış, kendi kendini uyarlayan anti-DPI motoru; Windows, macOS, Linux, Android ve iOS üzerinde yerel olarak çalışır.  
 Yerel Masaüstü Arayüzü (GUI), etkileşimli Kontrol Merkezi TUI ve root gerektirmeyen mobil uygulamalarla gelir - uzak sunucu ve telemetri olmadan şeffaf sistem geneli TUN bağdaştırıcısı veya hafif yerel vekil sunucu (Proxy) olarak çalışır.
 
-[![Sürüm](https://img.shields.io/badge/Release-v0.6.1-38bdf8?style=for-the-badge&logo=github)](https://github.com/Vuln-Inc/vdpi/releases/latest)
+[![Sürüm](https://img.shields.io/badge/Release-v0.6.2-38bdf8?style=for-the-badge&logo=github)](https://github.com/Vuln-Inc/vdpi/releases/latest)
 [![Lisans: MIT](https://img.shields.io/badge/License-MIT-34d399?style=for-the-badge)](./LICENSE)
 [![Platformlar](https://img.shields.io/badge/Platforms-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Android%20%7C%20iOS-818cf8?style=for-the-badge)](#hızlı-kurulum)
 
@@ -80,15 +80,27 @@ Yerel Masaüstü Arayüzü (GUI), etkileşimli Kontrol Merkezi TUI ve root gerek
 
 ## Hızlı Kurulum
 
+### Hangi Sürümü İndirmeliyim?
+
+`vdpi`, aynı yerel Rust motorunu ve `config.toml` dosyasını paylaşan üç sürümle gelir - kullanım şeklinize uygun olanı seçin (çoğu masaüstü kullanıcısı için yalnızca **Masaüstü Uygulaması** yeterlidir):
+
+| Sürüm | Kimler için? | Sürüm dosya adı | İçindekiler |
+| :--- | :--- | :--- | :--- |
+| **Masaüstü Uygulaması (GUI)** *(Önerilen)* | Çoğu Windows, macOS ve Linux kullanıcısı | `vdpi-desktop-*` (`.zip`, `.dmg`, `.deb`, `.AppImage`) | Yerel uygulama penceresi, sistem tepsisi, görsel Bölünmüş Tünel, DNS/Tanılama **ve** paketli `vdpi` motoru ile `wintun.dll` |
+| **Terminal / TUI (CLI)** | Terminal kullanıcıları, betikler, arayüzsüz veya ARM64 Linux | `vdpi-*` (`.zip`, `.tar.gz`) | Hafif terminal Kontrol Merkezi TUI ve arka plan servisi CLI ikilisi (pencere arayüzü yok) |
+| **Mobil** | Telefon ve tabletler | `vdpi-android-*.apk`, `vdpi-ios-*.ipa` | Android `8.0+` ve iOS/iPadOS `16+` için root gerektirmeyen yerel VPN uygulaması |
+
+> **İpucu:** **Masaüstü Uygulaması (GUI)** indirirseniz Terminal / TUI arşivini ayrıca indirmenize gerek yoktur - her şey paket içinde hazırdır.
+
 ### Masaüstü Uygulaması (GUI) - Windows, macOS ve Linux
 
-- **Windows (`x86_64`, Windows 10 ve 11):** [Taşınabilir (`.zip`)](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-windows-x86_64-portable.zip)
-- **macOS (Evrensel, Apple Silicon ve Intel):** [DMG (`.dmg`)](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-macos-universal.dmg)
-- **Linux (`x86_64`):** [Debian/Ubuntu (`.deb`)](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.deb) · [AppImage (`.AppImage`)](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.AppImage)
+- **Windows (`x86_64`, Windows 10 ve 11):** [`vdpi-desktop-windows-x86_64-portable.zip`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-windows-x86_64-portable.zip) (arşivi çıkarıp `vdpi-desktop.exe` dosyasını çalıştırın)
+- **macOS (Evrensel, Apple Silicon ve Intel):** [`vdpi-desktop-macos-universal.dmg`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-macos-universal.dmg) (DMG dosyasını açıp Uygulamalar klasörüne sürükleyin)
+- **Linux (`x86_64`):** [`vdpi-desktop-linux-x86_64.deb`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.deb) (Debian/Ubuntu) · [`vdpi-desktop-linux-x86_64.AppImage`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.AppImage) (tüm dağıtımlar)
 
-> **Not:** Masaüstü GUI paketleri `vdpi` motor dosyasını (Windows üzerinde ayrıca değiştirilmemiş WHQL imzalı `wintun.dll` `0.14.1` sürücüsünü) içinde barındırır, sistem tepsisi / menü çubuğu ile bütünleşir ve CLI ile aynı `config.toml` yapılandırmasını ve arka plan servisini paylaşır.
+> **Not:** Masaüstü GUI paketleri `vdpi` motor dosyasını (Windows üzerinde ayrıca değiştirilmemiş WHQL imzalı `wintun.dll` `0.14.1` sürücüsünü) içinde barındırır, sistem tepsisi / menü çubuğu ile bütünleşir ve Terminal / TUI sürümüyle aynı `config.toml` yapılandırmasını ve arka plan servisini paylaşır.
 
-### CLI / Komut Satırı - Windows (`x86_64`, Windows 10 ve 11)
+### Terminal / TUI (CLI) - Windows (`x86_64`, Windows 10 ve 11)
 
 ```powershell
 # PowerShell tek satır kurulum (SHA-256 doğrulamalı)
@@ -108,7 +120,7 @@ cargo install vdpi
 
 Doğrudan indirme: [`vdpi-windows-x86_64.zip`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-windows-x86_64.zip) (`vdpi.exe`, WHQL imzalı `wintun.dll` `0.14.1` ve `WINTUN-LICENSE.txt`) veya [crates.io/crates/vdpi](https://crates.io/crates/vdpi).
 
-### CLI / Komut Satırı - macOS ve Linux (`universal` / `x86_64` ve `arm64`)
+### Terminal / TUI (CLI) - macOS ve Linux (`universal` / `x86_64` ve `arm64`)
 
 ```bash
 # Kabuk tek satır kurulum (macOS ve Linux, SHA-256 doğrulamalı)

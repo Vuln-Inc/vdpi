@@ -466,7 +466,7 @@ function ensureStyles(): void {
 function formatVersionPill(version: string | undefined | null): string {
   const trimmed = version?.trim();
   const normalized = trimmed ? trimmed.replace(/^[vV]/, "") : "";
-  const base = normalized.length > 0 ? normalized : "0.6.1";
+  const base = normalized.length > 0 ? normalized : "0.6.2";
   return `v${base}`;
 }
 

@@ -30,7 +30,8 @@ export type ServiceOperation =
   | "resuming"
   | "pausing"
   | "switching_engine"
-  | "saving_config";
+  | "saving_config"
+  | "resetting_network";
 export type ActionErrorCode =
   | "busy"
   | "shutting_down"

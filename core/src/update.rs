@@ -1714,6 +1714,7 @@ fn run_windows_elevated_binary(bin: &Path, args: &[&str]) -> Result<()> {
     #[link(name = "kernel32")]
     extern "system" {
         fn GetLastError() -> Dword;
+        fn GetSystemDirectoryW(lp_buffer: *mut u16, u_size: Dword) -> Dword;
         fn WaitForSingleObject(h_handle: *mut c_void, dw_milliseconds: Dword) -> Dword;
         fn GetExitCodeProcess(h_process: *mut c_void, lp_exit_code: *mut Dword) -> Bool;
         fn CloseHandle(h_object: *mut c_void) -> Bool;
@@ -1728,8 +1729,35 @@ fn run_windows_elevated_binary(bin: &Path, args: &[&str]) -> Result<()> {
         value.encode_wide().chain(std::iter::once(0)).collect()
     }
 
+    fn resolve_system32_dir() -> PathBuf {
+        let mut buf = vec![0u16; 260];
+        loop {
+            // SAFETY: `buf` is a valid writable UTF-16 buffer of length `buf.len()`.
+            let len = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as Dword) };
+            if len == 0 {
+                break;
+            }
+            let len_usize = len as usize;
+            if len_usize < buf.len() {
+                let dir = String::from_utf16_lossy(&buf[..len_usize]);
+                let trimmed = dir.trim();
+                if !trimmed.is_empty() {
+                    return strip_windows_verbatim_prefix(Path::new(trimmed));
+                }
+                break;
+            }
+            buf.resize(len_usize + 1, 0);
+        }
+        let fallback = std::env::var_os("SystemRoot")
+            .or_else(|| std::env::var_os("WINDIR"))
+            .filter(|v| !v.is_empty())
+            .map(|root| PathBuf::from(root).join("System32"))
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32"));
+        strip_windows_verbatim_prefix(&fallback)
+    }
+
     let clean_bin = strip_windows_verbatim_prefix(bin);
-    let temp_dir = strip_windows_verbatim_prefix(&std::env::temp_dir());
+    let system32_dir = resolve_system32_dir();
     let params: String = args
         .iter()
         .map(|arg| crate::service::quote_windows_arg(arg))
@@ -1739,7 +1767,7 @@ fn run_windows_elevated_binary(bin: &Path, args: &[&str]) -> Result<()> {
     let verb_wide = to_wide_null(OsStr::new("runas"));
     let file_wide = to_wide_null(clean_bin.as_os_str());
     let params_wide = to_wide_null(OsStr::new(&params));
-    let dir_wide = to_wide_null(temp_dir.as_os_str());
+    let dir_wide = to_wide_null(system32_dir.as_os_str());
 
     let mut info = ShellExecuteInfoW {
         cb_size: std::mem::size_of::<ShellExecuteInfoW>() as Dword,

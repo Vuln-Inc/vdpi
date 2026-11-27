@@ -1226,11 +1226,22 @@ jobs:
                   }
                 ' > release-changes.md
           else
-            PREV_TAG="$(git describe --tags --abbrev=0 --match 'v*' "${TAG}^" 2>/dev/null || true)"
-            if [ -n "$PREV_TAG" ]; then
-              git log --no-merges --pretty=tformat:'- %s' "${PREV_TAG}..${TAG}" > release-changes.md
-            else
-              git log --no-merges -n 20 --pretty=tformat:'- %s' "$TAG" > release-changes.md
+            VER="${TAG#v}"
+            awk -v ver="$VER" '
+              BEGIN { in_sec = 0; target = "## [" ver "]" }
+              index($0, target) == 1 { in_sec = 1; next }
+              in_sec && index($0, "## [") == 1 { exit }
+              in_sec && /^(  )?- / { print }
+            ' CHANGELOG.md > release-changes.md || true
+            if [ ! -s release-changes.md ]; then
+              PREV_TAG="$(git describe --tags --abbrev=0 --match 'v*' "${TAG}^" 2>/dev/null || true)"
+              if [ -n "$PREV_TAG" ]; then
+                git log --no-merges --pretty=tformat:'- %s' "${PREV_TAG}..${TAG}" \
+                  | grep -Ev '^- (fix|chore|ci)\(ci\):' > release-changes.md || true
+              else
+                git log --no-merges -n 20 --pretty=tformat:'- %s' "$TAG" \
+                  | grep -Ev '^- (fix|chore|ci)\(ci\):' > release-changes.md || true
+              fi
             fi
           fi
           if [ ! -s release-changes.md ]; then
@@ -1243,21 +1254,40 @@ jobs:
             cat release-changes.md
             printf '\n'
             sed "s|__BASE_URL__|${BASE_URL}|g" <<'EOF'
-          ### Downloads
+          ### Which Download Should I Pick?
 
-          **Desktop App (GUI)**
-          - **Windows (`x86_64`):** [Portable (.zip)](__BASE_URL__/vdpi-desktop-windows-x86_64-portable.zip)
-          - **macOS (Universal):** [DMG (.dmg)](__BASE_URL__/vdpi-desktop-macos-universal.dmg)
-          - **Linux (`x86_64`):** [Debian/Ubuntu (.deb)](__BASE_URL__/vdpi-desktop-linux-x86_64.deb) · [AppImage](__BASE_URL__/vdpi-desktop-linux-x86_64.AppImage)
+          Most users only need **one** download:
+          - **Want a normal app with a window and tray icon?** Pick **Desktop App (GUI)** below - it already includes the `vdpi` engine and `wintun.dll` (you do not need the TUI/CLI archive separately).
+          - **Prefer the terminal Control Center TUI or headless CLI?** Pick **Terminal / TUI (CLI)** below.
+          - **On a phone or tablet?** Pick **Mobile** below.
 
-          **CLI / Headless**
-          - **Windows (`x86_64`):** [vdpi-windows-x86_64.zip](__BASE_URL__/vdpi-windows-x86_64.zip)
-          - **macOS (Universal):** [vdpi-macos-universal.tar.gz](__BASE_URL__/vdpi-macos-universal.tar.gz)
-          - **Linux:** [x86_64 (.tar.gz)](__BASE_URL__/vdpi-linux-x86_64.tar.gz) · [arm64 (.tar.gz)](__BASE_URL__/vdpi-linux-arm64.tar.gz)
+          #### Desktop App (GUI) - Recommended for most users
+          Full native app window, visual Split Tunneling, DNS & Rules, Diagnostics, system tray, and 1-click setup.
 
-          **Mobile**
-          - **Android:** [vdpi-android-universal.apk](__BASE_URL__/vdpi-android-universal.apk)
-          - **iOS (`16+`, unsigned):** [vdpi-ios-unsigned.ipa](__BASE_URL__/vdpi-ios-unsigned.ipa)
+          | Platform | Download | Notes |
+          | :--- | :--- | :--- |
+          | **Windows** (`x86_64`) | [vdpi-desktop-windows-x86_64-portable.zip](__BASE_URL__/vdpi-desktop-windows-x86_64-portable.zip) | Unzip and run `vdpi-desktop.exe` (includes `vdpi.exe` + `wintun.dll`) |
+          | **macOS** (Apple Silicon & Intel) | [vdpi-desktop-macos-universal.dmg](__BASE_URL__/vdpi-desktop-macos-universal.dmg) | Open DMG and drag `vdpi Desktop` to Applications |
+          | **Linux** (Debian / Ubuntu `x86_64`) | [vdpi-desktop-linux-x86_64.deb](__BASE_URL__/vdpi-desktop-linux-x86_64.deb) | Install via `sudo apt install ./vdpi-desktop-linux-x86_64.deb` |
+          | **Linux** (Any distro `x86_64`) | [vdpi-desktop-linux-x86_64.AppImage](__BASE_URL__/vdpi-desktop-linux-x86_64.AppImage) | `chmod +x` and run directly |
+
+          #### Terminal / TUI (CLI) - Lightweight, no GUI window
+          Interactive terminal Control Center TUI + background service CLI (`vdpi`). Ideal for terminal users, scripts, or headless/ARM64 Linux.
+
+          | Platform | Download | Notes |
+          | :--- | :--- | :--- |
+          | **Windows** (`x86_64`) | [vdpi-windows-x86_64.zip](__BASE_URL__/vdpi-windows-x86_64.zip) | `vdpi.exe` + `wintun.dll` |
+          | **macOS** (Apple Silicon & Intel) | [vdpi-macos-universal.tar.gz](__BASE_URL__/vdpi-macos-universal.tar.gz) | Universal binary (`arm64` + `x86_64`) |
+          | **Linux** (`x86_64`) | [vdpi-linux-x86_64.tar.gz](__BASE_URL__/vdpi-linux-x86_64.tar.gz) | Static `musl` binary |
+          | **Linux** (`arm64`) | [vdpi-linux-arm64.tar.gz](__BASE_URL__/vdpi-linux-arm64.tar.gz) | Static `musl` binary (Raspberry Pi / ARM servers) |
+
+          #### Mobile
+          Zero-root local VPN apps sharing the same Rust core.
+
+          | Platform | Download | Notes |
+          | :--- | :--- | :--- |
+          | **Android** (`8.0+`, universal) | [vdpi-android-universal.apk](__BASE_URL__/vdpi-android-universal.apk) | Signed APK (`arm64-v8a` / `armeabi-v7a` / `x86_64`) |
+          | **iOS / iPadOS** (`16+`, unsigned) | [vdpi-ios-unsigned.ipa](__BASE_URL__/vdpi-ios-unsigned.ipa) | For TrollStore or paid Apple Developer signing (`NetworkExtension`) |
 
           Verify downloads with [SHA256SUMS.txt](__BASE_URL__/SHA256SUMS.txt).
           EOF

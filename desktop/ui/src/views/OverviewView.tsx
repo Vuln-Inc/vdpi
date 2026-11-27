@@ -180,7 +180,12 @@ export function OverviewView({
 
   const normalizedBusy = busyAction?.trim().toLowerCase() ?? null;
   const pendingOp = status?.pendingOperation ?? null;
-  const isAnyBusy = normalizedBusy !== null || pendingOp !== null;
+  const isResettingNetwork =
+    normalizedBusy === "reset-network" ||
+    normalizedBusy === "resetting_network" ||
+    pendingOp === "resetting_network";
+  const isAnyBusy =
+    normalizedBusy !== null || pendingOp !== null || isResettingNetwork;
   const switchTargetEngine: EngineMode | null =
     normalizedBusy === "switch-engine:tun"
       ? "tun"
@@ -737,6 +742,14 @@ export function OverviewView({
         ? tOverview(lang, "engineDescProxyWintunMissing")
         : tOverview(lang, "engineDescProxy");
 
+  const showProxyGamesHint = Boolean(
+    status !== null &&
+      activeEngine === "proxy" &&
+      (!isNotInstalled || isRunning) &&
+      !isSwitchingEngine &&
+      !tunSwitchBlockedByWintun,
+  );
+
   return (
     <div className="view-stack view-overview">
       <section className="card control-card">
@@ -780,6 +793,11 @@ export function OverviewView({
             />
           </div>
           <p className="control-engine-hint">{engineHintText}</p>
+          {showProxyGamesHint ? (
+            <p className="control-engine-hint">
+              {tOverview(lang, "proxyGamesHint")}
+            </p>
+          ) : null}
         </div>
       </section>
 

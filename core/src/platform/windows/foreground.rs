@@ -1,11 +1,13 @@
 //! Keep the foreground fail-open PAC proxy lease tied to a detached process. Closing a
 //! Windows console can terminate its processes without running any Rust cleanup.
 use super::{
-    broadcast_environment_change, build_windows_pac_url, is_vdpi_owned_pac_url,
-    is_vdpi_owned_proxy_env, is_vdpi_owned_wininet_server, notify_wininet_refresh,
-    reset_winhttp_proxy_if_vdpi, sanitize_captured_wininet_state, SavedWindowsProxyState,
-    SavedWininetHiveState, ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
-    WINDOWS_PROXY_STATE_FILENAME,
+    broadcast_environment_change, build_windows_pac_url, internet_settings_key,
+    is_vdpi_owned_no_proxy_env, is_vdpi_owned_pac_url, is_vdpi_owned_proxy_env,
+    is_vdpi_owned_wininet_server, notify_wininet_refresh, reset_winhttp_proxy_if_vdpi,
+    sanitize_captured_wininet_state, sync_wininet_connection_blobs,
+    sync_wininet_connection_blobs_restore_manual, SavedWindowsProxyState, SavedWininetHiveState,
+    ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, NO_PROXY_ENV_VARS,
+    PROXY_ENV_VARS, WINDOWS_PROXY_STATE_FILENAME,
 };
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -137,6 +139,9 @@ fn guard_inner() -> Result<()> {
     let inet = Key::open(super::INTERNET_SETTINGS_SUBKEY)?;
     let prior_proxy_server = inet.read("ProxyServer")?.and_then(|v| v.as_string());
     let prior_proxy_override = inet.read("ProxyOverride")?.and_then(|v| v.as_string());
+    let had_vdpi_manual = prior_proxy_server
+        .as_deref()
+        .is_some_and(is_vdpi_owned_wininet_server);
     // Use fail-open PAC (`AutoConfigURL` + `ProxyEnable=0`), matching `windows.rs` so an abrupt
     // termination or Defender quarantine never leaves a fail-closed proxy that bricks internet.
     let mut proxy = Settings::prepare(
@@ -169,6 +174,12 @@ fn guard_inner() -> Result<()> {
         }
     }
 
+    // Delete any stale vdpi-owned manual ProxyServer/ProxyOverride even if ProxyEnable is already 0.
+    if had_vdpi_manual {
+        let _ = inet.write("ProxyServer", None);
+        let _ = inet.write("ProxyOverride", None);
+    }
+
     // Never write persistent HKCU\Environment HTTP_PROXY/HTTPS_PROXY/NO_PROXY because
     // Registry env vars cannot fail open if vdpi.exe is killed or quarantined. Clean up
     // any stale vdpi-owned env vars left over from older versions so upgrades auto-heal.
@@ -178,9 +189,87 @@ fn guard_inner() -> Result<()> {
     // Auto-heal any legacy fail-closed WinHTTP manual proxy left by older vdpi versions.
     reset_winhttp_proxy_if_vdpi();
 
+    let hkcu_inet_key = internet_settings_key("HKCU");
     with_proxy_lease(
         &mut proxy,
         Some((state_path.as_path(), created_state_file)),
+        || {
+            let _ = sync_wininet_connection_blobs(
+                &hkcu_inet_key,
+                false,
+                had_vdpi_manual,
+                Some(&pac_url),
+                false,
+            );
+        },
+        || {
+            if inet
+                .read("ProxyServer")
+                .ok()
+                .flatten()
+                .and_then(|v| v.as_string())
+                .as_deref()
+                .is_some_and(is_vdpi_owned_wininet_server)
+            {
+                let _ = inet.write("ProxyServer", None);
+                let _ = inet.write("ProxyOverride", None);
+            }
+            let live_pac = inet
+                .read("AutoConfigURL")
+                .ok()
+                .flatten()
+                .and_then(|v| v.as_string())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let live_enable = inet
+                .read("ProxyEnable")
+                .ok()
+                .flatten()
+                .and_then(|v| v.as_dword())
+                .is_some_and(|v| v != 0);
+            let live_server = inet
+                .read("ProxyServer")
+                .ok()
+                .flatten()
+                .and_then(|v| v.as_string())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let live_override = inet
+                .read("ProxyOverride")
+                .ok()
+                .flatten()
+                .and_then(|v| v.as_string())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            if live_enable {
+                if let Some(server) = live_server
+                    .as_deref()
+                    .filter(|s| !is_vdpi_owned_wininet_server(s))
+                {
+                    let _ = sync_wininet_connection_blobs_restore_manual(
+                        &hkcu_inet_key,
+                        live_pac.is_none(),
+                        live_pac.as_deref(),
+                        server,
+                        live_override.as_deref(),
+                    );
+                    return;
+                }
+            }
+
+            let clear_manual = had_vdpi_manual
+                || live_server
+                    .as_deref()
+                    .is_none_or(is_vdpi_owned_wininet_server);
+            let _ = sync_wininet_connection_blobs(
+                &hkcu_inet_key,
+                live_pac.is_none(),
+                clear_manual,
+                live_pac.as_deref(),
+                live_pac.is_none(),
+            );
+        },
         notify_wininet_refresh,
         reset_winhttp_proxy_if_vdpi,
         || {
@@ -205,8 +294,9 @@ fn cleanup_stale_vdpi_user_env() -> bool {
     let Ok(env_key) = Key::open(super::USER_ENV_SUBKEY) else {
         return false;
     };
+    let mut proxy_matched = false;
     let mut cleaned = false;
-    for name in ["HTTP_PROXY", "HTTPS_PROXY"] {
+    for name in PROXY_ENV_VARS {
         let is_vdpi = env_key
             .read(name)
             .ok()
@@ -214,22 +304,25 @@ fn cleanup_stale_vdpi_user_env() -> bool {
             .and_then(|v| v.as_string())
             .as_deref()
             .is_some_and(is_vdpi_owned_proxy_env);
-        if is_vdpi && env_key.write(name, None).is_ok() {
-            cleaned = true;
+        if is_vdpi {
+            proxy_matched = true;
+            if env_key.write(name, None).is_ok() {
+                cleaned = true;
+            }
         }
     }
-    if cleaned {
-        let _ = env_key.write("NO_PROXY", None);
-    }
-    let all_is_vdpi = env_key
-        .read("ALL_PROXY")
-        .ok()
-        .flatten()
-        .and_then(|v| v.as_string())
-        .as_deref()
-        .is_some_and(is_vdpi_owned_proxy_env);
-    if all_is_vdpi && env_key.write("ALL_PROXY", None).is_ok() {
-        cleaned = true;
+    for name in NO_PROXY_ENV_VARS {
+        let current = env_key
+            .read(name)
+            .ok()
+            .flatten()
+            .and_then(|v| v.as_string());
+        let should_delete = current.as_deref().is_some_and(|val| {
+            proxy_matched || is_vdpi_owned_no_proxy_env(val)
+        });
+        if should_delete && env_key.write(name, None).is_ok() {
+            cleaned = true;
+        }
     }
     cleaned
 }
@@ -256,7 +349,7 @@ fn normalize_stale_wininet_before(
         .find(|c| c.name == "ProxyEnable")
         .and_then(|c| c.before.as_ref())
         .and_then(Value::as_dword)
-        == Some(1);
+        .is_some_and(|v| v != 0);
     if before_enabled && prior_proxy_server.is_some_and(is_vdpi_owned_wininet_server) {
         if let Some(enable) = changes.iter_mut().find(|c| c.name == "ProxyEnable") {
             enable.before = Some(Value::dword(0));
@@ -279,7 +372,7 @@ fn snapshot_from_before(
         .find(|c| c.name == "ProxyEnable")
         .and_then(|c| c.before.as_ref())
         .and_then(Value::as_dword)
-        == Some(1);
+        .is_some_and(|v| v != 0);
     SavedWininetHiveState {
         proxy_enable,
         proxy_server: prior_proxy_server.map(ToString::to_string),
@@ -466,7 +559,11 @@ fn apply_saved_prior_wininet_before(
             .is_some_and(|s| !s.is_empty() && !is_vdpi_owned_wininet_server(s));
     if saved_has_external_manual && has_external_proxy_server {
         if let Some(enable) = changes.iter_mut().find(|c| c.name == "ProxyEnable") {
-            let already_enabled = enable.before.as_ref().and_then(Value::as_dword) == Some(1);
+            let already_enabled = enable
+                .before
+                .as_ref()
+                .and_then(Value::as_dword)
+                .is_some_and(|v| v != 0);
             if !already_enabled {
                 enable.before = Some(Value::dword(1));
             }
@@ -485,17 +582,23 @@ fn should_remove_state_file_on_cleanup(
 fn with_proxy_lease(
     proxy: &mut Settings<'_>,
     state_file: Option<(&Path, bool)>,
+    sync_on_activate: impl Fn(),
+    sync_on_restore: impl Fn(),
     refresh_inet: impl Fn(),
     reset_winhttp: impl Fn(),
     wait: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     let outcome = (|| -> Result<()> {
         proxy.apply()?;
+        sync_on_activate();
         refresh_inet();
         wait()
     })();
     let applied_all = proxy.applied == proxy.changes.len();
     let inet_restored = proxy.restore(Some("AutoConfigURL"));
+    if matches!(inet_restored, Ok(true)) {
+        sync_on_restore();
+    }
     refresh_inet();
     reset_winhttp();
     if let Some((path, created_state_file)) = state_file {
@@ -507,7 +610,7 @@ fn with_proxy_lease(
             let _ = fs::remove_file(path);
         }
     }
-    outcome.and(inet_restored)
+    outcome.and(inet_restored.map(|_| ()))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -595,12 +698,12 @@ impl<'a> Settings<'a> {
         Ok(())
     }
 
-    fn restore(&mut self, owner: Option<&str>) -> Result<()> {
+    fn restore(&mut self, owner: Option<&str>) -> Result<bool> {
         let mut failure = None;
         let applied = &self.changes[..self.applied];
         if let Some(owner) = applied.iter().find(|change| Some(change.name) == owner) {
             if self.key.read(owner.name)? != owner.after {
-                return Ok(());
+                return Ok(false);
             }
         }
         for change in applied.iter().rev() {
@@ -615,7 +718,7 @@ impl<'a> Settings<'a> {
             }
         }
         self.applied = 0;
-        failure.map_or(Ok(()), Err)
+        failure.map_or(Ok(true), Err)
     }
 }
 
@@ -747,6 +850,32 @@ mod tests {
         }
     }
 
+    struct TestRegKey(String);
+
+    impl TestRegKey {
+        fn create(subkey: &str) -> Self {
+            use windows_sys::Win32::System::Registry::RegCreateKeyW;
+
+            let mut hkey: HKEY = null_mut();
+            let rc = unsafe { RegCreateKeyW(HKEY_CURRENT_USER, wide(subkey).as_ptr(), &mut hkey) };
+            assert_eq!(rc, ERROR_SUCCESS, "RegCreateKeyW({subkey}) failed with {rc}");
+            unsafe {
+                let _ = RegCloseKey(hkey);
+            }
+            Self(subkey.to_string())
+        }
+    }
+
+    impl Drop for TestRegKey {
+        fn drop(&mut self) {
+            use windows_sys::Win32::System::Registry::RegDeleteTreeW;
+
+            unsafe {
+                let _ = RegDeleteTreeW(HKEY_CURRENT_USER, wide(&self.0).as_ptr());
+            }
+        }
+    }
+
     #[test]
     fn restores_proxy_after_parent_is_killed() {
         let local_pac = Value::string("http://127.0.0.1:18080/vdpi.pac");
@@ -782,6 +911,8 @@ mod tests {
                     None,
                     || {},
                     || {},
+                    || {},
+                    || {},
                     || {
                         let _ = io::stdin().lock().fill_buf();
                         Ok(())
@@ -791,15 +922,7 @@ mod tests {
             }
             _ => {
                 let path = format!(r"Software\vdpi-proxy-test-{}", std::process::id());
-                let full = format!(r"HKCU\{path}");
-                super::super::run_reg(&["add", &full, "/f"]).unwrap();
-                struct TestKey(String);
-                impl Drop for TestKey {
-                    fn drop(&mut self) {
-                        let _ = super::super::run_reg(&["delete", &self.0, "/f"]);
-                    }
-                }
-                let _cleanup = TestKey(full);
+                let _cleanup = TestRegKey::create(&path);
                 let key = Key::open(&path).unwrap();
                 key.write("AutoConfigURL", Some(&original_pac)).unwrap();
                 key.write("ProxyEnable", Some(&Value::dword(1))).unwrap();
@@ -1031,15 +1154,7 @@ mod tests {
             r"Software\vdpi-proxy-lease-test-{}-{seq}",
             std::process::id()
         );
-        let reg_full = format!(r"HKCU\{reg_path}");
-        super::super::run_reg(&["add", &reg_full, "/f"]).unwrap();
-        struct TestKey(String);
-        impl Drop for TestKey {
-            fn drop(&mut self) {
-                let _ = super::super::run_reg(&["delete", &self.0, "/f"]);
-            }
-        }
-        let _reg_cleanup = TestKey(reg_full);
+        let _reg_cleanup = TestRegKey::create(&reg_path);
 
         let dir = TestDir::new("lease-cleanup");
         let state_path = dir.0.join(WINDOWS_PROXY_STATE_FILENAME);
@@ -1076,12 +1191,20 @@ mod tests {
         assert!(created);
         assert!(state_path.is_file());
 
+        let activate_sync_count = AtomicUsize::new(0);
+        let restore_sync_count = AtomicUsize::new(0);
         let refresh_count = AtomicUsize::new(0);
         let winhttp_reset_count = AtomicUsize::new(0);
 
         with_proxy_lease(
             &mut settings,
             Some((state_path.as_path(), created)),
+            || {
+                activate_sync_count.fetch_add(1, Ordering::SeqCst);
+            },
+            || {
+                restore_sync_count.fetch_add(1, Ordering::SeqCst);
+            },
             || {
                 refresh_count.fetch_add(1, Ordering::SeqCst);
             },
@@ -1092,6 +1215,8 @@ mod tests {
                 assert_eq!(key.read("AutoConfigURL")?.as_ref(), Some(&local_pac));
                 assert_eq!(key.read("ProxyEnable")?.as_ref(), Some(&Value::dword(0)));
                 assert!(state_path.is_file());
+                assert_eq!(activate_sync_count.load(Ordering::SeqCst), 1);
+                assert_eq!(restore_sync_count.load(Ordering::SeqCst), 0);
                 assert_eq!(refresh_count.load(Ordering::SeqCst), 1);
                 assert_eq!(winhttp_reset_count.load(Ordering::SeqCst), 0);
                 Ok(())
@@ -1105,6 +1230,8 @@ mod tests {
             Some(&Value::dword(1))
         );
         assert!(!state_path.exists());
+        assert_eq!(activate_sync_count.load(Ordering::SeqCst), 1);
+        assert_eq!(restore_sync_count.load(Ordering::SeqCst), 1);
         assert_eq!(refresh_count.load(Ordering::SeqCst), 2);
         assert_eq!(winhttp_reset_count.load(Ordering::SeqCst), 1);
     }

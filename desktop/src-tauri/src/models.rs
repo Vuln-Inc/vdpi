@@ -88,6 +88,7 @@ pub enum ServiceOperationDto {
     Upgrading,
     Repairing,
     Uninstalling,
+    ResettingNetwork,
     Resuming,
     Pausing,
     SwitchingEngine,
@@ -314,4 +315,28 @@ pub struct ActionResultDto {
     pub code: Option<ActionErrorCodeDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<Box<DesktopStatusSnapshotDto>>,
+}
+
+impl ActionResultDto {
+    pub fn cancelled(message: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            message: message.into(),
+            needs_restart: None,
+            cancelled: Some(true),
+            code: None,
+            snapshot: None,
+        }
+    }
+
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            message: message.into(),
+            needs_restart: None,
+            cancelled: None,
+            code: None,
+            snapshot: None,
+        }
+    }
 }

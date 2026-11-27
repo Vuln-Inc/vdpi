@@ -8,6 +8,7 @@ pub mod linux_tun;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod macos_tun;
+pub mod network_reset;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod unix_foreground;
 pub mod vpn;
@@ -17,6 +18,8 @@ pub mod windows;
 #[cfg(target_os = "windows")]
 pub mod windows_service;
 pub mod windows_tun;
+
+pub use network_reset::*;
 
 /// Cross-platform system proxy session handle that configures OS-level HTTP/HTTPS/SOCKS5
 /// settings on startup, reconciles across network changes, and cleanly restores state on exit.

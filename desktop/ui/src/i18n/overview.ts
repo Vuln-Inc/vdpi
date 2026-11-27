@@ -15,6 +15,8 @@ const en = {
     "Add wintun.dll to the app folder to enable Full-PC (TUN) mode",
   engineSwitchingTo: "Switching engine to {engine}...",
   engineSwitching: "Switching engine...",
+  proxyGamesHint:
+    "Proxy mode covers browsers; use TUN mode for desktop games like Roblox and Discord voice.",
 
   // Headlines
   headlineChecking: "Checking status...",
@@ -188,6 +190,8 @@ const tr: OverviewDict = {
     "Tam PC (TUN) modunu etkinleştirmek için uygulama klasörüne wintun.dll ekleyin",
   engineSwitchingTo: "{engine} motoruna geçiliyor...",
   engineSwitching: "Motor değiştiriliyor...",
+  proxyGamesHint:
+    "Proxy modu tarayıcıları kapsar; Roblox gibi masaüstü oyunlar ve Discord sesli sohbet için TUN modunu kullanın.",
 
   // Headlines
   headlineChecking: "Durum kontrol ediliyor...",

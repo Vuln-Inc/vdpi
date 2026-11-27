@@ -566,6 +566,44 @@ fn is_orphan_vdpi_wintun_device(
     friendly_name.is_some_and(matches_vdpi_label) || device_desc.is_some_and(matches_vdpi_label)
 }
 
+/// Returns `true` when `token` parses as either of vdpi's virtual TUN DNS addresses
+/// (`198.18.0.2` or `fd00:7664:7069::2`, matching canonical and expanded IPv6 forms).
+#[cfg(any(target_os = "windows", test))]
+fn is_vdpi_dns_ip(token: &str) -> bool {
+    match token.trim().parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => ip == VDPI_TUN_DNS_V4,
+        Ok(std::net::IpAddr::V6(ip)) => ip == VDPI_TUN_DNS_V6,
+        Err(_) => false,
+    }
+}
+
+/// Strips vdpi's virtual TUN DNS IPs (`198.18.0.2`, `fd00:7664:7069::2`) from a Windows
+/// `Tcpip`/`Tcpip6` `NameServer` registry string (comma- or whitespace-delimited).
+///
+/// Returns `Some(cleaned)` only when at least one vdpi DNS IP was present and removed
+/// (`Some(String::new())` when no other DNS servers remain), or `None` if `raw` does not
+/// reference any vdpi DNS IP.
+#[cfg(any(target_os = "windows", test))]
+fn strip_vdpi_dns_servers(raw: &str) -> Option<String> {
+    let mut removed_any = false;
+    let mut kept: Vec<&str> = Vec::new();
+    for token in raw.split(|c: char| c == ',' || c.is_ascii_whitespace()) {
+        if token.is_empty() {
+            continue;
+        }
+        if is_vdpi_dns_ip(token) {
+            removed_any = true;
+        } else {
+            kept.push(token);
+        }
+    }
+    if !removed_any {
+        return None;
+    }
+    let sep = if raw.contains(',') { "," } else { " " };
+    Some(kept.join(sep))
+}
+
 /// Returns ordered, deduplicated hidden runtime-cache paths used to store or materialize the
 /// pinned `wintun.dll` (`%ProgramData%\vdpi\runtime\wintun-0.14.1.dll`, then
 /// `%LOCALAPPDATA%\vdpi\runtime\wintun-0.14.1.dll`, then `<temp>\vdpi-runtime\wintun-0.14.1.dll`).
@@ -1075,8 +1113,6 @@ mod win32 {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
-    use std::os::windows::process::CommandExt;
-    use std::process::Command;
     use std::ptr;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
@@ -1092,7 +1128,7 @@ mod win32 {
         WAIT_OBJECT_0,
     };
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        CancelMibChangeNotify2, ConvertInterfaceLuidToAlias, ConvertInterfaceLuidToGuid,
+        CancelMibChangeNotify2, ConvertInterfaceGuidToLuid, ConvertInterfaceLuidToGuid,
         CreateIpForwardEntry2, CreateUnicastIpAddressEntry, DeleteIpForwardEntry2,
         DeleteUnicastIpAddressEntry, FreeMibTable, GetIfTable2, GetIpForwardTable2,
         GetIpInterfaceEntry, GetIpInterfaceTable, GetUnicastIpAddressTable,
@@ -1112,7 +1148,10 @@ mod win32 {
         GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
     };
     use windows_sys::Win32::System::Registry::{
-        RegCloseKey, RegQueryValueExW, HKEY, KEY_READ, REG_EXPAND_SZ, REG_SZ, REG_VALUE_TYPE,
+        RegCloseKey, RegDeleteKeyW, RegDeleteValueW, RegEnumKeyExW, RegOpenKeyExW,
+        RegQueryInfoKeyW, RegQueryValueExW, RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE,
+        KEY_ENUMERATE_SUB_KEYS, KEY_QUERY_VALUE, KEY_READ, KEY_SET_VALUE, REG_EXPAND_SZ, REG_SZ,
+        REG_VALUE_TYPE,
     };
     use windows_sys::Win32::System::Threading::{
         ResetEvent, SetEvent, WaitForMultipleObjects, WaitForSingleObject, INFINITE,
@@ -1146,8 +1185,12 @@ mod win32 {
     const ROUTE_DEBOUNCE_WINDOW_MS: u32 = 250;
     /// Hard cap on continuous route-change debouncing so updates are never starved.
     const ROUTE_DEBOUNCE_MAX_WAIT: Duration = Duration::from_millis(1500);
-    /// Win32 process creation flag to hide `netsh` console window on pre-2004 Win10 fallback.
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    /// Windows registry subkey holding per-interface IPv4 Tcpip parameters (`NameServer`, etc.).
+    const TCPIP_INTERFACES_SUBKEY: &str =
+        r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces";
+    /// Windows registry subkey holding per-interface IPv6 Tcpip6 parameters (`NameServer`, etc.).
+    const TCPIP6_INTERFACES_SUBKEY: &str =
+        r"SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces";
     /// Win32 `FILE_SHARE_READ`: allows `LoadLibraryExW` to map the DLL while blocking writes,
     /// renames, and deletes on the open handle to eliminate TOCTOU races.
     const FILE_SHARE_READ: u32 = 0x0000_0001;
@@ -1316,7 +1359,6 @@ mod win32 {
             cch_file_path: u32,
             dw_flags: u32,
         ) -> u32;
-        fn GetSystemDirectoryW(lp_buffer: *mut u16, u_size: u32) -> u32;
         fn LocalFree(h_mem: *mut c_void) -> *mut c_void;
     }
 
@@ -1330,6 +1372,7 @@ mod win32 {
     ) -> WintunAdapterHandle;
     type WintunOpenAdapterFn = unsafe extern "system" fn(name: *const u16) -> WintunAdapterHandle;
     type WintunCloseAdapterFn = unsafe extern "system" fn(adapter: WintunAdapterHandle);
+    type WintunDeleteDriverFn = unsafe extern "system" fn() -> i32;
     type WintunGetAdapterLuidFn =
         unsafe extern "system" fn(adapter: WintunAdapterHandle, luid: *mut NET_LUID_LH);
     type WintunStartSessionFn = unsafe extern "system" fn(
@@ -2386,6 +2429,7 @@ mod win32 {
         create_adapter: WintunCreateAdapterFn,
         open_adapter: WintunOpenAdapterFn,
         close_adapter: WintunCloseAdapterFn,
+        delete_driver: Option<WintunDeleteDriverFn>,
         get_adapter_luid: WintunGetAdapterLuidFn,
         start_session: WintunStartSessionFn,
         end_session: WintunEndSessionFn,
@@ -2491,6 +2535,11 @@ mod win32 {
                     create_adapter: load_proc(module, c"WintunCreateAdapter")?,
                     open_adapter: load_proc(module, c"WintunOpenAdapter")?,
                     close_adapter: load_proc(module, c"WintunCloseAdapter")?,
+                    delete_driver: load_proc::<WintunDeleteDriverFn>(
+                        module,
+                        c"WintunDeleteDriver",
+                    )
+                    .ok(),
                     get_adapter_luid: load_proc(module, c"WintunGetAdapterLUID")?,
                     start_session: load_proc(module, c"WintunStartSession")?,
                     end_session: load_proc(module, c"WintunEndSession")?,
@@ -2524,8 +2573,14 @@ mod win32 {
     impl Drop for AdapterGuard {
         fn drop(&mut self) {
             if !self.handle.is_null() {
+                let mut luid_raw = NET_LUID_LH::default();
+                unsafe { (self.wintun.get_adapter_luid)(self.handle.as_raw(), &mut luid_raw) };
+                let luid = unsafe { luid_raw.Value };
+                let _ = cleanup_vdpi_luid_routes_and_dns(luid);
                 unsafe { (self.wintun.close_adapter)(self.handle.as_raw()) };
                 self.handle = SendHandle(ptr::null_mut());
+                let _ = delete_residual_vdpi_tcpip_interface_keys();
+                flush_dns_resolver_cache();
             }
         }
     }
@@ -2964,6 +3019,99 @@ mod win32 {
             .collect()
     }
 
+    #[inline]
+    fn guids_equal(a: &GUID, b: &GUID) -> bool {
+        a.data1 == b.data1 && a.data2 == b.data2 && a.data3 == b.data3 && a.data4 == b.data4
+    }
+
+    fn format_guid_braced(guid: &GUID) -> String {
+        format!(
+            "{{{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}}}",
+            guid.data1,
+            guid.data2,
+            guid.data3,
+            guid.data4[0],
+            guid.data4[1],
+            guid.data4[2],
+            guid.data4[3],
+            guid.data4[4],
+            guid.data4[5],
+            guid.data4[6],
+            guid.data4[7],
+        )
+    }
+
+    fn encode_reg_utf16_bytes(value: &str) -> Vec<u8> {
+        let mut out = Vec::with_capacity((value.len() + 1) * 2);
+        for unit in value.encode_utf16().chain(std::iter::once(0u16)) {
+            out.extend_from_slice(&unit.to_le_bytes());
+        }
+        out
+    }
+
+    fn read_reg_string_value(hkey: HKEY, value_name: &str) -> Option<(String, REG_VALUE_TYPE)> {
+        let name_w = encode_wide(value_name);
+        let mut reg_type: REG_VALUE_TYPE = 0;
+        let mut buf = vec![0u16; 128];
+        let mut cb_data = (buf.len() * mem::size_of::<u16>()) as u32;
+        let mut status = unsafe {
+            RegQueryValueExW(
+                hkey,
+                name_w.as_ptr(),
+                ptr::null(),
+                &mut reg_type,
+                buf.as_mut_ptr().cast::<u8>(),
+                &mut cb_data,
+            )
+        };
+        if status == ERROR_MORE_DATA && cb_data > 0 && cb_data <= 65_536 {
+            let needed_u16 = (cb_data as usize).div_ceil(mem::size_of::<u16>());
+            buf.resize(needed_u16, 0);
+            cb_data = (buf.len() * mem::size_of::<u16>()) as u32;
+            status = unsafe {
+                RegQueryValueExW(
+                    hkey,
+                    name_w.as_ptr(),
+                    ptr::null(),
+                    &mut reg_type,
+                    buf.as_mut_ptr().cast::<u8>(),
+                    &mut cb_data,
+                )
+            };
+        }
+        if status != NO_ERROR || (reg_type != REG_SZ && reg_type != REG_EXPAND_SZ) {
+            return None;
+        }
+        let u16_count = ((cb_data as usize) / mem::size_of::<u16>()).min(buf.len());
+        Some((utf16_array_to_string(&buf[..u16_count]), reg_type))
+    }
+
+    fn write_reg_string_value(
+        hkey: HKEY,
+        value_name: &str,
+        value: &str,
+        reg_type: REG_VALUE_TYPE,
+    ) -> Result<()> {
+        let name_w = encode_wide(value_name);
+        let bytes = encode_reg_utf16_bytes(value);
+        let cb_data = u32::try_from(bytes.len())
+            .context("registry string value exceeds u32 byte length")?;
+        let rc = unsafe {
+            RegSetValueExW(
+                hkey,
+                name_w.as_ptr(),
+                0,
+                reg_type,
+                bytes.as_ptr(),
+                cb_data,
+            )
+        };
+        if rc != NO_ERROR {
+            bail!("RegSetValueExW({value_name}) failed with Win32 error {rc}");
+        }
+        Ok(())
+    }
+
     fn setupdi_read_net_cfg_instance_id(
         open_dev_reg_key: SetupDiOpenDevRegKeyFn,
         dev_info: *mut c_void,
@@ -2983,41 +3131,7 @@ mod win32 {
             return None;
         }
         let _key_guard = RegKeyGuard(hkey);
-
-        let value_name = encode_wide("NetCfgInstanceId");
-        let mut reg_type: REG_VALUE_TYPE = 0;
-        let mut buf = vec![0u16; 128];
-        let mut cb_data = (buf.len() * mem::size_of::<u16>()) as u32;
-        let mut status = unsafe {
-            RegQueryValueExW(
-                hkey,
-                value_name.as_ptr(),
-                ptr::null(),
-                &mut reg_type,
-                buf.as_mut_ptr().cast::<u8>(),
-                &mut cb_data,
-            )
-        };
-        if status == ERROR_MORE_DATA && cb_data > 0 && cb_data <= 4096 {
-            let needed_u16 = (cb_data as usize).div_ceil(mem::size_of::<u16>());
-            buf.resize(needed_u16, 0);
-            cb_data = (buf.len() * mem::size_of::<u16>()) as u32;
-            status = unsafe {
-                RegQueryValueExW(
-                    hkey,
-                    value_name.as_ptr(),
-                    ptr::null(),
-                    &mut reg_type,
-                    buf.as_mut_ptr().cast::<u8>(),
-                    &mut cb_data,
-                )
-            };
-        }
-        if status != NO_ERROR || (reg_type != REG_SZ && reg_type != REG_EXPAND_SZ) {
-            return None;
-        }
-        let u16_count = ((cb_data as usize) / mem::size_of::<u16>()).min(buf.len());
-        let text = utf16_array_to_string(&buf[..u16_count]);
+        let (text, _) = read_reg_string_value(hkey, "NetCfgInstanceId")?;
         let trimmed = text.trim();
         if trimmed.is_empty() {
             None
@@ -3026,12 +3140,14 @@ mod win32 {
         }
     }
 
-    /// Enumerates all `GUID_DEVCLASS_NET` devices via dynamically loaded `setupapi.dll` and
-    /// removes any orphaned `vdpi0` Wintun device nodes via `SetupDiCallClassInstaller(DIF_REMOVE)`.
+    /// Enumerates all `GUID_DEVCLASS_NET` devices (with `flags = 0`, covering both present and
+    /// non-present/phantom nodes) via dynamically loaded `setupapi.dll`.
     ///
-    /// Works even when `WintunOpenAdapter` fails (e.g. phantom/broken PnP node) or when loose
-    /// `wintun.dll` was quarantined by Defender. Never touches third-party Wintun adapters.
-    fn remove_orphan_wintun_devices_via_setupapi() -> bool {
+    /// When `remove` is `false`, returns `true` on the first matching orphaned `vdpi0` Wintun
+    /// device node without mutating anything. When `remove` is `true`, invokes
+    /// `SetupDiCallClassInstaller(DIF_REMOVE)` on every matching node and returns `true` if any
+    /// device was removed. Never touches third-party Wintun adapters.
+    fn scan_orphan_wintun_devices_via_setupapi(remove: bool) -> bool {
         let setupapi_w = encode_wide("setupapi.dll");
         let hmod = unsafe {
             LoadLibraryExW(
@@ -3041,7 +3157,7 @@ mod win32 {
             )
         };
         if hmod.is_null() {
-            debug!("could not load setupapi.dll for orphan Wintun device cleanup");
+            debug!("could not load setupapi.dll for orphan Wintun device inspection");
             return false;
         }
         let _mod_guard = ModuleGuard(hmod);
@@ -3069,20 +3185,29 @@ mod win32 {
         }) else {
             return false;
         };
-        let Ok(call_installer) = (unsafe {
-            load_proc::<SetupDiCallClassInstallerFn>(hmod, c"SetupDiCallClassInstaller")
-        }) else {
-            return false;
+        let call_installer = if remove {
+            match unsafe {
+                load_proc::<SetupDiCallClassInstallerFn>(hmod, c"SetupDiCallClassInstaller")
+            } {
+                Ok(f) => Some(f),
+                Err(_) => return false,
+            }
+        } else {
+            None
         };
-        let set_install_params = unsafe {
-            load_proc::<SetupDiSetClassInstallParamsWFn>(hmod, c"SetupDiSetClassInstallParamsW")
-                .ok()
+        let set_install_params = if remove {
+            unsafe {
+                load_proc::<SetupDiSetClassInstallParamsWFn>(hmod, c"SetupDiSetClassInstallParamsW")
+                    .ok()
+            }
+        } else {
+            None
         };
         let open_dev_reg_key =
             unsafe { load_proc::<SetupDiOpenDevRegKeyFn>(hmod, c"SetupDiOpenDevRegKey").ok() };
 
         // Pass flags = 0 (not just DIGCF_PRESENT) so both present and non-present/phantom
-        // orphaned `vdpi0` Wintun device nodes in GUID_DEVCLASS_NET are cleaned up.
+        // orphaned `vdpi0` Wintun device nodes in GUID_DEVCLASS_NET are matched.
         let dev_info =
             unsafe { get_class_devs(&GUID_DEVCLASS_NET, ptr::null(), ptr::null_mut(), 0) };
         if dev_info.is_null() || dev_info == INVALID_HANDLE_PTR {
@@ -3095,7 +3220,7 @@ mod win32 {
             destroy: destroy_list,
         };
 
-        let mut removed_any = false;
+        let mut matched_or_removed = false;
         let mut index: u32 = 0;
         loop {
             let mut dev_data = SpDevinfoData {
@@ -3129,6 +3254,10 @@ mod win32 {
                 continue;
             }
 
+            if !remove {
+                return true;
+            }
+
             warn!(
                 adapter = VDPI_TUN_NAME,
                 friendly = ?friendly_names.first(),
@@ -3156,43 +3285,335 @@ mod win32 {
                 };
             }
 
-            let rm_ok = unsafe { call_installer(DIF_REMOVE, dev_info, &mut dev_data) };
-            if rm_ok != 0 {
-                removed_any = true;
-            } else {
-                let err = unsafe { GetLastError() };
-                warn!(
-                    error = err,
-                    adapter = VDPI_TUN_NAME,
-                    "SetupDiCallClassInstaller(DIF_REMOVE) failed for orphaned vdpi Wintun device"
-                );
+            if let Some(installer) = call_installer {
+                let rm_ok = unsafe { installer(DIF_REMOVE, dev_info, &mut dev_data) };
+                if rm_ok != 0 {
+                    matched_or_removed = true;
+                } else {
+                    let err = unsafe { GetLastError() };
+                    warn!(
+                        error = err,
+                        adapter = VDPI_TUN_NAME,
+                        "SetupDiCallClassInstaller(DIF_REMOVE) failed for orphaned vdpi Wintun device"
+                    );
+                }
             }
         }
 
-        removed_any
+        matched_or_removed
+    }
+
+    fn remove_orphan_wintun_devices_via_setupapi() -> bool {
+        scan_orphan_wintun_devices_via_setupapi(true)
+    }
+
+    fn lookup_vdpi_luid_by_guid() -> u64 {
+        let mut luid = NET_LUID_LH::default();
+        let rc = unsafe { ConvertInterfaceGuidToLuid(&VDPI_WINTUN_GUID, &mut luid) };
+        if rc == NO_ERROR {
+            unsafe { luid.Value }
+        } else {
+            0
+        }
+    }
+
+    fn clear_interface_dns_by_guid(guid: GUID) -> bool {
+        let iphlpapi_w = encode_wide("iphlpapi.dll");
+        let hmod = unsafe {
+            LoadLibraryExW(
+                iphlpapi_w.as_ptr(),
+                ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        };
+        if hmod.is_null() {
+            return false;
+        }
+        let _guard = ModuleGuard(hmod);
+        let set_dns = match unsafe {
+            load_proc::<SetInterfaceDnsSettingsFn>(hmod, c"SetInterfaceDnsSettings")
+        } {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+
+        let mut empty_v4 = encode_wide("");
+        let settings_v4 = DNS_INTERFACE_SETTINGS {
+            Version: DNS_INTERFACE_SETTINGS_VERSION1,
+            Flags: u64::from(DNS_SETTING_NAMESERVER),
+            NameServer: empty_v4.as_mut_ptr(),
+            ..Default::default()
+        };
+        let rc_v4 = unsafe { set_dns(guid, &settings_v4) };
+
+        let mut empty_v6 = encode_wide("");
+        let settings_v6 = DNS_INTERFACE_SETTINGS {
+            Version: DNS_INTERFACE_SETTINGS_VERSION1,
+            Flags: u64::from(DNS_SETTING_IPV6 | DNS_SETTING_NAMESERVER),
+            NameServer: empty_v6.as_mut_ptr(),
+            ..Default::default()
+        };
+        let rc_v6 = unsafe { set_dns(guid, &settings_v6) };
+
+        if rc_v4 != NO_ERROR && rc_v4 != ERROR_NOT_FOUND && rc_v4 != ERROR_FILE_NOT_FOUND {
+            debug!(
+                error = rc_v4,
+                "SetInterfaceDnsSettings(clear IPv4 DNS) returned non-fatal error"
+            );
+        }
+        if rc_v6 != NO_ERROR && rc_v6 != ERROR_NOT_FOUND && rc_v6 != ERROR_FILE_NOT_FOUND {
+            debug!(
+                error = rc_v6,
+                "SetInterfaceDnsSettings(clear IPv6 DNS) returned non-fatal error"
+            );
+        }
+
+        rc_v4 == NO_ERROR || rc_v6 == NO_ERROR
+    }
+
+    /// Explicitly removes every IPv4/IPv6 route associated with `luid` (or targeting a vdpi
+    /// virtual TUN/DNS next-hop) via `GetIpForwardTable2`/`DeleteIpForwardEntry2` and clears
+    /// IPv4 & IPv6 DNS settings on `VDPI_WINTUN_GUID` via `SetInterfaceDnsSettings(empty)`.
+    ///
+    /// Returns `(routes_removed, dns_cleared)`.
+    fn cleanup_vdpi_luid_routes_and_dns(luid: u64) -> (bool, bool) {
+        let mut routes_removed = false;
+
+        let mut raw_fwd: *mut MIB_IPFORWARD_TABLE2 = ptr::null_mut();
+        let rc = unsafe { GetIpForwardTable2(AF_UNSPEC, &mut raw_fwd) };
+        if rc == NO_ERROR && !raw_fwd.is_null() {
+            let fwd_table = MibTableGuard::new(raw_fwd);
+            let fwd_count = unsafe { (*fwd_table.as_ptr()).NumEntries } as usize;
+            if fwd_count > 0 {
+                let rows = unsafe {
+                    let first =
+                        ptr::addr_of!((*fwd_table.as_ptr()).Table).cast::<MIB_IPFORWARD_ROW2>();
+                    std::slice::from_raw_parts(first, fwd_count)
+                };
+                for row in rows {
+                    let row_luid = unsafe { row.InterfaceLuid.Value };
+                    let luid_match = luid != 0 && row_luid == luid;
+                    let next_hop_match = match unsafe { row.NextHop.si_family } {
+                        AF_INET => {
+                            let nh = in_addr_to_ipv4(unsafe { row.NextHop.Ipv4.sin_addr });
+                            nh == VDPI_TUN_IPV4 || nh == VDPI_TUN_DNS_V4
+                        }
+                        AF_INET6 => {
+                            let nh = Ipv6Addr::from(unsafe { row.NextHop.Ipv6.sin6_addr.u.Byte });
+                            nh == VDPI_TUN_IPV6 || nh == VDPI_TUN_DNS_V6
+                        }
+                        _ => false,
+                    };
+                    if !luid_match && !next_hop_match {
+                        continue;
+                    }
+                    let del_rc = unsafe { DeleteIpForwardEntry2(row) };
+                    if del_rc == NO_ERROR {
+                        routes_removed = true;
+                    } else if del_rc != ERROR_NOT_FOUND {
+                        debug!(
+                            luid = row_luid,
+                            error = del_rc,
+                            "DeleteIpForwardEntry2 returned non-fatal error during vdpi route teardown"
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut dns_cleared = clear_interface_dns_by_guid(VDPI_WINTUN_GUID);
+        if luid != 0 {
+            let net_luid = NET_LUID_LH { Value: luid };
+            let mut luid_guid = GUID::default();
+            if unsafe { ConvertInterfaceLuidToGuid(&net_luid, &mut luid_guid) } == NO_ERROR
+                && !guids_equal(&luid_guid, &VDPI_WINTUN_GUID)
+                && clear_interface_dns_by_guid(luid_guid)
+            {
+                dns_cleared = true;
+            }
+        }
+
+        (routes_removed, dns_cleared)
+    }
+
+    /// Deletes residual `NameServer` / `DhcpNameServer` values (and removes the interface subkey
+    /// if empty) under `Tcpip` and `Tcpip6` `Parameters\Interfaces\{VDPI_WINTUN_GUID}` via
+    /// native Advapi32 (`RegDeleteValueW` / `RegDeleteKeyW`), ignoring `ERROR_FILE_NOT_FOUND`.
+    fn delete_residual_vdpi_tcpip_interface_keys() -> bool {
+        let mut changed = false;
+
+        for parent in [TCPIP_INTERFACES_SUBKEY, TCPIP6_INTERFACES_SUBKEY] {
+            let subkey = format!(r"{parent}\{VDPI_WINTUN_GUID_STR}");
+            let subkey_w = encode_wide(&subkey);
+            let mut hkey: HKEY = ptr::null_mut();
+            let open_rc = unsafe {
+                RegOpenKeyExW(
+                    HKEY_LOCAL_MACHINE,
+                    subkey_w.as_ptr(),
+                    0,
+                    KEY_QUERY_VALUE | KEY_SET_VALUE,
+                    &mut hkey,
+                )
+            };
+            if open_rc == ERROR_FILE_NOT_FOUND || open_rc == ERROR_PATH_NOT_FOUND {
+                continue;
+            }
+            if open_rc != NO_ERROR {
+                debug!(
+                    subkey = %subkey,
+                    error = open_rc,
+                    "RegOpenKeyExW failed during residual vdpi Tcpip interface key cleanup"
+                );
+                continue;
+            }
+
+            let is_empty = {
+                let key_guard = RegKeyGuard(hkey);
+                for value_name in ["NameServer", "DhcpNameServer"] {
+                    let value_w = encode_wide(value_name);
+                    let del_val_rc = unsafe { RegDeleteValueW(key_guard.0, value_w.as_ptr()) };
+                    if del_val_rc == NO_ERROR {
+                        changed = true;
+                    } else if del_val_rc != ERROR_FILE_NOT_FOUND {
+                        debug!(
+                            subkey = %subkey,
+                            value = value_name,
+                            error = del_val_rc,
+                            "RegDeleteValueW returned non-fatal error during vdpi Tcpip cleanup"
+                        );
+                    }
+                }
+
+                let mut subkey_count: u32 = 0;
+                let mut value_count: u32 = 0;
+                let info_rc = unsafe {
+                    RegQueryInfoKeyW(
+                        key_guard.0,
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                        ptr::null(),
+                        &mut subkey_count,
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                        &mut value_count,
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                    )
+                };
+                info_rc == NO_ERROR && subkey_count == 0 && value_count == 0
+            };
+
+            if is_empty {
+                let del_key_rc = unsafe { RegDeleteKeyW(HKEY_LOCAL_MACHINE, subkey_w.as_ptr()) };
+                if del_key_rc == NO_ERROR {
+                    changed = true;
+                } else if del_key_rc != ERROR_FILE_NOT_FOUND && del_key_rc != ERROR_PATH_NOT_FOUND {
+                    debug!(
+                        subkey = %subkey,
+                        error = del_key_rc,
+                        "RegDeleteKeyW returned non-fatal error for empty vdpi Tcpip interface key"
+                    );
+                }
+            }
+        }
+
+        changed
+    }
+
+    /// Attempts to unload/remove the Wintun kernel driver via optional `WintunDeleteDriver` when
+    /// no Wintun adapter holds a reference. Wintun itself refcounts safely, so this is a no-op if
+    /// another Wintun adapter (WireGuard, Tailscale, Mullvad, etc.) is active.
+    pub fn try_delete_unused_wintun_driver() -> bool {
+        let Ok(wintun) = WintunApi::load_verified() else {
+            return false;
+        };
+        let Some(delete_driver) = wintun.delete_driver else {
+            return false;
+        };
+        let ok = unsafe { delete_driver() };
+        if ok != 0 {
+            debug!("WintunDeleteDriver removed unused Wintun kernel driver");
+            true
+        } else {
+            let err = unsafe { GetLastError() };
+            debug!(
+                error = err,
+                "WintunDeleteDriver did not remove driver (in use or already absent)"
+            );
+            false
+        }
+    }
+
+    /// Returns `true` when an orphaned `vdpi0` Wintun LUID, `GetIfTable2` alias/GUID entry, or
+    /// present/phantom SetupAPI `GUID_DEVCLASS_NET` device node exists on the host.
+    pub fn has_orphan_wintun_device_or_luid() -> bool {
+        if lookup_vdpi_luid_by_guid() != 0 {
+            return true;
+        }
+
+        let mut raw_if_table: *mut MIB_IF_TABLE2 = ptr::null_mut();
+        let rc = unsafe { GetIfTable2(&mut raw_if_table) };
+        if rc == NO_ERROR && !raw_if_table.is_null() {
+            let if_table = MibTableGuard::new(raw_if_table);
+            let if_count = unsafe { (*if_table.as_ptr()).NumEntries } as usize;
+            if if_count > 0 {
+                let rows = unsafe {
+                    let first = ptr::addr_of!((*if_table.as_ptr()).Table).cast::<MIB_IF_ROW2>();
+                    std::slice::from_raw_parts(first, if_count)
+                };
+                for row in rows {
+                    if guids_equal(&row.InterfaceGuid, &VDPI_WINTUN_GUID)
+                        || utf16_array_to_string(&row.Alias).eq_ignore_ascii_case(VDPI_TUN_NAME)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        scan_orphan_wintun_devices_via_setupapi(false)
     }
 
     /// Best-effort cleanup of an orphaned `vdpi0` Wintun adapter left behind by an abrupt
     /// process termination (e.g. `TerminateProcess` or `taskkill /F`).
     ///
-    /// Uses the process-lifetime cached `wintun.dll` (never unloading it) to close any openable
-    /// `vdpi0` adapter via `WintunOpenAdapter`/`WintunCloseAdapter`, and always runs SetupAPI
-    /// (`setupapi.dll` `SetupDiCallClassInstaller(DIF_REMOVE)`) so orphaned or phantom `vdpi0`
-    /// adapters are actually removed even when `WintunOpenAdapter` fails or loose `wintun.dll`
-    /// was quarantined. Flushes the Windows DNS resolver cache whenever an orphan adapter is
-    /// cleaned. Returns `true` only when an orphaned adapter was found and cleaned.
+    /// Resolves the `vdpi0` LUID via `ConvertInterfaceGuidToLuid(&VDPI_WINTUN_GUID)` even if
+    /// `WintunOpenAdapter` or `wintun.dll` loading fails (e.g. Defender quarantine), explicitly
+    /// deletes routes and DNS BEFORE closing any open Wintun handle, runs SetupAPI `DIF_REMOVE`
+    /// (`flags = 0`) for present and phantom device nodes, deletes residual Tcpip/Tcpip6
+    /// registry keys, and always flushes the Windows DNS resolver cache. Returns `true` when any
+    /// orphaned adapter, route, DNS entry, or registry state was cleaned.
     pub fn cleanup_orphan_wintun_adapter() -> bool {
         let mut cleaned = false;
+        let mut luid = lookup_vdpi_luid_by_guid();
+        let mut routes_dns_cleaned = false;
 
         if let Ok(wintun) = WintunApi::load_verified() {
             let name_w = encode_wide(VDPI_TUN_NAME);
             let handle = unsafe { (wintun.open_adapter)(name_w.as_ptr()) };
             if !handle.is_null() {
+                if luid == 0 {
+                    let mut luid_raw = NET_LUID_LH::default();
+                    unsafe { (wintun.get_adapter_luid)(handle, &mut luid_raw) };
+                    luid = unsafe { luid_raw.Value };
+                }
                 warn!(
                     adapter = VDPI_TUN_NAME,
-                    "found orphaned Wintun adapter via WintunOpenAdapter; closing handle"
+                    luid,
+                    "found orphaned Wintun adapter via WintunOpenAdapter; cleaning routes/DNS and closing handle"
                 );
+                let _ = cleanup_vdpi_luid_routes_and_dns(luid);
+                routes_dns_cleaned = true;
                 unsafe { (wintun.close_adapter)(handle) };
+                cleaned = true;
+            }
+        }
+
+        if !routes_dns_cleaned {
+            let (routes_removed, dns_cleared) = cleanup_vdpi_luid_routes_and_dns(luid);
+            if routes_removed || dns_cleared {
                 cleaned = true;
             }
         }
@@ -3201,10 +3622,171 @@ mod win32 {
             cleaned = true;
         }
 
-        if cleaned {
-            flush_dns_resolver_cache();
+        if delete_residual_vdpi_tcpip_interface_keys() {
+            cleaned = true;
         }
+
+        flush_dns_resolver_cache();
         cleaned
+    }
+
+    /// Performs a full Windows TUN and DNS reset:
+    /// 1. Cleans up `vdpi0` LUID routes/DNS, closes any orphaned Wintun adapter and SetupAPI
+    ///    nodes, deletes residual `vdpi0` Tcpip/Tcpip6 interface keys, and attempts
+    ///    `try_delete_unused_wintun_driver()`.
+    /// 2. Scans `HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces` and
+    ///    `Tcpip6\Parameters\Interfaces` via `RegEnumKeyExW`, stripping `198.18.0.2` or
+    ///    `fd00:7664:7069::2` from any interface `NameServer` value.
+    /// 3. Always flushes the Windows DNS resolver cache.
+    ///
+    /// Returns `(tun_changed, dns_override_changed, errors)`.
+    pub fn reset_windows_tun_and_dns_defaults() -> (bool, bool, Vec<String>) {
+        let mut tun_changed = false;
+        let mut dns_override_changed = false;
+        let mut errors: Vec<String> = Vec::new();
+
+        let luid = lookup_vdpi_luid_by_guid();
+        let (routes_removed, dns_cleared) = cleanup_vdpi_luid_routes_and_dns(luid);
+        if routes_removed || dns_cleared {
+            tun_changed = true;
+        }
+        if cleanup_orphan_wintun_adapter() {
+            tun_changed = true;
+        }
+        if delete_residual_vdpi_tcpip_interface_keys() {
+            tun_changed = true;
+        }
+        if try_delete_unused_wintun_driver() {
+            tun_changed = true;
+        }
+
+        for parent_path in [TCPIP_INTERFACES_SUBKEY, TCPIP6_INTERFACES_SUBKEY] {
+            let parent_w = encode_wide(parent_path);
+            let mut parent_hkey: HKEY = ptr::null_mut();
+            let open_rc = unsafe {
+                RegOpenKeyExW(
+                    HKEY_LOCAL_MACHINE,
+                    parent_w.as_ptr(),
+                    0,
+                    KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE,
+                    &mut parent_hkey,
+                )
+            };
+            if open_rc == ERROR_FILE_NOT_FOUND || open_rc == ERROR_PATH_NOT_FOUND {
+                continue;
+            }
+            if open_rc != NO_ERROR {
+                errors.push(format!(
+                    "RegOpenKeyExW(HKLM\\{parent_path}) failed with Win32 error {open_rc}"
+                ));
+                continue;
+            }
+            let parent_guard = RegKeyGuard(parent_hkey);
+
+            let mut name_buf = vec![0u16; 260];
+            let mut index: u32 = 0;
+            while index < 65_536 {
+                let mut name_len = name_buf.len() as u32;
+                let enum_rc = unsafe {
+                    RegEnumKeyExW(
+                        parent_guard.0,
+                        index,
+                        name_buf.as_mut_ptr(),
+                        &mut name_len,
+                        ptr::null(),
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                    )
+                };
+                if enum_rc == ERROR_NO_MORE_ITEMS {
+                    break;
+                }
+                if enum_rc == ERROR_MORE_DATA {
+                    if name_buf.len() >= 4096 {
+                        index = index.saturating_add(1);
+                        continue;
+                    }
+                    name_buf.resize(name_buf.len() * 2, 0);
+                    continue;
+                }
+                let cur_index = index;
+                index = index.saturating_add(1);
+                if enum_rc != NO_ERROR {
+                    errors.push(format!(
+                        "RegEnumKeyExW(HKLM\\{parent_path}, index={cur_index}) failed with Win32 error {enum_rc}"
+                    ));
+                    continue;
+                }
+
+                let subkey_name =
+                    String::from_utf16_lossy(&name_buf[..(name_len as usize).min(name_buf.len())]);
+                if subkey_name.is_empty() {
+                    continue;
+                }
+
+                let subkey_w = encode_wide(&subkey_name);
+                let mut sub_hkey: HKEY = ptr::null_mut();
+                let sub_open_rc = unsafe {
+                    RegOpenKeyExW(
+                        parent_guard.0,
+                        subkey_w.as_ptr(),
+                        0,
+                        KEY_QUERY_VALUE,
+                        &mut sub_hkey,
+                    )
+                };
+                if sub_open_rc != NO_ERROR {
+                    continue;
+                }
+                let sub_guard = RegKeyGuard(sub_hkey);
+
+                let Some((current_ns, reg_kind)) = read_reg_string_value(sub_guard.0, "NameServer")
+                else {
+                    continue;
+                };
+                let Some(cleaned_ns) = strip_vdpi_dns_servers(&current_ns) else {
+                    continue;
+                };
+                drop(sub_guard);
+
+                let mut write_hkey: HKEY = ptr::null_mut();
+                let write_open_rc = unsafe {
+                    RegOpenKeyExW(
+                        parent_guard.0,
+                        subkey_w.as_ptr(),
+                        0,
+                        KEY_SET_VALUE,
+                        &mut write_hkey,
+                    )
+                };
+                if write_open_rc != NO_ERROR {
+                    errors.push(format!(
+                        "RegOpenKeyExW(HKLM\\{parent_path}\\{subkey_name}, KEY_SET_VALUE) failed with Win32 error {write_open_rc}"
+                    ));
+                    continue;
+                }
+                let write_guard = RegKeyGuard(write_hkey);
+                if let Err(err) =
+                    write_reg_string_value(write_guard.0, "NameServer", &cleaned_ns, reg_kind)
+                {
+                    errors.push(format!(
+                        "failed to clean vdpi DNS from HKLM\\{parent_path}\\{subkey_name}\\NameServer: {err:#}"
+                    ));
+                } else {
+                    info!(
+                        path = %format!(r"HKLM\{parent_path}\{subkey_name}"),
+                        before = %current_ns,
+                        after = %cleaned_ns,
+                        "stripped residual vdpi DNS server from Windows interface NameServer"
+                    );
+                    dns_override_changed = true;
+                }
+            }
+        }
+
+        flush_dns_resolver_cache();
+        (tun_changed, dns_override_changed, errors)
     }
 
     fn create_or_recreate_adapter(wintun: &Arc<WintunApi>) -> Result<AdapterGuard> {
@@ -3212,16 +3794,20 @@ mod win32 {
         let tunnel_type_w = encode_wide(VDPI_WINTUN_TUNNEL_TYPE);
 
         // If an abrupt termination (e.g. Defender TerminateProcess or taskkill /F) left an
-        // orphaned zombie `vdpi0` adapter behind, open and close it cleanly (and remove any
-        // lingering PnP node via SetupAPI) before creating a fresh adapter.
+        // orphaned zombie `vdpi0` adapter behind, clean its routes/DNS, open and close it
+        // cleanly (and remove any lingering PnP node via SetupAPI) before creating a fresh adapter.
         let orphan = unsafe { (wintun.open_adapter)(name_w.as_ptr()) };
         if !orphan.is_null() {
             warn!(
                 adapter = VDPI_TUN_NAME,
                 "closing orphaned Wintun adapter left from a previous run before recreating"
             );
+            let mut luid_raw = NET_LUID_LH::default();
+            unsafe { (wintun.get_adapter_luid)(orphan, &mut luid_raw) };
+            let _ = cleanup_vdpi_luid_routes_and_dns(unsafe { luid_raw.Value });
             unsafe { (wintun.close_adapter)(orphan) };
             let _ = remove_orphan_wintun_devices_via_setupapi();
+            let _ = delete_residual_vdpi_tcpip_interface_keys();
         }
 
         let mut handle = unsafe {
@@ -3247,9 +3833,13 @@ mod win32 {
             );
             let stale = unsafe { (wintun.open_adapter)(name_w.as_ptr()) };
             if !stale.is_null() {
+                let mut luid_raw = NET_LUID_LH::default();
+                unsafe { (wintun.get_adapter_luid)(stale, &mut luid_raw) };
+                let _ = cleanup_vdpi_luid_routes_and_dns(unsafe { luid_raw.Value });
                 unsafe { (wintun.close_adapter)(stale) };
             }
             let _ = remove_orphan_wintun_devices_via_setupapi();
+            let _ = delete_residual_vdpi_tcpip_interface_keys();
             thread::sleep(Duration::from_millis(delay_ms));
             handle = unsafe {
                 (wintun.create_adapter)(name_w.as_ptr(), tunnel_type_w.as_ptr(), &VDPI_WINTUN_GUID)
@@ -3448,46 +4038,49 @@ mod win32 {
         Ok(())
     }
 
-    fn interface_alias_from_luid(vdpi_luid: u64) -> String {
-        let luid = NET_LUID_LH { Value: vdpi_luid };
-        let mut buf = [0u16; 257];
-        let rc = unsafe { ConvertInterfaceLuidToAlias(&luid, buf.as_mut_ptr(), buf.len()) };
-        if rc == NO_ERROR {
-            let alias = utf16_array_to_string(&buf);
-            if !alias.is_empty() {
-                return alias;
+    fn set_interface_dns_via_registry(guid: &GUID, is_v6: bool, name_server: &str) -> Result<()> {
+        let parent = if is_v6 {
+            TCPIP6_INTERFACES_SUBKEY
+        } else {
+            TCPIP_INTERFACES_SUBKEY
+        };
+        let guid_str = format_guid_braced(guid);
+        let subkey = format!(r"{parent}\{guid_str}");
+        let subkey_w = encode_wide(&subkey);
+        let mut hkey: HKEY = ptr::null_mut();
+        let open_rc = unsafe {
+            RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                subkey_w.as_ptr(),
+                0,
+                KEY_SET_VALUE,
+                &mut hkey,
+            )
+        };
+        if open_rc != NO_ERROR {
+            if name_server.is_empty()
+                && (open_rc == ERROR_FILE_NOT_FOUND || open_rc == ERROR_PATH_NOT_FOUND)
+            {
+                return Ok(());
             }
+            bail!("RegOpenKeyExW(HKLM\\{subkey}, KEY_SET_VALUE) failed with Win32 error {open_rc}");
         }
-        VDPI_TUN_NAME.to_string()
-    }
-
-    fn resolve_system32_netsh() -> PathBuf {
-        let mut buf = vec![0u16; 260];
-        for _ in 0..4 {
-            let len = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
-            if len == 0 {
-                break;
-            }
-            let len_usize = len as usize;
-            if len_usize < buf.len() {
-                let dir = PathBuf::from(OsString::from_wide(&buf[..len_usize]));
-                if !dir.as_os_str().is_empty() {
-                    return dir.join("netsh.exe");
-                }
-                break;
-            }
-            if len_usize > 32_768 {
-                break;
-            }
-            buf.resize(len_usize + 1, 0);
-        }
-        PathBuf::from(r"C:\Windows\System32\netsh.exe")
+        let key_guard = RegKeyGuard(hkey);
+        write_reg_string_value(key_guard.0, "NameServer", name_server, REG_SZ)?;
+        debug!(
+            subkey = %subkey,
+            name_server = %name_server,
+            ipv6 = is_v6,
+            "updated interface DNS NameServer via Advapi32 registry fallback"
+        );
+        Ok(())
     }
 
     /// Configures a static IPv4 or IPv6 DNS server on `vdpi0` via dynamically loaded
     /// `SetInterfaceDnsSettings` (Windows 10 2004+ / Windows 11), retrying briefly on
-    /// `ERROR_NOT_FOUND` and falling back to `<GetSystemDirectoryW>\netsh.exe` only on older
-    /// Windows 10 builds where `SetInterfaceDnsSettings` is absent from `iphlpapi.dll`.
+    /// `ERROR_NOT_FOUND` and falling back directly to Advapi32 `RegSetValueExW` on
+    /// `Tcpip{,6}\Parameters\Interfaces\{GUID}\NameServer` if `SetInterfaceDnsSettings` is
+    /// unavailable on older Windows builds.
     fn configure_interface_dns(vdpi_luid: u64, dns_server: IpAddr) -> Result<()> {
         let luid = NET_LUID_LH { Value: vdpi_luid };
         let mut guid = GUID::default();
@@ -3548,68 +4141,9 @@ mod win32 {
             }
         }
 
-        // Pre-2004 Windows 10 fallback when `SetInterfaceDnsSettings` is unavailable.
-        let alias = interface_alias_from_luid(vdpi_luid);
-        let netsh = resolve_system32_netsh();
-        debug!(
-            alias = %alias,
-            dns = %dns_server,
-            ipv6 = is_v6,
-            netsh = %netsh.display(),
-            "SetInterfaceDnsSettings unavailable; falling back to netsh"
-        );
-        let out = if is_v6 {
-            Command::new(&netsh)
-                .creation_flags(CREATE_NO_WINDOW)
-                .args([
-                    "interface",
-                    "ipv6",
-                    "set",
-                    "dnsservers",
-                    &format!("name={alias}"),
-                    "source=static",
-                    &format!("address={dns_server}"),
-                    "validate=no",
-                ])
-                .output()
-                .with_context(|| {
-                    format!(
-                        "failed to run {} fallback for IPv6 DNS configuration",
-                        netsh.display()
-                    )
-                })?
-        } else {
-            Command::new(&netsh)
-                .creation_flags(CREATE_NO_WINDOW)
-                .args([
-                    "interface",
-                    "ip",
-                    "set",
-                    "dns",
-                    &format!("name={alias}"),
-                    "source=static",
-                    &format!("addr={dns_server}"),
-                    "validate=no",
-                ])
-                .output()
-                .with_context(|| {
-                    format!(
-                        "failed to run {} fallback for IPv4 DNS configuration",
-                        netsh.display()
-                    )
-                })?
-        };
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let detail = if !stderr.trim().is_empty() {
-                stderr.trim()
-            } else {
-                stdout.trim()
-            };
-            bail!("netsh DNS configuration failed ({}): {detail}", out.status);
-        }
-        Ok(())
+        // Pre-2004 Windows 10 fallback when `SetInterfaceDnsSettings` is unavailable:
+        // write `NameServer` directly via Advapi32 without spawning any child process.
+        set_interface_dns_via_registry(&guid, is_v6, &dns_server.to_string())
     }
 
     fn configure_interface_dns_v4(vdpi_luid: u64, dns_server: Ipv4Addr) -> Result<()> {
@@ -3621,8 +4155,9 @@ mod win32 {
     }
 
     /// Clears static IPv6 DNS servers on `vdpi0` via `SetInterfaceDnsSettings` (empty
-    /// `NameServer` with `DNS_SETTING_IPV6 | DNS_SETTING_NAMESERVER`), falling back to
-    /// `<GetSystemDirectoryW>\netsh.exe` on pre-2004 Windows 10 builds.
+    /// `NameServer` with `DNS_SETTING_IPV6 | DNS_SETTING_NAMESERVER`), falling back directly
+    /// to Advapi32 `RegSetValueExW` on `Tcpip6\Parameters\Interfaces\{GUID}\NameServer` if
+    /// `SetInterfaceDnsSettings` is unavailable.
     fn clear_interface_dns_v6(vdpi_luid: u64) -> Result<()> {
         let luid = NET_LUID_LH { Value: vdpi_luid };
         let mut guid = GUID::default();
@@ -3661,41 +4196,7 @@ mod win32 {
         }
 
         // Pre-2004 Windows 10 fallback when `SetInterfaceDnsSettings` is unavailable.
-        let alias = interface_alias_from_luid(vdpi_luid);
-        let netsh = resolve_system32_netsh();
-        debug!(
-            alias = %alias,
-            netsh = %netsh.display(),
-            "SetInterfaceDnsSettings unavailable; clearing IPv6 DNS via netsh"
-        );
-        let out = Command::new(&netsh)
-            .creation_flags(CREATE_NO_WINDOW)
-            .args([
-                "interface",
-                "ipv6",
-                "set",
-                "dnsservers",
-                &format!("name={alias}"),
-                "source=dhcp",
-            ])
-            .output()
-            .with_context(|| {
-                format!(
-                    "failed to run {} fallback to clear IPv6 DNS",
-                    netsh.display()
-                )
-            })?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let detail = if !stderr.trim().is_empty() {
-                stderr.trim()
-            } else {
-                stdout.trim()
-            };
-            bail!("netsh IPv6 DNS clear failed ({}): {detail}", out.status);
-        }
-        Ok(())
+        set_interface_dns_via_registry(&guid, true, "")
     }
 
     /// Applies a [`TunRoamingPlan`] to `vdpi0` using make-before-break ordering (enabling the
@@ -4650,16 +5151,19 @@ mod win32 {
                 let _ = handle.join();
             }
 
-            // 4. End Wintun session, close adapter (atomically wiping all `vdpi0` routes/DNS),
-            //    close stop event, reset the outbound binder, and flush the DNS resolver cache.
+            // 4. End Wintun session, explicitly delete `vdpi0` routes & DNS BEFORE closing the
+            //    adapter, close adapter, clean residual Tcpip/Tcpip6 interface keys, close stop
+            //    event, reset the outbound binder, and always flush the DNS resolver cache.
             if !self.session.is_null() {
                 unsafe { (self.wintun.end_session)(self.session.as_raw()) };
                 self.session = SendHandle(ptr::null_mut());
             }
+            let _ = cleanup_vdpi_luid_routes_and_dns(self.vdpi_luid);
             if !self.adapter.is_null() {
                 unsafe { (self.wintun.close_adapter)(self.adapter.as_raw()) };
                 self.adapter = SendHandle(ptr::null_mut());
             }
+            let _ = delete_residual_vdpi_tcpip_interface_keys();
             if !self.stop_event.is_null() {
                 unsafe {
                     let _ = CloseHandle(self.stop_event.as_raw());
@@ -4677,11 +5181,33 @@ mod win32 {
 }
 
 #[cfg(target_os = "windows")]
-pub use win32::{cleanup_orphan_wintun_adapter, WindowsTunSession, WindowsTunStartParts};
+pub use win32::{
+    cleanup_orphan_wintun_adapter, has_orphan_wintun_device_or_luid,
+    reset_windows_tun_and_dns_defaults, try_delete_unused_wintun_driver, WindowsTunSession,
+    WindowsTunStartParts,
+};
 
 #[cfg(not(target_os = "windows"))]
 /// No-op on non-Windows platforms.
 pub fn cleanup_orphan_wintun_adapter() -> bool {
+    false
+}
+
+#[cfg(not(target_os = "windows"))]
+/// No-op on non-Windows platforms.
+pub fn has_orphan_wintun_device_or_luid() -> bool {
+    false
+}
+
+#[cfg(not(target_os = "windows"))]
+/// No-op on non-Windows platforms.
+pub fn reset_windows_tun_and_dns_defaults() -> (bool, bool, Vec<String>) {
+    (false, false, Vec::new())
+}
+
+#[cfg(not(target_os = "windows"))]
+/// No-op on non-Windows platforms.
+pub fn try_delete_unused_wintun_driver() -> bool {
     false
 }
 
@@ -5999,5 +6525,61 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn strip_vdpi_dns_servers_removes_only_vdpi_v4_and_v6_dns_ips() {
+        // Unrelated or empty NameServer values return None (no registry write needed).
+        assert_eq!(strip_vdpi_dns_servers(""), None);
+        assert_eq!(strip_vdpi_dns_servers("   "), None);
+        assert_eq!(strip_vdpi_dns_servers("1.1.1.1,8.8.8.8"), None);
+        assert_eq!(strip_vdpi_dns_servers("2606:4700:4700::1111"), None);
+        // Must not false-match IPs that only share a string prefix with vdpi DNS.
+        assert_eq!(strip_vdpi_dns_servers("198.18.0.20,8.8.8.8"), None);
+        assert_eq!(strip_vdpi_dns_servers("fd00:7664:7069::20"), None);
+        assert_eq!(strip_vdpi_dns_servers("198.18.0.1"), None);
+
+        // Single vdpi IPv4 or IPv6 DNS resets to empty string.
+        assert_eq!(strip_vdpi_dns_servers("198.18.0.2"), Some(String::new()));
+        assert_eq!(
+            strip_vdpi_dns_servers("fd00:7664:7069::2"),
+            Some(String::new())
+        );
+        // Expanded / uppercase IPv6 form is matched via IpAddr parsing.
+        assert_eq!(
+            strip_vdpi_dns_servers("FD00:7664:7069:0000:0000:0000:0000:0002"),
+            Some(String::new())
+        );
+        assert_eq!(
+            strip_vdpi_dns_servers("198.18.0.2,fd00:7664:7069::2"),
+            Some(String::new())
+        );
+
+        // Mixed lists strip only vdpi IPs and preserve remaining resolvers + delimiter style.
+        assert_eq!(
+            strip_vdpi_dns_servers("198.18.0.2,1.1.1.1"),
+            Some("1.1.1.1".to_string())
+        );
+        assert_eq!(
+            strip_vdpi_dns_servers("1.1.1.1,198.18.0.2,8.8.8.8"),
+            Some("1.1.1.1,8.8.8.8".to_string())
+        );
+        assert_eq!(
+            strip_vdpi_dns_servers("1.1.1.1 198.18.0.2 8.8.8.8"),
+            Some("1.1.1.1 8.8.8.8".to_string())
+        );
+        assert_eq!(
+            strip_vdpi_dns_servers("FD00:7664:7069:0:0:0:0:2,2606:4700:4700::1111"),
+            Some("2606:4700:4700::1111".to_string())
+        );
+    }
+
+    #[test]
+    fn windows_tun_has_no_netsh_dns_fallback_or_shell_out() {
+        let src = include_str!("windows_tun.rs");
+        assert!(
+            !src.contains(concat!("netsh", ".exe")),
+            "windows_tun.rs must not contain legacy netsh DNS shell-out binaries"
+        );
     }
 }

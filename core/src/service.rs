@@ -144,6 +144,7 @@ mod win_fs_hardening {
     const OPEN_EXISTING: u32 = 3;
 
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+    const MOVEFILE_DELAY_UNTIL_REBOOT: u32 = 0x0000_0004;
     const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
 
     const ERROR_SUCCESS: u32 = 0;
@@ -986,6 +987,16 @@ mod win_fs_hardening {
         fs::remove_dir(dir)
     }
 
+    pub(super) fn schedule_delete_on_reboot(path: &Path) -> bool {
+        if is_reparse_point(path) {
+            return false;
+        }
+        let path_w = encode_wide_nul(path);
+        // SAFETY: `path_w` is valid NUL-terminated UTF-16; a NULL destination with
+        // `MOVEFILE_DELAY_UNTIL_REBOOT` registers `path` for deletion on next reboot.
+        unsafe { MoveFileExW(path_w.as_ptr(), std::ptr::null(), MOVEFILE_DELAY_UNTIL_REBOOT) != 0 }
+    }
+
     fn fold_ascii_wide(u: u16) -> u16 {
         if (b'A' as u16..=b'Z' as u16).contains(&u) {
             u + 32
@@ -1274,6 +1285,35 @@ pub fn read_runtime_states() -> Vec<RuntimeState> {
         }
     }
     states
+}
+
+/// Removes all accessible stale `state.json` runtime state files across system and user
+/// locations. Used by the network reset orchestrator after stopping daemons.
+pub fn clear_all_stale_runtime_states() {
+    for path in runtime_state_read_paths() {
+        #[cfg(target_os = "windows")]
+        {
+            if path
+                .parent()
+                .is_some_and(win_fs_hardening::is_reparse_point)
+                || win_fs_hardening::is_reparse_point(&path)
+            {
+                continue;
+            }
+            let _ = win_fs_hardening::safe_remove_file(&path);
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            if ensure_no_symlink_under_user_home(&path).is_err() {
+                continue;
+            }
+            let _ = fs::remove_file(&path);
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+        {
+            let _ = fs::remove_file(&path);
+        }
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
@@ -1766,7 +1806,7 @@ pub fn home_dir() -> Result<PathBuf> {
     bail!("neither HOME nor USERPROFILE environment variable is set")
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(test)]
 fn is_valid_windows_program_files_path_str(raw: &str) -> bool {
     let trimmed = raw.trim();
     if trimmed.is_empty()
@@ -1787,93 +1827,12 @@ fn is_valid_windows_program_files_path_str(raw: &str) -> bool {
     !trimmed.split(['\\', '/']).any(|seg| seg == "..")
 }
 
-#[cfg(target_os = "windows")]
-fn windows_program_files_dir() -> Result<PathBuf> {
-    use std::ffi::{c_void, OsString};
-    use std::os::windows::ffi::OsStringExt;
-
-    #[repr(C)]
-    struct KnownFolderGuid {
-        data1: u32,
-        data2: u16,
-        data3: u16,
-        data4: [u8; 8],
-    }
-
-    // FOLDERID_ProgramFiles = {905E63B6-C1BF-494E-B29C-65B732D3D21A}
-    const FOLDERID_PROGRAM_FILES: KnownFolderGuid = KnownFolderGuid {
-        data1: 0x905e_63b6,
-        data2: 0xc1bf,
-        data3: 0x494e,
-        data4: [0xb2, 0x9c, 0x65, 0xb7, 0x32, 0xd3, 0xd2, 0x1a],
-    };
-
-    #[link(name = "shell32")]
-    extern "system" {
-        fn SHGetKnownFolderPath(
-            rfid: *const KnownFolderGuid,
-            dw_flags: u32,
-            h_token: *mut c_void,
-            ppsz_path: *mut *mut u16,
-        ) -> i32;
-    }
-
-    #[link(name = "ole32")]
-    extern "system" {
-        fn CoTaskMemFree(pv: *mut c_void);
-    }
-
-    struct CoTaskMemGuard(*mut u16);
-
-    impl Drop for CoTaskMemGuard {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                // SAFETY: `self.0` was allocated by `SHGetKnownFolderPath` and must be freed via `CoTaskMemFree`.
-                unsafe {
-                    CoTaskMemFree(self.0.cast::<c_void>());
-                }
-            }
-        }
-    }
-
-    let mut raw_ptr: *mut u16 = std::ptr::null_mut();
-    // SAFETY: `FOLDERID_PROGRAM_FILES` is a valid GUID and `raw_ptr` is a valid out-pointer.
-    let hr = unsafe {
-        SHGetKnownFolderPath(
-            &FOLDERID_PROGRAM_FILES,
-            0,
-            std::ptr::null_mut(),
-            &mut raw_ptr,
-        )
-    };
-    let _guard = CoTaskMemGuard(raw_ptr);
-    if hr == 0 && !raw_ptr.is_null() {
-        let wide_slice = unsafe {
-            let mut len = 0usize;
-            while *raw_ptr.add(len) != 0 {
-                len += 1;
-            }
-            std::slice::from_raw_parts(raw_ptr, len)
-        };
-        let candidate = PathBuf::from(OsString::from_wide(wide_slice));
-        if candidate
-            .to_str()
-            .is_some_and(is_valid_windows_program_files_path_str)
-            && !win_fs_hardening::is_reparse_point(&candidate)
-        {
-            return Ok(candidate);
-        }
-    }
-
-    let fallback = PathBuf::from(r"C:\Program Files");
-    win_fs_hardening::reject_reparse_point(&fallback)?;
-    Ok(fallback)
-}
-
 pub fn vdpi_root_dir() -> Result<PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        Ok(windows_program_files_dir()?.join("vdpi"))
+        let program_files = crate::platform::windows::known_program_files_dir();
+        win_fs_hardening::reject_reparse_point(&program_files)?;
+        Ok(program_files.join("vdpi"))
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -5744,9 +5703,9 @@ fn legacy_windows_root_dir() -> Option<PathBuf> {
 
 #[cfg(target_os = "windows")]
 fn cleanup_legacy_windows_startup() {
-    use crate::platform::windows::run_reg;
+    use crate::platform::windows::delete_reg_value_native;
 
-    let _ = run_reg(&["delete", WINDOWS_LEGACY_RUN_KEY, "/v", "vdpi", "/f"]);
+    let _ = delete_reg_value_native(WINDOWS_LEGACY_RUN_KEY, "vdpi");
     if let Some(legacy_root) = legacy_windows_root_dir() {
         if win_fs_hardening::is_reparse_point(&legacy_root) {
             return;
@@ -5787,36 +5746,113 @@ fn windows_system32_dir() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "windows")]
-fn resolve_windows_system32_exe(exe_name: &str) -> Option<PathBuf> {
-    let sys32 = windows_system32_dir()?;
-    let candidate = sys32.join(exe_name);
-    candidate.is_file().then_some(candidate)
+enum TerminatePidOutcome {
+    Terminated,
+    AccessDenied,
+    NotRunningOrMismatch,
+}
+
+#[cfg(target_os = "windows")]
+fn terminate_windows_vdpi_pid(pid: u32) -> TerminatePidOutcome {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    };
+
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
+
+    struct ProcessHandleGuard(HANDLE);
+    impl Drop for ProcessHandleGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+                // SAFETY: `self.0` is a valid process handle owned by this guard.
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    if pid == 0 || pid == std::process::id() {
+        return TerminatePidOutcome::NotRunningOrMismatch;
+    }
+
+    // SAFETY: Requesting query + terminate rights on a single PID; closed via RAII guard.
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+            0,
+            pid,
+        )
+    };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(ERROR_ACCESS_DENIED) {
+            return TerminatePidOutcome::AccessDenied;
+        }
+        return TerminatePidOutcome::NotRunningOrMismatch;
+    }
+    let _guard = ProcessHandleGuard(handle);
+
+    let mut buf = vec![0u16; 1024];
+    let image_path = loop {
+        let mut len = buf.len() as u32;
+        // SAFETY: `buf` is writable with capacity `len` UTF-16 code units.
+        let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len) };
+        if ok != 0 && len > 0 {
+            break PathBuf::from(OsString::from_wide(&buf[..len as usize]));
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(ERROR_INSUFFICIENT_BUFFER) && buf.len() < 32_768 {
+            buf.resize(buf.len() * 2, 0);
+            continue;
+        }
+        return TerminatePidOutcome::NotRunningOrMismatch;
+    };
+
+    let is_vdpi = image_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("vdpi.exe"));
+    if !is_vdpi {
+        return TerminatePidOutcome::NotRunningOrMismatch;
+    }
+
+    // SAFETY: Verified target PID image basename is `vdpi.exe` and not `current_pid`.
+    if unsafe { TerminateProcess(handle, 1) } != 0 {
+        TerminatePidOutcome::Terminated
+    } else if std::io::Error::last_os_error().raw_os_error() == Some(ERROR_ACCESS_DENIED) {
+        TerminatePidOutcome::AccessDenied
+    } else {
+        TerminatePidOutcome::NotRunningOrMismatch
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn stop_windows_foreground_daemons_detailed() -> (bool, bool) {
+    let my_pid = std::process::id();
+    let mut stopped_any = false;
+    let mut access_denied = false;
+    // Stop published daemon PIDs only; the unelevated caller may be waiting for our exit.
+    for state in read_runtime_states() {
+        if state.pid != my_pid {
+            match terminate_windows_vdpi_pid(state.pid) {
+                TerminatePidOutcome::Terminated => stopped_any = true,
+                TerminatePidOutcome::AccessDenied => access_denied = true,
+                TerminatePidOutcome::NotRunningOrMismatch => {}
+            }
+        }
+    }
+    (stopped_any, access_denied)
 }
 
 #[cfg(target_os = "windows")]
 fn stop_windows_foreground_daemons() {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-    let my_pid = std::process::id();
-    let Some(taskkill) = resolve_windows_system32_exe("taskkill.exe") else {
-        return;
-    };
-    // Stop published daemon PIDs only; the unelevated installer is waiting for our exit.
-    for state in read_runtime_states() {
-        if state.pid != my_pid {
-            let _ = Command::new(&taskkill)
-                .creation_flags(CREATE_NO_WINDOW)
-                .args([
-                    "/F",
-                    "/PID",
-                    &state.pid.to_string(),
-                    "/FI",
-                    "IMAGENAME eq vdpi.exe",
-                ])
-                .output();
-        }
-    }
+    let _ = stop_windows_foreground_daemons_detailed();
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -5850,11 +5886,35 @@ fn is_allowed_delayed_windows_cleanup_dir(candidate: &Path, program_files_vdpi: 
 }
 
 #[cfg(target_os = "windows")]
-fn schedule_delayed_windows_dir_cleanup(vdpi_root: &Path) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+fn schedule_delete_tree_on_reboot(path: &Path) {
+    if win_fs_hardening::is_reparse_point(path) {
+        return;
+    }
+    if path.is_dir() {
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let child = entry.path();
+                if win_fs_hardening::is_reparse_point(&child) {
+                    continue;
+                }
+                if child.is_dir() {
+                    schedule_delete_tree_on_reboot(&child);
+                } else if win_fs_hardening::safe_remove_file(&child).is_err() {
+                    let _ = win_fs_hardening::schedule_delete_on_reboot(&child);
+                }
+            }
+        }
+        if fs::remove_dir(path).is_err() {
+            let _ = win_fs_hardening::schedule_delete_on_reboot(path);
+        }
+    } else if win_fs_hardening::safe_remove_file(path).is_err() {
+        let _ = win_fs_hardening::schedule_delete_on_reboot(path);
+    }
+}
 
-    // Never allow elevated `cmd.exe rmdir /S /Q` against user-writable `%LOCALAPPDATA%`
+#[cfg(target_os = "windows")]
+fn schedule_delayed_windows_dir_cleanup(vdpi_root: &Path) {
+    // Never schedule delayed reboot deletion against user-writable `%LOCALAPPDATA%`
     // or any path outside the admin-owned `Program Files\vdpi` install tree.
     let Ok(allowed_root) = vdpi_root_dir() else {
         return;
@@ -5883,45 +5943,7 @@ fn schedule_delayed_windows_dir_cleanup(vdpi_root: &Path) {
         return;
     }
 
-    let Some(root_str) = vdpi_root.to_str() else {
-        return;
-    };
-    if root_str.is_empty()
-        || root_str.contains(['"', '&', '|', '%', '^', '<', '>', '\r', '\n', '\0'])
-    {
-        return;
-    }
-
-    let Some(sys32_dir) = windows_system32_dir() else {
-        return;
-    };
-    let (Some(cmd_exe), Some(ping_exe)) = (
-        resolve_windows_system32_exe("cmd.exe"),
-        resolve_windows_system32_exe("ping.exe"),
-    ) else {
-        return;
-    };
-    let Some(ping_str) = ping_exe.to_str() else {
-        return;
-    };
-    if ping_str.is_empty()
-        || ping_str.contains(['"', '&', '|', '%', '^', '<', '>', '\r', '\n', '\0'])
-    {
-        return;
-    }
-
-    let cleanup_cmd = format!(
-        "for /L %i in (1,1,12) do (rmdir /S /Q \"{root_str}\" 2>nul & if not exist \"{root_str}\" (exit /b 0) else (\"{ping_str}\" -n 2 127.0.0.1 >nul))"
-    );
-    let _ = Command::new(cmd_exe)
-        .current_dir(&sys32_dir)
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .raw_arg("/C")
-        .raw_arg(cleanup_cmd)
-        .spawn();
+    schedule_delete_tree_on_reboot(vdpi_root);
 }
 
 #[cfg(target_os = "windows")]
@@ -5952,14 +5974,15 @@ fn cleanup_windows_install_files(purge: bool) {
 
     if let Some(legacy) = legacy_root.as_deref().filter(|p| p.exists()) {
         if !win_fs_hardening::is_reparse_point(legacy) {
-            // Never schedule delayed `cmd.exe rmdir /S /Q` on user-writable `%LOCALAPPDATA%`
+            // Never schedule delayed reboot deletion on user-writable `%LOCALAPPDATA%`
             // paths (junction-swap LPE risk); use synchronous reparse-safe removal only.
+            let _ = win_fs_hardening::safe_remove_dir_all(&legacy.join("runtime"));
             if purge {
                 let _ = win_fs_hardening::safe_remove_dir_all(&legacy.join("logs"));
                 let _ = win_fs_hardening::safe_remove_dir_all(legacy);
             } else {
                 // Preserve `%LOCALAPPDATA%\vdpi\config.toml` and its parent directory when
-                // uninstall runs without `--purge`; remove only bin/, logs/, and state files.
+                // uninstall runs without `--purge`; remove only bin/, logs/, runtime/, and state files.
                 let _ = win_fs_hardening::safe_remove_dir_all(&legacy.join("logs"));
                 let _ = win_fs_hardening::safe_remove_file(&legacy.join("state.json"));
                 let _ = win_fs_hardening::safe_remove_file(
@@ -5975,11 +5998,29 @@ fn cleanup_windows_install_files(purge: bool) {
 
     let pd_dir = known_program_data_dir().join("vdpi");
     if pd_dir.exists() && !win_fs_hardening::is_reparse_point(&pd_dir) {
+        let _ = win_fs_hardening::safe_remove_dir_all(&pd_dir.join("runtime"));
         if purge {
             let _ = win_fs_hardening::safe_remove_dir_all(&pd_dir);
         } else {
             let _ = win_fs_hardening::safe_remove_file(&pd_dir.join("state.json"));
             let _ = win_fs_hardening::safe_remove_file(&pd_dir.join(WINDOWS_PROXY_STATE_FILENAME));
+        }
+    }
+
+    // Remove wintun runtime cache directories under `%TEMP%\vdpi-runtime` (reparse-safe).
+    let mut temp_roots = vec![std::env::temp_dir()];
+    if let Some(env_temp) = std::env::var_os("TEMP").filter(|v| !v.is_empty()) {
+        let p = PathBuf::from(env_temp);
+        if !temp_roots.contains(&p) {
+            temp_roots.push(p);
+        }
+    }
+    for temp_root in temp_roots {
+        if !win_fs_hardening::is_reparse_point(&temp_root) {
+            let runtime_cache = temp_root.join("vdpi-runtime");
+            if runtime_cache.exists() && !win_fs_hardening::is_reparse_point(&runtime_cache) {
+                let _ = win_fs_hardening::safe_remove_dir_all(&runtime_cache);
+            }
         }
     }
 
@@ -7519,12 +7560,292 @@ pub fn uninstall_service_with_options(purge: bool) -> Result<()> {
     uninstall_service_with_options_impl(purge, true)
 }
 
+#[cfg(target_os = "windows")]
+fn refresh_windows_network_caches_unconditionally() {
+    crate::platform::windows::notify_wininet_refresh();
+    crate::platform::windows::broadcast_environment_change();
+    crate::platform::windows::flush_dns_resolver_cache();
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn stop_unix_foreground_daemons_for_reset() -> (bool, bool) {
+    let my_pid = std::process::id();
+    let mut stopped_any = false;
+    let mut access_denied = false;
+
+    for state in read_runtime_states() {
+        let pid = state.pid;
+        if pid == 0 || pid == my_pid {
+            continue;
+        }
+        let Ok(raw_pid) = libc::pid_t::try_from(pid) else {
+            continue;
+        };
+        if raw_pid <= 0 {
+            continue;
+        }
+
+        #[cfg(target_os = "linux")]
+        let is_vdpi = fs::read_to_string(format!("/proc/{pid}/comm"))
+            .ok()
+            .is_some_and(|comm| comm.trim().starts_with("vdpi"));
+
+        #[cfg(target_os = "macos")]
+        let is_vdpi = Command::new("/bin/ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .is_some_and(|out| {
+                let text = String::from_utf8_lossy(&out.stdout);
+                let name = Path::new(text.trim())
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                name == "vdpi"
+            });
+
+        if !is_vdpi {
+            continue;
+        }
+
+        // SAFETY: Sending SIGTERM to a verified `vdpi` daemon PID != current_pid.
+        let rc = unsafe { libc::kill(raw_pid, libc::SIGTERM) };
+        if rc == 0 {
+            stopped_any = true;
+            let deadline = Instant::now() + Duration::from_millis(1500);
+            while Instant::now() < deadline {
+                // SAFETY: `kill(pid, 0)` only probes process existence.
+                if unsafe { libc::kill(raw_pid, 0) } != 0 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) {
+            access_denied = true;
+        }
+    }
+
+    (stopped_any, access_denied)
+}
+
+/// Stops all running `vdpi` background services and foreground daemons as part of
+/// a full or user-only network reset.
+///
+/// Returns `(stopped_any, skipped_privileges, errors)`.
+pub fn stop_all_vdpi_daemons_for_reset(elevated: bool) -> (bool, bool, Vec<String>) {
+    #[cfg(target_os = "windows")]
+    {
+        use crate::platform::windows_service::{
+            query_windows_service_status, stop_windows_service_if_running,
+        };
+
+        let mut stopped_any = false;
+        let mut skipped_privileges = false;
+        let mut errors = Vec::new();
+
+        let svc = query_windows_service_status();
+        if svc.installed && svc.state != "STOPPED" {
+            if elevated {
+                match stop_windows_service_if_running() {
+                    Ok(true) => stopped_any = true,
+                    Ok(false) => {}
+                    Err(err) => errors.push(format!(
+                        "failed to stop Windows service '{WINDOWS_SERVICE_NAME}': {err}"
+                    )),
+                }
+            } else {
+                skipped_privileges = true;
+            }
+        }
+
+        let (fg_stopped, fg_denied) = stop_windows_foreground_daemons_detailed();
+        if fg_stopped {
+            stopped_any = true;
+        }
+        if fg_denied && !elevated {
+            skipped_privileges = true;
+        }
+
+        (stopped_any, skipped_privileges, errors)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut stopped_any = false;
+        let mut skipped_privileges = false;
+        let mut errors = Vec::new();
+
+        let system_target = format!("system/{LAUNCH_DAEMON_LABEL}");
+        if launchctl_service_loaded(&system_target) {
+            if elevated && is_unix_root() {
+                let plist_path = launch_daemon_plist_path();
+                let mut out = Command::new("/bin/launchctl")
+                    .args(["bootout", &system_target])
+                    .stdin(Stdio::null())
+                    .output();
+                if let Ok(ref res) = out {
+                    if !res.status.success()
+                        && launchctl_service_loaded(&system_target)
+                        && plist_path.exists()
+                    {
+                        let plist_str = plist_path.display().to_string();
+                        out = Command::new("/bin/launchctl")
+                            .args(["bootout", "system", &plist_str])
+                            .stdin(Stdio::null())
+                            .output();
+                    }
+                }
+                wait_launchctl_unloaded(&system_target);
+                if !launchctl_service_loaded(&system_target) {
+                    stopped_any = true;
+                } else {
+                    let detail = match out {
+                        Ok(res) => String::from_utf8_lossy(&res.stderr).trim().to_string(),
+                        Err(err) => err.to_string(),
+                    };
+                    errors.push(if detail.is_empty() {
+                        format!("failed to stop LaunchDaemon '{LAUNCH_DAEMON_LABEL}'")
+                    } else {
+                        format!("failed to stop LaunchDaemon '{LAUNCH_DAEMON_LABEL}': {detail}")
+                    });
+                }
+            } else {
+                skipped_privileges = true;
+            }
+        }
+
+        let uid = current_uid();
+        let domain_target = format!("gui/{uid}");
+        let agent_target = format!("{domain_target}/{LAUNCH_AGENT_LABEL}");
+        if launchctl_service_loaded(&agent_target) {
+            let mut out = macos_launch_agent_launchctl_command()
+                .args(["bootout", &agent_target])
+                .stdin(Stdio::null())
+                .output();
+            if let Ok(ref res) = out {
+                if !res.status.success() && launchctl_service_loaded(&agent_target) {
+                    if let Ok(plist_path) = launch_agent_plist_path() {
+                        if plist_path.exists() {
+                            let plist_str = plist_path.display().to_string();
+                            out = macos_launch_agent_launchctl_command()
+                                .args(["bootout", &domain_target, &plist_str])
+                                .stdin(Stdio::null())
+                                .output();
+                        }
+                    }
+                }
+            }
+            wait_launchctl_unloaded(&agent_target);
+            if !launchctl_service_loaded(&agent_target) {
+                stopped_any = true;
+            } else {
+                let detail = match out {
+                    Ok(res) => String::from_utf8_lossy(&res.stderr).trim().to_string(),
+                    Err(err) => err.to_string(),
+                };
+                errors.push(if detail.is_empty() {
+                    format!("failed to stop LaunchAgent '{LAUNCH_AGENT_LABEL}'")
+                } else {
+                    format!("failed to stop LaunchAgent '{LAUNCH_AGENT_LABEL}': {detail}")
+                });
+            }
+        }
+
+        let (fg_stopped, fg_denied) = stop_unix_foreground_daemons_for_reset();
+        if fg_stopped {
+            stopped_any = true;
+        }
+        if fg_denied && !elevated {
+            skipped_privileges = true;
+        }
+
+        (stopped_any, skipped_privileges, errors)
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut stopped_any = false;
+        let mut skipped_privileges = false;
+        let mut errors = Vec::new();
+
+        if systemd_unit_active(false) {
+            if elevated && is_unix_root() {
+                match Command::new(resolve_systemctl_bin())
+                    .args(["stop", SYSTEMD_UNIT_NAME])
+                    .stdin(Stdio::null())
+                    .output()
+                {
+                    Ok(out) if out.status.success() || !systemd_unit_active(false) => {
+                        stopped_any = true;
+                    }
+                    Ok(out) => {
+                        let detail = format_systemctl_error(&out);
+                        errors.push(format!(
+                            "failed to stop systemd system unit '{SYSTEMD_UNIT_NAME}': {detail}"
+                        ));
+                    }
+                    Err(err) => {
+                        errors.push(format!(
+                            "failed to execute systemctl stop for '{SYSTEMD_UNIT_NAME}': {err}"
+                        ));
+                    }
+                }
+            } else {
+                skipped_privileges = true;
+            }
+        }
+
+        if systemd_unit_active(true) {
+            match linux_user_systemctl_command()
+                .args(["stop", SYSTEMD_UNIT_NAME])
+                .stdin(Stdio::null())
+                .output()
+            {
+                Ok(out) if out.status.success() || !systemd_unit_active(true) => {
+                    stopped_any = true;
+                }
+                Ok(out) => {
+                    let detail = format_systemctl_error(&out);
+                    errors.push(format!(
+                        "failed to stop systemd user unit '{SYSTEMD_UNIT_NAME}': {detail}"
+                    ));
+                }
+                Err(err) => {
+                    errors.push(format!(
+                        "failed to execute systemctl --user stop for '{SYSTEMD_UNIT_NAME}': {err}"
+                    ));
+                }
+            }
+        }
+
+        let (fg_stopped, fg_denied) = stop_unix_foreground_daemons_for_reset();
+        if fg_stopped {
+            stopped_any = true;
+        }
+        if fg_denied && !elevated {
+            skipped_privileges = true;
+        }
+
+        (stopped_any, skipped_privileges, errors)
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let _ = elevated;
+        (false, false, Vec::new())
+    }
+}
+
 fn uninstall_service_with_options_impl(purge: bool, verbose: bool) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         let daemon_present = launch_daemon_plist_path().exists()
             || launchctl_service_loaded(&format!("system/{LAUNCH_DAEMON_LABEL}"))
             || fs::symlink_metadata(UNIX_SYSTEM_BIN_PATH).is_ok()
+            || Path::new("/Library/Application Support/vdpi/macos-tun-state.json").exists()
             || (purge
                 && (config_file::system_config_path().exists()
                     || Path::new("/Library/Application Support/vdpi").exists()));
@@ -7596,6 +7917,11 @@ fn uninstall_service_with_options_impl(purge: bool, verbose: bool) -> Result<()>
 
         if remove_unix_shell_path() && verbose {
             println!("Removed ~/.vdpi/bin from shell PATH profile.");
+        }
+        // Recover any stale macOS TUN routes/DNS while `/Library/Application Support/vdpi/macos-tun-state.json`
+        // is still intact (before `uninstall --purge` deletes state files).
+        if is_unix_root() {
+            let _ = crate::platform::macos_tun::recover_stale_macos_tun_state_if_present();
         }
         // Restore system proxy settings while `~/.vdpi/macos-proxy-state.json` is still intact.
         clear_all_system_proxies()?;
@@ -7750,6 +8076,7 @@ fn uninstall_service_with_options_impl(purge: bool, verbose: bool) -> Result<()>
             }
             relaunch_elevated_and_wait(&args)?;
             clear_all_system_proxies()?;
+            refresh_windows_network_caches_unconditionally();
             if verbose {
                 println!(
                     "Removed Windows service '{WINDOWS_SERVICE_NAME}' and restored {} system proxy settings.",
@@ -7779,7 +8106,10 @@ fn uninstall_service_with_options_impl(purge: bool, verbose: bool) -> Result<()>
     clear_all_system_proxies()?;
 
     #[cfg(target_os = "windows")]
-    cleanup_windows_install_files(purge);
+    {
+        refresh_windows_network_caches_unconditionally();
+        cleanup_windows_install_files(purge);
+    }
 
     if verbose {
         println!("Restored {} system proxy settings.", platform_name());
@@ -7839,9 +8169,11 @@ fn pause_service_impl(verbose: bool) -> Result<()> {
                 }
                 if let Err(err) = relaunch_elevated_and_wait(&["pause".to_string()]) {
                     let _ = clear_all_system_proxies();
+                    refresh_windows_network_caches_unconditionally();
                     return Err(err);
                 }
                 clear_all_system_proxies()?;
+                refresh_windows_network_caches_unconditionally();
                 if verbose {
                     if orphan_tun && !detect_orphan_windows_tun_adapter() {
                         println!(
@@ -7862,6 +8194,7 @@ fn pause_service_impl(verbose: bool) -> Result<()> {
             }
             let orphan_cleaned = crate::platform::windows_tun::cleanup_orphan_wintun_adapter();
             clear_all_system_proxies()?;
+            refresh_windows_network_caches_unconditionally();
             if verbose {
                 if orphan_cleaned {
                     println!(
@@ -7885,9 +8218,11 @@ fn pause_service_impl(verbose: bool) -> Result<()> {
             }
             if let Err(err) = relaunch_elevated_and_wait(&["pause".to_string()]) {
                 let _ = clear_all_system_proxies();
+                refresh_windows_network_caches_unconditionally();
                 return Err(err);
             }
             clear_all_system_proxies()?;
+            refresh_windows_network_caches_unconditionally();
             return Ok(());
         }
 
@@ -7895,6 +8230,7 @@ fn pause_service_impl(verbose: bool) -> Result<()> {
         stop_windows_foreground_daemons();
         let _ = crate::platform::windows_tun::cleanup_orphan_wintun_adapter();
         clear_all_system_proxies()?;
+        refresh_windows_network_caches_unconditionally();
         if verbose {
             println!(
                 "Paused Windows service '{WINDOWS_SERVICE_NAME}' and restored Windows system proxies."
@@ -7939,6 +8275,7 @@ fn pause_service_impl(verbose: bool) -> Result<()> {
                 }
                 bail!("failed to pause LaunchDaemon '{LAUNCH_DAEMON_LABEL}': {detail}");
             }
+            let _ = crate::platform::macos_tun::recover_stale_macos_tun_state_if_present();
             if verbose {
                 println!(
                     "Paused LaunchDaemon '{LAUNCH_DAEMON_LABEL}' and restored macOS TUN routing/DNS."
@@ -7949,6 +8286,9 @@ fn pause_service_impl(verbose: bool) -> Result<()> {
 
         let plist_path = launch_agent_plist_path()?;
         if !plist_path.exists() {
+            if is_unix_root() {
+                let _ = crate::platform::macos_tun::recover_stale_macos_tun_state_if_present();
+            }
             bail!(
                 "vdpi LaunchAgent is not installed ({}).",
                 plist_path.display()
@@ -7989,6 +8329,9 @@ fn pause_service_impl(verbose: bool) -> Result<()> {
             bail!("failed to pause LaunchAgent '{LAUNCH_AGENT_LABEL}': {detail}");
         }
 
+        if is_unix_root() {
+            let _ = crate::platform::macos_tun::recover_stale_macos_tun_state_if_present();
+        }
         clear_all_system_proxies()?;
         if verbose {
             println!(
@@ -8917,7 +9260,7 @@ pub async fn print_status_with_options_and_config(
 
     #[cfg(target_os = "windows")]
     {
-        use crate::platform::windows::query_reg_sz;
+        use crate::platform::windows::query_reg_sz_native;
         use crate::platform::windows_service::query_windows_service_status;
 
         let svc = query_windows_service_status();
@@ -8937,7 +9280,7 @@ pub async fn print_status_with_options_and_config(
             println!("Windows Service ({WINDOWS_SERVICE_NAME})    : NOT INSTALLED");
         }
 
-        if let Some(legacy) = query_reg_sz(WINDOWS_LEGACY_RUN_KEY, "vdpi") {
+        if let Some(legacy) = query_reg_sz_native(WINDOWS_LEGACY_RUN_KEY, "vdpi") {
             println!(
                 "Legacy Startup (HKCU Run) : {} (run 'vdpi install' to migrate)",
                 redact_urls_in_text(&legacy)
@@ -9216,7 +9559,7 @@ fn is_loopback_winhttp_proxy(raw: &str) -> bool {
     }
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(test)]
 fn parse_winhttp_proxy_server_output(text: &str) -> Option<String> {
     let mut fallback_value: Option<String> = None;
     for line in text.lines() {
@@ -9243,21 +9586,7 @@ fn parse_winhttp_proxy_server_output(text: &str) -> Option<String> {
 
 #[cfg(target_os = "windows")]
 fn query_windows_winhttp_proxy_server() -> Option<String> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-    let netsh = resolve_windows_system32_exe("netsh.exe")?;
-    let out = Command::new(netsh)
-        .creation_flags(CREATE_NO_WINDOW)
-        .args(["winhttp", "show", "proxy"])
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    parse_winhttp_proxy_server_output(&text)
+    crate::platform::windows::query_winhttp_proxy_server()
 }
 
 #[cfg(target_os = "windows")]
@@ -9880,16 +10209,16 @@ fn collect_linux_proxy_snapshot() -> LinuxProxySnapshot {
 fn check_proxy_drift_for_live_daemon(active_addr: IpAddr, active_port: u16) -> Option<String> {
     #[cfg(target_os = "windows")]
     {
-        use crate::platform::windows::query_reg_sz;
+        use crate::platform::windows::query_reg_sz_native;
 
         let inet_key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
-        let enabled_raw = query_reg_sz(inet_key, "ProxyEnable").unwrap_or_default();
+        let enabled_raw = query_reg_sz_native(inet_key, "ProxyEnable").unwrap_or_default();
         let enabled = enabled_raw == "0x1" || enabled_raw == "1";
-        let server = query_reg_sz(inet_key, "ProxyServer").unwrap_or_default();
-        let auto_config_url = query_reg_sz(inet_key, "AutoConfigURL");
-        let env_http = query_reg_sz(r"HKCU\Environment", "HTTP_PROXY");
-        let env_https = query_reg_sz(r"HKCU\Environment", "HTTPS_PROXY");
-        let env_all = query_reg_sz(r"HKCU\Environment", "ALL_PROXY");
+        let server = query_reg_sz_native(inet_key, "ProxyServer").unwrap_or_default();
+        let auto_config_url = query_reg_sz_native(inet_key, "AutoConfigURL");
+        let env_http = query_reg_sz_native(r"HKCU\Environment", "HTTP_PROXY");
+        let env_https = query_reg_sz_native(r"HKCU\Environment", "HTTPS_PROXY");
+        let env_all = query_reg_sz_native(r"HKCU\Environment", "ALL_PROXY");
 
         evaluate_windows_proxy_drift_full(
             active_addr,
@@ -9939,16 +10268,16 @@ fn check_proxy_drift_for_live_daemon(active_addr: IpAddr, active_port: u16) -> O
 fn check_stale_proxy_when_no_daemon() -> Option<String> {
     #[cfg(target_os = "windows")]
     {
-        use crate::platform::windows::query_reg_sz;
+        use crate::platform::windows::query_reg_sz_native;
 
         let inet_key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings";
-        let enabled_raw = query_reg_sz(inet_key, "ProxyEnable").unwrap_or_default();
+        let enabled_raw = query_reg_sz_native(inet_key, "ProxyEnable").unwrap_or_default();
         let enabled = enabled_raw == "0x1" || enabled_raw == "1";
-        let server = query_reg_sz(inet_key, "ProxyServer").unwrap_or_default();
-        let auto_config_url = query_reg_sz(inet_key, "AutoConfigURL");
-        let env_http = query_reg_sz(r"HKCU\Environment", "HTTP_PROXY");
-        let env_https = query_reg_sz(r"HKCU\Environment", "HTTPS_PROXY");
-        let env_all = query_reg_sz(r"HKCU\Environment", "ALL_PROXY");
+        let server = query_reg_sz_native(inet_key, "ProxyServer").unwrap_or_default();
+        let auto_config_url = query_reg_sz_native(inet_key, "AutoConfigURL");
+        let env_http = query_reg_sz_native(r"HKCU\Environment", "HTTP_PROXY");
+        let env_https = query_reg_sz_native(r"HKCU\Environment", "HTTPS_PROXY");
+        let env_all = query_reg_sz_native(r"HKCU\Environment", "ALL_PROXY");
         let winhttp_proxy = query_windows_winhttp_proxy_server();
 
         evaluate_windows_stale_proxy_when_stopped_full(
@@ -9998,44 +10327,7 @@ fn check_stale_proxy_when_no_daemon() -> Option<String> {
 
 #[cfg(target_os = "windows")]
 fn detect_orphan_windows_tun_adapter() -> bool {
-    use windows_sys::Win32::Foundation::NO_ERROR;
-    use windows_sys::Win32::NetworkManagement::IpHelper::{
-        FreeMibTable, GetIfTable2, MIB_IF_ROW2, MIB_IF_TABLE2,
-    };
-
-    let mut raw_if_table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
-    // SAFETY: `GetIfTable2` populates `raw_if_table` on `NO_ERROR` and must be freed via `FreeMibTable`.
-    let rc = unsafe { GetIfTable2(&mut raw_if_table) };
-    if rc != NO_ERROR || raw_if_table.is_null() {
-        return false;
-    }
-
-    let mut found = false;
-    // SAFETY: `raw_if_table` is valid until `FreeMibTable`.
-    unsafe {
-        let count = (*raw_if_table).NumEntries as usize;
-        if count > 0 {
-            let first = std::ptr::addr_of!((*raw_if_table).Table).cast::<MIB_IF_ROW2>();
-            let rows = std::slice::from_raw_parts(first, count);
-            for row in rows {
-                let nul = row
-                    .Alias
-                    .iter()
-                    .position(|&c| c == 0)
-                    .unwrap_or(row.Alias.len());
-                let alias = String::from_utf16_lossy(&row.Alias[..nul]);
-                if alias
-                    .trim()
-                    .eq_ignore_ascii_case(crate::platform::windows_tun::VDPI_TUN_NAME)
-                {
-                    found = true;
-                    break;
-                }
-            }
-        }
-        FreeMibTable(raw_if_table.cast());
-    }
-    found
+    crate::platform::windows_tun::has_orphan_wintun_device_or_luid()
 }
 
 fn detect_orphan_tun_adapter() -> Option<&'static str> {

@@ -7,7 +7,7 @@
 Self-healing anti-DPI engine in Rust, native across Windows, macOS, Linux, Android, and iOS.  
 Ships as a native Desktop GUI, an interactive Control Center TUI, and zero-root mobile apps - running as a transparent system-wide TUN adapter or a lightweight local proxy with zero remote servers and zero telemetry.
 
-[![Release](https://img.shields.io/badge/Release-v0.6.1-38bdf8?style=for-the-badge&logo=github)](https://github.com/Vuln-Inc/vdpi/releases/latest)
+[![Release](https://img.shields.io/badge/Release-v0.6.2-38bdf8?style=for-the-badge&logo=github)](https://github.com/Vuln-Inc/vdpi/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-34d399?style=for-the-badge)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/Platforms-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Android%20%7C%20iOS-818cf8?style=for-the-badge)](#quick-install)
 
@@ -80,15 +80,27 @@ Ships as a native Desktop GUI, an interactive Control Center TUI, and zero-root 
 
 ## Quick Install
 
+### Which Download Should I Pick?
+
+`vdpi` ships in three editions that all share the same local Rust engine and `config.toml` - pick the one that fits how you use your device (most desktop users only need the **Desktop App**):
+
+| Edition | Best for | Release file pattern | What's inside |
+| :--- | :--- | :--- | :--- |
+| **Desktop App (GUI)** *(Recommended)* | Most Windows, macOS & Linux users | `vdpi-desktop-*` (`.zip`, `.dmg`, `.deb`, `.AppImage`) | Native app window, system tray, visual Split Tunneling, DNS/Diagnostics, **plus** bundled `vdpi` engine & `wintun.dll` |
+| **Terminal / TUI (CLI)** | Terminal users, scripts, headless or ARM64 Linux | `vdpi-*` (`.zip`, `.tar.gz`) | Lightweight terminal Control Center TUI & background service CLI (no GUI window) |
+| **Mobile** | Phones & tablets | `vdpi-android-*.apk`, `vdpi-ios-*.ipa` | Zero-root local VPN app for Android `8.0+` and iOS/iPadOS `16+` |
+
+> **Tip:** If you download the **Desktop App (GUI)**, you do **not** need the Terminal / TUI archive separately - everything is already bundled.
+
 ### Desktop App (GUI) - Windows, macOS & Linux
 
-- **Windows (`x86_64`, Windows 10 & 11):** [Portable (`.zip`)](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-windows-x86_64-portable.zip)
-- **macOS (Universal, Apple Silicon & Intel):** [DMG (`.dmg`)](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-macos-universal.dmg)
-- **Linux (`x86_64`):** [Debian/Ubuntu (`.deb`)](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.deb) · [AppImage (`.AppImage`)](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.AppImage)
+- **Windows (`x86_64`, Windows 10 & 11):** [`vdpi-desktop-windows-x86_64-portable.zip`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-windows-x86_64-portable.zip) (unzip and run `vdpi-desktop.exe`)
+- **macOS (Universal, Apple Silicon & Intel):** [`vdpi-desktop-macos-universal.dmg`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-macos-universal.dmg) (open DMG and drag to Applications)
+- **Linux (`x86_64`):** [`vdpi-desktop-linux-x86_64.deb`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.deb) (Debian/Ubuntu) · [`vdpi-desktop-linux-x86_64.AppImage`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.AppImage) (any distro)
 
-> **Note:** Desktop GUI packages bundle the `vdpi` engine binary (and the unmodified WHQL-signed `wintun.dll` `0.14.1` on Windows), integrate with the system tray / menu bar, and share the same `config.toml` and background service as the CLI.
+> **Note:** Desktop GUI packages bundle the `vdpi` engine binary (and the unmodified WHQL-signed `wintun.dll` `0.14.1` on Windows), integrate with the system tray / menu bar, and share the same `config.toml` and background service as the Terminal / TUI edition.
 
-### CLI / Headless - Windows (`x86_64`, Windows 10 & 11)
+### Terminal / TUI (CLI) - Windows (`x86_64`, Windows 10 & 11)
 
 ```powershell
 # PowerShell one-liner (SHA-256 verified)
@@ -108,7 +120,7 @@ cargo install vdpi
 
 Direct download: [`vdpi-windows-x86_64.zip`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-windows-x86_64.zip) (`vdpi.exe`, WHQL-signed `wintun.dll` `0.14.1`, and `WINTUN-LICENSE.txt`) or [crates.io/crates/vdpi](https://crates.io/crates/vdpi).
 
-### CLI / Headless - macOS & Linux (`universal` / `x86_64` & `arm64`)
+### Terminal / TUI (CLI) - macOS & Linux (`universal` / `x86_64` & `arm64`)
 
 ```bash
 # Shell one-liner (macOS & Linux, SHA-256 verified)

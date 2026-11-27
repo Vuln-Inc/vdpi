@@ -7,6 +7,7 @@ import {
   IconDns,
   IconFolder,
   IconOverview,
+  IconRefresh,
   IconSettings,
   IconShield,
 } from "../components/Icons";
@@ -44,6 +45,7 @@ export interface DiagnosticsViewProps {
   onStartProtection?: () => void | Promise<void>;
   onInstallService?: (engine?: EngineMode) => void | Promise<void>;
   onOpenAppFolder?: (kind: AppFolderTarget) => void | Promise<void>;
+  onResetNetwork?: () => void | Promise<void>;
 }
 
 interface ProbeCatalogItem {
@@ -1017,7 +1019,15 @@ function renderCheckRow(check: DiagnosticCheckItem, lang: ResolvedLanguage) {
 interface RecoveryAction {
   id: string;
   label: string;
-  icon: "settings" | "proxy" | "folder" | "logs" | "shield" | "overview" | "dns";
+  icon:
+    | "settings"
+    | "proxy"
+    | "folder"
+    | "logs"
+    | "shield"
+    | "overview"
+    | "dns"
+    | "refresh";
   busy?: boolean;
   disabled?: boolean;
   onClick: () => void;
@@ -1033,6 +1043,7 @@ function DiagnosticsViewComponent({
   onStartProtection,
   onInstallService,
   onOpenAppFolder,
+  onResetNetwork,
 }: DiagnosticsViewProps) {
   const { lang } = useLang();
   const langRef = useRef(lang);
@@ -1103,7 +1114,13 @@ function DiagnosticsViewComponent({
   const normalizedBusy = busyAction?.trim().toLowerCase() ?? null;
   const pendingOp = status?.pendingOperation ?? null;
   const normalizedPendingOp = pendingOp?.trim().toLowerCase() ?? null;
-  const isBusy = normalizedBusy !== null || pendingOp !== null;
+  const isResettingNetwork =
+    normalizedBusy === "reset-network" ||
+    normalizedBusy === "resetting_network" ||
+    normalizedPendingOp === "reset-network" ||
+    normalizedPendingOp === "resetting_network";
+  const isBusy =
+    normalizedBusy !== null || pendingOp !== null || isResettingNetwork;
   const isMutatingServiceBusy = Boolean(
     (normalizedBusy !== null &&
       (normalizedBusy === "install" ||
@@ -1117,7 +1134,9 @@ function DiagnosticsViewComponent({
         normalizedBusy === "repairing" ||
         normalizedBusy === "uninstall" ||
         normalizedBusy === "uninstall-service" ||
-        normalizedBusy === "uninstalling")) ||
+        normalizedBusy === "uninstalling" ||
+        normalizedBusy === "reset-network" ||
+        normalizedBusy === "resetting_network")) ||
       (normalizedPendingOp !== null &&
         (normalizedPendingOp === "install" ||
           normalizedPendingOp === "installing" ||
@@ -1126,7 +1145,9 @@ function DiagnosticsViewComponent({
           normalizedPendingOp === "repair" ||
           normalizedPendingOp === "repairing" ||
           normalizedPendingOp === "uninstall" ||
-          normalizedPendingOp === "uninstalling")),
+          normalizedPendingOp === "uninstalling" ||
+          normalizedPendingOp === "reset-network" ||
+          normalizedPendingOp === "resetting_network")),
   );
   const isMutatingServiceBusyRef = useRef(isMutatingServiceBusy);
   isMutatingServiceBusyRef.current = isMutatingServiceBusy;
@@ -1147,7 +1168,26 @@ function DiagnosticsViewComponent({
       (check) => check.status === "warn" || check.status === "fail",
     );
     if (problemChecks.length === 0) {
-      return [];
+      if (!onResetNetwork) {
+        return [];
+      }
+      return [
+        {
+          id: "reset-network",
+          label: tDiagnostics(
+            lang,
+            isResettingNetwork
+              ? "actionResettingNetwork"
+              : "actionResetNetwork",
+          ),
+          icon: "refresh",
+          busy: isResettingNetwork,
+          disabled: running || isBusy,
+          onClick: () => {
+            void onResetNetwork();
+          },
+        },
+      ];
     }
 
     const hasWintunIssue = problemChecks.some((check) =>
@@ -1318,6 +1358,22 @@ function DiagnosticsViewComponent({
       });
     }
 
+    if (onResetNetwork) {
+      actions.push({
+        id: "reset-network",
+        label: tDiagnostics(
+          lang,
+          isResettingNetwork ? "actionResettingNetwork" : "actionResetNetwork",
+        ),
+        icon: "refresh",
+        busy: isResettingNetwork,
+        disabled: running || isBusy,
+        onClick: () => {
+          void onResetNetwork();
+        },
+      });
+    }
+
     return actions;
   }, [
     activeEngine,
@@ -1326,12 +1382,14 @@ function DiagnosticsViewComponent({
     isInstallingService,
     isNotInstalled,
     isRepairNeeded,
+    isResettingNetwork,
     isStartingProtection,
     isSwitchingProxy,
     lang,
     onInstallService,
     onNavigate,
     onOpenAppFolder,
+    onResetNetwork,
     onStartProtection,
     onSwitchEngine,
     report,
@@ -1606,6 +1664,8 @@ function DiagnosticsViewComponent({
                   <IconDns size={13} />
                 ) : action.icon === "overview" ? (
                   <IconOverview size={13} />
+                ) : action.icon === "refresh" ? (
+                  <IconRefresh size={13} />
                 ) : action.icon === "folder" || action.icon === "logs" ? (
                   <IconFolder size={13} />
                 ) : (
@@ -1796,7 +1856,8 @@ function areDiagnosticsPropsEqual(
     prev.onSwitchEngine !== next.onSwitchEngine ||
     prev.onStartProtection !== next.onStartProtection ||
     prev.onInstallService !== next.onInstallService ||
-    prev.onOpenAppFolder !== next.onOpenAppFolder
+    prev.onOpenAppFolder !== next.onOpenAppFolder ||
+    prev.onResetNetwork !== next.onResetNetwork
   ) {
     return false;
   }

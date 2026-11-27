@@ -34,6 +34,10 @@ fn apply_linux_webkit_workarounds() {
 }
 
 fn main() {
+    if let Some(code) = vdpi_desktop_lib::actions::try_run_internal_network_reset_cli() {
+        std::process::exit(code);
+    }
+
     #[cfg(target_os = "linux")]
     apply_linux_webkit_workarounds();
 

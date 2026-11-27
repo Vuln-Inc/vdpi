@@ -380,8 +380,8 @@ impl BinaryMetadataCache {
     }
 }
 
-/// Returns `true` when `op` is a mutating install/upgrade/repair/uninstall
-/// service operation that modifies service binaries on disk.
+/// Returns `true` when `op` is a mutating install/upgrade/repair/uninstall or
+/// network-reset operation during which status polls and diagnostics should pause.
 pub const fn is_mutating_install_operation(op: Option<ServiceOperationDto>) -> bool {
     matches!(
         op,
@@ -390,6 +390,7 @@ pub const fn is_mutating_install_operation(op: Option<ServiceOperationDto>) -> b
                 | ServiceOperationDto::Upgrading
                 | ServiceOperationDto::Repairing
                 | ServiceOperationDto::Uninstalling
+                | ServiceOperationDto::ResettingNetwork
         )
     )
 }
@@ -1423,6 +1424,7 @@ mod tests {
             ServiceOperationDto::Upgrading,
             ServiceOperationDto::Repairing,
             ServiceOperationDto::Uninstalling,
+            ServiceOperationDto::ResettingNetwork,
         ] {
             state.set_active_operation(Some(op));
             assert_eq!(state.active_operation(), Some(op));

@@ -65,6 +65,13 @@ fn uninstall_confirm_body() -> &'static str {
     )
 }
 
+fn reset_network_confirm_body() -> &'static str {
+    tr(
+        "This stops vdpi and resets OS proxy, PAC, WinHTTP, orphan TUN routes, and DNS settings to defaults. Your vdpi config is kept.",
+        "Bu işlem vdpi'yi durdurur; OS proxy, PAC, WinHTTP, sahipsiz TUN yolları ve DNS ayarlarını varsayılanlara sıfırlar. vdpi yapılandırmanız korunur.",
+    )
+}
+
 // Restrained cool slate / white / emerald / ice-blue / semantic amber & red palette.
 const BORDER_SLATE: Color = Color::Rgb(58, 66, 78);
 const DIVIDER_SLATE: Color = Color::Rgb(48, 55, 66);
@@ -91,6 +98,7 @@ struct Palette {
     status_warn: Style,
     status_neutral: Style,
     status_warn_dot: &'static str,
+    warn_bold: Style,
     danger_bold: Style,
     active_row: Style,
     active_marker: Style,
@@ -120,6 +128,7 @@ impl Palette {
                 status_warn: Style::new().fg(AMBER_WARN),
                 status_neutral: Style::new().fg(STEEL_MUTED),
                 status_warn_dot: "● ",
+                warn_bold: Style::new().fg(AMBER_WARN).add_modifier(Modifier::BOLD),
                 danger_bold: Style::new().fg(RED_DANGER).add_modifier(Modifier::BOLD),
                 active_row: Style::new().bg(ACTIVE_BG),
                 active_marker: Style::new().fg(ICE_BLUE).add_modifier(Modifier::BOLD),
@@ -150,6 +159,7 @@ impl Palette {
                 status_warn: bold,
                 status_neutral: plain,
                 status_warn_dot: "! ",
+                warn_bold: bold,
                 danger_bold: bold,
                 active_row: rev,
                 active_marker: bold,
@@ -189,11 +199,17 @@ struct RenderCtx {
     inset: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfirmModal {
+    Uninstall,
+    ResetNetwork,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UiState {
     menu: LauncherMenu,
     selected: usize,
-    confirming_uninstall: bool,
+    confirming: Option<ConfirmModal>,
     selecting_dns: bool,
     dns_selected: usize,
     editing_custom_dns: bool,
@@ -251,7 +267,7 @@ impl UiState {
         Self {
             menu: build_menu_with_options(status, notice, dns, split_tunnel),
             selected: 0,
-            confirming_uninstall: false,
+            confirming: None,
             selecting_dns: false,
             dns_selected: dns_preset_index(dns),
             editing_custom_dns: false,
@@ -775,7 +791,7 @@ fn apply_refresh_with_notice(
     notice: Option<&str>,
 ) {
     state.menu = build_menu_with_options(latest, notice, &state.configured_dns, &state.split_tunnel);
-    state.confirming_uninstall = false;
+    state.confirming = None;
     state.selecting_dns = false;
     state.editing_custom_dns = false;
     state.custom_dns_input.clear();
@@ -1025,21 +1041,25 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Action {
         return Action::Ignore;
     }
 
-    if state.confirming_uninstall {
+    if let Some(modal) = state.confirming {
         if key.kind != KeyEventKind::Press {
             return Action::Ignore;
         }
+        let confirmed_choice = match modal {
+            ConfirmModal::Uninstall => Choice::Uninstall,
+            ConfirmModal::ResetNetwork => Choice::ResetNetwork,
+        };
         return match key.code {
-            KeyCode::Char('y' | 'Y') => Action::Finish(Choice::Uninstall),
+            KeyCode::Char('y' | 'Y') => Action::Finish(confirmed_choice),
             KeyCode::Char('e' | 'E') if active_lang() == Lang::Tr => {
-                Action::Finish(Choice::Uninstall)
+                Action::Finish(confirmed_choice)
             }
             KeyCode::Char('n' | 'N' | 'q' | 'Q') | KeyCode::Esc => {
-                state.confirming_uninstall = false;
+                state.confirming = None;
                 Action::Redraw
             }
             KeyCode::Char('h' | 'H') if active_lang() == Lang::Tr => {
-                state.confirming_uninstall = false;
+                state.confirming = None;
                 Action::Redraw
             }
             _ => Action::Ignore,
@@ -1113,10 +1133,28 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Action {
             }
             return Action::Ignore;
         }
+        KeyCode::Char('n' | 'N') => {
+            if let Some((index, _)) = state
+                .menu
+                .items
+                .iter()
+                .enumerate()
+                .find(|(_, item)| item.choice == Choice::ResetNetwork)
+            {
+                state.selected = index;
+                state.confirming = Some(ConfirmModal::ResetNetwork);
+                return Action::Redraw;
+            }
+            return Action::Ignore;
+        }
         KeyCode::Enter => {
             let choice = state.menu.items[state.selected].choice.clone();
             if choice == Choice::Uninstall {
-                state.confirming_uninstall = true;
+                state.confirming = Some(ConfirmModal::Uninstall);
+                return Action::Redraw;
+            }
+            if choice == Choice::ResetNetwork {
+                state.confirming = Some(ConfirmModal::ResetNetwork);
                 return Action::Redraw;
             }
             if choice == Choice::SelectDns {
@@ -1126,19 +1164,25 @@ fn handle_key(state: &mut UiState, key: KeyEvent) -> Action {
             return Action::Finish(choice);
         }
         KeyCode::Char(c @ '1'..='9') => {
-            let index = usize::from(c as u8 - b'1');
-            if let Some(item) = state.menu.items.get(index) {
-                if item.choice == Choice::Uninstall {
+            let digit_index = usize::from(c as u8 - b'1');
+            if let Some(index) = menu_index_for_digit(&state.menu, digit_index) {
+                let choice = state.menu.items[index].choice.clone();
+                if choice == Choice::Uninstall {
                     state.selected = index;
-                    state.confirming_uninstall = true;
+                    state.confirming = Some(ConfirmModal::Uninstall);
                     return Action::Redraw;
                 }
-                if item.choice == Choice::SelectDns {
+                if choice == Choice::ResetNetwork {
+                    state.selected = index;
+                    state.confirming = Some(ConfirmModal::ResetNetwork);
+                    return Action::Redraw;
+                }
+                if choice == Choice::SelectDns {
                     state.selected = index;
                     state.open_dns_picker();
                     return Action::Redraw;
                 }
-                return Action::Finish(item.choice.clone());
+                return Action::Finish(choice);
             }
             return Action::Ignore;
         }
@@ -1328,6 +1372,51 @@ fn key_badge(index: usize) -> Cow<'static, str> {
     )
 }
 
+fn item_uses_hotkey_badge(menu: &LauncherMenu, item: &MenuItem) -> bool {
+    menu.items.len() > 9 && item.choice == Choice::ResetNetwork
+}
+
+fn item_key_badge(menu: &LauncherMenu, index: usize) -> Cow<'static, str> {
+    if let Some(item) = menu.items.get(index) {
+        if item_uses_hotkey_badge(menu, item) {
+            return Cow::Borrowed("[n]");
+        }
+    }
+    let digit_slot = if menu.items.len() > 9 {
+        menu.items[..index]
+            .iter()
+            .filter(|item| !item_uses_hotkey_badge(menu, item))
+            .count()
+    } else {
+        index
+    };
+    key_badge(digit_slot)
+}
+
+fn menu_index_for_digit(menu: &LauncherMenu, digit_index: usize) -> Option<usize> {
+    if menu.items.len() > 9 {
+        menu.items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| !item_uses_hotkey_badge(menu, item))
+            .nth(digit_index)
+            .map(|(idx, _)| idx)
+    } else {
+        (digit_index < menu.items.len()).then_some(digit_index)
+    }
+}
+
+fn menu_digit_count(menu: &LauncherMenu) -> usize {
+    if menu.items.len() > 9 {
+        menu.items
+            .iter()
+            .filter(|item| !item_uses_hotkey_badge(menu, item))
+            .count()
+    } else {
+        menu.items.len()
+    }
+}
+
 fn range_label(count: usize) -> Cow<'static, str> {
     if count == 0 {
         return Cow::Borrowed("");
@@ -1376,13 +1465,17 @@ fn render(frame: &mut Frame<'_>, state: &UiState, color: bool) {
         .saturating_sub(padding.left.saturating_add(padding.right));
     let inset = inner_width >= 36;
 
-    if state.confirming_uninstall {
+    if let Some(modal) = state.confirming {
         let body_indent_len = if inset { 3usize } else { 2usize };
         let right_margin = usize::from(inset);
         let wrap_width = usize::from(inner_width)
             .saturating_sub(body_indent_len + right_margin)
             .max(1);
-        let body_lines = wrap_words(uninstall_confirm_body(), wrap_width);
+        let body_text = match modal {
+            ConfirmModal::Uninstall => uninstall_confirm_body(),
+            ConfirmModal::ResetNetwork => reset_network_confirm_body(),
+        };
+        let body_lines = wrap_words(body_text, wrap_width);
         let confirm_plan =
             ConfirmLayoutPlan::compute(area.height, menu.status_rows.len(), body_lines.len());
         let card_area = centered_rect(area, card_width, confirm_plan.card_height);
@@ -1433,12 +1526,12 @@ fn render(frame: &mut Frame<'_>, state: &UiState, color: bool) {
             u16::from(confirm_plan.show_footer) + u16::from(confirm_plan.show_bottom_divider);
         let body_bottom = bottom.saturating_sub(footer_reserve).max(y);
         let body_area = Rect::new(inner.x, y, inner.width, body_bottom.saturating_sub(y));
-        render_uninstall_confirm(frame, body_area, &body_lines, ctx);
+        render_confirm_modal(frame, body_area, modal, &body_lines, ctx);
 
         let mut footer_y = bottom;
         if confirm_plan.show_footer && footer_y > y {
             footer_y = footer_y.saturating_sub(1);
-            render_confirm_footer(frame, row(footer_y), ctx);
+            render_confirm_footer(frame, row(footer_y), modal, ctx);
         }
         if confirm_plan.show_bottom_divider && footer_y > y {
             footer_y = footer_y.saturating_sub(1);
@@ -1561,7 +1654,7 @@ fn render(frame: &mut Frame<'_>, state: &UiState, color: bool) {
         render_footer(
             frame,
             row(footer_y),
-            menu.items.len(),
+            menu_digit_count(menu),
             menu_has_dashboard(menu),
             menu_has_split_tunnel(menu),
             ctx,
@@ -1779,6 +1872,8 @@ fn is_warning_notice(text: &str) -> bool {
         "error",
         "issues",
         "already running",
+        "partial",
+        "skipped",
         "uyarı",
         "başarısız",
         "hata",
@@ -1791,6 +1886,8 @@ fn is_warning_notice(text: &str) -> bool {
         "desteklenmiyor",
         "erişilemiyor",
         "kaydedilemedi",
+        "kısmi",
+        "atlandı",
     ]
     .into_iter()
     .any(|needle| lower.contains(needle))
@@ -1897,9 +1994,10 @@ fn render_notice(
     }
 }
 
-fn render_uninstall_confirm(
+fn render_confirm_modal(
     frame: &mut Frame<'_>,
     area: Rect,
+    modal: ConfirmModal,
     body_lines: &[String],
     ctx: RenderCtx,
 ) {
@@ -1909,6 +2007,14 @@ fn render_uninstall_confirm(
     let pad = if ctx.inset { " " } else { "" };
     let body_indent = if ctx.inset { "   " } else { "  " };
     let right_margin = pad.len();
+    let accent = match modal {
+        ConfirmModal::Uninstall => ctx.palette.danger_bold,
+        ConfirmModal::ResetNetwork => ctx.palette.warn_bold,
+    };
+    let header_title = match modal {
+        ConfirmModal::Uninstall => tr("Confirm uninstall", "Kaldırmayı onayla"),
+        ConfirmModal::ResetNetwork => tr("Confirm network reset", "Ağ sıfırlamayı onayla"),
+    };
 
     let needed_tight = 1 + body_lines.len() + 1;
     let avail = usize::from(area.height);
@@ -1922,14 +2028,11 @@ fn render_uninstall_confirm(
 
     if y < max_y {
         let header_budget = usize::from(area.width).saturating_sub(pad.len() + 2 + right_margin);
-        let header_text = truncate_text(
-            tr("Confirm uninstall", "Kaldırmayı onayla"),
-            header_budget,
-        );
+        let header_text = truncate_text(header_title, header_budget);
         let line = Line::from(vec![
             Span::raw(pad),
-            Span::styled(ctx.palette.status_warn_dot, ctx.palette.danger_bold),
-            Span::styled(header_text, ctx.palette.danger_bold),
+            Span::styled(ctx.palette.status_warn_dot, accent),
+            Span::styled(header_text, accent),
         ]);
         frame.render_widget(line, Rect::new(area.x, y, area.width, 1));
         y = y.saturating_add(1);
@@ -1963,8 +2066,16 @@ fn render_uninstall_confirm(
         let no_esc_compact = if is_tr { "[h/Esc]" } else { "[n/Esc]" };
         let no_key = if is_tr { "[h]" } else { "[n]" };
         let tiny_pair = if is_tr { "[e]/[h]" } else { "[y]/[n]" };
-        let full_action = tr("Uninstall vdpi", "vdpi'yi kaldır");
-        let short_action = tr("Uninstall", "Kaldır");
+        let (full_action, short_action) = match modal {
+            ConfirmModal::Uninstall => (
+                tr("Uninstall vdpi", "vdpi'yi kaldır"),
+                tr("Uninstall", "Kaldır"),
+            ),
+            ConfirmModal::ResetNetwork => (
+                tr("Reset network", "Ağı sıfırla"),
+                tr("Reset", "Sıfırla"),
+            ),
+        };
         let cancel_label = tr("Cancel", "İptal");
         let yes_label = tr("Yes", "Evet");
         let no_label = tr("No", "Hayır");
@@ -1998,7 +2109,7 @@ fn render_uninstall_confirm(
         let line = if width >= full_prompt_cols {
             Line::from(vec![
                 Span::raw(body_indent),
-                Span::styled(yes_key, ctx.palette.danger_bold),
+                Span::styled(yes_key, accent),
                 Span::raw(" "),
                 Span::styled(full_action, ctx.palette.active_title),
                 Span::styled("   ·   ", ctx.palette.footer_text),
@@ -2009,7 +2120,7 @@ fn render_uninstall_confirm(
         } else if width >= compact_prompt_cols {
             Line::from(vec![
                 Span::raw(body_indent),
-                Span::styled(yes_key, ctx.palette.danger_bold),
+                Span::styled(yes_key, accent),
                 Span::raw(" "),
                 Span::styled(short_action, ctx.palette.active_title),
                 Span::styled(" · ", ctx.palette.footer_text),
@@ -2020,7 +2131,7 @@ fn render_uninstall_confirm(
         } else if width >= tiny_prompt_cols {
             Line::from(vec![
                 Span::raw(pad),
-                Span::styled(yes_key, ctx.palette.danger_bold),
+                Span::styled(yes_key, accent),
                 Span::raw(" "),
                 Span::styled(yes_label, ctx.palette.active_title),
                 Span::styled(" · ", ctx.palette.footer_text),
@@ -2030,10 +2141,7 @@ fn render_uninstall_confirm(
             ])
         } else {
             let short = truncate_text(tiny_pair, width.saturating_sub(pad.len() + right_margin));
-            Line::from(vec![
-                Span::raw(pad),
-                Span::styled(short, ctx.palette.danger_bold),
-            ])
+            Line::from(vec![Span::raw(pad), Span::styled(short, accent)])
         };
         frame.render_widget(line, prompt_area);
     }
@@ -2089,7 +2197,7 @@ fn render_items(
         }
         let is_selected = index == selected;
         let title_area = Rect::new(area.x, cursor_y, area.width, 1);
-        render_item_title(frame, title_area, index, item, is_selected, ctx);
+        render_item_title(frame, title_area, menu, index, item, is_selected, ctx);
         cursor_y = cursor_y.saturating_add(1);
 
         let should_render_hint = show_all_hints || (show_active_hint && is_selected);
@@ -2108,13 +2216,14 @@ fn render_items(
 fn render_item_title(
     frame: &mut Frame<'_>,
     area: Rect,
+    menu: &LauncherMenu,
     index: usize,
     item: &MenuItem,
     is_selected: bool,
     ctx: RenderCtx,
 ) {
     let lead = if ctx.inset { " " } else { "" };
-    let badge = key_badge(index);
+    let badge = item_key_badge(menu, index);
     let prefix_cols = lead.len() + 2 + badge.len() + 1;
     let budget = usize::from(area.width).saturating_sub(prefix_cols + lead.len());
     let title = truncate_text(&item.title, budget);
@@ -2783,43 +2892,56 @@ fn render_dns_footer(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx) {
     frame.render_widget(line, area);
 }
 
-fn render_confirm_footer(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx) {
+fn render_confirm_footer(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    modal: ConfirmModal,
+    ctx: RenderCtx,
+) {
     if area.is_empty() {
         return;
     }
     let pad = if ctx.inset { " " } else { "" };
     let key = ctx.palette.footer_key;
     let text = ctx.palette.footer_text;
+    let accent = match modal {
+        ConfirmModal::Uninstall => ctx.palette.danger_bold,
+        ConfirmModal::ResetNetwork => ctx.palette.warn_bold,
+    };
+    let (en_action, tr_action) = match modal {
+        ConfirmModal::Uninstall => (" uninstall  ·  ", " kaldır  ·  "),
+        ConfirmModal::ResetNetwork => (" reset  ·  ", " sıfırla  ·  "),
+    };
     let width = usize::from(area.width);
     let is_tr = active_lang() == Lang::Tr;
 
     let line = if is_tr && width >= pad.len() * 2 + 26 {
         Line::from(vec![
             Span::raw(pad),
-            Span::styled("e", ctx.palette.danger_bold),
-            Span::styled(" kaldır  ·  ", text),
+            Span::styled("e", accent),
+            Span::styled(tr_action, text),
             Span::styled("h / esc", key),
             Span::styled(" iptal", text),
         ])
     } else if !is_tr && width >= pad.len() * 2 + 30 {
         Line::from(vec![
             Span::raw(pad),
-            Span::styled("y", ctx.palette.danger_bold),
-            Span::styled(" uninstall  ·  ", text),
+            Span::styled("y", accent),
+            Span::styled(en_action, text),
             Span::styled("n / esc", key),
             Span::styled(" cancel", text),
         ])
     } else if is_tr {
         Line::from(vec![
             Span::raw(pad),
-            Span::styled("e", ctx.palette.danger_bold),
+            Span::styled("e", accent),
             Span::styled(" · ", text),
             Span::styled("h/esc", key),
         ])
     } else {
         Line::from(vec![
             Span::raw(pad),
-            Span::styled("y", ctx.palette.danger_bold),
+            Span::styled("y", accent),
             Span::styled(" · ", text),
             Span::styled("n/esc", key),
         ])
@@ -3216,14 +3338,21 @@ fn render_minimal(
         inset: false,
     };
 
-    if state.confirming_uninstall {
+    if let Some(modal) = state.confirming {
         if area.height >= 2 {
-            let prompt = truncate_text(
-                tr("Uninstall? [y/n]", "Kaldırılsın mı? [e/h]"),
-                usize::from(area.width),
-            );
+            let (prompt_text, accent) = match modal {
+                ConfirmModal::Uninstall => (
+                    tr("Uninstall? [y/n]", "Kaldırılsın mı? [e/h]"),
+                    palette.danger_bold,
+                ),
+                ConfirmModal::ResetNetwork => (
+                    tr("Reset net? [y/n]", "Ağ sıfırlansın mı? [e/h]"),
+                    palette.warn_bold,
+                ),
+            };
+            let prompt = truncate_text(prompt_text, usize::from(area.width));
             frame.render_widget(
-                Line::styled(prompt, palette.danger_bold),
+                Line::styled(prompt, accent),
                 Rect::new(area.x, area.y + 1, area.width, 1),
             );
         }
@@ -3257,7 +3386,7 @@ fn render_minimal(
 
     if let Some(item) = state.menu.items.get(selected).filter(|_| area.height >= 2) {
         let item_area = Rect::new(area.x, area.y + 1, area.width, 1);
-        render_item_title(frame, item_area, selected, item, true, ctx);
+        render_item_title(frame, item_area, &state.menu, selected, item, true, ctx);
     }
 
     if area.height >= 3 {
@@ -3265,7 +3394,7 @@ fn render_minimal(
         render_footer(
             frame,
             footer_area,
-            state.menu.items.len(),
+            menu_digit_count(&state.menu),
             menu_has_dashboard(&state.menu),
             menu_has_split_tunnel(&state.menu),
             ctx,
@@ -3403,10 +3532,10 @@ mod tests {
         assert!(text.contains("Proxy · 127.0.0.1:8080"));
 
         for (idx, item) in state.menu.items.iter().enumerate() {
+            let badge = item_key_badge(&state.menu, idx);
             assert!(
-                text.contains(&format!("[{}]", idx + 1)),
-                "missing badge {}:\n{text}",
-                idx + 1
+                text.contains(badge.as_ref()),
+                "missing badge {badge}:\n{text}",
             );
             assert!(
                 text.contains(&item.title),
@@ -3441,17 +3570,17 @@ mod tests {
         assert!(text.contains("Paused · v0.5.0 (temporarily stopped)"));
         assert!(text.contains("Offline · routes & proxies restored"));
         assert!(text.contains("✓ Service paused - system proxies restored."));
-        assert_eq!(state.menu.items.len(), 9);
+        assert_eq!(state.menu.items.len(), 10);
         assert!(state
             .menu
             .items
             .iter()
             .any(|item| matches!(item.choice, Choice::SwitchEngine(_))));
         for (idx, item) in state.menu.items.iter().enumerate() {
+            let badge = item_key_badge(&state.menu, idx);
             assert!(
-                text.contains(&format!("[{}]", idx + 1)),
-                "missing badge {}:\n{text}",
-                idx + 1
+                text.contains(badge.as_ref()),
+                "missing badge {badge}:\n{text}",
             );
             assert!(
                 text.contains(&item.title),
@@ -3491,9 +3620,10 @@ mod tests {
         assert!(fresh_text.contains("Install for automatic startup"));
         assert!(fresh_text.contains("Split tunneling · All apps"));
         assert!(fresh_text.contains("Run diagnostics"));
+        assert!(fresh_text.contains("Reset network settings"));
         assert!(fresh_text.contains("Quit"));
         assert!(
-            fresh_text.contains("↑↓ · 1-7 select · d dns · s split · r refresh · enter · q quit")
+            fresh_text.contains("↑↓ · 1-8 select · d dns · s split · r refresh · enter · q quit")
         );
 
         let update = UiState::new(&status_update_available(), None);
@@ -3526,23 +3656,25 @@ mod tests {
         let mut state = UiState::new(&status_running_live(), None);
         let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
 
-        // Select Uninstall via its number key -> enters confirmation instead of finishing.
+        // Select Uninstall via its badge digit key -> enters confirmation instead of finishing.
         let uninstall_idx = state
             .menu
             .items
             .iter()
             .position(|i| i.choice == Choice::Uninstall)
             .expect("running menu includes Uninstall");
-        let uninstall_key = char::from_digit(
-            u32::try_from(uninstall_idx + 1).expect("uninstall badge fits u32"),
-            10,
-        )
-        .expect("uninstall shortcut is single digit");
+        let uninstall_badge = item_key_badge(&state.menu, uninstall_idx);
+        let uninstall_key = uninstall_badge
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .chars()
+            .next()
+            .expect("uninstall shortcut is single char");
         assert_eq!(
             handle_key(&mut state, press(KeyCode::Char(uninstall_key))),
             Action::Redraw
         );
-        assert!(state.confirming_uninstall);
+        assert_eq!(state.confirming, Some(ConfirmModal::Uninstall));
         assert_eq!(state.selected, uninstall_idx);
 
         let buf = render_state(80, 24, &state, true);
@@ -3612,35 +3744,35 @@ mod tests {
             ),
             Action::Ignore
         );
-        assert!(state.confirming_uninstall);
+        assert_eq!(state.confirming, Some(ConfirmModal::Uninstall));
 
         // 'n' cancels safely back to menu.
         assert_eq!(
             handle_key(&mut state, press(KeyCode::Char('n'))),
             Action::Redraw
         );
-        assert!(!state.confirming_uninstall);
+        assert_eq!(state.confirming, None);
 
         // Re-enter via Enter on Uninstall item, then cancel with Esc.
         assert_eq!(
             handle_key(&mut state, press(KeyCode::Enter)),
             Action::Redraw
         );
-        assert!(state.confirming_uninstall);
+        assert_eq!(state.confirming, Some(ConfirmModal::Uninstall));
         assert_eq!(handle_key(&mut state, press(KeyCode::Esc)), Action::Redraw);
-        assert!(!state.confirming_uninstall);
+        assert_eq!(state.confirming, None);
 
         // Re-enter and cancel with 'q'.
         assert_eq!(
             handle_key(&mut state, press(KeyCode::Enter)),
             Action::Redraw
         );
-        assert!(state.confirming_uninstall);
+        assert_eq!(state.confirming, Some(ConfirmModal::Uninstall));
         assert_eq!(
             handle_key(&mut state, press(KeyCode::Char('q'))),
             Action::Redraw
         );
-        assert!(!state.confirming_uninstall);
+        assert_eq!(state.confirming, None);
 
         // Re-enter and confirm with 'y' and 'Y'.
         assert_eq!(
@@ -3662,9 +3794,9 @@ mod tests {
         let mut state = UiState::new(&status_paused(), None);
         let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
 
-        // Move to last item (index 8 of 9).
+        // Move to last item (index 9 of 10).
         assert_eq!(handle_key(&mut state, press(KeyCode::End)), Action::Redraw);
-        assert_eq!(state.selected, 8);
+        assert_eq!(state.selected, 9);
 
         // Pressing 'r' or 'R' requests refresh.
         assert_eq!(
@@ -3676,16 +3808,16 @@ mod tests {
             Action::Refresh
         );
 
-        // Apply refresh to NotInstalled (7 items): selection clamps cleanly to 6 and notice updates.
+        // Apply refresh to NotInstalled (8 items): selection clamps cleanly to 7 and notice updates.
         apply_refresh(&mut state, &status_not_installed());
-        assert_eq!(state.selected, 6);
+        assert_eq!(state.selected, 7);
         assert_eq!(state.menu.notice.as_deref(), Some("Status refreshed."));
-        assert!(!state.confirming_uninstall);
+        assert_eq!(state.confirming, None);
 
         let buf = render_state(80, 24, &state, true);
         let text = buffer_text(&buf);
         assert!(text.contains("✓ Status refreshed."));
-        assert!(text.contains("▸ [7] Quit"));
+        assert!(text.contains("▸ [8] Quit"));
     }
 
     #[test]
@@ -3699,10 +3831,10 @@ mod tests {
         assert!(text.contains("Anti-DPI"));
         assert!(text.contains("r refresh"));
         for idx in 0..running.menu.items.len() {
+            let badge = item_key_badge(&running.menu, idx);
             assert!(
-                text.contains(&format!("[{}]", idx + 1)),
-                "narrow 46x18 missing badge {}:\n{text}",
-                idx + 1
+                text.contains(badge.as_ref()),
+                "narrow 46x18 missing badge {badge}:\n{text}",
             );
         }
 
@@ -3713,25 +3845,29 @@ mod tests {
         assert!(!tighter_text.contains(repo_display()));
 
         // NO_COLOR across normal and confirm modes: plain border, zero RGB colors, REVERSED active row.
-        for confirming in [false, true] {
+        for confirming in [
+            None,
+            Some(ConfirmModal::Uninstall),
+            Some(ConfirmModal::ResetNetwork),
+        ] {
             let mut state = UiState::new(&status_running_live(), Some("Status refreshed."));
-            state.confirming_uninstall = confirming;
+            state.confirming = confirming;
             let no_color = render_state(80, 24, &state, false);
             let no_color_text = buffer_text(&no_color);
             assert!(
                 no_color_text.contains('┌')
                     && no_color_text.contains('└')
                     && !no_color_text.contains('╭'),
-                "NO_COLOR confirming={confirming} must use plain border:\n{no_color_text}"
+                "NO_COLOR confirming={confirming:?} must use plain border:\n{no_color_text}"
             );
             assert!(
                 no_color
                     .content()
                     .iter()
                     .all(|c| c.fg == Color::Reset && c.bg == Color::Reset),
-                "NO_COLOR confirming={confirming} must not emit RGB colors"
+                "NO_COLOR confirming={confirming:?} must not emit RGB colors"
             );
-            if !confirming {
+            if confirming.is_none() {
                 assert!(no_color
                     .content()
                     .iter()
@@ -3742,14 +3878,14 @@ mod tests {
                     .content()
                     .iter()
                     .any(|c| c.modifier.contains(Modifier::BOLD)),
-                "NO_COLOR confirming={confirming} must apply BOLD hierarchy"
+                "NO_COLOR confirming={confirming:?} must apply BOLD hierarchy"
             );
             assert!(
                 no_color
                     .content()
                     .iter()
                     .any(|c| c.modifier.contains(Modifier::DIM)),
-                "NO_COLOR confirming={confirming} must apply DIM hierarchy"
+                "NO_COLOR confirming={confirming:?} must apply DIM hierarchy"
             );
         }
     }
@@ -3758,7 +3894,9 @@ mod tests {
     fn renders_degenerate_and_scrolled_sizes_without_panicking() {
         let mut paused = UiState::new(&status_paused(), Some("Service paused."));
         let mut confirm = UiState::new(&status_running_live(), None);
-        confirm.confirming_uninstall = true;
+        confirm.confirming = Some(ConfirmModal::Uninstall);
+        let mut reset_confirm = UiState::new(&status_running_live(), None);
+        reset_confirm.confirming = Some(ConfirmModal::ResetNetwork);
         let empty = UiState {
             menu: LauncherMenu {
                 status_rows: Vec::new(),
@@ -3766,7 +3904,7 @@ mod tests {
                 items: Vec::new(),
             },
             selected: 0,
-            confirming_uninstall: false,
+            confirming: None,
             selecting_dns: false,
             dns_selected: 0,
             editing_custom_dns: false,
@@ -3778,7 +3916,7 @@ mod tests {
             show_tun_tip: false,
         };
 
-        for state in [&paused, &confirm, &empty] {
+        for state in [&paused, &confirm, &reset_confirm, &empty] {
             for (width, height) in [
                 (46, 18),
                 (28, 10),
@@ -3811,12 +3949,12 @@ mod tests {
         let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
 
         assert_eq!(handle_key(&mut state, press(KeyCode::Up)), Action::Redraw);
-        assert_eq!(state.selected, 6);
+        assert_eq!(state.selected, 7);
         assert_eq!(
             handle_key(&mut state, press(KeyCode::Char('k'))),
             Action::Redraw
         );
-        assert_eq!(state.selected, 5);
+        assert_eq!(state.selected, 6);
         assert_eq!(
             handle_key(
                 &mut state,
@@ -3824,7 +3962,7 @@ mod tests {
             ),
             Action::Redraw
         );
-        assert_eq!(state.selected, 4);
+        assert_eq!(state.selected, 5);
         assert_eq!(handle_key(&mut state, press(KeyCode::Home)), Action::Redraw);
         assert_eq!(state.selected, 0);
         assert_eq!(handle_key(&mut state, press(KeyCode::Down)), Action::Redraw);
@@ -3842,6 +3980,8 @@ mod tests {
         assert_eq!(state.selected, 5);
         assert_eq!(handle_key(&mut state, press(KeyCode::Tab)), Action::Redraw);
         assert_eq!(state.selected, 6);
+        assert_eq!(handle_key(&mut state, press(KeyCode::Tab)), Action::Redraw);
+        assert_eq!(state.selected, 7);
         assert_eq!(handle_key(&mut state, press(KeyCode::Tab)), Action::Redraw);
         assert_eq!(state.selected, 0);
 
@@ -3971,7 +4111,7 @@ mod tests {
                 ],
             },
             selected: 0,
-            confirming_uninstall: false,
+            confirming: None,
             selecting_dns: false,
             dns_selected: 0,
             editing_custom_dns: false,
@@ -4219,7 +4359,7 @@ mod tests {
                 }],
             },
             selected: 0,
-            confirming_uninstall: false,
+            confirming: None,
             selecting_dns: false,
             dns_selected: 0,
             editing_custom_dns: false,
@@ -4283,7 +4423,7 @@ mod tests {
         );
 
         // Confirm mode must ignore 'm' and 'M'.
-        state.confirming_uninstall = true;
+        state.confirming = Some(ConfirmModal::Uninstall);
         assert_eq!(
             handle_key(&mut state, press(KeyCode::Char('m'))),
             Action::Ignore
@@ -4312,7 +4452,7 @@ mod tests {
                 ],
             },
             selected: 0,
-            confirming_uninstall: false,
+            confirming: None,
             selecting_dns: false,
             dns_selected: 0,
             editing_custom_dns: false,
@@ -4761,7 +4901,7 @@ mod tests {
         );
 
         // Confirm and DNS picker modes must ignore 'l' and 'L'.
-        running.confirming_uninstall = true;
+        running.confirming = Some(ConfirmModal::Uninstall);
         assert_eq!(
             handle_key(&mut running, press(KeyCode::Char('l'))),
             Action::Ignore
@@ -4770,7 +4910,7 @@ mod tests {
             handle_key(&mut running, press(KeyCode::Char('L'))),
             Action::Ignore
         );
-        running.confirming_uninstall = false;
+        running.confirming = None;
 
         running.selecting_dns = true;
         assert_eq!(
@@ -4932,7 +5072,7 @@ mod tests {
         );
 
         // Confirm and DNS picker modes must ignore 's' and 'S'.
-        running.confirming_uninstall = true;
+        running.confirming = Some(ConfirmModal::Uninstall);
         assert_eq!(
             handle_key(&mut running, press(KeyCode::Char('s'))),
             Action::Ignore
@@ -4941,7 +5081,7 @@ mod tests {
             handle_key(&mut running, press(KeyCode::Char('S'))),
             Action::Ignore
         );
-        running.confirming_uninstall = false;
+        running.confirming = None;
 
         running.selecting_dns = true;
         assert_eq!(
@@ -5229,11 +5369,13 @@ mod tests {
                 !combined.contains('…'),
                 "2-line notice should fit without ellipsis:\n{text}"
             );
-            // All 9 paused menu items remain visible alongside the 2-line notice at 80x24.
-            for idx in 1..=state.menu.items.len() {
+            // All paused menu items remain visible alongside the 2-line notice at 80x24.
+            for (idx, item) in state.menu.items.iter().enumerate() {
+                let badge = item_key_badge(&state.menu, idx);
                 assert!(
-                    text.contains(&format!("[{idx}]")),
-                    "missing menu item [{idx}] with 2-line notice:\n{text}"
+                    text.contains(badge.as_ref()) && text.contains(&item.title),
+                    "missing menu item {badge} ({}) with 2-line notice:\n{text}",
+                    item.title
                 );
             }
         }
@@ -5324,7 +5466,7 @@ mod tests {
 
         // 1. Uninstall confirmation under NO_COLOR=1 uses ASCII '! ' prefix instead of '● '.
         let mut confirm_state = UiState::new(&status_running_live(), None);
-        confirm_state.confirming_uninstall = true;
+        confirm_state.confirming = Some(ConfirmModal::Uninstall);
         let confirm_buf = render_state(80, 24, &confirm_state, false);
         let confirm_text = buffer_text(&confirm_buf);
         assert!(
@@ -5686,7 +5828,7 @@ mod tests {
         // while still accepting both Turkish (e/h) and English (y/n) keys.
         state.editing_custom_dns = false;
         state.selecting_dns = false;
-        state.confirming_uninstall = true;
+        state.confirming = Some(ConfirmModal::Uninstall);
         let conf_buf = render_state(80, 24, &state, true);
         let conf_text = buffer_text(&conf_buf);
         assert!(conf_text.contains("[TR]") && !conf_text.contains("[g: TR]"));
@@ -5707,6 +5849,174 @@ mod tests {
         assert_eq!(
             handle_key(&mut state, KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
             Action::Finish(Choice::Uninstall)
+        );
+    }
+
+    #[test]
+    fn reset_network_n_hotkey_and_amber_confirmation_in_en_and_tr() {
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        // 10-row running live menu renders [n] badge for ResetNetwork so every row has a single-key trigger.
+        let mut state = UiState::new(&status_running_live(), None);
+        assert_eq!(state.menu.items.len(), 10);
+        let reset_idx = state
+            .menu
+            .items
+            .iter()
+            .position(|item| item.choice == Choice::ResetNetwork)
+            .expect("running menu includes ResetNetwork");
+        assert_eq!(item_key_badge(&state.menu, reset_idx), "[n]");
+        let menu_text = buffer_text(&render_state(80, 24, &state, true));
+        assert!(
+            menu_text.contains("[n] Reset network settings"),
+            "10-row menu must render [n] badge for ResetNetwork:\n{menu_text}"
+        );
+
+        // Repeat/Release and Ctrl/Alt-modified 'n' must be ignored.
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            assert_eq!(
+                handle_key(
+                    &mut state,
+                    KeyEvent::new_with_kind(KeyCode::Char('n'), KeyModifiers::NONE, kind)
+                ),
+                Action::Ignore
+            );
+        }
+        assert_eq!(
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)
+            ),
+            Action::Ignore
+        );
+        assert_eq!(
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT)
+            ),
+            Action::Ignore
+        );
+        assert_eq!(state.confirming, None);
+
+        // EN 2-keypress flow: 'n' opens amber ConfirmModal::ResetNetwork, 'y'/'Y' confirms.
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('n'))),
+            Action::Redraw
+        );
+        assert_eq!(state.selected, reset_idx);
+        assert_eq!(state.confirming, Some(ConfirmModal::ResetNetwork));
+
+        let en_buf = render_state(80, 24, &state, true);
+        let en_text = buffer_text(&en_buf);
+        assert!(
+            en_text.contains("● Confirm network reset"),
+            "missing EN reset confirm header:\n{en_text}"
+        );
+        assert!(
+            en_text.contains("Your vdpi config is kept."),
+            "EN reset confirm must note that vdpi config is kept:\n{en_text}"
+        );
+        assert!(
+            en_text.contains("[y] Reset network   ·   [n / Esc] Cancel"),
+            "missing EN reset confirm prompt:\n{en_text}"
+        );
+        assert!(
+            en_text.contains("y reset  ·  n / esc cancel"),
+            "missing EN reset confirm footer:\n{en_text}"
+        );
+        assert!(
+            en_buf
+                .content()
+                .iter()
+                .any(|c| c.symbol() == "●" && c.fg == AMBER_WARN),
+            "reset confirm header dot must be amber:\n{en_text}"
+        );
+
+        // Cancel with 'n', re-open with 'N', cancel with Esc, re-open and confirm with 'y' and 'Y'.
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('n'))),
+            Action::Redraw
+        );
+        assert_eq!(state.confirming, None);
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('N'))),
+            Action::Redraw
+        );
+        assert_eq!(state.confirming, Some(ConfirmModal::ResetNetwork));
+        assert_eq!(handle_key(&mut state, press(KeyCode::Esc)), Action::Redraw);
+        assert_eq!(state.confirming, None);
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('n'))),
+            Action::Redraw
+        );
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('y'))),
+            Action::Finish(Choice::ResetNetwork)
+        );
+        assert_eq!(
+            handle_key(&mut state, press(KeyCode::Char('Y'))),
+            Action::Finish(Choice::ResetNetwork)
+        );
+
+        // TR 2-keypress flow: 'n' opens Turkish amber confirm modal, 'h' cancels, 'e'/'E'/'y' confirm.
+        let _guard = vdpi::i18n::push_thread_lang(Some(Lang::Tr));
+        let mut tr_state = UiState::new(&status_running_live(), None);
+        assert_eq!(
+            handle_key(&mut tr_state, press(KeyCode::Char('n'))),
+            Action::Redraw
+        );
+        assert_eq!(tr_state.confirming, Some(ConfirmModal::ResetNetwork));
+
+        let tr_buf = render_state(80, 24, &tr_state, true);
+        let tr_text = buffer_text(&tr_buf);
+        assert!(
+            tr_text.contains("● Ağ sıfırlamayı onayla"),
+            "missing TR reset confirm header:\n{tr_text}"
+        );
+        let tr_body_flat: String = tr_text
+            .lines()
+            .map(|line| line.trim().trim_matches('│').trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            tr_body_flat.contains("vdpi yapılandırmanız korunur."),
+            "TR reset confirm must note that vdpi config is kept:\n{tr_text}"
+        );
+        assert!(
+            tr_text.contains("[e] Ağı sıfırla   ·   [h / Esc] İptal"),
+            "missing TR reset confirm prompt:\n{tr_text}"
+        );
+        assert!(
+            tr_text.contains("e sıfırla  ·  h / esc iptal"),
+            "missing TR reset confirm footer:\n{tr_text}"
+        );
+
+        let tr_min_text = buffer_text(&render_state(26, 4, &tr_state, true));
+        assert!(
+            tr_min_text.contains("Ağ sıfırlansın mı? [e/h]"),
+            "missing TR minimal reset confirm prompt:\n{tr_min_text}"
+        );
+
+        assert_eq!(
+            handle_key(&mut tr_state, press(KeyCode::Char('h'))),
+            Action::Redraw
+        );
+        assert_eq!(tr_state.confirming, None);
+        assert_eq!(
+            handle_key(&mut tr_state, press(KeyCode::Char('n'))),
+            Action::Redraw
+        );
+        assert_eq!(
+            handle_key(&mut tr_state, press(KeyCode::Char('e'))),
+            Action::Finish(Choice::ResetNetwork)
+        );
+        assert_eq!(
+            handle_key(&mut tr_state, press(KeyCode::Char('E'))),
+            Action::Finish(Choice::ResetNetwork)
+        );
+        assert_eq!(
+            handle_key(&mut tr_state, press(KeyCode::Char('y'))),
+            Action::Finish(Choice::ResetNetwork)
         );
     }
 }

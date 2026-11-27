@@ -1,6 +1,7 @@
 use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::{Component, Path, PathBuf};
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 use std::process::{Child, Command, Stdio};
@@ -28,7 +29,7 @@ use crate::models::{
     ActionErrorCodeDto, ActionResultDto, DnsConfigUpdateDto, EngineModeDto, UpdateCheckPayloadDto,
     VpnCoexistenceDto,
 };
-use crate::sidecar::{self, SidecarOutcome};
+use crate::sidecar::{self, SelfResetOutcome, SidecarOutcome};
 use crate::status::BundledVersionProbe;
 
 const MAX_DOMAIN_ENTRY_LEN: usize = 255;
@@ -43,6 +44,7 @@ const SIDECAR_TOGGLE_USER_TIMEOUT_SECS: u64 = 60;
 const SIDECAR_ENGINE_TIMEOUT_SECS: u64 = 90;
 const SIDECAR_INSTALL_TIMEOUT_SECS: u64 = 120;
 const SIDECAR_UNINSTALL_TIMEOUT_SECS: u64 = 90;
+const SIDECAR_NETWORK_RESET_TIMEOUT_SECS: u64 = 45;
 const UPDATE_CHECK_CACHE_TTL: Duration = Duration::from_secs(30);
 
 type UpdateCheckCacheSlot = tokio::sync::Mutex<Option<(Instant, UpdateCheckPayloadDto)>>;
@@ -2325,6 +2327,298 @@ pub fn open_directory_in_os(path: &Path) -> ActionResultDto {
     open_directory_in_os_with(path, &allowed, spawn_os_file_manager)
 }
 
+fn parse_internal_network_reset_args<I, S>(args: I) -> Option<Result<Option<PathBuf>, String>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let collected: Vec<OsString> = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_os_string())
+        .collect();
+    if collected.first().and_then(|s| s.to_str()) != Some("--internal-reset-network") {
+        return None;
+    }
+    match collected.as_slice() {
+        [_flag] => Some(Ok(None)),
+        [_flag, opt, path] if opt.to_str() == Some("--result-file") => {
+            if path.is_empty() {
+                Some(Err("Missing path for --result-file.".to_string()))
+            } else {
+                Some(Ok(Some(PathBuf::from(path))))
+            }
+        }
+        _ => Some(Err(
+            "Invalid arguments for --internal-reset-network.".to_string(),
+        )),
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn is_windows_other_user_vdpi_config_dir(dir: &Path) -> bool {
+    let Some(raw) = dir.to_str() else {
+        return false;
+    };
+    if validate_windows_path_syntax(raw).is_err() {
+        return false;
+    }
+    let replaced = raw.replace('/', "\\");
+    let parts: Vec<&str> = replaced[3..]
+        .split('\\')
+        .filter(|seg| !seg.is_empty() && *seg != ".")
+        .collect();
+    match parts.as_slice() {
+        [users, user, appdata, local, vdpi] => {
+            users.eq_ignore_ascii_case("users")
+                && !user.is_empty()
+                && *user != ".."
+                && appdata.eq_ignore_ascii_case("appdata")
+                && local.eq_ignore_ascii_case("local")
+                && vdpi.eq_ignore_ascii_case("vdpi")
+        }
+        [users, user, dot_vdpi] => {
+            users.eq_ignore_ascii_case("users")
+                && !user.is_empty()
+                && *user != ".."
+                && dot_vdpi.eq_ignore_ascii_case(".vdpi")
+        }
+        _ => false,
+    }
+}
+
+fn write_internal_network_reset_result_file_in(
+    result_path: &Path,
+    expected_user_config_dir: &Path,
+    json_bytes: &[u8],
+    allow_windows_other_user_dir: bool,
+) -> Result<(), String> {
+    if result_path.as_os_str().is_empty() {
+        return Err("Result file path cannot be empty.".to_string());
+    }
+    let Some(raw) = result_path.to_str() else {
+        return Err("Result file path contains invalid UTF-8.".to_string());
+    };
+    if raw.contains('\0') || raw.chars().any(char::is_control) {
+        return Err("Result file path contains invalid characters.".to_string());
+    }
+    if result_path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return Err("Refusing to write result file containing '..' traversal.".to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    validate_windows_path_syntax(raw)?;
+    #[cfg(not(target_os = "windows"))]
+    if !result_path.is_absolute() {
+        return Err("Result file path must be an absolute path.".to_string());
+    }
+
+    let Some(file_name) = result_path.file_name().and_then(OsStr::to_str) else {
+        return Err("Result file path must include a valid file name.".to_string());
+    };
+    if !file_name.starts_with(".vdpi-netreset-") || !file_name.ends_with(".json") {
+        return Err(
+            "Refusing to write result file with unexpected filename prefix or extension."
+                .to_string(),
+        );
+    }
+
+    let Some(parent) = result_path.parent().filter(|p| !p.as_os_str().is_empty()) else {
+        return Err("Result file path must have a valid parent directory.".to_string());
+    };
+    let clean_expected_dir = strip_windows_verbatim_prefix(expected_user_config_dir);
+    let in_expected_dir = paths_match_allowlist(parent, &clean_expected_dir);
+    #[cfg(any(target_os = "windows", test))]
+    let in_other_win_user_dir =
+        allow_windows_other_user_dir && is_windows_other_user_vdpi_config_dir(parent);
+    #[cfg(not(any(target_os = "windows", test)))]
+    let in_other_win_user_dir = {
+        let _ = allow_windows_other_user_dir;
+        false
+    };
+    if !in_expected_dir && !in_other_win_user_dir {
+        return Err(
+            "Refusing to write network reset result file outside the user configuration directory."
+                .to_string(),
+        );
+    }
+
+    verify_no_symlinks_in_path(result_path, false)?;
+
+    let pre_meta = fs::symlink_metadata(result_path)
+        .map_err(|err| format!("Failed to inspect network reset result file: {err}"))?;
+    if is_symlink_or_reparse(&pre_meta) || !pre_meta.is_file() {
+        return Err(
+            "Refusing to write to a symlink, reparse point, or non-regular result file."
+                .to_string(),
+        );
+    }
+
+    let mut open_opts = fs::OpenOptions::new();
+    open_opts.write(true);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        open_opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open_opts.custom_flags(libc::O_NOFOLLOW);
+    }
+
+    let mut file = open_opts
+        .open(result_path)
+        .map_err(|err| format!("Failed to open network reset result file: {err}"))?;
+    let opened_meta = file
+        .metadata()
+        .map_err(|err| format!("Failed to inspect opened network reset result file: {err}"))?;
+    if is_symlink_or_reparse(&opened_meta) || !opened_meta.is_file() {
+        return Err(
+            "Refusing to write to a symlink, reparse point, or non-regular result file."
+                .to_string(),
+        );
+    }
+    if opened_meta.len() != 0 {
+        return Err("Refusing to overwrite non-empty network reset result file.".to_string());
+    }
+
+    file.write_all(json_bytes)
+        .map_err(|err| format!("Failed to write network reset result file: {err}"))?;
+    file.sync_all()
+        .map_err(|err| format!("Failed to flush network reset result file: {err}"))?;
+    Ok(())
+}
+
+/// Headless internal CLI entry point invoked before Tauri/WebView2 startup when
+/// `vdpi-desktop` self-elevates with `--internal-reset-network [--result-file <path>]`.
+///
+/// Returns `None` for normal GUI launches, or `Some(exit_code)` after executing
+/// `vdpi::platform::reset_network_defaults(ResetScope::Full)` and emitting JSON.
+pub fn try_run_internal_network_reset_cli() -> Option<i32> {
+    let parsed = parse_internal_network_reset_args(std::env::args_os().skip(1))?;
+    let result_file = match parsed {
+        Ok(path) => path,
+        Err(err) => {
+            let _ = writeln!(std::io::stderr(), "{err}");
+            return Some(2);
+        }
+    };
+
+    let report = vdpi::platform::reset_network_defaults(vdpi::platform::ResetScope::Full);
+    let json_bytes = match serde_json::to_vec(&report) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "Failed to serialize network reset report: {err}"
+            );
+            return Some(1);
+        }
+    };
+
+    if let Some(result_path) = result_file {
+        let user_cfg = user_config_path();
+        let Some(expected_dir) = user_cfg.parent().filter(|p| !p.as_os_str().is_empty()) else {
+            let _ = writeln!(
+                std::io::stderr(),
+                "Could not resolve user configuration directory for --result-file."
+            );
+            return Some(1);
+        };
+        if let Err(err) = write_internal_network_reset_result_file_in(
+            &result_path,
+            expected_dir,
+            &json_bytes,
+            cfg!(target_os = "windows"),
+        ) {
+            let _ = writeln!(std::io::stderr(), "{err}");
+            return Some(1);
+        }
+    } else {
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(&json_bytes);
+        let _ = stdout.write_all(b"\n");
+        let _ = stdout.flush();
+    }
+
+    Some(if report.has_failures() { 1 } else { 0 })
+}
+
+fn format_network_reset_outcome(
+    has_failures: bool,
+    has_skipped_privileged: bool,
+    force_skipped_message: bool,
+) -> ActionResultDto {
+    let skipped = force_skipped_message || has_skipped_privileged;
+    if !has_failures {
+        let message = if skipped {
+            "User network settings reset to defaults (Administrator/root items skipped)."
+        } else {
+            "Network settings reset to defaults."
+        };
+        action_ok(message, Some(false))
+    } else {
+        let message = if skipped {
+            "Failed to reset some user network settings (Administrator/root items skipped)."
+        } else {
+            "Failed to reset network settings."
+        };
+        ActionResultDto::error(message)
+    }
+}
+
+fn reset_network_settings_with<FRun, FUserFallback>(
+    run_elevated: FRun,
+    run_user_fallback: FUserFallback,
+) -> ActionResultDto
+where
+    FRun: FnOnce() -> SelfResetOutcome,
+    FUserFallback: FnOnce() -> vdpi::platform::NetworkResetReport,
+{
+    match run_elevated() {
+        SelfResetOutcome::Ok(report) => format_network_reset_outcome(
+            report.has_failures(),
+            report.has_skipped_privileged(),
+            false,
+        ),
+        SelfResetOutcome::Cancelled => {
+            ActionResultDto::cancelled("Network reset was cancelled.")
+        }
+        SelfResetOutcome::ElevationUnavailable(_) => {
+            let report = run_user_fallback();
+            format_network_reset_outcome(
+                report.has_failures(),
+                report.has_skipped_privileged(),
+                true,
+            )
+        }
+        SelfResetOutcome::Err(msg) => {
+            let detail = redact_message(&msg);
+            let message = if detail.is_empty() {
+                "Failed to reset network settings.".to_string()
+            } else {
+                detail
+            };
+            ActionResultDto::error(message)
+        }
+    }
+}
+
+/// Resets OS network settings (proxy/PAC, WinHTTP, env vars, orphan TUN adapters/routes,
+/// DNS cache) to defaults via self-elevation of `vdpi-desktop`, falling back to in-process
+/// `ResetScope::UserOnly` recovery if elevation is unavailable. Works even if `vdpi.exe`
+/// and `wintun.dll` were quarantined or deleted by antivirus.
+pub fn reset_network_settings() -> ActionResultDto {
+    reset_network_settings_with(
+        || sidecar::run_self_elevated_reset_network(SIDECAR_NETWORK_RESET_TIMEOUT_SECS),
+        || vdpi::platform::reset_network_defaults(vdpi::platform::ResetScope::UserOnly),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4131,5 +4425,177 @@ mod tests {
         .expect("retry after error succeeds");
         assert_eq!(r4.latest_version, "v0.9.0");
         assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn internal_network_reset_cli_arg_parsing_is_strict() {
+        assert!(parse_internal_network_reset_args(Vec::<&str>::new()).is_none());
+        assert!(parse_internal_network_reset_args(["--minimized"]).is_none());
+        assert!(parse_internal_network_reset_args(["--other", "--internal-reset-network"]).is_none());
+
+        assert_eq!(
+            parse_internal_network_reset_args(["--internal-reset-network"]),
+            Some(Ok(None))
+        );
+        assert_eq!(
+            parse_internal_network_reset_args([
+                "--internal-reset-network",
+                "--result-file",
+                "C:/Users/Alice/AppData/Local/vdpi/.vdpi-netreset-1.json",
+            ]),
+            Some(Ok(Some(PathBuf::from(
+                "C:/Users/Alice/AppData/Local/vdpi/.vdpi-netreset-1.json"
+            ))))
+        );
+
+        assert!(matches!(
+            parse_internal_network_reset_args(["--internal-reset-network", "--result-file"]),
+            Some(Err(_))
+        ));
+        assert!(matches!(
+            parse_internal_network_reset_args(["--internal-reset-network", "--result-file", ""]),
+            Some(Err(_))
+        ));
+        assert!(matches!(
+            parse_internal_network_reset_args(["--internal-reset-network", "--unexpected"]),
+            Some(Err(_))
+        ));
+    }
+
+    #[test]
+    fn internal_network_reset_result_file_validation_and_write_enforcement() {
+        let dir = TempDirGuard::new("netreset-write");
+        let other_dir = TempDirGuard::new("netreset-other");
+
+        let valid_file = dir.path().join(".vdpi-netreset-1.0.abcd.json");
+        fs::write(&valid_file, b"").expect("create empty placeholder");
+
+        write_internal_network_reset_result_file_in(&valid_file, dir.path(), b"{\"ok\":true}", false)
+            .expect("writing to valid 0-byte placeholder succeeds");
+        assert_eq!(
+            fs::read_to_string(&valid_file).expect("read written json"),
+            "{\"ok\":true}"
+        );
+
+        // Non-empty file must be refused on subsequent write.
+        assert!(
+            write_internal_network_reset_result_file_in(&valid_file, dir.path(), b"{}", false)
+                .is_err()
+        );
+
+        // Missing file must be refused (never created).
+        let missing = dir.path().join(".vdpi-netreset-missing.json");
+        assert!(
+            write_internal_network_reset_result_file_in(&missing, dir.path(), b"{}", false)
+                .is_err()
+        );
+        assert!(!missing.exists());
+
+        // Unexpected filename or extension must be refused.
+        let wrong_name = dir.path().join("config.toml");
+        fs::write(&wrong_name, b"").expect("create config.toml");
+        assert!(
+            write_internal_network_reset_result_file_in(&wrong_name, dir.path(), b"{}", false)
+                .is_err()
+        );
+
+        // File outside expected user config dir must be refused.
+        let outside = other_dir.path().join(".vdpi-netreset-2.0.abcd.json");
+        fs::write(&outside, b"").expect("create outside placeholder");
+        assert!(
+            write_internal_network_reset_result_file_in(&outside, dir.path(), b"{}", false)
+                .is_err()
+        );
+
+        // Parent traversal and UNC paths must be refused.
+        let traversal = dir.path().join("..").join(".vdpi-netreset-3.0.abcd.json");
+        assert!(
+            write_internal_network_reset_result_file_in(&traversal, dir.path(), b"{}", false)
+                .is_err()
+        );
+        assert!(write_internal_network_reset_result_file_in(
+            Path::new(r"\\server\share\.vdpi-netreset-4.0.abcd.json"),
+            dir.path(),
+            b"{}",
+            true
+        )
+        .is_err());
+
+        // Windows over-the-shoulder UAC path matcher accepts only local user vdpi dirs.
+        assert!(is_windows_other_user_vdpi_config_dir(Path::new(
+            r"C:\Users\Alice\AppData\Local\vdpi"
+        )));
+        assert!(is_windows_other_user_vdpi_config_dir(Path::new(
+            r"C:\Users\Alice\.vdpi"
+        )));
+        assert!(!is_windows_other_user_vdpi_config_dir(Path::new(
+            r"C:\Windows\System32"
+        )));
+        assert!(!is_windows_other_user_vdpi_config_dir(Path::new(
+            r"\\server\share\Users\Alice\AppData\Local\vdpi"
+        )));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let target = dir.path().join(".vdpi-netreset-target.json");
+            let link = dir.path().join(".vdpi-netreset-link.json");
+            fs::write(&target, b"").expect("create target");
+            symlink(&target, &link).expect("create symlink");
+            assert!(
+                write_internal_network_reset_result_file_in(&link, dir.path(), b"{}", false)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn reset_network_settings_formatting_and_outcome_mapping() {
+        let full_ok = format_network_reset_outcome(false, false, false);
+        assert!(full_ok.ok);
+        assert_eq!(full_ok.message, "Network settings reset to defaults.");
+        assert_eq!(full_ok.needs_restart, Some(false));
+        assert_eq!(full_ok.cancelled, None);
+
+        let partial_ok = format_network_reset_outcome(false, true, false);
+        assert!(partial_ok.ok);
+        assert_eq!(
+            partial_ok.message,
+            "User network settings reset to defaults (Administrator/root items skipped)."
+        );
+
+        let forced_partial = format_network_reset_outcome(false, false, true);
+        assert!(forced_partial.ok);
+        assert_eq!(
+            forced_partial.message,
+            "User network settings reset to defaults (Administrator/root items skipped)."
+        );
+
+        let full_fail = format_network_reset_outcome(true, false, false);
+        assert!(!full_fail.ok);
+        assert_eq!(full_fail.message, "Failed to reset network settings.");
+
+        let partial_fail = format_network_reset_outcome(true, true, false);
+        assert!(!partial_fail.ok);
+        assert_eq!(
+            partial_fail.message,
+            "Failed to reset some user network settings (Administrator/root items skipped)."
+        );
+
+        let cancelled = reset_network_settings_with(
+            || SelfResetOutcome::Cancelled,
+            || unreachable!("cancelled reset must not run UserOnly fallback"),
+        );
+        assert!(!cancelled.ok);
+        assert_eq!(cancelled.cancelled, Some(true));
+        assert_eq!(cancelled.message, "Network reset was cancelled.");
+
+        let errored = reset_network_settings_with(
+            || SelfResetOutcome::Err("reset failed talking to https://secret.example/token".to_string()),
+            || unreachable!("hard error must not run UserOnly fallback"),
+        );
+        assert!(!errored.ok);
+        assert_eq!(errored.cancelled, None);
+        assert!(!errored.message.contains("token"));
     }
 }

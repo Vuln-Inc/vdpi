@@ -16,6 +16,27 @@ use tracing::{debug, info, warn};
 
 pub const PAC_PATH: &str = "/vdpi.pac";
 
+const SYSTEMD_PROXY_ENV_UNSET_ARGS: &[&str] = &[
+    "--user",
+    "unset-environment",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+];
+
+#[derive(Debug, Clone, Default)]
+pub struct UnixProxyResetOutcome {
+    pub proxy_changed: bool,
+    pub env_changed: bool,
+    pub skipped_privileges: bool,
+    pub errors: Vec<String>,
+}
+
 const TRUSTED_BIN_DIRS: &[&str] = &[
     "/usr/bin",
     "/bin",
@@ -1379,16 +1400,7 @@ impl LinuxProxySession {
                     });
                 if owned {
                     let _ = build_user_command(&systemctl, ctx_ref)
-                        .args([
-                            "--user",
-                            "unset-environment",
-                            "HTTP_PROXY",
-                            "HTTPS_PROXY",
-                            "http_proxy",
-                            "https_proxy",
-                            "NO_PROXY",
-                            "no_proxy",
-                        ])
+                        .args(SYSTEMD_PROXY_ENV_UNSET_ARGS)
                         .output();
                 }
             }
@@ -1863,21 +1875,259 @@ pub fn clear_all_linux_proxies() -> Result<()> {
             });
         if should_unset {
             let _ = build_user_command(&systemctl, ctx_ref)
-                .args([
-                    "--user",
-                    "unset-environment",
-                    "HTTP_PROXY",
-                    "HTTPS_PROXY",
-                    "http_proxy",
-                    "https_proxy",
-                    "NO_PROXY",
-                    "no_proxy",
-                ])
+                .args(SYSTEMD_PROXY_ENV_UNSET_ARGS)
                 .output();
         }
     }
     remove_state_file(&state_path, ctx_ref);
     Ok(())
+}
+
+fn reset_gnome_proxies_with_bin(
+    gsettings: &Path,
+    ctx_ref: Option<&SudoUserContext>,
+    errors: &mut Vec<String>,
+) -> bool {
+    const GNOME_RESET_KEYS: &[(&str, &str)] = &[
+        ("org.gnome.system.proxy", "mode"),
+        ("org.gnome.system.proxy", "autoconfig-url"),
+        ("org.gnome.system.proxy", "ignore-hosts"),
+        ("org.gnome.system.proxy.http", "enabled"),
+        ("org.gnome.system.proxy.http", "host"),
+        ("org.gnome.system.proxy.http", "port"),
+        ("org.gnome.system.proxy.https", "host"),
+        ("org.gnome.system.proxy.https", "port"),
+        ("org.gnome.system.proxy.socks", "host"),
+        ("org.gnome.system.proxy.socks", "port"),
+    ];
+
+    if gsettings_get_with_bin(gsettings, "org.gnome.system.proxy", "mode", ctx_ref).is_none() {
+        return false;
+    }
+
+    let mut changed = false;
+    for &(schema, key) in GNOME_RESET_KEYS {
+        let before = gsettings_get_with_bin(gsettings, schema, key, ctx_ref);
+        if before.is_none() {
+            continue;
+        }
+        match gsettings_reset_with_bin(gsettings, schema, key, ctx_ref) {
+            Ok(()) => {
+                let after = gsettings_get_with_bin(gsettings, schema, key, ctx_ref);
+                if before != after {
+                    changed = true;
+                }
+            }
+            Err(err) => {
+                errors.push(format!("gsettings reset {schema} {key} failed: {err}"));
+            }
+        }
+    }
+    changed
+}
+
+fn reset_kde_proxies_with_bins(
+    writer: &Path,
+    reader: Option<&Path>,
+    dbus_send: Option<&Path>,
+    ctx_ref: Option<&SudoUserContext>,
+    errors: &mut Vec<String>,
+) -> bool {
+    const KDE_DELETE_KEYS: &[&str] = &[
+        "Proxy Config Script",
+        "httpProxy",
+        "httpsProxy",
+        "socksProxy",
+        "NoProxyFor",
+    ];
+
+    let prev_type = reader.and_then(|r| kde_read_proxy_key(r, "ProxyType", ctx_ref));
+    let mut had_non_default = prev_type
+        .as_deref()
+        .is_some_and(|v| !v.is_empty() && v != "0");
+    if !had_non_default {
+        had_non_default = KDE_DELETE_KEYS.iter().any(|key| {
+            reader
+                .and_then(|r| kde_read_proxy_key(r, key, ctx_ref))
+                .is_some_and(|v| !v.is_empty())
+        });
+    }
+
+    let mut any_ok = false;
+    if kde_write_proxy_key(writer, "ProxyType", "0", ctx_ref) {
+        any_ok = true;
+    } else {
+        errors.push(format!(
+            "{} failed to set KDE ProxyType to 0",
+            writer.display()
+        ));
+    }
+    for key in KDE_DELETE_KEYS {
+        if kde_delete_proxy_key(writer, key, ctx_ref) {
+            any_ok = true;
+        } else {
+            errors.push(format!(
+                "{} failed to delete KDE proxy key '{key}'",
+                writer.display()
+            ));
+        }
+    }
+
+    if let Some(dbus_bin) = dbus_send {
+        notify_kde_reload_with_bin(dbus_bin, ctx_ref);
+    }
+
+    any_ok && (had_non_default || reader.is_none())
+}
+
+fn collect_linux_proxy_state_paths(sudo_ctx: Option<&SudoUserContext>) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::with_capacity(3);
+    let mut push_unique = |p: PathBuf| {
+        if !p.as_os_str().is_empty() && !paths.iter().any(|existing| existing == &p) {
+            paths.push(p);
+        }
+    };
+    push_unique(linux_proxy_state_path(sudo_ctx));
+    if let Some(ctx) = sudo_ctx {
+        push_unique(ctx.home.join(".vdpi").join("linux-proxy-state.json"));
+    } else if let Some(home) = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+    {
+        push_unique(home.join(".vdpi").join("linux-proxy-state.json"));
+    }
+    push_unique(PathBuf::from("/etc/vdpi/linux-proxy-state.json"));
+    paths
+}
+
+fn remove_linux_proxy_state_file_guarded(
+    path: &Path,
+    home_guard: Option<&Path>,
+    is_root: bool,
+    outcome: &mut UnixProxyResetOutcome,
+) {
+    if let Some(home) = home_guard {
+        if let Err(err) = ensure_no_symlink_under_home(path, home) {
+            warn!(
+                path = %path.display(),
+                error = %err,
+                "refusing to remove Linux proxy state file through symlink or traversal"
+            );
+            return;
+        }
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            warn!(
+                path = %path.display(),
+                "refusing to remove symlinked Linux proxy state file"
+            );
+            return;
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err) if !is_root && err.kind() == std::io::ErrorKind::PermissionDenied => {
+            outcome.skipped_privileges = true;
+            return;
+        }
+        Err(err) => {
+            outcome.errors.push(format!(
+                "failed to inspect {}: {err}",
+                path.display()
+            ));
+            return;
+        }
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) if !is_root && err.kind() == std::io::ErrorKind::PermissionDenied => {
+            outcome.skipped_privileges = true;
+        }
+        Err(err) => {
+            outcome.errors.push(format!(
+                "failed to remove {}: {err}",
+                path.display()
+            ));
+        }
+    }
+}
+
+/// Resets Linux GNOME/KDE desktop proxies, systemd user proxy environment variables,
+/// and saved proxy state files back to clean factory defaults.
+pub fn reset_linux_proxies_to_defaults() -> UnixProxyResetOutcome {
+    let mut outcome = UnixProxyResetOutcome::default();
+    let sudo_ctx = resolve_sudo_user_context();
+    let ctx_ref = sudo_ctx.as_ref();
+    // SAFETY: `geteuid(2)` is always safe to call and never fails.
+    let is_root = unsafe { libc::geteuid() == 0 };
+
+    if let Some(gsettings) = resolve_trusted_bin("gsettings") {
+        outcome.proxy_changed |=
+            reset_gnome_proxies_with_bin(&gsettings, ctx_ref, &mut outcome.errors);
+    }
+
+    if let Some(kbin) = detect_kde_writer_for_cleanup(ctx_ref) {
+        let reader = kde_reader_for_writer(&kbin);
+        let dbus_send = resolve_trusted_bin("dbus-send");
+        outcome.proxy_changed |= reset_kde_proxies_with_bins(
+            &kbin,
+            reader.as_deref(),
+            dbus_send.as_deref(),
+            ctx_ref,
+            &mut outcome.errors,
+        );
+    }
+
+    if let Some(systemctl) = resolve_trusted_bin("systemctl") {
+        if let Ok(show_out) = build_user_command(&systemctl, ctx_ref)
+            .args(["--user", "show-environment"])
+            .output()
+        {
+            if show_out.status.success() {
+                let text = String::from_utf8_lossy(&show_out.stdout);
+                let had_any = systemd_env_has_any_proxy_key(&text);
+                match build_user_command(&systemctl, ctx_ref)
+                    .args(SYSTEMD_PROXY_ENV_UNSET_ARGS)
+                    .output()
+                {
+                    Ok(unset_out) if unset_out.status.success() => {
+                        if had_any {
+                            outcome.env_changed = true;
+                        }
+                    }
+                    Ok(unset_out) => {
+                        let stderr = String::from_utf8_lossy(&unset_out.stderr).trim().to_string();
+                        outcome.errors.push(format!(
+                            "systemctl --user unset-environment exited {}: {stderr}",
+                            unset_out.status
+                        ));
+                    }
+                    Err(err) => {
+                        outcome.errors.push(format!(
+                            "failed to run systemctl --user unset-environment: {err}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    let user_home = ctx_ref
+        .map(|c| c.home.clone())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|h| !h.is_empty())
+                .map(PathBuf::from)
+        });
+    for path in collect_linux_proxy_state_paths(ctx_ref) {
+        let home_guard = user_home
+            .as_deref()
+            .filter(|home| path.starts_with(home));
+        remove_linux_proxy_state_file_guarded(&path, home_guard, is_root, &mut outcome);
+    }
+
+    outcome
 }
 
 pub fn print_linux_proxy_status() {
@@ -1947,6 +2197,26 @@ fn gsettings_set_with_bin(
         .args(["set", schema, key, val])
         .output()
         .is_ok_and(|out| out.status.success())
+}
+
+fn gsettings_reset_with_bin(
+    gsettings: &Path,
+    schema: &str,
+    key: &str,
+    sudo_ctx: Option<&SudoUserContext>,
+) -> Result<()> {
+    let out = build_user_command(gsettings, sudo_ctx)
+        .args(["reset", schema, key])
+        .output()
+        .with_context(|| format!("failed to execute {} reset {schema} {key}", gsettings.display()))?;
+    if !out.status.success() {
+        bail!(
+            "exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 fn snapshot_gnome_proxy_with_bin(
@@ -2398,9 +2668,33 @@ fn set_systemd_user_env(
 
 fn systemd_env_matches_proxy(env_output: &str, expected_proxy_url: &str) -> bool {
     env_output.lines().any(|line| {
-        ["HTTP_PROXY=", "HTTPS_PROXY=", "http_proxy=", "https_proxy="]
-            .into_iter()
-            .any(|prefix| line.strip_prefix(prefix) == Some(expected_proxy_url))
+        [
+            "HTTP_PROXY=",
+            "HTTPS_PROXY=",
+            "ALL_PROXY=",
+            "http_proxy=",
+            "https_proxy=",
+            "all_proxy=",
+        ]
+        .into_iter()
+        .any(|prefix| line.strip_prefix(prefix) == Some(expected_proxy_url))
+    })
+}
+
+fn systemd_env_has_any_proxy_key(env_output: &str) -> bool {
+    env_output.lines().any(|line| {
+        [
+            "HTTP_PROXY=",
+            "HTTPS_PROXY=",
+            "ALL_PROXY=",
+            "NO_PROXY=",
+            "http_proxy=",
+            "https_proxy=",
+            "all_proxy=",
+            "no_proxy=",
+        ]
+        .into_iter()
+        .any(|prefix| line.starts_with(prefix))
     })
 }
 
@@ -5024,5 +5318,133 @@ mod tests {
         assert!(victim_file.exists());
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn linux_proxy_reset_resets_gnome_kde_and_guards_state_files() {
+        use std::os::unix::fs::symlink;
+
+        assert!(systemd_env_matches_proxy(
+            "ALL_PROXY=http://127.0.0.1:8080\n",
+            "http://127.0.0.1:8080"
+        ));
+        assert!(systemd_env_has_any_proxy_key("all_proxy=socks5://127.0.0.1:1080\n"));
+        assert!(!systemd_env_has_any_proxy_key("PATH=/usr/bin\nHOME=/home/alice\n"));
+
+        let root = std::env::temp_dir().join(format!(
+            "vdpi-linux-proxy-reset-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let state_dir = root.join("gnome-state");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(state_dir.join("org.gnome.system.proxy.mode"), "'auto'\n").unwrap();
+        fs::write(
+            state_dir.join("org.gnome.system.proxy.autoconfig-url"),
+            "'http://127.0.0.1:8080/vdpi.pac'\n",
+        )
+        .unwrap();
+        fs::write(
+            state_dir.join("org.gnome.system.proxy.http.enabled"),
+            "true\n",
+        )
+        .unwrap();
+
+        let gnome_log = root.join("gnome-reset.log");
+        let fake_gsettings = root.join("gsettings");
+        fs::write(
+            &fake_gsettings,
+            format!(
+                "#!/bin/sh\nstate_dir=\"{}\"\ncmd=\"$1\"\nschema=\"$2\"\nkey=\"$3\"\nfile=\"$state_dir/$schema.$key\"\nif [ \"$cmd\" = \"get\" ]; then\n  if [ -f \"$file\" ]; then cat \"$file\"; else echo \"''\"; fi\n  exit 0\nfi\nif [ \"$cmd\" = \"reset\" ]; then\n  echo \"$schema $key\" >> \"{}\"\n  rm -f \"$file\"\n  exit 0\nfi\nexit 1\n",
+                state_dir.display(),
+                gnome_log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fake_gsettings, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut errors = Vec::new();
+        assert!(reset_gnome_proxies_with_bin(&fake_gsettings, None, &mut errors));
+        assert!(errors.is_empty());
+        let logged = fs::read_to_string(&gnome_log).unwrap();
+        for expected in [
+            "org.gnome.system.proxy mode",
+            "org.gnome.system.proxy autoconfig-url",
+            "org.gnome.system.proxy ignore-hosts",
+            "org.gnome.system.proxy.http enabled",
+            "org.gnome.system.proxy.http host",
+            "org.gnome.system.proxy.http port",
+            "org.gnome.system.proxy.https host",
+            "org.gnome.system.proxy.https port",
+            "org.gnome.system.proxy.socks host",
+            "org.gnome.system.proxy.socks port",
+        ] {
+            assert!(logged.contains(expected), "missing {expected} in {logged}");
+        }
+
+        // KDE reset writes ProxyType 0, deletes all 5 keys, and emits both KF6 & KF5 D-Bus signals.
+        let kde_log = root.join("kde-write.log");
+        let dbus_log = root.join("dbus.log");
+        let fake_kread = root.join("kreadconfig6");
+        let fake_kwrite = root.join("kwriteconfig6");
+        let fake_dbus = root.join("dbus-send");
+        fs::write(
+            &fake_kread,
+            "#!/bin/sh\ncase \"$6\" in\n  \"ProxyType\") echo \"2\" ;;\n  \"Proxy Config Script\") echo \"http://127.0.0.1:8080/vdpi.pac\" ;;\n  *) echo \"\" ;;\nesac\nexit 0\n",
+        )
+        .unwrap();
+        fs::write(
+            &fake_kwrite,
+            format!("#!/bin/sh\necho \"$@\" >> \"{}\"\nexit 0\n", kde_log.display()),
+        )
+        .unwrap();
+        fs::write(
+            &fake_dbus,
+            format!("#!/bin/sh\necho \"$@\" >> \"{}\"\nexit 0\n", dbus_log.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&fake_kread, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&fake_kwrite, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&fake_dbus, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(reset_kde_proxies_with_bins(
+            &fake_kwrite,
+            Some(&fake_kread),
+            Some(&fake_dbus),
+            None,
+            &mut errors
+        ));
+        assert!(errors.is_empty());
+        let kde_calls = fs::read_to_string(&kde_log).unwrap();
+        assert!(kde_calls.contains("--key ProxyType 0"));
+        for key in [
+            "Proxy Config Script",
+            "httpProxy",
+            "httpsProxy",
+            "socksProxy",
+            "NoProxyFor",
+        ] {
+            assert!(kde_calls.contains(&format!("--key {key} --delete")));
+        }
+        let dbus_calls = fs::read_to_string(&dbus_log).unwrap();
+        assert!(dbus_calls.contains("reparseWorkerConfiguration"));
+        assert!(dbus_calls.contains("reparseSlaveConfiguration"));
+
+        // Symlink-guarded state file removal refuses symlinks and deletes regular state files.
+        let fake_home = root.join("home");
+        let outside = root.join("outside");
+        fs::create_dir_all(fake_home.join(".vdpi")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let victim = outside.join("victim.json");
+        fs::write(&victim, "{}").unwrap();
+        let sym_state = fake_home.join(".vdpi").join("linux-proxy-state.json");
+        symlink(&victim, &sym_state).unwrap();
+
+        let mut outcome = UnixProxyResetOutcome::default();
+        remove_linux_proxy_state_file_guarded(&sym_state, Some(&fake_home), true, &mut outcome);
+        assert!(fs::symlink_metadata(&sym_state).is_ok());
+        assert!(victim.exists());
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -70,6 +70,26 @@ pub const RFC1918_EXCLUSIONS: &[&str] = &[
 
 /// Link-local, multicast, and reserved IPv4 prefixes excluded from `utun` split routes.
 pub const LINK_LOCAL_EXCLUSIONS: &[&str] = &["169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4"];
+
+/// Non-zero-anchor IPv4 split routes covering `1.0.0.0..=255.255.255.255` while leaving
+/// `0.0.0.0/8` untouched so `IP_BOUND_IF` on Ventura/Sonoma/Sequoia/Tahoe never hits
+/// `ENETUNREACH`.
+pub const IPV4_SPLIT_ROUTES: &[&str] = &[
+    "1.0.0.0/8",
+    "2.0.0.0/7",
+    "4.0.0.0/6",
+    "8.0.0.0/5",
+    "16.0.0.0/4",
+    "32.0.0.0/3",
+    "64.0.0.0/2",
+    "128.0.0.0/1",
+];
+
+/// IPv4 point-to-point subnet CIDR assigned to vdpi's `utun` interface.
+pub const MACOS_TUN_SUBNET_V4: &str = "198.18.0.0/30";
+
+/// IPv6 ULA subnet CIDR assigned to vdpi's `utun` interface.
+pub const MACOS_TUN_SUBNET_V6: &str = "fd00:7664:7069::/64";
 
 /// IPv6 prefixes routed into `utun` when IPv6 TUN mode is active:
 /// - `2000::/3`: Global Unicast IPv6 space
@@ -193,21 +213,223 @@ pub fn parse_dns_servers_output(stdout: &str) -> Vec<String> {
         .collect()
 }
 
+fn is_vdpi_dns_server(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed == MACOS_TUN_DNS_V4 || trimmed.eq_ignore_ascii_case(MACOS_TUN_DNS_V6) {
+        return true;
+    }
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        let v4 = MACOS_TUN_DNS_V4.parse::<IpAddr>().ok();
+        let v6 = MACOS_TUN_DNS_V6.parse::<IpAddr>().ok();
+        return Some(ip) == v4 || Some(ip) == v6;
+    }
+    false
+}
+
 /// Sanitizes a service's current DNS servers before recording them as original DNS.
 ///
-/// Never records [`MACOS_TUN_DNS_V4`] (`198.18.0.2`) as an original server; if the current
-/// list is `[MACOS_TUN_DNS_V4]` with no prior backup, returns an empty `Vec` (DHCP).
+/// Never records [`MACOS_TUN_DNS_V4`] (`198.18.0.2`) or [`MACOS_TUN_DNS_V6`]
+/// (`fd00:7664:7069::2`) as an original server; if the list only contained vdpi virtual DNS
+/// entries with no prior backup, returns an empty `Vec` (DHCP).
 pub fn sanitize_original_dns_servers(servers: Vec<String>) -> Vec<String> {
     servers
         .into_iter()
-        .filter(|srv| srv.trim() != MACOS_TUN_DNS_V4)
+        .filter(|srv| !is_vdpi_dns_server(srv))
         .collect()
 }
 
-/// Returns `true` if `current` equals `[MACOS_TUN_DNS_V4]`, indicating `vdpi` still owns
-/// the service's DNS configuration.
+/// Returns `true` if `current` contains any vdpi virtual DNS server ([`MACOS_TUN_DNS_V4`] or
+/// [`MACOS_TUN_DNS_V6`]), including mixed lists alongside external DNS servers.
 pub fn is_vdpi_owned_dns_servers(current: &[String]) -> bool {
-    current.len() == 1 && current[0].trim() == MACOS_TUN_DNS_V4
+    current.iter().any(|srv| is_vdpi_dns_server(srv))
+}
+
+fn is_utun_iface_token(tok: &str) -> bool {
+    let lower = tok.to_ascii_lowercase();
+    lower
+        .strip_prefix("utun")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn parse_bsd_ipv4_cidr(raw: &str) -> Option<(Ipv4Addr, u8)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
+        return None;
+    }
+    let (addr_part, explicit_prefix) = match trimmed.split_once('/') {
+        Some((ip, pfx)) => (ip, Some(pfx.parse::<u8>().ok()?)),
+        None => (trimmed, None),
+    };
+    let parts: Vec<&str> = addr_part.split('.').collect();
+    if parts.is_empty() || parts.len() > 4 {
+        return None;
+    }
+    let mut octets = [0u8; 4];
+    for (idx, part) in parts.iter().enumerate() {
+        octets[idx] = part.parse::<u8>().ok()?;
+    }
+    let prefix = match explicit_prefix {
+        Some(p) if p <= 32 => p,
+        Some(_) => return None,
+        None => match parts.len() {
+            1 => 8,
+            2 => 16,
+            3 => 24,
+            4 => 32,
+            _ => return None,
+        },
+    };
+    Some((Ipv4Addr::from(octets), prefix))
+}
+
+fn canonical_vdpi_ipv4_route(raw: &str) -> Option<&'static str> {
+    let (ip, prefix) = parse_bsd_ipv4_cidr(raw)?;
+    match (ip.octets(), prefix) {
+        ([1, 0, 0, 0], 8) => Some("1.0.0.0/8"),
+        ([2, 0, 0, 0], 7) => Some("2.0.0.0/7"),
+        ([4, 0, 0, 0], 6) => Some("4.0.0.0/6"),
+        ([8, 0, 0, 0], 5) => Some("8.0.0.0/5"),
+        ([16, 0, 0, 0], 4) => Some("16.0.0.0/4"),
+        ([32, 0, 0, 0], 3) => Some("32.0.0.0/3"),
+        ([64, 0, 0, 0], 2) => Some("64.0.0.0/2"),
+        ([128, 0, 0, 0], 1) => Some("128.0.0.0/1"),
+        ([198, 18, 0, 0], 30) => Some(MACOS_TUN_SUBNET_V4),
+        _ => None,
+    }
+}
+
+fn canonical_vdpi_ipv6_route(raw: &str) -> Option<&'static str> {
+    let trimmed = raw.trim();
+    let (ip_part, pfx_part) = trimmed.split_once('/')?;
+    let ip_no_zone = ip_part.split('%').next()?;
+    let ip: Ipv6Addr = ip_no_zone.parse().ok()?;
+    let prefix: u8 = pfx_part.parse().ok()?;
+    let global_v6: Ipv6Addr = "2000::".parse().ok()?;
+    let nat64_v6: Ipv6Addr = "64:ff9b::".parse().ok()?;
+    let vdpi_v6: Ipv6Addr = "fd00:7664:7069::".parse().ok()?;
+    if ip == global_v6 && prefix == 3 {
+        Some("2000::/3")
+    } else if ip == nat64_v6 && prefix == 96 {
+        Some("64:ff9b::/96")
+    } else if ip == vdpi_v6 && prefix == 64 {
+        Some(MACOS_TUN_SUBNET_V6)
+    } else {
+        None
+    }
+}
+
+/// Parses `netstat -rn` output and returns orphaned or vdpi-owned `utun*` routes matching
+/// vdpi's 8 IPv4 split routes (`1.0.0.0/8`..`128.0.0.0/1`), `2000::/3`, `64:ff9b::/96`,
+/// `198.18.0.0/30`, and `fd00:7664:7069::/64`.
+///
+/// Routes on dead `utun*` interfaces (`!is_iface_alive(iface)`), routes matching `saved_iface`,
+/// vdpi subnet routes (`198.18.0.0/30`, `fd00:7664:7069::/64`), and interfaces carrying vdpi's
+/// non-zero-anchor split-route fingerprint are returned while live third-party VPN tunnels
+/// (e.g. WireGuard `0.0.0.0/1` + `128.0.0.0/1`) are left untouched.
+pub fn parse_vdpi_utun_routes_from_netstat(
+    stdout: &str,
+    saved_iface: Option<&str>,
+    is_iface_alive: impl Fn(&str) -> bool,
+) -> Vec<ManagedRoute> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Section {
+        None,
+        Inet4,
+        Inet6,
+    }
+
+    let mut section = Section::None;
+    let mut candidates: Vec<(String, ManagedRoute)> = Vec::new();
+    // Per-utun fingerprint: (iface_lower, has_vdpi_subnet, non_zero_anchor_count)
+    let mut fingerprints: Vec<(String, bool, usize)> = Vec::new();
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("Routing tables") {
+            continue;
+        }
+        if trimmed.eq_ignore_ascii_case("Internet:") {
+            section = Section::Inet4;
+            continue;
+        }
+        if trimmed.eq_ignore_ascii_case("Internet6:") {
+            section = Section::Inet6;
+            continue;
+        }
+        if trimmed.starts_with("Destination") || section == Section::None {
+            continue;
+        }
+
+        let cols: Vec<&str> = trimmed.split_whitespace().collect();
+        if cols.len() < 4 {
+            continue;
+        }
+        let dest = cols[0];
+        let Some(utun_iface) = cols
+            .iter()
+            .skip(3)
+            .copied()
+            .find(|tok| is_utun_iface_token(tok))
+            .or_else(|| cols.get(1).copied().filter(|tok| is_utun_iface_token(tok)))
+        else {
+            continue;
+        };
+
+        let matched = match section {
+            Section::Inet4 => canonical_vdpi_ipv4_route(dest).map(|canon| (canon, false)),
+            Section::Inet6 => canonical_vdpi_ipv6_route(dest).map(|canon| (canon, true)),
+            Section::None => None,
+        };
+
+        let Some((canon_dest, is_ipv6)) = matched else {
+            continue;
+        };
+
+        let iface_lower = utun_iface.to_ascii_lowercase();
+        let fp = match fingerprints
+            .iter_mut()
+            .find(|(name, _, _)| *name == iface_lower)
+        {
+            Some(existing) => existing,
+            None => {
+                fingerprints.push((iface_lower, false, 0));
+                fingerprints.last_mut().expect("just pushed")
+            }
+        };
+        if canon_dest == MACOS_TUN_SUBNET_V4 || canon_dest == MACOS_TUN_SUBNET_V6 {
+            fp.1 = true;
+        } else if !is_ipv6 && canon_dest != "128.0.0.0/1" {
+            fp.2 += 1;
+        }
+
+        let route = ManagedRoute {
+            destination: canon_dest.to_string(),
+            is_ipv6,
+            interface: Some(utun_iface.to_string()),
+            gateway: None,
+            ifscope: None,
+        };
+        candidates.push((utun_iface.to_string(), route));
+    }
+
+    let mut out: Vec<ManagedRoute> = Vec::new();
+    for (iface, route) in candidates {
+        let is_vdpi_subnet =
+            route.destination == MACOS_TUN_SUBNET_V4 || route.destination == MACOS_TUN_SUBNET_V6;
+        let matches_saved = saved_iface.is_some_and(|s| s.eq_ignore_ascii_case(&iface));
+        let has_vdpi_fingerprint = fingerprints
+            .iter()
+            .find(|(name, _, _)| name.eq_ignore_ascii_case(&iface))
+            .is_some_and(|(_, has_subnet, anchor_count)| *has_subnet || *anchor_count >= 2);
+        let dead_iface = !is_iface_alive(&iface);
+
+        if (is_vdpi_subnet || dead_iface || matches_saved || has_vdpi_fingerprint)
+            && !out.contains(&route)
+        {
+            out.push(route);
+        }
+    }
+    out
 }
 
 /// Returns `true` if a raw Darwin `PF_ROUTE` message header represents a routing table,
@@ -508,10 +730,12 @@ mod imp {
         compute_desired_ipv6_active, compute_utun_max_pending_packets, detect_wake_or_time_jump,
         exclusion_routes_need_sync, ifscope_route_needs_sync, is_relevant_pf_route_msg,
         is_vdpi_owned_dns_servers, parse_dns_servers_output, parse_route_get_default,
-        poll_timeout_ms_ceil, MacosTunGuardState, ManagedRoute, LINK_LOCAL_EXCLUSIONS,
-        MACOS_ROUTE_IDLE_POLL_INTERVAL, MACOS_TUN_DNS_V4, MACOS_TUN_DNS_V6, MACOS_TUN_GUARD_ARG,
-        MACOS_TUN_IPV4, MACOS_TUN_IPV6, MACOS_TUN_MTU, MACOS_TUN_NETMASK_V4, MACOS_TUN_STATE_PATH,
-        MACOS_UTUN_DEFAULT_RCVBUF, MACOS_UTUN_SOCKBUF_LADDER, RFC1918_EXCLUSIONS,
+        parse_vdpi_utun_routes_from_netstat, poll_timeout_ms_ceil, sanitize_original_dns_servers,
+        DnsServiceSnapshot, MacosTunGuardState, ManagedRoute, IPV4_SPLIT_ROUTES,
+        LINK_LOCAL_EXCLUSIONS, MACOS_ROUTE_IDLE_POLL_INTERVAL, MACOS_TUN_DNS_V4, MACOS_TUN_DNS_V6,
+        MACOS_TUN_GUARD_ARG, MACOS_TUN_IPV4, MACOS_TUN_IPV6, MACOS_TUN_MTU, MACOS_TUN_NETMASK_V4,
+        MACOS_TUN_STATE_PATH, MACOS_UTUN_DEFAULT_RCVBUF, MACOS_UTUN_SOCKBUF_LADDER,
+        RFC1918_EXCLUSIONS,
     };
     use crate::binder::{DynamicOutboundBinder, OutboundTarget};
     use crate::platform::macos::list_configurable_network_services;
@@ -536,20 +760,6 @@ mod imp {
     /// `u_int32_t`). Not yet exposed by `libc 0.2.x`; defaults to `1` in XNU.
     const UTUN_OPT_MAX_PENDING_PACKETS: libc::c_int = 16;
     const GUARD_READY: &str = "ready";
-
-    /// Non-zero-anchor IPv4 split routes covering `1.0.0.0..=255.255.255.255` while leaving
-    /// `0.0.0.0/8` untouched so `IP_BOUND_IF` on Ventura/Sonoma/Sequoia/Tahoe never hits
-    /// `ENETUNREACH`.
-    const IPV4_SPLIT_ROUTES: &[&str] = &[
-        "1.0.0.0/8",
-        "2.0.0.0/7",
-        "4.0.0.0/6",
-        "8.0.0.0/5",
-        "16.0.0.0/4",
-        "32.0.0.0/3",
-        "64.0.0.0/2",
-        "128.0.0.0/1",
-    ];
 
     const ROUTE_DEBOUNCE_WINDOW: Duration = Duration::from_millis(350);
     const ROUTE_DEBOUNCE_MAX_WAIT: Duration = Duration::from_millis(1500);
@@ -616,6 +826,12 @@ mod imp {
     extern "C" {
         static kSCDynamicStoreUseSessionKeys: CFStringRef;
 
+        fn SCDynamicStoreCreate(
+            allocator: CFAllocatorRef,
+            name: CFStringRef,
+            callout: *const c_void,
+            context: *mut c_void,
+        ) -> SCDynamicStoreRef;
         fn SCDynamicStoreCreateWithOptions(
             allocator: CFAllocatorRef,
             name: CFStringRef,
@@ -623,6 +839,7 @@ mod imp {
             callout: *const c_void,
             context: *mut c_void,
         ) -> SCDynamicStoreRef;
+        fn SCDynamicStoreCopyValue(store: SCDynamicStoreRef, key: CFStringRef) -> CFTypeRef;
         fn SCDynamicStoreSetValue(
             store: SCDynamicStoreRef,
             key: CFStringRef,
@@ -1293,8 +1510,7 @@ mod imp {
                 bail!("macOS TUN mode requires root privileges (re-run with sudo)");
             }
 
-            recover_stale_macos_tun_state();
-            heal_legacy_networksetup_dns();
+            let _ = recover_stale_macos_tun_state_if_present();
 
             let phys_v4_raw = match detect_physical_default_v4() {
                 Ok(found) => Some(found),
@@ -1820,7 +2036,7 @@ mod imp {
         }
     }
 
-    fn recover_stale_macos_tun_state() {
+    fn recover_stale_macos_tun_state() -> bool {
         let path = Path::new(MACOS_TUN_STATE_PATH);
         match MacosTunGuardState::load_from_path(path) {
             Ok(Some(stale)) => {
@@ -1832,8 +2048,9 @@ mod imp {
                     "found stale macOS TUN crash-recovery state; restoring before startup"
                 );
                 restore_macos_tun_state(&stale);
+                true
             }
-            Ok(None) => {}
+            Ok(None) => false,
             Err(e) => {
                 warn!(
                     path = MACOS_TUN_STATE_PATH,
@@ -1841,8 +2058,19 @@ mod imp {
                     "failed to load stale macOS TUN state file; removing corrupt file"
                 );
                 remove_macos_tun_state_file();
+                true
             }
         }
+    }
+
+    /// Recovers stale macOS TUN state if [`MACOS_TUN_STATE_PATH`] is present and heals any
+    /// legacy `networksetup` DNS entries stuck on `198.18.0.2` / `fd00:7664:7069::2`.
+    ///
+    /// Returns `true` if stale TUN state was restored or legacy DNS was healed.
+    pub fn recover_stale_macos_tun_state_if_present() -> bool {
+        let recovered = recover_stale_macos_tun_state();
+        let healed = heal_legacy_networksetup_dns();
+        recovered || healed
     }
 
     fn open_pf_route_socket() -> Result<OwnedFd> {
@@ -2870,6 +3098,298 @@ mod imp {
         let _ = Command::new("/sbin/route").args(args).output();
     }
 
+    fn delete_managed_route_checked(route: &ManagedRoute) -> Result<bool> {
+        let Some(args) = managed_route_args("delete", route) else {
+            return Ok(false);
+        };
+        let out = Command::new("/sbin/route")
+            .args(&args)
+            .output()
+            .with_context(|| format!("failed to execute /sbin/route {args:?}"))?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let not_in_table = stdout.contains("not in table") || stderr.contains("not in table");
+        if not_in_table {
+            return Ok(false);
+        }
+        if !out.status.success() {
+            bail!(
+                "/sbin/route {:?} exited {}: {} {}",
+                args,
+                out.status,
+                stdout.trim(),
+                stderr.trim()
+            );
+        }
+        Ok(true)
+    }
+
+    fn sc_dynamic_store_open_default(name: &str) -> Result<CfOwned> {
+        let cf_name = cf_string(name)?;
+        // SAFETY: `cf_name` is a valid CFString; null allocator/callout/context uses defaults.
+        let store = unsafe {
+            SCDynamicStoreCreate(ptr::null(), cf_name.as_ptr(), ptr::null(), ptr::null_mut())
+        };
+        if store.is_null() {
+            bail!("SCDynamicStoreCreate({name}) failed: {}", sc_last_error());
+        }
+        CfOwned::from_raw(store, "SCDynamicStore")
+    }
+
+    fn sc_dynamic_store_has_vdpi_keys() -> bool {
+        let Ok(store) = sc_dynamic_store_open_default("com.vdpi.tun.inspect") else {
+            return false;
+        };
+        for key in [SC_KEY_DNS, SC_KEY_IPV6, SC_KEY_IPV4, SC_KEY_SERVICE] {
+            if let Ok(cf_key) = cf_string(key) {
+                // SAFETY: `store` and `cf_key` are valid non-null CoreFoundation refs.
+                let val = unsafe { SCDynamicStoreCopyValue(store.as_ptr(), cf_key.as_ptr()) };
+                if !val.is_null() {
+                    // SAFETY: `SCDynamicStoreCopyValue` returns a +1 retained object.
+                    unsafe { CFRelease(val) };
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn remove_lingering_sc_dynamic_store_keys(errors: &mut Vec<String>) -> (bool, bool) {
+        let store = match sc_dynamic_store_open_default("com.vdpi.tun.reset") {
+            Ok(s) => s,
+            Err(err) => {
+                errors.push(format!("{err:#}"));
+                return (false, false);
+            }
+        };
+
+        let mut tun_changed = false;
+        let mut dns_changed = false;
+        for key in [SC_KEY_DNS, SC_KEY_IPV6, SC_KEY_IPV4, SC_KEY_SERVICE] {
+            let cf_key = match cf_string(key) {
+                Ok(k) => k,
+                Err(err) => {
+                    errors.push(format!("{err:#}"));
+                    continue;
+                }
+            };
+            // SAFETY: `store` and `cf_key` are valid non-null CoreFoundation refs.
+            let existing = unsafe { SCDynamicStoreCopyValue(store.as_ptr(), cf_key.as_ptr()) };
+            if existing.is_null() {
+                continue;
+            }
+            // SAFETY: `SCDynamicStoreCopyValue` returns a +1 retained object.
+            unsafe { CFRelease(existing) };
+
+            // SAFETY: `store` and `cf_key` are valid non-null CoreFoundation refs.
+            let removed = unsafe { SCDynamicStoreRemoveValue(store.as_ptr(), cf_key.as_ptr()) };
+            if removed != 0 {
+                if key == SC_KEY_DNS {
+                    dns_changed = true;
+                } else {
+                    tun_changed = true;
+                }
+            } else {
+                errors.push(format!(
+                    "SCDynamicStoreRemoveValue({key}) failed: {}",
+                    sc_last_error()
+                ));
+            }
+        }
+        (tun_changed, dns_changed)
+    }
+
+    fn collect_orphan_netstat_routes(saved_iface: Option<&str>) -> Result<Vec<ManagedRoute>> {
+        let out = Command::new("/usr/sbin/netstat")
+            .arg("-rn")
+            .output()
+            .context("failed to execute /usr/sbin/netstat -rn")?;
+        if !out.status.success() {
+            bail!(
+                "/usr/sbin/netstat -rn exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        Ok(parse_vdpi_utun_routes_from_netstat(
+            &stdout,
+            saved_iface,
+            |iface| if_name_to_index(iface).is_ok(),
+        ))
+    }
+
+    fn has_any_vdpi_service_dns() -> bool {
+        let Ok(services) = list_configurable_network_services() else {
+            return false;
+        };
+        services.iter().any(|svc| {
+            get_service_dns_servers(svc)
+                .ok()
+                .is_some_and(|servers| is_vdpi_owned_dns_servers(&servers))
+        })
+    }
+
+    /// Resets macOS TUN split routes, lingering `SCDynamicStore` keys under
+    /// `State:/Network/Service/com.vdpi.tun/*`, vdpi-owned `networksetup` DNS entries,
+    /// saved TUN state files, and flushes macOS DNS caches.
+    ///
+    /// Returns `(tun_changed, dns_changed, skipped_privileges, errors)`.
+    pub fn reset_macos_tun_and_dns_defaults() -> (bool, bool, bool, Vec<String>) {
+        // SAFETY: `geteuid(2)` is always safe to call and never fails.
+        if unsafe { libc::geteuid() } != 0 {
+            let _ = Command::new("/usr/bin/dscacheutil")
+                .arg("-flushcache")
+                .output();
+            let has_root_artifacts = Path::new(MACOS_TUN_STATE_PATH).exists()
+                || collect_orphan_netstat_routes(None)
+                    .ok()
+                    .is_some_and(|routes| !routes.is_empty())
+                || sc_dynamic_store_has_vdpi_keys()
+                || has_any_vdpi_service_dns();
+            return (false, false, has_root_artifacts, Vec::new());
+        }
+
+        let mut tun_changed = false;
+        let mut dns_changed = false;
+        let mut errors: Vec<String> = Vec::new();
+
+        // 1. Restore & delete routes from MACOS_TUN_STATE_PATH if present, plus stateless
+        //    netstat -rn sweep for dead/orphan utun* routes matching vdpi's routes.
+        let mut saved_iface: Option<String> = None;
+        let mut saved_dns_snapshots: Vec<DnsServiceSnapshot> = Vec::new();
+        let state_path = Path::new(MACOS_TUN_STATE_PATH);
+        match MacosTunGuardState::load_from_path(state_path) {
+            Ok(Some(state)) => {
+                if !state.iface_name.trim().is_empty() {
+                    saved_iface = Some(state.iface_name.clone());
+                }
+                saved_dns_snapshots = state.dns_snapshots;
+                for route in state.routes.iter().rev() {
+                    match delete_managed_route_checked(route) {
+                        Ok(true) => {
+                            tun_changed = true;
+                        }
+                        Ok(false) => {}
+                        Err(err) => {
+                            errors.push(format!("{err:#}"));
+                        }
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!(
+                    path = MACOS_TUN_STATE_PATH,
+                    error = %err,
+                    "failed to parse macOS TUN state during reset; proceeding with stateless sweep"
+                );
+            }
+        }
+
+        match collect_orphan_netstat_routes(saved_iface.as_deref()) {
+            Ok(routes) => {
+                for route in &routes {
+                    match delete_managed_route_checked(route) {
+                        Ok(true) => {
+                            tun_changed = true;
+                        }
+                        Ok(false) => {}
+                        Err(err) => {
+                            errors.push(format!("{err:#}"));
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                errors.push(format!("{err:#}"));
+            }
+        }
+
+        // 2. Remove lingering SCDynamicStore keys under State:/Network/Service/com.vdpi.tun/*.
+        let (sc_tun, sc_dns) = remove_lingering_sc_dynamic_store_keys(&mut errors);
+        tun_changed |= sc_tun;
+        dns_changed |= sc_dns;
+
+        // 3. Reset any configurable network service whose DNS contains 198.18.0.2 or
+        //    fd00:7664:7069::2 back to its sanitized snapshot or Empty (DHCP).
+        let mut services = match list_configurable_network_services() {
+            Ok(svcs) => svcs,
+            Err(err) => {
+                errors.push(format!("{err:#}"));
+                Vec::new()
+            }
+        };
+        for snap in &saved_dns_snapshots {
+            if !snap.service.trim().is_empty() && !services.iter().any(|s| s == &snap.service) {
+                services.push(snap.service.clone());
+            }
+        }
+
+        for svc in &services {
+            let current = match get_service_dns_servers(svc) {
+                Ok(servers) => servers,
+                Err(err) => {
+                    debug!(
+                        service = %svc,
+                        error = %err,
+                        "failed to inspect macOS network service DNS during reset"
+                    );
+                    continue;
+                }
+            };
+
+            if !is_vdpi_owned_dns_servers(&current) {
+                continue;
+            }
+
+            let sanitized_orig = saved_dns_snapshots
+                .iter()
+                .find(|snap| snap.service == *svc)
+                .map(|snap| sanitize_original_dns_servers(snap.original_servers.clone()))
+                .unwrap_or_default();
+
+            let res = if sanitized_orig.is_empty() {
+                run_cmd("/usr/sbin/networksetup", &["-setdnsservers", svc, "Empty"])
+            } else {
+                let mut args: Vec<&str> = Vec::with_capacity(2 + sanitized_orig.len());
+                args.push("-setdnsservers");
+                args.push(svc);
+                for srv in &sanitized_orig {
+                    args.push(srv.as_str());
+                }
+                run_cmd("/usr/sbin/networksetup", &args)
+            };
+
+            match res {
+                Ok(()) => {
+                    dns_changed = true;
+                }
+                Err(err) => {
+                    errors.push(format!("{err:#}"));
+                }
+            }
+        }
+
+        // 4. Remove /Library/Application Support/vdpi/macos-tun-state.json.
+        match fs::remove_file(state_path) {
+            Ok(()) => {
+                tun_changed = true;
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                errors.push(format!(
+                    "failed to remove {MACOS_TUN_STATE_PATH}: {err}"
+                ));
+            }
+        }
+
+        // 5. Flush macOS DNS caches (dscacheutil -flushcache + killall -HUP mDNSResponder).
+        flush_macos_dns_cache();
+
+        (tun_changed, dns_changed, false, errors)
+    }
+
     fn get_service_dns_servers(service: &str) -> Result<Vec<String>> {
         let out = Command::new("/usr/sbin/networksetup")
             .args(["-getdnsservers", service])
@@ -2891,9 +3411,9 @@ mod imp {
     }
 
     /// One-time migration cleanup for upgrades from v0.5.0/v0.5.1: if any physical macOS network
-    /// service still has persistent `networksetup` DNS stuck on `[198.18.0.2]`, reset it to
-    /// `Empty` (DHCP) so Wi-Fi/Ethernet DNS heals automatically.
-    fn heal_legacy_networksetup_dns() {
+    /// service still has persistent `networksetup` DNS stuck on `198.18.0.2` / `fd00:7664:7069::2`,
+    /// reset it to `Empty` (DHCP) so Wi-Fi/Ethernet DNS heals automatically.
+    fn heal_legacy_networksetup_dns() -> bool {
         let services = match list_configurable_network_services() {
             Ok(svcs) => svcs,
             Err(e) => {
@@ -2901,7 +3421,7 @@ mod imp {
                     error = %e,
                     "failed to list macOS network services for legacy v0.5.x DNS migration check"
                 );
-                return;
+                return false;
             }
         };
 
@@ -2922,7 +3442,7 @@ mod imp {
             if is_vdpi_owned_dns_servers(&current) {
                 warn!(
                     service = %service,
-                    "found leftover v0.5.x networksetup DNS (198.18.0.2); resetting service to Empty (DHCP)"
+                    "found leftover v0.5.x networksetup DNS (198.18.0.2 / fd00:7664:7069::2); resetting service to Empty (DHCP)"
                 );
                 match run_cmd(
                     "/usr/sbin/networksetup",
@@ -2945,6 +3465,7 @@ mod imp {
         if healed {
             flush_macos_dns_cache();
         }
+        healed
     }
 
     fn restore_macos_tun_state(state: &MacosTunGuardState) {
@@ -3100,7 +3621,10 @@ mod imp {
 }
 
 #[cfg(target_os = "macos")]
-pub use imp::{open_utun, run_macos_tun_cleanup_guard, MacosTunSession};
+pub use imp::{
+    open_utun, recover_stale_macos_tun_state_if_present, reset_macos_tun_and_dns_defaults,
+    run_macos_tun_cleanup_guard, MacosTunSession,
+};
 
 #[cfg(test)]
 mod tests {
@@ -3247,10 +3771,16 @@ destination: default
     #[test]
     fn sanitizes_original_dns_and_checks_vdpi_ownership() {
         assert!(sanitize_original_dns_servers(vec![MACOS_TUN_DNS_V4.to_string()]).is_empty());
+        assert!(sanitize_original_dns_servers(vec![
+            MACOS_TUN_DNS_V4.to_string(),
+            MACOS_TUN_DNS_V6.to_string(),
+        ])
+        .is_empty());
         assert_eq!(
             sanitize_original_dns_servers(vec![
                 MACOS_TUN_DNS_V4.to_string(),
-                "1.1.1.1".to_string()
+                "1.1.1.1".to_string(),
+                MACOS_TUN_DNS_V6.to_string(),
             ]),
             vec!["1.1.1.1".to_string()]
         );
@@ -3260,12 +3790,20 @@ destination: default
         );
 
         assert!(is_vdpi_owned_dns_servers(&[MACOS_TUN_DNS_V4.to_string()]));
-        assert!(!is_vdpi_owned_dns_servers(&[]));
-        assert!(!is_vdpi_owned_dns_servers(&["1.1.1.1".to_string()]));
-        assert!(!is_vdpi_owned_dns_servers(&[
+        assert!(is_vdpi_owned_dns_servers(&[MACOS_TUN_DNS_V6.to_string()]));
+        assert!(is_vdpi_owned_dns_servers(&[
+            "FD00:7664:7069:0:0:0:0:2".to_string()
+        ]));
+        assert!(is_vdpi_owned_dns_servers(&[
             MACOS_TUN_DNS_V4.to_string(),
             "1.1.1.1".to_string()
         ]));
+        assert!(is_vdpi_owned_dns_servers(&[
+            "1.1.1.1".to_string(),
+            MACOS_TUN_DNS_V6.to_string()
+        ]));
+        assert!(!is_vdpi_owned_dns_servers(&[]));
+        assert!(!is_vdpi_owned_dns_servers(&["1.1.1.1".to_string()]));
     }
 
     #[test]
@@ -3643,5 +4181,59 @@ destination: default
                 },
             ]
         );
+    }
+
+    #[test]
+    fn parses_orphan_vdpi_utun_routes_from_macos_netstat_without_touching_live_vpn() {
+        let netstat_sample = "\
+Routing tables
+
+Internet:
+Destination        Gateway            Flags               Netif Expire
+default            192.168.1.1        UGScg                 en0
+0/1                utun3              USc                 utun3
+128.0/1            utun3              USc                 utun3
+1                  utun4              USc                 utun4
+2/7                utun4              USc                 utun4
+4/6                utun4              USc                 utun4
+8/5                utun4              USc                 utun4
+16/4               utun4              USc                 utun4
+32/3               utun4              USc                 utun4
+64/2               utun4              USc                 utun4
+128.0/1            utun4              USc                 utun4
+198.18.0/30        utun4              USc                 utun4
+
+Internet6:
+Destination                             Gateway                         Flags         Netif Expire
+default                                 fe80::1%en0                     UGcg            en0
+2000::/3                                utun3                           USc           utun3
+2000::/3                                utun4                           USc           utun4
+64:ff9b::/96                            utun4                           USc           utun4
+fd00:7664:7069::/64                     utun4                           USc           utun4
+";
+        // utun3 is a live WireGuard VPN (0/1 + 128.0/1 + 2000::/3); utun4 is dead vdpi utun.
+        let found =
+            parse_vdpi_utun_routes_from_netstat(netstat_sample, None, |iface| iface == "utun3");
+        assert!(found.iter().all(|r| r.interface.as_deref() == Some("utun4")));
+        for expected in [
+            "1.0.0.0/8",
+            "2.0.0.0/7",
+            "4.0.0.0/6",
+            "8.0.0.0/5",
+            "16.0.0.0/4",
+            "32.0.0.0/3",
+            "64.0.0.0/2",
+            "128.0.0.0/1",
+            "198.18.0.0/30",
+            "2000::/3",
+            "64:ff9b::/96",
+            "fd00:7664:7069::/64",
+        ] {
+            assert!(
+                found.iter().any(|r| r.destination == expected),
+                "expected {expected} in parsed vdpi routes: {found:?}"
+            );
+        }
+        assert_eq!(found.len(), 12);
     }
 }

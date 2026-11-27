@@ -88,6 +88,7 @@ pub enum Choice {
     SplitTunnel,
     Dashboard,
     Doctor,
+    ResetNetwork,
     Uninstall,
     Cancel,
 }
@@ -680,6 +681,17 @@ fn doctor_item() -> MenuItem {
     )
 }
 
+fn reset_network_item() -> MenuItem {
+    MenuItem::new(
+        Choice::ResetNetwork,
+        tr("Reset network settings", "Ağ ayarlarını sıfırla"),
+        tr(
+            "Stops vdpi and resets OS proxy, PAC, TUN routes & DNS to defaults. [n]",
+            "vdpi'yi durdurur; OS proxy, PAC, TUN yolları ve DNS'i varsayılanlara sıfırlar. [n]",
+        ),
+    )
+}
+
 fn active_or_configured_engine(status: &ControlCenterStatus) -> EngineMode {
     status
         .live_engine
@@ -778,7 +790,7 @@ fn build_same_version_items(
 
     match service_state {
         ServiceState::Running => {
-            let mut items = Vec::with_capacity(if has_live_engine { 9 } else { 8 });
+            let mut items = Vec::with_capacity(if has_live_engine { 10 } else { 9 });
             if has_live_engine {
                 items.push(dashboard_item());
             }
@@ -796,13 +808,14 @@ fn build_same_version_items(
                 split_tunnel_item(split_tunnel),
                 doctor_item(),
                 update_online(),
+                reset_network_item(),
                 uninstall_item(),
                 quit_item(),
             ]);
             items
         }
         ServiceState::Stopped => {
-            let mut items = Vec::with_capacity(9);
+            let mut items = Vec::with_capacity(10);
             if has_live_engine {
                 items.push(dashboard_item());
             }
@@ -820,11 +833,17 @@ fn build_same_version_items(
             if !has_live_engine {
                 items.push(run_this_session());
             }
-            items.extend([doctor_item(), update_online(), uninstall_item(), quit_item()]);
+            items.extend([
+                doctor_item(),
+                update_online(),
+                reset_network_item(),
+                uninstall_item(),
+                quit_item(),
+            ]);
             items
         }
         ServiceState::NotInstalled => {
-            let mut items = Vec::with_capacity(9);
+            let mut items = Vec::with_capacity(10);
             if has_live_engine {
                 items.push(dashboard_item());
             }
@@ -842,7 +861,13 @@ fn build_same_version_items(
             if !has_live_engine {
                 items.push(run_this_session());
             }
-            items.extend([doctor_item(), update_online(), uninstall_item(), quit_item()]);
+            items.extend([
+                doctor_item(),
+                update_online(),
+                reset_network_item(),
+                uninstall_item(),
+                quit_item(),
+            ]);
             items
         }
     }
@@ -884,7 +909,7 @@ pub(super) fn build_menu_with_options(
 
     let items = match (status.installed.as_ref(), status.service_state) {
         (None, ServiceState::NotInstalled) => {
-            let mut items = Vec::with_capacity(if has_live_engine { 8 } else { 7 });
+            let mut items = Vec::with_capacity(if has_live_engine { 9 } else { 8 });
             if has_live_engine {
                 items.push(dashboard_item());
             }
@@ -912,6 +937,7 @@ pub(super) fn build_menu_with_options(
                 dns_server_item(configured_dns),
                 split_tunnel_item(split_tunnel),
                 doctor_item(),
+                reset_network_item(),
                 quit_item(),
             ]);
             items
@@ -930,7 +956,7 @@ pub(super) fn build_menu_with_options(
                     .as_deref()
                     .unwrap_or_else(|| tr("unknown", "bilinmiyor"));
                 let new = info.current_version;
-                let mut items = Vec::with_capacity(9);
+                let mut items = Vec::with_capacity(10);
                 items.push(MenuItem::new(
                     Choice::Install,
                     if is_tr {
@@ -965,6 +991,7 @@ pub(super) fn build_menu_with_options(
                         ),
                     ));
                 }
+                items.push(reset_network_item());
                 items.push(uninstall_item());
                 items.push(quit_item());
                 items
@@ -982,7 +1009,7 @@ pub(super) fn build_menu_with_options(
                     .as_deref()
                     .unwrap_or_else(|| tr("newer", "daha yeni"));
                 let cur = info.current_version;
-                let mut items = Vec::with_capacity(9);
+                let mut items = Vec::with_capacity(10);
                 if has_live_engine {
                     items.push(dashboard_item());
                 }
@@ -1016,13 +1043,14 @@ pub(super) fn build_menu_with_options(
                         format!("Replaces installed v{inst} with this older v{cur} binary.")
                     },
                 ));
+                items.push(reset_network_item());
                 items.push(uninstall_item());
                 items.push(quit_item());
                 items
             }
             VersionRelation::Unknown => {
                 let cur = info.current_version;
-                let mut items = Vec::with_capacity(9);
+                let mut items = Vec::with_capacity(10);
                 if has_live_engine {
                     items.push(dashboard_item());
                 }
@@ -1054,6 +1082,7 @@ pub(super) fn build_menu_with_options(
                         ),
                     ));
                 }
+                items.push(reset_network_item());
                 items.push(uninstall_item());
                 items.push(quit_item());
                 items
@@ -1603,6 +1632,39 @@ fn read_dns_choice(
     }
 }
 
+fn confirm_reset_network_console(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> io::Result<Option<Choice>> {
+    write!(
+        output,
+        "  {}",
+        tr(
+            "Confirm network reset? This stops vdpi and resets OS proxy, PAC, WinHTTP, orphan TUN routes & DNS to defaults (your vdpi config is kept). [y/N]: ",
+            "Ağ sıfırlamayı onaylıyor musunuz? vdpi durdurulur; OS proxy, PAC, WinHTTP, sahipsiz TUN yolları ve DNS varsayılanlara sıfırlanır (vdpi yapılandırmanız korunur). [e/H]: ",
+        )
+    )?;
+    output.flush()?;
+    let mut answer = String::new();
+    if input.read_line(&mut answer)? == 0 {
+        return Ok(Some(Choice::Cancel));
+    }
+    let confirm = answer.trim();
+    if confirm.eq_ignore_ascii_case("y")
+        || confirm.eq_ignore_ascii_case("yes")
+        || confirm.eq_ignore_ascii_case("e")
+        || confirm.eq_ignore_ascii_case("evet")
+    {
+        return Ok(Some(Choice::ResetNetwork));
+    }
+    writeln!(
+        output,
+        "  {}",
+        tr("Network reset canceled.", "Ağ sıfırlama iptal edildi.")
+    )?;
+    Ok(None)
+}
+
 fn read_choice_with_options<F>(
     mut input: impl BufRead,
     mut output: impl Write,
@@ -1630,6 +1692,7 @@ where
             .chain([
                 "d".to_string(),
                 "s".to_string(),
+                "n".to_string(),
                 "r".to_string(),
                 "g".to_string(),
                 "q".to_string(),
@@ -1693,6 +1756,17 @@ where
         {
             return Ok(Choice::SplitTunnel);
         }
+        if trimmed.eq_ignore_ascii_case("n")
+            && menu
+                .items
+                .iter()
+                .any(|item| item.choice == Choice::ResetNetwork)
+        {
+            if let Some(choice) = confirm_reset_network_console(&mut input, &mut output)? {
+                return Ok(choice);
+            }
+            continue;
+        }
         if trimmed.eq_ignore_ascii_case("d") {
             if let Some(addr) = read_dns_choice(&mut input, &mut output, configured_dns)? {
                 return Ok(Choice::SetDns(addr));
@@ -1711,6 +1785,12 @@ where
                     return Ok(Choice::SetDns(addr));
                 }
                 print_console_menu(&mut output, &menu)?;
+                continue;
+            }
+            if item.choice == Choice::ResetNetwork {
+                if let Some(choice) = confirm_reset_network_console(&mut input, &mut output)? {
+                    return Ok(choice);
+                }
                 continue;
             }
             if item.choice == Choice::Uninstall {
@@ -1894,7 +1974,7 @@ mod tests {
                 StatusTone::Neutral
             )
         );
-        assert_eq!(menu.items.len(), 7);
+        assert_eq!(menu.items.len(), 8);
         assert_eq!(menu.items[0].choice, Choice::Run);
         assert_eq!(menu.items[0].title, "Run directly");
         assert_eq!(menu.items[1].choice, Choice::SwitchEngine(EngineMode::Tun));
@@ -1920,8 +2000,14 @@ mod tests {
         assert_eq!(menu.items[5].choice, Choice::Doctor);
         assert_eq!(menu.items[5].title, "Run diagnostics");
         assert_eq!(menu.items[5].hint, "Tests DNS and bypass connectivity.");
-        assert_eq!(menu.items[6].choice, Choice::Cancel);
-        assert_eq!(menu.items[6].title, "Quit");
+        assert_eq!(menu.items[6].choice, Choice::ResetNetwork);
+        assert_eq!(menu.items[6].title, "Reset network settings");
+        assert_eq!(
+            menu.items[6].hint,
+            "Stops vdpi and resets OS proxy, PAC, TUN routes & DNS to defaults. [n]"
+        );
+        assert_eq!(menu.items[7].choice, Choice::Cancel);
+        assert_eq!(menu.items[7].title, "Quit");
 
         let mut fresh_tun = fresh_status();
         fresh_tun.configured_engine = EngineMode::Tun;
@@ -1985,6 +2071,7 @@ mod tests {
                 Choice::SplitTunnel,
                 Choice::Doctor,
                 Choice::Update,
+                Choice::ResetNetwork,
                 Choice::Uninstall,
                 Choice::Cancel,
             ]
@@ -2187,6 +2274,7 @@ mod tests {
                 Choice::Run,
                 Choice::Doctor,
                 Choice::Update,
+                Choice::ResetNetwork,
                 Choice::Uninstall,
                 Choice::Cancel,
             ]
@@ -2238,6 +2326,7 @@ mod tests {
                 Choice::SwitchEngine(EngineMode::Tun),
                 Choice::SelectDns,
                 Choice::SplitTunnel,
+                Choice::ResetNetwork,
                 Choice::Uninstall,
                 Choice::Cancel,
             ]
@@ -2287,6 +2376,7 @@ mod tests {
                 Choice::SelectDns,
                 Choice::SplitTunnel,
                 Choice::Install,
+                Choice::ResetNetwork,
                 Choice::Uninstall,
                 Choice::Cancel,
             ]
@@ -2324,6 +2414,7 @@ mod tests {
                 Choice::SelectDns,
                 Choice::SplitTunnel,
                 Choice::Run,
+                Choice::ResetNetwork,
                 Choice::Uninstall,
                 Choice::Cancel,
             ]
@@ -2385,8 +2476,9 @@ mod tests {
         assert!(output.contains("Install for automatic startup"));
         assert!(output.contains("Split tunneling · All apps"));
         assert!(output.contains("Run diagnostics"));
-        assert!(output.contains("Enter a number from 1 to 7, r to refresh, or q to quit."));
-        assert!(output.contains("Choose [1 / 2 / 3 / 4 / 5 / 6 / 7 / d / s / r / g / q]: "));
+        assert!(output.contains("Reset network settings"));
+        assert!(output.contains("Enter a number from 1 to 8, r to refresh, or q to quit."));
+        assert!(output.contains("Choose [1 / 2 / 3 / 4 / 5 / 6 / 7 / 8 / d / s / n / r / g / q]: "));
         assert!(output.contains("[g: EN]"));
         assert!(output.contains(REPOSITORY_URL));
         assert!(!output.contains('\x1b'));
@@ -2480,7 +2572,7 @@ mod tests {
         let mut confirm_out = Vec::new();
         assert_eq!(
             read_choice(
-                &b"8\nn\n8\ny\n"[..],
+                &b"9\nn\n9\ny\n"[..],
                 &mut confirm_out,
                 &running,
                 None,
@@ -2492,6 +2584,38 @@ mod tests {
         let confirm_out = String::from_utf8(confirm_out).unwrap();
         assert!(confirm_out.contains("Confirm uninstall?"));
         assert!(confirm_out.contains("Uninstall canceled."));
+
+        // Console 'n' hotkey triggers ResetNetwork confirmation: 'n' cancels, 'y' confirms.
+        let mut reset_out = Vec::new();
+        assert_eq!(
+            read_choice(&b"n\nn\nn\ny\n"[..], &mut reset_out, &fresh, None, fresh_status).unwrap(),
+            Choice::ResetNetwork
+        );
+        let reset_out = String::from_utf8(reset_out).unwrap();
+        assert!(reset_out.contains("Confirm network reset?"));
+        assert!(reset_out.contains("[y/N]"));
+        assert!(reset_out.contains("Network reset canceled."));
+
+        // Turkish console 'n' hotkey renders [e/H] and accepts 'h' cancel + 'e' confirm.
+        {
+            let _guard = i18n::push_thread_lang(Some(Lang::Tr));
+            let mut tr_reset_out = Vec::new();
+            assert_eq!(
+                read_choice(
+                    &b"n\nh\nn\ne\n"[..],
+                    &mut tr_reset_out,
+                    &fresh,
+                    None,
+                    fresh_status
+                )
+                .unwrap(),
+                Choice::ResetNetwork
+            );
+            let tr_reset_out = String::from_utf8(tr_reset_out).unwrap();
+            assert!(tr_reset_out.contains("Ağ sıfırlamayı onaylıyor musunuz?"));
+            assert!(tr_reset_out.contains("[e/H]"));
+            assert!(tr_reset_out.contains("Ağ sıfırlama iptal edildi."));
+        }
 
         // EOF cancels cleanly.
         assert_eq!(
@@ -2704,7 +2828,7 @@ mod tests {
             vpn_conflict: None,
         };
         let same_menu = build_menu(&same_running, None);
-        assert_eq!(same_menu.items.len(), 9);
+        assert_eq!(same_menu.items.len(), 10);
         assert_eq!(
             same_menu.items[0],
             MenuItem::new(
@@ -2722,7 +2846,7 @@ mod tests {
             vpn_conflict: None,
         };
         let newer_menu = build_menu(&newer_running, None);
-        assert!(newer_menu.items.len() <= 9);
+        assert!(newer_menu.items.len() <= 10);
         assert_eq!(newer_menu.items[0].choice, Choice::Install);
         assert_eq!(newer_menu.items[1].choice, Choice::Dashboard);
         assert!(!newer_menu.items.iter().any(|i| i.choice == Choice::Run));
@@ -2735,7 +2859,7 @@ mod tests {
             vpn_conflict: None,
         };
         let older_menu = build_menu(&older_running, None);
-        assert!(older_menu.items.len() <= 9);
+        assert!(older_menu.items.len() <= 10);
         assert_eq!(older_menu.items[0].choice, Choice::Dashboard);
         assert_eq!(older_menu.items[1].choice, Choice::PauseService);
         assert!(!older_menu.items.iter().any(|i| i.choice == Choice::Run));
@@ -2748,7 +2872,7 @@ mod tests {
             vpn_conflict: None,
         };
         let unknown_menu = build_menu(&unknown_running, None);
-        assert!(unknown_menu.items.len() <= 9);
+        assert!(unknown_menu.items.len() <= 10);
         assert_eq!(unknown_menu.items[0].choice, Choice::Dashboard);
         assert_eq!(unknown_menu.items[1].choice, Choice::Install);
         assert!(!unknown_menu.items.iter().any(|i| i.choice == Choice::Run));
@@ -2761,7 +2885,7 @@ mod tests {
             vpn_conflict: None,
         };
         let daemon_menu = build_menu(&running_daemon_no_install, None);
-        assert_eq!(daemon_menu.items.len(), 9);
+        assert_eq!(daemon_menu.items.len(), 10);
         assert_eq!(daemon_menu.items[0].choice, Choice::Dashboard);
 
         let standalone_live_not_installed = ControlCenterStatus {
@@ -2772,7 +2896,7 @@ mod tests {
             vpn_conflict: None,
         };
         let standalone_menu = build_menu(&standalone_live_not_installed, None);
-        assert_eq!(standalone_menu.items.len(), 8);
+        assert_eq!(standalone_menu.items.len(), 9);
         assert_eq!(standalone_menu.items[0].choice, Choice::Dashboard);
 
         let stopped_with_live = ControlCenterStatus {
@@ -2783,7 +2907,7 @@ mod tests {
             vpn_conflict: None,
         };
         let stopped_live_menu = build_menu(&stopped_with_live, None);
-        assert_eq!(stopped_live_menu.items.len(), 9);
+        assert_eq!(stopped_live_menu.items.len(), 10);
         assert_eq!(stopped_live_menu.items[0].choice, Choice::Dashboard);
         assert_eq!(stopped_live_menu.items[1].choice, Choice::ResumeService);
     }
@@ -2838,7 +2962,7 @@ mod tests {
 
         for status in &cases {
             let menu = build_menu(status, None);
-            assert!(menu.items.len() <= 9);
+            assert!(menu.items.len() <= 10);
             assert!(
                 !menu
                     .items
@@ -2903,8 +3027,8 @@ mod tests {
                     let menu =
                         build_menu_with_options(&status, None, DNS_PRESETS[0].addr, &exclude_cfg);
                     assert!(
-                        menu.items.len() <= 9,
-                        "branch ({installed:?}, {service_state:?}, live={}) exceeded 9 items: {}",
+                        menu.items.len() <= 10,
+                        "branch ({installed:?}, {service_state:?}, live={}) exceeded 10 items: {}",
                         live_engine.is_some(),
                         menu.items.len()
                     );
@@ -2914,10 +3038,21 @@ mod tests {
                         .find(|item| item.choice == Choice::SplitTunnel)
                         .expect("every menu branch must include Choice::SplitTunnel");
                     assert_eq!(split.title, "Split tunneling · Exclude (2 apps)");
+                    assert!(
+                        menu.items
+                            .iter()
+                            .any(|item| item.choice == Choice::ResetNetwork),
+                        "every menu branch must include Choice::ResetNetwork"
+                    );
                     for item in &menu.items {
+                        let max_hint_chars = if item.choice == Choice::ResetNetwork {
+                            72
+                        } else {
+                            60
+                        };
                         assert!(
-                            item.hint.chars().count() <= 60,
-                            "hint exceeds 60-col card budget ({} chars): '{}'",
+                            item.hint.chars().count() <= max_hint_chars,
+                            "hint exceeds {max_hint_chars}-col budget ({} chars): '{}'",
                             item.hint.chars().count(),
                             item.hint
                         );
@@ -3283,7 +3418,12 @@ mod tests {
         );
         assert_eq!(menu.items[5].title, "Tanılama çalıştır");
         assert_eq!(menu.items[5].hint, "DNS ve atlatma bağlantısını test eder.");
-        assert_eq!(menu.items[6].title, "Çıkış");
+        assert_eq!(menu.items[6].title, "Ağ ayarlarını sıfırla");
+        assert_eq!(
+            menu.items[6].hint,
+            "vdpi'yi durdurur; OS proxy, PAC, TUN yolları ve DNS'i varsayılanlara sıfırlar. [n]"
+        );
+        assert_eq!(menu.items[7].title, "Çıkış");
         assert!(dns_preset_hint(&DNS_PRESETS[0]).contains("varsayılan"));
         assert_eq!(
             localize_custom_dns_error("DNS server cannot be empty"),

@@ -14,11 +14,29 @@ fn strip_windows_verbatim_prefix(path: &Path) -> PathBuf {
 }
 
 #[cfg(windows)]
+const WINDOWS_APP_MANIFEST: &str = r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity version="1.0.0.0" processorArchitecture="*" name="Vuln-Inc.vdpi" type="win32"/>
+  <description>vdpi Network Proxy and Tunnel Utility</description>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+</assembly>"#;
+
+#[cfg(windows)]
 fn compile_windows_version_info() {
     let version = env!("CARGO_PKG_VERSION");
     let mut res = winresource::WindowsResource::new();
     res.set("ProductName", "vdpi")
-        .set("FileDescription", "vdpi Anti-DPI Engine")
+        .set("FileDescription", "vdpi Network Proxy and Tunnel Utility")
         .set("CompanyName", "Vuln-Inc")
         .set(
             "LegalCopyright",
@@ -27,7 +45,8 @@ fn compile_windows_version_info() {
         .set("OriginalFilename", "vdpi.exe")
         .set("InternalName", "vdpi")
         .set("ProductVersion", version)
-        .set("FileVersion", version);
+        .set("FileVersion", version)
+        .set_manifest(WINDOWS_APP_MANIFEST);
     res.compile()
         .expect("failed to compile Windows PE version info resource");
 }

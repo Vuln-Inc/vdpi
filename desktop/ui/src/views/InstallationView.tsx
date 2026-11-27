@@ -55,6 +55,7 @@ export interface InstallationViewProps {
   onUpgradeService: () => void | Promise<void>;
   onRepairService: (engine?: EngineMode) => void | Promise<void>;
   onUninstallService: () => void | Promise<void>;
+  onResetNetwork?: () => void | Promise<void>;
   onCheckUpdates: (manual?: boolean) => void | Promise<void>;
   onOpenReleaseUrl: (url: string) => void | Promise<void>;
   onOpenAppFolder: (target: "config" | "logs" | "app") => void | Promise<void>;
@@ -826,6 +827,7 @@ function areInstallationPropsEqual(
     prev.onUpgradeService !== next.onUpgradeService ||
     prev.onRepairService !== next.onRepairService ||
     prev.onUninstallService !== next.onUninstallService ||
+    prev.onResetNetwork !== next.onResetNetwork ||
     prev.onCheckUpdates !== next.onCheckUpdates ||
     prev.onOpenReleaseUrl !== next.onOpenReleaseUrl ||
     prev.onOpenAppFolder !== next.onOpenAppFolder ||
@@ -914,6 +916,7 @@ function InstallationViewComponent({
   onUpgradeService,
   onRepairService,
   onUninstallService,
+  onResetNetwork,
   onCheckUpdates,
   onOpenReleaseUrl,
   onOpenAppFolder,
@@ -1051,6 +1054,7 @@ function InstallationViewComponent({
 
   const normalizedBusy = busyAction?.trim().toLowerCase() ?? null;
   const pendingOp = status?.pendingOperation ?? null;
+  const effectiveBusy = normalizedBusy ?? pendingOp;
 
   const isInstalling =
     pendingOp === "installing" ||
@@ -1075,8 +1079,14 @@ function InstallationViewComponent({
   const isSwitchingEngine =
     pendingOp === "switching_engine" ||
     (normalizedBusy !== null && normalizedBusy.startsWith("switch-engine"));
+  const isResettingNetwork =
+    pendingOp === "resetting_network" ||
+    effectiveBusy === "reset-network" ||
+    effectiveBusy === "resetting_network";
 
-  const isAnyServiceBusy = Boolean(normalizedBusy || pendingOp);
+  const isAnyServiceBusy = Boolean(
+    normalizedBusy || pendingOp || isResettingNetwork,
+  );
 
   const wintunNotReady = Boolean(
     platform === "windows" && status && !status.wintun.ready,
@@ -1620,6 +1630,31 @@ function InstallationViewComponent({
             <IconDiagnostics size={13} />
             <span>{tInstallation(lang, "btnOpenDiagnostics")}</span>
           </button>
+
+          {onResetNetwork &&
+          (installError.kind === "antivirus" ||
+            installError.kind === "generic") ? (
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm"
+              disabled={isAnyServiceBusy}
+              aria-busy={isResettingNetwork}
+              onClick={() => {
+                void onResetNetwork();
+              }}
+            >
+              {isResettingNetwork ? (
+                <span className="spinner" aria-hidden="true" />
+              ) : (
+                <IconRefresh size={13} />
+              )}
+              <span>
+                {isResettingNetwork
+                  ? tInstallation(lang, "btnResettingNetwork")
+                  : tInstallation(lang, "btnResetNetwork")}
+              </span>
+            </button>
+          ) : null}
         </div>
       </div>
     );
@@ -1843,6 +1878,28 @@ function InstallationViewComponent({
                     : tInstallation(lang, "btnRecheckWintun")}
                 </span>
               </button>
+              {onResetNetwork ? (
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-sm"
+                  disabled={isAnyServiceBusy}
+                  aria-busy={isResettingNetwork}
+                  onClick={() => {
+                    void onResetNetwork();
+                  }}
+                >
+                  {isResettingNetwork ? (
+                    <span className="spinner" aria-hidden="true" />
+                  ) : (
+                    <IconRefresh size={13} />
+                  )}
+                  <span>
+                    {isResettingNetwork
+                      ? tInstallation(lang, "btnResettingNetwork")
+                      : tInstallation(lang, "btnResetNetwork")}
+                  </span>
+                </button>
+              ) : null}
             </>
           }
         />
@@ -2468,6 +2525,39 @@ function InstallationViewComponent({
               <span>{tInstallation(lang, "btnOpenFolder")}</span>
             </button>
           </div>
+
+          {onResetNetwork ? (
+            <div className="install-path-row">
+              <div className="install-path-row__copy">
+                <span className="install-path-row__label">
+                  {tInstallation(lang, "networkRecoveryLabel")}
+                </span>
+                <p className="install-card__subtitle">
+                  {tInstallation(lang, "networkRecoveryDesc")}
+                </p>
+              </div>
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm"
+                disabled={isAnyServiceBusy}
+                aria-busy={isResettingNetwork}
+                onClick={() => {
+                  void onResetNetwork();
+                }}
+              >
+                {isResettingNetwork ? (
+                  <span className="spinner" aria-hidden="true" />
+                ) : (
+                  <IconRefresh size={13} />
+                )}
+                <span>
+                  {isResettingNetwork
+                    ? tInstallation(lang, "btnResettingNetwork")
+                    : tInstallation(lang, "btnResetNetwork")}
+                </span>
+              </button>
+            </div>
+          ) : null}
         </div>
       </section>
 

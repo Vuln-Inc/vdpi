@@ -2178,7 +2178,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vdpi"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2206,7 +2206,7 @@ dependencies = [
 
 [[package]]
 name = "vdpi-android"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "jni",
@@ -2219,7 +2219,7 @@ dependencies = [
 
 [[package]]
 name = "vdpi-core"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -2240,7 +2240,7 @@ dependencies = [
 
 [[package]]
 name = "vdpi-ios"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "etherparse",
@@ -2253,7 +2253,7 @@ dependencies = [
 
 [[package]]
 name = "vdpi-tun"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "etherparse",

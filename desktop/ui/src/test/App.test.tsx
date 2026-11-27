@@ -8,7 +8,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
-import { resetMockIpcState } from "../lib/ipc";
+import { getStatus, resetMockIpcState } from "../lib/ipc";
 import type {
   ActionResult,
   DesktopStatusSnapshot,
@@ -24,6 +24,7 @@ let checkUpdatesOverride:
   | ((force?: boolean) => Promise<UpdateCheckPayload>)
   | null = null;
 let upgradeServiceOverride: (() => Promise<ActionResult>) | null = null;
+let resetNetworkSettingsOverride: (() => Promise<ActionResult>) | null = null;
 
 vi.mock("../lib/ipc", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/ipc")>();
@@ -51,6 +52,31 @@ vi.mock("../lib/ipc", async (importOriginal) => {
       upgradeServiceOverride
         ? upgradeServiceOverride()
         : actual.upgradeService(),
+    resetNetworkSettings: async () => {
+      if (resetNetworkSettingsOverride) {
+        return resetNetworkSettingsOverride();
+      }
+      if (typeof actual.resetNetworkSettings === "function") {
+        const result = await actual.resetNetworkSettings();
+        return {
+          ...result,
+          snapshot: result.snapshot ? applyOverride(result.snapshot) : undefined,
+        };
+      }
+      const snapshot = applyOverride(await actual.getStatus(true));
+      return {
+        ok: true,
+        message: "Network settings reset to defaults.",
+        snapshot: {
+          ...snapshot,
+          serviceState:
+            snapshot.serviceState === "running"
+              ? "stopped"
+              : snapshot.serviceState,
+          live: null,
+        },
+      };
+    },
   };
 });
 
@@ -66,6 +92,7 @@ describe("App", () => {
     statusSnapshotOverride = null;
     checkUpdatesOverride = null;
     upgradeServiceOverride = null;
+    resetNetworkSettingsOverride = null;
     resetMockIpcState();
     vi.clearAllMocks();
   });
@@ -76,6 +103,7 @@ describe("App", () => {
     statusSnapshotOverride = null;
     checkUpdatesOverride = null;
     upgradeServiceOverride = null;
+    resetNetworkSettingsOverride = null;
     resetMockIpcState();
   });
 
@@ -906,5 +934,81 @@ describe("App", () => {
     ]) {
       expect(resultsText).not.toContain(rawEnglishLeak);
     }
+  });
+
+  it("resets network settings via ConfirmDialog from Settings and shows success toast", async () => {
+    const resetSpy = vi.fn(async (): Promise<ActionResult> => {
+      const current = await getStatus(true);
+      return {
+        ok: true,
+        message: "Network settings reset to defaults.",
+        snapshot: {
+          ...current,
+          serviceState: "stopped",
+          live: null,
+        },
+      };
+    });
+    resetNetworkSettingsOverride = resetSpy;
+
+    render(<App />);
+    await screen.findByRole("heading", { name: "Protected" });
+
+    fireEvent.click(getNavButton("Settings"));
+    await screen.findByRole("heading", { name: "Updates & Local Data" });
+
+    const resetBtn = screen.getByRole("button", { name: "Reset Network" });
+    expect(resetBtn).toBeEnabled();
+    fireEvent.click(resetBtn);
+
+    const confirmDialog = await screen.findByRole("dialog", {
+      name: "Reset network settings to defaults",
+    });
+    fireEvent.click(
+      within(confirmDialog).getByRole("button", { name: "Reset Network" }),
+    );
+
+    await waitFor(() => {
+      expect(resetSpy).toHaveBeenCalledTimes(1);
+    });
+    expect(
+      await screen.findByText("Network settings reset to defaults."),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps Reset Network available in Installation when bundled engine is missing", async () => {
+    statusSnapshotOverride = {
+      serviceState: "not_installed",
+      live: null,
+      canInstallFromBundle: false,
+      cliVersionRelation: "bundled_missing",
+    };
+
+    render(<App />);
+    await screen.findByRole("heading", { name: "Service Not Installed" });
+
+    fireEvent.click(getNavButton(/^Installation/i));
+    await screen.findByRole("heading", { name: "Installation" });
+
+    expect(
+      screen.getByText("Bundled engine binary not found"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Install & Protect" }),
+    ).toBeDisabled();
+
+    const resetButtons = screen.getAllByRole("button", {
+      name: "Reset Network",
+    });
+    expect(resetButtons.length).toBeGreaterThanOrEqual(2);
+    for (const btn of resetButtons) {
+      expect(btn).toBeEnabled();
+    }
+
+    fireEvent.click(resetButtons[0]);
+    const confirmDialog = await screen.findByRole("dialog", {
+      name: "Reset network settings to defaults",
+    });
+    expect(confirmDialog).toBeInTheDocument();
   });
 });

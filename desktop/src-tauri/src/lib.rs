@@ -531,6 +531,7 @@ pub fn run() {
             commands::upgrade_service,
             commands::repair_service,
             commands::uninstall_service,
+            commands::reset_network_settings,
             commands::check_updates,
             commands::open_app_folder,
             commands::open_external_url,

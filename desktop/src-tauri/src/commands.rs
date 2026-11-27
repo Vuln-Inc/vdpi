@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tracing::{debug, warn};
 
 use crate::models::{
@@ -137,6 +137,9 @@ pub(crate) fn busy_result_for_operation(active_op: Option<ServiceOperationDto>) 
         }
         Some(ServiceOperationDto::Uninstalling) => {
             "Service uninstall is already in progress.".to_string()
+        }
+        Some(ServiceOperationDto::ResettingNetwork) => {
+            "Network reset is already in progress.".to_string()
         }
         Some(ServiceOperationDto::Resuming | ServiceOperationDto::Pausing) => {
             "A protection toggle is already in progress.".to_string()
@@ -883,6 +886,35 @@ pub async fn uninstall_service(app: AppHandle) -> Result<ActionResultDto, String
 }
 
 #[tauri::command]
+pub async fn reset_network_settings(
+    app: AppHandle,
+    state: State<'_, DesktopAppState>,
+) -> Result<ActionResultDto, String> {
+    if state.is_quitting() {
+        return Ok(shutting_down_result());
+    }
+    let Ok(_guard) = state.action_lock.try_lock() else {
+        return Ok(busy_result_for_operation(state.active_operation()));
+    };
+    if state.is_quitting() {
+        return Ok(shutting_down_result());
+    }
+
+    let op_guard =
+        ServiceOperationGuard::acquire(&app, ServiceOperationDto::ResettingNetwork).await;
+    let mut result = match tokio::task::spawn_blocking(actions::reset_network_settings).await {
+        Ok(res) => res,
+        Err(err) => ActionResultDto::error(format!("Failed to reset network settings: {err}")),
+    };
+
+    result.snapshot =
+        refresh_and_broadcast_status_with_readiness(&app, Some(op_guard), ReadinessWait::None)
+            .await
+            .ok();
+    Ok(result)
+}
+
+#[tauri::command]
 pub async fn check_updates(force: Option<bool>) -> Result<UpdateCheckPayloadDto, String> {
     actions::check_for_updates_with_force(force.unwrap_or(false)).await
 }
@@ -1133,6 +1165,7 @@ mod tests {
             Some(ServiceOperationDto::Upgrading),
             Some(ServiceOperationDto::Repairing),
             Some(ServiceOperationDto::Uninstalling),
+            Some(ServiceOperationDto::ResettingNetwork),
             Some(ServiceOperationDto::Resuming),
             Some(ServiceOperationDto::Pausing),
             Some(ServiceOperationDto::SwitchingEngine),
@@ -1143,5 +1176,10 @@ mod tests {
             assert_eq!(res.code, Some(ActionErrorCodeDto::Busy));
             assert!(!res.message.is_empty());
         }
+
+        let net_reset = busy_result_for_operation(Some(ServiceOperationDto::ResettingNetwork));
+        assert!(!net_reset.ok);
+        assert_eq!(net_reset.code, Some(ActionErrorCodeDto::Busy));
+        assert_eq!(net_reset.message, "Network reset is already in progress.");
     }
 }

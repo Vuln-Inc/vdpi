@@ -105,10 +105,36 @@ pub const DEFAULT_BYPASS_PATTERNS: &[&str] = &[
     "*.pttavm.com",
     // Riot / Valorant (strict TLS & anti-cheat)
     "*.riotgames.com",
+    "*.riotgames.net",
     "*.riotcdn.net",
     "*.playvalorant.com",
+    "*.valorant.com",
     "*.pvp.net",
     "*.rgpub.io",
+    "*.rdatasrv.net",
+    "*.leagueoflegends.com",
+    // Third-party VPN control-plane, auth & bootstrap APIs
+    "*.mullvad.net",
+    "*.protonvpn.com",
+    "*.proton.me",
+    "*.nordvpn.com",
+    "*.surfshark.com",
+    "*.cloudflareclient.com",
+    "*.tailscale.com",
+    "*.expressvpn.com",
+    "*.expressvpn.net",
+    "*.expressapisv2.net",
+    "*.xvnet.net",
+    "*.xvtel.com",
+    "*.windscribe.com",
+    "*.cyberghostvpn.com",
+    "*.privateinternetaccess.com",
+    "*.pia-dns.com",
+    "*.ipvanish.com",
+    "*.tunnelbear.com",
+    "*.adguard-vpn.com",
+    "*.hotspotshield.com",
+    "*.warp.plus",
 ];
 
 /// Classification of a connection target for DPI bypass decisions.
@@ -601,6 +627,53 @@ fn default_pattern_overridden_by_includes(
     include_candidates.iter().any(|cand| pat_re.is_match(cand))
 }
 
+fn compile_include_override_matchers(include_domains: &[String]) -> (Vec<Regex>, Vec<String>) {
+    let mut include_regexes = Vec::new();
+    let mut include_candidates = Vec::new();
+    for raw in include_domains {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(re) = include_pattern_to_regex(trimmed)
+            .and_then(|expr| RegexBuilder::new(&expr).case_insensitive(true).build().ok())
+        {
+            include_regexes.push(re);
+        }
+        include_candidates.extend(extract_include_domain_candidates(trimmed));
+    }
+    (include_regexes, include_candidates)
+}
+
+/// Filters `domains` (bare domain suffixes such as `"riotgames.com"` or `"mullvad.net"`),
+/// omitting any non-local domain overridden by `include_domains`.
+pub fn filter_pac_default_bypass_domains<'a>(
+    domains: &[&'a str],
+    include_domains: &[String],
+) -> Vec<&'a str> {
+    if include_domains.is_empty() {
+        return domains.to_vec();
+    }
+    let (include_regexes, include_candidates) = compile_include_override_matchers(include_domains);
+    if include_regexes.is_empty() && include_candidates.is_empty() {
+        return domains.to_vec();
+    }
+    domains
+        .iter()
+        .copied()
+        .filter(|domain| {
+            let trimmed = domain.trim();
+            let cleaned = trimmed.trim_start_matches('*');
+            !default_pattern_overridden_by_includes(
+                trimmed,
+                cleaned,
+                &include_regexes,
+                &include_candidates,
+            )
+        })
+        .collect()
+}
+
 /// Builds a deduplicated `NO_PROXY` comma-separated string suitable for desktop runtimes and `libcurl`.
 pub fn build_no_proxy_value(extra: &[String]) -> String {
     build_no_proxy_value_with_includes(extra, &[])
@@ -629,20 +702,7 @@ pub fn build_no_proxy_value_with_includes(
         "fe80::/10".into(),
     ];
 
-    let mut include_regexes = Vec::new();
-    let mut include_candidates = Vec::new();
-    for raw in include_domains {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Some(expr) = include_pattern_to_regex(trimmed) {
-            if let Ok(re) = RegexBuilder::new(&expr).case_insensitive(true).build() {
-                include_regexes.push(re);
-            }
-        }
-        include_candidates.extend(extract_include_domain_candidates(trimmed));
-    }
+    let (include_regexes, include_candidates) = compile_include_override_matchers(include_domains);
 
     for pat in DEFAULT_BYPASS_PATTERNS {
         let cleaned = pat.trim().trim_start_matches('*');
@@ -1466,5 +1526,90 @@ mod tests {
         let entries: Vec<&str> = no_proxy.split(',').collect();
         assert!(!entries.contains(&".org.tr"));
         assert!(entries.contains(&".gov.tr"));
+    }
+
+    #[test]
+    fn bypasses_extended_riot_and_vpn_bootstrap_domains_and_filters_pac_defaults() {
+        let policy = BypassPolicy::new(&[], &[]).unwrap();
+
+        for host in [
+            "riotgames.net",
+            "edge.riotgames.net",
+            "valorant.com",
+            "api.valorant.com",
+            "rdatasrv.net",
+            "data.rdatasrv.net",
+            "leagueoflegends.com",
+            "auth.leagueoflegends.com",
+            "mullvad.net",
+            "api.mullvad.net",
+            "protonvpn.com",
+            "api.protonvpn.com",
+            "proton.me",
+            "vpn-api.proton.me",
+            "nordvpn.com",
+            "api.nordvpn.com",
+            "surfshark.com",
+            "api.surfshark.com",
+            "cloudflareclient.com",
+            "api.cloudflareclient.com",
+            "tailscale.com",
+            "controlplane.tailscale.com",
+        ] {
+            assert_eq!(
+                policy.classify(Some(host), None),
+                BypassClass::SensitiveDirect,
+                "expected SensitiveDirect for {host}"
+            );
+            assert!(!policy.should_desync(Some(host), None));
+        }
+
+        for unrelated in [
+            "notriotgames.net",
+            "fakevalorant.com",
+            "fakemullvad.net",
+            "notproton.me",
+            "mytailscale.com",
+        ] {
+            assert_eq!(
+                policy.classify(Some(unrelated), None),
+                BypassClass::DesyncEligible,
+                "expected DesyncEligible for {unrelated}"
+            );
+        }
+
+        let no_proxy = build_no_proxy_value(&[]);
+        let entries: Vec<&str> = no_proxy.split(',').collect();
+        for expected in [
+            ".riotgames.net",
+            ".valorant.com",
+            ".rdatasrv.net",
+            ".leagueoflegends.com",
+            ".mullvad.net",
+            ".protonvpn.com",
+            ".proton.me",
+            ".nordvpn.com",
+            ".surfshark.com",
+            ".cloudflareclient.com",
+            ".tailscale.com",
+        ] {
+            assert!(
+                entries.contains(&expected),
+                "expected NO_PROXY to contain `{expected}`, got: {no_proxy}"
+            );
+        }
+
+        let pac_domains = ["riotgames.com", "valorant.com", "mullvad.net", "proton.me"];
+        assert_eq!(
+            filter_pac_default_bypass_domains(&pac_domains, &[]),
+            vec!["riotgames.com", "valorant.com", "mullvad.net", "proton.me"]
+        );
+        assert_eq!(
+            filter_pac_default_bypass_domains(
+                &pac_domains,
+                &["auth.riotgames.com".into(), r"\.proton\.me$".into()]
+            ),
+            vec!["valorant.com", "mullvad.net"]
+        );
     }
 }
