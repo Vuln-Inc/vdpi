@@ -344,20 +344,6 @@ const DIALOG_FOCUSABLE_SELECTOR =
 
 const UPDATE_PROMPT_DIALOG_TESTID = "update-prompt-dialog";
 
-function hasForeignAriaModal(): boolean {
-  if (typeof document === "undefined") {
-    return false;
-  }
-  const modals = document.querySelectorAll('[aria-modal="true"]');
-  for (const modal of modals) {
-    if (modal.getAttribute("data-testid") === UPDATE_PROMPT_DIALOG_TESTID) {
-      continue;
-    }
-    return true;
-  }
-  return false;
-}
-
 function stripLeadingBullet(line: string): string {
   return line.replace(/^\s*(?:[-*\u2022]\s+)+/, "").trim();
 }
@@ -755,7 +741,7 @@ function AppShellContent({
   const [updatePromptUpgrading, setUpdatePromptUpgrading] = useState(false);
   const [updatePromptFeedback, setUpdatePromptFeedback] =
     useState<UpdatePromptFeedback | null>(null);
-  const [foreignModalOpen, setForeignModalOpen] = useState(false);
+  const [childModalOpen, setChildModalOpen] = useState(false);
   const [dismissedUpgradeKey, setDismissedUpgradeKey] = useState<string | null>(
     null,
   );
@@ -912,7 +898,9 @@ function AppShellContent({
       if (!payload || typeof payload !== "object") {
         return;
       }
-      ingestActionSnapshot(payload.snapshot);
+      if (!ingestActionSnapshot(payload.snapshot)) {
+        void refreshStatus();
+      }
       const currentLang = langRef.current;
       const surfaceLabel =
         platformRef.current === "macos"
@@ -978,18 +966,29 @@ function AppShellContent({
         unlisten = null;
       }
     };
-  }, [ingestActionSnapshot, pushToast]);
+  }, [ingestActionSnapshot, pushToast, refreshStatus]);
 
   const effectiveBusyAction = busyAction ?? status?.pendingOperation ?? null;
+  const effectiveBusyActionRef = useRef<string | null>(effectiveBusyAction);
+  effectiveBusyActionRef.current = effectiveBusyAction;
   const resetNetworkBusy =
     effectiveBusyAction === "reset-network" ||
     effectiveBusyAction === "resetting_network";
   const activeEngine: EngineMode =
     status?.live?.engine ??
-    effectiveSettings?.engine ??
     status?.configuredEngine ??
+    effectiveSettings?.engine ??
     "tun";
-  const isProtectionActive = Boolean(status?.live?.running);
+  const configuredEngine = status?.configuredEngine ?? effectiveSettings?.engine;
+  const isEngineEffective = useCallback(
+    (engine: EngineMode): boolean =>
+      (!status?.live || status.live.engine === engine) &&
+      configuredEngine === engine,
+    [configuredEngine, status?.live],
+  );
+  const isProtectionActive = Boolean(
+    status?.live?.running || status?.serviceState === "running",
+  );
   const hasAppUpdate = Boolean(updateInfo?.hasUpdate);
   const hasEngineUpgrade =
     status?.cliVersionRelation === "upgrade_available";
@@ -1001,40 +1000,6 @@ function AppShellContent({
         ? "app"
         : null;
 
-  useEffect(() => {
-    if (
-      typeof document === "undefined" ||
-      updatePromptDismissed ||
-      (updatePromptKind === null && !checkingUpdates)
-    ) {
-      setForeignModalOpen(false);
-      return;
-    }
-
-    const syncForeignModal = () => {
-      const next = hasForeignAriaModal();
-      setForeignModalOpen((prev) => (prev === next ? prev : next));
-    };
-
-    syncForeignModal();
-
-    if (typeof MutationObserver === "undefined") {
-      return;
-    }
-
-    const observer = new MutationObserver(syncForeignModal);
-    observer.observe(document.body, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      attributeFilter: ["aria-modal"],
-    });
-
-    return () => {
-      observer.disconnect();
-    };
-  }, [checkingUpdates, updatePromptDismissed, updatePromptKind]);
-
   const updatePromptOpen =
     updatePromptKind !== null &&
     !updatePromptDismissed &&
@@ -1043,18 +1008,17 @@ function AppShellContent({
     pendingTab === null &&
     !confirmSwitchToTunOpen &&
     !confirmResetNetworkOpen &&
-    !foreignModalOpen &&
-    !hasForeignAriaModal() &&
+    !childModalOpen &&
     (updatePromptUpgrading || effectiveBusyAction === null);
 
   useEffect(() => {
     if (
       confirmSwitchToTunOpen &&
-      (activeEngine === "tun" || !isProtectionActive)
+      (isEngineEffective("tun") || !isProtectionActive)
     ) {
       setConfirmSwitchToTunOpen(false);
     }
-  }, [activeEngine, confirmSwitchToTunOpen, isProtectionActive]);
+  }, [confirmSwitchToTunOpen, isEngineEffective, isProtectionActive]);
 
   const navigateToTab = useCallback(
     (tab: NavTab, options?: { focusMain?: boolean }) => {
@@ -1064,7 +1028,11 @@ function AppShellContent({
       setActiveTab(tab);
       setPendingTab(null);
       setConfirmSwitchToTunOpen(false);
-      if (busyActionRef.current === null) {
+      setChildModalOpen(false);
+      if (
+        busyActionRef.current === null &&
+        effectiveBusyActionRef.current === null
+      ) {
         setConfirmResetNetworkOpen(false);
       }
       if (tab === "installation") {
@@ -1206,6 +1174,7 @@ function AppShellContent({
       pendingTab !== null ||
       confirmSwitchToTunOpen ||
       confirmResetNetworkOpen ||
+      childModalOpen ||
       updatePromptOpen,
     onCloseModal: handleCloseModal,
   });
@@ -1376,7 +1345,10 @@ function AppShellContent({
 
   const handleToggleProtection = useCallback(
     async (connect?: boolean) => {
-      if (busyActionRef.current !== null) {
+      if (
+        busyActionRef.current !== null ||
+        effectiveBusyActionRef.current !== null
+      ) {
         return;
       }
 
@@ -1393,12 +1365,16 @@ function AppShellContent({
           return;
         }
 
-        const appliedDirect = ingestActionSnapshot(result.snapshot);
-        if (!appliedDirect) {
-          await refreshStatus();
-          if (!mountedRef.current) {
-            return;
+        if (!result.cancelled && !isCalmTransientCode(result.code)) {
+          const appliedDirect = ingestActionSnapshot(result.snapshot);
+          if (!appliedDirect) {
+            await refreshStatus();
+            if (!mountedRef.current) {
+              return;
+            }
           }
+        } else if (result.snapshot) {
+          ingestActionSnapshot(result.snapshot);
         }
 
         const currentLang = langRef.current;
@@ -1483,11 +1459,14 @@ function AppShellContent({
 
   const handleSwitchEngine = useCallback(
     async (engine: EngineMode) => {
-      if (busyActionRef.current !== null) {
+      if (
+        busyActionRef.current !== null ||
+        effectiveBusyActionRef.current !== null
+      ) {
         return;
       }
 
-      if (activeEngine === engine) {
+      if (isEngineEffective(engine)) {
         return;
       }
 
@@ -1498,9 +1477,13 @@ function AppShellContent({
           return;
         }
 
-        await syncAfterServiceMutation(result.snapshot);
-        if (!mountedRef.current) {
-          return;
+        if (!result.cancelled && !isCalmTransientCode(result.code)) {
+          await syncAfterServiceMutation(result.snapshot);
+          if (!mountedRef.current) {
+            return;
+          }
+        } else if (result.snapshot) {
+          ingestActionSnapshot(result.snapshot);
         }
 
         const currentLang = langRef.current;
@@ -1570,11 +1553,21 @@ function AppShellContent({
         setBusy(null);
       }
     },
-    [activeEngine, pushToast, setBusy, syncAfterServiceMutation],
+    [
+      ingestActionSnapshot,
+      isEngineEffective,
+      pushToast,
+      setBusy,
+      syncAfterServiceMutation,
+    ],
   );
 
   const handleSwitchToTun = useCallback(() => {
-    if (busyActionRef.current !== null || activeEngine === "tun") {
+    if (
+      busyActionRef.current !== null ||
+      effectiveBusyActionRef.current !== null ||
+      isEngineEffective("tun")
+    ) {
       return;
     }
     if (isProtectionActive) {
@@ -1582,10 +1575,13 @@ function AppShellContent({
       return;
     }
     return handleSwitchEngine("tun");
-  }, [activeEngine, handleSwitchEngine, isProtectionActive]);
+  }, [handleSwitchEngine, isEngineEffective, isProtectionActive]);
 
   const handleConfirmSwitchToTun = useCallback(() => {
-    if (busyActionRef.current !== null) {
+    if (
+      busyActionRef.current !== null ||
+      effectiveBusyActionRef.current !== null
+    ) {
       return;
     }
     setConfirmSwitchToTunOpen(false);
@@ -1594,7 +1590,10 @@ function AppShellContent({
 
   const handleInstallService = useCallback(
     async (engine?: EngineMode) => {
-      if (busyActionRef.current !== null) {
+      if (
+        busyActionRef.current !== null ||
+        effectiveBusyActionRef.current !== null
+      ) {
         return;
       }
 
@@ -1607,9 +1606,13 @@ function AppShellContent({
           return;
         }
 
-        await syncAfterServiceMutation(result.snapshot);
-        if (!mountedRef.current) {
-          return;
+        if (!result.cancelled && !isCalmTransientCode(result.code)) {
+          await syncAfterServiceMutation(result.snapshot);
+          if (!mountedRef.current) {
+            return;
+          }
+        } else if (result.snapshot) {
+          ingestActionSnapshot(result.snapshot);
         }
 
         const currentLang = langRef.current;
@@ -1703,6 +1706,7 @@ function AppShellContent({
     [
       activeEngine,
       canAutoRouteToInstallation,
+      ingestActionSnapshot,
       navigateToTab,
       pushToast,
       setBusy,
@@ -1723,7 +1727,10 @@ function AppShellContent({
         | "failed";
       message?: string;
     }> => {
-      if (busyActionRef.current !== null) {
+      if (
+        busyActionRef.current !== null ||
+        effectiveBusyActionRef.current !== null
+      ) {
         return { outcome: "busy" };
       }
 
@@ -1735,9 +1742,13 @@ function AppShellContent({
           return { outcome: "busy" };
         }
 
-        await syncAfterServiceMutation(result.snapshot);
-        if (!mountedRef.current) {
-          return { outcome: "busy" };
+        if (!result.cancelled && !isCalmTransientCode(result.code)) {
+          await syncAfterServiceMutation(result.snapshot);
+          if (!mountedRef.current) {
+            return { outcome: "busy" };
+          }
+        } else if (result.snapshot) {
+          ingestActionSnapshot(result.snapshot);
         }
 
         const currentLang = langRef.current;
@@ -1852,6 +1863,7 @@ function AppShellContent({
     [
       activeEngine,
       canAutoRouteToInstallation,
+      ingestActionSnapshot,
       navigateToTab,
       pushToast,
       setBusy,
@@ -1865,7 +1877,10 @@ function AppShellContent({
 
   const handleRepairService = useCallback(
     async (engine?: EngineMode) => {
-      if (busyActionRef.current !== null) {
+      if (
+        busyActionRef.current !== null ||
+        effectiveBusyActionRef.current !== null
+      ) {
         return;
       }
 
@@ -1878,9 +1893,13 @@ function AppShellContent({
           return;
         }
 
-        await syncAfterServiceMutation(result.snapshot);
-        if (!mountedRef.current) {
-          return;
+        if (!result.cancelled && !isCalmTransientCode(result.code)) {
+          await syncAfterServiceMutation(result.snapshot);
+          if (!mountedRef.current) {
+            return;
+          }
+        } else if (result.snapshot) {
+          ingestActionSnapshot(result.snapshot);
         }
 
         const currentLang = langRef.current;
@@ -1962,11 +1981,20 @@ function AppShellContent({
         setBusy(null);
       }
     },
-    [activeEngine, pushToast, setBusy, syncAfterServiceMutation],
+    [
+      activeEngine,
+      ingestActionSnapshot,
+      pushToast,
+      setBusy,
+      syncAfterServiceMutation,
+    ],
   );
 
   const handleUninstallService = useCallback(async () => {
-    if (busyActionRef.current !== null) {
+    if (
+      busyActionRef.current !== null ||
+      effectiveBusyActionRef.current !== null
+    ) {
       return;
     }
 
@@ -1978,9 +2006,13 @@ function AppShellContent({
         return;
       }
 
-      await syncAfterServiceMutation(result.snapshot);
-      if (!mountedRef.current) {
-        return;
+      if (!result.cancelled && !isCalmTransientCode(result.code)) {
+        await syncAfterServiceMutation(result.snapshot);
+        if (!mountedRef.current) {
+          return;
+        }
+      } else if (result.snapshot) {
+        ingestActionSnapshot(result.snapshot);
       }
 
       const currentLang = langRef.current;
@@ -2035,14 +2067,17 @@ function AppShellContent({
     } finally {
       setBusy(null);
     }
-  }, [pushToast, setBusy, syncAfterServiceMutation]);
+  }, [ingestActionSnapshot, pushToast, setBusy, syncAfterServiceMutation]);
 
   const handleRequestResetNetwork = useCallback(() => {
-    if (effectiveBusyAction) {
+    if (
+      busyActionRef.current !== null ||
+      effectiveBusyActionRef.current !== null
+    ) {
       return;
     }
     setConfirmResetNetworkOpen(true);
-  }, [effectiveBusyAction]);
+  }, []);
 
   const handleCancelResetNetwork = useCallback(() => {
     if (!resetNetworkBusy) {
@@ -2051,7 +2086,10 @@ function AppShellContent({
   }, [resetNetworkBusy]);
 
   const handleConfirmResetNetwork = useCallback(async () => {
-    if (busyActionRef.current !== null || effectiveBusyAction !== null) {
+    if (
+      busyActionRef.current !== null ||
+      effectiveBusyActionRef.current !== null
+    ) {
       return;
     }
 
@@ -2062,9 +2100,13 @@ function AppShellContent({
         return;
       }
 
-      await syncAfterServiceMutation(result.snapshot);
-      if (!mountedRef.current) {
-        return;
+      if (!result.cancelled && !isCalmTransientCode(result.code)) {
+        await syncAfterServiceMutation(result.snapshot);
+        if (!mountedRef.current) {
+          return;
+        }
+      } else if (result.snapshot) {
+        ingestActionSnapshot(result.snapshot);
       }
 
       const currentLang = langRef.current;
@@ -2123,11 +2165,15 @@ function AppShellContent({
         setConfirmResetNetworkOpen(false);
       }
     }
-  }, [effectiveBusyAction, pushToast, setBusy, syncAfterServiceMutation]);
+  }, [ingestActionSnapshot, pushToast, setBusy, syncAfterServiceMutation]);
 
   const handleUpdatePromptAction = useCallback(() => {
     if (updatePromptKind === "engine") {
-      if (updatePromptUpgrading || busyActionRef.current !== null) {
+      if (
+        updatePromptUpgrading ||
+        busyActionRef.current !== null ||
+        effectiveBusyActionRef.current !== null
+      ) {
         return;
       }
       setUpdatePromptFeedback(null);
@@ -2283,6 +2329,7 @@ function AppShellContent({
     setPendingTab(null);
     setConfirmSwitchToTunOpen(false);
     setConfirmResetNetworkOpen(false);
+    setChildModalOpen(false);
     setInstallError(null);
     setActiveTab("overview");
     if (mainContentRef.current) {
@@ -2435,6 +2482,7 @@ function AppShellContent({
                 onNavigate={handleProgrammaticNavigate}
                 onClearActivity={clearActivity}
                 onCopyActivity={handleCopyActivity}
+                onModalOpenChange={setChildModalOpen}
               />
             ) : null}
 
@@ -2501,6 +2549,7 @@ function AppShellContent({
                 onRefreshStatus={handleRefreshInstallationStatus}
                 onClearInstallError={handleClearInstallError}
                 onNavigate={handleProgrammaticNavigate}
+                onModalOpenChange={setChildModalOpen}
               />
             ) : null}
 
@@ -2523,6 +2572,7 @@ function AppShellContent({
                 onOpenReleaseUrl={handleOpenReleaseUrl}
                 onNavigate={handleProgrammaticNavigate}
                 onPushToast={handlePushToast}
+                onModalOpenChange={setChildModalOpen}
               />
             ) : null}
           </AppErrorBoundary>
@@ -2679,6 +2729,9 @@ function AppShell() {
   const handleRefreshSettings = useCallback(async () => {
     const seqAtStart = prefsPreviewSeqRef.current;
     const refreshed = await refreshSettings();
+    if (refreshed) {
+      settingsRef.current = refreshed;
+    }
     if (
       mountedRef.current &&
       refreshed &&
@@ -2736,6 +2789,9 @@ function AppShell() {
       }
       try {
         const refreshed = await refreshSettings();
+        if (refreshed) {
+          settingsRef.current = refreshed;
+        }
         if (mountedRef.current && seq === prefsPreviewSeqRef.current) {
           prefsSavePendingRef.current = false;
           if (refreshed) {

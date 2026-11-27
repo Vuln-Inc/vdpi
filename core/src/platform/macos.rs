@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -7,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info, warn};
-use vdpi_core::bypass::BypassPolicy;
+use vdpi_core::bypass::filter_pac_default_bypass_domains;
 use vdpi_core::config::VpnCoexistence;
 
 pub const PAC_PATH: &str = "/vdpi.pac";
@@ -1310,7 +1309,7 @@ impl MacosProxySession {
         }
 
         for svc in &services {
-            restore_service_proxy_state(svc, saved_state.find_service(svc));
+            restore_service_proxy_state(svc, saved_state.find_service(svc), Some(&self.pac_url));
         }
 
         unset_stale_loopback_launchd_proxy_env();
@@ -1336,6 +1335,17 @@ enum ServiceReconcileDecision {
     ApplyVdpiPac,
 }
 
+fn is_owned_vdpi_pac_url(url: &str, expected_pac_url: Option<&str>) -> bool {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    is_vdpi_pac_url(trimmed)
+        || expected_pac_url
+            .map(str::trim)
+            .is_some_and(|expected| !expected.is_empty() && trimmed.eq_ignore_ascii_case(expected))
+}
+
 fn has_active_non_loopback_manual_proxy(st: &NetworkServiceProxyStatus) -> bool {
     (st.web_enabled && !st.web_server.trim().is_empty() && !is_loopback_server(&st.web_server))
         || (st.secure_enabled
@@ -1351,7 +1361,7 @@ fn classify_service_reconcile(
     expected_pac_url: &str,
 ) -> ServiceReconcileDecision {
     let current_pac = st.auto_proxy_url.trim();
-    if !current_pac.is_empty() && !is_vdpi_pac_url(current_pac) {
+    if !current_pac.is_empty() && !is_owned_vdpi_pac_url(current_pac, Some(expected_pac_url)) {
         return ServiceReconcileDecision::SkipExternalProxy;
     }
     if has_active_non_loopback_manual_proxy(st) {
@@ -1415,66 +1425,98 @@ fn disable_non_loopback_manual_proxies(st: &NetworkServiceProxyStatus) {
     }
 }
 
-fn restore_service_proxy_state(svc: &str, saved: Option<&SavedServiceProxyState>) {
+fn restore_service_proxy_state(
+    svc: &str,
+    saved: Option<&SavedServiceProxyState>,
+    expected_pac_url: Option<&str>,
+) {
     let st = inspect_single_service_proxy(svc);
+    restore_service_proxy_state_with(
+        svc,
+        &st,
+        saved,
+        expected_pac_url,
+        run_networksetup,
+        set_proxy_bypass_domains,
+    );
+}
 
-    // 1. Restore previous AutoProxyURL state, or turn off vdpi's PAC if none existed before.
-    let current_is_vdpi_or_empty =
-        st.auto_proxy_url.is_empty() || is_vdpi_pac_url(&st.auto_proxy_url);
-    if let Some(prev) =
-        saved.filter(|s| !s.autoproxy.url.trim().is_empty() && !is_vdpi_pac_url(&s.autoproxy.url))
-    {
+fn restore_service_proxy_state_with(
+    svc: &str,
+    st: &NetworkServiceProxyStatus,
+    saved: Option<&SavedServiceProxyState>,
+    expected_pac_url: Option<&str>,
+    mut run_cmd: impl FnMut(&[&str]) -> Result<String>,
+    mut set_bypass: impl FnMut(&str, &[String]) -> Result<()>,
+) {
+    // 1. Restore previous AutoProxyURL state, or clear & disable vdpi's PAC if none existed before.
+    let current_pac_owned = is_owned_vdpi_pac_url(&st.auto_proxy_url, expected_pac_url);
+    let current_is_vdpi_or_empty = st.auto_proxy_url.trim().is_empty() || current_pac_owned;
+    if let Some(prev) = saved.filter(|s| {
+        !s.autoproxy.url.trim().is_empty()
+            && !is_owned_vdpi_pac_url(&s.autoproxy.url, expected_pac_url)
+    }) {
         if current_is_vdpi_or_empty {
-            let _ = run_networksetup(&["-setautoproxyurl", svc, &prev.autoproxy.url]);
+            let _ = run_cmd(&["-setautoproxyurl", svc, &prev.autoproxy.url]);
             let state_arg = if prev.autoproxy.enabled { "on" } else { "off" };
-            let _ = run_networksetup(&["-setautoproxystate", svc, state_arg]);
+            let _ = run_cmd(&["-setautoproxystate", svc, state_arg]);
         }
-    } else if st.auto_proxy_enabled && is_vdpi_pac_url(&st.auto_proxy_url) {
-        let _ = run_networksetup(&["-setautoproxystate", svc, "off"]);
+    } else if current_pac_owned {
+        let _ = run_cmd(&["-setautoproxyurl", svc, ""]);
+        let _ = run_cmd(&["-setautoproxystate", svc, "off"]);
     }
 
     // 2. Clean up any legacy 127.0.0.1 / ::1 fail-closed manual proxies.
-    disable_loopback_manual_proxies(&st);
+    disable_loopback_manual_proxies_with(st, &mut run_cmd);
 
     // 3. Restore any saved non-loopback manual proxies if they were previously enabled.
     if let Some(prev) = saved {
-        restore_manual_proxy_if_needed(
+        restore_manual_proxy_if_needed_with(
             svc,
             &prev.webproxy,
             st.web_enabled && !is_loopback_server(&st.web_server),
             "-setwebproxy",
             "-setwebproxystate",
+            &mut run_cmd,
         );
-        restore_manual_proxy_if_needed(
+        restore_manual_proxy_if_needed_with(
             svc,
             &prev.securewebproxy,
             st.secure_enabled && !is_loopback_server(&st.secure_server),
             "-setsecurewebproxy",
             "-setsecurewebproxystate",
+            &mut run_cmd,
         );
-        restore_manual_proxy_if_needed(
+        restore_manual_proxy_if_needed_with(
             svc,
             &prev.socksfirewallproxy,
             st.socks_enabled && !is_loopback_server(&st.socks_server),
             "-setsocksfirewallproxy",
             "-setsocksfirewallproxystate",
+            &mut run_cmd,
         );
 
-        // 4. Restore original proxy bypass domains if snapshotted before activation.
-        if let Some(original_bypass) = prev.bypass_domains.as_deref() {
-            if let Err(e) = set_proxy_bypass_domains(svc, original_bypass) {
-                warn!(service = %svc, error = %e, "failed to restore proxy bypass domains");
+        // 4. Restore original proxy bypass domains if snapshotted before activation and no
+        //    external proxy was enabled mid-session.
+        let external_proxy_active =
+            !current_is_vdpi_or_empty || has_active_non_loopback_manual_proxy(st);
+        if !external_proxy_active {
+            if let Some(original_bypass) = prev.bypass_domains.as_deref() {
+                if let Err(e) = set_bypass(svc, original_bypass) {
+                    warn!(service = %svc, error = %e, "failed to restore proxy bypass domains");
+                }
             }
         }
     }
 }
 
-fn restore_manual_proxy_if_needed(
+fn restore_manual_proxy_if_needed_with(
     svc: &str,
     saved: &ManualProxyState,
     currently_active_non_loopback: bool,
     set_cmd: &str,
     state_cmd: &str,
+    mut run_cmd: impl FnMut(&[&str]) -> Result<String>,
 ) {
     if currently_active_non_loopback
         || !saved.enabled
@@ -1485,8 +1527,8 @@ fn restore_manual_proxy_if_needed(
     {
         return;
     }
-    let _ = run_networksetup(&[set_cmd, svc, &saved.server, &saved.port]);
-    let _ = run_networksetup(&[state_cmd, svc, "on"]);
+    let _ = run_cmd(&[set_cmd, svc, &saved.server, &saved.port]);
+    let _ = run_cmd(&[state_cmd, svc, "on"]);
 }
 
 fn is_vpn_default_route_active() -> bool {
@@ -1511,7 +1553,7 @@ pub fn clear_all_macos_proxies() -> Result<()> {
     }
 
     for svc in &services {
-        restore_service_proxy_state(svc, saved_state.find_service(svc));
+        restore_service_proxy_state(svc, saved_state.find_service(svc), None);
     }
 
     unset_stale_loopback_launchd_proxy_env();
@@ -1553,7 +1595,13 @@ fn is_macos_privilege_error(err_text: &str) -> bool {
         || lower.contains("-60008")
 }
 
-fn collect_macos_proxy_state_paths(target_user: Option<&ElevatedUser>) -> Vec<PathBuf> {
+fn is_unrecognized_network_service_error(err_text: &str) -> bool {
+    err_text
+        .to_ascii_lowercase()
+        .contains("is not a recognized network service")
+}
+
+fn collect_macos_proxy_state_paths(target_user: Option<&ElevatedUser>, is_root: bool) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = Vec::with_capacity(4);
     let mut push_unique = |p: PathBuf| {
         if !p.as_os_str().is_empty() && !paths.iter().any(|existing| existing == &p) {
@@ -1567,7 +1615,9 @@ fn collect_macos_proxy_state_paths(target_user: Option<&ElevatedUser>) -> Vec<Pa
     push_unique(PathBuf::from(
         "/Library/Application Support/vdpi/macos-proxy-state.json",
     ));
-    push_unique(PathBuf::from("/var/root/.vdpi/macos-proxy-state.json"));
+    if is_root {
+        push_unique(PathBuf::from("/var/root/.vdpi/macos-proxy-state.json"));
+    }
     paths
 }
 
@@ -1663,6 +1713,71 @@ fn remove_macos_proxy_state_file_guarded(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn reset_single_macos_service_with(
+    svc: &str,
+    from_saved_state_only: bool,
+    is_root: bool,
+    status: &NetworkServiceProxyStatus,
+    bypass_res: Result<Vec<String>>,
+    outcome: &mut UnixProxyResetOutcome,
+    mut run_cmd: impl FnMut(&[&str]) -> Result<String>,
+) -> bool {
+    if from_saved_state_only {
+        if let Err(ref err) = bypass_res {
+            if is_unrecognized_network_service_error(&format!("{err:#}")) {
+                return false;
+            }
+        }
+    }
+    let bypass = bypass_res.ok();
+    let needs_reset = service_proxy_needs_reset(status, bypass.as_deref());
+    if !needs_reset && bypass.is_some() {
+        return false;
+    }
+
+    let reset_cmds: [&[&str]; 6] = [
+        &["-setautoproxyurl", svc, ""],
+        &["-setautoproxystate", svc, "off"],
+        &["-setwebproxystate", svc, "off"],
+        &["-setsecurewebproxystate", svc, "off"],
+        &["-setsocksfirewallproxystate", svc, "off"],
+        &[
+            "-setproxybypassdomains",
+            svc,
+            DEFAULT_MACOS_BYPASS_DOMAINS[0],
+            DEFAULT_MACOS_BYPASS_DOMAINS[1],
+        ],
+    ];
+
+    let mut any_succeeded = false;
+    for args in reset_cmds {
+        match run_cmd(args) {
+            Ok(_) => {
+                any_succeeded = true;
+            }
+            Err(err) => {
+                let msg = format!("{err:#}");
+                if from_saved_state_only && is_unrecognized_network_service_error(&msg) {
+                    return false;
+                }
+                if !is_root && is_macos_privilege_error(&msg) {
+                    outcome.skipped_privileges = true;
+                    return true;
+                }
+                outcome
+                    .errors
+                    .push(format!("networksetup {} failed: {msg}", args.join(" ")));
+            }
+        }
+    }
+
+    if any_succeeded && (needs_reset || bypass.is_none()) {
+        outcome.proxy_changed = true;
+    }
+    false
+}
+
 /// Resets macOS network service proxies, proxy bypass domains, launchd proxy environment
 /// variables, and saved proxy state files back to clean factory defaults.
 pub fn reset_macos_proxies_to_defaults() -> UnixProxyResetOutcome {
@@ -1671,9 +1786,9 @@ pub fn reset_macos_proxies_to_defaults() -> UnixProxyResetOutcome {
     let is_root = unsafe { libc::geteuid() == 0 };
     let target_user = resolve_target_desktop_user();
     let user_home = target_user.as_ref().and_then(|u| u.home_dir.as_deref());
-    let state_paths = collect_macos_proxy_state_paths(target_user.as_ref());
+    let state_paths = collect_macos_proxy_state_paths(target_user.as_ref(), is_root);
 
-    let mut services: Vec<String> = match list_configurable_network_services() {
+    let live_services: Vec<String> = match list_configurable_network_services() {
         Ok(svcs) => svcs,
         Err(err) => {
             let msg = format!("{err:#}");
@@ -1686,6 +1801,11 @@ pub fn reset_macos_proxies_to_defaults() -> UnixProxyResetOutcome {
         }
     };
 
+    let mut services: Vec<(String, bool)> = live_services
+        .into_iter()
+        .map(|svc| (svc, false))
+        .collect();
+
     for path in &state_paths {
         let guard_home = if is_root {
             user_home.filter(|home| path.starts_with(home))
@@ -1695,54 +1815,29 @@ pub fn reset_macos_proxies_to_defaults() -> UnixProxyResetOutcome {
         if let Ok(Some(saved)) = load_from_path_with_home_guard(path, guard_home) {
             for entry in saved.services {
                 if !entry.service.trim().is_empty()
-                    && !services.iter().any(|existing| existing == &entry.service)
+                    && !services
+                        .iter()
+                        .any(|(existing, _)| existing == &entry.service)
                 {
-                    services.push(entry.service);
+                    services.push((entry.service, true));
                 }
             }
         }
     }
 
-    'services: for svc in &services {
+    for (svc, from_saved_state_only) in &services {
         let status = inspect_single_service_proxy(svc);
-        let bypass = get_proxy_bypass_domains(svc).ok();
-        let needs_reset = service_proxy_needs_reset(&status, bypass.as_deref());
-
-        let reset_cmds: [&[&str]; 6] = [
-            &["-setautoproxyurl", svc, ""],
-            &["-setautoproxystate", svc, "off"],
-            &["-setwebproxystate", svc, "off"],
-            &["-setsecurewebproxystate", svc, "off"],
-            &["-setsocksfirewallproxystate", svc, "off"],
-            &[
-                "-setproxybypassdomains",
-                svc,
-                DEFAULT_MACOS_BYPASS_DOMAINS[0],
-                DEFAULT_MACOS_BYPASS_DOMAINS[1],
-            ],
-        ];
-
-        let mut any_succeeded = false;
-        for args in reset_cmds {
-            match run_networksetup(args) {
-                Ok(_) => {
-                    any_succeeded = true;
-                }
-                Err(err) => {
-                    let msg = format!("{err:#}");
-                    if !is_root && is_macos_privilege_error(&msg) {
-                        outcome.skipped_privileges = true;
-                        break 'services;
-                    }
-                    outcome
-                        .errors
-                        .push(format!("networksetup {} failed: {msg}", args.join(" ")));
-                }
-            }
-        }
-
-        if any_succeeded && (needs_reset || bypass.is_none()) {
-            outcome.proxy_changed = true;
+        let bypass_res = get_proxy_bypass_domains(svc);
+        if reset_single_macos_service_with(
+            svc,
+            *from_saved_state_only,
+            is_root,
+            &status,
+            bypass_res,
+            &mut outcome,
+            run_networksetup,
+        ) {
+            break;
         }
     }
 
@@ -1920,98 +2015,6 @@ fn is_local_or_ip_baseline(entry: &str) -> bool {
         || base.ends_with(".ts.net")
 }
 
-fn baseline_wildcard_to_regex(pattern: &str) -> Option<String> {
-    let p = pattern.trim().to_ascii_lowercase();
-    if let Some(suffix) = p.strip_prefix("*.").or_else(|| p.strip_prefix('.')) {
-        let suffix = suffix.trim_end_matches('.');
-        if suffix.is_empty() {
-            return None;
-        }
-        let escaped = regex::escape(suffix);
-        Some(format!(r"^(?:.+\.)?{escaped}$"))
-    } else {
-        let p = p.trim_end_matches('.');
-        if p.is_empty() {
-            return None;
-        }
-        if p.contains('*') {
-            let mut out = String::from("^");
-            for (i, part) in p.split('*').enumerate() {
-                if i > 0 {
-                    out.push_str(".*");
-                }
-                out.push_str(&regex::escape(part));
-            }
-            out.push('$');
-            Some(out)
-        } else {
-            let escaped = regex::escape(p);
-            Some(format!(r"^(?:.+\.)?{escaped}$"))
-        }
-    }
-}
-
-fn extract_include_domain_candidates(pattern: &str) -> Vec<String> {
-    let trimmed = pattern.trim().trim_end_matches('.');
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
-
-    let unescaped = trimmed.replace(r"\.", ".").replace(r"\-", "-");
-    let mut candidates = Vec::new();
-    for segment in unescaped.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-')) {
-        // Ignore prefix fragments such as `org.tr.` in `org\.tr\.(example|test)\.com$`.
-        if segment.is_empty() || segment.ends_with('.') {
-            continue;
-        }
-        let cleaned = segment.trim_start_matches('.').trim_matches('-');
-        if cleaned.contains('.') {
-            candidates.push(cleaned.to_ascii_lowercase());
-        }
-    }
-    candidates
-}
-
-fn baseline_overridden_by_includes(
-    baseline: &str,
-    include_policy: Option<&BypassPolicy>,
-    include_candidates: &[String],
-) -> bool {
-    if include_policy.is_none() && include_candidates.is_empty() {
-        return false;
-    }
-    if is_local_or_ip_baseline(baseline) {
-        return false;
-    }
-
-    let cleaned = baseline.trim().trim_start_matches('*');
-    let base = cleaned.trim_start_matches('.').to_ascii_lowercase();
-    if base.is_empty() {
-        return false;
-    }
-
-    if let Some(policy) = include_policy {
-        let sample_subdomain = format!("a.{base}");
-        if policy.should_desync(Some(&base), None)
-            || policy.should_desync(Some(cleaned), None)
-            || policy.should_desync(Some(&sample_subdomain), None)
-        {
-            return true;
-        }
-    }
-
-    if include_candidates.is_empty() {
-        return false;
-    }
-    let Some(expr) = baseline_wildcard_to_regex(baseline) else {
-        return false;
-    };
-    let Ok(pat_re) = Regex::new(&expr) else {
-        return false;
-    };
-    include_candidates.iter().any(|cand| pat_re.is_match(cand))
-}
-
 #[cfg(test)]
 fn merge_service_bypass_domains(existing: &[String], extra: &[String]) -> Vec<String> {
     merge_service_bypass_domains_with_include(existing, extra, &[])
@@ -2022,25 +2025,12 @@ fn merge_service_bypass_domains_with_include(
     extra: &[String],
     include_domains: &[String],
 ) -> Vec<String> {
-    let mut valid_include_patterns = Vec::new();
-    let mut include_candidates = Vec::new();
-    for raw in include_domains {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if RegexBuilder::new(trimmed)
-            .case_insensitive(true)
-            .build()
-            .is_ok()
-        {
-            valid_include_patterns.push(trimmed.to_string());
-        }
-        include_candidates.extend(extract_include_domain_candidates(trimmed));
-    }
-    let include_policy = (!valid_include_patterns.is_empty())
-        .then(|| BypassPolicy::new(&[], &valid_include_patterns).ok())
-        .flatten();
+    let filterable_baselines: Vec<&str> = BASELINE_BYPASS_DOMAINS
+        .iter()
+        .copied()
+        .filter(|baseline| !is_local_or_ip_baseline(baseline))
+        .collect();
+    let kept_non_local = filter_pac_default_bypass_domains(&filterable_baselines, include_domains);
 
     let mut out: Vec<String> = Vec::new();
     let mut push_unique = |val: &str| {
@@ -2054,11 +2044,7 @@ fn merge_service_bypass_domains_with_include(
         push_unique(item);
     }
     for baseline in BASELINE_BYPASS_DOMAINS {
-        if baseline_overridden_by_includes(
-            baseline,
-            include_policy.as_ref(),
-            &include_candidates,
-        ) {
+        if !is_local_or_ip_baseline(baseline) && !kept_non_local.contains(&baseline) {
             continue;
         }
         push_unique(baseline);
@@ -3564,12 +3550,19 @@ ProtonVPN
             gid: 20,
             home_dir: Some(PathBuf::from("/Users/alice")),
         };
-        let paths = collect_macos_proxy_state_paths(Some(&user));
-        assert!(paths.contains(&PathBuf::from("/Users/alice/.vdpi/macos-proxy-state.json")));
-        assert!(paths.contains(&PathBuf::from(
+        let root_paths = collect_macos_proxy_state_paths(Some(&user), true);
+        assert!(root_paths.contains(&PathBuf::from("/Users/alice/.vdpi/macos-proxy-state.json")));
+        assert!(root_paths.contains(&PathBuf::from(
             "/Library/Application Support/vdpi/macos-proxy-state.json"
         )));
-        assert!(paths.contains(&PathBuf::from("/var/root/.vdpi/macos-proxy-state.json")));
+        assert!(root_paths.contains(&PathBuf::from("/var/root/.vdpi/macos-proxy-state.json")));
+
+        let non_root_paths = collect_macos_proxy_state_paths(Some(&user), false);
+        assert!(non_root_paths.contains(&PathBuf::from("/Users/alice/.vdpi/macos-proxy-state.json")));
+        assert!(non_root_paths.contains(&PathBuf::from(
+            "/Library/Application Support/vdpi/macos-proxy-state.json"
+        )));
+        assert!(!non_root_paths.contains(&PathBuf::from("/var/root/.vdpi/macos-proxy-state.json")));
 
         let base = std::env::temp_dir().join(format!(
             "vdpi-macos-reset-symlink-guard-{}",
@@ -3597,5 +3590,238 @@ ProtonVPN
         assert!(victim.exists());
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn reset_single_service_skips_clean_and_ignores_stale_saved_unrecognized_service() {
+        let clean = NetworkServiceProxyStatus {
+            service: "Wi-Fi".to_string(),
+            auto_proxy_enabled: false,
+            auto_proxy_url: String::new(),
+            web_enabled: false,
+            web_server: String::new(),
+            web_port: String::new(),
+            secure_enabled: false,
+            secure_server: String::new(),
+            secure_port: String::new(),
+            socks_enabled: false,
+            socks_server: String::new(),
+            socks_port: String::new(),
+        };
+        let default_bypass = vec!["*.local".to_string(), "169.254/16".to_string()];
+
+        // Clean service with default bypass domains is skipped with zero networksetup calls.
+        let mut outcome = UnixProxyResetOutcome::default();
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        let priv_hit = reset_single_macos_service_with(
+            "Wi-Fi",
+            false,
+            false,
+            &clean,
+            Ok(default_bypass.clone()),
+            &mut outcome,
+            |args| {
+                calls.push(args.iter().map(|s| (*s).to_string()).collect());
+                Ok(String::new())
+            },
+        );
+        assert!(!priv_hit);
+        assert!(calls.is_empty());
+        assert!(!outcome.proxy_changed);
+        assert!(!outcome.skipped_privileges);
+        assert!(outcome.errors.is_empty());
+
+        // Saved-state-only stale service returning "is not a recognized network service" is ignored.
+        let mut stale_outcome = UnixProxyResetOutcome::default();
+        let mut stale_calls: Vec<Vec<String>> = Vec::new();
+        let priv_hit = reset_single_macos_service_with(
+            "USB 10/100/1000 LAN",
+            true,
+            false,
+            &clean,
+            Err(anyhow::anyhow!(
+                "USB 10/100/1000 LAN is not a recognized network service."
+            )),
+            &mut stale_outcome,
+            |args| {
+                stale_calls.push(args.iter().map(|s| (*s).to_string()).collect());
+                Ok(String::new())
+            },
+        );
+        assert!(!priv_hit);
+        assert!(stale_calls.is_empty());
+        assert!(!stale_outcome.proxy_changed);
+        assert!(stale_outcome.errors.is_empty());
+
+        // Also ignored if get_proxy_bypass_domains errored generically and run_cmd reports unrecognized.
+        let mut stale_cmd_outcome = UnixProxyResetOutcome::default();
+        let priv_hit = reset_single_macos_service_with(
+            "USB 10/100/1000 LAN",
+            true,
+            false,
+            &clean,
+            Err(anyhow::anyhow!("transient failure")),
+            &mut stale_cmd_outcome,
+            |_args| {
+                Err(anyhow::anyhow!(
+                    "USB 10/100/1000 LAN is not a recognized network service."
+                ))
+            },
+        );
+        assert!(!priv_hit);
+        assert!(!stale_cmd_outcome.proxy_changed);
+        assert!(stale_cmd_outcome.errors.is_empty());
+    }
+
+    #[test]
+    fn restore_service_clears_pac_url_preserves_mid_session_external_bypass_and_supports_non_loopback() {
+        let base_status = NetworkServiceProxyStatus {
+            service: "Wi-Fi".to_string(),
+            auto_proxy_enabled: true,
+            auto_proxy_url: "http://127.0.0.1:8080/vdpi.pac".to_string(),
+            web_enabled: false,
+            web_server: String::new(),
+            web_port: String::new(),
+            secure_enabled: false,
+            secure_server: String::new(),
+            secure_port: String::new(),
+            socks_enabled: false,
+            socks_server: String::new(),
+            socks_port: String::new(),
+        };
+        let saved_clean = SavedServiceProxyState {
+            service: "Wi-Fi".to_string(),
+            autoproxy: AutoProxyState::default(),
+            webproxy: ManualProxyState::default(),
+            securewebproxy: ManualProxyState::default(),
+            socksfirewallproxy: ManualProxyState::default(),
+            bypass_domains: Some(vec!["*.local".to_string(), "169.254/16".to_string()]),
+        };
+
+        // 1. Clearing vdpi PAC with no prior corporate PAC clears AutoProxyURL then disables state,
+        //    and restores bypass_domains.
+        let mut cmds: Vec<Vec<String>> = Vec::new();
+        let mut restored_bypass: Vec<Vec<String>> = Vec::new();
+        restore_service_proxy_state_with(
+            "Wi-Fi",
+            &base_status,
+            Some(&saved_clean),
+            Some("http://127.0.0.1:8080/vdpi.pac"),
+            |args| {
+                cmds.push(args.iter().map(|s| (*s).to_string()).collect());
+                Ok(String::new())
+            },
+            |_svc, domains| {
+                restored_bypass.push(domains.to_vec());
+                Ok(())
+            },
+        );
+        assert_eq!(
+            cmds,
+            vec![
+                vec!["-setautoproxyurl", "Wi-Fi", ""],
+                vec!["-setautoproxystate", "Wi-Fi", "off"],
+            ]
+        );
+        assert_eq!(
+            restored_bypass,
+            vec![vec!["*.local".to_string(), "169.254/16".to_string()]]
+        );
+
+        // 2. Non-loopback --addr PAC URL is recognized via expected_pac_url and cleared cleanly.
+        let mut non_loopback = base_status.clone();
+        non_loopback.auto_proxy_url = "http://192.168.1.50:8080/vdpi.pac".to_string();
+        assert_eq!(
+            classify_service_reconcile(&non_loopback, "http://192.168.1.50:8080/vdpi.pac"),
+            ServiceReconcileDecision::AlreadyAligned
+        );
+        let mut non_loopback_cmds: Vec<Vec<String>> = Vec::new();
+        let mut non_loopback_bypass: Vec<Vec<String>> = Vec::new();
+        restore_service_proxy_state_with(
+            "Wi-Fi",
+            &non_loopback,
+            Some(&saved_clean),
+            Some("http://192.168.1.50:8080/vdpi.pac"),
+            |args| {
+                non_loopback_cmds.push(args.iter().map(|s| (*s).to_string()).collect());
+                Ok(String::new())
+            },
+            |_svc, domains| {
+                non_loopback_bypass.push(domains.to_vec());
+                Ok(())
+            },
+        );
+        assert_eq!(
+            non_loopback_cmds,
+            vec![
+                vec!["-setautoproxyurl", "Wi-Fi", ""],
+                vec!["-setautoproxystate", "Wi-Fi", "off"],
+            ]
+        );
+        assert_eq!(non_loopback_bypass.len(), 1);
+
+        // 3. Mid-session corporate PAC enabled -> skip clearing PAC and skip restoring bypass_domains.
+        let mut corp_pac = base_status.clone();
+        corp_pac.auto_proxy_url = "https://corp.example/wpad.dat".to_string();
+        let mut corp_cmds: Vec<Vec<String>> = Vec::new();
+        let mut corp_bypass: Vec<Vec<String>> = Vec::new();
+        restore_service_proxy_state_with(
+            "Wi-Fi",
+            &corp_pac,
+            Some(&saved_clean),
+            Some("http://127.0.0.1:8080/vdpi.pac"),
+            |args| {
+                corp_cmds.push(args.iter().map(|s| (*s).to_string()).collect());
+                Ok(String::new())
+            },
+            |_svc, domains| {
+                corp_bypass.push(domains.to_vec());
+                Ok(())
+            },
+        );
+        assert!(corp_cmds.is_empty());
+        assert!(corp_bypass.is_empty());
+
+        // 4. Mid-session corporate manual proxy enabled -> skip restoring bypass_domains.
+        let mut corp_manual = base_status.clone();
+        corp_manual.web_enabled = true;
+        corp_manual.web_server = "proxy.corp.example".to_string();
+        corp_manual.web_port = "3128".to_string();
+        let mut manual_bypass: Vec<Vec<String>> = Vec::new();
+        restore_service_proxy_state_with(
+            "Wi-Fi",
+            &corp_manual,
+            Some(&saved_clean),
+            Some("http://127.0.0.1:8080/vdpi.pac"),
+            |_args| Ok(String::new()),
+            |_svc, domains| {
+                manual_bypass.push(domains.to_vec());
+                Ok(())
+            },
+        );
+        assert!(manual_bypass.is_empty());
+    }
+
+    #[test]
+    fn wildcard_include_domains_override_matching_macos_baselines() {
+        let existing = vec!["*.local".to_string()];
+        let org_tr_wildcard = merge_service_bypass_domains_with_include(
+            &existing,
+            &[],
+            &["*.org.tr".to_string()],
+        );
+        assert!(!org_tr_wildcard.contains(&"*.org.tr".to_string()));
+        assert!(org_tr_wildcard.contains(&"*.gov.tr".to_string()));
+        assert!(org_tr_wildcard.contains(&"localhost".to_string()));
+        assert!(org_tr_wildcard.contains(&"192.168.*".to_string()));
+
+        let dot_gov_tr = merge_service_bypass_domains_with_include(
+            &existing,
+            &[],
+            &[".gov.tr".to_string()],
+        );
+        assert!(!dot_gov_tr.contains(&"*.gov.tr".to_string()));
+        assert!(!dot_gov_tr.contains(&"*.osym.gov.tr".to_string()));
+        assert!(dot_gov_tr.contains(&"*.org.tr".to_string()));
     }
 }

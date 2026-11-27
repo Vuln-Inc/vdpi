@@ -473,6 +473,14 @@ pub struct CliArgs {
         default_value_t = false
     )]
     pub internal_macos_tun_guard: bool,
+
+    /// Run Windows WinINET refresh helper in the interactive user session (internal)
+    #[arg(
+        long = "internal-wininet-notify",
+        hide = true,
+        default_value_t = false
+    )]
+    pub internal_wininet_notify: bool,
 }
 
 #[derive(Debug, Default)]
@@ -511,7 +519,7 @@ impl ExplicitFlags {
         let mut flags = Self::default();
         let mut skip_next = false;
 
-        for raw in args {
+        for raw in args.iter().skip(1) {
             let arg = raw.as_str();
             if skip_next {
                 skip_next = false;
@@ -587,7 +595,7 @@ impl ExplicitFlags {
                     "proxy" => flags.proxy = true,
                     "tun-ipv6" => flags.tun_ipv6 = true,
                     "no-tun-ipv6" => flags.no_tun_ipv6 = true,
-                    "config" | "vpn-coexistence" | "split-mode" => {
+                    "config" | "vpn-coexistence" | "split-mode" | "app" | "query" | "filter" => {
                         skip_next = !has_eq;
                     }
                     _ => {}
@@ -636,6 +644,12 @@ impl ExplicitFlags {
                         }
                         't' => {
                             flags.timeout_ms = true;
+                            if chars.peek().is_none() {
+                                skip_next = true;
+                            }
+                            break;
+                        }
+                        'f' => {
                             if chars.peek().is_none() {
                                 skip_next = true;
                             }
@@ -765,7 +779,7 @@ impl CliArgs {
             Some(raw_socks_port)
         };
 
-        let dns_addr = if explicit.dns_addr {
+        let raw_dns_addr = if explicit.dns_addr {
             self.dns_addr
         } else {
             file_cfg
@@ -774,6 +788,8 @@ impl CliArgs {
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or(self.dns_addr)
         };
+        let dns_addr =
+            vdpi_core::dns::validate_custom_dns_input(&raw_dns_addr).unwrap_or(raw_dns_addr);
 
         let dns_port = if explicit.dns_port {
             self.dns_port
@@ -796,6 +812,7 @@ impl CliArgs {
         } else {
             file_cfg.doh.unwrap_or(self.enable_doh)
         };
+        let enable_doh = vdpi_core::dns::effective_enable_doh(&dns_addr, enable_doh);
 
         let chunk_size = if explicit.chunk_size {
             self.chunk_size
@@ -1746,5 +1763,65 @@ mod tests {
                 no_elevate: true,
             })
         );
+    }
+
+    #[test]
+    fn explicit_flags_skips_binary_name_and_handles_value_taking_subcommand_flags() {
+        // Binary name starting with a short flag (`-4` or `-p`) must not be parsed as a flag.
+        let argv_bin_flag = ["-4", "--no-ipv4-only", "start"].map(str::to_string);
+        let cli = CliArgs::parse_from_iter(&argv_bin_flag)
+            .expect("binary name '-4' must not conflict with --no-ipv4-only");
+        let cfg = cli.resolve_runtime_config(&FileConfig::default(), &argv_bin_flag);
+        assert!(!cfg.dns_ipv4_only);
+
+        // `--app`, `--query`, `--filter`, and `-f` must consume their values so hyphenated
+        // values are not misinterpreted as top-level flags.
+        let flags_app = ExplicitFlags::from_args(
+            &["vdpi", "split", "apply", "--mode", "exclude", "--app", "-4"].map(str::to_string),
+        );
+        assert!(!flags_app.ipv4_only);
+
+        let flags_query = ExplicitFlags::from_args(
+            &["vdpi", "split", "list", "--query", "--no-doh"].map(str::to_string),
+        );
+        assert!(!flags_query.no_doh);
+
+        let flags_filter = ExplicitFlags::from_args(
+            &["vdpi", "split", "list", "--filter", "--tun"].map(str::to_string),
+        );
+        assert!(!flags_filter.tun);
+
+        let flags_short_f = ExplicitFlags::from_args(
+            &["vdpi", "split", "list", "-f", "--no-doh"].map(str::to_string),
+        );
+        assert!(!flags_short_f.no_doh);
+
+        let flags_short_f_attached = ExplicitFlags::from_args(
+            &["vdpi", "split", "list", "-f4"].map(str::to_string),
+        );
+        assert!(!flags_short_f_attached.ipv4_only);
+    }
+
+    #[test]
+    fn resolve_runtime_config_normalizes_dns_and_reconciles_effective_enable_doh() {
+        let argv = [
+            "vdpi",
+            "start",
+            "--dns",
+            "  https://dns.nextdns.io/abc123  ",
+            "--no-doh",
+        ]
+        .map(str::to_string);
+        let cli = CliArgs::parse_from_iter(&argv).expect("valid dns + --no-doh args");
+        let cfg = cli.resolve_runtime_config(&FileConfig::default(), &argv);
+        assert_eq!(cfg.dns_addr, "https://dns.nextdns.io/abc123");
+        assert!(
+            cfg.enable_doh,
+            "explicit https:// DoH URL must reconcile enable_doh to true even with --no-doh"
+        );
+
+        let wininet_cli = CliArgs::parse_from_iter(["vdpi", "--internal-wininet-notify"])
+            .expect("hidden --internal-wininet-notify must parse");
+        assert!(wininet_cli.internal_wininet_notify);
     }
 }

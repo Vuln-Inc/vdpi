@@ -124,13 +124,77 @@ async fn resolve_proxy_vpn_conflict(policy: VpnCoexistence) -> Option<String> {
     format_proxy_vpn_conflict(policy, &cached_scope)
 }
 
+async fn write_http_error_and_shutdown(client: &mut TcpStream, response: &[u8]) {
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        client.write_all(response).await?;
+        client.flush().await?;
+        client.shutdown().await
+    })
+    .await;
+}
+
+async fn complete_pipelined_tls_record(client: &mut TcpStream, initial: &mut Vec<u8>) {
+    if !initial.is_empty()
+        && initial.len() < 5
+        && initial[0] == 0x16
+        && (initial.len() == 1 || initial[1] == 0x03)
+        && (initial.len() < 3 || initial[2] <= 0x04)
+    {
+        let mut cur = initial.len();
+        initial.resize(5, 0);
+        let _ = tokio::time::timeout(Duration::from_millis(200), async {
+            while cur < 5 {
+                let n = client.read(&mut initial[cur..5]).await?;
+                if n == 0 {
+                    break;
+                }
+                cur += n;
+                if (cur >= 2 && initial[1] != 0x03) || (cur >= 3 && initial[2] > 0x04) {
+                    break;
+                }
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await;
+        initial.truncate(cur);
+    }
+
+    if let Some(expected_len) = expected_tls_record_len(initial) {
+        if expected_len <= 16896 && initial.len() < expected_len {
+            let start = initial.len();
+            initial.resize(expected_len, 0);
+            let mut cur = start;
+            let _ = tokio::time::timeout(Duration::from_millis(400), async {
+                while cur < expected_len {
+                    let n = client.read(&mut initial[cur..expected_len]).await?;
+                    if n == 0 {
+                        break;
+                    }
+                    cur += n;
+                }
+                Ok::<(), std::io::Error>(())
+            })
+            .await;
+            initial.truncate(cur);
+        }
+    }
+}
+
 /// Handles an incoming HTTP/1.x proxy request or `CONNECT` tunnel on `client`.
-pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Result<()> {
+pub async fn handle_http_client(client: TcpStream, ctx: EngineContext) -> Result<()> {
+    handle_http_client_with_timeout(client, ctx, HANDSHAKE_TIMEOUT).await
+}
+
+async fn handle_http_client_with_timeout(
+    mut client: TcpStream,
+    ctx: EngineContext,
+    handshake_timeout: Duration,
+) -> Result<()> {
     let _ = client.set_nodelay(true);
 
     let mut buf = Vec::with_capacity(4096);
     let mut temp = [0u8; 4096];
-    let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + handshake_timeout;
     let mut scan_from = 0;
 
     let header_end = loop {
@@ -138,17 +202,27 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
             break scan_from + pos;
         }
         if buf.len() >= MAX_HTTP_HEADER_BYTES {
-            let _ = client
-                .write_all(
-                    b"HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-                )
-                .await;
-            let _ = client.flush().await;
+            write_http_error_and_shutdown(
+                &mut client,
+                b"HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await;
             bail!("HTTP header exceeded {MAX_HTTP_HEADER_BYTES} bytes");
         }
         scan_from = buf.len().saturating_sub(3);
         let read_limit = temp.len().min(MAX_HTTP_HEADER_BYTES - buf.len());
-        let n = tokio::time::timeout_at(deadline, client.read(&mut temp[..read_limit])).await??;
+        let n = match tokio::time::timeout_at(deadline, client.read(&mut temp[..read_limit])).await
+        {
+            Ok(res) => res?,
+            Err(_) => {
+                write_http_error_and_shutdown(
+                    &mut client,
+                    b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+                bail!("HTTP request header timed out after {handshake_timeout:?}");
+            }
+        };
         if n == 0 {
             return Ok(());
         }
@@ -158,17 +232,21 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
     let header_bytes = &buf[..header_end];
     let leftover = &buf[header_end..];
     if has_bare_lf(header_bytes) {
-        let _ = client
-            .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
-            .await;
+        write_http_error_and_shutdown(
+            &mut client,
+            b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n",
+        )
+        .await;
         bail!("bare LF in HTTP request header");
     }
     let header_str = match std::str::from_utf8(header_bytes) {
         Ok(s) => s,
         Err(_) => {
-            let _ = client
-                .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
-                .await;
+            write_http_error_and_shutdown(
+                &mut client,
+                b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n",
+            )
+            .await;
             bail!("non-UTF8 HTTP request header");
         }
     };
@@ -184,9 +262,11 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
     let version = parts.next().unwrap_or("HTTP/1.1");
 
     if !is_valid_http_method(method) || target.is_empty() {
-        let _ = client
-            .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
-            .await;
+        write_http_error_and_shutdown(
+            &mut client,
+            b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n",
+        )
+        .await;
         bail!("malformed HTTP request line");
     }
 
@@ -236,9 +316,11 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
         let (host, port) = match parse_authority(target, 443) {
             Ok(hp) => hp,
             Err(e) => {
-                let _ = client
-                    .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
-                    .await;
+                write_http_error_and_shutdown(
+                    &mut client,
+                    b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n",
+                )
+                .await;
                 return Err(e);
             }
         };
@@ -250,7 +332,7 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
                 b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                     .as_slice()
             };
-            let _ = client.write_all(status).await;
+            write_http_error_and_shutdown(&mut client, status).await;
             bail!("forbidden HTTP CONNECT target '{host}:{port}'");
         }
 
@@ -277,25 +359,7 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
                 if !leftover.is_empty() {
                     let mut initial = leftover.to_vec();
                     drop(buf);
-                    if let Some(expected_len) = expected_tls_record_len(&initial) {
-                        if expected_len <= 16896 && initial.len() < expected_len {
-                            let start = initial.len();
-                            initial.resize(expected_len, 0);
-                            let mut cur = start;
-                            let _ = tokio::time::timeout(Duration::from_millis(400), async {
-                                while cur < expected_len {
-                                    let n = client.read(&mut initial[cur..expected_len]).await?;
-                                    if n == 0 {
-                                        break;
-                                    }
-                                    cur += n;
-                                }
-                                Ok::<(), std::io::Error>(())
-                            })
-                            .await;
-                            initial.truncate(cur);
-                        }
-                    }
+                    complete_pipelined_tls_record(&mut client, &mut initial).await;
                     return ctx
                         .establish_and_relay(client, remote, &initial, Some(&host), remote_addr)
                         .await;
@@ -314,14 +378,16 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
                     b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                         .as_slice()
                 };
-                let _ = client.write_all(status).await;
+                write_http_error_and_shutdown(&mut client, status).await;
                 bail!("forbidden resolved HTTP CONNECT target '{remote_addr}'");
             }
             Err(ConnectTargetError::Upstream(e)) => {
                 debug!(host = %host, port = port, error = %e, "HTTP CONNECT upstream failed");
-                let _ = client
-                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                    .await;
+                write_http_error_and_shutdown(
+                    &mut client,
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
                 return Err(e);
             }
         }
@@ -331,9 +397,11 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
     let (host, port, origin_path) = match parse_http_proxy_target(target, header_str) {
         Ok(res) => res,
         Err(e) => {
-            let _ = client
-                .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
-                .await;
+            write_http_error_and_shutdown(
+                &mut client,
+                b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n",
+            )
+            .await;
             return Err(e);
         }
     };
@@ -343,7 +411,7 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
         } else {
             b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice()
         };
-        let _ = client.write_all(status).await;
+        write_http_error_and_shutdown(&mut client, status).await;
         bail!("forbidden HTTP proxy target '{host}:{port}'");
     }
 
@@ -367,15 +435,15 @@ pub async fn handle_http_client(mut client: TcpStream, ctx: EngineContext) -> Re
                 b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                     .as_slice()
             };
-            let _ = client.write_all(status).await;
+            write_http_error_and_shutdown(&mut client, status).await;
             bail!("forbidden resolved HTTP proxy target '{remote_addr}'");
         }
         Err(ConnectTargetError::Upstream(e)) => {
-            let _ = client
-                .write_all(
-                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .await;
+            write_http_error_and_shutdown(
+                &mut client,
+                b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await;
             Err(e)
         }
     }
@@ -469,14 +537,75 @@ async fn connect_http_target(
 async fn write_pac_response(client: &mut TcpStream, bytes: &[u8]) -> Result<()> {
     tokio::time::timeout(PAC_WRITE_TIMEOUT, async {
         client.write_all(bytes).await?;
-        client.flush().await
+        client.flush().await?;
+        let _ = client.shutdown().await;
+        Ok::<(), std::io::Error>(())
     })
     .await??;
     Ok(())
 }
 
+fn is_pac_path(path: &str) -> bool {
+    path.eq_ignore_ascii_case("/vdpi.pac")
+        || (path.len() >= 10 && path.as_bytes()[..10].eq_ignore_ascii_case(b"/vdpi.pac?"))
+}
+
+fn is_pac_local_host_match(host: &str, local_addr: Option<SocketAddr>) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let Ok(ip) = host.parse::<IpAddr>() else {
+        return false;
+    };
+    let canonical = ip.to_canonical();
+    if canonical.is_loopback() {
+        return true;
+    }
+    local_addr.is_some_and(|local| {
+        let local_ip = local.ip().to_canonical();
+        !local_ip.is_unspecified() && canonical == local_ip
+    })
+}
+
+fn is_local_pac_peer(peer_addr: Option<SocketAddr>, local_addr: Option<SocketAddr>) -> bool {
+    let Some(peer_ip) = peer_addr.map(|p| p.ip().to_canonical()) else {
+        return false;
+    };
+    if peer_ip.is_loopback() {
+        return true;
+    }
+    local_addr.is_some_and(|local| {
+        let local_ip = local.ip().to_canonical();
+        !local_ip.is_unspecified() && peer_ip == local_ip
+    })
+}
+
+fn is_local_pac_host(header_str: &str, local_addr: Option<SocketAddr>) -> bool {
+    let mut seen_host = false;
+    for line in header_str.lines().skip(1) {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("host") {
+            continue;
+        }
+        seen_host = true;
+        let Ok((host, _)) = parse_authority(value, 80) else {
+            return false;
+        };
+        if !is_pac_local_host_match(&host, local_addr) {
+            return false;
+        }
+    }
+    seen_host
+}
+
 fn is_local_pac_request_target(target: &str, local_addr: Option<SocketAddr>) -> bool {
-    if target == "/vdpi.pac" || target.starts_with("/vdpi.pac?") {
+    if is_pac_path(target) {
         return true;
     }
     if target.len() >= 7 && target.as_bytes()[..7].eq_ignore_ascii_case(b"http://") {
@@ -486,19 +615,16 @@ fn is_local_pac_request_target(target: &str, local_addr: Option<SocketAddr>) -> 
         };
         let authority = &rest[..path_idx];
         let path = &rest[path_idx..];
-        if path != "/vdpi.pac" && !path.starts_with("/vdpi.pac?") {
+        if !is_pac_path(path) {
             return false;
         }
         let default_port = local_addr.map_or(80, |a| a.port());
         let Ok((host, port)) = parse_authority(authority, default_port) else {
             return false;
         };
-        let is_loopback_host = host.eq_ignore_ascii_case("localhost")
-            || host
-                .parse::<IpAddr>()
-                .is_ok_and(|ip| ip.to_canonical().is_loopback());
+        let host_matches = is_pac_local_host_match(&host, local_addr);
         let port_matches = local_addr.is_none_or(|local| port == local.port());
-        return is_loopback_host && port_matches;
+        return host_matches && port_matches;
     }
     false
 }
@@ -637,15 +763,26 @@ fn render_pac_bypass_clauses(bypass_domains: &[String]) -> String {
         }
         let unbracketed = trimmed.trim_start_matches('[').trim_end_matches(']');
         if let Ok(ip) = unbracketed.parse::<IpAddr>() {
-            let lit = escape_js_string(&ip.to_canonical().to_string());
-            clauses.push_str(&format!(" ||\n    h === {lit}"));
+            match ip.to_canonical() {
+                IpAddr::V4(v4) => {
+                    let lit = escape_js_string(&v4.to_string());
+                    clauses.push_str(&format!(" ||\n    h === {lit}"));
+                }
+                IpAddr::V6(v6) => {
+                    let lit = escape_js_string(&v6.to_string());
+                    clauses.push_str(&format!(
+                        " ||\n    (h.indexOf(\":\") !== -1 && isInNetV6(h, {lit}, 128))"
+                    ));
+                }
+            }
             continue;
         }
         if let Some(suffix) = trimmed
             .strip_prefix("*.")
             .or_else(|| trimmed.strip_prefix('.'))
+            .map(|s| s.trim_end_matches('.'))
+            .filter(|s| !s.contains('*'))
         {
-            let suffix = suffix.trim_end_matches('.');
             if suffix.is_empty() {
                 continue;
             }
@@ -689,28 +826,26 @@ const PAC_DEFAULT_DIRECT_DOMAINS: &[&str] = &[
     "rgpub.io",
     "rdatasrv.net",
     "leagueoflegends.com",
-    // Third-party VPN control-plane, auth & bootstrap APIs
-    "mullvad.net",
-    "protonvpn.com",
-    "proton.me",
-    "nordvpn.com",
-    "surfshark.com",
+    // Unblocked mesh/VPN control-plane & bootstrap APIs (BTK-blocked consumer VPN & Proton web
+    // domains are intentionally omitted so they remain reachable through vdpi)
     "cloudflareclient.com",
     "tailscale.com",
+    "tailscale.io",
+    "radmin-vpn.com",
+    "radmin.com",
+    "famatech.com",
     "expressvpn.com",
     "expressvpn.net",
     "expressapisv2.net",
     "xvnet.net",
     "xvtel.com",
-    "windscribe.com",
-    "cyberghostvpn.com",
-    "privateinternetaccess.com",
-    "pia-dns.com",
-    "ipvanish.com",
-    "tunnelbear.com",
-    "adguard-vpn.com",
-    "hotspotshield.com",
-    "warp.plus",
+    // Core unblocked Windows / Microsoft OS update, telemetry & push domains
+    "windowsupdate.com",
+    "update.microsoft.com",
+    "delivery.mp.microsoft.com",
+    "smartscreen.microsoft.com",
+    "wns.windows.com",
+    "gvt2.com",
 ];
 
 #[cfg(test)]
@@ -761,6 +896,7 @@ fn render_pac_script_with_policy(
     format!(
         concat!(
             "function FindProxyForURL(url, host) {{\n",
+            "  if (!host) return \"DIRECT\";\n",
             "  var h = host.toLowerCase().replace(/\\.$/, \"\").replace(/^\\[|\\]$/g, \"\").replace(/%.*$/, \"\");\n",
             "  var isIpv4 = /^\\d{{1,3}}(?:\\.\\d{{1,3}}){{3}}$/.test(h);\n",
             "  if (\n",
@@ -787,6 +923,7 @@ fn render_pac_script_with_policy(
             "    shExpMatch(h, \"*.internal\") ||\n",
             "    shExpMatch(h, \"*.lan\") ||\n",
             "    shExpMatch(h, \"*.home.arpa\") ||\n",
+            "    h === \"ts.net\" ||\n",
             "    shExpMatch(h, \"*.ts.net\") ||\n",
             "    h === \"captive.apple.com\" ||\n",
             "    h === \"www.msftconnecttest.com\" ||\n",
@@ -813,7 +950,7 @@ fn render_pac_script_with_policy(
             "    shExpMatch(h, \"*.localtest.me\") ||\n",
             "    (isIpv4 && shExpMatch(h, \"10.*\")) ||\n",
             "    (isIpv4 && shExpMatch(h, \"192.168.*\")) ||\n",
-            "    (isIpv4 && isInNet(h, \"192.0.0.0\", \"255.255.255.0\")) ||\n",
+            "    (isIpv4 && shExpMatch(h, \"192.0.0.*\")) ||\n",
             "    (isIpv4 && shExpMatch(h, \"169.254.*\")) ||\n",
             "    (isIpv4 && /^172\\.(1[6-9]|2[0-9]|3[0-1])\\./.test(h)) ||\n",
             "    /^100\\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.\\d{{1,3}}\\.\\d{{1,3}}$/.test(h) ||\n",
@@ -837,11 +974,10 @@ async fn handle_pac_http_request(
     header_str: &str,
     ctx: &EngineContext,
 ) -> Result<()> {
-    let is_loopback_peer = client
-        .peer_addr()
-        .is_ok_and(|p| p.ip().to_canonical().is_loopback());
-    if !is_loopback_peer
-        || !is_local_health_host(header_str)
+    let peer_addr = client.peer_addr().ok();
+    let local_addr = client.local_addr().ok();
+    if !is_local_pac_peer(peer_addr, local_addr)
+        || !is_local_pac_host(header_str, local_addr)
         || has_forbidden_browser_headers(header_str)
     {
         let _ = write_pac_response(
@@ -863,14 +999,14 @@ async fn handle_pac_http_request(
         return Ok(());
     }
 
-    let proxy_authority = resolve_pac_proxy_authority(client.local_addr().ok(), ctx);
+    let proxy_authority = resolve_pac_proxy_authority(local_addr, ctx);
     let body = render_pac_script_with_policy(
         &proxy_authority,
         &ctx.config.bypass_domains,
         &ctx.config.patterns,
     );
     let headers = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig; charset=utf-8\r\nCache-Control: no-store, max-age=0\r\nX-Content-Type-Options: nosniff\r\nCross-Origin-Resource-Policy: same-origin\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig; charset=utf-8\r\nCache-Control: no-cache, max-age=0, private\r\nX-Content-Type-Options: nosniff\r\nCross-Origin-Resource-Policy: same-origin\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     if is_head {
@@ -1503,17 +1639,19 @@ mod tests {
         assert!(
             headers.contains("Content-Type: application/x-ns-proxy-autoconfig; charset=utf-8\r\n")
         );
-        assert!(headers.contains("Cache-Control: no-store, max-age=0\r\n"));
+        assert!(headers.contains("Cache-Control: no-cache, max-age=0, private\r\n"));
         assert!(headers.contains("X-Content-Type-Options: nosniff\r\n"));
         assert!(headers.contains("Cross-Origin-Resource-Policy: same-origin\r\n"));
         assert!(headers.contains(&format!("Content-Length: {}\r\n", body.len())));
         assert!(headers.contains("Connection: close"));
         assert!(body.contains("function FindProxyForURL(url, host)"));
+        assert!(body.contains("if (!host) return \"DIRECT\";"));
         assert!(body.contains("var h = host.toLowerCase()"));
         assert!(body.contains("shExpMatch(h, \"127.*\")"));
         assert!(body.contains("h === \"0.0.0.0\""));
         assert!(body.contains("h === \"::\""));
         assert!(body.contains("h === \"0:0:0:0:0:0:0:1\""));
+        assert!(body.contains("h === \"ts.net\""));
         assert!(body.contains("shExpMatch(h, \"*.ts.net\")"));
         assert!(body.contains("shExpMatch(h, \"*.lan\")"));
         assert!(body.contains("shExpMatch(h, \"*.home.arpa\")"));
@@ -1750,7 +1888,7 @@ mod tests {
             "/^::ffff:(169\\.254\\.|a9fe:)/i.test(h)",
             "/^::ffff:(100\\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\\.|64[4-7][0-9a-f]:)/i.test(h)",
             "/^::ffff:(0\\.|[0-9a-f]{1,2}:)/i.test(h)",
-            "(isIpv4 && isInNet(h, \"192.0.0.0\", \"255.255.255.0\"))",
+            "(isIpv4 && shExpMatch(h, \"192.0.0.*\"))",
             "h === \"lvh.me\"",
             "shExpMatch(h, \"*.lvh.me\")",
             "h === \"nip.io\"",
@@ -1825,6 +1963,7 @@ mod tests {
                 "unexpected legacy shExpMatch IPv4-mapped clause: {legacy}"
             );
         }
+        assert!(!script.contains("isInNet"));
         assert!(!script.contains("dnsResolve"));
     }
 
@@ -2309,7 +2448,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pac_endpoint_uses_no_store_cache_and_bypasses_riot_and_vpn_bootstrap_domains() {
+    async fn pac_endpoint_uses_no_cache_private_and_bypasses_riot_unblocked_vpn_and_msft_domains() {
         let mut cfg = CliArgs::parse_from_iter(["vdpi", "--no-system-proxy"])
             .unwrap()
             .into_runtime_config();
@@ -2337,11 +2476,12 @@ mod tests {
         let resp_str = String::from_utf8(resp).unwrap();
         let (headers, body) = resp_str.split_once("\r\n\r\n").unwrap();
         assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"));
-        assert!(headers.contains("Cache-Control: no-store, max-age=0\r\n"));
+        assert!(headers.contains("Cache-Control: no-cache, max-age=0, private\r\n"));
+        assert!(!headers.contains("no-store"));
         assert!(!headers.contains("max-age=30"));
 
         let direct_branch = body
-            .split_once("return \"DIRECT\";")
+            .rsplit_once("return \"DIRECT\";")
             .expect("PAC script must contain DIRECT return")
             .0;
 
@@ -2355,13 +2495,21 @@ mod tests {
             "rgpub.io",
             "rdatasrv.net",
             "leagueoflegends.com",
-            "mullvad.net",
-            "protonvpn.com",
-            "proton.me",
-            "nordvpn.com",
-            "surfshark.com",
             "cloudflareclient.com",
             "tailscale.com",
+            "tailscale.io",
+            "radmin-vpn.com",
+            "radmin.com",
+            "famatech.com",
+            "expressvpn.com",
+            "expressapisv2.net",
+            "xvnet.net",
+            "windowsupdate.com",
+            "update.microsoft.com",
+            "delivery.mp.microsoft.com",
+            "smartscreen.microsoft.com",
+            "wns.windows.com",
+            "gvt2.com",
         ] {
             let exact = format!("h === \"{domain}\"");
             let suffix = format!("\".{domain}\"");
@@ -2372,6 +2520,29 @@ mod tests {
             assert!(
                 direct_branch.contains(&suffix),
                 "missing PAC subdomain DIRECT clause for {domain}"
+            );
+        }
+
+        // BTK-blocked consumer VPN & Proton web domains must NOT bypass the proxy by default.
+        for blocked_vpn_domain in [
+            "proton.me",
+            "protonvpn.com",
+            "mullvad.net",
+            "nordvpn.com",
+            "surfshark.com",
+            "windscribe.com",
+            "cyberghostvpn.com",
+            "privateinternetaccess.com",
+            "pia-dns.com",
+            "ipvanish.com",
+            "tunnelbear.com",
+            "adguard-vpn.com",
+            "hotspotshield.com",
+            "warp.plus",
+        ] {
+            assert!(
+                !direct_branch.contains(blocked_vpn_domain),
+                "BTK-blocked consumer VPN/Proton domain must not be default DIRECT: {blocked_vpn_domain}"
             );
         }
 
@@ -2386,11 +2557,11 @@ mod tests {
             .into_runtime_config();
         cfg.patterns = vec![
             "auth.riotgames.com".to_string(),
-            "*.proton.me".to_string(),
-            r"\.mullvad\.net$".to_string(),
+            "*.tailscale.com".to_string(),
+            r"\.expressvpn\.com$".to_string(),
         ];
         // Explicit user bypass still wins over include_domains.
-        cfg.bypass_domains = vec!["mullvad.net".to_string()];
+        cfg.bypass_domains = vec!["expressvpn.com".to_string()];
         let ctx = EngineContext::new(cfg).unwrap();
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2415,12 +2586,116 @@ mod tests {
 
         // Overridden defaults are omitted so included targets reach the proxy.
         assert!(!body.contains("h === \"riotgames.com\""));
-        assert!(!body.contains("h === \"proton.me\""));
+        assert!(!body.contains("h === \"tailscale.com\""));
         // Explicit user bypass still remains DIRECT.
-        assert!(body.contains("h === \"mullvad.net\""));
-        // Unrelated Riot and VPN bootstrap domains stay DIRECT.
+        assert!(body.contains("h === \"expressvpn.com\""));
+        // Unrelated Riot, mesh VPN, and OS update domains stay DIRECT.
         assert!(body.contains("h === \"valorant.com\""));
-        assert!(body.contains("h === \"tailscale.com\""));
-        assert!(body.contains("h === \"nordvpn.com\""));
+        assert!(body.contains("h === \"tailscale.io\""));
+        assert!(body.contains("h === \"radmin-vpn.com\""));
+        assert!(body.contains("h === \"windowsupdate.com\""));
+    }
+
+    #[test]
+    fn pac_bypass_clauses_emit_is_in_net_v6_for_bare_ipv6_and_guard_multi_wildcards() {
+        let entries = vec![
+            "2001:0db8::1".to_string(),
+            "[fd00::42]".to_string(),
+            "*.foo.*.example.com".to_string(),
+            "*.".to_string(),
+            "198.51.100.7".to_string(),
+        ];
+        let clauses = render_pac_bypass_clauses(&entries);
+        assert!(clauses.contains("(h.indexOf(\":\") !== -1 && isInNetV6(h, \"2001:db8::1\", 128))"));
+        assert!(clauses.contains("(h.indexOf(\":\") !== -1 && isInNetV6(h, \"fd00::42\", 128))"));
+        assert!(clauses.contains("shExpMatch(h, \"*.foo.*.example.com\")"));
+        assert!(!clauses.contains("h === \"foo.*.example.com\""));
+        assert!(!clauses.contains("shExpMatch(h, \"*\")"));
+        assert!(clauses.contains("h === \"198.51.100.7\""));
+
+        let script = render_pac_script_with_bypass("127.0.0.1:8080", &["2001:db8::1".to_string()]);
+        assert!(script.contains("isInNetV6(h, \"2001:db8::1\", 128)"));
+        assert!(script.contains("function isInNetV6(ip, net, prefixLen)"));
+    }
+
+    #[test]
+    fn pac_path_is_case_insensitive_and_allows_non_loopback_local_addr_match() {
+        let lan_local: SocketAddr = "192.168.1.50:8080".parse().unwrap();
+        let lan_same_peer: SocketAddr = "192.168.1.50:54321".parse().unwrap();
+        let lan_other_peer: SocketAddr = "192.168.1.99:54321".parse().unwrap();
+
+        assert!(is_local_pac_request_target("/VDPI.PAC", Some(lan_local)));
+        assert!(is_local_pac_request_target("/Vdpi.Pac?v=2", Some(lan_local)));
+        assert!(is_local_pac_request_target(
+            "http://192.168.1.50:8080/VDPI.PAC?ts=1",
+            Some(lan_local)
+        ));
+        assert!(!is_local_pac_request_target(
+            "http://192.168.1.99:8080/vdpi.pac",
+            Some(lan_local)
+        ));
+        assert!(!is_local_pac_request_target("/vdpi.pac.bak", Some(lan_local)));
+
+        assert!(is_local_pac_peer(Some(lan_same_peer), Some(lan_local)));
+        assert!(!is_local_pac_peer(Some(lan_other_peer), Some(lan_local)));
+
+        let lan_host_hdr = "GET /VDPI.PAC HTTP/1.1\r\nHost: 192.168.1.50:8080\r\n\r\n";
+        let other_host_hdr = "GET /VDPI.PAC HTTP/1.1\r\nHost: 192.168.1.99:8080\r\n\r\n";
+        assert!(is_local_pac_host(lan_host_hdr, Some(lan_local)));
+        assert!(!is_local_pac_host(other_host_hdr, Some(lan_local)));
+    }
+
+    #[tokio::test]
+    async fn http_handshake_timeout_returns_408_and_shuts_down_cleanly() {
+        let cli = CliArgs::parse_from_iter(["vdpi", "--no-system-proxy"]).unwrap();
+        let ctx = EngineContext::new(cli.into_runtime_config()).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            handle_http_client_with_timeout(sock, ctx, Duration::from_millis(50)).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n")
+            .await
+            .unwrap();
+
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        assert_eq!(
+            resp,
+            b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        assert!(server.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn connect_pipelined_tls_record_reassembles_split_header_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut record = vec![0x16, 0x03, 0x01, 0x00, 0x10];
+        record.extend_from_slice(&[0xab; 16]);
+        let rest_of_record = record[2..].to_vec();
+
+        let client_task = tokio::spawn(async move {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            // Send remaining 3 header bytes + 16-byte record body in two chunks.
+            client.write_all(&rest_of_record[..3]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            client.write_all(&rest_of_record[3..]).await.unwrap();
+            let _ = client.shutdown().await;
+        });
+
+        let (mut server_sock, _) = listener.accept().await.unwrap();
+        let mut initial = record[..2].to_vec();
+        complete_pipelined_tls_record(&mut server_sock, &mut initial).await;
+        client_task.await.unwrap();
+        assert_eq!(initial, record);
     }
 }

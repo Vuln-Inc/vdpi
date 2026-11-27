@@ -105,17 +105,29 @@ fn parse_valid_doh_authority(authority: &str) -> Option<&str> {
         .then_some(host_port)
 }
 
-/// Redacts custom `https://` DoH URL path/query/userinfo tokens so NextDNS/ControlD
-/// profile identifiers are never leaked in doctor diagnostics or telemetry output.
-/// Bracketed IPv6 hosts are preserved; malformed `https://` URLs collapse to
-/// `https://[redacted]` so raw secrets can never leak.
+fn split_http_scheme(trimmed: &str) -> Option<(&'static str, &str)> {
+    if trimmed
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
+        Some(("https://", &trimmed[8..]))
+    } else if trimmed
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+    {
+        Some(("http://", &trimmed[7..]))
+    } else {
+        None
+    }
+}
+
+/// Redacts custom `https://` and `http://` URL path/query/userinfo tokens so NextDNS/ControlD
+/// profile identifiers or proxy credentials are never leaked in doctor diagnostics or telemetry.
+/// Bracketed IPv6 hosts are preserved; malformed URLs collapse to `<scheme>[redacted]` so raw
+/// secrets can never leak.
 fn redact_dns_addr(dns_addr: &str) -> String {
     let trimmed = dns_addr.trim();
-    let Some(rest) = trimmed
-        .get(..8)
-        .filter(|prefix| prefix.eq_ignore_ascii_case("https://"))
-        .map(|_| &trimmed[8..])
-    else {
+    let Some((scheme, rest)) = split_http_scheme(trimmed) else {
         return trimmed.to_string();
     };
 
@@ -124,32 +136,38 @@ fn redact_dns_addr(dns_addr: &str) -> String {
         None => (rest, ""),
     };
     let Some(host_port) = parse_valid_doh_authority(authority) else {
-        return "https://[redacted]".to_string();
+        return format!("{scheme}[redacted]");
     };
     if !suffix.is_empty() && suffix != "/" {
-        format!("https://{host_port}/[redacted]")
+        format!("{scheme}{host_port}/[redacted]")
     } else {
-        format!("https://{host_port}")
+        format!("{scheme}{host_port}")
     }
 }
 
-fn find_https_scheme_ascii_ci(s: &str, from: usize) -> Option<usize> {
+fn find_http_scheme_ascii_ci(s: &str, from: usize) -> Option<(usize, usize)> {
     let bytes = s.as_bytes();
-    if bytes.len().saturating_sub(from) < 8 {
+    if bytes.len().saturating_sub(from) < 7 {
         return None;
     }
-    for i in from..=bytes.len() - 8 {
-        if bytes[i..i + 8].eq_ignore_ascii_case(b"https://") {
-            return Some(i);
+    for i in from..=bytes.len() - 7 {
+        if bytes
+            .get(i..i + 8)
+            .is_some_and(|w| w.eq_ignore_ascii_case(b"https://"))
+        {
+            return Some((i, 8));
+        }
+        if bytes[i..i + 7].eq_ignore_ascii_case(b"http://") {
+            return Some((i, 7));
         }
     }
     None
 }
 
-/// Redacts any embedded `https://` URLs inside diagnostic/error detail strings
-/// (e.g. `reqwest` or DNS resolver errors) so raw DoH tokens never leak in reports.
+/// Redacts any embedded `https://` or `http://` URLs inside diagnostic/error detail strings
+/// (e.g. `reqwest` or DNS resolver errors) so raw DoH tokens or credentials never leak in reports.
 fn redact_urls_in_detail(detail: &str) -> String {
-    let Some(first) = find_https_scheme_ascii_ci(detail, 0) else {
+    let Some(first) = find_http_scheme_ascii_ci(detail, 0) else {
         return detail.to_string();
     };
 
@@ -157,7 +175,7 @@ fn redact_urls_in_detail(detail: &str) -> String {
     let mut cursor = 0usize;
     let mut next_match = Some(first);
 
-    while let Some(start) = next_match {
+    while let Some((start, scheme_len)) = next_match {
         out.push_str(&detail[cursor..start]);
 
         let rest = &detail[start..];
@@ -172,7 +190,7 @@ fn redact_urls_in_detail(detail: &str) -> String {
         let mut url_end = start + rel_end;
         // Strip trailing wrapper/sentence punctuation without stripping a closing
         // IPv6 bracket (`]`) or balanced delimiters inside the URL itself.
-        while url_end > start + 8 {
+        while url_end > start + scheme_len {
             let candidate = &detail[start..url_end];
             let last = candidate.as_bytes()[candidate.len() - 1];
             let should_trim = match last {
@@ -200,7 +218,7 @@ fn redact_urls_in_detail(detail: &str) -> String {
 
         out.push_str(&redact_dns_addr(&detail[start..url_end]));
         cursor = url_end;
-        next_match = find_https_scheme_ascii_ci(detail, cursor);
+        next_match = find_http_scheme_ascii_ci(detail, cursor);
     }
 
     out.push_str(&detail[cursor..]);
@@ -209,10 +227,16 @@ fn redact_urls_in_detail(detail: &str) -> String {
 
 /// Runs live connectivity probes using `vdpi`'s real DoH resolver and 7-stage TLS desync engine.
 pub async fn run_doctor(cfg: &TunnelConfig) -> DoctorReport {
-    let mut runtime_cfg = cfg.clone().into_runtime_config();
-    // Prevent iOS/Android TUN DNS recursion loops through the system resolver.
-    runtime_cfg.disable_system_dns_fallback = true;
-    let ctx = match EngineContext::new(runtime_cfg) {
+    run_doctor_with_binder(cfg, None).await
+}
+
+/// Runs live connectivity probes using `vdpi`'s real DoH resolver and 7-stage TLS desync engine
+/// with an optional outbound socket [`vdpi_core::binder::OutboundBinder`].
+pub async fn run_doctor_with_binder(
+    cfg: &TunnelConfig,
+    binder: Option<Arc<dyn vdpi_core::binder::OutboundBinder>>,
+) -> DoctorReport {
+    let ctx = match crate::build_engine_context_with_binder(cfg.clone(), binder).await {
         Ok(c) => c,
         Err(e) => {
             return DoctorReport {
@@ -374,23 +398,28 @@ async fn probe_connected_tls_target(
         Ok(Ok((head, filled)))
             if filled >= 6 && head[0] == 0x16 && head[1] == 0x03 && head[5] == 0x02 =>
         {
-            let learned = ctx
-                .adaptive_cache
-                .read()
-                .await
-                .get(&host.to_ascii_lowercase())
-                .copied()
-                .unwrap_or_else(|| ctx.preferred_stage());
+            let detail = if ctx.bypass.is_bypassed(Some(host), Some(remote_addr.ip())) {
+                "TLS ServerHello via bypassed (direct)".to_string()
+            } else {
+                let learned = ctx
+                    .adaptive_cache
+                    .read()
+                    .await
+                    .get(&host.to_ascii_lowercase())
+                    .copied()
+                    .unwrap_or_else(|| ctx.preferred_stage());
+                format!(
+                    "TLS ServerHello via Stage {} ({})",
+                    learned.stage_number(),
+                    learned.label()
+                )
+            };
             DoctorCheck {
                 name: name.into(),
                 target,
                 passed: true,
                 latency_ms,
-                detail: format!(
-                    "TLS ServerHello via Stage {} ({})",
-                    learned.stage_number(),
-                    learned.label()
-                ),
+                detail,
             }
         }
         Ok(Ok((head, filled))) if filled > 0 => DoctorCheck {
@@ -621,6 +650,145 @@ mod tests {
                 "bağlantı hatası (https://dns.nextdns.io/gizli?k=1): reddedildi"
             ),
             "bağlantı hatası (https://dns.nextdns.io/[redacted]): reddedildi"
+        );
+    }
+
+    #[test]
+    fn redact_dns_addr_and_detail_mask_http_and_https_urls() {
+        assert_eq!(
+            redact_dns_addr("http://user:pass@proxy.local:8080/secret?k=v"),
+            "http://proxy.local:8080/[redacted]"
+        );
+        assert_eq!(
+            redact_dns_addr("HTTP://dns.example.com/profile123"),
+            "http://dns.example.com/[redacted]"
+        );
+        assert_eq!(
+            redact_dns_addr("http://[2606:4700:4700::1111]:8080/secret"),
+            "http://[2606:4700:4700::1111]:8080/[redacted]"
+        );
+        assert_eq!(redact_dns_addr("http://example.com"), "http://example.com");
+        assert_eq!(redact_dns_addr("http://example.com/"), "http://example.com");
+        assert_eq!(redact_dns_addr("http://"), "http://[redacted]");
+        assert_eq!(redact_dns_addr("http:///secret-path"), "http://[redacted]");
+        assert_eq!(
+            redact_dns_addr("http://user:secret@/path"),
+            "http://[redacted]"
+        );
+
+        assert_eq!(
+            redact_urls_in_detail(
+                "proxy connect error for url (http://user:secret@proxy.example.com:8080/auth?k=1): refused"
+            ),
+            "proxy connect error for url (http://proxy.example.com:8080/[redacted]): refused"
+        );
+        assert_eq!(
+            redact_urls_in_detail(
+                "mixed HTTP://alice:pw@a.test/tok1, fallback <https://bob:pw@b.test/tok2>."
+            ),
+            "mixed http://a.test/[redacted], fallback <https://b.test/[redacted]>."
+        );
+        assert_eq!(
+            redact_urls_in_detail("bad endpoint (http:///top-secret): parse error"),
+            "bad endpoint (http://[redacted]): parse error"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_connected_tls_target_reports_bypassed_direct_when_host_is_bypassed() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert = rcgen::generate_simple_self_signed(vec!["doctor.test".to_string()]).unwrap();
+        let cert_der = CertificateDer::from(cert.cert.der().to_vec());
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
+        let srv_cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(srv_cfg));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let srv = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let _ = acceptor.accept(sock).await;
+        });
+
+        let mut runtime_cfg = TunnelConfig {
+            bypass_domains: vec!["doctor.test".into()],
+            ..Default::default()
+        }
+        .into_runtime_config();
+        runtime_cfg.patterns = vec!["doctor\\.test$".into()];
+        let ctx = EngineContext::new(runtime_cfg).unwrap();
+        let remote = ctx.connect_upstream_addr(addr).await.unwrap();
+        let check = probe_connected_tls_target(
+            &ctx,
+            "Bypassed TLS",
+            "doctor.test",
+            addr.to_string(),
+            remote,
+            addr,
+            Instant::now(),
+        )
+        .await;
+        let _ = srv.await;
+
+        assert!(check.passed, "expected bypassed TLS ServerHello to pass: {check:?}");
+        assert!(
+            check.detail.contains("bypassed (direct)"),
+            "expected bypassed attribution, got: {}",
+            check.detail
+        );
+        assert!(
+            !check.detail.contains("Stage "),
+            "bypassed host must not misattribute preferred stage: {}",
+            check.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn run_doctor_with_binder_routes_outbound_probes_through_binder() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct CountingRejectBinder(Arc<AtomicUsize>);
+
+        impl vdpi_core::binder::OutboundBinder for CountingRejectBinder {
+            fn bind_socket(
+                &self,
+                _sock: socket2::SockRef<'_>,
+                _is_ipv4: bool,
+            ) -> std::io::Result<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "synthetic binder reject",
+                ))
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let binder: Arc<dyn vdpi_core::binder::OutboundBinder> =
+            Arc::new(CountingRejectBinder(Arc::clone(&calls)));
+        let cfg = TunnelConfig {
+            dns_addr: "1.1.1.1".into(),
+            enable_doh: true,
+            ..Default::default()
+        };
+
+        let report = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_doctor_with_binder(&cfg, Some(binder)),
+        )
+        .await
+        .expect("run_doctor_with_binder should fail fast when binder rejects");
+
+        assert!(!report.ok);
+        assert_eq!(report.checks.len(), 4);
+        assert!(
+            calls.load(Ordering::SeqCst) > 0,
+            "expected doctor probes to invoke OutboundBinder"
         );
     }
 }

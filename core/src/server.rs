@@ -7,6 +7,7 @@ use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinSet;
@@ -15,7 +16,12 @@ use tracing::{debug, info, warn};
 pub const REPOSITORY_URL: &str = "https://github.com/Vuln-Inc/vdpi";
 const PRIMARY_FALLBACK_PORTS: &[u16] = &[18080, 18081, 18082, 28080, 38080, 48080];
 const SOCKS_FALLBACK_PORTS: &[u16] = &[11080, 11081, 11082, 21080, 31080, 41080];
-const MAX_CLIENT_SESSIONS: usize = 256;
+const MAX_CLIENT_SESSIONS: usize = 2048;
+const MAX_OVERLOAD_RESPONDERS: usize = 64;
+const OVERLOAD_PEEK_TIMEOUT: Duration = Duration::from_millis(50);
+const OVERLOAD_RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
+const HTTP_503_RESPONSE: &[u8] =
+    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
 pub struct BoundListeners {
     pub primary_listener: TcpListener,
@@ -250,15 +256,18 @@ async fn serve_with_limit(
             .and_then(|(listener, addr)| ipv4_companion(listener, addr)),
     ];
     let slots = Arc::new(Semaphore::new(limit));
+    let overload_slots = Arc::new(Semaphore::new(MAX_OVERLOAD_RESPONDERS));
     let primary_loop = serve_listener(
         listeners.primary_listener,
         ctx.clone(),
         shutdown_rx.clone(),
         slots.clone(),
+        overload_slots.clone(),
+        true,
     );
     let socks_loop = async move {
         if let Some(listener) = listeners.socks_listener {
-            serve_listener(listener, ctx, shutdown_rx, slots).await;
+            serve_listener(listener, ctx, shutdown_rx, slots, overload_slots, false).await;
         }
     };
     tokio::join!(primary_loop, socks_loop);
@@ -273,11 +282,41 @@ fn ipv4_companion(listener: &TcpListener, addr: SocketAddr) -> Option<SocketAddr
     .then(|| SocketAddr::from((Ipv4Addr::UNSPECIFIED, addr.port())))
 }
 
+async fn respond_overloaded(mut stream: TcpStream, is_http_listener: bool) {
+    let _ = tokio::time::timeout(OVERLOAD_RESPONSE_TIMEOUT, async {
+        if is_http_listener {
+            let mut first = [0u8; 1];
+            let is_socks = matches!(
+                tokio::time::timeout(OVERLOAD_PEEK_TIMEOUT, stream.peek(&mut first)).await,
+                Ok(Ok(1)) if matches!(first[0], 0x04 | 0x05)
+            );
+            if !is_socks {
+                // Drain already-buffered HTTP request bytes so Windows does not emit TCP RST
+                // on close before the browser finishes reading the 503 status line.
+                let mut drain = [0u8; 1024];
+                for _ in 0..8 {
+                    match stream.try_read(&mut drain) {
+                        Ok(0) => break,
+                        Ok(_) => continue,
+                        Err(_) => break,
+                    }
+                }
+                let _ = stream.write_all(HTTP_503_RESPONSE).await;
+                let _ = stream.flush().await;
+            }
+        }
+        let _ = stream.shutdown().await;
+    })
+    .await;
+}
+
 async fn serve_listener(
     listener: TcpListener,
     ctx: EngineContext,
     mut stop: watch::Receiver<bool>,
     slots: Arc<Semaphore>,
+    overload_slots: Arc<Semaphore>,
+    is_http_listener: bool,
 ) {
     let mut sessions = JoinSet::new();
     let shutdown = async { drop(stop.wait_for(|stopped| *stopped).await) };
@@ -294,8 +333,15 @@ async fn serve_listener(
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, peer)) => {
-                        // Close excess sockets rather than queueing unbounded client tasks.
+                        // Return HTTP 503 on the HTTP listener (or cleanly close SOCKS) rather than
+                        // abruptly dropping the socket and triggering browser bad-proxy bans.
                         let Ok(slot) = slots.clone().try_acquire_owned() else {
+                            if let Ok(overload_slot) = overload_slots.clone().try_acquire_owned() {
+                                sessions.spawn(async move {
+                                    let _overload_slot = overload_slot;
+                                    respond_overloaded(stream, is_http_listener).await;
+                                });
+                            }
                             continue;
                         };
                         let conn_ctx = ctx.clone();
@@ -341,7 +387,7 @@ pub async fn dispatch_autodetect(stream: TcpStream, ctx: EngineContext) -> Resul
 mod tests {
     use super::*;
     use crate::config::CliArgs;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
     use tokio::time::timeout;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -483,6 +529,58 @@ mod tests {
 
             stop.send(true).unwrap();
             server.await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn max_client_sessions_supports_modern_browser_concurrency() {
+        assert_eq!(MAX_CLIENT_SESSIONS, 2048);
+    }
+
+    #[tokio::test]
+    async fn saturated_http_listener_returns_503_and_closes_cleanly_while_socks_eof() {
+        timeout(TEST_TIMEOUT, async {
+            let ctx = test_context("127.0.0.1");
+            let bound = bind_listeners(&ctx).unwrap();
+            let primary = bound.primary_addr;
+            let socks = bound.socks_addr.unwrap();
+            let (stop, rx) = watch::channel(false);
+            let server = tokio::spawn(serve_with_limit(bound, ctx, rx, 1));
+
+            // Occupy the sole session slot.
+            let mut active = TcpStream::connect(primary).await.unwrap();
+            active.write_all(&[5, 1, 0]).await.unwrap();
+            let mut reply = [0; 2];
+            active.read_exact(&mut reply).await.unwrap();
+            assert_eq!(reply, [5, 0]);
+
+            // Saturated HTTP request on primary listener receives HTTP 503 + clean EOF.
+            let mut http_overflow = TcpStream::connect(primary).await.unwrap();
+            http_overflow
+                .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+                .await
+                .unwrap();
+            let mut resp = Vec::new();
+            http_overflow.read_to_end(&mut resp).await.unwrap();
+            assert_eq!(resp, HTTP_503_RESPONSE);
+
+            // Saturated SOCKS5 request on primary listener closes cleanly without HTTP bytes.
+            let mut socks_on_primary = TcpStream::connect(primary).await.unwrap();
+            socks_on_primary.write_all(&[5, 1, 0]).await.unwrap();
+            let mut socks_resp = Vec::new();
+            socks_on_primary.read_to_end(&mut socks_resp).await.unwrap();
+            assert!(socks_resp.is_empty());
+
+            // Saturated dedicated SOCKS listener closes cleanly with EOF.
+            let mut socks_overflow = TcpStream::connect(socks).await.unwrap();
+            let mut buf = [0u8; 16];
+            assert_eq!(socks_overflow.read(&mut buf).await.unwrap(), 0);
+
+            drop(active);
+            stop.send(true).unwrap();
+            server.await.unwrap();
         })
         .await
         .unwrap();

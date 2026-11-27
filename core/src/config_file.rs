@@ -118,6 +118,8 @@ impl FileConfig {
                 runtime.dns_addr = validated;
             }
         }
+        runtime.enable_doh =
+            vdpi_core::dns::effective_enable_doh(&runtime.dns_addr, runtime.enable_doh);
         if let Some(ref domains) = self.bypass_domains {
             runtime.bypass_domains = domains.clone();
         }
@@ -344,7 +346,14 @@ fn windows_user_config_path(
             .join("vdpi")
             .join("config.toml");
     }
-    windows_system_config_path(None)
+    #[cfg(target_os = "windows")]
+    {
+        system_config_path()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        windows_system_config_path(None)
+    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -371,27 +380,77 @@ fn linux_user_config_path(xdg_config_home: Option<&OsStr>, home: Option<&OsStr>)
 
 fn candidate_config_paths(service_mode: bool) -> Vec<PathBuf> {
     if service_mode {
-        // On Windows, `LocalSystem` services must only read the admin-protected
-        // `%ProgramData%\vdpi\config.toml` path and never user-writable paths.
-        #[cfg(target_os = "windows")]
-        {
-            vec![system_config_path()]
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            vec![system_config_path(), user_config_path()]
-        }
+        // Services must only read the admin/root-protected machine-wide config
+        // and never user-writable paths.
+        vec![system_config_path()]
     } else {
         vec![user_config_path(), system_config_path()]
     }
+}
+
+fn load_merged_user_and_system_config(
+    user_path: &Path,
+    sys_path: &Path,
+) -> Result<(Option<PathBuf>, FileConfig)> {
+    let user_cfg = if let Some(contents) = read_bounded_config_file(user_path)? {
+        Some(
+            parse_config_toml(&contents)
+                .with_context(|| format!("failed to parse config file {}", user_path.display()))?,
+        )
+    } else {
+        None
+    };
+
+    if user_path == sys_path {
+        return Ok(match user_cfg {
+            Some(cfg) => (Some(user_path.to_path_buf()), cfg),
+            None => (None, FileConfig::default()),
+        });
+    }
+
+    let sys_cfg = if let Some(contents) = read_bounded_config_file(sys_path)? {
+        Some(
+            parse_config_toml(&contents)
+                .with_context(|| format!("failed to parse config file {}", sys_path.display()))?,
+        )
+    } else {
+        None
+    };
+
+    match (sys_cfg, user_cfg) {
+        (Some(sys), Some(user)) => Ok((Some(user_path.to_path_buf()), sys.merge(&user))),
+        (None, Some(user)) => Ok((Some(user_path.to_path_buf()), user)),
+        (Some(sys), None) => Ok((Some(sys_path.to_path_buf()), sys)),
+        (None, None) => Ok((None, FileConfig::default())),
+    }
+}
+
+fn load_default_file_config(service_mode: bool) -> Result<(Option<PathBuf>, FileConfig)> {
+    if service_mode {
+        for path in candidate_config_paths(true) {
+            if let Some(contents) = read_bounded_config_file(&path)? {
+                let cfg = parse_config_toml(&contents)
+                    .with_context(|| format!("failed to parse config file {}", path.display()))?;
+                return Ok((Some(path), cfg));
+            }
+        }
+        return Ok((None, FileConfig::default()));
+    }
+
+    let user_path = user_config_path();
+    let sys_path = system_config_path();
+    load_merged_user_and_system_config(&user_path, &sys_path)
 }
 
 /// Loads `FileConfig` from `explicit_path` or the OS-appropriate config path.
 ///
 /// When `explicit_path` is `Some(path)`, returns an error if the requested file
 /// does not exist rather than silently falling back to defaults.
-/// In `service_mode` on Windows, only [`system_config_path`] is consulted when
-/// `explicit_path` is `None` so `LocalSystem` never reads user-writable files.
+/// In `service_mode`, only [`system_config_path`] is consulted when
+/// `explicit_path` is `None` so privileged services never read user-writable files.
+/// In non-service mode when both [`system_config_path`] and [`user_config_path`]
+/// exist, merges `sys_cfg.merge(&user_cfg)` so sparse user overrides (e.g.
+/// `language = "tr"`) do not wipe machine-wide settings.
 /// Returns `(None, FileConfig::default())` when `explicit_path` is `None` and
 /// no default config file exists.
 pub fn load_file_config(
@@ -407,15 +466,7 @@ pub fn load_file_config(
         return Ok((Some(path.to_path_buf()), cfg));
     }
 
-    for path in candidate_config_paths(service_mode) {
-        if let Some(contents) = read_bounded_config_file(&path)? {
-            let cfg = parse_config_toml(&contents)
-                .with_context(|| format!("failed to parse config file {}", path.display()))?;
-            return Ok((Some(path), cfg));
-        }
-    }
-
-    Ok((None, FileConfig::default()))
+    load_default_file_config(service_mode)
 }
 
 /// Loads `FileConfig` from `explicit_path` or the OS-appropriate config path,
@@ -427,20 +478,16 @@ pub fn load_file_config_or_default(
     explicit_path: Option<&Path>,
     service_mode: bool,
 ) -> Result<(Option<PathBuf>, FileConfig)> {
-    let candidates = match explicit_path {
-        Some(path) => vec![path.to_path_buf()],
-        None => candidate_config_paths(service_mode),
-    };
-
-    for path in candidates {
-        if let Some(contents) = read_bounded_config_file(&path)? {
+    if let Some(path) = explicit_path {
+        if let Some(contents) = read_bounded_config_file(path)? {
             let cfg = parse_config_toml(&contents)
                 .with_context(|| format!("failed to parse config file {}", path.display()))?;
-            return Ok((Some(path), cfg));
+            return Ok((Some(path.to_path_buf()), cfg));
         }
+        return Ok((None, FileConfig::default()));
     }
 
-    Ok((None, FileConfig::default()))
+    load_default_file_config(service_mode)
 }
 
 fn is_unc_device_or_verbatim_path(path: &Path) -> bool {
@@ -486,6 +533,16 @@ fn validate_config_path_syntax(path: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn should_check_windows_reparse_component(cur: &Path, abs_path: &Path) -> bool {
+    cur == abs_path
+        || abs_path.parent().is_some_and(|parent| cur == parent)
+        || cur
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("vdpi"))
 }
 
 fn read_bounded_config_file(path: &Path) -> Result<Option<String>> {
@@ -536,7 +593,12 @@ fn read_bounded_config_file(path: &Path) -> Result<Option<String>> {
                 });
             }
         };
-        if meta.file_type().is_symlink() {
+        #[cfg(windows)]
+        let check_this_component = should_check_windows_reparse_component(&cur, &abs_path);
+        #[cfg(not(windows))]
+        let check_this_component = true;
+
+        if check_this_component && meta.file_type().is_symlink() {
             #[cfg(target_os = "macos")]
             if cur != abs_path {
                 use std::os::unix::fs::MetadataExt as _;
@@ -566,9 +628,11 @@ fn read_bounded_config_file(path: &Path) -> Result<Option<String>> {
             );
         }
         #[cfg(windows)]
-        {
+        if check_this_component {
             use std::os::windows::fs::MetadataExt as _;
-            if (meta.file_attributes() & windows_fs::FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            if (meta.file_attributes() & windows_fs::FILE_ATTRIBUTE_REPARSE_POINT) != 0
+                && windows_fs::is_symlink_or_mount_point_path(&cur)
+            {
                 bail!(
                     "refusing to read config file through reparse point {}",
                     cur.display()
@@ -622,7 +686,9 @@ fn read_bounded_config_file(path: &Path) -> Result<Option<String>> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt as _;
-        if (opened_meta.file_attributes() & windows_fs::FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        if (opened_meta.file_attributes() & windows_fs::FILE_ATTRIBUTE_REPARSE_POINT) != 0
+            && windows_fs::is_symlink_or_mount_point_file(&file)
+        {
             bail!(
                 "refusing to read reparse-point config file {}",
                 path.display()
@@ -800,6 +866,9 @@ mod windows_fs {
 
     pub(super) const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
     pub(super) const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    pub(super) const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
+    pub(super) const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+    const FILE_ATTRIBUTE_TAG_INFO_CLASS: i32 = 9;
     pub(super) const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     pub(super) const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
@@ -847,6 +916,12 @@ mod windows_fs {
         n_length: u32,
         lp_security_descriptor: *mut c_void,
         b_inherit_handle: i32,
+    }
+
+    #[repr(C)]
+    struct FileAttributeTagInfo {
+        file_attributes: u32,
+        reparse_tag: u32,
     }
 
     #[repr(C)]
@@ -990,6 +1065,12 @@ mod windows_fs {
             h_file: HANDLE,
             lp_file_information: *mut ByHandleFileInformation,
         ) -> i32;
+        fn GetFileInformationByHandleEx(
+            h_file: HANDLE,
+            file_information_class: i32,
+            lp_file_information: *mut c_void,
+            dw_buffer_size: u32,
+        ) -> i32;
         fn LocalFree(h_mem: *mut c_void) -> *mut c_void;
     }
 
@@ -1032,6 +1113,73 @@ mod windows_fs {
 
     pub(super) fn is_reparse_point_attrs(attrs: u32) -> bool {
         attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+    }
+
+    pub(super) fn is_symlink_or_mount_point_tag(tag: u32) -> bool {
+        matches!(tag, IO_REPARSE_TAG_MOUNT_POINT | IO_REPARSE_TAG_SYMLINK)
+    }
+
+    fn query_reparse_tag_for_handle(handle: HANDLE) -> std::io::Result<Option<u32>> {
+        let mut info = FileAttributeTagInfo {
+            file_attributes: 0,
+            reparse_tag: 0,
+        };
+        // SAFETY: `handle` is an open file/directory handle and `info` is a valid out-buffer
+        // matching `FILE_ATTRIBUTE_TAG_INFO` for `FileAttributeTagInfo` (9).
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FILE_ATTRIBUTE_TAG_INFO_CLASS,
+                (&mut info as *mut FileAttributeTagInfo).cast(),
+                std::mem::size_of::<FileAttributeTagInfo>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if (info.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            Ok(Some(info.reparse_tag))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(super) fn is_symlink_or_mount_point_path(path: &Path) -> bool {
+        let path_w = encode_wide_nul(path);
+        let share_mode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+        let flags = FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT;
+        // SAFETY: `path_w` is NUL-terminated UTF-16; returned handle is owned by `HandleGuard`.
+        let raw_handle = unsafe {
+            CreateFileW(
+                path_w.as_ptr(),
+                FILE_READ_ATTRIBUTES,
+                share_mode,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                flags,
+                std::ptr::null_mut(),
+            )
+        };
+        if raw_handle.is_null() || raw_handle == INVALID_HANDLE_VALUE {
+            // Fail closed if we cannot inspect a path already flagged as a reparse point.
+            return true;
+        }
+        let guard = HandleGuard(raw_handle);
+        match query_reparse_tag_for_handle(guard.0) {
+            Ok(Some(tag)) => is_symlink_or_mount_point_tag(tag),
+            Ok(None) => false,
+            Err(_) => true,
+        }
+    }
+
+    pub(super) fn is_symlink_or_mount_point_file(file: &File) -> bool {
+        use std::os::windows::io::AsRawHandle as _;
+        let handle: HANDLE = file.as_raw_handle();
+        match query_reparse_tag_for_handle(handle) {
+            Ok(Some(tag)) => is_symlink_or_mount_point_tag(tag),
+            Ok(None) => false,
+            Err(_) => true,
+        }
     }
 
     fn is_owner_privilege_error(code: u32) -> bool {
@@ -1564,13 +1712,21 @@ pub fn set_config_key(cfg: &mut FileConfig, key: &str, value: &str) -> Result<()
             cfg.bind = Some(ip);
         }
         "port" => {
-            cfg.port = Some(parse_uint_str::<u16>(trimmed, "port", "u16")?);
+            let port = parse_uint_str::<u16>(trimmed, "port", "u16")?;
+            if port == 0 {
+                bail!("value for 'port' must be between 1 and 65535");
+            }
+            cfg.port = Some(port);
         }
         "socks_port" => {
             cfg.socks_port = Some(parse_uint_str::<u16>(trimmed, "socks_port", "u16")?);
         }
         "dns_port" => {
-            cfg.dns_port = Some(parse_uint_str::<u16>(trimmed, "dns_port", "u16")?);
+            let dns_port = parse_uint_str::<u16>(trimmed, "dns_port", "u16")?;
+            if dns_port == 0 {
+                bail!("value for 'dns_port' must be between 1 and 65535");
+            }
+            cfg.dns_port = Some(dns_port);
         }
         "ipv4_only" => {
             cfg.ipv4_only = Some(parse_bool_str(trimmed, "ipv4_only")?);
@@ -1798,6 +1954,46 @@ pub fn validate_split_tunnel_apps(apps: &[String]) -> Result<Vec<String>> {
     Ok(sanitize_split_tunnel_apps(apps))
 }
 
+fn has_later_path_extension(rest: &str, extensions: &[&str]) -> bool {
+    let Some(first_sep) = rest.find(['/', '\\']) else {
+        return false;
+    };
+    let before_sep = rest[..first_sep].trim_start();
+    // If the text before the first separator is empty (e.g. ` /usr/bin/foo.app`),
+    // starts with a CLI option (`--flag`), contains a quote, or contains a drive
+    // colon (`C:`), then `rest` is CLI arguments rather than a parent directory name.
+    if before_sep.is_empty()
+        || before_sep.starts_with("--")
+        || before_sep.contains([':', '"', '\''])
+    {
+        return false;
+    }
+
+    let after_sep = &rest[first_sep + 1..];
+    for ext in extensions {
+        let mut search_from = 0;
+        while let Some(rel) = after_sep[search_from..].find(ext) {
+            let ext_start = search_from + rel;
+            let ext_end = ext_start + ext.len();
+            let preceded_by_name = ext_start > 0
+                && !matches!(
+                    after_sep.as_bytes()[ext_start - 1],
+                    b'/' | b'\\' | b' ' | b'\t'
+                );
+            let followed_by_boundary = after_sep[ext_end..].is_empty()
+                || after_sep[ext_end..]
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_whitespace() || ch == '/' || ch == '\\');
+            if preceded_by_name && followed_by_boundary {
+                return true;
+            }
+            search_from = ext_end;
+        }
+    }
+    false
+}
+
 fn strip_cli_args_after_extension(s: &str) -> &str {
     const EXTENSIONS: &[&str] = &[".exe", ".app", ".appimage", ".bat", ".cmd"];
     let lower = s.to_ascii_lowercase();
@@ -1815,6 +2011,10 @@ fn strip_cli_args_after_extension(s: &str) -> &str {
                 .next()
                 .is_some_and(char::is_whitespace);
             if preceded_by_name && followed_by_ws {
+                if has_later_path_extension(&lower[ext_end..], EXTENSIONS) {
+                    search_from = ext_end;
+                    continue;
+                }
                 earliest_end = Some(earliest_end.map_or(ext_end, |prev| prev.min(ext_end)));
                 break;
             }
@@ -2203,13 +2403,21 @@ fn apply_parsed_entry(
             cfg.bind = Some(ip);
         }
         "port" => {
-            cfg.port = Some(extract_uint::<u16>(val, val_line, key, "u16")?);
+            let port = extract_uint::<u16>(val, val_line, key, "u16")?;
+            if port == 0 {
+                bail!("line {val_line}: key '{key}' must be between 1 and 65535");
+            }
+            cfg.port = Some(port);
         }
         "socks_port" => {
             cfg.socks_port = Some(extract_uint::<u16>(val, val_line, key, "u16")?);
         }
         "dns_port" => {
-            cfg.dns_port = Some(extract_uint::<u16>(val, val_line, key, "u16")?);
+            let dns_port = extract_uint::<u16>(val, val_line, key, "u16")?;
+            if dns_port == 0 {
+                bail!("line {val_line}: key '{key}' must be between 1 and 65535");
+            }
+            cfg.dns_port = Some(dns_port);
         }
         "ipv4_only" => {
             cfg.ipv4_only = Some(extract_bool(val, val_line, key)?);
@@ -3359,11 +3567,8 @@ port = 8081
         );
         assert!(user_config_path().is_absolute());
 
-        #[cfg(target_os = "windows")]
-        {
-            let service_paths = candidate_config_paths(true);
-            assert_eq!(service_paths, vec![system_config_path()]);
-        }
+        let service_paths = candidate_config_paths(true);
+        assert_eq!(service_paths, vec![system_config_path()]);
     }
 
     #[test]
@@ -4175,6 +4380,156 @@ split_tunnel_apps = [
                     "file symlink must be rejected"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn merged_user_and_system_config_preserves_system_fields_under_sparse_user_override() {
+        let dir = TestTempDir::new("merged-user-sys");
+        let sys_path = dir.path().join("system").join("config.toml");
+        let user_path = dir.path().join("user").join("config.toml");
+        fs::create_dir_all(sys_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(user_path.parent().unwrap()).unwrap();
+
+        fs::write(
+            &sys_path,
+            "schema_version = 1\nengine = \"tun\"\nport = 9090\ndns_addr = \"9.9.9.9\"\n",
+        )
+        .unwrap();
+        fs::write(&user_path, "schema_version = 1\nlanguage = \"tr\"\n").unwrap();
+
+        let (found, merged) = load_merged_user_and_system_config(&user_path, &sys_path)
+            .expect("merged config must load");
+        assert_eq!(found.as_deref(), Some(user_path.as_path()));
+        assert_eq!(merged.engine, Some(EngineMode::Tun));
+        assert_eq!(merged.port, Some(9090));
+        assert_eq!(merged.dns_addr.as_deref(), Some("9.9.9.9"));
+        assert_eq!(merged.language.as_deref(), Some("tr"));
+
+        // Explicit user override takes precedence over system value.
+        fs::write(
+            &user_path,
+            "schema_version = 1\nport = 8181\nlanguage = \"en\"\n",
+        )
+        .unwrap();
+        let (_, overridden) = load_merged_user_and_system_config(&user_path, &sys_path)
+            .expect("overridden merged config must load");
+        assert_eq!(overridden.engine, Some(EngineMode::Tun));
+        assert_eq!(overridden.port, Some(8181));
+        assert_eq!(overridden.dns_addr.as_deref(), Some("9.9.9.9"));
+        assert_eq!(overridden.language.as_deref(), Some("en"));
+
+        // When user config is absent, system config is returned directly.
+        fs::remove_file(&user_path).unwrap();
+        let (sys_only_path, sys_only) = load_merged_user_and_system_config(&user_path, &sys_path)
+            .expect("system-only config must load");
+        assert_eq!(sys_only_path.as_deref(), Some(sys_path.as_path()));
+        assert_eq!(sys_only.engine, Some(EngineMode::Tun));
+        assert_eq!(sys_only.port, Some(9090));
+
+        // Identical user and system path reads cleanly once.
+        let (same_path, same_cfg) = load_merged_user_and_system_config(&sys_path, &sys_path)
+            .expect("identical path must load");
+        assert_eq!(same_path.as_deref(), Some(sys_path.as_path()));
+        assert_eq!(same_cfg.port, Some(9090));
+    }
+
+    #[test]
+    fn rejects_zero_port_and_zero_dns_port_in_toml_and_set_key() {
+        let port_err = parse_config_toml("port = 0\n").expect_err("port = 0 must fail");
+        assert!(port_err.to_string().contains("line 1:"));
+        let dns_port_err =
+            parse_config_toml("\ndns_port = 0\n").expect_err("dns_port = 0 must fail");
+        assert!(dns_port_err.to_string().contains("line 2:"));
+
+        let mut cfg = FileConfig::default();
+        assert!(set_config_key(&mut cfg, "port", "0").is_err());
+        assert!(set_config_key(&mut cfg, "dns_port", "0").is_err());
+        assert!(set_config_key(&mut cfg, "dns-port", "0").is_err());
+        // socks_port = 0 remains valid (disables dedicated SOCKS5 listener).
+        set_config_key(&mut cfg, "socks_port", "0").expect("socks_port = 0 stays valid");
+        assert_eq!(cfg.socks_port, Some(0));
+    }
+
+    #[test]
+    fn apply_to_runtime_reconciles_effective_enable_doh_for_https_urls() {
+        let mut runtime = RuntimeConfig {
+            enable_doh: false,
+            ..RuntimeConfig::default()
+        };
+        let file_cfg = FileConfig {
+            doh: Some(false),
+            dns_addr: Some("https://dns.nextdns.io/abc123".to_string()),
+            ..Default::default()
+        };
+        file_cfg.apply_to_runtime(&mut runtime);
+        assert_eq!(runtime.dns_addr, "https://dns.nextdns.io/abc123");
+        assert!(
+            runtime.enable_doh,
+            "explicit https:// DoH URL must force enable_doh = true"
+        );
+
+        let mut plain_runtime = RuntimeConfig::default();
+        let plain_cfg = FileConfig {
+            doh: Some(false),
+            dns_addr: Some("9.9.9.9".to_string()),
+            ..Default::default()
+        };
+        plain_cfg.apply_to_runtime(&mut plain_runtime);
+        assert_eq!(plain_runtime.dns_addr, "9.9.9.9");
+        assert!(!plain_runtime.enable_doh);
+    }
+
+    #[test]
+    fn strip_cli_args_does_not_truncate_parent_dir_extensions() {
+        let sanitized = sanitize_split_tunnel_apps(&[
+            r"C:\Users\Alice\My.app Folder\bin\game.exe --fullscreen".to_string(),
+            r"C:\Users\Alice\My.app Folder\bin\client.exe".to_string(),
+            r"C:\Games\Test.exe Build\Sub\Launcher.exe /silent".to_string(),
+            "/Applications/My.app Tools/Helper.app --incognito".to_string(),
+            r"C:\Program Files\Runner\run.exe --target C:\Games\child.exe".to_string(),
+            r"C:\Program Files\Runner\direct.exe C:\Games\child.exe".to_string(),
+        ]);
+        assert_eq!(
+            sanitized,
+            vec![
+                "game.exe".to_string(),
+                "client.exe".to_string(),
+                "Launcher.exe".to_string(),
+                "Helper.app".to_string(),
+                "run.exe".to_string(),
+                "direct.exe".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_reparse_component_filter_skips_os_ancestors_and_checks_vdpi_and_leaf() {
+        let user_cfg = Path::new("C:/Users/Alice/OneDrive/AppData/Local/vdpi/config.toml");
+        assert!(!should_check_windows_reparse_component(
+            Path::new("C:/Users"),
+            user_cfg
+        ));
+        assert!(!should_check_windows_reparse_component(
+            Path::new("C:/Users/Alice/OneDrive"),
+            user_cfg
+        ));
+        assert!(should_check_windows_reparse_component(
+            Path::new("C:/Users/Alice/OneDrive/AppData/Local/vdpi"),
+            user_cfg
+        ));
+        assert!(should_check_windows_reparse_component(user_cfg, user_cfg));
+
+        #[cfg(windows)]
+        {
+            assert!(windows_fs::is_symlink_or_mount_point_tag(
+                windows_fs::IO_REPARSE_TAG_MOUNT_POINT
+            ));
+            assert!(windows_fs::is_symlink_or_mount_point_tag(
+                windows_fs::IO_REPARSE_TAG_SYMLINK
+            ));
+            // OneDrive Cloud Files reparse tag must NOT be treated as a symlink/junction.
+            assert!(!windows_fs::is_symlink_or_mount_point_tag(0x9000_001A));
         }
     }
 }

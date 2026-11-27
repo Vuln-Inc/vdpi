@@ -113,6 +113,7 @@ fn schedule_macos_delayed_minimize_check(app: &AppHandle, wake: &StatusPollerWak
 pub(crate) struct StatusPollerWake {
     notify: Arc<Notify>,
     window_hidden: Arc<AtomicBool>,
+    window_actively_visible: Arc<AtomicBool>,
     last_activity: Arc<Mutex<Option<Instant>>>,
 }
 
@@ -121,12 +122,25 @@ impl StatusPollerWake {
         Self {
             notify: Arc::new(Notify::new()),
             window_hidden: Arc::new(AtomicBool::new(false)),
+            window_actively_visible: Arc::new(AtomicBool::new(false)),
             last_activity: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn is_window_actively_visible(&self) -> bool {
+        self.window_actively_visible.load(Ordering::SeqCst)
+    }
+
+    fn set_window_actively_visible(&self, visible: bool) {
+        self.window_actively_visible.store(visible, Ordering::SeqCst);
+        if !visible {
+            self.window_hidden.store(true, Ordering::SeqCst);
         }
     }
 
     fn mark_window_hidden(&self) {
         self.window_hidden.store(true, Ordering::SeqCst);
+        self.window_actively_visible.store(false, Ordering::SeqCst);
     }
 
     fn record_poll(&self, now: Instant) {
@@ -150,11 +164,13 @@ impl StatusPollerWake {
 
     fn wake_for_visible(&self) {
         self.window_hidden.store(false, Ordering::SeqCst);
+        self.window_actively_visible.store(true, Ordering::SeqCst);
         self.wake_now();
     }
 
     fn wake_if_hidden_or_stale(&self) {
         let was_hidden = self.window_hidden.swap(false, Ordering::SeqCst);
+        self.window_actively_visible.store(true, Ordering::SeqCst);
         let now = Instant::now();
         let mut guard = self
             .last_activity
@@ -184,19 +200,54 @@ pub(crate) fn wake_status_poller_for_visible(app: &AppHandle) {
     }
 }
 
+pub(crate) fn mark_main_window_hidden(app: &AppHandle) {
+    if let Some(wake) = app.try_state::<StatusPollerWake>() {
+        wake.mark_window_hidden();
+    }
+}
+
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 
 pub(crate) fn is_main_window_actively_visible(app: &AppHandle) -> bool {
-    let Some(window) = app.get_webview_window(tray::MAIN_WINDOW_LABEL) else {
-        return false;
-    };
-    if !window.is_visible().unwrap_or(false) {
+    app.try_state::<StatusPollerWake>()
+        .is_some_and(|wake| wake.is_window_actively_visible())
+}
+
+fn wake_throttle_delay(last_poll: Option<Instant>, now: Instant) -> Option<Duration> {
+    let prev = last_poll?;
+    let elapsed = now.saturating_duration_since(prev);
+    MIN_WAKE_INTERVAL
+        .checked_sub(elapsed)
+        .filter(|delay| !delay.is_zero())
+}
+
+/// Sleeps for `duration` while allowing a quit notification to interrupt
+/// immediately. Returns `true` when the application is quitting.
+async fn sleep_throttle_unless_quitting(
+    state: &DesktopAppState,
+    wake: &StatusPollerWake,
+    duration: Duration,
+) -> bool {
+    if state.is_quitting() {
+        return true;
+    }
+    if duration.is_zero() {
         return false;
     }
-    !window.is_minimized().unwrap_or(false)
+    let deadline = tokio::time::Instant::now() + duration;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => return state.is_quitting(),
+            _ = wake.notify.notified() => {
+                if state.is_quitting() {
+                    return true;
+                }
+            }
+        }
+    }
 }
 
 /// Checks whether the main window is currently minimized and, if so, marks it
@@ -208,6 +259,10 @@ fn handle_minimize_to_tray_if_minimized(window: &tauri::Window, wake: &StatusPol
         .try_state::<DesktopAppState>()
         .is_some_and(|state| state.is_restoring())
     {
+        return false;
+    }
+
+    if !window.is_visible().unwrap_or(false) {
         return false;
     }
 
@@ -261,32 +316,43 @@ fn spawn_status_poller(app: AppHandle, wake: StatusPollerWake) {
             }
 
             let tray_active = app.tray_by_id(tray::TRAY_ID).is_some();
-            let visible = is_main_window_actively_visible(&app);
+            let visible = wake.is_window_actively_visible();
             if !visible {
                 wake.mark_window_hidden();
             }
             if !visible && !tray_active {
                 wake.notify.notified().await;
-                if let Some(prev) = last_poll {
-                    let elapsed = prev.elapsed();
-                    if elapsed < MIN_WAKE_INTERVAL {
-                        tokio::time::sleep(MIN_WAKE_INTERVAL - elapsed).await;
+                if state.is_quitting() {
+                    break;
+                }
+                if let Some(delay) = wake_throttle_delay(last_poll, Instant::now()) {
+                    if sleep_throttle_unless_quitting(&state, &wake, delay).await {
+                        break;
                     }
                 }
                 continue;
             }
 
-            // Skip disk/binary/service probes while an install, upgrade, repair, or
-            // uninstall operation is actively mutating the service binaries.
+            // Skip disk/binary/service probes while any mutating service or
+            // configuration operation is active so mid-switch restarts never
+            // flash transient states.
             if state.is_mutating_install_operation_active() {
                 let interval = if visible {
                     VISIBLE_POLL_INTERVAL
                 } else {
                     HIDDEN_TRAY_POLL_INTERVAL
                 };
-                tokio::select! {
-                    _ = tokio::time::sleep(interval) => {}
-                    _ = wake.notify.notified() => {}
+                let woke_by_notify = tokio::select! {
+                    _ = tokio::time::sleep(interval) => false,
+                    _ = wake.notify.notified() => true,
+                };
+                if state.is_quitting() {
+                    break;
+                }
+                if woke_by_notify
+                    && sleep_throttle_unless_quitting(&state, &wake, MIN_WAKE_INTERVAL).await
+                {
+                    break;
                 }
                 continue;
             }
@@ -304,14 +370,13 @@ fn spawn_status_poller(app: AppHandle, wake: StatusPollerWake) {
 
             match snapshot_result {
                 Ok(Some(snapshot)) => {
-                    let is_current = app.try_state::<DesktopAppState>().is_some_and(|s| {
-                        !s.is_quitting()
-                            && s.last_snapshot()
-                                .is_none_or(|last| snapshot.snapshot_seq >= last.snapshot_seq)
-                    });
+                    let is_current = !state.is_quitting()
+                        && state
+                            .last_snapshot()
+                            .is_none_or(|last| snapshot.snapshot_seq >= last.snapshot_seq);
                     if is_current {
                         tray::update_tray_visuals(&app, &snapshot);
-                        if is_main_window_actively_visible(&app) {
+                        if wake.is_window_actively_visible() {
                             if let Err(err) =
                                 app.emit_to(tray::MAIN_WINDOW_LABEL, STATUS_EVENT_NAME, &snapshot)
                             {
@@ -329,24 +394,24 @@ fn spawn_status_poller(app: AppHandle, wake: StatusPollerWake) {
                 }
             }
 
-            let quitting_after = match app.try_state::<DesktopAppState>() {
-                Some(state) => state.is_quitting(),
-                None => break,
-            };
-            if quitting_after {
+            if state.is_quitting() {
                 break;
             }
 
             let tray_active_after = app.tray_by_id(tray::TRAY_ID).is_some();
-            let visible_after = is_main_window_actively_visible(&app);
+            let visible_after = wake.is_window_actively_visible();
             if !visible_after {
                 wake.mark_window_hidden();
             }
             if !visible_after && !tray_active_after {
                 wake.notify.notified().await;
-                let elapsed = now.elapsed();
-                if elapsed < MIN_WAKE_INTERVAL {
-                    tokio::time::sleep(MIN_WAKE_INTERVAL - elapsed).await;
+                if state.is_quitting() {
+                    break;
+                }
+                if let Some(delay) = wake_throttle_delay(Some(now), Instant::now()) {
+                    if sleep_throttle_unless_quitting(&state, &wake, delay).await {
+                        break;
+                    }
                 }
                 continue;
             }
@@ -357,12 +422,17 @@ fn spawn_status_poller(app: AppHandle, wake: StatusPollerWake) {
                 HIDDEN_TRAY_POLL_INTERVAL
             };
 
-            tokio::select! {
-                _ = tokio::time::sleep(interval) => {}
-                _ = wake.notify.notified() => {
-                    let elapsed = now.elapsed();
-                    if elapsed < MIN_WAKE_INTERVAL {
-                        tokio::time::sleep(MIN_WAKE_INTERVAL - elapsed).await;
+            let woke_by_notify = tokio::select! {
+                _ = tokio::time::sleep(interval) => false,
+                _ = wake.notify.notified() => true,
+            };
+            if state.is_quitting() {
+                break;
+            }
+            if woke_by_notify {
+                if let Some(delay) = wake_throttle_delay(Some(now), Instant::now()) {
+                    if sleep_throttle_unless_quitting(&state, &wake, delay).await {
+                        break;
                     }
                 }
             }
@@ -412,12 +482,26 @@ pub fn run() {
                                 "failed to keep taskbar icon visible on minimized startup"
                             );
                         }
+                        if let Err(err) = window.show() {
+                            warn!(
+                                error = %err,
+                                "failed to show main window prior to minimized startup"
+                            );
+                        }
                         if let Err(err) = window.minimize() {
                             warn!(error = %err, "failed to minimize main window on startup");
+                            if window.is_visible().unwrap_or(false)
+                                && !window.is_minimized().unwrap_or(false)
+                            {
+                                setup_wake.set_window_actively_visible(true);
+                            }
+                        } else {
+                            setup_wake.mark_window_hidden();
                         }
                     }
                 } else {
                     tray::hide_main_window_to_tray(&app_handle, true);
+                    setup_wake.mark_window_hidden();
                 }
             } else {
                 tray::show_main_window(&app_handle);
@@ -461,6 +545,7 @@ pub fn run() {
                         window_wake.mark_window_hidden();
                         tray::hide_main_window_to_tray(app, true);
                     } else {
+                        window_wake.mark_window_hidden();
                         if let Some(state) = app.try_state::<DesktopAppState>() {
                             state.set_quitting(true);
                         }
@@ -483,19 +568,28 @@ pub fn run() {
                         return;
                     }
 
-                    if window.is_visible().unwrap_or(false) {
+                    if window.is_visible().unwrap_or(false)
+                        && !window.is_minimized().unwrap_or(false)
+                    {
                         window_wake.wake_if_hidden_or_stale();
+                    } else {
+                        window_wake.mark_window_hidden();
                     }
                 }
                 WindowEvent::Focused(false) => {
                     if !handle_minimize_to_tray_if_minimized(window, &window_wake) {
-                        if !window.is_visible().unwrap_or(false) {
+                        let app = window.app_handle();
+                        let is_restoring = app
+                            .try_state::<DesktopAppState>()
+                            .is_some_and(|state| state.is_restoring());
+                        if !window.is_visible().unwrap_or(false)
+                            || (!is_restoring && window.is_minimized().unwrap_or(false))
+                        {
                             window_wake.mark_window_hidden();
                         }
 
                         #[cfg(target_os = "macos")]
                         {
-                            let app = window.app_handle();
                             if let Some(state) = app.try_state::<DesktopAppState>() {
                                 let prefs = state.preferences();
                                 if should_schedule_macos_delayed_minimize_check(
@@ -511,7 +605,16 @@ pub fn run() {
                     }
                 }
                 WindowEvent::Focused(true) => {
-                    window_wake.wake_if_hidden_or_stale();
+                    if window.is_visible().unwrap_or(true)
+                        && !window.is_minimized().unwrap_or(false)
+                    {
+                        window_wake.wake_if_hidden_or_stale();
+                    } else {
+                        window_wake.mark_window_hidden();
+                    }
+                }
+                WindowEvent::Destroyed => {
+                    window_wake.mark_window_hidden();
                 }
                 _ => {}
             }
@@ -570,16 +673,73 @@ mod tests {
     #[test]
     fn status_poller_wake_for_visible_clears_hidden_flag() {
         let wake = StatusPollerWake::new();
+        assert!(!wake.is_window_actively_visible());
+
         wake.mark_window_hidden();
         assert!(wake.window_hidden.load(Ordering::SeqCst));
+        assert!(!wake.is_window_actively_visible());
 
         wake.wake_for_visible();
         assert!(!wake.window_hidden.load(Ordering::SeqCst));
+        assert!(wake.is_window_actively_visible());
         assert!(wake
             .last_activity
             .lock()
             .expect("lock last_activity")
             .is_some());
+
+        wake.set_window_actively_visible(false);
+        assert!(!wake.is_window_actively_visible());
+        assert!(wake.window_hidden.load(Ordering::SeqCst));
+
+        wake.wake_if_hidden_or_stale();
+        assert!(wake.is_window_actively_visible());
+        assert!(!wake.window_hidden.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn wake_throttle_delay_bounds_rapid_wakes_without_delaying_stale_ones() {
+        let t0 = Instant::now();
+        assert_eq!(wake_throttle_delay(None, t0), None);
+        assert_eq!(
+            wake_throttle_delay(Some(t0), t0 + Duration::from_millis(120)),
+            Some(MIN_WAKE_INTERVAL - Duration::from_millis(120))
+        );
+        assert_eq!(wake_throttle_delay(Some(t0), t0 + MIN_WAKE_INTERVAL), None);
+        assert_eq!(
+            wake_throttle_delay(Some(t0), t0 + Duration::from_secs(2)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn sleep_throttle_unless_quitting_exits_immediately_on_quit() {
+        let state = DesktopAppState::default();
+        let wake = StatusPollerWake::new();
+
+        // Already quitting returns immediately without waiting for duration.
+        state.set_quitting(true);
+        let started = Instant::now();
+        assert!(
+            sleep_throttle_unless_quitting(&state, &wake, Duration::from_secs(10)).await
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
+
+        // Mid-sleep quit wakes and aborts immediately instead of waiting out the full sleep.
+        let state_mid = std::sync::Arc::new(DesktopAppState::default());
+        let state_for_task = std::sync::Arc::clone(&state_mid);
+        let wake_for_task = wake.clone();
+        let quit_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            state_for_task.set_quitting(true);
+            wake_for_task.wake_now();
+        });
+        let mid_started = Instant::now();
+        assert!(
+            sleep_throttle_unless_quitting(&state_mid, &wake, Duration::from_secs(10)).await
+        );
+        assert!(mid_started.elapsed() < Duration::from_millis(500));
+        quit_task.await.expect("join quit task");
     }
 
     #[test]

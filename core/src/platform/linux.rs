@@ -1476,7 +1476,9 @@ fn should_reconcile_gnome(
     if clean_mode == "auto" && clean_url.is_empty() {
         return false;
     }
-    if !clean_url.is_empty() && !is_vdpi_pac_url(clean_url) {
+    if !clean_url.is_empty()
+        && !(clean_url.eq_ignore_ascii_case(expected_pac_url) || is_vdpi_pac_url(clean_url))
+    {
         return false;
     }
     !(clean_mode == "auto" && clean_url.eq_ignore_ascii_case(expected_pac_url))
@@ -1496,7 +1498,9 @@ fn should_reconcile_kde(
     if !matches!(clean_type, "" | "0" | "2") {
         return false;
     }
-    if !clean_script.is_empty() && !is_vdpi_pac_url(clean_script) {
+    if !clean_script.is_empty()
+        && !(clean_script.eq_ignore_ascii_case(expected_pac_url) || is_vdpi_pac_url(clean_script))
+    {
         return false;
     }
     !(clean_type == "2" && clean_script.eq_ignore_ascii_case(expected_pac_url))
@@ -1585,7 +1589,7 @@ fn deactivate_gnome_with_bin(
         gsettings_get_with_bin(gsettings, "org.gnome.system.proxy", "autoconfig-url", ctx_ref);
     let pac_owned = autoconfig.as_deref().is_some_and(|val| {
         let clean = val.trim_matches('\'');
-        clean.eq_ignore_ascii_case(pac_url) || is_vdpi_pac_url(clean)
+        clean.eq_ignore_ascii_case(pac_url)
     });
 
     let http_owned = [
@@ -1645,7 +1649,11 @@ fn deactivate_gnome_with_bin(
             ctx_ref,
         );
     }
-    let _ = clear_stale_gnome_manual_keys_with_bin(gsettings, ctx_ref);
+    if (pac_owned && mode.as_deref() == Some("'auto'"))
+        || ((http_owned || socks_owned) && mode.as_deref() == Some("'manual'"))
+    {
+        let _ = clear_stale_gnome_manual_keys_with_bin(gsettings, ctx_ref);
+    }
 
     if let Some(orig_ignore) = saved_ignore_hosts {
         let current_ignore =
@@ -1684,20 +1692,28 @@ fn deactivate_kde_with_bins(
 ) {
     let pac_owned = reader
         .and_then(|r| kde_read_proxy_key(r, "Proxy Config Script", ctx_ref))
-        .is_some_and(|val| val.eq_ignore_ascii_case(pac_url) || is_vdpi_pac_url(&val));
+        .is_some_and(|val| val.trim().eq_ignore_ascii_case(pac_url));
     let proxy_type = reader.and_then(|r| kde_read_proxy_key(r, "ProxyType", ctx_ref));
-    let expected_http = format!("http://{} {}", addr, http_port);
+    let norm_addr = normalize_proxy_addr(addr);
+    let kde_host = |ip: IpAddr| match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => format!("[{v6}]"),
+    };
+    let expected_http_norm = format!("http://{} {}", kde_host(norm_addr), http_port);
+    let expected_http_raw = format!("http://{} {}", addr, http_port);
     let http_owned = reader.is_some_and(|r| {
         ["httpProxy", "httpsProxy"].into_iter().any(|key| {
-            kde_read_proxy_key(r, key, ctx_ref).is_some_and(|val| val == expected_http)
+            kde_read_proxy_key(r, key, ctx_ref)
+                .is_some_and(|val| val == expected_http_norm || val == expected_http_raw)
         })
     });
     let socks_owned = socks_configured
         && socks_port.is_some_and(|sp| {
-            let expected_socks = format!("socks://{} {sp}", addr);
+            let expected_socks_norm = format!("socks://{} {sp}", kde_host(norm_addr));
+            let expected_socks_raw = format!("socks://{} {sp}", addr);
             reader
                 .and_then(|r| kde_read_proxy_key(r, "socksProxy", ctx_ref))
-                .is_some_and(|val| val == expected_socks)
+                .is_some_and(|val| val == expected_socks_norm || val == expected_socks_raw)
         });
     let manual_owned = http_owned || socks_owned;
     let reset_type =
@@ -1717,9 +1733,9 @@ fn deactivate_kde_with_bins(
         if reset_type {
             let _ = kde_write_proxy_key(writer, "ProxyType", restore_type, ctx_ref);
             changed = true;
-        }
-        if clear_stale_kde_manual_keys_with_reader(writer, reader, ctx_ref) {
-            changed = true;
+            if clear_stale_kde_manual_keys_with_reader(writer, reader, ctx_ref) {
+                changed = true;
+            }
         }
     }
 
@@ -2270,8 +2286,9 @@ fn clear_stale_gnome_manual_keys_with_bin(
             && gsettings_get_with_bin(gsettings, schema, "enabled", sudo_ctx).as_deref()
                 == Some("true")
         {
+            // Clear dangling empty-host HTTP enabled flag without marking `cleared = true`,
+            // so corporate HTTPS-only or SOCKS-only manual proxies keep `mode == 'manual'`.
             let _ = gsettings_set_with_bin(gsettings, schema, "enabled", "false", sudo_ctx);
-            cleared = true;
         }
     }
     cleared
@@ -5444,6 +5461,327 @@ mod tests {
         remove_linux_proxy_state_file_guarded(&sym_state, Some(&fake_home), true, &mut outcome);
         assert!(fs::symlink_metadata(&sym_state).is_ok());
         assert!(victim.exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reconcile_recognizes_non_loopback_expected_pac_url() {
+        let lan_pac = "http://192.168.1.50:8080/vdpi.pac";
+        let lan_pac_quoted = format!("'{lan_pac}'");
+
+        // GNOME: mode reverted to 'none' while autoconfig-url still holds our non-loopback PAC.
+        assert!(should_reconcile_gnome(
+            Some("'none'"),
+            Some(&lan_pac_quoted),
+            lan_pac
+        ));
+        // GNOME: already aligned on our non-loopback PAC -> no-op.
+        assert!(!should_reconcile_gnome(
+            Some("'auto'"),
+            Some(&lan_pac_quoted),
+            lan_pac
+        ));
+        // GNOME: unrelated non-loopback PAC -> never clobber.
+        assert!(!should_reconcile_gnome(
+            Some("'none'"),
+            Some("'http://192.168.1.99:8080/vdpi.pac'"),
+            lan_pac
+        ));
+
+        // KDE: ProxyType reverted to 0 while Proxy Config Script holds our non-loopback PAC.
+        assert!(should_reconcile_kde(Some("0"), Some(lan_pac), lan_pac));
+        // KDE: already aligned on our non-loopback PAC -> no-op.
+        assert!(!should_reconcile_kde(Some("2"), Some(lan_pac), lan_pac));
+        // KDE: unrelated non-loopback PAC -> never clobber.
+        assert!(!should_reconcile_kde(
+            Some("0"),
+            Some("http://192.168.1.99:8080/vdpi.pac"),
+            lan_pac
+        ));
+    }
+
+    #[test]
+    fn deactivate_scoped_preserves_unrelated_local_proxies_other_vdpi_ports_and_normalizes_kde_addr() {
+        let root = std::env::temp_dir().join(format!(
+            "vdpi-linux-scoped-preserve-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let gnome_dir = root.join("gnome");
+        let kde_state = root.join("kde-state");
+        fs::create_dir_all(&gnome_dir).unwrap();
+        fs::create_dir_all(&kde_state).unwrap();
+
+        let fake_gsettings = root.join("gsettings");
+        fs::write(
+            &fake_gsettings,
+            format!(
+                "#!/bin/sh\nstate_dir=\"{}\"\ncmd=\"$1\"\nschema=\"$2\"\nkey=\"$3\"\nfile=\"$state_dir/$schema.$key\"\nif [ \"$cmd\" = \"get\" ]; then\n  if [ -f \"$file\" ]; then cat \"$file\"; else echo \"''\"; fi\n  exit 0\nfi\nif [ \"$cmd\" = \"set\" ]; then\n  val=\"$4\"\n  if [ \"$key\" = \"ignore-hosts\" ] || [ \"$key\" = \"port\" ] || [ \"$key\" = \"enabled\" ]; then\n    printf '%s\\n' \"$val\" > \"$file\"\n  else\n    printf \"'%s'\\n\" \"$val\" > \"$file\"\n  fi\n  exit 0\nfi\nexit 1\n",
+                gnome_dir.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fake_gsettings, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let fake_kwrite = root.join("kwriteconfig6");
+        let fake_kread = root.join("kreadconfig6");
+        fs::write(
+            &fake_kwrite,
+            format!(
+                "#!/bin/sh\nstate_dir=\"{}\"\nkey=\"$6\"\nval=\"$7\"\nfile=\"$state_dir/$(printf '%s' \"$key\" | tr ' /' '__')\"\nif [ \"$val\" = \"--delete\" ]; then\n  rm -f \"$file\"\nelse\n  printf '%s\\n' \"$val\" > \"$file\"\nfi\nexit 0\n",
+                kde_state.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &fake_kread,
+            format!(
+                "#!/bin/sh\nstate_dir=\"{}\"\nkey=\"$6\"\nfile=\"$state_dir/$(printf '%s' \"$key\" | tr ' /' '__')\"\nif [ -f \"$file\" ]; then cat \"$file\"; else echo \"\"; fi\nexit 0\n",
+                kde_state.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fake_kwrite, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&fake_kread, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let pac_8080 = "http://127.0.0.1:8080/vdpi.pac";
+        let pac_9090 = "http://127.0.0.1:9090/vdpi.pac";
+
+        // 1. GNOME: user switched mid-session to unrelated local proxy 127.0.0.1:7890 -> must NOT be wiped.
+        fs::write(gnome_dir.join("org.gnome.system.proxy.mode"), "'manual'\n").unwrap();
+        fs::write(
+            gnome_dir.join("org.gnome.system.proxy.autoconfig-url"),
+            format!("'{pac_8080}'\n"),
+        )
+        .unwrap();
+        fs::write(
+            gnome_dir.join("org.gnome.system.proxy.http.host"),
+            "'127.0.0.1'\n",
+        )
+        .unwrap();
+        fs::write(gnome_dir.join("org.gnome.system.proxy.http.port"), "7890\n").unwrap();
+        fs::write(
+            gnome_dir.join("org.gnome.system.proxy.http.enabled"),
+            "true\n",
+        )
+        .unwrap();
+
+        deactivate_gnome_with_bin(
+            &fake_gsettings,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            8080,
+            pac_8080,
+            false,
+            None,
+            None,
+            Some("none"),
+            Some(""),
+            None,
+            None,
+        );
+        assert_eq!(
+            gsettings_get_with_bin(&fake_gsettings, "org.gnome.system.proxy", "mode", None)
+                .as_deref(),
+            Some("'manual'")
+        );
+        assert_eq!(
+            gsettings_get_with_bin(&fake_gsettings, "org.gnome.system.proxy.http", "host", None)
+                .as_deref(),
+            Some("'127.0.0.1'")
+        );
+        assert_eq!(
+            gsettings_get_with_bin(&fake_gsettings, "org.gnome.system.proxy.http", "port", None)
+                .as_deref(),
+            Some("7890")
+        );
+
+        // 2. GNOME: exiting port 8080 must NOT clobber another vdpi instance on port 9090.
+        fs::write(gnome_dir.join("org.gnome.system.proxy.mode"), "'auto'\n").unwrap();
+        fs::write(
+            gnome_dir.join("org.gnome.system.proxy.autoconfig-url"),
+            format!("'{pac_9090}'\n"),
+        )
+        .unwrap();
+        deactivate_gnome_with_bin(
+            &fake_gsettings,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            8080,
+            pac_8080,
+            false,
+            None,
+            None,
+            Some("none"),
+            Some(""),
+            None,
+            None,
+        );
+        assert_eq!(
+            gsettings_get_with_bin(&fake_gsettings, "org.gnome.system.proxy", "mode", None)
+                .as_deref(),
+            Some("'auto'")
+        );
+        assert_eq!(
+            gsettings_get_with_bin(
+                &fake_gsettings,
+                "org.gnome.system.proxy",
+                "autoconfig-url",
+                None
+            )
+            .as_deref(),
+            Some("'http://127.0.0.1:9090/vdpi.pac'")
+        );
+
+        // 3. GNOME: clear_stale_gnome_manual_keys_with_bin preserves corporate HTTPS-only manual proxy
+        //    even when http.host is empty and http.enabled is true.
+        fs::write(gnome_dir.join("org.gnome.system.proxy.mode"), "'manual'\n").unwrap();
+        fs::write(
+            gnome_dir.join("org.gnome.system.proxy.autoconfig-url"),
+            "''\n",
+        )
+        .unwrap();
+        fs::write(gnome_dir.join("org.gnome.system.proxy.http.host"), "''\n").unwrap();
+        fs::write(gnome_dir.join("org.gnome.system.proxy.http.port"), "0\n").unwrap();
+        fs::write(
+            gnome_dir.join("org.gnome.system.proxy.http.enabled"),
+            "true\n",
+        )
+        .unwrap();
+        fs::write(
+            gnome_dir.join("org.gnome.system.proxy.https.host"),
+            "'proxy.corp.example'\n",
+        )
+        .unwrap();
+        fs::write(
+            gnome_dir.join("org.gnome.system.proxy.https.port"),
+            "8443\n",
+        )
+        .unwrap();
+        assert!(!clear_stale_gnome_manual_keys_with_bin(&fake_gsettings, None));
+        clear_gnome_proxies_with_bin(&fake_gsettings, None, None, None, None);
+        assert_eq!(
+            gsettings_get_with_bin(&fake_gsettings, "org.gnome.system.proxy", "mode", None)
+                .as_deref(),
+            Some("'manual'")
+        );
+        assert_eq!(
+            gsettings_get_with_bin(&fake_gsettings, "org.gnome.system.proxy.https", "host", None)
+                .as_deref(),
+            Some("'proxy.corp.example'")
+        );
+
+        // 4. KDE: user switched mid-session to unrelated local proxy 127.0.0.1:7890 -> must NOT be wiped.
+        assert!(kde_write_proxy_key(&fake_kwrite, "ProxyType", "1", None));
+        assert!(kde_write_proxy_key(
+            &fake_kwrite,
+            "Proxy Config Script",
+            pac_8080,
+            None
+        ));
+        assert!(kde_write_proxy_key(
+            &fake_kwrite,
+            "httpProxy",
+            "http://127.0.0.1 7890",
+            None
+        ));
+        deactivate_kde_with_bins(
+            &fake_kwrite,
+            Some(&fake_kread),
+            None,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            8080,
+            pac_8080,
+            false,
+            None,
+            None,
+            Some("0"),
+            Some(""),
+            None,
+            None,
+        );
+        assert_eq!(
+            kde_read_proxy_key(&fake_kread, "ProxyType", None).as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            kde_read_proxy_key(&fake_kread, "httpProxy", None).as_deref(),
+            Some("http://127.0.0.1 7890")
+        );
+
+        // 5. KDE: exiting port 8080 must NOT clobber active vdpi instance on port 9090.
+        assert!(kde_write_proxy_key(&fake_kwrite, "ProxyType", "2", None));
+        assert!(kde_write_proxy_key(
+            &fake_kwrite,
+            "Proxy Config Script",
+            pac_9090,
+            None
+        ));
+        deactivate_kde_with_bins(
+            &fake_kwrite,
+            Some(&fake_kread),
+            None,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            8080,
+            pac_8080,
+            false,
+            None,
+            None,
+            Some("0"),
+            Some(""),
+            None,
+            None,
+        );
+        assert_eq!(
+            kde_read_proxy_key(&fake_kread, "ProxyType", None).as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            kde_read_proxy_key(&fake_kread, "Proxy Config Script", None).as_deref(),
+            Some(pac_9090)
+        );
+
+        // 6. KDE: unspecified bind address 0.0.0.0 normalizes to 127.0.0.1 for manual key ownership.
+        assert!(kde_write_proxy_key(&fake_kwrite, "ProxyType", "1", None));
+        assert!(kde_delete_proxy_key(&fake_kwrite, "Proxy Config Script", None));
+        assert!(kde_write_proxy_key(
+            &fake_kwrite,
+            "httpProxy",
+            "http://127.0.0.1 8080",
+            None
+        ));
+        assert!(kde_write_proxy_key(
+            &fake_kwrite,
+            "socksProxy",
+            "socks://127.0.0.1 1080",
+            None
+        ));
+        deactivate_kde_with_bins(
+            &fake_kwrite,
+            Some(&fake_kread),
+            None,
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            8080,
+            pac_8080,
+            true,
+            Some(1080),
+            None,
+            Some("0"),
+            Some(""),
+            None,
+            None,
+        );
+        assert_eq!(
+            kde_read_proxy_key(&fake_kread, "ProxyType", None).as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            kde_read_proxy_key(&fake_kread, "httpProxy", None).as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            kde_read_proxy_key(&fake_kread, "socksProxy", None).as_deref(),
+            Some("")
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

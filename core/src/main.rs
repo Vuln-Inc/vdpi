@@ -42,6 +42,11 @@ fn main() -> Result<()> {
         return foreground::run_guard();
     }
     if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new("--internal-wininet-notify"))
+    {
+        return run_internal_wininet_notify();
+    }
+    if std::env::args_os().nth(1).as_deref()
         == Some(std::ffi::OsStr::new(
             vdpi::platform::linux_tun::LINUX_TUN_CLEANUP_ARG,
         ))
@@ -78,11 +83,13 @@ fn run_main() -> Result<()> {
     let bare = args.len() == 1;
     let raw_args: Vec<String> = args
         .iter()
-        .skip(1)
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
     let cli = CliArgs::parse_from_iter(args).unwrap_or_else(|e| e.exit());
 
+    if cli.internal_wininet_notify {
+        return run_internal_wininet_notify();
+    }
     if cli.internal_linux_tun_cleanup {
         return run_internal_linux_tun_cleanup();
     }
@@ -105,7 +112,8 @@ fn run_main() -> Result<()> {
     let resilient_admin_cmd = matches!(
         cli.command,
         Some(
-            Command::Uninstall { .. }
+            Command::Install { upgrade: true }
+                | Command::Uninstall { .. }
                 | Command::Pause
                 | Command::Resume
                 | Command::ResetNetwork { .. }
@@ -113,7 +121,7 @@ fn run_main() -> Result<()> {
     );
     let effective_service_mode =
         cli.service || (cli.config_path.is_none() && has_installed_system_service());
-    let (_loaded_config_path, file_cfg) = match load_file_config(
+    let (loaded_config_path, file_cfg) = match load_file_config(
         cli.config_path.as_deref(),
         effective_service_mode,
     ) {
@@ -142,13 +150,26 @@ fn run_main() -> Result<()> {
     } else {
         None
     };
+    let is_service_flag = cli.service;
+    let cli_for_reset = cli.clone();
     let mut command = cli.command.clone();
-    let mut cfg = cli.resolve_runtime_config(&file_cfg, &raw_args);
+    let mut cfg = resolve_startup_runtime_config(
+        cli,
+        &file_cfg,
+        &raw_args,
+        is_service_flag && loaded_config_path.is_some(),
+    );
 
     #[cfg(target_os = "windows")]
     if cfg.windows_service && matches!(command, Some(Command::Start) | None) {
-        init_tracing(&cfg);
-        return vdpi::platform::windows_service::run_windows_service(cfg);
+        let log_dir = service_log_dir();
+        let service_log_guard = vdpi::logging::init_service_file_tracing(&log_dir, cfg.debug);
+        if service_log_guard.is_none() {
+            init_tracing(&cfg);
+        }
+        let result = vdpi::platform::windows_service::run_windows_service(cfg);
+        drop(service_log_guard);
+        return result;
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -238,10 +259,15 @@ fn run_main() -> Result<()> {
                     if cfg.engine == EngineMode::Tun
                         && !vdpi::platform::windows_service::is_elevated()
                     {
-                        match vdpi::platform::windows_service::relaunch_elevated_and_wait(&[
-                            "--tun".to_string(),
-                            "start".to_string(),
-                        ]) {
+                        let cwd = std::env::current_dir().ok();
+                        let elevated_args = build_elevated_tun_run_args(
+                            &cfg,
+                            explicit_config_path.as_deref(),
+                            cwd.as_deref(),
+                        );
+                        match vdpi::platform::windows_service::relaunch_elevated_and_wait(
+                            &elevated_args,
+                        ) {
                             Ok(()) => return Ok(()),
                             Err(err) => {
                                 notice = Some(sanitize_notice(&format!(
@@ -255,8 +281,14 @@ fn run_main() -> Result<()> {
                     }
                     #[cfg(any(target_os = "macos", target_os = "linux"))]
                     if cfg.engine == EngineMode::Tun && !vdpi::service::is_unix_root() {
+                        let cwd = std::env::current_dir().ok();
+                        let elevated_args = build_elevated_tun_run_args(
+                            &cfg,
+                            explicit_config_path.as_deref(),
+                            cwd.as_deref(),
+                        );
                         match vdpi::service::relaunch_unix_sudo_and_wait(
-                            &["--tun".to_string(), "start".to_string()],
+                            &elevated_args,
                             "run vdpi in TUN mode",
                         ) {
                             Ok(()) => return Ok(()),
@@ -469,7 +501,7 @@ fn run_main() -> Result<()> {
                         cfg.engine = target;
                         session_engine_override = Some(target);
                         let user_path = user_config_path();
-                        let save_res = load_file_config_or_default(Some(&user_path), false)
+                        let save_res = load_file_config_or_default(None, false)
                             .and_then(|(_, mut fc)| {
                                 fc.schema_version = Some(CONFIG_SCHEMA_VERSION);
                                 fc.engine = Some(target);
@@ -701,6 +733,9 @@ fn run_main() -> Result<()> {
                             session_engine_override = None;
                             session_dns_override = None;
                             session_split_override = None;
+                            cfg = cli_for_reset
+                                .clone()
+                                .resolve_runtime_config(&FileConfig::default(), &raw_args);
                             notice = Some(
                                 launcher::tr(
                                     "vdpi background service uninstalled.",
@@ -812,11 +847,14 @@ fn run_main() -> Result<()> {
             })
         }
         Some(Command::Start) | None => {
+            if !is_managed_service_process(&cfg) {
+                check_foreground_service_conflict(&cfg, vdpi::service::detect_service_state())?;
+            }
             #[cfg(target_os = "windows")]
             if cfg.engine == EngineMode::Tun {
-                if let Err(msg) = preflight_windows_wintun_dll() {
+                if let Err(err) = vdpi::platform::windows_tun::find_verified_wintun_dll() {
                     if vdpi::platform::windows_service::is_elevated() {
-                        if vdpi::platform::windows_tun::cleanup_orphan_wintun_adapter() {
+                        if cleanup_orphan_wintun_if_service_not_running() {
                             eprintln!(
                                 "Removed orphaned Windows TUN adapter (vdpi0) after wintun.dll preflight failure."
                             );
@@ -826,9 +864,7 @@ fn run_main() -> Result<()> {
                             "Note: if a leftover vdpi0 adapter is blocking connectivity, run `vdpi reset-network`."
                         );
                     }
-                    return Err(desktop_tun::format_tun_start_error(anyhow::anyhow!(
-                        "{msg}"
-                    )));
+                    return Err(desktop_tun::format_tun_start_error(err));
                 }
             }
             #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
@@ -836,7 +872,7 @@ fn run_main() -> Result<()> {
                 && !is_process_elevated()
                 && !unattended
                 && !is_service_mode(&cfg)
-                && try_auto_elevate_current_cli("run vdpi in TUN mode")?
+                && try_auto_elevate_current_cli("run vdpi in TUN mode", true)?
             {
                 return Ok(());
             }
@@ -860,6 +896,92 @@ fn run_main() -> Result<()> {
             ))
         }
     }
+}
+
+fn resolve_startup_runtime_config(
+    cli: CliArgs,
+    file_cfg: &FileConfig,
+    raw_args: &[String],
+    file_cfg_wins_over_cli: bool,
+) -> RuntimeConfig {
+    let mut cfg = cli.resolve_runtime_config(file_cfg, raw_args);
+    if file_cfg_wins_over_cli {
+        file_cfg.apply_to_runtime(&mut cfg);
+        cfg.enable_doh = vdpi_core::dns::effective_enable_doh(&cfg.dns_addr, cfg.enable_doh);
+    }
+    cfg
+}
+
+#[cfg(target_os = "windows")]
+fn service_log_dir() -> PathBuf {
+    vdpi::service::vdpi_root_dir()
+        .map(|root| root.join("logs"))
+        .unwrap_or_else(|_| {
+            vdpi::platform::windows::known_program_data_dir()
+                .join("vdpi")
+                .join("logs")
+        })
+}
+
+fn is_managed_service_process(cfg: &RuntimeConfig) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        cfg.windows_service || vdpi::platform::windows::is_running_as_service()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        cfg.windows_service || std::env::var_os("INVOCATION_ID").is_some()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        cfg.windows_service
+            || std::env::var_os("XPC_SERVICE_NAME")
+                .and_then(|v| v.into_string().ok())
+                .is_some_and(|name| {
+                    name == vdpi::service::LAUNCH_DAEMON_LABEL
+                        || name == vdpi::service::LAUNCH_AGENT_LABEL
+                })
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        cfg.windows_service
+    }
+}
+
+fn check_foreground_service_conflict(
+    cfg: &RuntimeConfig,
+    service_state: ServiceState,
+) -> Result<()> {
+    if service_state != ServiceState::Running {
+        return Ok(());
+    }
+    if cfg.engine == EngineMode::Tun {
+        anyhow::bail!(
+            "Background service is already running. Pause it first (`vdpi pause`) before starting foreground TUN mode."
+        );
+    }
+    if cfg.system_proxy {
+        anyhow::bail!(
+            "Background service is already running. Pause it first (`vdpi pause`) or run with `--no-system-proxy`."
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn cleanup_orphan_wintun_if_service_not_running() -> bool {
+    if vdpi::service::detect_service_state() == ServiceState::Running {
+        return false;
+    }
+    vdpi::platform::windows_tun::cleanup_orphan_wintun_adapter()
+}
+
+fn run_internal_wininet_notify() -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        vdpi::platform::windows::run_internal_wininet_notify();
+    }
+    Ok(())
 }
 
 fn run_internal_linux_tun_cleanup() -> Result<()> {
@@ -1190,14 +1312,211 @@ fn is_process_elevated() -> bool {
     }
 }
 
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
+fn absolutize_arg_path(raw: &str, cwd: Option<&Path>) -> String {
+    if raw.is_empty() || Path::new(raw).is_absolute() {
+        return raw.to_string();
+    }
+    match cwd {
+        Some(dir) => dir.join(raw).to_string_lossy().into_owned(),
+        None => raw.to_string(),
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
+fn build_elevated_tun_run_args(
+    cfg: &RuntimeConfig,
+    explicit_config_path: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Vec<String> {
+    let mut tun_cfg = cfg.clone();
+    tun_cfg.engine = EngineMode::Tun;
+    let mut args = vdpi::service::build_service_cli_args(&tun_cfg);
+    if let Some(path) = explicit_config_path {
+        let abs = absolutize_arg_path(&path.to_string_lossy(), cwd);
+        args.push("--config".to_string());
+        args.push(abs);
+    }
+    if tun_cfg.quiet {
+        args.push("--quiet".to_string());
+    }
+    args.push("start".to_string());
+    args
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
+fn prepare_elevated_cli_args(
+    raw_os_args: &[std::ffi::OsString],
+    cwd: Option<&Path>,
+    force_tun: bool,
+) -> Result<Vec<String>> {
+    let mut args = Vec::with_capacity(raw_os_args.len() + usize::from(force_tun));
+    for raw in raw_os_args {
+        let s = raw.to_str().ok_or_else(|| {
+            anyhow::anyhow!("cannot auto-elevate with non-UTF-8 command-line argument")
+        })?;
+        args.push(s.to_string());
+    }
+
+    let mut out = Vec::with_capacity(args.len() + usize::from(force_tun));
+    let mut idx = 0;
+    let mut after_double_dash = false;
+    let mut has_engine_flag = false;
+    let mut seen_config_subcmd = false;
+    let mut seen_apply_file_subcmd = false;
+    let mut absolutized_apply_file_path = false;
+    let mut subcmd_decided = false;
+
+    while idx < args.len() {
+        let arg = &args[idx];
+        if after_double_dash {
+            if seen_apply_file_subcmd && !absolutized_apply_file_path {
+                out.push(absolutize_arg_path(arg, cwd));
+                absolutized_apply_file_path = true;
+            } else {
+                out.push(arg.clone());
+            }
+            idx += 1;
+            continue;
+        }
+
+        if arg == "--" {
+            after_double_dash = true;
+            out.push(arg.clone());
+            idx += 1;
+            continue;
+        }
+
+        if arg == "--config" {
+            out.push(arg.clone());
+            if let Some(val) = args.get(idx + 1) {
+                out.push(absolutize_arg_path(val, cwd));
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+
+        if let Some(val) = arg.strip_prefix("--config=") {
+            out.push(format!("--config={}", absolutize_arg_path(val, cwd)));
+            idx += 1;
+            continue;
+        }
+
+        if let Some(long) = arg.strip_prefix("--") {
+            let (name, has_eq) = match long.split_once('=') {
+                Some((n, _)) => (n, true),
+                None => (long, false),
+            };
+            if name == "tun" || name == "proxy" {
+                has_engine_flag = true;
+            }
+            let takes_value = matches!(
+                name,
+                "bind"
+                    | "addr"
+                    | "port"
+                    | "socks-port"
+                    | "mode"
+                    | "strategy"
+                    | "chunk-size"
+                    | "window-size"
+                    | "dns"
+                    | "dns-addr"
+                    | "dns-port"
+                    | "include"
+                    | "pattern"
+                    | "bypass"
+                    | "split-mode"
+                    | "split-app"
+                    | "timeout"
+                    | "vpn-coexistence"
+                    | "app"
+                    | "query"
+                    | "filter"
+            );
+            out.push(arg.clone());
+            if takes_value && !has_eq {
+                if let Some(val) = args.get(idx + 1) {
+                    out.push(val.clone());
+                    idx += 2;
+                    continue;
+                }
+            }
+            idx += 1;
+            continue;
+        }
+
+        if let Some(short) = arg.strip_prefix('-') {
+            if !short.is_empty() {
+                out.push(arg.clone());
+                let mut takes_next = false;
+                let mut chars = short.chars().peekable();
+                while let Some(ch) = chars.next() {
+                    match ch {
+                        'b' | 'p' | 's' | 'm' | 'c' | 't' | 'f' => {
+                            if chars.peek().is_none() {
+                                takes_next = true;
+                            }
+                            break;
+                        }
+                        '4' | 'd' | 'q' => {}
+                        _ => break,
+                    }
+                }
+                if takes_next {
+                    if let Some(val) = args.get(idx + 1) {
+                        out.push(val.clone());
+                        idx += 2;
+                        continue;
+                    }
+                }
+                idx += 1;
+                continue;
+            }
+        }
+
+        // Positional token (subcommand or subcommand argument)
+        if !subcmd_decided {
+            subcmd_decided = true;
+            if arg == "config" {
+                seen_config_subcmd = true;
+            }
+            out.push(arg.clone());
+        } else if seen_config_subcmd && !seen_apply_file_subcmd {
+            if arg == "apply-file" {
+                seen_apply_file_subcmd = true;
+            } else {
+                seen_config_subcmd = false;
+            }
+            out.push(arg.clone());
+        } else if seen_apply_file_subcmd && !absolutized_apply_file_path {
+            out.push(absolutize_arg_path(arg, cwd));
+            absolutized_apply_file_path = true;
+        } else {
+            out.push(arg.clone());
+        }
+        idx += 1;
+    }
+
+    if force_tun && !has_engine_flag {
+        out.insert(0, "--tun".to_string());
+    }
+
+    Ok(out)
+}
+
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-fn try_auto_elevate_current_cli(action_description: &str) -> Result<bool> {
+fn try_auto_elevate_current_cli(action_description: &str, force_tun: bool) -> Result<bool> {
     use std::io::IsTerminal;
 
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Ok(false);
     }
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let raw_os_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let cwd = std::env::current_dir().ok();
+    let args = prepare_elevated_cli_args(&raw_os_args, cwd.as_deref(), force_tun)?;
     #[cfg(target_os = "windows")]
     {
         let _ = action_description;
@@ -1235,7 +1554,7 @@ fn resolve_writable_config_path(
             return Ok(WritableConfigPath::Ready(sys));
         }
         #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-        if try_auto_elevate_current_cli("update system vdpi configuration")? {
+        if try_auto_elevate_current_cli("update system vdpi configuration", false)? {
             return Ok(WritableConfigPath::ElevatedAndDone);
         }
         #[cfg(target_os = "windows")]
@@ -1256,7 +1575,7 @@ fn resolve_writable_config_path(
             return Ok(WritableConfigPath::Ready(sys));
         }
         #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-        if try_auto_elevate_current_cli("update system vdpi configuration")? {
+        if try_auto_elevate_current_cli("update system vdpi configuration", false)? {
             return Ok(WritableConfigPath::ElevatedAndDone);
         }
         #[cfg(target_os = "windows")]
@@ -2132,21 +2451,43 @@ fn handle_config_apply_file(
 ) -> Result<()> {
     use anyhow::Context as _;
 
+    let staged_cfg = load_and_validate_apply_config_file(source_path)?;
     let service_state = vdpi::service::detect_service_state();
     let system_service_installed = has_installed_system_service();
     let elevated = is_process_elevated();
-
-    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-    if explicit_path.is_none() && !service_mode && system_service_installed && !elevated {
-        // Validate before triggering an interactive elevation prompt.
-        let _ = load_and_validate_apply_config_file(source_path)?;
-        if try_auto_elevate_current_cli("update system vdpi configuration")? {
-            return Ok(());
-        }
-    }
-
     let system_path = system_config_path();
     let user_path = user_config_path();
+
+    let targets_active_config = explicit_path.is_none()
+        || explicit_path == Some(system_path.as_path())
+        || explicit_path == Some(user_path.as_path());
+    let prev_engine = load_file_config(explicit_path, service_mode || system_service_installed)
+        .ok()
+        .and_then(|(_, fc)| fc.engine)
+        .unwrap_or(EngineMode::Proxy);
+    let new_engine = staged_cfg.engine.unwrap_or(EngineMode::Proxy);
+    let engine_changed =
+        service_state != ServiceState::NotInstalled && targets_active_config && new_engine != prev_engine;
+
+    #[cfg(target_os = "windows")]
+    if new_engine == EngineMode::Tun && targets_active_config {
+        vdpi::platform::windows_tun::find_verified_wintun_dll()
+            .map_err(desktop_tun::format_tun_start_error)?;
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    if explicit_path.is_none()
+        && !service_mode
+        && system_service_installed
+        && !elevated
+        && try_auto_elevate_current_cli("update system vdpi configuration", false)?
+    {
+        return Ok(());
+    }
+
+    let mut runtime_cfg = RuntimeConfig::default();
+    staged_cfg.apply_to_runtime(&mut runtime_cfg);
+
     let (target, restarted) = apply_config_file_with(
         source_path,
         restart,
@@ -2159,12 +2500,25 @@ fn handle_config_apply_file(
         &user_path,
         save_config_with_ownership,
         || {
-            vdpi::service::pause_service_quiet()
-                .context("failed to pause running vdpi service for restart")?;
-            vdpi::service::resume_service_quiet()
-                .context("failed to resume vdpi service after pause")
+            if engine_changed {
+                switch_service_engine_quiet(new_engine, &runtime_cfg)
+                    .context("failed to switch installed vdpi service engine")
+            } else {
+                vdpi::service::pause_service_quiet()
+                    .context("failed to pause running vdpi service for restart")?;
+                vdpi::service::resume_service_quiet()
+                    .context("failed to resume vdpi service after pause")
+            }
         },
     )?;
+
+    if engine_changed && service_state == ServiceState::Stopped {
+        if let Err(source) = switch_service_engine_quiet(new_engine, &runtime_cfg)
+            .context("failed to switch installed vdpi service engine")
+        {
+            return Err(anyhow::Error::new(ApplyFileRestartError { target, source }));
+        }
+    }
 
     if restarted {
         println!(
@@ -3141,11 +3495,9 @@ async fn run_daemon(
 
     #[cfg(target_os = "windows")]
     if vdpi::platform::windows_service::is_elevated() {
-        let cleaned = tokio::task::spawn_blocking(
-            vdpi::platform::windows_tun::cleanup_orphan_wintun_adapter,
-        )
-        .await
-        .unwrap_or(false);
+        let cleaned = tokio::task::spawn_blocking(cleanup_orphan_wintun_if_service_not_running)
+            .await
+            .unwrap_or(false);
         if cleaned {
             info!("cleaned up orphaned Windows Wintun adapter before starting foreground Proxy mode");
         }
@@ -3160,89 +3512,107 @@ async fn run_daemon(
     let primary_addr = bound.primary_addr;
     let socks_addr = bound.socks_addr;
 
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // Spawn the HTTP/PAC/SOCKS server BEFORE activating OS system proxy so
+    // `/vdpi.pac` is already accepting requests when WinINET refreshes.
+    let server_task = tokio::spawn(serve_until_shutdown(bound, ctx.clone(), shutdown_rx.clone()));
+
     #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     let (proxy_spec, mut proxy_session, proxy_summary, mut proxy_vpn_guard, mut proxy_last_warned) = {
         use vdpi::config::VpnCoexistence;
         use vdpi::platform::vpn::{detect_active_vpn, VpnScope};
         use vdpi::platform::vpn_guard::{GuardAction, VpnGuard};
 
-        let mut vpn_guard = VpnGuard::new(cfg.vpn_coexistence);
-        let mut last_warned: Option<String> = None;
+        let activation_res: Result<_> = async {
+            let mut vpn_guard = VpnGuard::new(cfg.vpn_coexistence);
+            let mut last_warned: Option<String> = None;
 
-        if cfg.system_proxy {
-            let spec = ForegroundProxySpec::from_runtime_config(&cfg, primary_addr, socks_addr);
+            if cfg.system_proxy {
+                let spec =
+                    ForegroundProxySpec::from_runtime_config(&cfg, primary_addr, socks_addr);
 
-            let initial_scope = if cfg.vpn_coexistence != VpnCoexistence::Off {
-                tokio::task::spawn_blocking(|| detect_active_vpn(None))
-                    .await
-                    .unwrap_or(VpnScope::None)
-            } else {
-                VpnScope::None
-            };
-            let initial_action = vpn_guard.evaluate(&initial_scope, Instant::now());
+                let initial_scope = if cfg.vpn_coexistence != VpnCoexistence::Off {
+                    tokio::task::spawn_blocking(|| detect_active_vpn(None))
+                        .await
+                        .unwrap_or(VpnScope::None)
+                } else {
+                    VpnScope::None
+                };
+                let initial_action = vpn_guard.evaluate(&initial_scope, Instant::now());
 
-            match initial_action {
-                GuardAction::YieldTun { provider } => {
-                    warn!(
-                        provider = %provider,
-                        "full-tunnel VPN active at startup; holding system proxy in yielded standby until VPN disconnects"
-                    );
-                    #[cfg(windows)]
-                    {
-                        let _ = tokio::task::spawn_blocking(|| {
-                            let _ = vdpi::platform::windows::clear_all_windows_proxies();
-                            vdpi::platform::windows::flush_dns_resolver_cache();
-                        })
-                        .await;
+                match initial_action {
+                    GuardAction::YieldTun { provider } => {
+                        warn!(
+                            provider = %provider,
+                            "full-tunnel VPN active at startup; holding system proxy in yielded standby until VPN disconnects"
+                        );
+                        #[cfg(windows)]
+                        {
+                            let _ = tokio::task::spawn_blocking(|| {
+                                let _ = vdpi::platform::windows::clear_all_windows_proxies();
+                                vdpi::platform::windows::flush_dns_resolver_cache();
+                            })
+                            .await;
+                        }
+                        Ok((
+                            Some(spec),
+                            None,
+                            Some(format!("standby (yielded to {provider})")),
+                            vpn_guard,
+                            last_warned,
+                        ))
                     }
-                    (
-                        Some(spec),
-                        None,
-                        Some(format!("standby (yielded to {provider})")),
-                        vpn_guard,
-                        last_warned,
-                    )
+                    GuardAction::WarnOnly { provider } => {
+                        warn!(
+                            provider = %provider,
+                            "full-tunnel VPN detected (vpn_coexistence=warn); activating system proxy anyway"
+                        );
+                        last_warned = Some(provider);
+                        let act_spec = spec.clone();
+                        let (session, summary) =
+                            tokio::task::spawn_blocking(move || act_spec.activate())
+                                .await
+                                .map_err(|e| {
+                                    anyhow::anyhow!("system proxy activation task panicked: {e}")
+                                })??;
+                        Ok((
+                            Some(spec),
+                            Some(session),
+                            Some(summary),
+                            vpn_guard,
+                            last_warned,
+                        ))
+                    }
+                    GuardAction::None | GuardAction::ResumeTun => {
+                        let act_spec = spec.clone();
+                        let (session, summary) =
+                            tokio::task::spawn_blocking(move || act_spec.activate())
+                                .await
+                                .map_err(|e| {
+                                    anyhow::anyhow!("system proxy activation task panicked: {e}")
+                                })??;
+                        Ok((
+                            Some(spec),
+                            Some(session),
+                            Some(summary),
+                            vpn_guard,
+                            last_warned,
+                        ))
+                    }
                 }
-                GuardAction::WarnOnly { provider } => {
-                    warn!(
-                        provider = %provider,
-                        "full-tunnel VPN detected (vpn_coexistence=warn); activating system proxy anyway"
-                    );
-                    last_warned = Some(provider);
-                    let act_spec = spec.clone();
-                    let (session, summary) =
-                        tokio::task::spawn_blocking(move || act_spec.activate())
-                            .await
-                            .map_err(|e| {
-                                anyhow::anyhow!("system proxy activation task panicked: {e}")
-                            })??;
-                    (
-                        Some(spec),
-                        Some(session),
-                        Some(summary),
-                        vpn_guard,
-                        last_warned,
-                    )
-                }
-                GuardAction::None | GuardAction::ResumeTun => {
-                    let act_spec = spec.clone();
-                    let (session, summary) =
-                        tokio::task::spawn_blocking(move || act_spec.activate())
-                            .await
-                            .map_err(|e| {
-                                anyhow::anyhow!("system proxy activation task panicked: {e}")
-                            })??;
-                    (
-                        Some(spec),
-                        Some(session),
-                        Some(summary),
-                        vpn_guard,
-                        last_warned,
-                    )
-                }
+            } else {
+                Ok((None, None, None, vpn_guard, last_warned))
             }
-        } else {
-            (None, None, None, vpn_guard, last_warned)
+        }
+        .await;
+
+        match activation_res {
+            Ok(activated) => activated,
+            Err(err) => {
+                let _ = shutdown_tx.send(true);
+                let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
+                return Err(err);
+            }
         }
     };
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
@@ -3269,8 +3639,6 @@ async fn run_daemon(
             "vdpi engine active"
         );
     }
-
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     let proxy_supervisor_task = proxy_spec.map(|spec| {
@@ -3489,8 +3857,6 @@ async fn run_daemon(
             }
         })
     });
-
-    let server_task = tokio::spawn(serve_until_shutdown(bound, ctx.clone(), shutdown_rx));
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     if let Some(dashboard) = dashboard_tracing {
@@ -4022,6 +4388,9 @@ mod desktop_tun {
                 self.pipeline_stop_tx = Some(stop_tx);
                 self.pipeline_task = Some(pipeline_task);
                 self.route_rx = Some(route_rx);
+                let _ =
+                    tokio::task::spawn_blocking(vdpi::platform::windows::notify_wininet_refresh)
+                        .await;
                 Ok(())
             }
 
@@ -4440,7 +4809,7 @@ mod desktop_tun {
                     #[cfg(target_os = "windows")]
                     {
                         let _ = tokio::task::spawn_blocking(
-                            vdpi::platform::windows_tun::cleanup_orphan_wintun_adapter,
+                            super::cleanup_orphan_wintun_if_service_not_running,
                         )
                         .await;
                     }
@@ -4488,7 +4857,10 @@ mod desktop_tun {
     ) -> Result<()> {
         let explicit_dns_ipv4_only = cfg.dns_ipv4_only;
         let cfg = normalize_tun_runtime_config(cfg);
-        let binder = DynamicOutboundBinder::new(OutboundTarget::default());
+        let binder = DynamicOutboundBinder::new(OutboundTarget {
+            fail_closed: true,
+            ..OutboundTarget::default()
+        });
         let binder_dyn: Arc<dyn OutboundBinder> = binder.clone();
         let ctx = EngineContext::new_with_binder(cfg.clone(), Some(binder_dyn))?;
         if let Some(cache_path) = vdpi::desync::default_desktop_cache_path() {
@@ -4536,7 +4908,7 @@ mod desktop_tun {
                         #[cfg(target_os = "windows")]
                         {
                             let _ = tokio::task::spawn_blocking(
-                                vdpi::platform::windows_tun::cleanup_orphan_wintun_adapter,
+                                super::cleanup_orphan_wintun_if_service_not_running,
                             )
                             .await;
                         }
@@ -4566,7 +4938,7 @@ mod desktop_tun {
                         #[cfg(target_os = "windows")]
                         {
                             let _ = tokio::task::spawn_blocking(
-                                vdpi::platform::windows_tun::cleanup_orphan_wintun_adapter,
+                                super::cleanup_orphan_wintun_if_service_not_running,
                             )
                             .await;
                         }
@@ -4586,7 +4958,7 @@ mod desktop_tun {
             // Clean up any orphaned vdpi0 adapter left behind by a prior crash so it cannot
             // blackhole traffic while TUN is held in VPN-yielded or offline preflight standby.
             let _ = tokio::task::spawn_blocking(
-                vdpi::platform::windows_tun::cleanup_orphan_wintun_adapter,
+                super::cleanup_orphan_wintun_if_service_not_running,
             )
             .await;
         }
@@ -4750,7 +5122,7 @@ mod desktop_tun {
         let vpn_policy = cfg.vpn_coexistence;
         let mut last_scope = initial_scope;
 
-        let supervisor_task: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
+        let mut supervisor_task: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
             #[cfg(target_os = "windows")]
             let (mut power_resume_rx, _power_notify_guard, mut power_resume_open) = {
                 let (tx, rx) = watch::channel::<u64>(0);
@@ -5276,16 +5648,28 @@ mod desktop_tun {
         let _ = shutdown_tx.send(true);
         clear_runtime_state(std::process::id());
 
-        let supervisor_result = match tokio::time::timeout(Duration::from_secs(12), supervisor_task)
-            .await
-        {
-            Ok(Ok(res)) => res,
-            Ok(Err(join_err)) => Err(anyhow::anyhow!("TUN supervisor task panicked: {join_err}")),
-            Err(_) => {
-                warn!("timed out after 12s waiting for TUN supervisor cleanup");
-                Ok(())
-            }
-        };
+        let supervisor_result =
+            match tokio::time::timeout(Duration::from_secs(12), &mut supervisor_task).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(join_err)) => {
+                    Err(anyhow::anyhow!("TUN supervisor task panicked: {join_err}"))
+                }
+                Err(_) => {
+                    warn!("timed out after 12s waiting for TUN supervisor cleanup; aborting and running synchronous platform TUN cleanup");
+                    supervisor_task.abort();
+                    let _ = tokio::time::timeout(Duration::from_millis(500), &mut supervisor_task)
+                        .await;
+                    #[cfg(target_os = "windows")]
+                    {
+                        let _ = super::cleanup_orphan_wintun_if_service_not_running();
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        let _ = vdpi::platform::linux_tun::cleanup_linux_tun_state();
+                    }
+                    Ok(())
+                }
+            };
         let _ = tokio::time::timeout(Duration::from_secs(2), health_task).await;
         if let Err(err) = ctx.flush_persisted_cache().await {
             debug!(error = %err, "failed to flush adaptive cache on TUN shutdown");
@@ -5625,7 +6009,7 @@ mod tests {
             port: Some(8088),
             ..Default::default()
         };
-        let raw_args = vec![
+        let raw_args = [
             "--tun".to_string(),
             "--port".to_string(),
             "9090".to_string(),
@@ -5637,13 +6021,13 @@ mod tests {
         argv.extend(raw_args.iter().cloned());
         let cli = CliArgs::parse_from_iter(&argv).unwrap();
         assert_eq!(
-            resolve_effective_config_key(cli.clone(), &file_cfg, &raw_args, "port")
+            resolve_effective_config_key(cli.clone(), &file_cfg, &argv, "port")
                 .unwrap()
                 .as_deref(),
             Some("9090")
         );
         assert_eq!(
-            resolve_effective_config_key(cli, &file_cfg, &raw_args, "engine")
+            resolve_effective_config_key(cli, &file_cfg, &argv, "engine")
                 .unwrap()
                 .as_deref(),
             Some("tun")
@@ -7227,5 +7611,161 @@ split_tunnel_apps = ["discord.exe"]
             assert!(missing.contains("wintun.dll"));
             assert!(missing.contains("bulunamadı"));
         }
+    }
+
+    #[test]
+    fn service_startup_gives_config_toml_precedence_over_legacy_baked_scm_flags() {
+        let file_cfg = FileConfig {
+            schema_version: Some(CONFIG_SCHEMA_VERSION),
+            engine: Some(EngineMode::Proxy),
+            port: Some(9090),
+            doh: Some(false),
+            dns_addr: Some("https://dns.nextdns.io/abc123".to_string()),
+            ..Default::default()
+        };
+        let argv = [
+            "vdpi",
+            "--service",
+            "--quiet",
+            "--tun",
+            "--port",
+            "8080",
+            "--dns",
+            "1.1.1.1",
+        ]
+        .map(str::to_string);
+        let cli = CliArgs::parse_from_iter(&argv).expect("valid legacy service argv");
+
+        // When --service has a loaded config.toml, config.toml wins over legacy SCM flags
+        // and effective_enable_doh is reconciled for explicit https:// DoH URLs.
+        let svc_cfg = resolve_startup_runtime_config(cli.clone(), &file_cfg, &argv, true);
+        assert_eq!(svc_cfg.engine, EngineMode::Proxy);
+        assert_eq!(svc_cfg.port, 9090);
+        assert_eq!(svc_cfg.dns_addr, "https://dns.nextdns.io/abc123");
+        assert!(svc_cfg.enable_doh);
+        assert!(svc_cfg.windows_service);
+        assert!(svc_cfg.quiet);
+
+        // Without file_cfg_wins_over_cli (foreground CLI or missing config.toml), CLI wins.
+        let cli_cfg = resolve_startup_runtime_config(cli, &file_cfg, &argv, false);
+        assert_eq!(cli_cfg.engine, EngineMode::Tun);
+        assert_eq!(cli_cfg.port, 8080);
+        assert_eq!(cli_cfg.dns_addr, "1.1.1.1");
+    }
+
+    #[test]
+    fn foreground_service_conflict_guard_blocks_tun_and_system_proxy_when_running() {
+        let tun_cfg = RuntimeConfig {
+            engine: EngineMode::Tun,
+            system_proxy: false,
+            ..RuntimeConfig::default()
+        };
+        assert!(check_foreground_service_conflict(&tun_cfg, ServiceState::Running).is_err());
+        assert!(check_foreground_service_conflict(&tun_cfg, ServiceState::Stopped).is_ok());
+        assert!(check_foreground_service_conflict(&tun_cfg, ServiceState::NotInstalled).is_ok());
+
+        let sys_proxy_cfg = RuntimeConfig {
+            engine: EngineMode::Proxy,
+            system_proxy: true,
+            ..RuntimeConfig::default()
+        };
+        assert!(check_foreground_service_conflict(&sys_proxy_cfg, ServiceState::Running).is_err());
+        assert!(check_foreground_service_conflict(&sys_proxy_cfg, ServiceState::Stopped).is_ok());
+
+        let no_sys_proxy_cfg = RuntimeConfig {
+            engine: EngineMode::Proxy,
+            system_proxy: false,
+            ..RuntimeConfig::default()
+        };
+        assert!(
+            check_foreground_service_conflict(&no_sys_proxy_cfg, ServiceState::Running).is_ok()
+        );
+    }
+
+    #[test]
+    fn prepare_elevated_cli_args_absolutizes_paths_and_adds_explicit_tun() {
+        use std::ffi::OsString;
+
+        let cwd = std::env::temp_dir();
+
+        // Absolutizes `--config <rel>` and injects `--tun` when force_tun is true.
+        let raw_tun: Vec<OsString> = ["--config", "my.toml", "start"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        let elevated_tun = prepare_elevated_cli_args(&raw_tun, Some(&cwd), true).unwrap();
+        assert_eq!(elevated_tun[0], "--tun");
+        assert_eq!(elevated_tun[1], "--config");
+        assert_eq!(
+            PathBuf::from(&elevated_tun[2]),
+            cwd.join("my.toml")
+        );
+        assert_eq!(elevated_tun[3], "start");
+
+        // Does not duplicate `--tun` if already present, and absolutizes `--config=<rel>`.
+        let raw_eq: Vec<OsString> = ["--config=sub/alt.toml", "--tun", "start"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        let elevated_eq = prepare_elevated_cli_args(&raw_eq, Some(&cwd), true).unwrap();
+        assert_eq!(
+            elevated_eq.iter().filter(|a| a.as_str() == "--tun").count(),
+            1
+        );
+        assert_eq!(
+            elevated_eq[0],
+            format!("--config={}", cwd.join("sub/alt.toml").display())
+        );
+
+        // Absolutizes `config apply-file <rel>` even when `--restart` precedes the path.
+        let raw_apply: Vec<OsString> = ["config", "apply-file", "--restart", "staged.toml"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        let elevated_apply = prepare_elevated_cli_args(&raw_apply, Some(&cwd), false).unwrap();
+        assert_eq!(elevated_apply[0], "config");
+        assert_eq!(elevated_apply[1], "apply-file");
+        assert_eq!(elevated_apply[2], "--restart");
+        assert_eq!(
+            PathBuf::from(&elevated_apply[3]),
+            cwd.join("staged.toml")
+        );
+    }
+
+    #[test]
+    fn build_elevated_tun_run_args_forwards_effective_flags_and_abs_config() {
+        let cwd = std::env::temp_dir();
+        let cfg = RuntimeConfig {
+            engine: EngineMode::Tun,
+            port: 9091,
+            dns_addr: "9.9.9.9".to_string(),
+            enable_doh: false,
+            tun_ipv6: true,
+            quiet: true,
+            debug: true,
+            ..RuntimeConfig::default()
+        };
+        let args = build_elevated_tun_run_args(&cfg, Some(Path::new("custom.toml")), Some(&cwd));
+        assert!(args.contains(&"--tun".to_string()));
+        assert!(args.contains(&"--no-doh".to_string()));
+        assert!(args.contains(&"--tun-ipv6".to_string()));
+        assert!(args.contains(&"--quiet".to_string()));
+        assert!(args.contains(&"--debug".to_string()));
+        assert_eq!(args.last().map(String::as_str), Some("start"));
+        let cfg_idx = args
+            .iter()
+            .position(|a| a == "--config")
+            .expect("explicit --config must be forwarded");
+        assert_eq!(PathBuf::from(&args[cfg_idx + 1]), cwd.join("custom.toml"));
+
+        let mut full_argv = vec!["vdpi".to_string()];
+        full_argv.extend(args);
+        let parsed = CliArgs::parse_from_iter(&full_argv)
+            .expect("elevated TUN run args must parse cleanly");
+        assert!(parsed.tun);
+        assert!(parsed.tun_ipv6);
+        assert!(parsed.quiet);
+        assert!(parsed.debug);
+        assert!(matches!(parsed.command, Some(Command::Start)));
     }
 }

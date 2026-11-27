@@ -81,6 +81,55 @@ fn run_sidecar_cli(args: &[&str], elevated: bool, timeout_secs: u64) -> SidecarO
     }
 }
 
+#[cfg(target_os = "windows")]
+fn refresh_interactive_windows_proxy_env() {
+    vdpi::platform::windows::notify_wininet_refresh();
+    vdpi::platform::windows::broadcast_environment_change();
+}
+
+#[cfg(any(target_os = "windows", test))]
+const fn windows_post_mutation_actions(
+    ok: bool,
+    ran_elevated: bool,
+    cleanup_user_proxies: bool,
+    process_elevated: bool,
+) -> (bool, bool) {
+    if !ok {
+        return (false, false);
+    }
+    let run_user_proxy_cleanup = cleanup_user_proxies && !process_elevated;
+    let run_refresh = ran_elevated || cleanup_user_proxies;
+    (run_user_proxy_cleanup, run_refresh)
+}
+
+#[cfg(target_os = "windows")]
+fn finish_windows_sidecar_mutation(
+    result: &ActionResultDto,
+    ran_elevated: bool,
+    cleanup_user_proxies: bool,
+) {
+    let (run_user_proxy_cleanup, run_refresh) = windows_post_mutation_actions(
+        result.ok,
+        ran_elevated,
+        cleanup_user_proxies,
+        vdpi::platform::windows_service::is_elevated(),
+    );
+    if run_user_proxy_cleanup {
+        let _ = vdpi::platform::windows::clear_all_windows_proxies();
+    }
+    if run_refresh {
+        refresh_interactive_windows_proxy_env();
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn finish_windows_sidecar_mutation(
+    _result: &ActionResultDto,
+    _ran_elevated: bool,
+    _cleanup_user_proxies: bool,
+) {
+}
+
 fn action_ok(message: impl Into<String>, needs_restart: Option<bool>) -> ActionResultDto {
     ActionResultDto {
         ok: true,
@@ -418,12 +467,108 @@ fn uninstall_needs_elevation() -> bool {
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn split_windows_service_cmdline(cmdline: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut has_token = false;
+    let chars: Vec<char> = cmdline.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\\' {
+            let mut backslashes = 0usize;
+            while i < chars.len() && chars[i] == '\\' {
+                backslashes += 1;
+                i += 1;
+            }
+            if i < chars.len() && chars[i] == '"' {
+                for _ in 0..(backslashes / 2) {
+                    current.push('\\');
+                }
+                if backslashes % 2 == 1 {
+                    current.push('"');
+                } else {
+                    in_quotes = !in_quotes;
+                }
+                has_token = true;
+                i += 1;
+            } else {
+                for _ in 0..backslashes {
+                    current.push('\\');
+                }
+                has_token = true;
+            }
+            continue;
+        }
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            has_token = true;
+            i += 1;
+            continue;
+        }
+        if !in_quotes && ch.is_ascii_whitespace() {
+            if has_token {
+                args.push(std::mem::take(&mut current));
+                has_token = false;
+            }
+            i += 1;
+            continue;
+        }
+        current.push(ch);
+        has_token = true;
+        i += 1;
+    }
+    if has_token {
+        args.push(current);
+    }
+    args
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn engine_from_windows_service_binary_path(binary_path: Option<&str>) -> Option<EngineMode> {
+    let cmdline = binary_path?;
+    let tokens = split_windows_service_cmdline(cmdline);
+    let mut detected = None;
+    for token in tokens.iter().skip(1) {
+        match token.as_str() {
+            "--tun" => detected = Some(EngineMode::Tun),
+            "--proxy" => detected = Some(EngineMode::Proxy),
+            _ => {}
+        }
+    }
+    detected
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn default_engine_for_windows_service_binary_path(
+    system_service_installed: bool,
+    binary_path: Option<&str>,
+) -> EngineMode {
+    if system_service_installed {
+        if let Some(engine) = engine_from_windows_service_binary_path(binary_path) {
+            return engine;
+        }
+    }
+    RuntimeConfig::default().engine
+}
+
 fn default_engine_for_service_mode(system_service_installed: bool) -> EngineMode {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if system_service_installed {
         return EngineMode::Tun;
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    if system_service_installed {
+        let svc = vdpi::platform::windows_service::query_windows_service_status();
+        return default_engine_for_windows_service_binary_path(
+            system_service_installed,
+            svc.binary_path.as_deref(),
+        );
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     let _ = system_service_installed;
     RuntimeConfig::default().engine
 }
@@ -579,9 +724,91 @@ pub fn toggle_protection(connect: bool) -> ActionResultDto {
     } else {
         SIDECAR_TOGGLE_USER_TIMEOUT_SECS
     };
-    toggle_protection_with(connect, elevated, |args, need_elev| {
+    let mut ran_elevated = false;
+    let result = toggle_protection_with(connect, elevated, |args, need_elev| {
+        if need_elev {
+            ran_elevated = true;
+        }
         run_sidecar_cli(args, need_elev, timeout)
-    })
+    });
+    finish_windows_sidecar_mutation(&result, ran_elevated, !connect);
+    result
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwitchEngineWintunPreflight {
+    ReadyStandard,
+    ReadyViaBundledCli,
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn resolve_windows_tun_switch_wintun_preflight<FProbe>(
+    engine: EngineMode,
+    service_installed: bool,
+    mut probe: FProbe,
+) -> Result<SwitchEngineWintunPreflight, (ActionErrorCodeDto, String)>
+where
+    FProbe: FnMut(bool) -> crate::status::WintunPreflightResult,
+{
+    if engine != EngineMode::Tun {
+        return Ok(SwitchEngineWintunPreflight::ReadyStandard);
+    }
+    if !service_installed {
+        return match probe(false) {
+            crate::status::WintunPreflightResult::Ready => {
+                Ok(SwitchEngineWintunPreflight::ReadyStandard)
+            }
+            crate::status::WintunPreflightResult::Missing(msg) => {
+                Err((ActionErrorCodeDto::WintunMissing, msg))
+            }
+            crate::status::WintunPreflightResult::Invalid(msg) => {
+                Err((ActionErrorCodeDto::WintunInvalid, msg))
+            }
+        };
+    }
+    match probe(true) {
+        crate::status::WintunPreflightResult::Ready => {
+            Ok(SwitchEngineWintunPreflight::ReadyStandard)
+        }
+        service_err => match probe(false) {
+            crate::status::WintunPreflightResult::Ready => {
+                Ok(SwitchEngineWintunPreflight::ReadyViaBundledCli)
+            }
+            bundle_err => match (service_err, bundle_err) {
+                (crate::status::WintunPreflightResult::Invalid(msg), _)
+                | (_, crate::status::WintunPreflightResult::Invalid(msg)) => {
+                    Err((ActionErrorCodeDto::WintunInvalid, msg))
+                }
+                (crate::status::WintunPreflightResult::Missing(msg), _)
+                | (_, crate::status::WintunPreflightResult::Missing(msg)) => {
+                    Err((ActionErrorCodeDto::WintunMissing, msg))
+                }
+                (
+                    crate::status::WintunPreflightResult::Ready,
+                    crate::status::WintunPreflightResult::Ready,
+                ) => unreachable!("checked above"),
+            },
+        },
+    }
+}
+
+fn check_windows_tun_switch_wintun_preflight(
+    engine: EngineMode,
+    service_installed: bool,
+) -> Result<SwitchEngineWintunPreflight, (ActionErrorCodeDto, String)> {
+    #[cfg(target_os = "windows")]
+    {
+        resolve_windows_tun_switch_wintun_preflight(
+            engine,
+            service_installed,
+            crate::status::probe_wintun_preflight,
+        )
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (engine, service_installed);
+        Ok(SwitchEngineWintunPreflight::ReadyStandard)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -596,8 +823,9 @@ fn switch_engine_with<FDetect, FWintun, FRun>(
 ) -> ActionResultDto
 where
     FDetect: FnOnce() -> ServiceState,
-    FWintun: FnOnce(EngineMode, bool) -> Result<(), (ActionErrorCodeDto, String)>,
-    FRun: FnOnce(&[&str], bool) -> SidecarOutcome,
+    FWintun:
+        FnOnce(EngineMode, bool) -> Result<SwitchEngineWintunPreflight, (ActionErrorCodeDto, String)>,
+    FRun: FnOnce(&[&str], bool, bool) -> SidecarOutcome,
 {
     let target = engine_mode_from_dto(engine);
     let label = engine_display_name(target);
@@ -605,12 +833,14 @@ where
     let service_state = detect_service();
     let service_installed = service_state != ServiceState::NotInstalled;
 
-    if let Err((code, err)) = check_wintun(target, service_installed) {
-        return action_err_with_code(redact_message(&err), code);
-    }
+    let wintun_plan = match check_wintun(target, service_installed) {
+        Ok(plan) => plan,
+        Err((code, err)) => return action_err_with_code(redact_message(&err), code),
+    };
 
     if service_installed {
-        return match run_cli(&["engine", cli_mode], needs_elevation) {
+        let use_bundled_cli = wintun_plan == SwitchEngineWintunPreflight::ReadyViaBundledCli;
+        return match run_cli(&["engine", cli_mode], needs_elevation, use_bundled_cli) {
             SidecarOutcome::Ok(_) => {
                 let message = if service_state == ServiceState::Running {
                     format!("Switched engine to {label} mode and restarted background service.")
@@ -677,24 +907,38 @@ where
 /// Switches the active transport engine (`TUN` or `Proxy`).
 ///
 /// When the target is `TUN` on Windows, verifies `wintun.dll` integrity before
-/// elevating or persisting. When the background service is installed, delegates
-/// to the `vdpi` CLI sidecar (`engine tun|proxy`). Otherwise persists atomically
-/// to `config.toml`.
+/// elevating or persisting (falling back to the portable bundle next to
+/// `vdpi-desktop.exe` and running the bundled `vdpi.exe` so it copies the
+/// verified DLL into `Program Files\vdpi\bin\` when needed). When the
+/// background service is installed, delegates to the `vdpi` CLI sidecar
+/// (`engine tun|proxy`). Otherwise persists atomically to `config.toml`.
 pub fn switch_engine(engine: EngineModeDto) -> ActionResultDto {
     let target = engine_mode_from_dto(engine);
     let user_cfg_path = user_config_path();
     let sys_cfg_path = system_config_path();
     let fallback = (sys_cfg_path != user_cfg_path).then_some(sys_cfg_path.as_path());
     let elevated = engine_switch_needs_elevation(target);
-    switch_engine_with(
+    let mut ran_elevated = false;
+    let result = switch_engine_with(
         engine,
         &user_cfg_path,
         fallback,
         elevated,
         detect_service_state,
-        check_windows_tun_wintun_preflight,
-        |args, need_elev| run_sidecar_cli(args, need_elev, SIDECAR_ENGINE_TIMEOUT_SECS),
-    )
+        check_windows_tun_switch_wintun_preflight,
+        |args, need_elev, use_bundled_cli| {
+            if need_elev {
+                ran_elevated = true;
+            }
+            if use_bundled_cli {
+                sidecar::run_bundled_vdpi_cli(args, need_elev, SIDECAR_ENGINE_TIMEOUT_SECS)
+            } else {
+                run_sidecar_cli(args, need_elev, SIDECAR_ENGINE_TIMEOUT_SECS)
+            }
+        },
+    );
+    finish_windows_sidecar_mutation(&result, ran_elevated, false);
+    result
 }
 
 fn normalized_domain_list_lossy(domains: &[String]) -> Vec<String> {
@@ -709,11 +953,13 @@ fn normalized_domain_list_lossy(domains: &[String]) -> Vec<String> {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn save_dns_and_rules_with<FDetect, FApplySystem>(
     update: DnsConfigUpdateDto,
     primary_config_path: &Path,
     fallback_config_path: Option<&Path>,
     use_system_config: bool,
+    default_engine: EngineMode,
     detect_service: FDetect,
     apply_system_config: FApplySystem,
 ) -> ActionResultDto
@@ -765,7 +1011,10 @@ where
             }
         };
 
-    let mut prev_runtime = RuntimeConfig::default();
+    let mut prev_runtime = RuntimeConfig {
+        engine: default_engine,
+        ..RuntimeConfig::default()
+    };
     file_cfg.apply_to_runtime(&mut prev_runtime);
     let prev_dns = validate_custom_dns_input(&prev_runtime.dns_addr)
         .unwrap_or_else(|_| prev_runtime.dns_addr.clone());
@@ -785,6 +1034,7 @@ where
     let anything_changed = dns_changed || other_rules_changed;
 
     file_cfg.schema_version = Some(CONFIG_SCHEMA_VERSION);
+    file_cfg.engine.get_or_insert(default_engine);
     file_cfg.dns_addr = Some(validated_dns);
     file_cfg.doh = Some(effective_doh);
     file_cfg.block_quic = Some(update.block_quic);
@@ -801,11 +1051,12 @@ where
         );
     }
 
-    // When a system-scoped service is installed, apply ALL changes atomically via a
-    // restricted temporary config file through the elevated sidecar so secret DoH URLs
-    // never appear on argv and non-DNS rule edits never hit PermissionDenied.
-    if service_installed && use_system_config {
-        return match apply_system_config(&file_cfg, true, service_running) {
+    // When a system-scoped service is installed (or a user-scoped service is running and
+    // needs an immediate restart), apply ALL changes atomically via a restricted temporary
+    // config file through the sidecar so secret DoH URLs never appear on argv, non-DNS rule
+    // edits never hit PermissionDenied, and running services restart automatically.
+    if service_installed && (use_system_config || service_running) {
+        return match apply_system_config(&file_cfg, use_system_config, service_running) {
             SidecarOutcome::Ok(_) => {
                 let message = if service_running {
                     format!(
@@ -863,9 +1114,11 @@ where
 
 /// Validates DNS and routing rules, seeds from the active config fallback order,
 /// and applies changes either via [`sidecar::apply_config_via_temp_file`] (when a
-/// system-scoped service is installed) or atomically to the user's `config.toml`.
+/// system-scoped service is installed or a user-scoped service is running) or
+/// atomically to the user's `config.toml`.
 pub fn save_dns_and_rules(update: DnsConfigUpdateDto) -> ActionResultDto {
     let use_system = is_system_service_installed();
+    let default_engine = default_engine_for_service_mode(use_system);
     let sys_path = system_config_path();
     let user_path = user_config_path();
     let (primary, fallback) = if use_system {
@@ -874,14 +1127,23 @@ pub fn save_dns_and_rules(update: DnsConfigUpdateDto) -> ActionResultDto {
         let fb = (sys_path != user_path).then_some(sys_path.as_path());
         (user_path.as_path(), fb)
     };
-    save_dns_and_rules_with(
+    let mut ran_elevated = false;
+    let result = save_dns_and_rules_with(
         update,
         primary,
         fallback,
         use_system,
+        default_engine,
         detect_service_state,
-        sidecar::apply_config_via_temp_file,
-    )
+        |cfg, elevate, restart| {
+            if elevate {
+                ran_elevated = true;
+            }
+            sidecar::apply_config_via_temp_file(cfg, elevate, restart)
+        },
+    );
+    finish_windows_sidecar_mutation(&result, ran_elevated, false);
+    result
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1056,13 +1318,34 @@ fn resolve_verified_user_config_for_fresh_install_in(
     Some(raw.to_string())
 }
 
-#[cfg(target_os = "windows")]
-fn resolve_windows_fresh_install_seed_config(service_state: ServiceState) -> Option<String> {
+#[cfg(any(target_os = "windows", test))]
+fn resolve_windows_fresh_install_seed_config_from(
+    service_state: ServiceState,
+    user_cfg_path: &Path,
+    system_cfg_path: &Path,
+    validate_windows_syntax: bool,
+) -> Option<String> {
     if service_state != ServiceState::NotInstalled {
         return None;
     }
+    resolve_verified_user_config_for_fresh_install_in(user_cfg_path, validate_windows_syntax)
+        .or_else(|| {
+            if system_cfg_path != user_cfg_path {
+                resolve_verified_user_config_for_fresh_install_in(
+                    system_cfg_path,
+                    validate_windows_syntax,
+                )
+            } else {
+                None
+            }
+        })
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_windows_fresh_install_seed_config(service_state: ServiceState) -> Option<String> {
     let user_cfg = user_config_path();
-    resolve_verified_user_config_for_fresh_install_in(&user_cfg, true)
+    let sys_cfg = system_config_path();
+    resolve_windows_fresh_install_seed_config_from(service_state, &user_cfg, &sys_cfg, true)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -1212,7 +1495,8 @@ pub fn install_background_service(engine: Option<EngineModeDto>) -> ActionResult
     let seed_config_path = resolve_windows_fresh_install_seed_config(service_state);
     let elevated = install_needs_elevation(target_engine, use_system);
 
-    install_background_service_checked_with(
+    let mut ran_elevated = false;
+    let result = install_background_service_checked_with(
         target_engine,
         elevated,
         seed_config_path.as_deref(),
@@ -1226,9 +1510,14 @@ pub fn install_background_service(engine: Option<EngineModeDto>) -> ActionResult
         installed_binary_present,
         installed_version.as_deref(),
         |args, need_elev| {
+            if need_elev {
+                ran_elevated = true;
+            }
             sidecar::run_bundled_vdpi_cli(args, need_elev, SIDECAR_INSTALL_TIMEOUT_SECS)
         },
-    )
+    );
+    finish_windows_sidecar_mutation(&result, ran_elevated, false);
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1321,7 +1610,8 @@ pub fn upgrade_background_service() -> ActionResultDto {
     );
     let elevated = upgrade_needs_elevation(cfg.engine, use_system);
 
-    upgrade_background_service_with(
+    let mut ran_elevated = false;
+    let result = upgrade_background_service_with(
         elevated,
         bundled_cli_result,
         bundled_version_probe
@@ -1333,9 +1623,14 @@ pub fn upgrade_background_service() -> ActionResultDto {
         installed_binary_present,
         installed_version.as_deref(),
         |args, need_elev| {
+            if need_elev {
+                ran_elevated = true;
+            }
             sidecar::run_bundled_vdpi_cli(args, need_elev, SIDECAR_INSTALL_TIMEOUT_SECS)
         },
-    )
+    );
+    finish_windows_sidecar_mutation(&result, ran_elevated, false);
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1388,14 +1683,22 @@ where
         run_cli(&["install", "--upgrade"], needs_elevation)
     };
 
+    let restarted_or_installed = !service_installed || service_state == ServiceState::Running;
     match outcome {
-        SidecarOutcome::Ok(_) => action_ok(
-            format!(
-                "Repaired and restarted vdpi background service ({} mode).",
-                engine_display_name(effective_engine)
-            ),
-            Some(false),
-        ),
+        SidecarOutcome::Ok(_) => {
+            let message = if restarted_or_installed {
+                format!(
+                    "Repaired and restarted vdpi background service ({} mode).",
+                    engine_display_name(effective_engine)
+                )
+            } else {
+                format!(
+                    "Repaired vdpi background service ({} mode).",
+                    engine_display_name(effective_engine)
+                )
+            };
+            action_ok(message, Some(false))
+        }
         SidecarOutcome::SavedNeedsRestart(msg) => {
             let detail = redact_message(&msg);
             let message = if detail.is_empty() {
@@ -1445,7 +1748,8 @@ pub fn repair_background_service(engine: Option<EngineModeDto>) -> ActionResultD
     let seed_config_path = resolve_windows_fresh_install_seed_config(service_state);
     let elevated = upgrade_needs_elevation(effective_engine, use_system);
 
-    repair_background_service_with(
+    let mut ran_elevated = false;
+    let result = repair_background_service_with(
         service_state,
         explicit_engine,
         effective_engine,
@@ -1460,9 +1764,14 @@ pub fn repair_background_service(engine: Option<EngineModeDto>) -> ActionResultD
         installed_binary_present,
         installed_version.as_deref(),
         |args, need_elev| {
+            if need_elev {
+                ran_elevated = true;
+            }
             sidecar::run_bundled_vdpi_cli(args, need_elev, SIDECAR_INSTALL_TIMEOUT_SECS)
         },
-    )
+    );
+    finish_windows_sidecar_mutation(&result, ran_elevated, false);
+    result
 }
 
 fn uninstall_background_service_with<FRun>(needs_elevation: bool, run_cli: FRun) -> ActionResultDto
@@ -1500,9 +1809,15 @@ where
 /// sidecar while preserving persisted configuration files.
 pub fn uninstall_background_service() -> ActionResultDto {
     let elevated = uninstall_needs_elevation();
-    uninstall_background_service_with(elevated, |args, need_elev| {
+    let mut ran_elevated = false;
+    let result = uninstall_background_service_with(elevated, |args, need_elev| {
+        if need_elev {
+            ran_elevated = true;
+        }
         run_sidecar_cli(args, need_elev, SIDECAR_UNINSTALL_TIMEOUT_SECS)
-    })
+    });
+    finish_windows_sidecar_mutation(&result, ran_elevated, true);
+    result
 }
 
 fn validate_external_url(raw: &str) -> Result<String, String> {
@@ -2822,9 +3137,9 @@ mod tests {
             |target, installed| {
                 assert_eq!(target, EngineMode::Tun);
                 assert!(!installed);
-                Ok(())
+                Ok(SwitchEngineWintunPreflight::ReadyStandard)
             },
-            |_, _| unreachable!("service not installed"),
+            |_, _, _| unreachable!("service not installed"),
         );
         assert!(
             res_uninstalled.ok,
@@ -2862,7 +3177,7 @@ mod tests {
                     "wintun.dll is missing".to_string(),
                 ))
             },
-            |_, _| unreachable!("must not elevate when Wintun is missing"),
+            |_, _, _| unreachable!("must not elevate when Wintun is missing"),
         );
         assert!(!res_wintun_missing.ok);
         assert_eq!(
@@ -2882,7 +3197,7 @@ mod tests {
                     "wintun.dll failed SHA-256 hash verification".to_string(),
                 ))
             },
-            |_, _| unreachable!("must not elevate when Wintun is corrupted"),
+            |_, _, _| unreachable!("must not elevate when Wintun is corrupted"),
         );
         assert!(!res_wintun_invalid.ok);
         assert_eq!(
@@ -2890,7 +3205,7 @@ mod tests {
             Some(ActionErrorCodeDto::WintunInvalid)
         );
 
-        // Installed & running -> delegates to sidecar `engine proxy`.
+        // Installed & running -> delegates to sidecar `engine proxy` using standard CLI resolution.
         let called = Cell::new(false);
         let res_running = switch_engine_with(
             EngineModeDto::Proxy,
@@ -2898,11 +3213,12 @@ mod tests {
             Some(&sys_cfg_path),
             true,
             || ServiceState::Running,
-            |_, _| Ok(()),
-            |args, elevated| {
+            |_, _| Ok(SwitchEngineWintunPreflight::ReadyStandard),
+            |args, elevated, use_bundled_cli| {
                 called.set(true);
                 assert_eq!(args, &["engine", "proxy"]);
                 assert!(elevated);
+                assert!(!use_bundled_cli);
                 SidecarOutcome::Ok(String::new())
             },
         );
@@ -2911,6 +3227,32 @@ mod tests {
         assert_eq!(res_running.needs_restart, Some(false));
         assert!(res_running.message.contains("Proxy"));
 
+        // Portable Proxy -> TUN fallback: when service-side Wintun is missing/invalid but
+        // bundled Wintun is verified, delegates via bundled CLI so `vdpi.exe` copies the DLL.
+        let bundled_called = Cell::new(false);
+        let res_bundled_tun = switch_engine_with(
+            EngineModeDto::Tun,
+            &user_cfg_path,
+            Some(&sys_cfg_path),
+            true,
+            || ServiceState::Running,
+            |target, installed| {
+                assert_eq!(target, EngineMode::Tun);
+                assert!(installed);
+                Ok(SwitchEngineWintunPreflight::ReadyViaBundledCli)
+            },
+            |args, elevated, use_bundled_cli| {
+                bundled_called.set(true);
+                assert_eq!(args, &["engine", "tun"]);
+                assert!(elevated);
+                assert!(use_bundled_cli);
+                SidecarOutcome::Ok(String::new())
+            },
+        );
+        assert!(bundled_called.get());
+        assert!(res_bundled_tun.ok);
+        assert_eq!(res_bundled_tun.needs_restart, Some(false));
+
         // Elevation cancelled maps to `cancelled: Some(true)`.
         let res_cancelled = switch_engine_with(
             EngineModeDto::Tun,
@@ -2918,8 +3260,8 @@ mod tests {
             None,
             true,
             || ServiceState::Running,
-            |_, _| Ok(()),
-            |_, _| SidecarOutcome::Cancelled,
+            |_, _| Ok(SwitchEngineWintunPreflight::ReadyStandard),
+            |_, _, _| SidecarOutcome::Cancelled,
         );
         assert!(!res_cancelled.ok);
         assert_eq!(res_cancelled.message, "Elevation was cancelled.");
@@ -2932,8 +3274,8 @@ mod tests {
             None,
             true,
             || ServiceState::Stopped,
-            |_, _| Ok(()),
-            |_, _| {
+            |_, _| Ok(SwitchEngineWintunPreflight::ReadyStandard),
+            |_, _, _| {
                 SidecarOutcome::Err(
                     "failed against https://user:pw@dns.example.com/secretpath".to_string(),
                 )
@@ -2943,6 +3285,85 @@ mod tests {
         assert!(res_err.message.contains("https://dns.example.com"));
         assert!(!res_err.message.contains("secretpath"));
         assert!(!res_err.message.contains("pw"));
+    }
+
+    #[test]
+    fn windows_tun_switch_preflight_falls_back_to_bundled_wintun_and_preserves_invalid_errors() {
+        use crate::status::WintunPreflightResult;
+
+        // Proxy mode never probes Wintun.
+        assert_eq!(
+            resolve_windows_tun_switch_wintun_preflight(EngineMode::Proxy, true, |_| {
+                unreachable!("Proxy mode must not probe Wintun")
+            }),
+            Ok(SwitchEngineWintunPreflight::ReadyStandard)
+        );
+
+        // Installed service with valid service-side Wintun uses standard CLI without probing bundle.
+        let probed_standard = RefCell::new(Vec::new());
+        assert_eq!(
+            resolve_windows_tun_switch_wintun_preflight(EngineMode::Tun, true, |svc| {
+                probed_standard.borrow_mut().push(svc);
+                WintunPreflightResult::Ready
+            }),
+            Ok(SwitchEngineWintunPreflight::ReadyStandard)
+        );
+        assert_eq!(*probed_standard.borrow(), vec![true]);
+
+        // Installed service missing service-side Wintun falls back to verified portable bundle.
+        let probed_fallback = RefCell::new(Vec::new());
+        assert_eq!(
+            resolve_windows_tun_switch_wintun_preflight(EngineMode::Tun, true, |svc| {
+                probed_fallback.borrow_mut().push(svc);
+                if svc {
+                    WintunPreflightResult::Missing("service wintun missing".to_string())
+                } else {
+                    WintunPreflightResult::Ready
+                }
+            }),
+            Ok(SwitchEngineWintunPreflight::ReadyViaBundledCli)
+        );
+        assert_eq!(*probed_fallback.borrow(), vec![true, false]);
+
+        // Installed service with corrupted service-side Wintun also recovers via verified bundle.
+        assert_eq!(
+            resolve_windows_tun_switch_wintun_preflight(EngineMode::Tun, true, |svc| {
+                if svc {
+                    WintunPreflightResult::Invalid("service wintun corrupt".to_string())
+                } else {
+                    WintunPreflightResult::Ready
+                }
+            }),
+            Ok(SwitchEngineWintunPreflight::ReadyViaBundledCli)
+        );
+
+        // When both service and bundle fail, Invalid takes precedence over Missing.
+        let invalid_err = resolve_windows_tun_switch_wintun_preflight(EngineMode::Tun, true, |svc| {
+            if svc {
+                WintunPreflightResult::Invalid("service wintun corrupt".to_string())
+            } else {
+                WintunPreflightResult::Missing("bundle wintun missing".to_string())
+            }
+        })
+        .expect_err("must fail when both probes fail");
+        assert_eq!(invalid_err.0, ActionErrorCodeDto::WintunInvalid);
+
+        let missing_err = resolve_windows_tun_switch_wintun_preflight(EngineMode::Tun, true, |_| {
+            WintunPreflightResult::Missing("wintun missing".to_string())
+        })
+        .expect_err("must fail when both probes are missing");
+        assert_eq!(missing_err.0, ActionErrorCodeDto::WintunMissing);
+
+        // Uninstalled service only probes bundle (`false`).
+        let probed_uninstalled = RefCell::new(Vec::new());
+        assert_eq!(
+            resolve_windows_tun_switch_wintun_preflight(EngineMode::Tun, false, |svc| {
+                probed_uninstalled.borrow_mut().push(svc);
+                WintunPreflightResult::Ready
+            }),
+            Ok(SwitchEngineWintunPreflight::ReadyStandard)
+        );
+        assert_eq!(*probed_uninstalled.borrow(), vec![false]);
     }
 
     #[test]
@@ -2958,6 +3379,7 @@ mod tests {
             &cfg_path,
             None,
             false,
+            EngineMode::Proxy,
             || ServiceState::Running,
             |_, _, _| unreachable!("invalid DNS must not invoke sidecar"),
         );
@@ -2972,6 +3394,7 @@ mod tests {
             &cfg_path,
             None,
             false,
+            EngineMode::Proxy,
             || ServiceState::Running,
             |_, _, _| unreachable!(),
         );
@@ -2987,6 +3410,7 @@ mod tests {
             &cfg_path,
             None,
             false,
+            EngineMode::Proxy,
             || ServiceState::Running,
             |_, _, _| unreachable!(),
         );
@@ -3020,6 +3444,7 @@ mod tests {
             &cfg_path,
             Some(&fallback_sys),
             false,
+            EngineMode::Proxy,
             || ServiceState::NotInstalled,
             |_, _, _| unreachable!("service not installed"),
         );
@@ -3049,7 +3474,8 @@ mod tests {
             Some(vec!["discord.com".to_string()])
         );
 
-        // User-scoped running service + rule change -> saves atomically, needs_restart = true.
+        // User-scoped running service + rule change -> applies via non-elevated sidecar and
+        // restarts immediately (`needs_restart = Some(false)`).
         let update_rule_only = DnsConfigUpdateDto {
             dns_addr: "https://dns.nextdns.io/mysecretprofile".to_string(),
             doh_enabled: true,
@@ -3060,28 +3486,90 @@ mod tests {
             bypass_domains: vec!["example.com".to_string(), "*.corp.local".to_string()],
             include_domains: vec!["discord.com".to_string()],
         };
+        let user_sidecar_called = Cell::new(false);
         let res = save_dns_and_rules_with(
             update_rule_only.clone(),
             &cfg_path,
             None,
             false,
+            EngineMode::Proxy,
             || ServiceState::Running,
-            |_, _, _| unreachable!("user-scoped service saves directly"),
+            |cfg, elevate, restart_if_running| {
+                user_sidecar_called.set(true);
+                assert!(!elevate, "user-scoped service must not elevate");
+                assert!(restart_if_running, "running user-scoped service must restart");
+                assert_eq!(cfg.block_quic, Some(true));
+                // Persist to cfg_path so subsequent no-op check sees updated config.
+                save_file_config_atomic(&cfg_path, cfg).expect("simulate sidecar apply");
+                SidecarOutcome::Ok(String::new())
+            },
         );
+        assert!(user_sidecar_called.get());
         assert!(res.ok);
-        assert_eq!(res.needs_restart, Some(true));
+        assert_eq!(res.needs_restart, Some(false));
+        assert!(res.message.contains("restarted"));
 
-        // Identical values on existing config -> no-op, no restart required.
-        let res_noop = save_dns_and_rules_with(
-            update_rule_only,
+        // Stopped user-scoped service writes directly without invoking sidecar.
+        let mut update_stopped_user = update_rule_only.clone();
+        update_stopped_user.block_quic = false;
+        let res_stopped_user = save_dns_and_rules_with(
+            update_stopped_user.clone(),
             &cfg_path,
             None,
             false,
+            EngineMode::Proxy,
+            || ServiceState::Stopped,
+            |_, _, _| unreachable!("stopped user-scoped service saves directly"),
+        );
+        assert!(res_stopped_user.ok);
+        assert_eq!(res_stopped_user.needs_restart, Some(false));
+        assert!(!res_stopped_user.message.contains("restarted"));
+
+        // Identical values on existing config -> no-op, no restart required.
+        let res_noop = save_dns_and_rules_with(
+            update_stopped_user,
+            &cfg_path,
+            None,
+            false,
+            EngineMode::Proxy,
             || ServiceState::Running,
             |_, _, _| unreachable!("nothing changed"),
         );
         assert!(res_noop.ok);
         assert_eq!(res_noop.needs_restart, Some(false));
+
+        // System service installed with `engine` omitted in config.toml seeds `file_cfg.engine`
+        // from `default_engine` so saving DNS/rules never flips a Windows TUN service to Proxy.
+        let sys_no_engine_dir = TempDirGuard::new("save-dns-seed-engine");
+        let sys_no_engine_path = sys_no_engine_dir.config_path();
+        save_file_config_atomic(
+            &sys_no_engine_path,
+            &FileConfig {
+                engine: None,
+                dns_addr: Some("1.1.1.1".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("seed system config without engine");
+        let seeded_engine = Cell::new(None::<EngineMode>);
+        let mut seed_update = base_dns_update();
+        seed_update.dns_addr = "9.9.9.9".to_string();
+        let res_seed_engine = save_dns_and_rules_with(
+            seed_update,
+            &sys_no_engine_path,
+            None,
+            true,
+            EngineMode::Tun,
+            || ServiceState::Running,
+            |cfg, elevate, restart| {
+                assert!(elevate);
+                assert!(restart);
+                seeded_engine.set(cfg.engine);
+                SidecarOutcome::Ok(String::new())
+            },
+        );
+        assert!(res_seed_engine.ok);
+        assert_eq!(seeded_engine.get(), Some(EngineMode::Tun));
 
         // System service installed: BOTH DNS and non-DNS rule edits apply via temp-file sidecar
         // (never direct write PermissionDenied and never secret DoH URLs on argv).
@@ -3115,6 +3603,7 @@ mod tests {
             &sys_cfg_path,
             None,
             true,
+            EngineMode::Tun,
             || ServiceState::Running,
             |cfg, system_scope, restart_if_running| {
                 assert!(system_scope);
@@ -3157,6 +3646,7 @@ mod tests {
             &sys_cfg_path,
             None,
             true,
+            EngineMode::Tun,
             || ServiceState::Stopped,
             |cfg, system_scope, restart_if_running| {
                 called_rule_only.set(true);
@@ -3177,6 +3667,7 @@ mod tests {
             &sys_cfg_path,
             None,
             true,
+            EngineMode::Tun,
             || ServiceState::Running,
             |_, _, _| unreachable!("unchanged system settings must not prompt for elevation"),
         );
@@ -3192,6 +3683,7 @@ mod tests {
             &sys_cfg_path,
             None,
             true,
+            EngineMode::Tun,
             || ServiceState::Running,
             |_, system_scope, restart_if_running| {
                 assert!(system_scope);
@@ -3215,6 +3707,7 @@ mod tests {
             &sys_cfg_path,
             None,
             true,
+            EngineMode::Tun,
             || ServiceState::Running,
             |_, _, _| SidecarOutcome::SavedNeedsRestart(String::new()),
         );
@@ -4191,6 +4684,10 @@ mod tests {
             },
         );
         assert!(repair_fresh.ok);
+        assert_eq!(
+            repair_fresh.message,
+            "Repaired and restarted vdpi background service (Proxy mode)."
+        );
 
         // Repair distinguishes WintunInvalid vs WintunMissing and surfaces AV launch errors.
         let repair_wintun_invalid = repair_background_service_with(
@@ -4232,7 +4729,8 @@ mod tests {
         assert_eq!(repair_av.code, None);
         assert!(repair_av.message.contains("Win32 error 226"));
 
-        // Repair when installed binary is missing/corrupted (`installed_version == None`) is allowed.
+        // Repair when installed binary is missing/corrupted (`installed_version == None`) is allowed;
+        // repairing a stopped service must NOT claim it was restarted.
         let repair_corrupt = repair_background_service_with(
             ServiceState::Stopped,
             None,
@@ -4251,8 +4749,13 @@ mod tests {
             },
         );
         assert!(repair_corrupt.ok);
+        assert_eq!(
+            repair_corrupt.message,
+            "Repaired vdpi background service (TUN mode)."
+        );
 
-        // Repair with explicit engine passes `install --upgrade --proxy`.
+        // Repair with explicit engine on running service passes `install --upgrade --proxy`
+        // and reports restarted.
         let repair_explicit = repair_background_service_with(
             ServiceState::Running,
             Some(EngineMode::Proxy),
@@ -4271,6 +4774,10 @@ mod tests {
             },
         );
         assert!(repair_explicit.ok);
+        assert_eq!(
+            repair_explicit.message,
+            "Repaired and restarted vdpi background service (Proxy mode)."
+        );
 
         // Repair blocks downgrade when installed > bundled (including via live version fallback).
         let live_fallback = effective_installed_version_for_guard(
@@ -4344,6 +4851,96 @@ mod tests {
                 resolve_verified_user_config_for_fresh_install_in(&link_cfg, false).is_none()
             );
         }
+
+        // Fresh install seed config prefers user_config_path, falls back to system_config_path,
+        // and skips seeding once a service is already installed.
+        let missing_user = dir.path().join("missing-user-config.toml");
+        let sys_cfg = dir.path().join("system-config.toml");
+        fs::write(&sys_cfg, "engine = \"proxy\"\n").expect("write system config.toml");
+
+        let from_user = resolve_windows_fresh_install_seed_config_from(
+            ServiceState::NotInstalled,
+            &cfg_file,
+            &sys_cfg,
+            cfg!(target_os = "windows"),
+        );
+        assert_eq!(from_user.as_deref(), cfg_file.to_str());
+
+        let from_sys_fallback = resolve_windows_fresh_install_seed_config_from(
+            ServiceState::NotInstalled,
+            &missing_user,
+            &sys_cfg,
+            cfg!(target_os = "windows"),
+        );
+        assert_eq!(from_sys_fallback.as_deref(), sys_cfg.to_str());
+
+        assert!(resolve_windows_fresh_install_seed_config_from(
+            ServiceState::Stopped,
+            &cfg_file,
+            &sys_cfg,
+            cfg!(target_os = "windows"),
+        )
+        .is_none());
+        assert!(resolve_windows_fresh_install_seed_config_from(
+            ServiceState::Running,
+            &missing_user,
+            &sys_cfg,
+            cfg!(target_os = "windows"),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn windows_service_binary_path_engine_detection_and_post_mutation_refresh_rules() {
+        assert_eq!(
+            default_engine_for_windows_service_binary_path(
+                true,
+                Some(r#""C:\Program Files\vdpi\bin\vdpi.exe" --service --tun --bind 127.0.0.1 --quiet"#),
+            ),
+            EngineMode::Tun
+        );
+        assert_eq!(
+            default_engine_for_windows_service_binary_path(
+                true,
+                Some(r#""C:\Program Files\vdpi\bin\vdpi.exe" --service --proxy --quiet"#),
+            ),
+            EngineMode::Proxy
+        );
+        // Quoted executable path containing `--tun` must not fool argv[1..] flag parsing.
+        assert_eq!(
+            default_engine_for_windows_service_binary_path(
+                true,
+                Some(r#""C:\Users\--tun\vdpi.exe" --service --proxy"#),
+            ),
+            EngineMode::Proxy
+        );
+        // Missing or flagless binary_path falls back to RuntimeConfig::default().engine.
+        assert_eq!(
+            default_engine_for_windows_service_binary_path(true, None),
+            RuntimeConfig::default().engine
+        );
+        assert_eq!(
+            default_engine_for_windows_service_binary_path(
+                true,
+                Some(r#""C:\Program Files\vdpi\bin\vdpi.exe" --service --quiet"#),
+            ),
+            RuntimeConfig::default().engine
+        );
+        assert_eq!(
+            default_engine_for_windows_service_binary_path(
+                false,
+                Some(r#""C:\Program Files\vdpi\bin\vdpi.exe" --service --tun"#),
+            ),
+            RuntimeConfig::default().engine
+        );
+
+        // Post-mutation Windows WinINET/env refresh and unelevated pause/uninstall cleanup rules.
+        assert_eq!(windows_post_mutation_actions(false, true, true, false), (false, false));
+        assert_eq!(windows_post_mutation_actions(true, true, false, false), (false, true));
+        assert_eq!(windows_post_mutation_actions(true, true, true, false), (true, true));
+        assert_eq!(windows_post_mutation_actions(true, true, true, true), (false, true));
+        assert_eq!(windows_post_mutation_actions(true, false, false, false), (false, false));
+        assert_eq!(windows_post_mutation_actions(true, false, true, false), (true, true));
     }
 
     #[tokio::test]

@@ -50,7 +50,7 @@ impl Eq for AppBypassHook {}
 
 pub const MIN_MTU: usize = 1280;
 pub const DEFAULT_MTU: usize = 1400;
-pub const DESKTOP_MTU: usize = 16384;
+pub const DESKTOP_MTU: usize = 4096;
 pub const MAX_MTU: usize = 65535;
 
 /// Resource-budget tuning profile for the userspace TUN stack.
@@ -80,28 +80,28 @@ pub struct TunProfile {
 
 impl TunProfile {
     /// Tuned for gigabit desktop virtual TUN adapters (Wintun / utun / `/dev/net/tun`):
-    /// 448 KiB smoltcp TCP buffers (458_752 bytes, safely below Windows NT Heap's 508 KiB
-    /// `VirtualMemoryThreshold` so `TcpSocketBuffer` allocations never trigger
-    /// `VirtualAlloc`/`VirtualFree` cross-core TLB shootdowns that cause VoiceMeeter audio
-    /// crackles, while still enabling RFC 7323 TCP Window Scaling and 1 Gbps+ throughput over
-    /// local <0.2ms TUN RTT), 4096-deep queues, 512 TCP sessions / 512 UDP flows, 256 KiB TCP
-    /// relay & UDP socket buffers, and 128-packet I/O bursts paired with `DESKTOP_MTU = 16384`.
+    /// 256 KiB smoltcp TCP buffers (safely below Windows NT Heap's 508 KiB
+    /// `VirtualMemoryThreshold` while cutting per-session RSS in half and still saturating
+    /// over 1 Gbps over local `<0.2ms` TUN RTT), 2048-deep queues, 256 TCP sessions / 1024 UDP
+    /// flows (headroom for games + Discord + browsers), 128 KiB TCP relay & UDP socket buffers,
+    /// and 64-packet I/O bursts paired with `DESKTOP_MTU = 4096` (safely inside Windows NT LFH
+    /// `<= 16368` bytes to avoid global HeapLock / TLB shootdowns and jumbo DPC bursts).
     pub const DESKTOP: Self = Self {
         stack_buffer_size: 4096,
         tcp_buffer_size: 1024,
         udp_buffer_size: 1024,
-        tcp_recv_buffer_size: 448 * 1024,
-        tcp_send_buffer_size: 448 * 1024,
-        max_tcp_sessions: 512,
-        max_udp_flows: 512,
-        max_dns_inflight: 256,
+        tcp_recv_buffer_size: 256 * 1024,
+        tcp_send_buffer_size: 256 * 1024,
+        max_tcp_sessions: 256,
+        max_udp_flows: 1024,
+        max_dns_inflight: 128,
         max_reverse_dns_entries: 8192,
-        channel_capacity: 4096,
-        udp_reply_capacity: 4096,
-        tcp_relay_buf_size: 256 * 1024,
-        packet_pool_size: 1024,
-        batch_size: 128,
-        udp_socket_buf_bytes: 256 * 1024,
+        channel_capacity: 2048,
+        udp_reply_capacity: 2048,
+        tcp_relay_buf_size: 128 * 1024,
+        packet_pool_size: 512,
+        batch_size: 64,
+        udp_socket_buf_bytes: 128 * 1024,
         emit_quic_icmp_reject: true,
     };
 
@@ -278,7 +278,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(desktop.clamped_mtu(), DESKTOP_MTU);
-        assert_eq!(DESKTOP_MTU, 16384);
+        assert_eq!(DESKTOP_MTU, 4096);
         let low = TunnelConfig {
             mtu: 64,
             ..Default::default()
@@ -359,44 +359,46 @@ mod tests {
         assert_eq!(desk.udp_buffer_size, 1024);
         assert!(desk.tcp_buffer_size > std.tcp_buffer_size);
         assert!(desk.udp_buffer_size > std.udp_buffer_size);
-        assert_eq!(desk.tcp_recv_buffer_size, 448 * 1024);
-        assert_eq!(desk.tcp_send_buffer_size, 448 * 1024);
+        assert_eq!(desk.tcp_recv_buffer_size, 256 * 1024);
+        assert_eq!(desk.tcp_send_buffer_size, 256 * 1024);
         // Stay safely below Windows NT Heap's 508 KiB VirtualMemoryThreshold.
         assert!(desk.tcp_recv_buffer_size < 508 * 1024);
         assert!(desk.tcp_send_buffer_size < 508 * 1024);
-        assert_eq!(desk.max_tcp_sessions, 512);
+        assert_eq!(desk.max_tcp_sessions, 256);
         assert_eq!(std.max_tcp_sessions, 128);
-        assert_eq!(desk.max_udp_flows, 512);
+        assert_eq!(desk.max_udp_flows, 1024);
         assert_eq!(std.max_udp_flows, 128);
         assert!(desk.max_tcp_sessions > std.max_tcp_sessions);
         assert!(desk.max_udp_flows > std.max_udp_flows);
-        assert_eq!(desk.max_dns_inflight, 256);
+        assert_eq!(desk.max_dns_inflight, 128);
         assert!(desk.max_dns_inflight > std.max_dns_inflight);
         assert_eq!(desk.max_reverse_dns_entries, 8192);
         assert!(desk.max_reverse_dns_entries > std.max_reverse_dns_entries);
-        assert_eq!(desk.channel_capacity, 4096);
-        assert_eq!(desk.udp_reply_capacity, 4096);
+        assert_eq!(desk.channel_capacity, 2048);
+        assert_eq!(desk.udp_reply_capacity, 2048);
         assert!(desk.channel_capacity > std.channel_capacity);
         assert!(desk.udp_reply_capacity > std.udp_reply_capacity);
-        assert_eq!(desk.tcp_relay_buf_size, 256 * 1024);
-        assert_eq!(desk.packet_pool_size, 1024);
+        assert_eq!(desk.tcp_relay_buf_size, 128 * 1024);
+        assert_eq!(desk.packet_pool_size, 512);
         assert!(desk.packet_pool_size > std.packet_pool_size);
-        assert_eq!(desk.batch_size, 128);
+        assert_eq!(desk.batch_size, 64);
         assert!(desk.batch_size > std.batch_size);
-        assert_eq!(desk.udp_socket_buf_bytes, 256 * 1024);
+        assert_eq!(desk.udp_socket_buf_bytes, 128 * 1024);
         assert_eq!(std.udp_socket_buf_bytes, 128 * 1024);
         assert!(desk.emit_quic_icmp_reject);
         assert!(std.emit_quic_icmp_reject);
 
-        // Worst-case desktop smoltcp TCP buffer footprint: 512 sessions * (448 KiB + 448 KiB) = 448 MiB.
+        // Worst-case desktop smoltcp TCP buffer footprint: 256 sessions * (256 KiB + 256 KiB) = 128 MiB.
         let max_tcp_mem = desk.max_tcp_sessions
             * (desk.tcp_recv_buffer_size as usize + desk.tcp_send_buffer_size as usize);
-        assert_eq!(max_tcp_mem, 448 * 1024 * 1024);
+        assert_eq!(max_tcp_mem, 128 * 1024 * 1024);
         // Android STANDARD FD budget stays well under the 1024 FD ceiling.
         assert!(std.max_tcp_sessions + std.max_udp_flows <= 256);
 
         assert_eq!(DEFAULT_MTU, 1400);
-        assert_eq!(DESKTOP_MTU, 16384);
+        assert_eq!(DESKTOP_MTU, 4096);
+        // Stay safely inside Windows NT LFH max payload (16368 bytes).
+        const { assert!(DESKTOP_MTU <= 16368) };
         assert_eq!(MAX_MTU, 65535);
     }
 

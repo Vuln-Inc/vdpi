@@ -6,7 +6,7 @@
 //! macOS (allowlisted `.app` bundle -> `.icns` embedded PNG parser), and Linux
 //! (`.desktop` entry -> `Icon=` PNG resolver).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -118,6 +118,80 @@ fn is_within_request_length_limits(app: &AppIconRequestDto) -> bool {
             .is_none_or(|p| p.len() <= MAX_REQUEST_PATH_LEN)
 }
 
+fn resolve_app_icons_batch_with<F>(
+    apps: &[AppIconRequestDto],
+    cache: &Mutex<IconCache>,
+    now: Instant,
+    extract_uncached: F,
+) -> HashMap<String, String>
+where
+    F: FnOnce(&[AppIconRequestDto]) -> Vec<Option<String>>,
+{
+    let mut results = HashMap::new();
+    let mut seen_keys: HashSet<&str> = HashSet::new();
+    let mut pending: Vec<(String, usize)> = Vec::new();
+    let mut miss_index_by_cache_key: HashMap<String, usize> = HashMap::new();
+    let mut unique_misses: Vec<AppIconRequestDto> = Vec::new();
+    let mut unique_miss_cache_keys: Vec<String> = Vec::new();
+
+    {
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        for app in apps.iter().take(MAX_BATCH_APPS) {
+            if !is_within_request_length_limits(app) || !seen_keys.insert(app.key.as_str()) {
+                continue;
+            }
+
+            let cache_key = cache_key_for(app);
+            if let Some(cached_uri) = guard.get(&cache_key, now) {
+                if let Some(uri) = cached_uri {
+                    results.insert(app.key.clone(), uri);
+                }
+                continue;
+            }
+
+            let miss_idx = match miss_index_by_cache_key.get(&cache_key).copied() {
+                Some(idx) => idx,
+                None => {
+                    let idx = unique_misses.len();
+                    miss_index_by_cache_key.insert(cache_key.clone(), idx);
+                    unique_miss_cache_keys.push(cache_key);
+                    unique_misses.push(app.clone());
+                    idx
+                }
+            };
+            pending.push((app.key.clone(), miss_idx));
+        }
+    }
+
+    if unique_misses.is_empty() {
+        return results;
+    }
+
+    let extracted = extract_uncached(&unique_misses);
+
+    {
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (idx, cache_key) in unique_miss_cache_keys.into_iter().enumerate() {
+            let resolved = extracted.get(idx).cloned().flatten();
+            guard.insert(cache_key, resolved, now);
+        }
+    }
+
+    for (app_key, miss_idx) in pending {
+        if let Some(Some(uri)) = extracted.get(miss_idx) {
+            results.insert(app_key, uri.clone());
+        }
+    }
+
+    results
+}
+
+#[cfg(test)]
 fn resolve_app_icons_with<F>(
     apps: &[AppIconRequestDto],
     cache: &Mutex<IconCache>,
@@ -127,55 +201,28 @@ fn resolve_app_icons_with<F>(
 where
     F: FnMut(&AppIconRequestDto) -> Option<String>,
 {
-    let mut results = HashMap::new();
-
-    for app in apps.iter().take(MAX_BATCH_APPS) {
-        if !is_within_request_length_limits(app) || results.contains_key(&app.key) {
-            continue;
-        }
-
-        let cache_key = cache_key_for(app);
-        let cached = {
-            let mut guard = cache
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard.get(&cache_key, now)
-        };
-
-        if let Some(cached_uri) = cached {
-            if let Some(uri) = cached_uri {
-                results.insert(app.key.clone(), uri);
-            }
-            continue;
-        }
-
-        let resolved = extractor(app);
-
-        {
-            let mut guard = cache
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard.insert(cache_key, resolved.clone(), now);
-        }
-
-        if let Some(uri) = resolved {
-            results.insert(app.key.clone(), uri);
-        }
-    }
-
-    results
+    resolve_app_icons_batch_with(apps, cache, now, |misses| {
+        misses.iter().map(&mut extractor).collect()
+    })
 }
 
 /// Resolves native OS application icons for a batch of applications (capped at 256 items).
 ///
 /// Returns a map from `app.key` to a validated `"data:image/png;base64,..."` URI for each
 /// application whose icon could be safely extracted. Results (including 60s TTL negative
-/// lookups) are cached in a bounded global FIFO map so repeated tab opens are instant.
+/// lookups) are cached in a bounded global FIFO map so repeated tab opens are instant
+/// without touching COM or spawning/waking the Windows STA icon worker thread.
 pub fn resolve_app_icons(apps: &[AppIconRequestDto]) -> HashMap<String, String> {
-    #[cfg(target_os = "windows")]
-    let _com_guard = windows_icons::ComGuard::init();
-
-    resolve_app_icons_with(apps, icon_cache(), Instant::now(), extract_icon_data_uri)
+    resolve_app_icons_batch_with(apps, icon_cache(), Instant::now(), |misses| {
+        #[cfg(target_os = "windows")]
+        {
+            windows_icons::extract_batch_on_sta_thread(misses)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            misses.iter().map(extract_icon_data_uri).collect()
+        }
+    })
 }
 
 fn cache_key_for(app: &AppIconRequestDto) -> String {
@@ -592,13 +639,17 @@ mod windows_icons {
     use core::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
     use std::path::{Component, Path, PathBuf};
+    use std::sync::{mpsc, Mutex, OnceLock};
 
     use windows_sys::Win32::Storage::FileSystem::{
         GetFileAttributesW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
         INVALID_FILE_ATTRIBUTES,
     };
 
-    use super::{downscale_rgba_if_needed, encode_rgba_png, is_safe_windows_exe_path_syntax};
+    use super::{
+        downscale_rgba_if_needed, encode_rgba_png, is_safe_windows_exe_path_syntax,
+        AppIconRequestDto,
+    };
 
     type Handle = *mut c_void;
     type HIcon = Handle;
@@ -740,14 +791,14 @@ mod windows_icons {
         fn DeleteObject(ho: HGDIObj) -> i32;
     }
 
-    pub(super) struct ComGuard {
+    struct ComGuard {
         should_uninit: bool,
     }
 
     impl ComGuard {
-        pub(super) fn init() -> Self {
-            // SAFETY: `CoInitializeEx` with NULL reserved pointer and STA flags is safe to call
-            // on the blocking worker thread; `CoUninitialize` is invoked iff S_OK or S_FALSE.
+        fn init() -> Self {
+            // SAFETY: `CoInitializeEx` with NULL reserved pointer and STA flags is called on the
+            // dedicated `vdpi-icon-sta` worker thread; `CoUninitialize` is invoked iff S_OK or S_FALSE.
             let hr = unsafe {
                 CoInitializeEx(
                     std::ptr::null(),
@@ -768,6 +819,99 @@ mod windows_icons {
                     CoUninitialize();
                 }
             }
+        }
+    }
+
+    type StaJob = Box<dyn FnOnce() + Send + 'static>;
+
+    struct StaWorker {
+        tx: Mutex<mpsc::Sender<StaJob>>,
+    }
+
+    static STA_WORKER: OnceLock<Option<StaWorker>> = OnceLock::new();
+
+    fn sta_worker() -> Option<&'static StaWorker> {
+        STA_WORKER
+            .get_or_init(|| {
+                let (tx, rx) = mpsc::channel::<StaJob>();
+                let spawn_res = std::thread::Builder::new()
+                    .name("vdpi-icon-sta".to_string())
+                    .spawn(move || {
+                        let _com_guard = ComGuard::init();
+                        while let Ok(job) = rx.recv() {
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                        }
+                    });
+                match spawn_res {
+                    Ok(_handle) => Some(StaWorker { tx: Mutex::new(tx) }),
+                    Err(_) => None,
+                }
+            })
+            .as_ref()
+    }
+
+    pub(super) fn run_on_sta_thread<T, F>(f: F) -> Option<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let worker = sta_worker()?;
+        let (reply_tx, reply_rx) = mpsc::sync_channel::<T>(1);
+        let job: StaJob = Box::new(move || {
+            let value = f();
+            let _ = reply_tx.send(value);
+        });
+        {
+            let tx = worker
+                .tx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tx.send(job).ok()?;
+        }
+        reply_rx.recv().ok()
+    }
+
+    pub(super) fn extract_batch_on_sta_thread(apps: &[AppIconRequestDto]) -> Vec<Option<String>> {
+        if apps.is_empty() {
+            return Vec::new();
+        }
+        let jobs = apps.to_vec();
+        run_on_sta_thread(move || jobs.iter().map(super::extract_icon_data_uri).collect())
+            .unwrap_or_else(|| vec![None; apps.len()])
+    }
+
+    #[cfg(test)]
+    pub(super) fn probe_sta_worker_apartment() -> Option<(std::thread::ThreadId, i32)> {
+        run_on_sta_thread(|| {
+            let tid = std::thread::current().id();
+            // Calling `CoInitializeEx(STA)` on an already-STA thread returns `S_FALSE` (1)
+            // and increments the COM refcount, which must be balanced with `CoUninitialize`.
+            let hr = unsafe {
+                CoInitializeEx(
+                    std::ptr::null(),
+                    COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
+                )
+            };
+            if hr == S_OK || hr == S_FALSE {
+                unsafe {
+                    CoUninitialize();
+                }
+            }
+            (tid, hr)
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn init_mta_on_current_thread_for_test() -> bool {
+        const COINIT_MULTITHREADED: u32 = 0x0;
+        let hr = unsafe { CoInitializeEx(std::ptr::null(), COINIT_MULTITHREADED) };
+        hr == S_OK || hr == S_FALSE
+    }
+
+    #[cfg(test)]
+    pub(super) fn uninit_com_on_current_thread_for_test() {
+        unsafe {
+            CoUninitialize();
         }
     }
 
@@ -2534,5 +2678,82 @@ Icon=com.discordapp.Discord
         // Second lookup must hit the in-memory cache and return the identical URI.
         let second = resolve_app_icons(&req);
         assert_eq!(second.get("sys-exe"), Some(uri));
+    }
+
+    #[test]
+    fn batch_resolver_checks_cache_before_extract_and_dedupes_shared_cache_keys() {
+        let cache = Mutex::new(IconCache::new(16));
+        let t0 = Instant::now();
+
+        let batch = vec![
+            AppIconRequestDto {
+                key: "app-a".to_string(),
+                path: Some(r"C:\Apps\Shared\tool.exe".to_string()),
+                exe_name: "tool.exe".to_string(),
+            },
+            AppIconRequestDto {
+                key: "app-b".to_string(),
+                path: Some(r"c:\apps\shared\tool.exe".to_string()),
+                exe_name: "TOOL.EXE".to_string(),
+            },
+        ];
+
+        let mut extractor_invocations = 0usize;
+        let mut extracted_count = 0usize;
+        let first = resolve_app_icons_batch_with(&batch, &cache, t0, |misses| {
+            extractor_invocations += 1;
+            extracted_count += misses.len();
+            misses
+                .iter()
+                .map(|m| Some(format!("{DATA_URI_PREFIX}{}", m.key)))
+                .collect()
+        });
+        assert_eq!(extractor_invocations, 1);
+        assert_eq!(
+            extracted_count, 1,
+            "identical normalized cache keys in one batch must only extract once"
+        );
+        assert_eq!(
+            first.get("app-a").map(String::as_str),
+            Some("data:image/png;base64,app-a")
+        );
+        assert_eq!(
+            first.get("app-b").map(String::as_str),
+            Some("data:image/png;base64,app-a")
+        );
+
+        // Full cache hit must return immediately without invoking the extractor closure at all.
+        let second = resolve_app_icons_batch_with(&batch, &cache, t0, |_| {
+            extractor_invocations += 1;
+            panic!("extractor must not be invoked when all requested icons are cached");
+        });
+        assert_eq!(extractor_invocations, 1);
+        assert_eq!(second, first);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_sta_worker_runs_on_dedicated_sta_thread_even_from_mta_caller() {
+        let join = std::thread::spawn(|| {
+            let caller_tid = std::thread::current().id();
+            let did_init_mta = windows_icons::init_mta_on_current_thread_for_test();
+            let (worker_tid, sta_hr) = windows_icons::probe_sta_worker_apartment()
+                .expect("STA worker thread must be available");
+            if did_init_mta {
+                windows_icons::uninit_com_on_current_thread_for_test();
+            }
+            (caller_tid, worker_tid, sta_hr)
+        });
+
+        let (caller_tid, worker_tid, sta_hr) = join.join().expect("join MTA caller test thread");
+        assert_ne!(
+            worker_tid, caller_tid,
+            "Windows icon extraction must dispatch off MTA caller thread onto dedicated STA worker"
+        );
+        // S_FALSE (1) confirms COM is already initialized as STA on the worker thread.
+        assert_eq!(
+            sta_hr, 1,
+            "expected S_FALSE (1) confirming dedicated worker thread is initialized as STA"
+        );
     }
 }

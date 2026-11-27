@@ -25,9 +25,10 @@ use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, RwLock};
 use tracing::debug;
 
-pub const PERSISTED_CACHE_VERSION: u32 = 1;
+pub const PERSISTED_CACHE_VERSION: u32 = 2;
 pub const MAX_PERSISTED_HOSTS: usize = 256;
 pub const PERSISTED_CACHE_TTL_SECS: u64 = 7 * 24 * 3600;
+pub const OOB_CACHE_TTL_SECS: u64 = 4 * 3600;
 pub const GLOBAL_ISP_STAGE_TTL_SECS: u64 = 86_400;
 pub const PERSIST_DEBOUNCE_SECS: u64 = 10;
 const MAX_PERSISTED_FILE_BYTES: u64 = 512 * 1024;
@@ -39,7 +40,7 @@ const MAX_PROMOTION_VOTE_HOSTS: usize = 64;
 const PROMOTION_VOTE_WINDOW_SECS: u64 = 15 * 60;
 const FAST_EOF_THRESHOLD: Duration = Duration::from_millis(800);
 const FAST_SERVER_HELLO_THRESHOLD: Duration = Duration::from_millis(800);
-const MAX_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(16);
+const MAX_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(12);
 const DIRECT_PASSTHROUGH_FALLBACK_BUDGET: Duration = Duration::from_millis(2000);
 const RETRY_DNS_TIMEOUT: Duration = Duration::from_millis(1500);
 const MAX_DEAD_RETRY_IPS: usize = 256;
@@ -50,7 +51,7 @@ const RELAY_BUF_SIZE: usize = 16 * 1024;
 #[cfg(target_os = "android")]
 const RELAY_BUF_SIZE: usize = 64 * 1024;
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
-const RELAY_BUF_SIZE: usize = 256 * 1024;
+const RELAY_BUF_SIZE: usize = 128 * 1024;
 
 const TELEMETRY_BATCH_BYTES: u64 = RELAY_BUF_SIZE as u64;
 
@@ -177,6 +178,15 @@ fn parent_domain_cache_key(host: &str) -> Option<String> {
                 | ("akamaized", "net")
                 | ("fastly", "net")
                 | ("vercel", "app")
+                | ("microsoft", "com")
+                | ("windows", "com")
+                | ("live", "com")
+                | ("gvt2", "com")
+                | ("azureedge", "net")
+                | ("azurefd", "net")
+                | ("windows", "net")
+                | ("googleapis", "com")
+                | ("gstatic", "com")
                 | ("k12" | "bel" | "pol" | "kep" | "tsk", "tr")
         );
     let parent = if is_two_part_tld {
@@ -379,13 +389,31 @@ impl LearnedStrategy {
         )
     }
 
+    fn allows_parent_wildcard(self) -> bool {
+        matches!(
+            self,
+            Self::Primary | Self::FineFragment | Self::SlowSniSlice
+        )
+    }
+
+    fn cache_ttl_secs(self) -> u64 {
+        if self.is_oob() {
+            OOB_CACHE_TTL_SECS
+        } else {
+            PERSISTED_CACHE_TTL_SECS
+        }
+    }
+
     fn promotion_quorum(self) -> Option<usize> {
         match self {
-            Self::Primary | Self::OobSniDesync | Self::MultiRecordOob | Self::FineFragment => {
+            Self::Primary | Self::OobSniDesync | Self::MultiRecordOob => {
                 Some(FAST_PROMOTION_QUORUM)
             }
             Self::DeepRecordStorm | Self::SlowSniSlice => Some(SLOW_PROMOTION_QUORUM),
-            Self::DirectPassthrough => None,
+            // FineFragment is a single intact TLS record (strictly weaker against DPI than
+            // multi-record Primary): cache it per-host and allow it only when demoting FROM
+            // an OOB stage via `oob_alert_demotion`, never promote to it from Primary.
+            Self::FineFragment | Self::DirectPassthrough => None,
         }
     }
 }
@@ -475,25 +503,6 @@ fn is_hard_block_write_error(err: &anyhow::Error) -> bool {
     })
 }
 
-fn is_tcp_connect_io_error(err: &std::io::Error) -> bool {
-    matches!(
-        err.kind(),
-        ErrorKind::ConnectionRefused
-            | ErrorKind::NotConnected
-            | ErrorKind::AddrNotAvailable
-            | ErrorKind::NetworkUnreachable
-            | ErrorKind::HostUnreachable
-    )
-}
-
-fn is_tcp_connect_write_error(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(is_tcp_connect_io_error)
-    })
-}
-
 fn evict_oldest_adaptive_entries(
     cache: &mut HashMap<String, LearnedStrategy>,
     timestamps: &mut HashMap<String, u64>,
@@ -529,9 +538,15 @@ fn upsert_adaptive_entry(
     if !cache.contains_key(&key) && cache.len() >= MAX_PERSISTED_HOSTS {
         evict_oldest_adaptive_entries(cache, timestamps, MAX_PERSISTED_HOSTS.saturating_sub(1));
     }
+    let is_expired = timestamps
+        .get(&key)
+        .is_some_and(|&ts| now.saturating_sub(ts) > stage.cache_ttl_secs());
     let prev = cache.insert(key.clone(), stage);
-    timestamps.insert(key, now);
-    prev != Some(stage)
+    if prev != Some(stage) || !timestamps.contains_key(&key) || is_expired {
+        timestamps.insert(key, now);
+        return true;
+    }
+    false
 }
 
 #[repr(align(64))]
@@ -756,6 +771,27 @@ fn are_trailing_tls_records_complete(mut trailing: &[u8]) -> bool {
     true
 }
 
+/// Returns `true` if `trailing` (bytes immediately following the leading `ClientHello` TLS record)
+/// contains a coalesced TLS 1.3 0-RTT `ApplicationData` (`0x17`) record. Coalesced 0-RTT early
+/// data must be sent strictly single-attempt and never replayed across adaptive retry stages.
+fn trailing_contains_tls_app_data(mut trailing: &[u8]) -> bool {
+    while !trailing.is_empty() {
+        if trailing[0] == 0x17 {
+            return true;
+        }
+        if trailing.len() < 5 {
+            return false;
+        }
+        let rec_len = u16::from_be_bytes([trailing[3], trailing[4]]) as usize;
+        let total = 5 + rec_len;
+        if trailing.len() < total {
+            return false;
+        }
+        trailing = &trailing[total..];
+    }
+    false
+}
+
 #[derive(Clone)]
 pub struct EngineContext {
     pub config: Arc<RuntimeConfig>,
@@ -948,14 +984,14 @@ impl EngineContext {
             if entry.stage > max_stage {
                 continue;
             }
-            if now.saturating_sub(entry.updated_at) > PERSISTED_CACHE_TTL_SECS {
+            let strategy = LearnedStrategy::from_u8(entry.stage);
+            if now.saturating_sub(entry.updated_at) > strategy.cache_ttl_secs() {
                 continue;
             }
             let host = entry.host.trim().to_ascii_lowercase();
             if !is_valid_cache_host(&host) {
                 continue;
             }
-            let strategy = LearnedStrategy::from_u8(entry.stage);
             deduped
                 .entry(host)
                 .and_modify(|existing| {
@@ -1026,7 +1062,7 @@ impl EngineContext {
                         return None;
                     }
                     let updated_at = ts_guard.get(host).copied().unwrap_or(now);
-                    if now.saturating_sub(updated_at) > PERSISTED_CACHE_TTL_SECS {
+                    if now.saturating_sub(updated_at) > strategy.cache_ttl_secs() {
                         return None;
                     }
                     Some(PersistedHostEntry {
@@ -1666,6 +1702,7 @@ impl EngineContext {
     where
         C: AsyncRead + AsyncWrite + Unpin,
     {
+        let remote_addr = canonical_socket_addr(remote_addr);
         let remote_ip = remote_addr.ip();
 
         if let Some(ch_info) = parse_client_hello(payload) {
@@ -1693,12 +1730,16 @@ impl EngineContext {
             let current_global_stage = self.preferred_stage();
 
             // Coalesced TLS 1.3 0-RTT early data (`payload.len() > ch_info.record_total_len`):
-            // If a trailing 0-RTT AppData record spans beyond `first_buf` (incomplete TLS record),
-            // blocking for `ServerHello` before forwarding the remainder deadlocks the handshake.
-            // Apply the cached/preferred desync strategy ONCE to the leading ClientHello, forward
-            // the trailing bytes, and enter `relay_bidirectional` immediately.
-            if payload.len() > ch_info.record_total_len
-                && !are_trailing_tls_records_complete(&payload[ch_info.record_total_len..])
+            // - If a trailing record spans beyond `first_buf` (incomplete TLS record), blocking
+            //   for `ServerHello` before forwarding the remainder deadlocks the handshake.
+            // - If trailing records contain TLS 1.3 0-RTT `ApplicationData` (`0x17`), replaying
+            //   early data across retry attempts risks non-idempotent request duplication.
+            // In both cases apply the cached/preferred desync strategy ONCE, forward trailing
+            // bytes, and enter `relay_bidirectional` immediately.
+            let trailing = &payload[ch_info.record_total_len..];
+            if !trailing.is_empty()
+                && (!are_trailing_tls_records_complete(trailing)
+                    || trailing_contains_tls_app_data(trailing))
             {
                 let stage = cached_stage.unwrap_or(current_global_stage);
                 self.write_tls_flight(&mut remote, payload, &ch_info, stage)
@@ -1718,7 +1759,7 @@ impl EngineContext {
             let mut current_global_hard_blocked = false;
             let mut current_global_timed_out = false;
             let mut saw_tls_alert = false;
-            let mut stage0_connect_error = false;
+            let mut prefer_same_ip_retry = false;
             let handshake_deadline = Instant::now() + attempt_cfg.budget;
             let mut tried_direct_passthrough = false;
             let mut deadline_exceeded = false;
@@ -1751,35 +1792,98 @@ impl EngineContext {
                 let (mut stream, stream_addr) = match current_remote.take() {
                     Some(s) => (s, remote_addr),
                     None => {
-                        let alt_target = if deadline_exceeded {
-                            remote_addr
+                        let connected = if deadline_exceeded {
+                            connect_retry_stream(
+                                self,
+                                remote_addr,
+                                remote_addr,
+                                stage_deadline,
+                                &mut dead_retry_ips,
+                            )
+                            .await
+                        } else if prefer_same_ip_retry {
+                            // Stage 0 failed with a server TLS Alert or fast FIN: the server is
+                            // alive and merely rejected the strategy, so dial `remote_addr` first.
+                            match connect_retry_stream(
+                                self,
+                                remote_addr,
+                                remote_addr,
+                                stage_deadline,
+                                &mut dead_retry_ips,
+                            )
+                            .await
+                            {
+                                Some(pair) => Some(pair),
+                                None => {
+                                    prefer_same_ip_retry = false;
+                                    let fallback_remaining =
+                                        stage_deadline.saturating_duration_since(Instant::now());
+                                    let addrs = match retry_addrs.as_ref() {
+                                        Some(a) => a,
+                                        None => {
+                                            let resolved = self
+                                                .collect_retry_addrs(
+                                                    known_host,
+                                                    ch_info.sni.as_deref(),
+                                                    remote_addr,
+                                                    fallback_remaining,
+                                                )
+                                                .await;
+                                            retry_addrs.insert(resolved)
+                                        }
+                                    };
+                                    self.sync_dead_retry_ips(addrs, &mut dead_retry_ips).await;
+                                    let alt_target = select_retry_target(
+                                        addrs,
+                                        remote_addr,
+                                        &dead_retry_ips,
+                                        idx,
+                                    );
+                                    if alt_target != remote_addr {
+                                        connect_retry_stream(
+                                            self,
+                                            alt_target,
+                                            remote_addr,
+                                            stage_deadline,
+                                            &mut dead_retry_ips,
+                                        )
+                                        .await
+                                    } else {
+                                        None
+                                    }
+                                }
+                            }
                         } else {
                             let addrs = match retry_addrs.as_ref() {
                                 Some(a) => a,
                                 None => {
                                     let resolved = self
-                                        .collect_retry_addrs(effective_host, remote_addr, remaining)
+                                        .collect_retry_addrs(
+                                            known_host,
+                                            ch_info.sni.as_deref(),
+                                            remote_addr,
+                                            remaining,
+                                        )
                                         .await;
                                     retry_addrs.insert(resolved)
                                 }
                             };
                             self.sync_dead_retry_ips(addrs, &mut dead_retry_ips).await;
-                            select_retry_target(addrs, remote_addr, &dead_retry_ips, idx)
+                            let alt_target =
+                                select_retry_target(addrs, remote_addr, &dead_retry_ips, idx);
+                            connect_retry_stream(
+                                self,
+                                alt_target,
+                                remote_addr,
+                                stage_deadline,
+                                &mut dead_retry_ips,
+                            )
+                            .await
                         };
-                        match connect_retry_stream(
-                            self,
-                            alt_target,
-                            remote_addr,
-                            stage_deadline,
-                            &mut dead_retry_ips,
-                        )
-                        .await
-                        {
+                        match connected {
                             Some(pair) => pair,
                             None => {
-                                if idx == 0 {
-                                    stage0_connect_error = true;
-                                }
+                                prefer_same_ip_retry = false;
                                 continue;
                             }
                         }
@@ -1788,7 +1892,7 @@ impl EngineContext {
 
                 let write_remaining = stage_deadline.saturating_duration_since(Instant::now());
                 if write_remaining.is_zero() {
-                    if is_direct_passthrough {
+                    if is_last_stage {
                         break;
                     }
                     deadline_exceeded = true;
@@ -1803,13 +1907,11 @@ impl EngineContext {
                 {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => {
+                        prefer_same_ip_retry = false;
                         if !is_last_stage {
                             self.telemetry
                                 .auto_heal_escalations
                                 .fetch_add(1, Ordering::Relaxed);
-                        }
-                        if idx == 0 && is_tcp_connect_write_error(&err) {
-                            stage0_connect_error = true;
                         }
                         if stage == current_global_stage && is_hard_block_write_error(&err) {
                             current_global_hard_blocked = true;
@@ -1817,12 +1919,13 @@ impl EngineContext {
                         continue;
                     }
                     Err(_) => {
+                        prefer_same_ip_retry = false;
                         debug!(
                             host = ?effective_host,
                             ?stage,
                             "adaptive TLS handshake deadline exceeded during strategy write"
                         );
-                        if is_direct_passthrough {
+                        if is_last_stage {
                             break;
                         }
                         deadline_exceeded = true;
@@ -1832,7 +1935,7 @@ impl EngineContext {
 
                 let read_remaining = stage_deadline.saturating_duration_since(Instant::now());
                 if read_remaining.is_zero() {
-                    if is_direct_passthrough {
+                    if is_last_stage {
                         break;
                     }
                     deadline_exceeded = true;
@@ -1840,8 +1943,8 @@ impl EngineContext {
                 }
 
                 let wait_ms = match stage {
+                    _ if idx == 0 => 2200,
                     LearnedStrategy::DeepRecordStorm | LearnedStrategy::SlowSniSlice => 2000,
-                    _ if idx == 0 => 1500,
                     _ => 1800,
                 };
                 let read_timeout = Duration::from_millis(wait_ms).min(read_remaining);
@@ -1855,6 +1958,11 @@ impl EngineContext {
                                 .fetch_add(1, Ordering::Relaxed);
                         }
                         let elapsed = read_started.elapsed();
+                        if idx == 0 && elapsed < FAST_EOF_THRESHOLD {
+                            prefer_same_ip_retry = true;
+                        } else if elapsed >= FAST_EOF_THRESHOLD {
+                            prefer_same_ip_retry = false;
+                        }
                         if stage == current_global_stage && elapsed < FAST_EOF_THRESHOLD {
                             current_global_hard_blocked = true;
                         }
@@ -1895,6 +2003,9 @@ impl EngineContext {
                                 .auto_heal_escalations
                                 .fetch_add(1, Ordering::Relaxed);
                             if probe_buf[0] == 0x15 {
+                                if idx == 0 {
+                                    prefer_same_ip_retry = true;
+                                }
                                 if stage == current_global_stage {
                                     saw_tls_alert = true;
                                 }
@@ -1904,6 +2015,7 @@ impl EngineContext {
                                     "upstream returned TLS Alert (0x15); auto-healing with next stage"
                                 );
                             } else {
+                                prefer_same_ip_retry = false;
                                 // Non-TLS response on a TLS handshake (e.g. ISP injected HTTP 302/403 block page)
                                 if stage == current_global_stage {
                                     current_global_hard_blocked = true;
@@ -1919,27 +2031,20 @@ impl EngineContext {
                         }
 
                         let mut expected_server_record_len = None;
-                        if is_valid_tls_server_hello {
+                        let record_stage_promotion = if is_valid_tls_server_hello {
                             let elapsed = read_started.elapsed();
-                            let used_alternate_ip = stream_addr != remote_addr;
-                            let blocked_by_dead_primary_ip =
-                                used_alternate_ip && stage0_connect_error;
+                            let used_alternate_ip =
+                                canonical_socket_addr(stream_addr) != remote_addr;
                             let silent_drop_recovered =
                                 current_global_timed_out && elapsed < FAST_SERVER_HELLO_THRESHOLD;
                             let oob_alert_demotion = current_global_stage.is_oob()
                                 && saw_tls_alert
                                 && stage.is_clean_non_oob();
                             let eligible_for_promotion = idx > 0
+                                && !used_alternate_ip
                                 && (((current_global_hard_blocked || silent_drop_recovered)
                                     && !saw_tls_alert)
-                                    || oob_alert_demotion)
-                                && !blocked_by_dead_primary_ip;
-                            self.record_host_stage(
-                                cache_key.as_deref(),
-                                stage,
-                                eligible_for_promotion,
-                            )
-                            .await;
+                                    || oob_alert_demotion);
 
                             // Finish reading the full outer ServerHello/HRR TLS record before
                             // checking HelloRetryRequest and forwarding to the client so a
@@ -1976,9 +2081,10 @@ impl EngineContext {
                                     })
                                     .await;
                             }
-                        } else if let (Some(_), Some(key)) = (cached_stage, cache_key.as_deref()) {
-                            self.evict_cached_host_stage(key).await;
-                        }
+                            Some(eligible_for_promotion)
+                        } else {
+                            None
+                        };
 
                         let is_hrr = is_valid_tls_server_hello
                             && expected_server_record_len
@@ -2032,6 +2138,20 @@ impl EngineContext {
                         client.write_all(&probe_buf[..n]).await?;
                         client.flush().await?;
                         drop(probe_buf);
+
+                        // Record learned stage only after the ServerHello has been delivered to
+                        // the client so aborted/timed-out client connections never poison cache.
+                        if let Some(eligible_for_promotion) = record_stage_promotion {
+                            self.record_host_stage_with_escalation(
+                                cache_key.as_deref(),
+                                stage,
+                                eligible_for_promotion,
+                                idx > 0,
+                            )
+                            .await;
+                        } else if let (Some(_), Some(key)) = (cached_stage, cache_key.as_deref()) {
+                            self.evict_cached_host_stage(key).await;
+                        }
 
                         // TLS 1.3 HelloRetryRequest (e.g. server declines iOS X25519MLKEM768
                         // key_share and requests secp256r1/x25519): forward any late-arriving
@@ -2191,13 +2311,11 @@ impl EngineContext {
                         return Ok(stream);
                     }
                     Ok(Err(err)) => {
+                        prefer_same_ip_retry = false;
                         if !is_last_stage {
                             self.telemetry
                                 .auto_heal_escalations
                                 .fetch_add(1, Ordering::Relaxed);
-                        }
-                        if idx == 0 && is_tcp_connect_io_error(&err) {
-                            stage0_connect_error = true;
                         }
                         if stage == current_global_stage && is_hard_block_io_error(&err) {
                             current_global_hard_blocked = true;
@@ -2211,6 +2329,7 @@ impl EngineContext {
                         continue;
                     }
                     Err(_) => {
+                        prefer_same_ip_retry = false;
                         if !is_last_stage {
                             self.telemetry
                                 .auto_heal_escalations
@@ -2253,13 +2372,25 @@ impl EngineContext {
     /// - Exception-only `adaptive_cache`: only hosts whose stage differs from `preferred_isp_stage`
     ///   are inserted; hosts matching `preferred_isp_stage` remove any stale override entry.
     /// - Quorum-gated `HardBlock`-only promotion of `preferred_isp_stage` (>= 3 distinct hosts for
-    ///   fast stages `OobSniDesync`..=`FineFragment`, >= 5 distinct hosts for slow stages
-    ///   `DeepRecordStorm`..=`SlowSniSlice`).
+    ///   `Primary`/`OobSniDesync`/`MultiRecordOob`, >= 5 distinct hosts for slow stages
+    ///   `DeepRecordStorm`/`SlowSniSlice`; `FineFragment` never promotes from `Primary`).
+    #[cfg(test)]
     pub(crate) async fn record_host_stage(
         &self,
         host: Option<&str>,
         stage: LearnedStrategy,
         hard_block_promotion_eligible: bool,
+    ) {
+        self.record_host_stage_with_escalation(host, stage, hard_block_promotion_eligible, false)
+            .await;
+    }
+
+    async fn record_host_stage_with_escalation(
+        &self,
+        host: Option<&str>,
+        stage: LearnedStrategy,
+        hard_block_promotion_eligible: bool,
+        escalated: bool,
     ) {
         let Some(key) = host
             .map(|h| h.trim().to_ascii_lowercase())
@@ -2297,22 +2428,58 @@ impl EngineContext {
             }
         }
 
-        // Fast-path: when no global promotion occurred, check under a shared read lock whether
+        let parent_key_opt = parent_domain_cache_key(&key);
+
+        // Fast-path: when no global promotion occurred, check under shared read locks whether
         // the cache already reflects `stage` (either uncached when matching `preferred_stage()`,
-        // or already cached with the unchanged exception `stage` + matching parent wildcard)
-        // before acquiring any exclusive write locks.
+        // covered by an existing parent wildcard / apex on a non-escalated `idx == 0` hit, or
+        // already cached with the unchanged exception `stage`) before taking exclusive write locks.
         if !promoted {
+            let now = unix_now_secs();
             let current_preferred = self.preferred_stage();
             let guard = self.adaptive_cache.read().await;
+            let ts_guard = self.adaptive_timestamps.read().await;
+            let is_fresh = |k: &str, s: LearnedStrategy| {
+                ts_guard
+                    .get(k)
+                    .is_none_or(|&ts| now.saturating_sub(ts) <= s.cache_ttl_secs())
+            };
             let already_up_to_date = if stage == current_preferred {
-                !guard.contains_key(&key)
-            } else if guard.get(&key) != Some(&stage) {
-                false
-            } else if stage != LearnedStrategy::Primary
-                && stage != LearnedStrategy::DirectPassthrough
+                let has_exact = guard.contains_key(&key);
+                let has_stale_inherited = escalated
+                    && parent_key_opt.as_deref().is_some_and(|p| {
+                        guard.contains_key(p)
+                            || p.strip_prefix("*.").is_some_and(|apex| {
+                                guard
+                                    .get(apex)
+                                    .is_some_and(|s| s.allows_parent_wildcard())
+                            })
+                    });
+                !has_exact && !has_stale_inherited
+            } else if !escalated
+                && stage.allows_parent_wildcard()
+                && parent_key_opt
+                    .as_deref()
+                    .is_some_and(|p| guard.get(p) == Some(&stage) && is_fresh(p, stage))
             {
-                parent_domain_cache_key(&key)
-                    .is_none_or(|parent_key| guard.get(&parent_key) == Some(&stage))
+                // Succeeded on attempt 0 (`idx == 0`) via an existing parent wildcard:
+                // skip writing a duplicate subdomain entry and do not refresh the wildcard TTL.
+                true
+            } else if !escalated
+                && stage.allows_parent_wildcard()
+                && !guard.contains_key(&key)
+                && parent_key_opt
+                    .as_deref()
+                    .and_then(|p| p.strip_prefix("*."))
+                    .is_some_and(|apex| guard.get(apex) == Some(&stage) && is_fresh(apex, stage))
+            {
+                true
+            } else if guard.get(&key) != Some(&stage) || !is_fresh(&key, stage) {
+                false
+            } else if stage != current_preferred && stage.allows_parent_wildcard() {
+                parent_key_opt.as_deref().is_none_or(|parent_key| {
+                    guard.get(parent_key) == Some(&stage) && is_fresh(parent_key, stage)
+                })
             } else {
                 true
             };
@@ -2347,20 +2514,45 @@ impl EngineContext {
                     ts_guard.remove(&key);
                     cache_changed = true;
                 }
+                if escalated {
+                    if let Some(ref parent_key) = parent_key_opt {
+                        if guard.remove(parent_key).is_some() {
+                            ts_guard.remove(parent_key);
+                            cache_changed = true;
+                        }
+                        if let Some(apex) = parent_key.strip_prefix("*.") {
+                            if guard
+                                .get(apex)
+                                .is_some_and(|s| s.allows_parent_wildcard())
+                                && guard.remove(apex).is_some()
+                            {
+                                ts_guard.remove(apex);
+                                cache_changed = true;
+                            }
+                        }
+                    }
+                }
             } else {
-                let parent_key = if stage != LearnedStrategy::Primary
-                    && stage != LearnedStrategy::DirectPassthrough
-                {
-                    parent_domain_cache_key(&key)
+                let parent_key = if stage != current_preferred && stage.allows_parent_wildcard() {
+                    parent_key_opt
                 } else {
                     None
                 };
-                if upsert_adaptive_entry(&mut guard, &mut ts_guard, key, stage, now) {
-                    cache_changed = true;
-                }
-                if let Some(parent_key) = parent_key {
-                    cache_changed |=
-                        upsert_adaptive_entry(&mut guard, &mut ts_guard, parent_key, stage, now);
+                let parent_already_matches = !escalated
+                    && parent_key.as_deref().is_some_and(|p| {
+                        guard.get(p) == Some(&stage)
+                            && ts_guard
+                                .get(p)
+                                .is_none_or(|&ts| now.saturating_sub(ts) <= stage.cache_ttl_secs())
+                    });
+                if !parent_already_matches {
+                    if upsert_adaptive_entry(&mut guard, &mut ts_guard, key, stage, now) {
+                        cache_changed = true;
+                    }
+                    if let Some(parent_key) = parent_key {
+                        cache_changed |=
+                            upsert_adaptive_entry(&mut guard, &mut ts_guard, parent_key, stage, now);
+                    }
                 }
             }
 
@@ -2375,24 +2567,33 @@ impl EngineContext {
     }
 
     async fn lookup_cached_host_stage(&self, key: &str) -> Option<LearnedStrategy> {
+        let now = unix_now_secs();
         let guard = self.adaptive_cache.read().await;
-        if let Some(&stage) = guard.get(key) {
+        let ts_guard = self.adaptive_timestamps.read().await;
+        let is_fresh = |k: &str, s: LearnedStrategy| {
+            ts_guard
+                .get(k)
+                .is_none_or(|&ts| now.saturating_sub(ts) <= s.cache_ttl_secs())
+        };
+        if let Some(&stage) = guard.get(key).filter(|&&s| is_fresh(key, s)) {
             return Some(stage);
         }
         if let Some(parent_key) = parent_domain_cache_key(key) {
             if let Some(stage) = guard
                 .get(&parent_key)
                 .copied()
-                .filter(|&s| s != LearnedStrategy::DirectPassthrough)
+                .filter(|&s| s.allows_parent_wildcard() && is_fresh(&parent_key, s))
             {
                 return Some(stage);
             }
-            if let Some(stage) = parent_key
-                .strip_prefix("*.")
-                .and_then(|apex| guard.get(apex).copied())
-                .filter(|&s| s != LearnedStrategy::DirectPassthrough)
-            {
-                return Some(stage);
+            if let Some(apex) = parent_key.strip_prefix("*.") {
+                if let Some(stage) = guard
+                    .get(apex)
+                    .copied()
+                    .filter(|&s| s.allows_parent_wildcard() && is_fresh(apex, s))
+                {
+                    return Some(stage);
+                }
             }
         }
         None
@@ -2411,6 +2612,16 @@ impl EngineContext {
                 if guard.remove(&parent_key).is_some() {
                     ts_guard.remove(&parent_key);
                     removed = true;
+                }
+                if let Some(apex) = parent_key.strip_prefix("*.") {
+                    if guard
+                        .get(apex)
+                        .is_some_and(|s| s.allows_parent_wildcard())
+                        && guard.remove(apex).is_some()
+                    {
+                        ts_guard.remove(apex);
+                        removed = true;
+                    }
                 }
             }
             self.telemetry
@@ -2451,30 +2662,40 @@ impl EngineContext {
 
     async fn collect_retry_addrs(
         &self,
-        host: Option<&str>,
+        known_host: Option<&str>,
+        sni_host: Option<&str>,
         initial_addr: SocketAddr,
         max_wait: Duration,
     ) -> Vec<SocketAddr> {
+        let initial_addr = canonical_socket_addr(initial_addr);
         let mut addrs = vec![initial_addr];
         let resolve_timeout = RETRY_DNS_TIMEOUT.min(max_wait);
-        if resolve_timeout.is_zero() {
+        if resolve_timeout.is_zero() || initial_addr.ip().is_loopback() {
             return addrs;
         }
+        // Prefer caller-supplied `known_host` over untrusted ClientHello SNI when present.
+        let host = known_host
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .or_else(|| sni_host.map(str::trim).filter(|h| !h.is_empty()));
         if let Some(h) = host {
-            if !initial_addr.ip().is_loopback() {
-                if let Ok(Ok(ips)) =
-                    tokio::time::timeout(resolve_timeout, self.dns.resolve_internal(h)).await
-                {
-                    // Only rotate among alternate IPs of the same address family that already
-                    // proved reachable on attempt 0 so unreachable IPv6 never stalls retries.
-                    for ip in ips {
-                        if ip.is_ipv4() != initial_addr.is_ipv4() {
-                            continue;
-                        }
-                        let sa = SocketAddr::new(ip, initial_addr.port());
-                        if !addrs.contains(&sa) {
-                            addrs.push(sa);
-                        }
+            if let Ok(Ok(ips)) =
+                tokio::time::timeout(resolve_timeout, self.dns.resolve_internal(h)).await
+            {
+                // Only rotate among public alternate IPs of the same address family that already
+                // proved reachable on attempt 0 so unreachable IPv6 never stalls retries and
+                // rogue DNS answers cannot SSRF into private/loopback/link-local targets.
+                for ip in ips {
+                    let ip = ip.to_canonical();
+                    if BypassPolicy::is_non_public_ip(ip) {
+                        continue;
+                    }
+                    if ip.is_ipv4() != initial_addr.is_ipv4() {
+                        continue;
+                    }
+                    let sa = SocketAddr::new(ip, initial_addr.port());
+                    if !addrs.contains(&sa) {
+                        addrs.push(sa);
                     }
                 }
             }
@@ -3640,11 +3861,16 @@ mod tests {
                 PersistedHostEntry {
                     host: "Fresh.Example".to_string(),
                     stage: LearnedStrategy::FineFragment as u8,
-                    updated_at: now.saturating_sub(60),
+                    updated_at: now.saturating_sub(OOB_CACHE_TTL_SECS + 60),
+                },
+                PersistedHostEntry {
+                    host: "stale-oob.example".to_string(),
+                    stage: LearnedStrategy::OobSniDesync as u8,
+                    updated_at: now.saturating_sub(OOB_CACHE_TTL_SECS + 60),
                 },
                 PersistedHostEntry {
                     host: "stale.example".to_string(),
-                    stage: LearnedStrategy::OobSniDesync as u8,
+                    stage: LearnedStrategy::FineFragment as u8,
                     updated_at: now.saturating_sub(PERSISTED_CACHE_TTL_SECS + 60),
                 },
                 PersistedHostEntry {
@@ -3969,6 +4195,20 @@ mod tests {
             Some(LearnedStrategy::FineFragment)
         );
 
+        // FineFragment must NEVER promote global_isp_stage from Primary (even across 5+ hosts).
+        let fine_ctx = test_engine_context();
+        for idx in 1..=SLOW_PROMOTION_QUORUM {
+            fine_ctx
+                .record_host_stage(
+                    Some(&format!("fine-{idx}.example")),
+                    LearnedStrategy::FineFragment,
+                    true,
+                )
+                .await;
+            assert_eq!(fine_ctx.preferred_stage(), LearnedStrategy::Primary);
+        }
+        assert_eq!(fine_ctx.learned_host_count().await, SLOW_PROMOTION_QUORUM);
+
         // Slow stages (DeepRecordStorm / SlowSniSlice) require 5 distinct hard-blocked hosts.
         let slow_ctx = test_engine_context();
         for idx in 1..SLOW_PROMOTION_QUORUM {
@@ -3989,22 +4229,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persisted_cache_expires_global_isp_stage_after_24h_and_loads_v1_without_timestamp() {
+    async fn persisted_cache_expires_global_isp_stage_after_24h_and_resets_v1_caches() {
+        assert_eq!(PERSISTED_CACHE_VERSION, 2);
         let tmp = TempCacheDir::new("global-ttl");
-        let v1_legacy = tmp.file("v1-legacy.json");
+        let v1_stale = tmp.file("v1-stale.json");
+        let v2_no_ts = tmp.file("v2-no-ts.json");
         let expired_file = tmp.file("expired-global.json");
         let fresh_file = tmp.file("fresh-global.json");
         let now = unix_now_secs();
 
-        // Backwards-compatible v1 JSON omitting `global_isp_stage_updated_at`: deserializes cleanly
-        // and safely expires the untimestamped global_isp_stage back to Primary.
-        let legacy_json = format!(
-            r#"{{"version":1,"global_isp_stage":4,"entries":[{{"host":"legacy.example","stage":2,"updated_at":{now}}}]}}"#
+        // Stale v1 cache files (e.g. poisoned v0.6.2 adaptive-cache.json) auto-reset cleanly on load.
+        let v1_json = format!(
+            r#"{{"version":1,"global_isp_stage":3,"global_isp_stage_updated_at":{now},"entries":[{{"host":"*.microsoft.com","stage":1,"updated_at":{now}}}]}}"#
         );
-        std::fs::write(&v1_legacy, legacy_json).unwrap();
+        std::fs::write(&v1_stale, v1_json).unwrap();
+        let ctx_v1 = test_engine_context();
+        assert_eq!(ctx_v1.load_persisted_cache(&v1_stale).await, 0);
+        assert_eq!(ctx_v1.preferred_stage(), LearnedStrategy::Primary);
+        assert_eq!(ctx_v1.learned_host_count().await, 0);
+
+        // Current-version JSON omitting `global_isp_stage_updated_at` deserializes cleanly
+        // and safely expires the untimestamped global_isp_stage back to Primary.
+        let v2_no_ts_json = format!(
+            r#"{{"version":{PERSISTED_CACHE_VERSION},"global_isp_stage":4,"entries":[{{"host":"legacy.example","stage":2,"updated_at":{now}}}]}}"#
+        );
+        std::fs::write(&v2_no_ts, v2_no_ts_json).unwrap();
 
         let ctx_legacy = test_engine_context();
-        assert_eq!(ctx_legacy.load_persisted_cache(&v1_legacy).await, 1);
+        assert_eq!(ctx_legacy.load_persisted_cache(&v2_no_ts).await, 1);
         assert_eq!(ctx_legacy.preferred_stage(), LearnedStrategy::Primary);
 
         // Expired (> 24h) global_isp_stage resets back to Primary on load.
@@ -4275,7 +4527,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coalesced_tls13_zero_rtt_auto_heals_and_preserves_trailing_early_data() {
+    async fn coalesced_tls13_zero_rtt_is_single_attempt_while_ccs_only_auto_heals() {
         let config = RuntimeConfig {
             system_proxy: false,
             chunk_size: 10,
@@ -4286,24 +4538,79 @@ mod tests {
 
         let ch = build_synthetic_client_hello("api.zero-rtt.example", 256);
         let orig_rec_len = u16::from_be_bytes([ch[3], ch[4]]) as usize;
-        // Simulated coalesced TLS 1.3 ChangeCipherSpec + 0-RTT ApplicationData trailing bytes.
-        let trailing: Vec<u8> = vec![
+
+        // Part A: Coalesced TLS 1.3 ChangeCipherSpec + 0-RTT ApplicationData (`0x17`) must be
+        // sent strictly single-attempt (never replayed across adaptive retry stages).
+        let trailing_0rtt: Vec<u8> = vec![
             0x14, 0x03, 0x03, 0x00, 0x01, 0x01, // CCS
             0x17, 0x03, 0x03, 0x00, 0x08, b'0', b'R', b'T', b'T', b'D', b'A', b'T', b'A',
         ];
-        let mut coalesced = ch.clone();
-        coalesced.extend_from_slice(&trailing);
+        assert!(trailing_contains_tls_app_data(&trailing_0rtt));
+        let mut coalesced_0rtt = ch.clone();
+        coalesced_0rtt.extend_from_slice(&trailing_0rtt);
+
+        let upstream_0rtt = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_0rtt_addr = upstream_0rtt.local_addr().unwrap();
+        let attempts_0rtt = Arc::new(AtomicUsize::new(0));
+        let attempts_0rtt_srv = Arc::clone(&attempts_0rtt);
+        let trailing_0rtt_exp = trailing_0rtt.clone();
+
+        let srv_0rtt = tokio::spawn(async move {
+            let (mut sock, _) = upstream_0rtt.accept().await.unwrap();
+            attempts_0rtt_srv.fetch_add(1, Ordering::SeqCst);
+            let mut got_ch = 0usize;
+            while got_ch < orig_rec_len {
+                let mut hdr = [0u8; 5];
+                sock.read_exact(&mut hdr).await.unwrap();
+                let rlen = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                let mut body = vec![0u8; rlen];
+                sock.read_exact(&mut body).await.unwrap();
+                got_ch += rlen;
+            }
+            let mut got_trailing = vec![0u8; trailing_0rtt_exp.len()];
+            sock.read_exact(&mut got_trailing).await.unwrap();
+            assert_eq!(got_trailing, trailing_0rtt_exp);
+            // Reply with a TLS Alert; because 0-RTT is single-attempt, engine must not retry.
+            let _ = sock
+                .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x2f])
+                .await;
+            let _ = sock.shutdown().await;
+        });
+
+        let (_app_0rtt, mut tun_0rtt) = tokio::io::duplex(8192);
+        let initial_0rtt = TcpStream::connect(upstream_0rtt_addr).await.unwrap();
+        let mut established_0rtt = ctx
+            .establish_initial_flight(
+                &mut tun_0rtt,
+                initial_0rtt,
+                &coalesced_0rtt,
+                Some("api.zero-rtt.example"),
+                upstream_0rtt_addr,
+            )
+            .await
+            .unwrap();
+        srv_0rtt.await.unwrap();
+        let mut alert_reply = [0u8; 7];
+        established_0rtt.read_exact(&mut alert_reply).await.unwrap();
+        assert_eq!(alert_reply[0], 0x15);
+        assert_eq!(attempts_0rtt.load(Ordering::SeqCst), 1);
+        assert_eq!(ctx.learned_host_count().await, 0);
+
+        // Part B: Coalesced TLS 1.3 ChangeCipherSpec (`0x14`) WITHOUT `0x17` ApplicationData
+        // remains safe to auto-heal across retries while preserving trailing bytes intact.
+        let trailing_ccs: Vec<u8> = vec![0x14, 0x03, 0x03, 0x00, 0x01, 0x01];
+        assert!(!trailing_contains_tls_app_data(&trailing_ccs));
+        let mut coalesced_ccs = ch.clone();
+        coalesced_ccs.extend_from_slice(&trailing_ccs);
 
         let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream.local_addr().unwrap();
         let attempts = Arc::new(AtomicUsize::new(0));
         let attempts_srv = Arc::clone(&attempts);
-        let trailing_expected = trailing.clone();
+        let trailing_expected = trailing_ccs.clone();
         let trailing_ok = Arc::new(AtomicBool::new(false));
         let trailing_ok_srv = Arc::clone(&trailing_ok);
 
-        // Reject split ClientHello (Stage 1 Combo) with a TLS Alert, then accept intact
-        // single-record ClientHello (Stage 2 OobSniDesync) and verify trailing 0-RTT bytes arrive intact.
         tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = upstream.accept().await else {
@@ -4364,7 +4671,7 @@ mod tests {
             .establish_initial_flight(
                 &mut tun_side,
                 initial_remote,
-                &coalesced,
+                &coalesced_ccs,
                 Some("api.zero-rtt.example"),
                 upstream_addr,
             )
@@ -4536,8 +4843,9 @@ mod tests {
         #[cfg(target_os = "android")]
         assert_eq!(RELAY_BUF_SIZE, 64 * 1024);
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
-        assert_eq!(RELAY_BUF_SIZE, 256 * 1024);
+        assert_eq!(RELAY_BUF_SIZE, 128 * 1024);
         assert_eq!(TELEMETRY_BATCH_BYTES, RELAY_BUF_SIZE as u64);
+        assert_eq!(MAX_HANDSHAKE_DEADLINE, Duration::from_secs(12));
     }
 
     #[tokio::test]
@@ -4885,7 +5193,7 @@ mod tests {
     async fn direct_passthrough_skips_parent_wildcard_and_eviction_removes_both_keys() {
         let ctx = test_engine_context();
 
-        // Multi-tenant cloud and Turkish suffixes must be treated as two-part TLDs.
+        // Multi-tenant cloud, Microsoft/Google, and Turkish suffixes must be treated as two-part TLDs.
         for host in [
             "d123.cloudfront.net",
             "s3.amazonaws.com",
@@ -4895,6 +5203,15 @@ mod tests {
             "tenant.akamaized.net",
             "cdn.fastly.net",
             "demo.vercel.app",
+            "login.microsoft.com",
+            "ctldl.windows.com",
+            "auth.live.com",
+            "edgedl.gvt2.com",
+            "svc.azureedge.net",
+            "edge.azurefd.net",
+            "blob.windows.net",
+            "fonts.googleapis.com",
+            "www.gstatic.com",
             "school.k12.tr",
             "ankara.bel.tr",
             "egm.pol.tr",
@@ -4916,30 +5233,33 @@ mod tests {
             Some("*.site.pages.dev")
         );
 
-        // DirectPassthrough must never write a `*.parent` wildcard entry.
-        ctx.record_host_stage(
-            Some("strict.vendor.example"),
-            LearnedStrategy::DirectPassthrough,
-            false,
-        )
-        .await;
-        {
+        // DirectPassthrough, OOB stages, and DeepRecordStorm must never write a `*.parent` wildcard.
+        for (host, stage) in [
+            ("strict.vendor.example", LearnedStrategy::DirectPassthrough),
+            ("oob1.oob-host.example", LearnedStrategy::OobSniDesync),
+            ("oob2.moob-host.example", LearnedStrategy::MultiRecordOob),
+            ("storm.storm-host.example", LearnedStrategy::DeepRecordStorm),
+        ] {
+            ctx.record_host_stage(Some(host), stage, false).await;
+            let parent = parent_domain_cache_key(host).unwrap();
             let guard = ctx.adaptive_cache.read().await;
-            assert_eq!(
-                guard.get("strict.vendor.example").copied(),
-                Some(LearnedStrategy::DirectPassthrough)
+            assert_eq!(guard.get(host).copied(), Some(stage));
+            assert!(
+                !guard.contains_key(&parent),
+                "{stage:?} must not auto-wildcard onto {parent}"
             );
-            assert!(!guard.contains_key("*.vendor.example"));
         }
 
         // Non-Primary / non-DirectPassthrough writes both host and `*.parent`, and eviction
-        // must remove both together so stale `*.parent` does not survive.
+        // must remove both together (plus any inherited apex entry) so stale wildcards do not survive.
         ctx.record_host_stage(
             Some("shard1.cdn.example"),
             LearnedStrategy::FineFragment,
             false,
         )
         .await;
+        ctx.record_host_stage(Some("cdn.example"), LearnedStrategy::FineFragment, false)
+            .await;
         {
             let guard = ctx.adaptive_cache.read().await;
             assert_eq!(
@@ -4950,12 +5270,17 @@ mod tests {
                 guard.get("*.cdn.example").copied(),
                 Some(LearnedStrategy::FineFragment)
             );
+            assert_eq!(
+                guard.get("cdn.example").copied(),
+                Some(LearnedStrategy::FineFragment)
+            );
         }
         ctx.evict_cached_host_stage("shard1.cdn.example").await;
         {
             let guard = ctx.adaptive_cache.read().await;
             assert!(!guard.contains_key("shard1.cdn.example"));
             assert!(!guard.contains_key("*.cdn.example"));
+            assert!(!guard.contains_key("cdn.example"));
         }
 
         // Fragment mode must deduplicate FineFragment in build_stage_order.
@@ -5409,7 +5734,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stage_promotion_and_oob_demotion_succeed_with_alternate_ip_after_dpi_reset() {
+    async fn alternate_ip_failover_never_promotes_and_tls_alert_retries_same_ip() {
         let config = RuntimeConfig {
             system_proxy: false,
             chunk_size: 10,
@@ -5421,8 +5746,10 @@ mod tests {
         };
         let ctx = EngineContext::new(config).unwrap();
 
-        // Part A: Primary IP connects and gets DPI fast-EOF on stage 0 (Primary), while stage 1
-        // (FineFragment) succeeds on an alternate IP. Must still promote preferred_isp_stage.
+        // Part A: Primary IP receives DPI HTTP 302 block injection on stage 0 (Primary),
+        // triggering alternate-IP failover. Even when OobSniDesync succeeds on `alt_addr`
+        // across FAST_PROMOTION_QUORUM (3) distinct hosts, `!used_alternate_ip` must block
+        // global stage promotion so IP failover never casts a global promotion vote.
         let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let primary_addr = primary_listener.local_addr().unwrap();
         let alt_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5435,7 +5762,6 @@ mod tests {
             "b.alt-promo-b.example",
             "c.alt-promo-c.example",
         ];
-        let expected_payload_len = build_synthetic_client_hello(promo_hosts[0], 256).len() - 5;
 
         tokio::spawn(async move {
             loop {
@@ -5443,21 +5769,24 @@ mod tests {
                     break;
                 };
                 tokio::spawn(async move {
-                    let mut total = 0usize;
-                    while total < expected_payload_len {
-                        let mut hdr = [0u8; 5];
-                        if sock.read_exact(&mut hdr).await.is_err() {
-                            break;
-                        }
-                        let rlen = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
-                        let mut body = vec![0u8; rlen];
-                        if sock.read_exact(&mut body).await.is_err() {
-                            break;
-                        }
-                        total += rlen;
+                    let mut hdr = [0u8; 5];
+                    if sock.read_exact(&mut hdr).await.is_err() {
+                        return;
                     }
-                    // Simulate immediate DPI connection teardown after ClientHello.
+                    let rlen = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                    let mut body = vec![0u8; rlen];
+                    let _ = sock.read_exact(&mut body).await;
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 302 Found\r\nLocation: http://blocked.isp/\r\n\r\n",
+                        )
+                        .await;
                     let _ = sock.shutdown().await;
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        tokio::io::copy(&mut sock, &mut tokio::io::sink()),
+                    )
+                    .await;
                 });
             }
         });
@@ -5467,9 +5796,8 @@ mod tests {
                 let Ok((mut sock, _)) = alt_listener.accept().await else {
                     break;
                 };
-                let hits = Arc::clone(&alt_hits_srv);
+                let step = alt_hits_srv.fetch_add(1, Ordering::SeqCst) % 4;
                 tokio::spawn(async move {
-                    hits.fetch_add(1, Ordering::SeqCst);
                     let mut hdr = [0u8; 5];
                     if sock.read_exact(&mut hdr).await.is_err() {
                         return;
@@ -5477,9 +5805,19 @@ mod tests {
                     let rlen = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
                     let mut body = vec![0u8; rlen];
                     let _ = sock.read_exact(&mut body).await;
-                    let _ = sock
-                        .write_all(&[0x16, 0x03, 0x03, 0x00, 0x05, b'A', b'L', b'T', b'O', b'K'])
-                        .await;
+                    if step < 3 {
+                        // Reject FineFragment / DeepRecordStorm / SlowSniSlice with TLS Alert.
+                        let _ = sock
+                            .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x32])
+                            .await;
+                    } else {
+                        // Succeed on OobSniDesync on alternate IP.
+                        let _ = sock
+                            .write_all(&[
+                                0x16, 0x03, 0x03, 0x00, 0x05, b'A', b'L', b'T', b'O', b'K',
+                            ])
+                            .await;
+                    }
                     let _ = sock.shutdown().await;
                     let _ = tokio::time::timeout(
                         Duration::from_secs(1),
@@ -5519,11 +5857,13 @@ mod tests {
                 &[0x16, 0x03, 0x03, 0x00, 0x05, b'A', b'L', b'T', b'O', b'K']
             );
         }
-        assert_eq!(alt_hits.load(Ordering::SeqCst), FAST_PROMOTION_QUORUM);
-        assert_eq!(ctx.preferred_stage(), LearnedStrategy::FineFragment);
+        assert_eq!(alt_hits.load(Ordering::SeqCst), FAST_PROMOTION_QUORUM * 4);
+        assert_eq!(ctx.preferred_stage(), LearnedStrategy::Primary);
 
-        // Part B: Promoted OOB stage receives TLS Alert (0x15) on primary IP, and clean non-OOB
-        // Primary succeeds on an alternate IP. Must still demote OOB back to Primary.
+        // Part B: Promoted OOB stage receives a server TLS Alert (0x15) on primary IP.
+        // Because the server is alive and merely rejected the strategy, retry must dial
+        // `primary_oob_addr` FIRST (`alt_oob_hits == 0`) so clean Primary succeeds on the
+        // same IP and demotes OOB back to Primary across 3 distinct hosts.
         ctx.preferred_isp_stage_updated_at
             .store(unix_now_secs(), Ordering::Release);
         ctx.preferred_isp_stage
@@ -5533,6 +5873,8 @@ mod tests {
         let primary_oob_addr = primary_oob.local_addr().unwrap();
         let alt_oob = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let alt_oob_addr = alt_oob.local_addr().unwrap();
+        let primary_oob_hits = Arc::new(AtomicUsize::new(0));
+        let primary_oob_hits_srv = Arc::clone(&primary_oob_hits);
         let alt_oob_hits = Arc::new(AtomicUsize::new(0));
         let alt_oob_hits_srv = Arc::clone(&alt_oob_hits);
 
@@ -5541,6 +5883,7 @@ mod tests {
                 let Ok((mut sock, _)) = primary_oob.accept().await else {
                     break;
                 };
+                let step = primary_oob_hits_srv.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
                     let mut hdr = [0u8; 5];
                     if sock.read_exact(&mut hdr).await.is_err() {
@@ -5549,9 +5892,17 @@ mod tests {
                     let rlen = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
                     let mut body = vec![0u8; rlen];
                     let _ = sock.read_exact(&mut body).await;
-                    let _ = sock
-                        .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x32])
-                        .await;
+                    if step.is_multiple_of(2) {
+                        let _ = sock
+                            .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x32])
+                            .await;
+                    } else {
+                        let _ = sock
+                            .write_all(&[
+                                0x16, 0x03, 0x03, 0x00, 0x05, b'C', b'L', b'E', b'A', b'N',
+                            ])
+                            .await;
+                    }
                     let _ = sock.shutdown().await;
                     let _ = tokio::time::timeout(
                         Duration::from_secs(1),
@@ -5570,22 +5921,7 @@ mod tests {
                 let hits = Arc::clone(&alt_oob_hits_srv);
                 tokio::spawn(async move {
                     hits.fetch_add(1, Ordering::SeqCst);
-                    let mut hdr = [0u8; 5];
-                    if sock.read_exact(&mut hdr).await.is_err() {
-                        return;
-                    }
-                    let rlen = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
-                    let mut body = vec![0u8; rlen];
-                    let _ = sock.read_exact(&mut body).await;
-                    let _ = sock
-                        .write_all(&[0x16, 0x03, 0x03, 0x00, 0x05, b'C', b'L', b'E', b'A', b'N'])
-                        .await;
                     let _ = sock.shutdown().await;
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(1),
-                        tokio::io::copy(&mut sock, &mut tokio::io::sink()),
-                    )
-                    .await;
                 });
             }
         });
@@ -5624,7 +5960,11 @@ mod tests {
                 &[0x16, 0x03, 0x03, 0x00, 0x05, b'C', b'L', b'E', b'A', b'N']
             );
         }
-        assert_eq!(alt_oob_hits.load(Ordering::SeqCst), FAST_PROMOTION_QUORUM);
+        assert_eq!(alt_oob_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            primary_oob_hits.load(Ordering::SeqCst),
+            FAST_PROMOTION_QUORUM * 2
+        );
         assert_eq!(ctx.preferred_stage(), LearnedStrategy::Primary);
     }
 
@@ -6010,5 +6350,299 @@ mod tests {
 
         dns_task.abort();
         accept_task.abort();
+    }
+
+    #[tokio::test]
+    async fn wildcard_cache_self_heals_without_duplication_or_ttl_refresh_and_guards_retry_ssrf() {
+        // 1. Non-escalated (`idx == 0`) hit via existing parent wildcard must NOT write a
+        //    duplicate subdomain entry or refresh the parent wildcard's timestamp.
+        let ctx = test_engine_context();
+        ctx.record_host_stage(
+            Some("shard1.heal-cdn.example"),
+            LearnedStrategy::FineFragment,
+            false,
+        )
+        .await;
+        let old_ts = unix_now_secs().saturating_sub(3600);
+        ctx.adaptive_timestamps
+            .write()
+            .await
+            .insert("*.heal-cdn.example".to_string(), old_ts);
+        ctx.record_host_stage_with_escalation(
+            Some("shard2.heal-cdn.example"),
+            LearnedStrategy::FineFragment,
+            false,
+            false,
+        )
+        .await;
+        {
+            let guard = ctx.adaptive_cache.read().await;
+            let ts_guard = ctx.adaptive_timestamps.read().await;
+            assert!(!guard.contains_key("shard2.heal-cdn.example"));
+            assert_eq!(ts_guard.get("*.heal-cdn.example").copied(), Some(old_ts));
+        }
+
+        // 2. Poisoned wildcard + inherited apex entry must self-heal immediately when a
+        //    subdomain escalates (`idx > 0`) and recovers with `current_preferred` (Primary).
+        let ctx_heal = EngineContext::new(RuntimeConfig {
+            system_proxy: false,
+            chunk_size: 10,
+            patterns: vec!["poisoned\\.example$".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        {
+            let mut guard = ctx_heal.adaptive_cache.write().await;
+            guard.insert("*.poisoned.example".to_string(), LearnedStrategy::FineFragment);
+            guard.insert("poisoned.example".to_string(), LearnedStrategy::FineFragment);
+            ctx_heal
+                .telemetry
+                .learned_hosts
+                .store(guard.len(), Ordering::Relaxed);
+        }
+
+        let ch_heal = build_synthetic_client_hello("sub.poisoned.example", 256);
+        let orig_rec_len = u16::from_be_bytes([ch_heal[3], ch_heal[4]]) as usize;
+        let heal_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let heal_addr = heal_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = heal_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut hdr = [0u8; 5];
+                    if sock.read_exact(&mut hdr).await.is_err() {
+                        return;
+                    }
+                    let rec_len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                    let mut body = vec![0u8; rec_len];
+                    let _ = sock.read_exact(&mut body).await;
+                    if rec_len == orig_rec_len {
+                        // Reject poisoned single-record FineFragment with TLS Alert.
+                        let _ = sock
+                            .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x2f])
+                            .await;
+                    } else {
+                        // Accept multi-record Primary recovery.
+                        let _ = sock
+                            .write_all(&[
+                                0x16, 0x03, 0x03, 0x00, 0x05, b'H', b'E', b'A', b'L', b'!',
+                            ])
+                            .await;
+                    }
+                    let _ = sock.shutdown().await;
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        tokio::io::copy(&mut sock, &mut tokio::io::sink()),
+                    )
+                    .await;
+                });
+            }
+        });
+
+        let (mut app_heal, mut tun_heal) = tokio::io::duplex(8192);
+        let heal_reader = tokio::spawn(async move {
+            let mut reply = [0u8; 10];
+            app_heal.read_exact(&mut reply).await.unwrap();
+            reply
+        });
+        let remote_heal = TcpStream::connect(heal_addr).await.unwrap();
+        let _stream_heal = ctx_heal
+            .establish_initial_flight(
+                &mut tun_heal,
+                remote_heal,
+                &ch_heal,
+                Some("sub.poisoned.example"),
+                heal_addr,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            &heal_reader.await.unwrap(),
+            &[0x16, 0x03, 0x03, 0x00, 0x05, b'H', b'E', b'A', b'L', b'!']
+        );
+        assert_eq!(ctx_heal.learned_host_count().await, 0);
+        assert_eq!(
+            ctx_heal
+                .lookup_cached_host_stage("other.poisoned.example")
+                .await,
+            None
+        );
+
+        // 3. When `global_isp_stage != Primary`, a Primary override CAN cache `*.roblox.com`.
+        let ctx_primary_override = test_engine_context();
+        ctx_primary_override
+            .preferred_isp_stage_updated_at
+            .store(unix_now_secs(), Ordering::Release);
+        ctx_primary_override
+            .preferred_isp_stage
+            .store(LearnedStrategy::OobSniDesync as u8, Ordering::Release);
+        ctx_primary_override
+            .record_host_stage_with_escalation(
+                Some("apis.roblox.com"),
+                LearnedStrategy::Primary,
+                false,
+                true,
+            )
+            .await;
+        {
+            let guard = ctx_primary_override.adaptive_cache.read().await;
+            assert_eq!(
+                guard.get("apis.roblox.com").copied(),
+                Some(LearnedStrategy::Primary)
+            );
+            assert_eq!(
+                guard.get("*.roblox.com").copied(),
+                Some(LearnedStrategy::Primary)
+            );
+        }
+        assert_eq!(
+            ctx_primary_override
+                .lookup_cached_host_stage("clientsettings.roblox.com")
+                .await,
+            Some(LearnedStrategy::Primary)
+        );
+
+        // 4. Aborted client connection (write_all fails) must never poison adaptive_cache.
+        let ctx_abort = EngineContext::new(RuntimeConfig {
+            system_proxy: false,
+            chunk_size: 10,
+            patterns: vec!["abort-check\\.example$".to_string()],
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        let ch_abort = build_synthetic_client_hello("sub.abort-check.example", 256);
+        let orig_abort_len = u16::from_be_bytes([ch_abort[3], ch_abort[4]]) as usize;
+        let abort_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let abort_addr = abort_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = abort_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut hdr = [0u8; 5];
+                    if sock.read_exact(&mut hdr).await.is_err() {
+                        return;
+                    }
+                    let rec_len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                    let mut body = vec![0u8; rec_len];
+                    let _ = sock.read_exact(&mut body).await;
+                    if rec_len < orig_abort_len {
+                        let _ = sock
+                            .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x2f])
+                            .await;
+                    } else {
+                        let _ = sock
+                            .write_all(&[
+                                0x16, 0x03, 0x03, 0x00, 0x05, b'O', b'K', b'!', b'!', b'!',
+                            ])
+                            .await;
+                    }
+                    let _ = sock.shutdown().await;
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        tokio::io::copy(&mut sock, &mut tokio::io::sink()),
+                    )
+                    .await;
+                });
+            }
+        });
+        let (app_abort, mut tun_abort) = tokio::io::duplex(8192);
+        drop(app_abort); // Simulate client disconnecting before ServerHello is written.
+        let remote_abort = TcpStream::connect(abort_addr).await.unwrap();
+        assert!(ctx_abort
+            .establish_initial_flight(
+                &mut tun_abort,
+                remote_abort,
+                &ch_abort,
+                Some("sub.abort-check.example"),
+                abort_addr,
+            )
+            .await
+            .is_err());
+        assert_eq!(ctx_abort.learned_host_count().await, 0);
+
+        // 5. `collect_retry_addrs` must canonicalize `initial_addr`, prefer `known_host` over
+        //    untrusted SNI, and filter out non-public IPs (loopback/RFC1918/link-local/CGNAT).
+        let udp_dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_dns_addr = udp_dns.local_addr().unwrap();
+        let dns_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, peer)) = udp_dns.recv_from(&mut buf).await {
+                if n < 12 {
+                    continue;
+                }
+                let mut pos = 12usize;
+                while pos < n && buf[pos] != 0 {
+                    pos = pos.saturating_add(1 + usize::from(buf[pos]));
+                }
+                let question_end = pos.saturating_add(5);
+                if question_end > n {
+                    continue;
+                }
+                let is_evil = buf[12..pos].windows(4).any(|w| w == b"evil");
+                let answers: Vec<Ipv4Addr> = if is_evil {
+                    vec![Ipv4Addr::new(203, 0, 113, 99)]
+                } else {
+                    vec![
+                        Ipv4Addr::LOCALHOST,
+                        Ipv4Addr::new(10, 0, 0, 5),
+                        Ipv4Addr::new(169, 254, 169, 254),
+                        Ipv4Addr::new(100, 64, 0, 1),
+                        Ipv4Addr::new(198, 51, 100, 20),
+                    ]
+                };
+                let rd = u16::from_be_bytes([buf[2], buf[3]]) & 0x0100;
+                let resp_flags = 0x8080 | rd;
+                let mut resp = Vec::with_capacity(12 + (question_end - 12) + answers.len() * 16);
+                resp.extend_from_slice(&buf[0..2]);
+                resp.extend_from_slice(&resp_flags.to_be_bytes());
+                resp.extend_from_slice(&1u16.to_be_bytes());
+                resp.extend_from_slice(&u16::try_from(answers.len()).unwrap().to_be_bytes());
+                resp.extend_from_slice(&0u16.to_be_bytes());
+                resp.extend_from_slice(&0u16.to_be_bytes());
+                resp.extend_from_slice(&buf[12..question_end]);
+                for v4 in answers {
+                    resp.extend_from_slice(&[0xc0, 0x0c]);
+                    resp.extend_from_slice(&1u16.to_be_bytes());
+                    resp.extend_from_slice(&1u16.to_be_bytes());
+                    resp.extend_from_slice(&60u32.to_be_bytes());
+                    resp.extend_from_slice(&4u16.to_be_bytes());
+                    resp.extend_from_slice(&v4.octets());
+                }
+                let _ = udp_dns.send_to(&resp, peer).await;
+            }
+        });
+
+        let ctx_dns = EngineContext::new(RuntimeConfig {
+            system_proxy: false,
+            dns_addr: "127.0.0.1".to_string(),
+            dns_port: udp_dns_addr.port(),
+            enable_doh: false,
+            dns_ipv4_only: true,
+            disable_system_dns_fallback: true,
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+
+        let mapped_initial: SocketAddr = "[::ffff:198.51.100.10]:443".parse().unwrap();
+        let retry_addrs = ctx_dns
+            .collect_retry_addrs(
+                Some("trusted.example"),
+                Some("evil-sni.example"),
+                mapped_initial,
+                Duration::from_secs(2),
+            )
+            .await;
+        assert_eq!(
+            retry_addrs,
+            vec![
+                "198.51.100.10:443".parse::<SocketAddr>().unwrap(),
+                "198.51.100.20:443".parse::<SocketAddr>().unwrap(),
+            ]
+        );
+        dns_task.abort();
     }
 }

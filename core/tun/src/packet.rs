@@ -11,12 +11,19 @@ const IPV6_NEXT_FRAGMENT: u8 = 44;
 const IPV6_NEXT_DEST_OPTS: u8 = 60;
 const ICMPV4_TYPE_DEST_UNREACHABLE: u8 = 3;
 const ICMPV4_CODE_PORT_UNREACHABLE: u8 = 3;
+const ICMPV4_CODE_FRAG_NEEDED: u8 = 4;
 const ICMPV6_TYPE_DEST_UNREACHABLE: u8 = 1;
 const ICMPV6_CODE_NO_ROUTE: u8 = 0;
 const ICMPV6_CODE_PORT_UNREACHABLE: u8 = 4;
+const ICMPV6_TYPE_PACKET_TOO_BIG: u8 = 2;
+const ICMPV6_CODE_PACKET_TOO_BIG: u8 = 0;
+const IPV4_MIN_MTU: u16 = 68;
 const IPV4_ICMP_MAX_UDP_PAYLOAD_QUOTE: usize = 64;
 const IPV6_MIN_MTU: usize = 1280;
 const STUN_MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xA4, 0x42];
+const RAKNET_OFFLINE_MAGIC: [u8; 16] = [
+    0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78,
+];
 const TUN_GATEWAY_IPV6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x7664, 0x7069, 0, 0, 0, 0, 2);
 pub(crate) const MAX_IPV6_EXT_HEADERS: usize = 8;
 
@@ -122,7 +129,7 @@ pub fn inspect_inbound_udp(pkt: &[u8]) -> Option<InboundUdpPacket<'_>> {
             let dst_port = u16::from_be_bytes([udp_hdr[2], udp_hdr[3]]);
             let udp_len = usize::from(u16::from_be_bytes([udp_hdr[4], udp_hdr[5]]));
             let remaining = total_len.checked_sub(ihl)?;
-            if udp_len < 8 || udp_len != remaining {
+            if udp_len < 8 || udp_len > remaining {
                 return None;
             }
             let payload_start = ihl.checked_add(8)?;
@@ -144,7 +151,7 @@ pub fn inspect_inbound_udp(pkt: &[u8]) -> Option<InboundUdpPacket<'_>> {
             let src_port = u16::from_be_bytes([udp_hdr[0], udp_hdr[1]]);
             let dst_port = u16::from_be_bytes([udp_hdr[2], udp_hdr[3]]);
             let udp_len = usize::from(u16::from_be_bytes([udp_hdr[4], udp_hdr[5]]));
-            if udp_len < 8 || udp_len != upper.len() {
+            if udp_len < 8 || udp_len > upper.len() {
                 return None;
             }
             let payload = upper.get(8..udp_len)?;
@@ -194,7 +201,7 @@ pub fn is_valid_inbound_tun_packet(pkt: &[u8]) -> bool {
     if let Some(TransportSlice::Udp(udp)) = &sliced.transport {
         let declared = usize::from(udp.length());
         let actual = 8 + udp.payload().len();
-        if declared < 8 || declared != actual {
+        if declared < 8 || declared > actual {
             return false;
         }
         if inspect_inbound_udp(pkt).is_none() {
@@ -284,11 +291,12 @@ pub fn is_stun_packet(payload: &[u8]) -> bool {
 }
 
 /// Returns `true` if `payload` starts with a DTLS 1.0 / 1.2 / 1.3 record header
-/// (`0x14..=0x19` with version `0xfe 0xff` / `0xfe 0xfd` / `0xfe 0xfe` and at least
-/// the 13-byte RFC 6347 DTLSPlaintext header).
+/// (`0x14..=0x1a`, including RFC 9147 DTLS 1.3 plaintext ACK `0x1a`, with version
+/// `0xfe 0xff` / `0xfe 0xfd` / `0xfe 0xfe` and at least the 13-byte RFC 6347
+/// DTLSPlaintext header).
 pub fn is_dtls_packet(payload: &[u8]) -> bool {
     payload.len() >= 13
-        && (0x14..=0x19).contains(&payload[0])
+        && (0x14..=0x1a).contains(&payload[0])
         && payload[1] == 0xfe
         && matches!(payload[2], 0xfd..=0xff)
 }
@@ -300,19 +308,28 @@ pub fn is_dtls13_ciphertext_packet(payload: &[u8]) -> bool {
     payload.len() >= 13 && (payload[0] & 0xe0) == 0x20
 }
 
+/// Returns `true` if `payload` matches a RakNet offline handshake / ping datagram carrying
+/// the 16-byte offline magic (`00 ff ff 00 fe fe fe fe fd fd fd fd 12 34 56 78`) at offset
+/// `1` (`OpenConnectionRequest1/2`, `OpenConnectionReply1/2`, etc.) or offset `9`
+/// (`UnconnectedPing`/`UnconnectedPong` after the 8-byte timestamp).
+pub fn is_raknet_offline_packet(payload: &[u8]) -> bool {
+    payload.get(1..17) == Some(RAKNET_OFFLINE_MAGIC.as_slice())
+        || payload.get(9..25) == Some(RAKNET_OFFLINE_MAGIC.as_slice())
+}
+
 /// Detects whether a UDP/443 payload looks like QUIC traffic (including RFC 9000 Long Header
 /// `0xc0`, RFC 9287 Greased Fixed-Bit Long Header `0x80`, and Short-Header 1-RTT packets).
 /// When `block_quic` is enabled on a mobile TUN, dropping *all* non-empty UDP/443 datagrams for
 /// desync-eligible hosts prevents half-open or migrated QUIC sessions that otherwise trigger
 /// Chrome `ERR_QUIC_PROTOCOL_ERROR` instead of a clean TCP/TLS fallback.
 ///
-/// RFC 5389 STUN packets and DTLS 1.0/1.2/1.3 records are explicitly exempted so WebRTC
-/// TURN/DTLS-over-UDP/443 is never broken.
+/// RFC 5389 STUN packets, DTLS 1.0/1.2/1.3 records, and RakNet offline handshakes are
+/// explicitly exempted so WebRTC TURN/DTLS-over-UDP/443 and RakNet games are never broken.
 pub fn is_blocked_quic_udp(dst_port: u16, payload: &[u8]) -> bool {
     if dst_port != 443 || payload.is_empty() {
         return false;
     }
-    if is_stun_packet(payload) || is_dtls_packet(payload) {
+    if is_stun_packet(payload) || is_dtls_packet(payload) || is_raknet_offline_packet(payload) {
         return false;
     }
     true
@@ -396,9 +413,10 @@ pub fn build_udp_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Opt
             let total_len_u16 = u16::try_from(total_len).ok()?;
 
             let mut out = vec![0u8; total_len];
-            // IPv4 header (20 bytes, IHL=5, TTL=64, Protocol=UDP)
+            // IPv4 header (20 bytes, IHL=5, DF=1 with ID=0 per RFC 6864, TTL=64, Protocol=UDP)
             out[0] = 0x45;
             out[2..4].copy_from_slice(&total_len_u16.to_be_bytes());
+            out[6] = 0x40;
             out[8] = 64;
             out[9] = IP_PROTO_UDP;
             out[12..16].copy_from_slice(&src_v4.ip().octets());
@@ -680,8 +698,157 @@ pub fn build_icmpv6_no_route(invoking_pkt: &[u8]) -> Option<Vec<u8>> {
     )
 }
 
+fn is_icmpv4_error_type(icmp_type: u8) -> bool {
+    matches!(icmp_type, 3 | 4 | 5 | 11 | 12)
+}
+
+/// Synthesizes an RFC 1191 ICMPv4 Destination Unreachable / Fragmentation Needed and DF Set
+/// (Type 3, Code 4 with Next-Hop MTU) or RFC 4443 ICMPv6 Packet Too Big (Type 2, Code 0 with
+/// 32-bit MTU) for an invoking IP packet so callers can provide instant PMTUD feedback on
+/// `WSAEMSGSIZE` or oversized `DF=1` UDP probes.
+pub fn build_icmp_frag_needed(invoking_pkt: &[u8], next_hop_mtu: u16) -> Option<Vec<u8>> {
+    if next_hop_mtu == 0 {
+        return None;
+    }
+    let version = *invoking_pkt.first()? >> 4;
+    match version {
+        4 => {
+            if next_hop_mtu < IPV4_MIN_MTU {
+                return None;
+            }
+            if invoking_pkt.len() < 20 {
+                return None;
+            }
+            let ihl = usize::from(invoking_pkt[0] & 0x0f) * 4;
+            if ihl < 20 || invoking_pkt.len() < ihl {
+                return None;
+            }
+            let total_len = usize::from(u16::from_be_bytes([invoking_pkt[2], invoking_pkt[3]]));
+            if total_len < ihl.checked_add(8)? || invoking_pkt.len() < total_len {
+                return None;
+            }
+            // RFC 792 / RFC 1812: never send ICMP errors for non-initial fragments.
+            let frag = u16::from_be_bytes([invoking_pkt[6], invoking_pkt[7]]);
+            if (frag & 0x1fff) != 0 {
+                return None;
+            }
+            // RFC 1812 Section 4.3.2.7: never send an ICMP error about an ICMP error message.
+            if invoking_pkt[9] == IP_PROTO_ICMP {
+                let icmp_type = *invoking_pkt.get(ihl)?;
+                if is_icmpv4_error_type(icmp_type) {
+                    return None;
+                }
+            }
+
+            let orig_src = Ipv4Addr::new(
+                invoking_pkt[12],
+                invoking_pkt[13],
+                invoking_pkt[14],
+                invoking_pkt[15],
+            );
+            let orig_dst = Ipv4Addr::new(
+                invoking_pkt[16],
+                invoking_pkt[17],
+                invoking_pkt[18],
+                invoking_pkt[19],
+            );
+            if is_invalid_icmpv4_addr(orig_src) || is_invalid_icmpv4_addr(orig_dst) {
+                return None;
+            }
+
+            let max_quote = ihl
+                .checked_add(8)?
+                .checked_add(IPV4_ICMP_MAX_UDP_PAYLOAD_QUOTE)?;
+            let quote_len = total_len.min(max_quote);
+            let quote = invoking_pkt.get(..quote_len)?;
+
+            let icmp_len = 8usize.checked_add(quote.len())?;
+            let out_total_len = 20usize.checked_add(icmp_len)?;
+            let out_total_len_u16 = u16::try_from(out_total_len).ok()?;
+
+            let mut out = vec![0u8; out_total_len];
+            // RFC 792 / RFC 6864 IPv4 header (20 bytes, IHL=5, DF=1 with ID=0)
+            out[0] = 0x45;
+            out[2..4].copy_from_slice(&out_total_len_u16.to_be_bytes());
+            out[6] = 0x40;
+            out[8] = 64;
+            out[9] = IP_PROTO_ICMP;
+            out[12..16].copy_from_slice(&orig_dst.octets());
+            out[16..20].copy_from_slice(&orig_src.octets());
+
+            let ip_cksum = internet_checksum(&out[..20]);
+            out[10..12].copy_from_slice(&ip_cksum.to_be_bytes());
+
+            // RFC 1191 ICMPv4 Destination Unreachable / Fragmentation Needed (Type 3, Code 4)
+            // Bytes 24..26 are unused (0), bytes 26..28 carry the 16-bit Next-Hop MTU.
+            out[20] = ICMPV4_TYPE_DEST_UNREACHABLE;
+            out[21] = ICMPV4_CODE_FRAG_NEEDED;
+            out[26..28].copy_from_slice(&next_hop_mtu.to_be_bytes());
+            out[28..].copy_from_slice(quote);
+
+            let icmp_cksum = internet_checksum(&out[20..]);
+            out[22..24].copy_from_slice(&icmp_cksum.to_be_bytes());
+
+            Some(out)
+        }
+        6 => {
+            if invoking_pkt.len() < 40 {
+                return None;
+            }
+            let payload_len = usize::from(u16::from_be_bytes([invoking_pkt[4], invoking_pkt[5]]));
+            if payload_len == 0 {
+                return None;
+            }
+            let end = 40usize.checked_add(payload_len)?;
+            let body = invoking_pkt.get(..end)?;
+            if is_icmpv6_error_or_non_initial_fragment(body) {
+                return None;
+            }
+            let src_bytes: [u8; 16] = body.get(8..24)?.try_into().ok()?;
+            let dst_bytes: [u8; 16] = body.get(24..40)?.try_into().ok()?;
+            let orig_src = Ipv6Addr::from(src_bytes);
+            let orig_dst = Ipv6Addr::from(dst_bytes);
+            if is_invalid_icmpv6_addr(orig_src) || is_invalid_icmpv6_addr(orig_dst) {
+                return None;
+            }
+
+            // RFC 4443 Section 3.2: Packet Too Big quotes as much of the invoking packet
+            // as possible without exceeding the 1280-byte IPv6 minimum MTU.
+            const MAX_QUOTE: usize = IPV6_MIN_MTU - 40 - 8;
+            let quote = &body[..body.len().min(MAX_QUOTE)];
+            let icmp_len = 8usize.checked_add(quote.len())?;
+            let icmp_len_u16 = u16::try_from(icmp_len).ok()?;
+            let out_total_len = 40usize.checked_add(icmp_len)?;
+
+            // RFC 8200 Section 5: IPv6 link MTU is always at least 1280 bytes.
+            let effective_mtu = u32::from(next_hop_mtu.max(IPV6_MIN_MTU as u16));
+
+            let mut out = vec![0u8; out_total_len];
+            // IPv6 header (40 bytes): version=6, traffic class=0, flow label=0
+            out[0] = 0x60;
+            out[4..6].copy_from_slice(&icmp_len_u16.to_be_bytes());
+            out[6] = IP_PROTO_ICMPV6;
+            out[7] = 64;
+            out[8..24].copy_from_slice(&orig_dst.octets());
+            out[24..40].copy_from_slice(&orig_src.octets());
+
+            // RFC 4443 Section 3.2: ICMPv6 Packet Too Big (Type 2, Code 0)
+            out[40] = ICMPV6_TYPE_PACKET_TOO_BIG;
+            out[41] = ICMPV6_CODE_PACKET_TOO_BIG;
+            out[44..48].copy_from_slice(&effective_mtu.to_be_bytes());
+            out[48..].copy_from_slice(quote);
+
+            let icmp_cksum = icmpv6_checksum(orig_dst, orig_src, &out[40..]);
+            out[42..44].copy_from_slice(&icmp_cksum.to_be_bytes());
+
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
 /// RFC 9715 / DNS Flag Day 2020 maximum safe internet UDP DNS payload size (1232 bytes),
-/// ensuring oversized local TUN MTUs (such as `DESKTOP_MTU = 16384`) never synthesize
+/// ensuring oversized local TUN MTUs (such as `DESKTOP_MTU = 4096`) never synthesize
 /// UDP/53 replies larger than 1232 bytes.
 pub(crate) const MAX_DNS_UDP_PAYLOAD: usize = 1232;
 
@@ -1239,6 +1406,9 @@ mod tests {
             let pkt = build_udp_packet(src_v4, dst_v4, payload).expect("IPv4 UDP packet");
             assert_eq!(pkt.len(), 20 + 8 + payload.len());
             assert_eq!(pkt[0], 0x45);
+            assert_eq!(&pkt[4..6], &[0u8, 0u8]);
+            assert_eq!(pkt[6], 0x40, "IPv4 DF bit must be set per RFC 6864");
+            assert_eq!(pkt[7], 0x00);
             assert_eq!(pkt[9], IP_PROTO_UDP);
             assert_eq!(internet_checksum(&pkt[..20]), 0);
             let mut udp_zero = pkt[20..].to_vec();
@@ -1442,6 +1612,8 @@ mod tests {
 
     #[test]
     fn max_udp_payload_caps_dns_at_1232_and_build_udp_handles_65507() {
+        assert_eq!(max_dns_udp_payload_for_mtu(4096, true), 1232);
+        assert_eq!(max_dns_udp_payload_for_mtu(4096, false), 1232);
         assert_eq!(max_dns_udp_payload_for_mtu(16384, true), 1232);
         assert_eq!(max_dns_udp_payload_for_mtu(16384, false), 1232);
         assert_eq!(max_dns_udp_payload_for_mtu(65535, true), 1232);
@@ -1449,6 +1621,8 @@ mod tests {
         assert_eq!(max_dns_udp_payload_for_mtu(1280, false), 1232);
         assert_eq!(max_dns_udp_payload_for_mtu(1000, true), 972);
 
+        assert_eq!(max_udp_payload_for_mtu(4096, true), 4096 - 28);
+        assert_eq!(max_udp_payload_for_mtu(4096, false), 4096 - 48);
         assert_eq!(max_udp_payload_for_mtu(16384, true), 16384 - 28);
         assert_eq!(max_udp_payload_for_mtu(16384, false), 16384 - 48);
         assert_eq!(max_udp_payload_for_mtu(65535, true), 65507);
@@ -1462,6 +1636,7 @@ mod tests {
         let dst_v4 = SocketAddr::new(IpAddr::V4(v4_dst), 51000);
         let pkt_v4 = build_udp_packet(src_v4, dst_v4, &max_payload).expect("max IPv4 UDP packet");
         assert_eq!(pkt_v4.len(), 65535);
+        assert_eq!(pkt_v4[6], 0x40);
         assert_eq!(internet_checksum(&pkt_v4[..20]), 0);
         let parsed_v4 = inspect_inbound_udp(&pkt_v4).expect("inspect max IPv4 UDP");
         assert_eq!(parsed_v4.payload.len(), 65507);
@@ -1481,7 +1656,7 @@ mod tests {
 
     #[test]
     fn dtls_detector_exempts_dtls_10_12_13_on_udp_443_without_exempting_quic() {
-        for content_type in 0x14u8..=0x19 {
+        for content_type in 0x14u8..=0x1a {
             for minor in [0xfdu8, 0xfe, 0xff] {
                 let mut rec = [0u8; 16];
                 rec[0] = content_type;
@@ -1496,6 +1671,15 @@ mod tests {
                     "DTLS on UDP/443 must never be blocked as QUIC"
                 );
             }
+        }
+
+        // Content types immediately outside 0x14..=0x1a must not match.
+        for content_type in [0x13u8, 0x1bu8] {
+            let mut rec = [0u8; 16];
+            rec[0] = content_type;
+            rec[1] = 0xfe;
+            rec[2] = 0xfd;
+            assert!(!is_dtls_packet(&rec));
         }
 
         // Truncated (< 13 bytes) or non-DTLS versions must not match.
@@ -1545,7 +1729,7 @@ mod tests {
         assert!(!is_dtls13_ciphertext_packet(&[0x40u8; 16]));
 
         // Plaintext DTLS 1.0/1.2/1.3 records stay handled by is_dtls_packet only.
-        for content_type in 0x14u8..=0x19 {
+        for content_type in 0x14u8..=0x1a {
             for minor in [0xfdu8, 0xfe, 0xff] {
                 let mut rec = [0u8; 16];
                 rec[0] = content_type;
@@ -1606,5 +1790,212 @@ mod tests {
         pkt.extend_from_slice(&tcp);
 
         assert_eq!(ipv6_tcp_payload(&pkt), Some(tcp.as_slice()));
+    }
+
+    #[test]
+    fn padded_rfc768_udp_packets_are_accepted_and_truncated_udp_rejected() {
+        let v4_src = Ipv4Addr::new(10, 0, 0, 1);
+        let v4_dst = Ipv4Addr::new(10, 0, 0, 2);
+        let mut padded_v4 = build_ipv4_udp(v4_src, 50000, v4_dst, 19132, b"hello");
+        // Append 4 trailing IP padding bytes while leaving UDP length at 8 + 5 = 13.
+        padded_v4.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        let new_total_len = padded_v4.len() as u16;
+        padded_v4[2..4].copy_from_slice(&new_total_len.to_be_bytes());
+        padded_v4[10] = 0;
+        padded_v4[11] = 0;
+        let cksum = internet_checksum(&padded_v4[..20]);
+        padded_v4[10..12].copy_from_slice(&cksum.to_be_bytes());
+
+        assert!(is_valid_inbound_tun_packet(&padded_v4));
+        let parsed_v4 = inspect_inbound_udp(&padded_v4).expect("padded IPv4 UDP must be accepted");
+        assert_eq!(parsed_v4.payload, b"hello");
+
+        // UDP length < 8 remains rejected.
+        let mut bad_short_v4 = padded_v4.clone();
+        bad_short_v4[24..26].copy_from_slice(&7u16.to_be_bytes());
+        assert!(inspect_inbound_udp(&bad_short_v4).is_none());
+        assert!(!is_valid_inbound_tun_packet(&bad_short_v4));
+
+        // UDP length > remaining remains rejected.
+        let mut bad_overrun_v4 = padded_v4.clone();
+        let overrun_len = (padded_v4.len() - 20 + 1) as u16;
+        bad_overrun_v4[24..26].copy_from_slice(&overrun_len.to_be_bytes());
+        assert!(inspect_inbound_udp(&bad_overrun_v4).is_none());
+        assert!(!is_valid_inbound_tun_packet(&bad_overrun_v4));
+
+        // IPv6 padded UDP (payload_len > udp_len) is also accepted and sliced to udp_len.
+        let v6_src = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let v6_dst = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+        let mut padded_v6 =
+            build_ipv6_with_ext_headers(v6_src, v6_dst, IP_PROTO_UDP, &[], 50001, 19132, b"world");
+        padded_v6.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        let new_v6_payload_len = (padded_v6.len() - 40) as u16;
+        padded_v6[4..6].copy_from_slice(&new_v6_payload_len.to_be_bytes());
+
+        assert!(is_valid_inbound_tun_packet(&padded_v6));
+        let parsed_v6 = inspect_inbound_udp(&padded_v6).expect("padded IPv6 UDP must be accepted");
+        assert_eq!(parsed_v6.payload, b"world");
+
+        let mut bad_overrun_v6 = padded_v6.clone();
+        let overrun_v6_udp = (new_v6_payload_len + 1).to_be_bytes();
+        bad_overrun_v6[44..46].copy_from_slice(&overrun_v6_udp);
+        assert!(inspect_inbound_udp(&bad_overrun_v6).is_none());
+        assert!(!is_valid_inbound_tun_packet(&bad_overrun_v6));
+    }
+
+    #[test]
+    fn raknet_offline_detector_matches_magic_at_offset_1_and_9_and_exempts_udp_443() {
+        // Offset 1: OpenConnectionRequest1 (0x05) with MTU padding.
+        let mut open_req1 = vec![0u8; 1464];
+        open_req1[0] = 0x05;
+        open_req1[1..17].copy_from_slice(&RAKNET_OFFLINE_MAGIC);
+        open_req1[17] = 11; // RakNet protocol version
+        assert!(is_raknet_offline_packet(&open_req1));
+        assert!(!is_blocked_quic_udp(443, &open_req1));
+
+        // Exact minimum length for offset 1 (17 bytes).
+        let mut min_off1 = [0u8; 17];
+        min_off1[0] = 0x06; // OpenConnectionReply1
+        min_off1[1..17].copy_from_slice(&RAKNET_OFFLINE_MAGIC);
+        assert!(is_raknet_offline_packet(&min_off1));
+        assert!(!is_blocked_quic_udp(443, &min_off1));
+
+        // Offset 9: UnconnectedPing (0x01) + 8-byte timestamp + 16-byte magic + 8-byte client GUID.
+        let mut ping = vec![0u8; 33];
+        ping[0] = 0x01;
+        ping[1..9].copy_from_slice(&0x0102_0304_0506_0708u64.to_be_bytes());
+        ping[9..25].copy_from_slice(&RAKNET_OFFLINE_MAGIC);
+        assert!(is_raknet_offline_packet(&ping));
+        assert!(!is_blocked_quic_udp(443, &ping));
+
+        // Exact minimum length for offset 9 (25 bytes).
+        let mut min_off9 = [0u8; 25];
+        min_off9[0] = 0x1c; // UnconnectedPong
+        min_off9[9..25].copy_from_slice(&RAKNET_OFFLINE_MAGIC);
+        assert!(is_raknet_offline_packet(&min_off9));
+        assert!(!is_blocked_quic_udp(443, &min_off9));
+
+        // Truncated or misaligned magic must not match and must stay blocked on UDP/443.
+        assert!(!is_raknet_offline_packet(&[]));
+        assert!(!is_raknet_offline_packet(&min_off1[..16]));
+        assert!(!is_raknet_offline_packet(&min_off9[..24]));
+
+        let mut wrong_offset = vec![0xc0u8; 32];
+        wrong_offset[0..16].copy_from_slice(&RAKNET_OFFLINE_MAGIC);
+        assert!(!is_raknet_offline_packet(&wrong_offset));
+        assert!(is_blocked_quic_udp(443, &wrong_offset));
+
+        let mut corrupted = open_req1.clone();
+        corrupted[16] ^= 0x01;
+        assert!(!is_raknet_offline_packet(&corrupted));
+        assert!(is_blocked_quic_udp(443, &corrupted));
+    }
+
+    #[test]
+    fn icmp_frag_needed_builds_valid_rfc1191_ipv4_and_rfc4443_ipv6_ptb() {
+        // IPv4: ICMPv4 Type 3 Code 4 with RFC 1191 Next-Hop MTU.
+        let orig_src_v4 = Ipv4Addr::new(198, 18, 0, 1);
+        let orig_dst_v4 = Ipv4Addr::new(203, 0, 113, 10);
+        let mut invoking_v4 = build_ipv4_udp(orig_src_v4, 51234, orig_dst_v4, 19132, &[0x55u8; 1472]);
+        invoking_v4[6] = 0x40; // DF=1
+        invoking_v4[10..12].fill(0);
+        let ip_ck = internet_checksum(&invoking_v4[..20]);
+        invoking_v4[10..12].copy_from_slice(&ip_ck.to_be_bytes());
+
+        let icmp_v4 = build_icmp_frag_needed(&invoking_v4, 1400)
+            .expect("expected RFC 1191 ICMPv4 Frag Needed");
+        // 20 outer IPv4 + 8 ICMPv4 + (20 invoking IPv4 + 8 UDP + 64 UDP payload) = 120 bytes
+        assert_eq!(icmp_v4.len(), 120);
+        assert_eq!(icmp_v4[0], 0x45);
+        assert_eq!(icmp_v4[6], 0x40);
+        assert_eq!(icmp_v4[9], IP_PROTO_ICMP);
+        assert_eq!(&icmp_v4[12..16], orig_dst_v4.octets().as_slice());
+        assert_eq!(&icmp_v4[16..20], orig_src_v4.octets().as_slice());
+        assert_eq!(internet_checksum(&icmp_v4[..20]), 0);
+        assert_eq!(icmp_v4[20], ICMPV4_TYPE_DEST_UNREACHABLE);
+        assert_eq!(icmp_v4[21], ICMPV4_CODE_FRAG_NEEDED);
+        assert_eq!(&icmp_v4[24..26], &[0u8, 0u8]);
+        assert_eq!(u16::from_be_bytes([icmp_v4[26], icmp_v4[27]]), 1400);
+        assert_eq!(internet_checksum(&icmp_v4[20..]), 0);
+        assert_eq!(&icmp_v4[28..], &invoking_v4[..92]);
+        assert!(SlicedPacket::from_ip(&icmp_v4).is_ok());
+        assert!(is_valid_inbound_tun_packet(&icmp_v4));
+
+        // Must never generate an ICMPv4 error in response to an ICMPv4 error.
+        assert!(build_icmp_frag_needed(&icmp_v4, 1400).is_none());
+        // Reject invalid MTU (< 68), multicast/broadcast/unspecified addrs, and non-initial fragments.
+        assert!(build_icmp_frag_needed(&invoking_v4, 0).is_none());
+        assert!(build_icmp_frag_needed(&invoking_v4, 67).is_none());
+        let mut non_init_frag = invoking_v4.clone();
+        non_init_frag[7] = 1;
+        assert!(build_icmp_frag_needed(&non_init_frag, 1400).is_none());
+        let bcast_v4 = build_ipv4_udp(orig_src_v4, 50000, Ipv4Addr::BROADCAST, 19132, b"probe");
+        assert!(build_icmp_frag_needed(&bcast_v4, 1400).is_none());
+
+        // IPv4 TCP packet also works for generic PMTUD feedback.
+        let tcp_v4 = build_ipv4_tcp_syn(orig_src_v4, orig_dst_v4);
+        let tcp_icmp = build_icmp_frag_needed(&tcp_v4, 1492).expect("ICMPv4 Frag Needed for TCP");
+        assert_eq!(tcp_icmp[20], ICMPV4_TYPE_DEST_UNREACHABLE);
+        assert_eq!(tcp_icmp[21], ICMPV4_CODE_FRAG_NEEDED);
+        assert_eq!(u16::from_be_bytes([tcp_icmp[26], tcp_icmp[27]]), 1492);
+        assert_eq!(internet_checksum(&tcp_icmp[20..]), 0);
+
+        // IPv6: RFC 4443 ICMPv6 Packet Too Big (Type 2, Code 0) with 32-bit MTU.
+        let orig_src_v6 = Ipv6Addr::new(0xfd00, 0x7664, 0x7069, 0, 0, 0, 0, 1);
+        let orig_dst_v6 = Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111);
+        let invoking_v6 = build_ipv6_with_ext_headers(
+            orig_src_v6,
+            orig_dst_v6,
+            IP_PROTO_UDP,
+            &[],
+            54321,
+            19132,
+            &[0x77u8; 1400],
+        );
+        let icmp_v6 = build_icmp_frag_needed(&invoking_v6, 1400)
+            .expect("expected RFC 4443 ICMPv6 Packet Too Big");
+        assert_eq!(icmp_v6.len(), IPV6_MIN_MTU);
+        assert_eq!(icmp_v6[0] >> 4, 6);
+        assert_eq!(
+            u16::from_be_bytes([icmp_v6[4], icmp_v6[5]]),
+            (IPV6_MIN_MTU - 40) as u16
+        );
+        assert_eq!(icmp_v6[6], IP_PROTO_ICMPV6);
+        assert_eq!(&icmp_v6[8..24], orig_dst_v6.octets().as_slice());
+        assert_eq!(&icmp_v6[24..40], orig_src_v6.octets().as_slice());
+        assert_eq!(icmp_v6[40], ICMPV6_TYPE_PACKET_TOO_BIG);
+        assert_eq!(icmp_v6[41], ICMPV6_CODE_PACKET_TOO_BIG);
+        assert_eq!(
+            u32::from_be_bytes([icmp_v6[44], icmp_v6[45], icmp_v6[46], icmp_v6[47]]),
+            1400
+        );
+        assert_eq!(&icmp_v6[48..], &invoking_v6[..(IPV6_MIN_MTU - 48)]);
+        assert_eq!(icmpv6_checksum(orig_dst_v6, orig_src_v6, &icmp_v6[40..]), 0);
+        assert!(SlicedPacket::from_ip(&icmp_v6).is_ok());
+        assert!(is_valid_inbound_tun_packet(&icmp_v6));
+
+        // Sub-1280 non-zero MTU clamps to IPV6_MIN_MTU (1280); 0 is rejected.
+        let clamped_v6 =
+            build_icmp_frag_needed(&invoking_v6, 1200).expect("clamped IPv6 Packet Too Big");
+        assert_eq!(
+            u32::from_be_bytes([clamped_v6[44], clamped_v6[45], clamped_v6[46], clamped_v6[47]]),
+            IPV6_MIN_MTU as u32
+        );
+        assert_eq!(
+            icmpv6_checksum(orig_dst_v6, orig_src_v6, &clamped_v6[40..]),
+            0
+        );
+        assert!(build_icmp_frag_needed(&invoking_v6, 0).is_none());
+
+        // Must never generate an ICMPv6 error in response to an ICMPv6 error.
+        assert!(build_icmp_frag_needed(&icmp_v6, 1280).is_none());
+
+        // Reject multicast/unspecified IPv6 addresses.
+        let mcast_v6 = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
+        assert!(build_icmp_frag_needed(
+            &build_ipv6_tcp_syn(orig_src_v6, mcast_v6, 0),
+            1280
+        )
+        .is_none());
     }
 }

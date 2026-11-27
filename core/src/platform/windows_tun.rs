@@ -85,13 +85,9 @@ pub const VDPI_TUN_PREFIX_V6: u8 = 126;
 /// Virtual IPv6 DNS server configured on `vdpi0` when IPv6 TUN mode is active
 /// (intercepted by the userspace TUN stack).
 pub const VDPI_TUN_DNS_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x7664, 0x7069, 0, 0, 0, 0, 2);
-/// Link MTU configured on `vdpi0` (matches `vdpi_tun::config::DESKTOP_MTU`; Wintun 0.14.1
-/// supports up to 65,535 bytes natively via `NlMtu`).
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub const VDPI_TUN_MTU: u32 = vdpi_tun::config::DESKTOP_MTU as u32;
-/// Link MTU configured on `vdpi0`.
-#[cfg(any(target_os = "android", target_os = "ios"))]
-pub const VDPI_TUN_MTU: u32 = 16_384;
+/// Link MTU configured on `vdpi0` (`4096` bytes: fits Windows NT LFH `<= 16368` and
+/// eliminates 16 KiB jumbo NDIS DPC bursts while keeping high local TUN throughput).
+pub const VDPI_TUN_MTU: u32 = 4096;
 
 /// Windows NDIS `IF_TYPE_ETHERNET_CSMACD`.
 pub const NDIS_IF_TYPE_ETHERNET: u32 = 6;
@@ -235,6 +231,8 @@ pub struct UplinkCandidate {
     pub iface_metric: u32,
     /// `true` when the interface has at least one usable unicast IP for the address family.
     pub has_unicast_ip: bool,
+    /// `true` when `MIB_IF_ROW2.InterfaceAndOperStatusFlags.HardwareInterface` (bit 0) is set.
+    pub is_hardware_interface: bool,
 }
 
 impl UplinkCandidate {
@@ -253,6 +251,18 @@ const VIRTUAL_ADAPTER_TOKENS: &[&str] = &[
     "wireguard",
     "tailscale",
     "zerotier",
+    "radmin",
+    "famatech",
+    "hamachi",
+    "logmein",
+    "softether",
+    "amnezia",
+    "surfshark",
+    "expressvpn",
+    "windscribe",
+    "adguard",
+    "outline",
+    "ivpn",
     "tap-windows",
     "tap-nordvpn",
     "openvpn",
@@ -298,10 +308,10 @@ const HYPERV_INTERNAL_SWITCH_TOKENS: &[&str] = &[
     "host-only",
 ];
 
-/// Lowercase word-boundary tokens identifying NAT Hyper-V virtual switches (matched with
-/// non-alphanumeric boundaries so names such as `External Native` or `International` are
-/// never falsely excluded).
-const HYPERV_INTERNAL_SWITCH_WORDS: &[&str] = &["nat"];
+/// Lowercase word-boundary tokens identifying NAT/Internal/Private Hyper-V virtual switches
+/// (matched with non-alphanumeric boundaries so names such as `External Native` or
+/// `International` are never falsely excluded).
+const HYPERV_INTERNAL_SWITCH_WORDS: &[&str] = &["nat", "internal", "private"];
 
 /// Returns `true` if `needle` appears in `haystack` bounded on both sides by start/end of
 /// string or non-alphanumeric characters (case-sensitive; callers pass lowercase).
@@ -394,7 +404,14 @@ pub fn rank_physical_uplink(
     if let Some(physical) = candidates
         .iter()
         .filter(|c| is_eligible(c) && !is_hyperv_vethernet(&c.alias, &c.description))
-        .min_by_key(|c| (c.combined_metric(), c.if_index, c.luid))
+        .min_by_key(|c| {
+            (
+                !c.is_hardware_interface,
+                c.combined_metric(),
+                c.if_index,
+                c.luid,
+            )
+        })
     {
         return Some(physical);
     }
@@ -402,7 +419,14 @@ pub fn rank_physical_uplink(
     candidates
         .iter()
         .filter(|c| is_eligible(c) && is_hyperv_vethernet(&c.alias, &c.description))
-        .min_by_key(|c| (c.combined_metric(), c.if_index, c.luid))
+        .min_by_key(|c| {
+            (
+                !c.is_hardware_interface,
+                c.combined_metric(),
+                c.if_index,
+                c.luid,
+            )
+        })
 }
 
 fn push_unique_path(out: &mut Vec<PathBuf>, candidate: PathBuf) {
@@ -689,6 +713,177 @@ pub fn verify_wintun_dll_sha256(path: &Path, expected_sha256: &str) -> Result<()
 #[inline]
 pub fn is_ipv6_global_unicast(ip: Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xe000) == 0x2000
+}
+
+/// Windows `NL_SUFFIX_ORIGIN::IpSuffixOriginRandom` (`5`), assigned to RFC 4941 temporary
+/// IPv6 privacy addresses.
+#[cfg(any(target_os = "windows", test))]
+const IP_SUFFIX_ORIGIN_RANDOM: i32 = 5;
+
+/// Returns `true` when an IPv6 unicast address has Windows RFC 4941 temporary privacy
+/// suffix origin (`IpSuffixOriginRandom = 5`).
+#[cfg(any(target_os = "windows", test))]
+#[inline]
+fn is_ipv6_privacy_suffix_origin(suffix_origin: i32) -> bool {
+    suffix_origin == IP_SUFFIX_ORIGIN_RANDOM
+}
+
+/// Filters `(ip, suffix_origin)` pairs into `(has_usable_global_v6, stable_global_v6_addrs)`:
+/// - `has_usable_global_v6` is `true` if any global unicast (`2000::/3`) address is present
+///   (including RFC 4941 temporary privacy addresses when no permanent address exists).
+/// - `stable_global_v6_addrs` excludes RFC 4941 temporary privacy addresses
+///   (`IpSuffixOriginRandom = 5`) so periodic privacy-address rotation never churns
+///   `UplinkSignature`.
+#[cfg(any(target_os = "windows", test))]
+fn collect_stable_ipv6_addrs(addrs: &[(Ipv6Addr, i32)]) -> (bool, Vec<Ipv6Addr>) {
+    let mut has_any = false;
+    let mut stable = Vec::new();
+    for &(ip, suffix_origin) in addrs {
+        if !is_ipv6_global_unicast(ip) {
+            continue;
+        }
+        has_any = true;
+        if !is_ipv6_privacy_suffix_origin(suffix_origin) {
+            stable.push(ip);
+        }
+    }
+    stable.sort_unstable();
+    stable.dedup();
+    (has_any, stable)
+}
+
+/// Returns `true` when `pkt` is an IPv4 packet with protocol 6 (TCP) or an IPv6 packet
+/// whose next-header (following any standard extension headers) is 6 (TCP).
+#[cfg(any(target_os = "windows", test))]
+#[inline]
+fn is_tcp_ip_packet(pkt: &[u8]) -> bool {
+    if pkt.is_empty() {
+        return false;
+    }
+    match pkt[0] >> 4 {
+        4 => pkt.len() >= 20 && pkt[9] == 6,
+        6 => {
+            if pkt.len() < 40 {
+                return false;
+            }
+            let mut next_hdr = pkt[6];
+            let mut offset = 40usize;
+            for _ in 0..8 {
+                if next_hdr == 6 {
+                    return true;
+                }
+                match next_hdr {
+                    // Hop-by-Hop (0), Routing (43), Destination Options (60)
+                    0 | 43 | 60 => {
+                        if offset + 2 > pkt.len() {
+                            return false;
+                        }
+                        next_hdr = pkt[offset];
+                        let hdr_len = (usize::from(pkt[offset + 1]) + 1) * 8;
+                        offset = match offset.checked_add(hdr_len) {
+                            Some(next) if next <= pkt.len() => next,
+                            _ => return false,
+                        };
+                    }
+                    // Fragment (44): fixed 8-byte header
+                    44 => {
+                        if offset + 8 > pkt.len() {
+                            return false;
+                        }
+                        next_hdr = pkt[offset];
+                        offset += 8;
+                    }
+                    _ => return false,
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Deterministic GUID for vdpi's managed Windows NRPT catch-all DNS policy rule.
+#[cfg(any(target_os = "windows", test))]
+const VDPI_NRPT_RULE_GUID: &str = "{D7A4E10B-6E4A-4B9E-8F2C-766470690001}";
+/// Windows registry subkey path under `HKLM` for vdpi's managed NRPT rule.
+#[cfg(any(target_os = "windows", test))]
+const VDPI_NRPT_RULE_SUBKEY: &str =
+    r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig\{D7A4E10B-6E4A-4B9E-8F2C-766470690001}";
+/// NRPT `Version` value (Windows NRPT v2 schema).
+#[cfg(any(target_os = "windows", test))]
+const VDPI_NRPT_VERSION: u32 = 2;
+/// NRPT `ConfigOptions` bitmask (`0x8` = `DNS_POLICY_CONFIG_GENERIC_DNS_SERVER`).
+#[cfg(any(target_os = "windows", test))]
+const VDPI_NRPT_CONFIG_OPTIONS: u32 = 0x8;
+/// NRPT `Comment` value identifying vdpi as the rule owner.
+#[cfg(any(target_os = "windows", test))]
+const VDPI_NRPT_COMMENT: &str = "vdpi managed DNS policy";
+
+/// Formats the `GenericDNSServers` value for vdpi's managed NRPT catch-all rule.
+///
+/// Uses `"198.18.0.2"` when IPv6 TUN mode is inactive and `"198.18.0.2;fd00:7664:7069::2"`
+/// when IPv6 TUN mode is active (semicolon-delimited per Windows `DnsPolicyConfig` schema).
+#[cfg(any(target_os = "windows", test))]
+fn format_vdpi_nrpt_dns_servers(ipv6_enabled: bool) -> String {
+    if ipv6_enabled {
+        format!("{VDPI_TUN_DNS_V4};{VDPI_TUN_DNS_V6}")
+    } else {
+        VDPI_TUN_DNS_V4.to_string()
+    }
+}
+
+/// Encodes a slice of strings into UTF-16LE `REG_MULTI_SZ` bytes (each string NUL-terminated,
+/// followed by a final NUL terminator; e.g. `&["."]` -> `".\0\0"`).
+#[cfg(any(target_os = "windows", test))]
+fn encode_reg_multi_sz_utf16_bytes(values: &[&str]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for value in values {
+        for unit in value.encode_utf16() {
+            out.extend_from_slice(&unit.to_le_bytes());
+        }
+        out.extend_from_slice(&0u16.to_le_bytes());
+    }
+    if values.is_empty() {
+        out.extend_from_slice(&0u16.to_le_bytes());
+    }
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
+}
+
+/// Parses a braced or unbraced Windows GUID string (`{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}`)
+/// into `(data1, data2, data3, data4)`.
+#[cfg(any(target_os = "windows", test))]
+fn parse_guid_braced(raw: &str) -> Option<(u32, u16, u16, [u8; 8])> {
+    let inner = raw.trim();
+    let inner = inner
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .unwrap_or(inner);
+    let mut parts = inner.split('-');
+    let p1 = parts.next()?;
+    let p2 = parts.next()?;
+    let p3 = parts.next()?;
+    let p4 = parts.next()?;
+    let p5 = parts.next()?;
+    if parts.next().is_some()
+        || p1.len() != 8
+        || p2.len() != 4
+        || p3.len() != 4
+        || p4.len() != 4
+        || p5.len() != 12
+    {
+        return None;
+    }
+    let data1 = u32::from_str_radix(p1, 16).ok()?;
+    let data2 = u16::from_str_radix(p2, 16).ok()?;
+    let data3 = u16::from_str_radix(p3, 16).ok()?;
+    let mut data4 = [0u8; 8];
+    let tail = format!("{p4}{p5}");
+    for (idx, chunk) in tail.as_bytes().chunks_exact(2).enumerate() {
+        let hex = std::str::from_utf8(chunk).ok()?;
+        data4[idx] = u8::from_str_radix(hex, 16).ok()?;
+    }
+    Some((data1, data2, data3, data4))
 }
 
 /// Returns `true` when IPv6 should be configured on `vdpi0`: either explicitly requested
@@ -1133,29 +1328,33 @@ mod win32 {
         DeleteUnicastIpAddressEntry, FreeMibTable, GetIfTable2, GetIpForwardTable2,
         GetIpInterfaceEntry, GetIpInterfaceTable, GetUnicastIpAddressTable,
         InitializeIpForwardEntry, InitializeIpInterfaceEntry, InitializeUnicastIpAddressEntry,
-        NotifyRouteChange2, NotifyUnicastIpAddressChange, SetIpInterfaceEntry,
-        DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1, DNS_SETTING_IPV6,
-        DNS_SETTING_NAMESERVER, MIB_IF_ROW2, MIB_IF_TABLE2, MIB_IPFORWARD_ROW2,
-        MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW, MIB_IPINTERFACE_TABLE, MIB_NOTIFICATION_TYPE,
-        MIB_UNICASTIPADDRESS_ROW, MIB_UNICASTIPADDRESS_TABLE,
+        MibAddInstance, MibParameterNotification, NotifyRouteChange2,
+        NotifyUnicastIpAddressChange, SetIpInterfaceEntry, DNS_INTERFACE_SETTINGS,
+        DNS_INTERFACE_SETTINGS_VERSION1, DNS_SETTING_IPV6, DNS_SETTING_NAMESERVER, MIB_IF_ROW2,
+        MIB_IF_TABLE2, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW,
+        MIB_IPINTERFACE_TABLE, MIB_NOTIFICATION_TYPE, MIB_UNICASTIPADDRESS_ROW,
+        MIB_UNICASTIPADDRESS_TABLE,
     };
     use windows_sys::Win32::NetworkManagement::Ndis::{IfOperStatusUp, NET_LUID_LH};
     use windows_sys::Win32::Networking::WinSock::{
-        IpDadStatePreferred, AF_INET, AF_INET6, AF_UNSPEC, IN6_ADDR, IN6_ADDR_0, IN_ADDR,
-        IN_ADDR_0, SOCKADDR_IN, SOCKADDR_IN6,
+        IpDadStateDeprecated, IpDadStatePreferred, IpDadStateTentative, IpSuffixOriginRandom,
+        AF_INET, AF_INET6, AF_UNSPEC, IN6_ADDR, IN6_ADDR_0, IN_ADDR, IN_ADDR_0, SOCKADDR_IN,
+        SOCKADDR_IN6,
     };
     use windows_sys::Win32::System::LibraryLoader::{
         GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
     };
     use windows_sys::Win32::System::Registry::{
-        RegCloseKey, RegDeleteKeyW, RegDeleteValueW, RegEnumKeyExW, RegOpenKeyExW,
+        RegCloseKey, RegDeleteKeyW, RegDeleteTreeW, RegDeleteValueW, RegEnumKeyExW, RegOpenKeyExW,
         RegQueryInfoKeyW, RegQueryValueExW, RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE,
-        KEY_ENUMERATE_SUB_KEYS, KEY_QUERY_VALUE, KEY_READ, KEY_SET_VALUE, REG_EXPAND_SZ, REG_SZ,
-        REG_VALUE_TYPE,
+        KEY_ENUMERATE_SUB_KEYS, KEY_QUERY_VALUE, KEY_READ, KEY_SET_VALUE, KEY_WRITE, REG_DWORD,
+        REG_EXPAND_SZ, REG_MULTI_SZ, REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE,
     };
     use windows_sys::Win32::System::Threading::{
         ResetEvent, SetEvent, WaitForMultipleObjects, WaitForSingleObject, INFINITE,
     };
+
+    const _: () = assert!(IP_SUFFIX_ORIGIN_RANDOM == IpSuffixOriginRandom);
 
     /// Fixed deterministic GUID for `vdpi0` so Windows never spawns `vdpi0 2`, `vdpi0 3`, etc.
     const VDPI_WINTUN_GUID: GUID = GUID::from_u128(0x7664_7069_5769_6e74_756e_5630_3530_0001);
@@ -1163,20 +1362,20 @@ mod win32 {
     const GUID_DEVCLASS_NET: GUID = GUID::from_u128(0x4d36_e972_e325_11ce_bfc1_0800_2be1_0318);
     /// Wintun adapter tunnel type label shown in Device Manager / NDIS.
     const VDPI_WINTUN_TUNNEL_TYPE: &str = "vdpi";
-    /// Wintun ring buffer capacity: 16 MiB per direction (32 MiB total kernel ring).
-    const WINTUN_RING_CAPACITY: u32 = 0x0100_0000;
+    /// Wintun ring buffer capacity: 4 MiB per direction (8 MiB total locked non-paged MDL,
+    /// matching WireGuard desktop standard to avoid DPC/memory-pressure audio glitches).
+    pub(super) const WINTUN_RING_CAPACITY: u32 = 0x0040_0000;
     /// Bounded Tokio channel depth for inbound IP packets (matches `TunProfile::DESKTOP`, 4096).
     pub(super) const TUN_CHANNEL_CAPACITY: usize =
         vdpi_tun::config::TunProfile::DESKTOP.channel_capacity;
-    /// Bounded Tokio channel depth for outbound IP packets (matches [`TX_BATCH_LIMIT`] = 128)
-    /// so bulk TCP bursts cannot queue thousands of frames ahead of latency-sensitive UDP/DNS
-    /// replies, preserving gigabit throughput with sub-ms UDP preemption.
-    pub(super) const TUN_TX_CHANNEL_CAPACITY: usize = 128;
-    /// Maximum outbound IP packets drained per wakeup via `blocking_recv_many`.
-    pub(super) const TX_BATCH_LIMIT: usize = 128;
-    /// Maximum inbound IP packets drained per burst from `WintunReceivePacket` before handing
-    /// off to the async channel (continues draining until `ERROR_NO_MORE_ITEMS` before waiting).
-    pub(super) const RX_BURST_LIMIT: usize = 128;
+    /// Bounded Tokio channel depth for outbound IP packets (512 frames).
+    pub(super) const TUN_TX_CHANNEL_CAPACITY: usize = 512;
+    /// Maximum outbound IP packets drained per wakeup via `blocking_recv_many` (32 frames to
+    /// prevent unpaced multi-megabyte NDIS DPC bursts).
+    pub(super) const TX_BATCH_LIMIT: usize = 32;
+    /// Maximum consecutive inbound IP packets drained from `WintunReceivePacket` before
+    /// `thread::yield_now()` so RX cannot pin a CPU core or starve MMCSS audio threads.
+    pub(super) const RX_BURST_LIMIT: usize = 64;
     /// Maximum IP packet size supported by Wintun.
     const WINTUN_MAX_IP_PACKET_SIZE: usize = 65_535;
     /// Interface metric assigned to `vdpi0`.
@@ -1293,6 +1492,11 @@ mod win32 {
     /// Retry delays when `SetInterfaceDnsSettings` briefly returns `ERROR_NOT_FOUND` on a new NIC.
     const DNS_NOT_FOUND_RETRY_DELAYS_MS: &[u64] = &[50, 100, 200, 400];
 
+    /// Windows service registry subkey created by the Wintun kernel driver (`wintun.sys`).
+    const WINTUN_DRIVER_SERVICE_SUBKEY: &str = r"SYSTEM\CurrentControlSet\Services\Wintun";
+    /// Coalescing window for repeated `DnsFlushResolverCache()` calls (1.5s).
+    const DNS_FLUSH_COALESCE_WINDOW: Duration = Duration::from_millis(1500);
+
     /// Process-lifetime cache for the verified `wintun.dll` handle/export table.
     ///
     /// Wintun 0.14.1 schedules an asynchronous Windows threadpool callback
@@ -1300,6 +1504,14 @@ mod win32 {
     /// for process lifetime (never calling `FreeLibrary`) eliminates the UAF crash completely.
     static WINTUN_API_CACHE: OnceLock<Arc<WintunApi>> = OnceLock::new();
     static WINTUN_API_INIT_LOCK: Mutex<()> = Mutex::new(());
+    /// Process-lifetime cached `DnsFlushResolverCache` proc from `dnsapi.dll` (avoids repeated
+    /// `LoadLibraryExW`/`FreeLibrary` under the Windows PEB loader lock on every flush).
+    static DNS_FLUSH_RESOLVER_CACHE_FN: OnceLock<Option<DnsFlushResolverCacheFn>> = OnceLock::new();
+    /// Last timestamp at which `DnsFlushResolverCache` was invoked (for 1.5s coalescing).
+    static LAST_DNS_FLUSH: Mutex<Option<Instant>> = Mutex::new(None);
+    /// Process-lifetime cached `SetInterfaceDnsSettings` proc from `iphlpapi.dll`.
+    static SET_INTERFACE_DNS_SETTINGS_FN: OnceLock<Option<SetInterfaceDnsSettingsFn>> =
+        OnceLock::new();
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -1360,6 +1572,21 @@ mod win32 {
             dw_flags: u32,
         ) -> u32;
         fn LocalFree(h_mem: *mut c_void) -> *mut c_void;
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegCreateKeyExW(
+            hkey: HKEY,
+            lp_sub_key: *const u16,
+            reserved: u32,
+            lp_class: *const u16,
+            dw_options: u32,
+            sam_desired: u32,
+            lp_security_attributes: *const c_void,
+            phk_result: *mut HKEY,
+            lpdw_disposition: *mut u32,
+        ) -> u32;
     }
 
     type WintunAdapterHandle = *mut c_void;
@@ -2580,6 +2807,9 @@ mod win32 {
                 unsafe { (self.wintun.close_adapter)(self.handle.as_raw()) };
                 self.handle = SendHandle(ptr::null_mut());
                 let _ = delete_residual_vdpi_tcpip_interface_keys();
+                if let Err(err) = remove_vdpi_nrpt_rule() {
+                    debug!(error = %err, "failed to remove managed NRPT rule during AdapterGuard rollback");
+                }
                 flush_dns_resolver_cache();
             }
         }
@@ -2720,11 +2950,30 @@ mod win32 {
             }
         }
 
-        fn to_outbound_target(&self) -> OutboundTarget {
+        /// Returns the uplink signature scoped to the active TUN address families.
+        ///
+        /// When `include_v6` is `false` (e.g. `!tun_ipv6 && uplink.v4.is_some()`), `v6` is
+        /// masked to `None` so IPv6 RA / privacy-address churn never triggers spurious DNS
+        /// flushes or `route_tx` / `drain_udp_nat` resets.
+        pub(super) fn effective_signature(&self, include_v6: bool) -> UplinkSignature {
+            let mut sig = self.signature();
+            if !include_v6 {
+                sig.v6 = None;
+            }
+            sig
+        }
+
+        /// Builds the fail-closed [`OutboundTarget`] for [`DynamicOutboundBinder`].
+        ///
+        /// When `ipv6_enabled` is `false`, `if_index_v6` is forced to `None` so IPv6
+        /// link-local/multicast packets on `vdpi0` can never leak out a physical NIC.
+        pub(super) fn to_outbound_target(&self, ipv6_enabled: bool) -> OutboundTarget {
             OutboundTarget {
                 nic_name: self.nic_name.clone(),
                 if_index_v4: self.v4.as_ref().map(|u| u.if_index),
-                if_index_v6: self.v6.as_ref().map(|u| u.if_index),
+                if_index_v6: ipv6_enabled
+                    .then(|| self.v6.as_ref().map(|u| u.if_index))
+                    .flatten(),
                 fwmark: None,
                 fail_closed: true,
             }
@@ -2737,6 +2986,7 @@ mod win32 {
         description: String,
         if_type: u32,
         is_up: bool,
+        is_hardware_interface: bool,
     }
 
     /// Detects the active physical IPv4 and IPv6 uplinks via Windows IP Helper APIs
@@ -2767,6 +3017,9 @@ mod win32 {
                         description: utf16_array_to_string(&row.Description),
                         if_type: row.Type,
                         is_up: row.OperStatus == IfOperStatusUp,
+                        // Bit 0 of `MIB_IF_ROW2.InterfaceAndOperStatusFlags` is `HardwareInterface`.
+                        is_hardware_interface: (row.InterfaceAndOperStatusFlags._bitfield & 0x01)
+                            != 0,
                     },
                 );
             }
@@ -2800,6 +3053,9 @@ mod win32 {
 
         // 3. Enumerate unicast addresses so interfaces without usable IPs are excluded and
         //    local unicast IPv4/IPv6 addresses are captured in `UplinkSignature`.
+        //    Windows RFC 4941 temporary IPv6 privacy addresses (`IpSuffixOriginRandom = 5`)
+        //    are excluded from `UplinkSignature::v6.local_addrs` while still counting toward
+        //    `has_unicast_ip` if no permanent global unicast IPv6 address exists.
         let mut raw_unicast: *mut MIB_UNICASTIPADDRESS_TABLE = ptr::null_mut();
         let rc = unsafe { GetUnicastIpAddressTable(AF_UNSPEC, &mut raw_unicast) };
         if rc != NO_ERROR {
@@ -2807,7 +3063,7 @@ mod win32 {
         }
         let unicast_table = MibTableGuard::new(raw_unicast);
         let mut unicast_v4: HashMap<u64, Vec<Ipv4Addr>> = HashMap::new();
-        let mut unicast_v6: HashMap<u64, Vec<Ipv6Addr>> = HashMap::new();
+        let mut unicast_v6_raw: HashMap<u64, Vec<(Ipv6Addr, i32)>> = HashMap::new();
         let unicast_count = unsafe { (*unicast_table.as_ptr()).NumEntries } as usize;
         if unicast_count > 0 {
             let rows = unsafe {
@@ -2829,11 +3085,18 @@ mod win32 {
                 } else if family == AF_INET6 {
                     let ip = Ipv6Addr::from(unsafe { row.Address.Ipv6.sin6_addr.u.Byte });
                     if is_ipv6_global_unicast(ip) {
-                        unicast_v6.entry(luid).or_default().push(ip);
+                        unicast_v6_raw
+                            .entry(luid)
+                            .or_default()
+                            .push((ip, row.SuffixOrigin));
                     }
                 }
             }
         }
+        let unicast_v6: HashMap<u64, (bool, Vec<Ipv6Addr>)> = unicast_v6_raw
+            .into_iter()
+            .map(|(luid, entries)| (luid, collect_stable_ipv6_addrs(&entries)))
+            .collect();
 
         // 4. Enumerate default routes (`PrefixLength == 0`) from the IP forward table.
         let mut raw_fwd: *mut MIB_IPFORWARD_TABLE2 = ptr::null_mut();
@@ -2874,6 +3137,13 @@ mod win32 {
                         continue;
                     }
                     let gateway = in_addr_to_ipv4(unsafe { row.NextHop.Ipv4.sin_addr });
+                    // Skip on-link IPv4 `/0` routes (`0.0.0.0` gateway) on Ethernet/Wi-Fi adapters
+                    // (typically injected by virtual/mesh VPN adapters rather than a real router).
+                    if gateway.is_unspecified()
+                        && matches!(meta.if_type, NDIS_IF_TYPE_ETHERNET | NDIS_IF_TYPE_WIFI)
+                    {
+                        continue;
+                    }
                     candidates_v4.push(UplinkCandidate {
                         luid,
                         if_index,
@@ -2884,6 +3154,7 @@ mod win32 {
                         route_metric: row.Metric,
                         iface_metric: iface_metric_v4.get(&luid).copied().unwrap_or(0),
                         has_unicast_ip: unicast_v4.contains_key(&luid),
+                        is_hardware_interface: meta.is_hardware_interface,
                     });
                     gateways_v4.push(gateway);
                 } else if family == AF_INET6 {
@@ -2903,7 +3174,8 @@ mod win32 {
                         is_up: meta.is_up,
                         route_metric: row.Metric,
                         iface_metric: iface_metric_v6.get(&luid).copied().unwrap_or(0),
-                        has_unicast_ip: unicast_v6.contains_key(&luid),
+                        has_unicast_ip: unicast_v6.get(&luid).is_some_and(|(has_any, _)| *has_any),
+                        is_hardware_interface: meta.is_hardware_interface,
                     });
                     gateways_v6.push(gateway);
                 }
@@ -2939,7 +3211,7 @@ mod win32 {
                 .unwrap_or(Ipv6Addr::UNSPECIFIED);
             let mut local_addrs: Vec<IpAddr> = unicast_v6
                 .get(&c.luid)
-                .map(|ips| ips.iter().copied().map(IpAddr::V6).collect())
+                .map(|(_, stable_ips)| stable_ips.iter().copied().map(IpAddr::V6).collect())
                 .unwrap_or_default();
             local_addrs.sort_unstable();
             local_addrs.dedup();
@@ -3112,6 +3384,244 @@ mod win32 {
         Ok(())
     }
 
+    fn parse_win32_guid(raw: &str) -> Option<GUID> {
+        let (data1, data2, data3, data4) = parse_guid_braced(raw)?;
+        Some(GUID {
+            data1,
+            data2,
+            data3,
+            data4,
+        })
+    }
+
+    fn read_reg_dword_value(hkey: HKEY, value_name: &str) -> Option<u32> {
+        let name_w = encode_wide(value_name);
+        let mut reg_type: REG_VALUE_TYPE = 0;
+        let mut value: u32 = 0;
+        let mut cb_data = mem::size_of::<u32>() as u32;
+        let status = unsafe {
+            RegQueryValueExW(
+                hkey,
+                name_w.as_ptr(),
+                ptr::null(),
+                &mut reg_type,
+                (&mut value as *mut u32).cast::<u8>(),
+                &mut cb_data,
+            )
+        };
+        if status == NO_ERROR && reg_type == REG_DWORD && cb_data == mem::size_of::<u32>() as u32 {
+            Some(value)
+        } else {
+            None
+        }
+    }
+
+    fn write_reg_dword_value(hkey: HKEY, value_name: &str, value: u32) -> Result<()> {
+        let name_w = encode_wide(value_name);
+        let bytes = value.to_le_bytes();
+        let rc = unsafe {
+            RegSetValueExW(
+                hkey,
+                name_w.as_ptr(),
+                0,
+                REG_DWORD,
+                bytes.as_ptr(),
+                bytes.len() as u32,
+            )
+        };
+        if rc != NO_ERROR {
+            bail!("RegSetValueExW({value_name}) failed with Win32 error {rc}");
+        }
+        Ok(())
+    }
+
+    fn write_reg_multi_sz_value(hkey: HKEY, value_name: &str, values: &[&str]) -> Result<()> {
+        let name_w = encode_wide(value_name);
+        let bytes = encode_reg_multi_sz_utf16_bytes(values);
+        let cb_data = u32::try_from(bytes.len())
+            .context("registry MULTI_SZ value exceeds u32 byte length")?;
+        let rc = unsafe {
+            RegSetValueExW(
+                hkey,
+                name_w.as_ptr(),
+                0,
+                REG_MULTI_SZ,
+                bytes.as_ptr(),
+                cb_data,
+            )
+        };
+        if rc != NO_ERROR {
+            bail!("RegSetValueExW({value_name}) failed with Win32 error {rc}");
+        }
+        Ok(())
+    }
+
+    /// Installs or updates vdpi's managed Windows NRPT catch-all rule under
+    /// `HKLM\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig\{D7A4E10B-6E4A-4B9E-8F2C-766470690001}`
+    /// to close Windows SMHNR IPv6/multi-NIC DNS leaks (`DNS-Client 8048`).
+    ///
+    /// Best-effort: logs a warning on error and never fails TUN startup if restricted.
+    fn install_vdpi_nrpt_rule(dns_servers: &str) {
+        let res = (|| -> Result<()> {
+            let subkey_w = encode_wide(VDPI_NRPT_RULE_SUBKEY);
+            let mut hkey: HKEY = ptr::null_mut();
+            let rc = unsafe {
+                RegCreateKeyExW(
+                    HKEY_LOCAL_MACHINE,
+                    subkey_w.as_ptr(),
+                    0,
+                    ptr::null(),
+                    REG_OPTION_NON_VOLATILE,
+                    KEY_WRITE,
+                    ptr::null(),
+                    &mut hkey,
+                    ptr::null_mut(),
+                )
+            };
+            if rc != NO_ERROR {
+                bail!(
+                    "RegCreateKeyExW(HKLM\\{VDPI_NRPT_RULE_SUBKEY}) failed with Win32 error {rc}"
+                );
+            }
+            let key_guard = RegKeyGuard(hkey);
+            write_reg_dword_value(key_guard.0, "Version", VDPI_NRPT_VERSION)?;
+            write_reg_multi_sz_value(key_guard.0, "Name", &["."])?;
+            write_reg_string_value(key_guard.0, "GenericDNSServers", dns_servers, REG_SZ)?;
+            write_reg_dword_value(key_guard.0, "ConfigOptions", VDPI_NRPT_CONFIG_OPTIONS)?;
+            write_reg_string_value(key_guard.0, "Comment", VDPI_NRPT_COMMENT, REG_SZ)?;
+            Ok(())
+        })();
+        match res {
+            Ok(()) => {
+                debug!(
+                    guid = VDPI_NRPT_RULE_GUID,
+                    subkey = VDPI_NRPT_RULE_SUBKEY,
+                    dns_servers,
+                    "installed managed Windows NRPT catch-all DNS policy rule"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    guid = VDPI_NRPT_RULE_GUID,
+                    subkey = VDPI_NRPT_RULE_SUBKEY,
+                    dns_servers,
+                    error = %err,
+                    "failed to install managed Windows NRPT DNS policy rule (continuing without NRPT)"
+                );
+            }
+        }
+    }
+
+    /// Removes vdpi's managed Windows NRPT catch-all rule (`VDPI_NRPT_RULE_GUID`), ignoring
+    /// `ERROR_FILE_NOT_FOUND` / `ERROR_PATH_NOT_FOUND`.
+    ///
+    /// Returns `Ok(true)` if the rule existed and was removed, `Ok(false)` if already absent,
+    /// or `Err` on unexpected registry errors.
+    fn remove_vdpi_nrpt_rule() -> Result<bool> {
+        let subkey_w = encode_wide(VDPI_NRPT_RULE_SUBKEY);
+        let rc = unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, subkey_w.as_ptr()) };
+        if rc == NO_ERROR {
+            debug!(
+                subkey = VDPI_NRPT_RULE_SUBKEY,
+                "removed managed Windows NRPT catch-all DNS policy rule"
+            );
+            return Ok(true);
+        }
+        if rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND {
+            return Ok(false);
+        }
+        let fallback_rc = unsafe { RegDeleteKeyW(HKEY_LOCAL_MACHINE, subkey_w.as_ptr()) };
+        if fallback_rc == NO_ERROR {
+            debug!(
+                subkey = VDPI_NRPT_RULE_SUBKEY,
+                "removed managed Windows NRPT catch-all DNS policy rule via RegDeleteKeyW"
+            );
+            return Ok(true);
+        }
+        if fallback_rc == ERROR_FILE_NOT_FOUND || fallback_rc == ERROR_PATH_NOT_FOUND {
+            return Ok(false);
+        }
+        bail!(
+            "failed to remove managed Windows NRPT DNS policy rule HKLM\\{VDPI_NRPT_RULE_SUBKEY} \
+             (RegDeleteTreeW={rc}, RegDeleteKeyW={fallback_rc})"
+        );
+    }
+
+    fn resolve_set_interface_dns_settings_fn() -> Option<SetInterfaceDnsSettingsFn> {
+        *SET_INTERFACE_DNS_SETTINGS_FN.get_or_init(|| {
+            let iphlpapi_w = encode_wide("iphlpapi.dll");
+            let hmod = unsafe {
+                LoadLibraryExW(
+                    iphlpapi_w.as_ptr(),
+                    ptr::null_mut(),
+                    LOAD_LIBRARY_SEARCH_SYSTEM32,
+                )
+            };
+            if hmod.is_null() {
+                return None;
+            }
+            match unsafe {
+                load_proc::<SetInterfaceDnsSettingsFn>(hmod, c"SetInterfaceDnsSettings")
+            } {
+                Ok(f) => Some(f),
+                Err(_) => {
+                    unsafe {
+                        let _ = FreeLibrary(hmod);
+                    }
+                    None
+                }
+            }
+        })
+    }
+
+    /// Returns `true` if a `Tcpip` or `Tcpip6` interface registry key exists for
+    /// `VDPI_WINTUN_GUID_STR`.
+    fn has_vdpi_tcpip_interface_key() -> bool {
+        for parent in [TCPIP_INTERFACES_SUBKEY, TCPIP6_INTERFACES_SUBKEY] {
+            let subkey = format!(r"{parent}\{VDPI_WINTUN_GUID_STR}");
+            let subkey_w = encode_wide(&subkey);
+            let mut hkey: HKEY = ptr::null_mut();
+            let rc = unsafe {
+                RegOpenKeyExW(
+                    HKEY_LOCAL_MACHINE,
+                    subkey_w.as_ptr(),
+                    0,
+                    KEY_QUERY_VALUE,
+                    &mut hkey,
+                )
+            };
+            if rc == NO_ERROR {
+                let _guard = RegKeyGuard(hkey);
+                return true;
+            }
+            if rc != ERROR_FILE_NOT_FOUND && rc != ERROR_PATH_NOT_FOUND {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns `true` when the Wintun kernel driver service key exists in SCM and is not
+    /// already marked for deletion (`DeleteFlag != 1`).
+    fn is_wintun_driver_service_installed() -> bool {
+        let subkey_w = encode_wide(WINTUN_DRIVER_SERVICE_SUBKEY);
+        let mut hkey: HKEY = ptr::null_mut();
+        let rc = unsafe {
+            RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                subkey_w.as_ptr(),
+                0,
+                KEY_QUERY_VALUE,
+                &mut hkey,
+            )
+        };
+        if rc != NO_ERROR {
+            return false;
+        }
+        let key_guard = RegKeyGuard(hkey);
+        read_reg_dword_value(key_guard.0, "DeleteFlag").unwrap_or(0) == 0
+    }
+
     fn setupdi_read_net_cfg_instance_id(
         open_dev_reg_key: SetupDiOpenDevRegKeyFn,
         dev_info: *mut c_void,
@@ -3147,7 +3657,10 @@ mod win32 {
     /// device node without mutating anything. When `remove` is `true`, invokes
     /// `SetupDiCallClassInstaller(DIF_REMOVE)` on every matching node and returns `true` if any
     /// device was removed. Never touches third-party Wintun adapters.
-    fn scan_orphan_wintun_devices_via_setupapi(remove: bool) -> bool {
+    fn scan_orphan_wintun_devices_via_setupapi(
+        remove: bool,
+        mut errors: Option<&mut Vec<String>>,
+    ) -> bool {
         let setupapi_w = encode_wide("setupapi.dll");
         let hmod = unsafe {
             LoadLibraryExW(
@@ -3213,6 +3726,11 @@ mod win32 {
         if dev_info.is_null() || dev_info == INVALID_HANDLE_PTR {
             let err = unsafe { GetLastError() };
             debug!(error = err, "SetupDiGetClassDevsW(GUID_DEVCLASS_NET) failed");
+            if let Some(errs) = errors.as_deref_mut() {
+                errs.push(format!(
+                    "SetupDiGetClassDevsW(GUID_DEVCLASS_NET) failed with Win32 error {err}"
+                ));
+            }
             return false;
         }
         let _list_guard = DevInfoListGuard {
@@ -3296,6 +3814,11 @@ mod win32 {
                         adapter = VDPI_TUN_NAME,
                         "SetupDiCallClassInstaller(DIF_REMOVE) failed for orphaned vdpi Wintun device"
                     );
+                    if let Some(errs) = errors.as_deref_mut() {
+                        errs.push(format!(
+                            "SetupDiCallClassInstaller(DIF_REMOVE) failed for orphaned {VDPI_TUN_NAME} device with Win32 error {err}"
+                        ));
+                    }
                 }
             }
         }
@@ -3304,7 +3827,7 @@ mod win32 {
     }
 
     fn remove_orphan_wintun_devices_via_setupapi() -> bool {
-        scan_orphan_wintun_devices_via_setupapi(true)
+        scan_orphan_wintun_devices_via_setupapi(true, None)
     }
 
     fn lookup_vdpi_luid_by_guid() -> u64 {
@@ -3317,24 +3840,12 @@ mod win32 {
         }
     }
 
-    fn clear_interface_dns_by_guid(guid: GUID) -> bool {
-        let iphlpapi_w = encode_wide("iphlpapi.dll");
-        let hmod = unsafe {
-            LoadLibraryExW(
-                iphlpapi_w.as_ptr(),
-                ptr::null_mut(),
-                LOAD_LIBRARY_SEARCH_SYSTEM32,
-            )
-        };
-        if hmod.is_null() {
+    fn clear_interface_dns_by_guid_with_errors(
+        guid: GUID,
+        mut errors: Option<&mut Vec<String>>,
+    ) -> bool {
+        let Some(set_dns) = resolve_set_interface_dns_settings_fn() else {
             return false;
-        }
-        let _guard = ModuleGuard(hmod);
-        let set_dns = match unsafe {
-            load_proc::<SetInterfaceDnsSettingsFn>(hmod, c"SetInterfaceDnsSettings")
-        } {
-            Ok(f) => f,
-            Err(_) => return false,
         };
 
         let mut empty_v4 = encode_wide("");
@@ -3360,12 +3871,24 @@ mod win32 {
                 error = rc_v4,
                 "SetInterfaceDnsSettings(clear IPv4 DNS) returned non-fatal error"
             );
+            if let Some(list) = errors.as_deref_mut() {
+                list.push(format!(
+                    "SetInterfaceDnsSettings(clear IPv4 DNS on {}) failed with Win32 error {rc_v4}",
+                    format_guid_braced(&guid)
+                ));
+            }
         }
         if rc_v6 != NO_ERROR && rc_v6 != ERROR_NOT_FOUND && rc_v6 != ERROR_FILE_NOT_FOUND {
             debug!(
                 error = rc_v6,
                 "SetInterfaceDnsSettings(clear IPv6 DNS) returned non-fatal error"
             );
+            if let Some(list) = errors {
+                list.push(format!(
+                    "SetInterfaceDnsSettings(clear IPv6 DNS on {}) failed with Win32 error {rc_v6}",
+                    format_guid_braced(&guid)
+                ));
+            }
         }
 
         rc_v4 == NO_ERROR || rc_v6 == NO_ERROR
@@ -3373,10 +3896,14 @@ mod win32 {
 
     /// Explicitly removes every IPv4/IPv6 route associated with `luid` (or targeting a vdpi
     /// virtual TUN/DNS next-hop) via `GetIpForwardTable2`/`DeleteIpForwardEntry2` and clears
-    /// IPv4 & IPv6 DNS settings on `VDPI_WINTUN_GUID` via `SetInterfaceDnsSettings(empty)`.
+    /// IPv4 & IPv6 DNS settings on `VDPI_WINTUN_GUID` via `SetInterfaceDnsSettings(empty)`
+    /// (only when `luid != 0` or a residual `vdpi0` Tcpip interface key exists).
     ///
     /// Returns `(routes_removed, dns_cleared)`.
-    fn cleanup_vdpi_luid_routes_and_dns(luid: u64) -> (bool, bool) {
+    fn cleanup_vdpi_luid_routes_and_dns_with_errors(
+        luid: u64,
+        mut errors: Option<&mut Vec<String>>,
+    ) -> (bool, bool) {
         let mut routes_removed = false;
 
         let mut raw_fwd: *mut MIB_IPFORWARD_TABLE2 = ptr::null_mut();
@@ -3416,18 +3943,40 @@ mod win32 {
                             error = del_rc,
                             "DeleteIpForwardEntry2 returned non-fatal error during vdpi route teardown"
                         );
+                        if let Some(errs) = errors.as_deref_mut() {
+                            errs.push(format!(
+                                "DeleteIpForwardEntry2(luid={row_luid}) failed with Win32 error {del_rc}"
+                            ));
+                        }
                     }
                 }
             }
+        } else if rc != NO_ERROR {
+            debug!(
+                error = rc,
+                "GetIpForwardTable2 failed during vdpi route teardown"
+            );
+            if let Some(errs) = errors.as_deref_mut() {
+                errs.push(format!(
+                    "GetIpForwardTable2 failed during vdpi route teardown with Win32 error {rc}"
+                ));
+            }
         }
 
-        let mut dns_cleared = clear_interface_dns_by_guid(VDPI_WINTUN_GUID);
+        // Skip `SetInterfaceDnsSettings(VDPI_WINTUN_GUID, empty)` when `luid == 0` and no
+        // residual `vdpi0` Tcpip/Tcpip6 interface key exists so a clean host is never mutated
+        // or falsely flagged as changed.
+        let mut dns_cleared = if luid != 0 || has_vdpi_tcpip_interface_key() {
+            clear_interface_dns_by_guid_with_errors(VDPI_WINTUN_GUID, errors.as_deref_mut())
+        } else {
+            false
+        };
         if luid != 0 {
             let net_luid = NET_LUID_LH { Value: luid };
             let mut luid_guid = GUID::default();
             if unsafe { ConvertInterfaceLuidToGuid(&net_luid, &mut luid_guid) } == NO_ERROR
                 && !guids_equal(&luid_guid, &VDPI_WINTUN_GUID)
-                && clear_interface_dns_by_guid(luid_guid)
+                && clear_interface_dns_by_guid_with_errors(luid_guid, errors)
             {
                 dns_cleared = true;
             }
@@ -3436,10 +3985,16 @@ mod win32 {
         (routes_removed, dns_cleared)
     }
 
+    fn cleanup_vdpi_luid_routes_and_dns(luid: u64) -> (bool, bool) {
+        cleanup_vdpi_luid_routes_and_dns_with_errors(luid, None)
+    }
+
     /// Deletes residual `NameServer` / `DhcpNameServer` values (and removes the interface subkey
     /// if empty) under `Tcpip` and `Tcpip6` `Parameters\Interfaces\{VDPI_WINTUN_GUID}` via
     /// native Advapi32 (`RegDeleteValueW` / `RegDeleteKeyW`), ignoring `ERROR_FILE_NOT_FOUND`.
-    fn delete_residual_vdpi_tcpip_interface_keys() -> bool {
+    fn delete_residual_vdpi_tcpip_interface_keys_with_errors(
+        mut errors: Option<&mut Vec<String>>,
+    ) -> bool {
         let mut changed = false;
 
         for parent in [TCPIP_INTERFACES_SUBKEY, TCPIP6_INTERFACES_SUBKEY] {
@@ -3464,6 +4019,11 @@ mod win32 {
                     error = open_rc,
                     "RegOpenKeyExW failed during residual vdpi Tcpip interface key cleanup"
                 );
+                if let Some(errs) = errors.as_deref_mut() {
+                    errs.push(format!(
+                        "RegOpenKeyExW(HKLM\\{subkey}) failed during residual vdpi Tcpip cleanup with Win32 error {open_rc}"
+                    ));
+                }
                 continue;
             }
 
@@ -3481,6 +4041,11 @@ mod win32 {
                             error = del_val_rc,
                             "RegDeleteValueW returned non-fatal error during vdpi Tcpip cleanup"
                         );
+                        if let Some(errs) = errors.as_deref_mut() {
+                            errs.push(format!(
+                                "RegDeleteValueW(HKLM\\{subkey}\\{value_name}) failed with Win32 error {del_val_rc}"
+                            ));
+                        }
                     }
                 }
 
@@ -3515,6 +4080,11 @@ mod win32 {
                         error = del_key_rc,
                         "RegDeleteKeyW returned non-fatal error for empty vdpi Tcpip interface key"
                     );
+                    if let Some(errs) = errors.as_deref_mut() {
+                        errs.push(format!(
+                            "RegDeleteKeyW(HKLM\\{subkey}) failed with Win32 error {del_key_rc}"
+                        ));
+                    }
                 }
             }
         }
@@ -3522,10 +4092,19 @@ mod win32 {
         changed
     }
 
+    fn delete_residual_vdpi_tcpip_interface_keys() -> bool {
+        delete_residual_vdpi_tcpip_interface_keys_with_errors(None)
+    }
+
     /// Attempts to unload/remove the Wintun kernel driver via optional `WintunDeleteDriver` when
     /// no Wintun adapter holds a reference. Wintun itself refcounts safely, so this is a no-op if
     /// another Wintun adapter (WireGuard, Tailscale, Mullvad, etc.) is active.
+    ///
+    /// Returns `true` only when the Wintun driver service was actually installed beforehand and
+    /// removed (or marked for deletion) by `WintunDeleteDriver` (never unconditionally on
+    /// `WintunDeleteDriver() != 0`, which Wintun returns even when no driver was installed).
     pub fn try_delete_unused_wintun_driver() -> bool {
+        let existed_before = is_wintun_driver_service_installed();
         let Ok(wintun) = WintunApi::load_verified() else {
             return false;
         };
@@ -3534,8 +4113,13 @@ mod win32 {
         };
         let ok = unsafe { delete_driver() };
         if ok != 0 {
-            debug!("WintunDeleteDriver removed unused Wintun kernel driver");
-            true
+            let removed = existed_before && !is_wintun_driver_service_installed();
+            debug!(
+                existed_before,
+                removed,
+                "WintunDeleteDriver completed"
+            );
+            removed
         } else {
             let err = unsafe { GetLastError() };
             debug!(
@@ -3573,20 +4157,31 @@ mod win32 {
             }
         }
 
-        scan_orphan_wintun_devices_via_setupapi(false)
+        scan_orphan_wintun_devices_via_setupapi(false, None)
     }
 
-    /// Best-effort cleanup of an orphaned `vdpi0` Wintun adapter left behind by an abrupt
-    /// process termination (e.g. `TerminateProcess` or `taskkill /F`).
+    /// Single-pass orphan `vdpi0` adapter, route/DNS, SetupAPI, Tcpip key, and NRPT cleanup
+    /// shared by [`cleanup_orphan_wintun_adapter`] and [`reset_windows_tun_and_dns_defaults`].
     ///
-    /// Resolves the `vdpi0` LUID via `ConvertInterfaceGuidToLuid(&VDPI_WINTUN_GUID)` even if
-    /// `WintunOpenAdapter` or `wintun.dll` loading fails (e.g. Defender quarantine), explicitly
-    /// deletes routes and DNS BEFORE closing any open Wintun handle, runs SetupAPI `DIF_REMOVE`
-    /// (`flags = 0`) for present and phantom device nodes, deletes residual Tcpip/Tcpip6
-    /// registry keys, and always flushes the Windows DNS resolver cache. Returns `true` when any
-    /// orphaned adapter, route, DNS entry, or registry state was cleaned.
-    pub fn cleanup_orphan_wintun_adapter() -> bool {
-        let mut cleaned = false;
+    /// Returns `(tun_changed, nrpt_removed)`.
+    fn cleanup_orphan_wintun_adapter_inner(
+        mut errors: Option<&mut Vec<String>>,
+        flush_dns: bool,
+    ) -> (bool, bool) {
+        let mut tun_changed = false;
+        let mut nrpt_removed = false;
+
+        match remove_vdpi_nrpt_rule() {
+            Ok(true) => nrpt_removed = true,
+            Ok(false) => {}
+            Err(err) => {
+                warn!(error = %err, "failed to remove managed Windows NRPT rule during cleanup");
+                if let Some(errs) = errors.as_deref_mut() {
+                    errs.push(format!("{err:#}"));
+                }
+            }
+        }
+
         let mut luid = lookup_vdpi_luid_by_guid();
         let mut routes_dns_cleaned = false;
 
@@ -3604,63 +4199,75 @@ mod win32 {
                     luid,
                     "found orphaned Wintun adapter via WintunOpenAdapter; cleaning routes/DNS and closing handle"
                 );
-                let _ = cleanup_vdpi_luid_routes_and_dns(luid);
+                let _ = cleanup_vdpi_luid_routes_and_dns_with_errors(luid, errors.as_deref_mut());
                 routes_dns_cleaned = true;
                 unsafe { (wintun.close_adapter)(handle) };
-                cleaned = true;
+                tun_changed = true;
             }
         }
 
         if !routes_dns_cleaned {
-            let (routes_removed, dns_cleared) = cleanup_vdpi_luid_routes_and_dns(luid);
+            let (routes_removed, dns_cleared) =
+                cleanup_vdpi_luid_routes_and_dns_with_errors(luid, errors.as_deref_mut());
             if routes_removed || dns_cleared {
-                cleaned = true;
+                tun_changed = true;
             }
         }
 
-        if remove_orphan_wintun_devices_via_setupapi() {
-            cleaned = true;
+        if scan_orphan_wintun_devices_via_setupapi(true, errors.as_deref_mut()) {
+            tun_changed = true;
         }
 
-        if delete_residual_vdpi_tcpip_interface_keys() {
-            cleaned = true;
+        if delete_residual_vdpi_tcpip_interface_keys_with_errors(errors) {
+            tun_changed = true;
         }
 
-        flush_dns_resolver_cache();
-        cleaned
+        if flush_dns {
+            flush_dns_resolver_cache();
+        }
+        (tun_changed, nrpt_removed)
+    }
+
+    /// Best-effort cleanup of an orphaned `vdpi0` Wintun adapter left behind by an abrupt
+    /// process termination (e.g. `TerminateProcess` or `taskkill /F`).
+    ///
+    /// Removes any managed NRPT policy rule, resolves the `vdpi0` LUID via
+    /// `ConvertInterfaceGuidToLuid(&VDPI_WINTUN_GUID)` even if `WintunOpenAdapter` or `wintun.dll`
+    /// loading fails (e.g. Defender quarantine), explicitly deletes routes and DNS BEFORE closing
+    /// any open Wintun handle, runs SetupAPI `DIF_REMOVE` (`flags = 0`) for present and phantom
+    /// device nodes, deletes residual Tcpip/Tcpip6 registry keys, and flushes the Windows DNS
+    /// resolver cache. Returns `true` when any orphaned adapter, route, DNS entry, NRPT rule, or
+    /// registry state was cleaned.
+    pub fn cleanup_orphan_wintun_adapter() -> bool {
+        let (tun_changed, nrpt_removed) = cleanup_orphan_wintun_adapter_inner(None, true);
+        tun_changed || nrpt_removed
     }
 
     /// Performs a full Windows TUN and DNS reset:
-    /// 1. Cleans up `vdpi0` LUID routes/DNS, closes any orphaned Wintun adapter and SetupAPI
-    ///    nodes, deletes residual `vdpi0` Tcpip/Tcpip6 interface keys, and attempts
-    ///    `try_delete_unused_wintun_driver()`.
+    /// 1. Runs a single deduplicated orphan-cleanup pass (managed NRPT rule, `vdpi0` LUID
+    ///    routes/DNS, orphaned Wintun adapter + SetupAPI nodes, residual `vdpi0` Tcpip/Tcpip6
+    ///    interface keys) and attempts `try_delete_unused_wintun_driver()`.
     /// 2. Scans `HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces` and
     ///    `Tcpip6\Parameters\Interfaces` via `RegEnumKeyExW`, stripping `198.18.0.2` or
-    ///    `fd00:7664:7069::2` from any interface `NameServer` value.
-    /// 3. Always flushes the Windows DNS resolver cache.
+    ///    `fd00:7664:7069::2` from any physical adapter via `SetInterfaceDnsSettings` (falling
+    ///    back to raw registry writes only when `SetInterfaceDnsSettings` is unavailable or the
+    ///    interface is absent).
+    /// 3. Flushes the Windows DNS resolver cache once.
     ///
     /// Returns `(tun_changed, dns_override_changed, errors)`.
     pub fn reset_windows_tun_and_dns_defaults() -> (bool, bool, Vec<String>) {
-        let mut tun_changed = false;
-        let mut dns_override_changed = false;
         let mut errors: Vec<String> = Vec::new();
+        let (mut tun_changed, mut dns_override_changed) =
+            cleanup_orphan_wintun_adapter_inner(Some(&mut errors), false);
 
-        let luid = lookup_vdpi_luid_by_guid();
-        let (routes_removed, dns_cleared) = cleanup_vdpi_luid_routes_and_dns(luid);
-        if routes_removed || dns_cleared {
-            tun_changed = true;
-        }
-        if cleanup_orphan_wintun_adapter() {
-            tun_changed = true;
-        }
-        if delete_residual_vdpi_tcpip_interface_keys() {
-            tun_changed = true;
-        }
         if try_delete_unused_wintun_driver() {
             tun_changed = true;
         }
 
-        for parent_path in [TCPIP_INTERFACES_SUBKEY, TCPIP6_INTERFACES_SUBKEY] {
+        for (parent_path, is_v6) in [
+            (TCPIP_INTERFACES_SUBKEY, false),
+            (TCPIP6_INTERFACES_SUBKEY, true),
+        ] {
             let parent_w = encode_wide(parent_path);
             let mut parent_hkey: HKEY = ptr::null_mut();
             let open_rc = unsafe {
@@ -3736,7 +4343,13 @@ mod win32 {
                         &mut sub_hkey,
                     )
                 };
+                if sub_open_rc == ERROR_FILE_NOT_FOUND || sub_open_rc == ERROR_PATH_NOT_FOUND {
+                    continue;
+                }
                 if sub_open_rc != NO_ERROR {
+                    errors.push(format!(
+                        "RegOpenKeyExW(HKLM\\{parent_path}\\{subkey_name}, KEY_QUERY_VALUE) failed with Win32 error {sub_open_rc}"
+                    ));
                     continue;
                 }
                 let sub_guard = RegKeyGuard(sub_hkey);
@@ -3749,6 +4362,48 @@ mod win32 {
                     continue;
                 };
                 drop(sub_guard);
+
+                // Prefer `SetInterfaceDnsSettings` so Windows `Dnscache`/`Tcpip` refreshes
+                // immediately; fall back to raw registry writes only when the API is unavailable,
+                // the subkey is not a GUID, or the interface is absent (`ERROR_NOT_FOUND`).
+                let mut handled_via_api = false;
+                if let (Some(set_dns), Some(guid)) = (
+                    resolve_set_interface_dns_settings_fn(),
+                    parse_win32_guid(&subkey_name),
+                ) {
+                    let mut cleaned_w = encode_wide(&cleaned_ns);
+                    let flags = if is_v6 {
+                        u64::from(DNS_SETTING_IPV6 | DNS_SETTING_NAMESERVER)
+                    } else {
+                        u64::from(DNS_SETTING_NAMESERVER)
+                    };
+                    let settings = DNS_INTERFACE_SETTINGS {
+                        Version: DNS_INTERFACE_SETTINGS_VERSION1,
+                        Flags: flags,
+                        NameServer: cleaned_w.as_mut_ptr(),
+                        ..Default::default()
+                    };
+                    let status = unsafe { set_dns(guid, &settings) };
+                    if status == NO_ERROR {
+                        info!(
+                            path = %format!(r"HKLM\{parent_path}\{subkey_name}"),
+                            before = %current_ns,
+                            after = %cleaned_ns,
+                            ipv6 = is_v6,
+                            "stripped residual vdpi DNS server via SetInterfaceDnsSettings"
+                        );
+                        dns_override_changed = true;
+                        handled_via_api = true;
+                    } else if status != ERROR_NOT_FOUND && status != ERROR_FILE_NOT_FOUND {
+                        errors.push(format!(
+                            "SetInterfaceDnsSettings(HKLM\\{parent_path}\\{subkey_name}, ipv6={is_v6}) failed with Win32 error {status}"
+                        ));
+                        handled_via_api = true;
+                    }
+                }
+                if handled_via_api {
+                    continue;
+                }
 
                 let mut write_hkey: HKEY = ptr::null_mut();
                 let write_open_rc = unsafe {
@@ -3778,7 +4433,7 @@ mod win32 {
                         path = %format!(r"HKLM\{parent_path}\{subkey_name}"),
                         before = %current_ns,
                         after = %cleaned_ns,
-                        "stripped residual vdpi DNS server from Windows interface NameServer"
+                        "stripped residual vdpi DNS server from Windows interface NameServer via registry fallback"
                     );
                     dns_override_changed = true;
                 }
@@ -3792,6 +4447,11 @@ mod win32 {
     fn create_or_recreate_adapter(wintun: &Arc<WintunApi>) -> Result<AdapterGuard> {
         let name_w = encode_wide(VDPI_TUN_NAME);
         let tunnel_type_w = encode_wide(VDPI_WINTUN_TUNNEL_TYPE);
+
+        // Always clear any stale managed NRPT rule before creating/recreating `vdpi0`.
+        if let Err(err) = remove_vdpi_nrpt_rule() {
+            debug!(error = %err, "failed to remove stale NRPT rule before adapter creation");
+        }
 
         // If an abrupt termination (e.g. Defender TerminateProcess or taskkill /F) left an
         // orphaned zombie `vdpi0` adapter behind, clean its routes/DNS, open and close it
@@ -3808,6 +4468,7 @@ mod win32 {
             unsafe { (wintun.close_adapter)(orphan) };
             let _ = remove_orphan_wintun_devices_via_setupapi();
             let _ = delete_residual_vdpi_tcpip_interface_keys();
+            let _ = remove_vdpi_nrpt_rule();
         }
 
         let mut handle = unsafe {
@@ -3840,6 +4501,7 @@ mod win32 {
             }
             let _ = remove_orphan_wintun_devices_via_setupapi();
             let _ = delete_residual_vdpi_tcpip_interface_keys();
+            let _ = remove_vdpi_nrpt_rule();
             thread::sleep(Duration::from_millis(delay_ms));
             handle = unsafe {
                 (wintun.create_adapter)(name_w.as_ptr(), tunnel_type_w.as_ptr(), &VDPI_WINTUN_GUID)
@@ -4090,55 +4752,42 @@ mod win32 {
         }
 
         let is_v6 = dns_server.is_ipv6();
-        let iphlpapi_w = encode_wide("iphlpapi.dll");
-        let hmod = unsafe {
-            LoadLibraryExW(
-                iphlpapi_w.as_ptr(),
-                ptr::null_mut(),
-                LOAD_LIBRARY_SEARCH_SYSTEM32,
-            )
-        };
-        if !hmod.is_null() {
-            let _guard = ModuleGuard(hmod);
-            if let Ok(set_dns) =
-                unsafe { load_proc::<SetInterfaceDnsSettingsFn>(hmod, c"SetInterfaceDnsSettings") }
-            {
-                let mut dns_w = encode_wide(&dns_server.to_string());
-                let flags = if is_v6 {
-                    u64::from(DNS_SETTING_IPV6 | DNS_SETTING_NAMESERVER)
-                } else {
-                    u64::from(DNS_SETTING_NAMESERVER)
-                };
-                let settings = DNS_INTERFACE_SETTINGS {
-                    Version: DNS_INTERFACE_SETTINGS_VERSION1,
-                    Flags: flags,
-                    NameServer: dns_w.as_mut_ptr(),
-                    ..Default::default()
-                };
-                let mut status = unsafe { set_dns(guid, &settings) };
-                for &delay_ms in DNS_NOT_FOUND_RETRY_DELAYS_MS {
-                    if status != ERROR_NOT_FOUND {
-                        break;
-                    }
-                    debug!(
-                        dns = %dns_server,
-                        ipv6 = is_v6,
-                        delay_ms,
-                        "SetInterfaceDnsSettings returned ERROR_NOT_FOUND; retrying"
-                    );
-                    thread::sleep(Duration::from_millis(delay_ms));
-                    status = unsafe { set_dns(guid, &settings) };
+        if let Some(set_dns) = resolve_set_interface_dns_settings_fn() {
+            let mut dns_w = encode_wide(&dns_server.to_string());
+            let flags = if is_v6 {
+                u64::from(DNS_SETTING_IPV6 | DNS_SETTING_NAMESERVER)
+            } else {
+                u64::from(DNS_SETTING_NAMESERVER)
+            };
+            let settings = DNS_INTERFACE_SETTINGS {
+                Version: DNS_INTERFACE_SETTINGS_VERSION1,
+                Flags: flags,
+                NameServer: dns_w.as_mut_ptr(),
+                ..Default::default()
+            };
+            let mut status = unsafe { set_dns(guid, &settings) };
+            for &delay_ms in DNS_NOT_FOUND_RETRY_DELAYS_MS {
+                if status != ERROR_NOT_FOUND {
+                    break;
                 }
-                if status == NO_ERROR {
-                    debug!(
-                        dns = %dns_server,
-                        ipv6 = is_v6,
-                        "configured vdpi0 DNS via SetInterfaceDnsSettings"
-                    );
-                    return Ok(());
-                }
-                bail!("SetInterfaceDnsSettings({dns_server}) failed with Win32 error {status}");
+                debug!(
+                    dns = %dns_server,
+                    ipv6 = is_v6,
+                    delay_ms,
+                    "SetInterfaceDnsSettings returned ERROR_NOT_FOUND; retrying"
+                );
+                thread::sleep(Duration::from_millis(delay_ms));
+                status = unsafe { set_dns(guid, &settings) };
             }
+            if status == NO_ERROR {
+                debug!(
+                    dns = %dns_server,
+                    ipv6 = is_v6,
+                    "configured vdpi0 DNS via SetInterfaceDnsSettings"
+                );
+                return Ok(());
+            }
+            bail!("SetInterfaceDnsSettings({dns_server}) failed with Win32 error {status}");
         }
 
         // Pre-2004 Windows 10 fallback when `SetInterfaceDnsSettings` is unavailable:
@@ -4166,33 +4815,20 @@ mod win32 {
             bail!("ConvertInterfaceLuidToGuid failed with Win32 error {rc}");
         }
 
-        let iphlpapi_w = encode_wide("iphlpapi.dll");
-        let hmod = unsafe {
-            LoadLibraryExW(
-                iphlpapi_w.as_ptr(),
-                ptr::null_mut(),
-                LOAD_LIBRARY_SEARCH_SYSTEM32,
-            )
-        };
-        if !hmod.is_null() {
-            let _guard = ModuleGuard(hmod);
-            if let Ok(set_dns) =
-                unsafe { load_proc::<SetInterfaceDnsSettingsFn>(hmod, c"SetInterfaceDnsSettings") }
-            {
-                let mut empty_w = encode_wide("");
-                let settings = DNS_INTERFACE_SETTINGS {
-                    Version: DNS_INTERFACE_SETTINGS_VERSION1,
-                    Flags: u64::from(DNS_SETTING_IPV6 | DNS_SETTING_NAMESERVER),
-                    NameServer: empty_w.as_mut_ptr(),
-                    ..Default::default()
-                };
-                let status = unsafe { set_dns(guid, &settings) };
-                if status == NO_ERROR || status == ERROR_NOT_FOUND {
-                    debug!("cleared vdpi0 IPv6 DNS via SetInterfaceDnsSettings");
-                    return Ok(());
-                }
-                bail!("SetInterfaceDnsSettings(clear IPv6 DNS) failed with Win32 error {status}");
+        if let Some(set_dns) = resolve_set_interface_dns_settings_fn() {
+            let mut empty_w = encode_wide("");
+            let settings = DNS_INTERFACE_SETTINGS {
+                Version: DNS_INTERFACE_SETTINGS_VERSION1,
+                Flags: u64::from(DNS_SETTING_IPV6 | DNS_SETTING_NAMESERVER),
+                NameServer: empty_w.as_mut_ptr(),
+                ..Default::default()
+            };
+            let status = unsafe { set_dns(guid, &settings) };
+            if status == NO_ERROR || status == ERROR_NOT_FOUND {
+                debug!("cleared vdpi0 IPv6 DNS via SetInterfaceDnsSettings");
+                return Ok(());
             }
+            bail!("SetInterfaceDnsSettings(clear IPv6 DNS) failed with Win32 error {status}");
         }
 
         // Pre-2004 Windows 10 fallback when `SetInterfaceDnsSettings` is unavailable.
@@ -4200,13 +4836,16 @@ mod win32 {
     }
 
     /// Applies a [`TunRoamingPlan`] to `vdpi0` using make-before-break ordering (enabling the
-    /// incoming address family before tearing down the outgoing one) and updates `ipv6_active`.
+    /// incoming address family before tearing down the outgoing one), updates `ipv6_active`,
+    /// and keeps the managed Windows NRPT DNS policy rule in sync when IPv6 toggles.
     fn apply_tun_roaming_plan(
         vdpi_luid: u64,
         mut state: TunStackState,
         plan: TunRoamingPlan,
         ipv6_active: &AtomicBool,
     ) -> TunStackState {
+        let initial_ipv6_active = state.ipv6_active;
+
         if plan.add_ipv4_routes {
             let mut all_ok = true;
             for &(dest, prefix_len) in PUBLIC_IPV4_COMPLEMENT_CIDRS {
@@ -4322,40 +4961,74 @@ mod win32 {
             }
         }
 
+        if state.ipv6_active != initial_ipv6_active {
+            install_vdpi_nrpt_rule(&format_vdpi_nrpt_dns_servers(state.ipv6_active));
+        }
+
         state
     }
 
-    /// Best-effort call to `DnsFlushResolverCache()` in `dnsapi.dll`.
+    fn resolve_dns_flush_fn() -> Option<DnsFlushResolverCacheFn> {
+        *DNS_FLUSH_RESOLVER_CACHE_FN.get_or_init(|| {
+            let dnsapi_w = encode_wide("dnsapi.dll");
+            let hmod = unsafe {
+                LoadLibraryExW(
+                    dnsapi_w.as_ptr(),
+                    ptr::null_mut(),
+                    LOAD_LIBRARY_SEARCH_SYSTEM32,
+                )
+            };
+            if hmod.is_null() {
+                debug!("could not load dnsapi.dll to flush DNS resolver cache");
+                return None;
+            }
+            match unsafe { load_proc::<DnsFlushResolverCacheFn>(hmod, c"DnsFlushResolverCache") } {
+                Ok(flush_fn) => {
+                    // Keep `dnsapi.dll` pinned for process lifetime so subsequent flushes never
+                    // take the Windows PEB loader lock via `LoadLibraryExW`/`FreeLibrary`.
+                    Some(flush_fn)
+                }
+                Err(_) => {
+                    unsafe {
+                        let _ = FreeLibrary(hmod);
+                    }
+                    None
+                }
+            }
+        })
+    }
+
+    /// Best-effort call to cached `DnsFlushResolverCache()` in `dnsapi.dll`, coalescing
+    /// repeated calls within [`DNS_FLUSH_COALESCE_WINDOW`] (1.5s).
     ///
     /// Clears stale ISP-poisoned DNS entries from Windows `Dnscache` so browsers (such as Chrome)
     /// drop pre-TUN sockets and pick up the TUN interface immediately without a restart.
     fn flush_dns_resolver_cache() {
-        let dnsapi_w = encode_wide("dnsapi.dll");
-        let hmod = unsafe {
-            LoadLibraryExW(
-                dnsapi_w.as_ptr(),
-                ptr::null_mut(),
-                LOAD_LIBRARY_SEARCH_SYSTEM32,
-            )
-        };
-        if hmod.is_null() {
-            debug!("could not load dnsapi.dll to flush DNS resolver cache");
+        let Some(flush_fn) = resolve_dns_flush_fn() else {
             return;
-        }
-        let _guard = ModuleGuard(hmod);
-        if let Ok(flush_fn) =
-            unsafe { load_proc::<DnsFlushResolverCacheFn>(hmod, c"DnsFlushResolverCache") }
+        };
+        let now = Instant::now();
         {
-            let ok = unsafe { flush_fn() };
-            debug!(ok = (ok != 0), "invoked DnsFlushResolverCache()");
+            let mut last = LAST_DNS_FLUSH
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if last.is_some_and(|prev| now.duration_since(prev) < DNS_FLUSH_COALESCE_WINDOW) {
+                debug!("coalesced duplicate DnsFlushResolverCache() within 1.5s window");
+                return;
+            }
+            *last = Some(now);
         }
+        let ok = unsafe { flush_fn() };
+        debug!(ok = (ok != 0), "invoked DnsFlushResolverCache()");
     }
 
-    /// Lock-free shared state read inside the `NotifyRouteChange2` callback.
+    /// Lock-free shared state read inside the `NotifyRouteChange2` and
+    /// `NotifyUnicastIpAddressChange` callbacks.
     struct RouteNotifyContext {
         vdpi_luid: u64,
         generation: AtomicU64,
         force_reconcile_gen: AtomicU64,
+        dad_tentative_pending: AtomicBool,
         wake_event: SendHandle,
     }
 
@@ -4379,19 +5052,25 @@ mod win32 {
     unsafe impl Send for NotifyCtxPtr {}
 
     /// Lock-free `NotifyRouteChange2` callback: never calls any `iphlpapi` function,
-    /// ignores mutations on `vdpi_luid`, and signals the off-callback debounce thread.
+    /// ignores `MibParameterNotification`, non-default/non-split-default prefixes (`> /1`),
+    /// and mutations on `vdpi_luid`, then signals the off-callback debounce thread.
     unsafe extern "system" fn route_change_callback(
         caller_context: *const c_void,
         row: *const MIB_IPFORWARD_ROW2,
-        _notification_type: MIB_NOTIFICATION_TYPE,
+        notification_type: MIB_NOTIFICATION_TYPE,
     ) {
-        if caller_context.is_null() {
+        if caller_context.is_null() || notification_type == MibParameterNotification {
             return;
         }
         let ctx = &*caller_context.cast::<RouteNotifyContext>();
         if !row.is_null() {
             let row_luid = (*row).InterfaceLuid.Value;
             if row_luid == ctx.vdpi_luid {
+                return;
+            }
+            // Keep `/0` default routes and `/1` VPN split-default routes; ignore `/2`..`/128`
+            // LAN/host/neighbor route churn to avoid NDIS `GetIfTable2` DPC storms.
+            if (*row).DestinationPrefix.PrefixLength > 1 {
                 return;
             }
         }
@@ -4400,13 +5079,12 @@ mod win32 {
     }
 
     /// Lock-free `NotifyUnicastIpAddressChange` callback: never calls any `iphlpapi` function,
-    /// ignores mutations on `vdpi_luid`, and signals the off-callback debounce thread so DAD
-    /// tentative-to-preferred transitions on Wi-Fi/Hotspot/Ethernet handoff immediately wake
-    /// uplink detection.
+    /// ignores `vdpi_luid`, link-local/loopback/`IpSuffixOriginRandom` rows, and periodic
+    /// `MibParameterNotification` lifetime refreshes unless DAD preferred state changed.
     unsafe extern "system" fn unicast_ip_change_callback(
         caller_context: *const c_void,
         row: *const MIB_UNICASTIPADDRESS_ROW,
-        _notification_type: MIB_NOTIFICATION_TYPE,
+        notification_type: MIB_NOTIFICATION_TYPE,
     ) {
         if caller_context.is_null() {
             return;
@@ -4417,6 +5095,48 @@ mod win32 {
             if row_luid == ctx.vdpi_luid {
                 return;
             }
+            if is_ipv6_privacy_suffix_origin((*row).SuffixOrigin) {
+                return;
+            }
+            let family = (*row).Address.si_family;
+            if family == AF_INET {
+                let ip = in_addr_to_ipv4((*row).Address.Ipv4.sin_addr);
+                if ip.is_unspecified() || ip.is_loopback() || ip.is_link_local() {
+                    return;
+                }
+            } else if family == AF_INET6 {
+                let ip = Ipv6Addr::from((*row).Address.Ipv6.sin6_addr.u.Byte);
+                if ip.is_unspecified()
+                    || ip.is_loopback()
+                    || (ip.segments()[0] & 0xffc0) == 0xfe80
+                    || !is_ipv6_global_unicast(ip)
+                {
+                    return;
+                }
+            } else {
+                return;
+            }
+
+            let is_preferred =
+                (*row).DadState == IpDadStatePreferred && (*row).PreferredLifetime != 0;
+            if notification_type == MibParameterNotification {
+                if !is_preferred {
+                    if (*row).DadState == IpDadStateTentative {
+                        ctx.dad_tentative_pending.store(true, Ordering::Release);
+                    }
+                    if (*row).DadState != IpDadStateDeprecated {
+                        return;
+                    }
+                } else if !ctx.dad_tentative_pending.swap(false, Ordering::AcqRel) {
+                    // Periodic RA/DHCP lifetime refresh on an already-preferred address.
+                    return;
+                }
+            } else if notification_type == MibAddInstance && !is_preferred {
+                ctx.dad_tentative_pending.store(true, Ordering::Release);
+                return;
+            }
+        } else if notification_type == MibParameterNotification {
+            return;
         }
         ctx.generation.fetch_add(1, Ordering::SeqCst);
         let _ = SetEvent(ctx.wake_event.as_raw());
@@ -4491,15 +5211,19 @@ mod win32 {
 
                     match detect_physical_uplink(vdpi_luid) {
                         Ok(uplink) => {
-                            let next_sig = uplink.signature();
-                            let target = uplink.to_outbound_target();
-                            let prev = binder.snapshot();
                             let roaming_plan = plan_tun_roaming_transition(
                                 stack_state,
                                 tun_ipv6,
                                 uplink.v4.is_some(),
                                 uplink.v6.is_some(),
                             );
+                            // Ignore IPv6 changes when IPv6 TUN mode is inactive (`!tun_ipv6 &&
+                            // uplink.v4.is_some()`) so IPv6 RA/privacy churn never triggers
+                            // `flush_dns_resolver_cache()` or `route_tx.send()` (`drain_udp_nat`).
+                            let track_v6 = roaming_plan.next_state.ipv6_active;
+                            let next_sig = uplink.effective_signature(track_v6);
+                            let target = uplink.to_outbound_target(track_v6);
+                            let prev = binder.snapshot();
                             let uplink_changed = next_sig != last_sig
                                 || target != prev
                                 || roaming_plan.has_changes();
@@ -4534,6 +5258,13 @@ mod win32 {
                                         roaming_plan,
                                         &ipv6_active,
                                     );
+                                    if stack_state.ipv6_active != track_v6 {
+                                        binder.update(
+                                            uplink.to_outbound_target(stack_state.ipv6_active),
+                                        );
+                                        last_sig =
+                                            uplink.effective_signature(stack_state.ipv6_active);
+                                    }
                                     info!(
                                         iface = VDPI_TUN_NAME,
                                         prev_v4_routes,
@@ -4590,20 +5321,21 @@ mod win32 {
             .name("vdpi-wintun-rx".to_string())
             .spawn(move || {
                 let handles = [read_event.as_raw(), stop_event.as_raw()];
-                let mut burst: Vec<Vec<u8>> = Vec::with_capacity(RX_BURST_LIMIT);
 
                 'outer: loop {
                     if stop_flag.load(Ordering::Acquire) {
                         break;
                     }
 
-                    // Drain queued IP packets in full bursts from WintunReceivePacket until the
-                    // ring reports ERROR_NO_MORE_ITEMS before waiting on WaitForMultipleObjects.
+                    // Drain queued IP packets directly from WintunReceivePacket and forward each
+                    // packet immediately via try_send (no staging Vec delaying packet 0). Cap
+                    // consecutive drain iterations to RX_BURST_LIMIT (64) before yielding so RX
+                    // cannot pin a CPU core or starve MMCSS audio threads.
                     loop {
-                        burst.clear();
+                        let mut drained = 0usize;
                         let mut ring_empty = false;
 
-                        while burst.len() < RX_BURST_LIMIT {
+                        while drained < RX_BURST_LIMIT {
                             if stop_flag.load(Ordering::Acquire) {
                                 break 'outer;
                             }
@@ -4618,7 +5350,55 @@ mod win32 {
                                 unsafe {
                                     (wintun.release_receive_packet)(session.as_raw(), pkt_ptr);
                                 }
-                                burst.push(pkt);
+                                drained += 1;
+
+                                match inbound_tx.try_send(pkt) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(mut pkt)) => {
+                                        if is_tcp_ip_packet(&pkt) {
+                                            trace!(
+                                                len = pkt.len(),
+                                                "inbound TUN channel full; dropping TCP packet to prevent HOL blocking and teardown stall"
+                                            );
+                                        } else {
+                                            // Non-TCP (UDP/DNS/ICMP): retry briefly while checking
+                                            // stop_flag/stop_event so teardown can never deadlock.
+                                            let pkt_len = pkt.len();
+                                            let mut sent = false;
+                                            for _ in 0..3 {
+                                                if stop_flag.load(Ordering::Acquire)
+                                                    || unsafe {
+                                                        WaitForSingleObject(stop_event.as_raw(), 0)
+                                                    } == WAIT_OBJECT_0
+                                                {
+                                                    break 'outer;
+                                                }
+                                                thread::yield_now();
+                                                match inbound_tx.try_send(pkt) {
+                                                    Ok(()) => {
+                                                        sent = true;
+                                                        break;
+                                                    }
+                                                    Err(mpsc::error::TrySendError::Full(p)) => {
+                                                        pkt = p;
+                                                    }
+                                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                                        break 'outer;
+                                                    }
+                                                }
+                                            }
+                                            if !sent {
+                                                trace!(
+                                                    len = pkt_len,
+                                                    "inbound TUN channel full; dropping non-TCP packet after brief retries"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        break 'outer;
+                                    }
+                                }
                                 continue;
                             }
 
@@ -4635,28 +5415,10 @@ mod win32 {
                             break 'outer;
                         }
 
-                        for pkt in burst.drain(..) {
-                            match inbound_tx.try_send(pkt) {
-                                Ok(()) => {}
-                                Err(mpsc::error::TrySendError::Full(pkt)) => {
-                                    // Backpressure rather than silently dropping TCP segments
-                                    // (smoltcp lacks sender SACK, so a single drop triggers an RTO stall).
-                                    if stop_flag.load(Ordering::Acquire) {
-                                        break 'outer;
-                                    }
-                                    if inbound_tx.blocking_send(pkt).is_err() {
-                                        break 'outer;
-                                    }
-                                }
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    break 'outer;
-                                }
-                            }
-                        }
-
                         if ring_empty {
                             break;
                         }
+                        thread::yield_now();
                     }
 
                     let wait = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
@@ -4678,12 +5440,52 @@ mod win32 {
             .context("failed to spawn Wintun RX thread")
     }
 
+    /// Rate limiter for `WintunAllocateSendPacket` non-overflow warnings (logs first occurrence,
+    /// then at most once per 10 seconds with the suppressed count).
+    struct TxAllocWarnLimiter {
+        last_logged: Option<Instant>,
+        suppressed: u64,
+    }
+
+    impl TxAllocWarnLimiter {
+        fn new() -> Self {
+            Self {
+                last_logged: None,
+                suppressed: 0,
+            }
+        }
+
+        fn warn_alloc_failed(&mut self, err: u32) {
+            const WARN_INTERVAL: Duration = Duration::from_secs(10);
+            let now = Instant::now();
+            match self.last_logged {
+                None => {
+                    self.last_logged = Some(now);
+                    warn!(error = err, "WintunAllocateSendPacket failed");
+                }
+                Some(prev) if now.duration_since(prev) >= WARN_INTERVAL => {
+                    let suppressed = self.suppressed;
+                    self.suppressed = 0;
+                    self.last_logged = Some(now);
+                    warn!(
+                        error = err,
+                        suppressed,
+                        "WintunAllocateSendPacket failed"
+                    );
+                }
+                Some(_) => {
+                    self.suppressed = self.suppressed.saturating_add(1);
+                }
+            }
+        }
+    }
+
     fn send_wintun_packet(
         wintun: &WintunApi,
         session: SendHandle,
         stop_flag: &AtomicBool,
         pkt: &[u8],
-        yielded_in_burst: &mut bool,
+        warn_limiter: &mut TxAllocWarnLimiter,
     ) -> bool {
         if pkt.is_empty() || pkt.len() > WINTUN_MAX_IP_PACKET_SIZE {
             return true;
@@ -4695,18 +5497,25 @@ mod win32 {
                 if stop_flag.load(Ordering::Acquire) {
                     return false;
                 }
-                // With a 16 MiB ring, overflow only happens under true saturation. Yield at most
-                // once per drained burst (never per-packet up to TX_BATCH_LIMIT times, and never
-                // with microsecond sleeps or spin loops that spike Windows DPC/audio latency such
-                // as VoiceMeeter), then tail-drop fast so TCP congestion control adapts naturally.
-                if !*yielded_in_burst {
-                    *yielded_in_burst = true;
-                    thread::yield_now();
-                    dst = unsafe {
-                        (wintun.allocate_send_packet)(session.as_raw(), pkt.len() as u32)
-                    };
-                    if dst.is_null() {
+                // Tail-drop TCP immediately so congestion control adapts without stalling TX or
+                // spiking DPC/audio latency; for latency-sensitive UDP/DNS/ICMP packets, allow
+                // up to 3 brief yields before dropping.
+                if !is_tcp_ip_packet(pkt) {
+                    for _ in 0..3 {
+                        if stop_flag.load(Ordering::Acquire) {
+                            return false;
+                        }
+                        thread::yield_now();
+                        dst = unsafe {
+                            (wintun.allocate_send_packet)(session.as_raw(), pkt.len() as u32)
+                        };
+                        if !dst.is_null() {
+                            break;
+                        }
                         err = unsafe { GetLastError() };
+                        if err != ERROR_BUFFER_OVERFLOW {
+                            break;
+                        }
                     }
                 }
             }
@@ -4714,6 +5523,7 @@ mod win32 {
                 if err == ERROR_BUFFER_OVERFLOW {
                     trace!(
                         len = pkt.len(),
+                        tcp = is_tcp_ip_packet(pkt),
                         "Wintun TX ring full; tail-dropping outbound packet"
                     );
                     return true;
@@ -4722,7 +5532,7 @@ mod win32 {
                     debug!("Wintun TX ring reached EOF; exiting TX thread");
                     return false;
                 }
-                warn!(error = err, "WintunAllocateSendPacket failed");
+                warn_limiter.warn_alloc_failed(err);
                 return true;
             }
         }
@@ -4745,13 +5555,13 @@ mod win32 {
             .name("vdpi-wintun-tx".to_string())
             .spawn(move || {
                 let mut batch: Vec<Vec<u8>> = Vec::with_capacity(TX_BATCH_LIMIT);
+                let mut warn_limiter = TxAllocWarnLimiter::new();
                 'outer: loop {
                     batch.clear();
                     let count = outbound_rx.blocking_recv_many(&mut batch, TX_BATCH_LIMIT);
                     if count == 0 || stop_flag.load(Ordering::Acquire) {
                         break;
                     }
-                    let mut yielded_in_burst = false;
                     for pkt in batch.drain(..) {
                         if stop_flag.load(Ordering::Acquire) {
                             break 'outer;
@@ -4761,7 +5571,7 @@ mod win32 {
                             session,
                             &stop_flag,
                             &pkt,
-                            &mut yielded_in_burst,
+                            &mut warn_limiter,
                         ) {
                             break 'outer;
                         }
@@ -4844,8 +5654,11 @@ mod win32 {
                     "no active physical network uplink detected; connect to Wi-Fi or Ethernet and retry"
                 );
             }
-            let initial_uplink_sig = uplink.signature();
-            binder.update(uplink.to_outbound_target());
+            let ipv6_only_uplink = uplink.v4.is_none() && uplink.v6.is_some();
+            let ipv6_enabled =
+                should_enable_tun_ipv6(tun_ipv6, uplink.v4.is_some(), uplink.v6.is_some());
+            let initial_uplink_sig = uplink.effective_signature(ipv6_enabled);
+            binder.update(uplink.to_outbound_target(ipv6_enabled));
             let mut binder_guard = BinderResetGuard {
                 binder: Some(Arc::clone(&binder)),
             };
@@ -4853,6 +5666,7 @@ mod win32 {
                 nic = ?uplink.nic_name,
                 v4_if = ?uplink.v4.as_ref().map(|u| (u.if_index, u.luid, u.combined_metric, u.gateway)),
                 v6_if = ?uplink.v6.as_ref().map(|u| (u.if_index, u.luid, u.combined_metric, u.gateway)),
+                ipv6_enabled,
                 "detected Windows physical uplink"
             );
 
@@ -4880,9 +5694,6 @@ mod win32 {
             // (`64:ff9b::/96`) routes when requested and backed by an active global-unicast IPv6
             // uplink, or automatically on an IPv6-only uplink (`uplink.v4.is_none() &&
             // uplink.v6.is_some()`).
-            let ipv6_only_uplink = uplink.v4.is_none() && uplink.v6.is_some();
-            let ipv6_enabled =
-                should_enable_tun_ipv6(tun_ipv6, uplink.v4.is_some(), uplink.v6.is_some());
             if ipv6_only_uplink && !tun_ipv6 {
                 info!(
                     iface = VDPI_TUN_NAME,
@@ -4897,13 +5708,17 @@ mod win32 {
                     add_ipv6_route(vdpi_luid, dest, prefix_len)?;
                 }
             }
+            // Install managed Windows NRPT catch-all DNS policy rule so Windows SMHNR cannot
+            // race/leak queries over physical IPv6/IPv4 NICs (`DNS-Client 8048`).
+            install_vdpi_nrpt_rule(&format_vdpi_nrpt_dns_servers(ipv6_enabled));
+
             let initial_stack_state = TunStackState {
                 ipv4_routes_installed: uplink.v4.is_some(),
                 ipv6_active: ipv6_enabled,
             };
             let ipv6_active = Arc::new(AtomicBool::new(ipv6_enabled));
 
-            // Start Wintun packet ring session (16 MiB per ring).
+            // Start Wintun packet ring session (4 MiB per ring).
             let raw_session = unsafe {
                 (wintun.start_session)(adapter_guard.handle.as_raw(), WINTUN_RING_CAPACITY)
             };
@@ -4938,6 +5753,7 @@ mod win32 {
                 vdpi_luid,
                 generation: AtomicU64::new(0),
                 force_reconcile_gen: AtomicU64::new(0),
+                dad_tentative_pending: AtomicBool::new(false),
                 wake_event: route_wake_event.into_raw(),
             });
             let cb_ctx_raw = Arc::into_raw(Arc::clone(&notify_ctx));
@@ -5152,8 +5968,9 @@ mod win32 {
             }
 
             // 4. End Wintun session, explicitly delete `vdpi0` routes & DNS BEFORE closing the
-            //    adapter, close adapter, clean residual Tcpip/Tcpip6 interface keys, close stop
-            //    event, reset the outbound binder, and always flush the DNS resolver cache.
+            //    adapter, close adapter, clean residual Tcpip/Tcpip6 interface keys, remove the
+            //    managed NRPT DNS policy rule, close stop event, reset the outbound binder, and
+            //    flush the DNS resolver cache.
             if !self.session.is_null() {
                 unsafe { (self.wintun.end_session)(self.session.as_raw()) };
                 self.session = SendHandle(ptr::null_mut());
@@ -5164,6 +5981,9 @@ mod win32 {
                 self.adapter = SendHandle(ptr::null_mut());
             }
             let _ = delete_residual_vdpi_tcpip_interface_keys();
+            if let Err(err) = remove_vdpi_nrpt_rule() {
+                warn!(error = %err, "failed to remove managed Windows NRPT rule during session teardown");
+            }
             if !self.stop_event.is_null() {
                 unsafe {
                     let _ = CloseHandle(self.stop_event.as_raw());
@@ -5273,8 +6093,7 @@ mod tests {
             Ipv6Addr::new(0xfd00, 0x7664, 0x7069, 0, 0, 0, 0, 2)
         );
         assert_eq!(VDPI_TUN_DNS_V6.to_string(), "fd00:7664:7069::2");
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        assert_eq!(VDPI_TUN_MTU, vdpi_tun::config::DESKTOP_MTU as u32);
+        assert_eq!(VDPI_TUN_MTU, 4096);
     }
 
     #[test]
@@ -5397,6 +6216,7 @@ mod tests {
                 route_metric: 0,
                 iface_metric: 5,
                 has_unicast_ip: true,
+                is_hardware_interface: false,
             },
             UplinkCandidate {
                 luid: 0x1001,
@@ -5408,6 +6228,7 @@ mod tests {
                 route_metric: 0,
                 iface_metric: 1,
                 has_unicast_ip: true,
+                is_hardware_interface: false,
             },
             UplinkCandidate {
                 luid: 0x1002,
@@ -5419,6 +6240,7 @@ mod tests {
                 route_metric: 0,
                 iface_metric: 10,
                 has_unicast_ip: true,
+                is_hardware_interface: false,
             },
             UplinkCandidate {
                 luid: 0x1003,
@@ -5430,6 +6252,7 @@ mod tests {
                 route_metric: 0,
                 iface_metric: 5,
                 has_unicast_ip: true,
+                is_hardware_interface: false,
             },
             UplinkCandidate {
                 luid: 0x1004,
@@ -5441,6 +6264,7 @@ mod tests {
                 route_metric: 0,
                 iface_metric: 5,
                 has_unicast_ip: true,
+                is_hardware_interface: true,
             },
             UplinkCandidate {
                 luid: 0x1005,
@@ -5452,6 +6276,7 @@ mod tests {
                 route_metric: 0,
                 iface_metric: 10,
                 has_unicast_ip: false,
+                is_hardware_interface: true,
             },
             UplinkCandidate {
                 luid: 0x2001,
@@ -5463,6 +6288,7 @@ mod tests {
                 route_metric: 0,
                 iface_metric: 45,
                 has_unicast_ip: true,
+                is_hardware_interface: true,
             },
             UplinkCandidate {
                 luid: 0x2002,
@@ -5474,6 +6300,7 @@ mod tests {
                 route_metric: 5,
                 iface_metric: 25,
                 has_unicast_ip: true,
+                is_hardware_interface: true,
             },
         ];
 
@@ -5790,6 +6617,7 @@ mod tests {
             route_metric: 0,
             iface_metric: metric,
             has_unicast_ip: true,
+            is_hardware_interface: !is_hyperv_vethernet(alias, desc),
         };
 
         let internal_only = vec![
@@ -5931,19 +6759,23 @@ mod tests {
         );
         assert!(
             src.contains("mpsc::channel::<Vec<u8>>(TUN_CHANNEL_CAPACITY)"),
-            "inbound channel must keep TUN_CHANNEL_CAPACITY (4096)"
+            "inbound channel must keep TUN_CHANNEL_CAPACITY (2048)"
         );
         assert!(
             src.contains("mpsc::channel::<Vec<u8>>(TUN_TX_CHANNEL_CAPACITY)"),
-            "outbound channel must use TUN_TX_CHANNEL_CAPACITY (128) for sub-ms UDP preemption"
+            "outbound channel must use TUN_TX_CHANNEL_CAPACITY (512)"
+        );
+        assert!(
+            !src.contains(concat!("blocking_", "send")),
+            "windows_tun.rs RX thread must never call blocking send (prevents HOL blocking and teardown deadlocks)"
         );
         #[cfg(target_os = "windows")]
         {
-            assert_eq!(win32::TUN_CHANNEL_CAPACITY, 4096);
-            assert_eq!(win32::TUN_TX_CHANNEL_CAPACITY, 128);
-            assert_eq!(win32::TUN_TX_CHANNEL_CAPACITY, win32::TX_BATCH_LIMIT);
-            assert_eq!(win32::TX_BATCH_LIMIT, 128);
-            assert_eq!(win32::RX_BURST_LIMIT, 128);
+            assert_eq!(win32::WINTUN_RING_CAPACITY, 0x0040_0000);
+            assert_eq!(win32::TUN_CHANNEL_CAPACITY, 2048);
+            assert_eq!(win32::TUN_TX_CHANNEL_CAPACITY, 512);
+            assert_eq!(win32::TX_BATCH_LIMIT, 32);
+            assert_eq!(win32::RX_BURST_LIMIT, 64);
         }
     }
 
@@ -5960,6 +6792,7 @@ mod tests {
             route_metric: 0,
             iface_metric: metric,
             has_unicast_ip: true,
+            is_hardware_interface: false,
         };
 
         // True NAT switches must still be excluded.
@@ -6581,5 +7414,249 @@ mod tests {
             !src.contains(concat!("netsh", ".exe")),
             "windows_tun.rs must not contain legacy netsh DNS shell-out binaries"
         );
+    }
+
+    #[test]
+    fn radmin_extended_vpn_tokens_hyperv_internal_private_and_hardware_interface_ranking() {
+        let vdpi_luid = 0xAA00_0001;
+        let excluded_adapters = [
+            ("Radmin VPN", "Radmin VPN"),
+            ("Ethernet 7", "Famatech Radmin VPN Ethernet Adapter"),
+            ("Hamachi", "LogMeIn Hamachi Virtual Ethernet Adapter"),
+            ("VPN - VPN Client", "VPN Client Adapter - SoftEther"),
+            ("AmneziaWG", "AmneziaVPN Tunnel"),
+            ("SurfsharkWireGuard", "Surfshark Tunnel"),
+            ("ExpressVPN Wintun", "ExpressVPN TAP Adapter"),
+            ("Windscribe", "Windscribe IKEv2"),
+            ("AdGuard VPN", "AdGuard Tunnel"),
+            ("Outline", "Outline TAP"),
+            ("IVPN", "IVPN WireGuard"),
+            ("vEthernet (Internal)", "Hyper-V Virtual Ethernet Adapter"),
+            (
+                "vEthernet (Internal Switch)",
+                "Hyper-V Virtual Ethernet Adapter #2",
+            ),
+            ("vEthernet (Private)", "Hyper-V Virtual Ethernet Adapter #3"),
+            (
+                "vEthernet (Private Lab)",
+                "Hyper-V Virtual Ethernet Adapter #4",
+            ),
+        ];
+        for (alias, desc) in excluded_adapters {
+            assert!(
+                is_virtual_or_excluded_adapter(NDIS_IF_TYPE_ETHERNET, alias, desc),
+                "expected virtual/VPN/internal adapter ({alias} / {desc}) to be excluded"
+            );
+        }
+
+        // Physical NICs and non-internal External Hyper-V vSwitches remain eligible.
+        assert!(!is_virtual_or_excluded_adapter(
+            NDIS_IF_TYPE_ETHERNET,
+            "Ethernet 4",
+            "Realtek PCIe 2.5GbE Family Controller",
+        ));
+        assert!(!is_virtual_or_excluded_adapter(
+            NDIS_IF_TYPE_ETHERNET,
+            "vEthernet (External)",
+            "Hyper-V Virtual Ethernet Adapter #5",
+        ));
+
+        // HardwareInterface == true strictly beats software Ethernet adapters even when the
+        // software adapter has a lower route/interface metric.
+        let candidates = vec![
+            UplinkCandidate {
+                luid: 0x5001,
+                if_index: 3,
+                alias: "Radmin VPN".into(),
+                description: "Radmin VPN".into(),
+                if_type: NDIS_IF_TYPE_ETHERNET,
+                is_up: true,
+                route_metric: 0,
+                iface_metric: 5,
+                has_unicast_ip: true,
+                is_hardware_interface: false,
+            },
+            UplinkCandidate {
+                luid: 0x5002,
+                if_index: 4,
+                alias: "Custom Software NIC".into(),
+                description: "Unknown Software Ethernet Driver".into(),
+                if_type: NDIS_IF_TYPE_ETHERNET,
+                is_up: true,
+                route_metric: 0,
+                iface_metric: 5,
+                has_unicast_ip: true,
+                is_hardware_interface: false,
+            },
+            UplinkCandidate {
+                luid: 0x5003,
+                if_index: 12,
+                alias: "Ethernet 4".into(),
+                description: "Realtek PCIe 2.5GbE Family Controller".into(),
+                if_type: NDIS_IF_TYPE_ETHERNET,
+                is_up: true,
+                route_metric: 0,
+                iface_metric: 25,
+                has_unicast_ip: true,
+                is_hardware_interface: true,
+            },
+        ];
+        let winner =
+            rank_physical_uplink(&candidates, vdpi_luid).expect("hardware physical NIC must win");
+        assert_eq!(winner.alias, "Ethernet 4");
+        assert!(winner.is_hardware_interface);
+        assert_eq!(winner.if_index, 12);
+    }
+
+    #[test]
+    fn ipv6_privacy_address_filtering_and_inactive_ipv6_signature_suppression() {
+        let perm_v6: Ipv6Addr = "2001:db8:1::10".parse().unwrap();
+        let temp_v6_a: Ipv6Addr = "2001:db8:1::a1b2:c3d4".parse().unwrap();
+        let temp_v6_b: Ipv6Addr = "2001:db8:1::dead:beef".parse().unwrap();
+        let link_local: Ipv6Addr = "fe80::1".parse().unwrap();
+
+        assert!(is_ipv6_privacy_suffix_origin(IP_SUFFIX_ORIGIN_RANDOM));
+        assert!(!is_ipv6_privacy_suffix_origin(3)); // IpSuffixOriginDhcp
+        assert!(!is_ipv6_privacy_suffix_origin(4)); // IpSuffixOriginLinkLayerAddress
+
+        // Permanent + rotating RFC 4941 temporary privacy addresses yield identical stable sets.
+        let (has_a, stable_a) = collect_stable_ipv6_addrs(&[
+            (link_local, 4),
+            (perm_v6, 4),
+            (temp_v6_a, IP_SUFFIX_ORIGIN_RANDOM),
+        ]);
+        let (has_b, stable_b) = collect_stable_ipv6_addrs(&[
+            (link_local, 4),
+            (perm_v6, 4),
+            (temp_v6_b, IP_SUFFIX_ORIGIN_RANDOM),
+        ]);
+        assert!(has_a);
+        assert!(has_b);
+        assert_eq!(stable_a, vec![perm_v6]);
+        assert_eq!(stable_a, stable_b);
+
+        // When only a temporary global IPv6 address exists, `has_usable_global_v6` stays true
+        // while `stable_global_v6_addrs` stays empty so rotation does not churn signatures.
+        let (has_temp_only, stable_temp_only) =
+            collect_stable_ipv6_addrs(&[(link_local, 4), (temp_v6_a, IP_SUFFIX_ORIGIN_RANDOM)]);
+        assert!(has_temp_only);
+        assert!(stable_temp_only.is_empty());
+
+        // Link-local only yields false + empty.
+        let (has_ll, stable_ll) = collect_stable_ipv6_addrs(&[(link_local, 4)]);
+        assert!(!has_ll);
+        assert!(stable_ll.is_empty());
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::net::IpAddr;
+            let mk_dual = |v6_ip: Ipv6Addr, v6_gw: Ipv6Addr| win32::DetectedUplink {
+                nic_name: Some("Ethernet 4".into()),
+                v4: Some(win32::UplinkEndpoint {
+                    luid: 0x7001,
+                    if_index: 4,
+                    alias: "Ethernet 4".into(),
+                    combined_metric: 25,
+                    gateway: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+                    local_addrs: vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50))],
+                }),
+                v6: Some(win32::UplinkEndpoint {
+                    luid: 0x7001,
+                    if_index: 4,
+                    alias: "Ethernet 4".into(),
+                    combined_metric: 25,
+                    gateway: IpAddr::V6(v6_gw),
+                    local_addrs: vec![IpAddr::V6(v6_ip)],
+                }),
+            };
+            let u1 = mk_dual(perm_v6, "fe80::1".parse().unwrap());
+            let u2 = mk_dual(temp_v6_b, "fe80::2".parse().unwrap());
+
+            // When IPv6 TUN mode is inactive (`include_v6 = false`), v6 churn is ignored and
+            // `to_outbound_target(false)` clears `if_index_v6` to `None`.
+            assert_eq!(u1.effective_signature(false), u2.effective_signature(false));
+            assert_eq!(u1.effective_signature(false).v6, None);
+            let target_v4_only = u1.to_outbound_target(false);
+            assert_eq!(target_v4_only.if_index_v4, Some(4));
+            assert_eq!(target_v4_only.if_index_v6, None);
+
+            // When IPv6 TUN mode is active (`include_v6 = true`), v6 changes ARE tracked and
+            // `if_index_v6` is populated.
+            assert_ne!(u1.effective_signature(true), u2.effective_signature(true));
+            let target_dual = u1.to_outbound_target(true);
+            assert_eq!(target_dual.if_index_v4, Some(4));
+            assert_eq!(target_dual.if_index_v6, Some(4));
+        }
+    }
+
+    #[test]
+    fn nrpt_rule_formatting_guid_parsing_and_tcp_packet_detection() {
+        assert_eq!(VDPI_NRPT_RULE_GUID, "{D7A4E10B-6E4A-4B9E-8F2C-766470690001}");
+        assert_eq!(
+            VDPI_NRPT_RULE_SUBKEY,
+            r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig\{D7A4E10B-6E4A-4B9E-8F2C-766470690001}"
+        );
+        assert_eq!(VDPI_NRPT_VERSION, 2);
+        assert_eq!(VDPI_NRPT_CONFIG_OPTIONS, 0x8);
+        assert_eq!(VDPI_NRPT_COMMENT, "vdpi managed DNS policy");
+        assert_eq!(format_vdpi_nrpt_dns_servers(false), "198.18.0.2");
+        assert_eq!(
+            format_vdpi_nrpt_dns_servers(true),
+            "198.18.0.2;fd00:7664:7069::2"
+        );
+        // `REG_MULTI_SZ` for `"."` must be UTF-16LE `".\0\0"` (6 bytes).
+        assert_eq!(
+            encode_reg_multi_sz_utf16_bytes(&["."]),
+            vec![0x2e, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
+
+        // GUID parser accepts braced uppercase/lowercase and rejects malformed strings.
+        assert_eq!(
+            parse_guid_braced(VDPI_NRPT_RULE_GUID),
+            Some((
+                0xD7A4_E10B,
+                0x6E4A,
+                0x4B9E,
+                [0x8F, 0x2C, 0x76, 0x64, 0x70, 0x69, 0x00, 0x01],
+            ))
+        );
+        assert_eq!(
+            parse_guid_braced("{76647069-5769-6e74-756e-563035300001}"),
+            Some((
+                0x7664_7069,
+                0x5769,
+                0x6e74,
+                [0x75, 0x6e, 0x56, 0x30, 0x35, 0x30, 0x00, 0x01],
+            ))
+        );
+        assert_eq!(parse_guid_braced("not-a-guid"), None);
+
+        // IPv4 TCP (proto 6) vs UDP (proto 17) and IPv6 TCP (next-header 6) vs UDP (17).
+        let mut ipv4_tcp = [0u8; 20];
+        ipv4_tcp[0] = 0x45;
+        ipv4_tcp[9] = 6;
+        assert!(is_tcp_ip_packet(&ipv4_tcp));
+
+        let mut ipv4_udp = ipv4_tcp;
+        ipv4_udp[9] = 17;
+        assert!(!is_tcp_ip_packet(&ipv4_udp));
+        assert!(!is_tcp_ip_packet(&ipv4_tcp[..10]));
+
+        let mut ipv6_tcp = [0u8; 40];
+        ipv6_tcp[0] = 0x60;
+        ipv6_tcp[6] = 6;
+        assert!(is_tcp_ip_packet(&ipv6_tcp));
+
+        let mut ipv6_udp = ipv6_tcp;
+        ipv6_udp[6] = 17;
+        assert!(!is_tcp_ip_packet(&ipv6_udp));
+
+        // IPv6 Hop-by-Hop extension header followed by TCP (next-header 6).
+        let mut ipv6_ext_tcp = [0u8; 48];
+        ipv6_ext_tcp[0] = 0x60;
+        ipv6_ext_tcp[6] = 0; // Hop-by-Hop
+        ipv6_ext_tcp[40] = 6; // Next Header = TCP
+        ipv6_ext_tcp[41] = 0; // Hdr Ext Len = 0 -> 8 bytes
+        assert!(is_tcp_ip_packet(&ipv6_ext_tcp));
     }
 }

@@ -1,9 +1,10 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, Manager, State};
 use tracing::{debug, warn};
+use vdpi_core::config::{RuntimeConfig, VpnCoexistence};
 
 use crate::models::{
     ActionErrorCodeDto, ActionResultDto, AppIconRequestDto, DesktopSettingsPayloadDto,
@@ -187,29 +188,52 @@ enum ReadinessWait {
     None,
     Live,
     LiveFreshVersion,
+    LiveEngine(EngineModeDto),
+}
+
+fn configured_vpn_coexistence(config_path: &str) -> VpnCoexistence {
+    let trimmed = config_path.trim();
+    if trimmed.is_empty() {
+        return RuntimeConfig::default().vpn_coexistence;
+    }
+    match vdpi::config_file::load_file_config_or_default(Some(Path::new(trimmed)), false) {
+        Ok((_, file_cfg)) => file_cfg
+            .vpn_coexistence
+            .unwrap_or_else(|| RuntimeConfig::default().vpn_coexistence),
+        Err(_) => RuntimeConfig::default().vpn_coexistence,
+    }
 }
 
 fn is_readiness_snapshot_ready(
     wait: ReadinessWait,
     snap: &DesktopStatusSnapshotDto,
     is_quitting: bool,
+    vpn_auto_yield: bool,
 ) -> bool {
     if is_quitting {
         return true;
     }
     match wait {
         ReadinessWait::None => true,
-        ReadinessWait::Live | ReadinessWait::LiveFreshVersion => {
-            if snap.service_state == ServiceStateDto::NotInstalled {
+        ReadinessWait::Live | ReadinessWait::LiveFreshVersion | ReadinessWait::LiveEngine(_) => {
+            if matches!(
+                snap.service_state,
+                ServiceStateDto::NotInstalled | ServiceStateDto::Stopped
+            ) {
                 return true;
             }
-            if snap.service_state == ServiceStateDto::Running && snap.vpn_conflict.is_some() {
+            if snap.service_state == ServiceStateDto::Running
+                && snap.vpn_conflict.is_some()
+                && vpn_auto_yield
+            {
                 return true;
             }
-            let has_live = snap.live.is_some();
             match wait {
-                ReadinessWait::Live => has_live,
-                ReadinessWait::LiveFreshVersion => has_live && !snap.live_version_stale,
+                ReadinessWait::Live => snap.live.is_some(),
+                ReadinessWait::LiveFreshVersion => snap.live.is_some() && !snap.live_version_stale,
+                ReadinessWait::LiveEngine(target) => {
+                    snap.live.as_ref().is_some_and(|live| live.engine == target)
+                }
                 ReadinessWait::None => true,
             }
         }
@@ -246,12 +270,18 @@ async fn refresh_and_broadcast_status_with_readiness(
     let snapshot = loop {
         let app_clone = app.clone();
         let force_full_refresh = attempt == 0;
-        let snap = tokio::task::spawn_blocking(move || {
+        let (snap, vpn_auto_yield) = tokio::task::spawn_blocking(move || {
             let state = app_clone.state::<DesktopAppState>();
             if force_full_refresh {
                 state.invalidate_static_cache();
             }
-            status::collect_status_snapshot_for_readiness(&state, force_full_refresh)
+            let snap = status::collect_status_snapshot_for_readiness(&state, force_full_refresh);
+            let vpn_auto_yield = if wait != ReadinessWait::None && snap.vpn_conflict.is_some() {
+                configured_vpn_coexistence(&snap.config_path) == VpnCoexistence::AutoYield
+            } else {
+                false
+            };
+            (snap, vpn_auto_yield)
         })
         .await
         .map_err(|err| format!("Failed to refresh status snapshot: {err}"))?;
@@ -259,7 +289,7 @@ async fn refresh_and_broadcast_status_with_readiness(
         let is_quitting = app
             .try_state::<DesktopAppState>()
             .is_some_and(|state| state.is_quitting());
-        if is_readiness_snapshot_ready(wait, &snap, is_quitting) {
+        if is_readiness_snapshot_ready(wait, &snap, is_quitting, vpn_auto_yield) {
             break snap;
         }
 
@@ -322,10 +352,19 @@ async fn refresh_and_broadcast_status_with_readiness(
     Ok(Box::new((*final_snapshot).clone()))
 }
 
-fn resolve_toggle_target(app: &AppHandle, connect: Option<bool>) -> Result<bool, ActionResultDto> {
-    let state = app.state::<DesktopAppState>();
-    let snapshot = status::collect_status_snapshot(&state, true);
+fn resolve_toggle_target_from_snapshot(
+    snapshot: &DesktopStatusSnapshotDto,
+    connect: Option<bool>,
+) -> Result<bool, ActionResultDto> {
     if snapshot.service_state == ServiceStateDto::NotInstalled {
+        let can_pause_orphan_live = match connect {
+            Some(false) => snapshot.live.is_some(),
+            None => snapshot.live.as_ref().is_some_and(|live| live.running),
+            Some(true) => false,
+        };
+        if can_pause_orphan_live {
+            return Ok(false);
+        }
         return Err(ActionResultDto {
             ok: false,
             message: "Background service is not installed. Install the service from Installation or Settings first."
@@ -333,8 +372,32 @@ fn resolve_toggle_target(app: &AppHandle, connect: Option<bool>) -> Result<bool,
             needs_restart: None,
             cancelled: None,
             code: None,
-            snapshot: Some(Box::new((*snapshot).clone())),
+            snapshot: Some(Box::new(snapshot.clone())),
         });
+    }
+
+    if connect == Some(true)
+        && snapshot.service_state == ServiceStateDto::Running
+        && snapshot.live.is_none()
+    {
+        if let Some(vpn_name) = snapshot.vpn_conflict.as_deref() {
+            let trimmed = vpn_name.trim();
+            let message = if trimmed.is_empty() {
+                "Protection is already running in standby while yielded to an active VPN. Disconnect the VPN or change VPN coexistence in Settings to resume.".to_string()
+            } else {
+                format!(
+                    "Protection is already running in standby while yielded to active VPN ({trimmed}). Disconnect the VPN or change VPN coexistence in Settings to resume."
+                )
+            };
+            return Err(ActionResultDto {
+                ok: true,
+                message,
+                needs_restart: Some(false),
+                cancelled: None,
+                code: None,
+                snapshot: Some(Box::new(snapshot.clone())),
+            });
+        }
     }
 
     let should_connect = match connect {
@@ -346,6 +409,12 @@ fn resolve_toggle_target(app: &AppHandle, connect: Option<bool>) -> Result<bool,
         }
     };
     Ok(should_connect)
+}
+
+fn resolve_toggle_target(app: &AppHandle, connect: Option<bool>) -> Result<bool, ActionResultDto> {
+    let state = app.state::<DesktopAppState>();
+    let snapshot = status::collect_status_snapshot(&state, true);
+    resolve_toggle_target_from_snapshot(&snapshot, connect)
 }
 
 /// Serialized handler invoked when the user toggles protection from the native
@@ -586,9 +655,12 @@ pub async fn toggle_protection(
 
     let should_connect = match target {
         Ok(should_connect) => should_connect,
-        Err(not_installed) => {
+        Err(early_result) => {
+            if let Some(ref snap) = early_result.snapshot {
+                tray::update_tray_visuals(&app, snap.as_ref());
+            }
             drop(busy_guard);
-            return Ok(not_installed);
+            return Ok(early_result);
         }
     };
 
@@ -639,9 +711,8 @@ pub async fn switch_engine(
         .await
         .map_err(|err| format!("Failed to switch engine: {err}"))?;
 
-    let wait = if result.ok && result.needs_restart != Some(true) && result.message.contains("restarted")
-    {
-        ReadinessWait::Live
+    let wait = if result.ok && result.needs_restart != Some(true) {
+        ReadinessWait::LiveEngine(engine)
     } else {
         ReadinessWait::None
     };
@@ -733,25 +804,29 @@ pub async fn get_app_icons(
         .map_err(|err| format!("Failed to resolve application icons: {err}"))
 }
 
+fn diagnostics_busy_error(active_op: Option<ServiceOperationDto>) -> Option<String> {
+    active_op.map(|op| busy_result_for_operation(Some(op)).message)
+}
+
 #[tauri::command]
 pub async fn run_diagnostics(app: AppHandle) -> Result<DiagnosticsReportDto, String> {
     let state = app.state::<DesktopAppState>();
     if state.is_quitting() {
         return Err("Application is shutting down.".to_string());
     }
-    if state.is_mutating_install_operation_active() {
-        return Err(busy_result_for_operation(state.active_operation()).message);
+    if let Some(busy_msg) = diagnostics_busy_error(state.active_operation()) {
+        return Err(busy_msg);
     }
 
     let app_clone = app.clone();
     let snapshot = tokio::task::spawn_blocking(move || {
         let state = app_clone.state::<DesktopAppState>();
-        if state.is_mutating_install_operation_active() {
-            return Err(busy_result_for_operation(state.active_operation()).message);
+        if let Some(busy_msg) = diagnostics_busy_error(state.active_operation()) {
+            return Err(busy_msg);
         }
         let snapshot = status::collect_status_snapshot(&state, true);
-        if crate::state::is_mutating_install_operation(snapshot.pending_operation) {
-            return Err(busy_result_for_operation(snapshot.pending_operation).message);
+        if let Some(busy_msg) = diagnostics_busy_error(snapshot.pending_operation) {
+            return Err(busy_msg);
         }
         Ok(snapshot)
     })
@@ -759,6 +834,14 @@ pub async fn run_diagnostics(app: AppHandle) -> Result<DiagnosticsReportDto, Str
     .map_err(|err| format!("Failed to collect status snapshot for diagnostics: {err}"))??;
 
     tray::update_tray_visuals(&app, &snapshot);
+    if crate::is_main_window_actively_visible(&app) {
+        if let Err(err) = app.emit_to(tray::MAIN_WINDOW_LABEL, STATUS_EVENT_NAME, &*snapshot) {
+            debug!(
+                error = %err,
+                "failed to emit fresh vdpi://status event during diagnostics"
+            );
+        }
+    }
     Ok(diagnostics::run_desktop_diagnostics(&snapshot).await)
 }
 
@@ -1111,12 +1194,36 @@ mod tests {
         };
 
         // LiveFreshVersion keeps waiting while live daemon is still on old version.
-        assert!(is_readiness_snapshot_ready(ReadinessWait::None, &snap, false));
-        assert!(is_readiness_snapshot_ready(ReadinessWait::Live, &snap, false));
+        assert!(is_readiness_snapshot_ready(
+            ReadinessWait::None,
+            &snap,
+            false,
+            true
+        ));
+        assert!(is_readiness_snapshot_ready(
+            ReadinessWait::Live,
+            &snap,
+            false,
+            true
+        ));
         assert!(!is_readiness_snapshot_ready(
             ReadinessWait::LiveFreshVersion,
             &snap,
-            false
+            false,
+            true
+        ));
+        // LiveEngine waits until live telemetry reports the exact target engine.
+        assert!(is_readiness_snapshot_ready(
+            ReadinessWait::LiveEngine(EngineModeDto::Tun),
+            &snap,
+            false,
+            true
+        ));
+        assert!(!is_readiness_snapshot_ready(
+            ReadinessWait::LiveEngine(EngineModeDto::Proxy),
+            &snap,
+            false,
+            true
         ));
 
         // Once live daemon reports the upgraded version, LiveFreshVersion exits ready.
@@ -1124,37 +1231,269 @@ mod tests {
         assert!(is_readiness_snapshot_ready(
             ReadinessWait::LiveFreshVersion,
             &snap,
-            false
+            false,
+            true
         ));
 
         // Offline service keeps waiting until live telemetry appears...
         snap.live = None;
-        assert!(!is_readiness_snapshot_ready(ReadinessWait::Live, &snap, false));
+        assert!(!is_readiness_snapshot_ready(
+            ReadinessWait::Live,
+            &snap,
+            false,
+            true
+        ));
         assert!(!is_readiness_snapshot_ready(
             ReadinessWait::LiveFreshVersion,
             &snap,
-            false
-        ));
-        // ...unless quitting, VPN-yielded while running, or NotInstalled (short-circuit).
-        assert!(is_readiness_snapshot_ready(
-            ReadinessWait::LiveFreshVersion,
-            &snap,
+            false,
             true
         ));
-        snap.vpn_conflict = Some("WireGuard".to_string());
+        assert!(!is_readiness_snapshot_ready(
+            ReadinessWait::LiveEngine(EngineModeDto::Tun),
+            &snap,
+            false,
+            true
+        ));
+        // ...unless quitting, VPN-yielded while running in AutoYield mode, Stopped, or NotInstalled.
         assert!(is_readiness_snapshot_ready(
             ReadinessWait::LiveFreshVersion,
             &snap,
+            true,
             false
+        ));
+        snap.vpn_conflict = Some("WireGuard".to_string());
+        // VPN conflict only short-circuits when vpn_coexistence is AutoYield (not Warn/Off).
+        assert!(!is_readiness_snapshot_ready(
+            ReadinessWait::LiveFreshVersion,
+            &snap,
+            false,
+            false
+        ));
+        assert!(!is_readiness_snapshot_ready(
+            ReadinessWait::LiveEngine(EngineModeDto::Tun),
+            &snap,
+            false,
+            false
+        ));
+        assert!(is_readiness_snapshot_ready(
+            ReadinessWait::LiveFreshVersion,
+            &snap,
+            false,
+            true
+        ));
+        assert!(is_readiness_snapshot_ready(
+            ReadinessWait::LiveEngine(EngineModeDto::Tun),
+            &snap,
+            false,
+            true
         ));
         snap.vpn_conflict = None;
-        snap.service_state = ServiceStateDto::NotInstalled;
-        assert!(is_readiness_snapshot_ready(ReadinessWait::Live, &snap, false));
+
+        // Stopped service short-circuits immediately so stopped repair/upgrade/switch never stalls.
+        snap.service_state = ServiceStateDto::Stopped;
+        assert!(is_readiness_snapshot_ready(
+            ReadinessWait::Live,
+            &snap,
+            false,
+            false
+        ));
         assert!(is_readiness_snapshot_ready(
             ReadinessWait::LiveFreshVersion,
             &snap,
+            false,
             false
         ));
+        assert!(is_readiness_snapshot_ready(
+            ReadinessWait::LiveEngine(EngineModeDto::Proxy),
+            &snap,
+            false,
+            false
+        ));
+
+        snap.service_state = ServiceStateDto::NotInstalled;
+        assert!(is_readiness_snapshot_ready(
+            ReadinessWait::Live,
+            &snap,
+            false,
+            false
+        ));
+        assert!(is_readiness_snapshot_ready(
+            ReadinessWait::LiveFreshVersion,
+            &snap,
+            false,
+            false
+        ));
+        assert!(is_readiness_snapshot_ready(
+            ReadinessWait::LiveEngine(EngineModeDto::Tun),
+            &snap,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn toggle_target_allows_pausing_orphan_live_and_avoids_noop_resume_when_vpn_yielded() {
+        use crate::models::{
+            CliVersionRelationDto, LiveTelemetryDto, SplitTunnelModeDto, WintunStatusDto,
+        };
+
+        let sample_live = LiveTelemetryDto {
+            running: true,
+            engine: EngineModeDto::Proxy,
+            addr: "127.0.0.1".to_string(),
+            port: 8080,
+            socks_port: Some(1080),
+            tun_interface: None,
+            physical_nic: None,
+            vpn_conflict: None,
+            version: Some("0.6.3".to_string()),
+            mode: Some("combo".to_string()),
+            doh_enabled: true,
+            dns_display: "1.1.1.1".to_string(),
+            block_quic: true,
+            active_connections: 0,
+            total_connections: 0,
+            learned_hosts: 0,
+            isp_stage: None,
+            udp_flows_active: 0,
+            quic_blocked: 0,
+            dns_queries: 0,
+            rss_kb: None,
+            bytes_rx: 0,
+            bytes_tx: 0,
+            rx_rate_bps: 0,
+            tx_rate_bps: 0,
+            tls_handshakes: 0,
+            auto_heal_escalations: 0,
+        };
+
+        let mut snap = DesktopStatusSnapshotDto {
+            snapshot_seq: 1,
+            app_version: "0.6.3".to_string(),
+            platform: "windows".to_string(),
+            service_state: ServiceStateDto::NotInstalled,
+            installed_version: None,
+            configured_engine: EngineModeDto::Proxy,
+            live: Some(sample_live),
+            vpn_conflict: None,
+            wintun: WintunStatusDto {
+                required: false,
+                ready: true,
+                message: None,
+            },
+            split_tunnel_mode: SplitTunnelModeDto::All,
+            split_tunnel_count: 0,
+            config_path: String::new(),
+            logs_dir: String::new(),
+            tray_supported: true,
+            config_warning: None,
+            bundled_engine_version: Some("0.6.3".to_string()),
+            cli_version_relation: CliVersionRelationDto::NotInstalled,
+            can_install_from_bundle: true,
+            live_version_stale: false,
+            pending_operation: None,
+            running_from_readonly_dmg: false,
+        };
+
+        // Orphan foreground daemon with NotInstalled service can be paused explicitly or via tray toggle.
+        assert_eq!(
+            resolve_toggle_target_from_snapshot(&snap, Some(false)).ok(),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_toggle_target_from_snapshot(&snap, None).ok(),
+            Some(false)
+        );
+        let err_connect = resolve_toggle_target_from_snapshot(&snap, Some(true))
+            .expect_err("cannot resume uninstalled service");
+        assert!(!err_connect.ok);
+        assert!(err_connect.message.contains("not installed"));
+
+        // NotInstalled with no live daemon rejects both pause and resume.
+        snap.live = None;
+        assert!(resolve_toggle_target_from_snapshot(&snap, Some(false)).is_err());
+        assert!(resolve_toggle_target_from_snapshot(&snap, None).is_err());
+
+        // Running service yielded to VPN with `connect == Some(true)` returns non-mutating explanation.
+        snap.service_state = ServiceStateDto::Running;
+        snap.vpn_conflict = Some("WireGuard (wg0)".to_string());
+        let yielded = resolve_toggle_target_from_snapshot(&snap, Some(true))
+            .expect_err("yielded VPN state must not run no-op elevated resume");
+        assert!(yielded.ok);
+        assert_eq!(yielded.needs_restart, Some(false));
+        assert!(yielded.message.contains("WireGuard (wg0)"));
+        assert!(yielded.message.contains("yielded"));
+        assert!(yielded.snapshot.is_some());
+
+        // Pausing a VPN-yielded running service still proceeds normally.
+        assert_eq!(
+            resolve_toggle_target_from_snapshot(&snap, Some(false)).ok(),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_toggle_target_from_snapshot(&snap, None).ok(),
+            Some(false)
+        );
+
+        // Stopped service toggles to connect.
+        snap.service_state = ServiceStateDto::Stopped;
+        snap.vpn_conflict = None;
+        assert_eq!(
+            resolve_toggle_target_from_snapshot(&snap, None).ok(),
+            Some(true)
+        );
+        assert_eq!(
+            resolve_toggle_target_from_snapshot(&snap, Some(true)).ok(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn configured_vpn_coexistence_reads_config_file_and_defaults_to_auto_yield() {
+        assert_eq!(configured_vpn_coexistence(""), VpnCoexistence::AutoYield);
+        assert_eq!(configured_vpn_coexistence("   "), VpnCoexistence::AutoYield);
+
+        let base = std::env::temp_dir().join(format!(
+            "vdpi-commands-vpn-coexist-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&base);
+        let warn_cfg = base.join("warn.toml");
+        let off_cfg = base.join("off.toml");
+        std::fs::write(&warn_cfg, "vpn_coexistence = \"warn\"\n").expect("write warn.toml");
+        std::fs::write(&off_cfg, "vpn_coexistence = \"off\"\n").expect("write off.toml");
+
+        assert_eq!(
+            configured_vpn_coexistence(&warn_cfg.display().to_string()),
+            VpnCoexistence::Warn
+        );
+        assert_eq!(
+            configured_vpn_coexistence(&off_cfg.display().to_string()),
+            VpnCoexistence::Off
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn diagnostics_busy_error_blocks_all_mutating_service_operations() {
+        assert!(diagnostics_busy_error(None).is_none());
+        for op in [
+            ServiceOperationDto::Installing,
+            ServiceOperationDto::Upgrading,
+            ServiceOperationDto::Repairing,
+            ServiceOperationDto::Uninstalling,
+            ServiceOperationDto::ResettingNetwork,
+            ServiceOperationDto::Resuming,
+            ServiceOperationDto::Pausing,
+            ServiceOperationDto::SwitchingEngine,
+            ServiceOperationDto::SavingConfig,
+        ] {
+            let msg = diagnostics_busy_error(Some(op))
+                .expect("any active service operation must block diagnostics");
+            assert!(!msg.is_empty());
+        }
     }
 
     #[test]

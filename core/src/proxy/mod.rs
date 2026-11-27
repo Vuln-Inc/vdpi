@@ -15,6 +15,8 @@ use tracing::debug;
 use vdpi_core::bypass::BypassPolicy;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+const SPLIT_TUNNEL_RESOLVE_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[cfg(any(target_os = "android", target_os = "ios"))]
 const DIRECT_RELAY_BUF_SIZE: usize = 16 * 1024;
@@ -103,12 +105,23 @@ pub(crate) async fn check_split_tunnel_bypass(
         Some(addr) => {
             let ip = addr.ip().to_canonical();
             let port = addr.port();
-            tokio::task::spawn_blocking(move || {
-                crate::split_tunnel::resolve_local_app(ip, port, false)
-            })
+            match tokio::time::timeout(
+                SPLIT_TUNNEL_RESOLVE_TIMEOUT,
+                tokio::task::spawn_blocking(move || {
+                    crate::split_tunnel::resolve_local_app(ip, port, false)
+                }),
+            )
             .await
-            .ok()
-            .flatten()
+            {
+                Ok(res) => res.ok().flatten(),
+                Err(_) => {
+                    debug!(
+                        %addr,
+                        "split-tunnel: resolve_local_app timed out after {SPLIT_TUNNEL_RESOLVE_TIMEOUT:?}"
+                    );
+                    None
+                }
+            }
         }
         None => None,
     };

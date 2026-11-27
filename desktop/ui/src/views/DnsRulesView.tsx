@@ -1162,6 +1162,8 @@ function DnsRulesViewComponent({
     setResetNonce((prev) => prev + 1);
   };
 
+  const isDirtyRef = useRef(false);
+
   useEffect(() => {
     if (!settings) return;
     const nextBaseline = buildBaseline(settings);
@@ -1169,6 +1171,9 @@ function DnsRulesViewComponent({
     if (lastSettingsSigRef.current === sig) return;
     lastSettingsSigRef.current = sig;
     setSaved(nextBaseline);
+    if (isDirtyRef.current && !keepErrorBannerOnNextSyncRef.current) {
+      return;
+    }
     applyBaselineToDraft(nextBaseline);
     if (keepErrorBannerOnNextSyncRef.current) {
       keepErrorBannerOnNextSyncRef.current = false;
@@ -1298,6 +1303,7 @@ function DnsRulesViewComponent({
   ]);
 
   const isDirty = dirtyChanges.length > 0;
+  isDirtyRef.current = isDirty;
   const normalizedBusy = busyAction?.trim().toLowerCase() ?? null;
   const isExternalBusy =
     normalizedBusy !== null || Boolean(status?.pendingOperation);
@@ -1329,7 +1335,10 @@ function DnsRulesViewComponent({
   const activeVpnConflict =
     (status?.live?.vpnConflict ?? status?.vpnConflict)?.trim() || null;
   const activeEngine =
-    status?.live?.engine ?? settings?.engine ?? status?.configuredEngine ?? "tun";
+    status?.live?.engine ??
+    status?.configuredEngine ??
+    settings?.engine ??
+    "tun";
   const isProxyMode = activeEngine === "proxy";
 
   const handleSelectResolver = (id: ResolverPresetId) => {
@@ -1376,6 +1385,7 @@ function DnsRulesViewComponent({
 
   const handleDiscard = () => {
     if (!saved || saving || savingRef.current) return;
+    keepErrorBannerOnNextSyncRef.current = false;
     applyBaselineToDraft(saved);
     setErrorBanner(null);
   };
@@ -1383,6 +1393,7 @@ function DnsRulesViewComponent({
   const handleSave = async () => {
     if (savingRef.current || !canSave) return;
     savingRef.current = true;
+    keepErrorBannerOnNextSyncRef.current = false;
     setSaving(true);
     setErrorBanner(null);
 
@@ -1467,8 +1478,6 @@ function DnsRulesViewComponent({
           try {
             await onSaved?.(result.snapshot);
           } catch {
-            // Parent refresh errors are handled upstream.
-          } finally {
             keepErrorBannerOnNextSyncRef.current = false;
           }
         }
@@ -1485,10 +1494,12 @@ function DnsRulesViewComponent({
         bypassDomains: [...payload.bypassDomains],
         includeDomains: [...payload.includeDomains],
       };
+      const matchedPreset = findPresetByAddress(payload.dnsAddr);
       lastSettingsSigRef.current = serializeBaseline(nextBaseline);
       setSaved(nextBaseline);
       setDohEnabled(payload.dohEnabled);
-      setCustomDns(selectedResolver === "custom" ? payload.dnsAddr : "");
+      setSelectedResolver(matchedPreset ? matchedPreset.id : "custom");
+      setCustomDns(matchedPreset ? "" : payload.dnsAddr);
       setRevealCustom(false);
       setResetNonce((prev) => prev + 1);
 

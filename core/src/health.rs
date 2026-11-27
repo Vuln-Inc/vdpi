@@ -21,6 +21,9 @@ const MAX_STANDALONE_HEALTH_SESSIONS: usize = 8;
 const MAX_HEALTH_REQUEST_BYTES: usize = 4 * 1024;
 const HEALTH_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const HEALTH_WRITE_TIMEOUT: Duration = Duration::from_secs(3);
+const HEALTH_OVERLOAD_WRITE_TIMEOUT: Duration = Duration::from_millis(200);
+const HEALTH_OVERLOAD_RESPONSE: &[u8] =
+    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
 /// Dynamic runtime metadata attached to `/vdpi-health` responses.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -110,9 +113,7 @@ fn redact_dns_addr_for_health(raw: &str) -> String {
 /// additive v0.5.0 engine, TUN, DNS, and process RSS fields.
 pub fn render_health_json(ctx: &EngineContext, meta: &HealthRuntimeMeta) -> String {
     let snap = ctx.telemetry_snapshot();
-    let effective_doh =
-        vdpi_core::dns::is_effective_doh_target(&ctx.config.dns_addr, ctx.config.enable_doh);
-    let effective_dns_addr = meta
+    let raw_effective_dns = meta
         .dns_addr
         .as_deref()
         .map(str::trim)
@@ -120,8 +121,11 @@ pub fn render_health_json(ctx: &EngineContext, meta: &HealthRuntimeMeta) -> Stri
         .or_else(|| {
             let cfg_dns = ctx.config.dns_addr.trim();
             (!cfg_dns.is_empty()).then_some(cfg_dns)
-        })
-        .map(redact_dns_addr_for_health);
+        });
+    let effective_doh = raw_effective_dns.is_some_and(|dns| {
+        vdpi_core::dns::is_effective_doh_target(dns, ctx.config.enable_doh)
+    });
+    let effective_dns_addr = raw_effective_dns.map(redact_dns_addr_for_health);
     let payload = serde_json::json!({
         "status": "ok",
         "service": "vdpi",
@@ -209,10 +213,23 @@ pub fn has_forbidden_browser_headers(header_str: &str) -> bool {
 async fn write_health_response(client: &mut TcpStream, bytes: &[u8]) -> Result<()> {
     tokio::time::timeout(HEALTH_WRITE_TIMEOUT, async {
         client.write_all(bytes).await?;
-        client.flush().await
+        client.flush().await?;
+        let _ = client.shutdown().await;
+        Ok::<(), std::io::Error>(())
     })
     .await??;
     Ok(())
+}
+
+async fn write_health_overload_response(mut client: TcpStream) {
+    let _ = client.set_nodelay(true);
+    let _ = tokio::time::timeout(HEALTH_OVERLOAD_WRITE_TIMEOUT, async {
+        client.write_all(HEALTH_OVERLOAD_RESPONSE).await?;
+        client.flush().await?;
+        let _ = client.shutdown().await;
+        Ok::<(), std::io::Error>(())
+    })
+    .await;
 }
 
 /// Handles a `/vdpi-health` HTTP request, enforcing loopback peer, loopback `Host` header,
@@ -369,6 +386,12 @@ pub async fn serve_health_until_shutdown(
                 match accepted {
                     Ok((stream, peer)) => {
                         let Ok(slot) = slots.clone().try_acquire_owned() else {
+                            debug!(%peer, "standalone health session limit reached; returning 503");
+                            tokio::select! {
+                                biased;
+                                _ = &mut shutdown => break,
+                                _ = write_health_overload_response(stream) => {}
+                            }
                             continue;
                         };
                         let conn_ctx = ctx.clone();
@@ -598,6 +621,7 @@ mod tests {
         let tun_json: serde_json::Value = serde_json::from_str(&tun_body).unwrap();
         assert_eq!(tun_json["status"].as_str(), Some("ok"));
         assert_eq!(tun_json["service"].as_str(), Some("vdpi"));
+        assert_eq!(tun_json["doh"].as_bool(), Some(false));
         assert_eq!(tun_json["engine"].as_str(), Some("tun"));
         assert_eq!(tun_json["tun_interface"].as_str(), Some("vdpi0"));
         assert_eq!(tun_json["physical_nic"].as_str(), Some("Ethernet"));
@@ -995,6 +1019,90 @@ mod tests {
             .await;
             assert!(forbidden_resp.starts_with("HTTP/1.1 403 Forbidden\r\n"));
 
+            shutdown_tx.send(true).unwrap();
+            server.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn render_health_json_prefers_meta_dns_addr_for_both_doh_and_redaction() {
+        // Config is plain UDP 1.1.1.1 with enable_doh=false, but live meta overrides to DoH URL.
+        let udp_cfg = RuntimeConfig {
+            mode: DesyncMode::TlsRecord,
+            enable_doh: false,
+            dns_addr: "1.1.1.1".to_string(),
+            ..Default::default()
+        };
+        let udp_ctx = EngineContext::new(udp_cfg).unwrap();
+        let doh_meta = HealthRuntimeMeta {
+            engine: EngineMode::Tun,
+            dns_addr: Some("https://dns.nextdns.io/secret-profile?k=v".to_string()),
+            ..Default::default()
+        };
+        let doh_json: serde_json::Value =
+            serde_json::from_str(&render_health_json(&udp_ctx, &doh_meta)).unwrap();
+        assert_eq!(doh_json["doh"].as_bool(), Some(true));
+        assert_eq!(
+            doh_json["dns_addr"].as_str(),
+            Some("https://dns.nextdns.io")
+        );
+
+        // Config is DoH-capable 1.1.1.1 with enable_doh=true, but live meta overrides to custom non-DoH IP.
+        let doh_cfg = RuntimeConfig {
+            mode: DesyncMode::TlsRecord,
+            enable_doh: true,
+            dns_addr: "1.1.1.1".to_string(),
+            ..Default::default()
+        };
+        let doh_ctx = EngineContext::new(doh_cfg).unwrap();
+        let custom_ip_meta = HealthRuntimeMeta {
+            engine: EngineMode::Tun,
+            dns_addr: Some("76.76.2.0".to_string()),
+            ..Default::default()
+        };
+        let custom_json: serde_json::Value =
+            serde_json::from_str(&render_health_json(&doh_ctx, &custom_ip_meta)).unwrap();
+        assert_eq!(custom_json["doh"].as_bool(), Some(false));
+        assert_eq!(custom_json["dns_addr"].as_str(), Some("76.76.2.0"));
+    }
+
+    #[tokio::test]
+    async fn standalone_loopback_health_listener_returns_503_when_saturated() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let ctx = test_engine_context();
+            let listener = bind_loopback_health_listener(0).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let meta_fn: HealthMetaFn = Arc::new(HealthRuntimeMeta::default);
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let server = tokio::spawn(serve_health_until_shutdown(
+                listener,
+                ctx,
+                meta_fn,
+                shutdown_rx,
+            ));
+
+            let mut held = Vec::with_capacity(MAX_STANDALONE_HEALTH_SESSIONS);
+            for _ in 0..MAX_STANDALONE_HEALTH_SESSIONS {
+                let mut stream = TcpStream::connect(addr).await.unwrap();
+                // Incomplete HTTP request holds the session permit until closed or read-timed-out.
+                stream.write_all(b"GET /vdpi-health ").await.unwrap();
+                held.push(stream);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let overload_resp = send_raw_http(
+                addr,
+                b"GET /vdpi-health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            )
+            .await;
+            assert!(
+                overload_resp.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+                "expected 503 Service Unavailable when saturated, got: {overload_resp:?}"
+            );
+
+            drop(held);
             shutdown_tx.send(true).unwrap();
             server.await.unwrap();
         })

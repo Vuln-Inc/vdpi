@@ -1060,6 +1060,12 @@ function DiagnosticsViewComponent({
     liveRunning: boolean;
     wintunReady: boolean | null;
     cliVersionRelation: DesktopStatusSnapshot["cliVersionRelation"] | null;
+    vpnConflict: string | null;
+    liveDnsDisplay: string | null;
+    liveDohEnabled: boolean | null;
+    splitTunnelMode: DesktopStatusSnapshot["splitTunnelMode"] | null;
+    splitTunnelCount: number | null;
+    configWarning: string | null;
   } | null>(null);
   const [running, setRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
@@ -1122,37 +1128,11 @@ function DiagnosticsViewComponent({
     normalizedPendingOp === "reset-network" ||
     normalizedPendingOp === "resetting_network";
   const isBusy =
-    normalizedBusy !== null || pendingOp !== null || isResettingNetwork;
-  const isMutatingServiceBusy = Boolean(
-    (normalizedBusy !== null &&
-      (normalizedBusy === "install" ||
-        normalizedBusy === "install-service" ||
-        normalizedBusy === "installing" ||
-        normalizedBusy === "upgrade" ||
-        normalizedBusy === "upgrade-service" ||
-        normalizedBusy === "upgrading" ||
-        normalizedBusy === "repair" ||
-        normalizedBusy === "repair-service" ||
-        normalizedBusy === "repairing" ||
-        normalizedBusy === "uninstall" ||
-        normalizedBusy === "uninstall-service" ||
-        normalizedBusy === "uninstalling" ||
-        normalizedBusy === "reset-network" ||
-        normalizedBusy === "resetting_network")) ||
-      (normalizedPendingOp !== null &&
-        (normalizedPendingOp === "install" ||
-          normalizedPendingOp === "installing" ||
-          normalizedPendingOp === "upgrade" ||
-          normalizedPendingOp === "upgrading" ||
-          normalizedPendingOp === "repair" ||
-          normalizedPendingOp === "repairing" ||
-          normalizedPendingOp === "uninstall" ||
-          normalizedPendingOp === "uninstalling" ||
-          normalizedPendingOp === "reset-network" ||
-          normalizedPendingOp === "resetting_network")),
-  );
-  const isMutatingServiceBusyRef = useRef(isMutatingServiceBusy);
-  isMutatingServiceBusyRef.current = isMutatingServiceBusy;
+    normalizedBusy !== null ||
+    Boolean(status?.pendingOperation) ||
+    isResettingNetwork;
+  const isBusyRef = useRef(isBusy);
+  isBusyRef.current = isBusy;
   const isSwitchingProxy =
     normalizedBusy === "switch-engine:proxy" ||
     pendingOp === "switching_engine";
@@ -1405,24 +1385,36 @@ function DiagnosticsViewComponent({
   ]);
 
   const handleRunDiagnostics = useCallback(async () => {
-    if (inFlightRef.current || isMutatingServiceBusyRef.current) return;
+    if (inFlightRef.current || isBusyRef.current) return;
     inFlightRef.current = true;
+    const preRunStatus = statusRef.current;
+    const preRunSnap = {
+      serviceState: preRunStatus?.serviceState ?? null,
+      configuredEngine: preRunStatus?.configuredEngine ?? null,
+      liveEngine: preRunStatus?.live?.engine ?? null,
+      liveRunning: Boolean(preRunStatus?.live?.running),
+      wintunReady: preRunStatus ? preRunStatus.wintun.ready : null,
+      cliVersionRelation: preRunStatus?.cliVersionRelation ?? null,
+      vpnConflict:
+        (
+          preRunStatus?.live?.vpnConflict ?? preRunStatus?.vpnConflict
+        )?.trim() || null,
+      liveDnsDisplay: preRunStatus?.live?.dnsDisplay ?? null,
+      liveDohEnabled: preRunStatus?.live ? preRunStatus.live.dohEnabled : null,
+      splitTunnelMode: preRunStatus?.splitTunnelMode ?? null,
+      splitTunnelCount: preRunStatus?.splitTunnelCount ?? null,
+      configWarning: preRunStatus?.configWarning?.trim() || null,
+    };
     setRunning(true);
     setRunError(null);
 
     try {
       const nextReport = await runDiagnostics();
       if (!mountedRef.current) return;
-      const latestStatus = statusRef.current;
       setReport(nextReport);
       setReportStatusSnap({
         ranAtMs: nextReport.ranAtMs,
-        serviceState: latestStatus?.serviceState ?? null,
-        configuredEngine: latestStatus?.configuredEngine ?? null,
-        liveEngine: latestStatus?.live?.engine ?? null,
-        liveRunning: Boolean(latestStatus?.live?.running),
-        wintunReady: latestStatus ? latestStatus.wintun.ready : null,
-        cliVersionRelation: latestStatus?.cliVersionRelation ?? null,
+        ...preRunSnap,
       });
       setCopied(false);
     } catch (error) {
@@ -1482,6 +1474,13 @@ function DiagnosticsViewComponent({
   const currentLiveRunning = Boolean(status?.live?.running);
   const currentWintunReady = status ? status.wintun.ready : null;
   const currentCliVersionRelation = status?.cliVersionRelation ?? null;
+  const currentVpnConflict =
+    (status?.live?.vpnConflict ?? status?.vpnConflict)?.trim() || null;
+  const currentLiveDnsDisplay = status?.live?.dnsDisplay ?? null;
+  const currentLiveDohEnabled = status?.live ? status.live.dohEnabled : null;
+  const currentSplitTunnelMode = status?.splitTunnelMode ?? null;
+  const currentSplitTunnelCount = status?.splitTunnelCount ?? null;
+  const currentConfigWarning = status?.configWarning?.trim() || null;
   const statusChangedSinceRun = Boolean(
     report &&
       !running &&
@@ -1492,7 +1491,13 @@ function DiagnosticsViewComponent({
         reportStatusSnap.liveEngine !== currentLiveEngine ||
         reportStatusSnap.liveRunning !== currentLiveRunning ||
         reportStatusSnap.wintunReady !== currentWintunReady ||
-        reportStatusSnap.cliVersionRelation !== currentCliVersionRelation),
+        reportStatusSnap.cliVersionRelation !== currentCliVersionRelation ||
+        reportStatusSnap.vpnConflict !== currentVpnConflict ||
+        reportStatusSnap.liveDnsDisplay !== currentLiveDnsDisplay ||
+        reportStatusSnap.liveDohEnabled !== currentLiveDohEnabled ||
+        reportStatusSnap.splitTunnelMode !== currentSplitTunnelMode ||
+        reportStatusSnap.splitTunnelCount !== currentSplitTunnelCount ||
+        reportStatusSnap.configWarning !== currentConfigWarning),
   );
 
   return (
@@ -1523,7 +1528,7 @@ function DiagnosticsViewComponent({
           <button
             type="button"
             className="btn btn-primary diag-btn diag-btn--primary"
-            disabled={running || isMutatingServiceBusy}
+            disabled={running || isBusy}
             aria-busy={running}
             onClick={() => {
               void handleRunDiagnostics();
@@ -1577,7 +1582,7 @@ function DiagnosticsViewComponent({
             <button
               type="button"
               className="inline-banner__action"
-              disabled={running || isMutatingServiceBusy}
+              disabled={running || isBusy}
               onClick={() => {
                 void handleRunDiagnostics();
               }}
@@ -1883,11 +1888,16 @@ function areDiagnosticsPropsEqual(
     prevStatus.cliVersionRelation === nextStatus.cliVersionRelation &&
     prevStatus.canInstallFromBundle === nextStatus.canInstallFromBundle &&
     prevStatus.pendingOperation === nextStatus.pendingOperation &&
+    prevStatus.splitTunnelMode === nextStatus.splitTunnelMode &&
+    prevStatus.splitTunnelCount === nextStatus.splitTunnelCount &&
+    prevStatus.configWarning === nextStatus.configWarning &&
     prevStatus.wintun.required === nextStatus.wintun.required &&
     prevStatus.wintun.ready === nextStatus.wintun.ready &&
     (prevLive?.running ?? false) === (nextLive?.running ?? false) &&
     prevLive?.engine === nextLive?.engine &&
-    prevLive?.vpnConflict === nextLive?.vpnConflict
+    prevLive?.vpnConflict === nextLive?.vpnConflict &&
+    prevLive?.dnsDisplay === nextLive?.dnsDisplay &&
+    prevLive?.dohEnabled === nextLive?.dohEnabled
   );
 }
 

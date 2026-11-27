@@ -266,9 +266,10 @@ struct CachedWintunVerification {
 /// subprocess spawn, bundled sidecar `--version` spawn, and `wintun.dll` SHA-256
 /// verification).
 ///
-/// Entries persist across [`STATIC_PROBE_CACHE_TTL`] expirations while the
-/// inspected file `(path, len, mtime)` metadata stays identical, and are
-/// cleared whenever [`DesktopAppState::invalidate_static_cache`] is called.
+/// Entries persist across [`STATIC_PROBE_CACHE_TTL`] expirations and routine
+/// [`DesktopAppState::invalidate_static_cache`] calls while the inspected file
+/// `(path, len, mtime)` metadata stays identical, and are explicitly cleared by
+/// [`DesktopAppState::invalidate_all_caches`].
 #[derive(Debug, Default, Clone)]
 pub struct BinaryMetadataCache {
     installed_version: Option<CachedInstalledVersion>,
@@ -380,8 +381,9 @@ impl BinaryMetadataCache {
     }
 }
 
-/// Returns `true` when `op` is a mutating install/upgrade/repair/uninstall or
-/// network-reset operation during which status polls and diagnostics should pause.
+/// Returns `true` when `op` is a mutating service or configuration operation
+/// during which background status polls and diagnostics should pause so
+/// mid-switch restarts never flash transient states.
 pub const fn is_mutating_install_operation(op: Option<ServiceOperationDto>) -> bool {
     matches!(
         op,
@@ -391,6 +393,10 @@ pub const fn is_mutating_install_operation(op: Option<ServiceOperationDto>) -> b
                 | ServiceOperationDto::Repairing
                 | ServiceOperationDto::Uninstalling
                 | ServiceOperationDto::ResettingNetwork
+                | ServiceOperationDto::SwitchingEngine
+                | ServiceOperationDto::SavingConfig
+                | ServiceOperationDto::Resuming
+                | ServiceOperationDto::Pausing
         )
     )
 }
@@ -716,14 +722,23 @@ impl DesktopAppState {
         cache.set_wintun_with_mode(metadata, wintun, strict_primary);
     }
 
-    /// Invalidates cached slow probes and binary metadata caches so the next
-    /// status snapshot refreshes service, config, binary version, Wintun,
-    /// split-tunnel, and VPN conflict state.
+    /// Invalidates cached slow probes (`static_probe_cache`) so the next
+    /// status snapshot refreshes service, config, split-tunnel, and VPN
+    /// conflict state while preserving `binary_metadata_cache` (already keyed
+    /// by `(path, len, mtime)`) to avoid redundant `vdpi --version` spawns and
+    /// `wintun.dll` SHA-256 re-hashes on unchanged files.
     pub fn invalidate_static_cache(&self) {
         self.static_probe_cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .invalidate();
+    }
+
+    /// Invalidates both `static_probe_cache` and `binary_metadata_cache`,
+    /// forcing version subprocess probes and `wintun.dll` SHA-256 verification
+    /// to re-run even when `(path, len, mtime)` is unchanged.
+    pub fn invalidate_all_caches(&self) {
+        self.invalidate_static_cache();
         self.binary_metadata_cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1402,10 +1417,24 @@ mod tests {
             .is_none());
         assert!(state.cached_wintun_status(&[], true).is_none());
 
-        // `invalidate_static_cache()` clears BOTH static_probe_cache and binary_metadata_cache.
+        // `invalidate_static_cache()` clears ONLY `static_probe_cache` and preserves
+        // `binary_metadata_cache` (which is already keyed by `(path, len, mtime)`).
         let now = Instant::now();
         state.set_static_probe_cache(sample_static_probe(now));
         state.invalidate_static_cache();
+        assert!(state.cached_static_probes(now).is_none());
+        assert_eq!(
+            state.cached_installed_version(&bin_key),
+            Some(Some("0.6.0".to_string()))
+        );
+        assert!(state
+            .cached_wintun_status(std::slice::from_ref(&dll_key), true)
+            .is_some());
+
+        // Explicit `invalidate_all_caches()` clears BOTH `static_probe_cache` and
+        // `binary_metadata_cache`.
+        state.set_static_probe_cache(sample_static_probe(now));
+        state.invalidate_all_caches();
         assert!(state.cached_static_probes(now).is_none());
         assert!(state.cached_installed_version(&bin_key).is_none());
         assert!(state
@@ -1425,13 +1454,6 @@ mod tests {
             ServiceOperationDto::Repairing,
             ServiceOperationDto::Uninstalling,
             ServiceOperationDto::ResettingNetwork,
-        ] {
-            state.set_active_operation(Some(op));
-            assert_eq!(state.active_operation(), Some(op));
-            assert!(state.is_mutating_install_operation_active());
-        }
-
-        for op in [
             ServiceOperationDto::Resuming,
             ServiceOperationDto::Pausing,
             ServiceOperationDto::SwitchingEngine,
@@ -1439,7 +1461,10 @@ mod tests {
         ] {
             state.set_active_operation(Some(op));
             assert_eq!(state.active_operation(), Some(op));
-            assert!(!state.is_mutating_install_operation_active());
+            assert!(
+                state.is_mutating_install_operation_active(),
+                "expected {op:?} to pause background status polling"
+            );
         }
 
         state.set_active_operation(None);
@@ -1456,7 +1481,14 @@ mod tests {
             state.cached_bundled_version(&bundled_key),
             Some(Some("0.6.1".to_string()))
         );
+        // Routine static cache invalidation preserves bundled version metadata cache.
         state.invalidate_static_cache();
+        assert_eq!(
+            state.cached_bundled_version(&bundled_key),
+            Some(Some("0.6.1".to_string()))
+        );
+        // Full cache invalidation clears bundled version metadata cache too.
+        state.invalidate_all_caches();
         assert!(state.cached_bundled_version(&bundled_key).is_none());
     }
 }

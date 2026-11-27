@@ -336,10 +336,18 @@ fn join_errors(errors: &[String]) -> Option<String> {
     }
 }
 
+fn should_clear_runtime_states(
+    stopped_any: bool,
+    service_skipped_priv: bool,
+    service_errors: &[String],
+) -> bool {
+    stopped_any && !service_skipped_priv && service_errors.is_empty()
+}
+
 /// Orchestrates a complete (or user-only) OS network reset back to factory defaults:
 ///
 /// 1. Stops running `vdpi` background services and foreground daemons, then clears stale
-///    runtime `state.json` files.
+///    runtime `state.json` files when daemons were cleanly stopped.
 /// 2. Resets OS proxy / PAC / environment variables (and WinHTTP on Windows).
 /// 3. Cleans up TUN adapters, routes, and DNS overrides.
 /// 4. Flushes the OS DNS resolver cache unconditionally.
@@ -347,10 +355,13 @@ pub fn reset_network_defaults(scope: ResetScope) -> NetworkResetReport {
     let effective_elevated = matches!(scope, ResetScope::Full) && process_is_elevated();
     let mut items = Vec::with_capacity(7);
 
-    // 1. Stop running daemons / services and clear stale runtime state files.
+    // 1. Stop running daemons / services and clear stale runtime state files only when
+    //    daemons/services were actually stopped cleanly without privileged skips or errors.
     let (stopped_any, service_skipped_priv, service_errors) =
         crate::service::stop_all_vdpi_daemons_for_reset(effective_elevated);
-    crate::service::clear_all_stale_runtime_states();
+    if should_clear_runtime_states(stopped_any, service_skipped_priv, &service_errors) {
+        crate::service::clear_all_stale_runtime_states();
+    }
 
     let service_item = if !service_errors.is_empty() {
         make_item(
@@ -729,12 +740,97 @@ fn reset_tun_and_dns_subsystems(
     }
 }
 
+#[cfg(target_os = "windows")]
+fn flush_windows_dns_resolver_cache_result() -> Result<(), (Option<i32>, String)> {
+    use windows_sys::Win32::Foundation::{FreeLibrary, SetLastError, HMODULE};
+    use windows_sys::Win32::System::LibraryLoader::{
+        GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+    };
+
+    type DnsFlushResolverCacheFn = unsafe extern "system" fn() -> i32;
+    struct ModuleGuard(HMODULE);
+    impl Drop for ModuleGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` is a valid module handle returned by `LoadLibraryExW`.
+                unsafe {
+                    let _ = FreeLibrary(self.0);
+                }
+            }
+        }
+    }
+
+    let dnsapi_w: Vec<u16> = "dnsapi.dll\0".encode_utf16().collect();
+    // SAFETY: `dnsapi_w` is NUL-terminated UTF-16 and `LOAD_LIBRARY_SEARCH_SYSTEM32` restricts search to System32.
+    let hmod = unsafe {
+        LoadLibraryExW(
+            dnsapi_w.as_ptr(),
+            std::ptr::null_mut(),
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+    };
+    if hmod.is_null() {
+        let err = std::io::Error::last_os_error();
+        return Err((
+            err.raw_os_error(),
+            format!("failed to load dnsapi.dll: {err}"),
+        ));
+    }
+    let _guard = ModuleGuard(hmod);
+    // SAFETY: `hmod` is valid and `"DnsFlushResolverCache"` is a static NUL-terminated C string.
+    let Some(proc) =
+        (unsafe { GetProcAddress(hmod, c"DnsFlushResolverCache".as_ptr().cast::<u8>()) })
+    else {
+        let err = std::io::Error::last_os_error();
+        return Err((
+            err.raw_os_error(),
+            format!("DnsFlushResolverCache export not found in dnsapi.dll: {err}"),
+        ));
+    };
+    // SAFETY: `DnsFlushResolverCache` in `dnsapi.dll` has signature `BOOL WINAPI DnsFlushResolverCache(void)`.
+    let flush_fn: DnsFlushResolverCacheFn = unsafe { std::mem::transmute_copy(&proc) };
+    // SAFETY: Clears this thread's Win32 last-error slot prior to invoking `DnsFlushResolverCache`.
+    unsafe { SetLastError(0) };
+    let ok = unsafe { flush_fn() };
+    if ok != 0 {
+        Ok(())
+    } else {
+        let err = std::io::Error::last_os_error();
+        let raw = err.raw_os_error();
+        let detail = if raw == Some(0) {
+            "DnsFlushResolverCache returned FALSE".to_string()
+        } else {
+            format!("DnsFlushResolverCache failed: {err}")
+        };
+        Err((raw, detail))
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_dns_flush_item(res: Result<(), (Option<i32>, String)>) -> SubsystemResetItem {
+    const ERROR_SERVICE_NOT_ACTIVE: i32 = 1062;
+    const RPC_S_SERVER_UNAVAILABLE: i32 = 1722;
+    const EPT_S_NOT_REGISTERED: i32 = 1753;
+
+    match res {
+        Ok(()) => make_item("dns_cache", SubsystemStatus::Reset, None),
+        Err((
+            Some(ERROR_SERVICE_NOT_ACTIVE | RPC_S_SERVER_UNAVAILABLE | EPT_S_NOT_REGISTERED),
+            _,
+        )) => make_item(
+            "dns_cache",
+            SubsystemStatus::AlreadyDefault,
+            Some("Windows DNS Client service inactive".to_string()),
+        ),
+        Err((_, detail)) => make_item("dns_cache", SubsystemStatus::Failed, Some(detail)),
+    }
+}
+
 fn flush_os_dns_cache(effective_elevated: bool) -> SubsystemResetItem {
     #[cfg(target_os = "windows")]
     {
         let _ = effective_elevated;
-        crate::platform::windows::flush_dns_resolver_cache();
-        make_item("dns_cache", SubsystemStatus::Reset, None)
+        windows_dns_flush_item(flush_windows_dns_resolver_cache_result())
     }
 
     #[cfg(target_os = "macos")]
@@ -1091,5 +1187,61 @@ mod tests {
         assert_eq!(roundtrip.scope, ResetScope::UserOnly);
         assert_eq!(roundtrip.items.len(), 1);
         assert_eq!(roundtrip.items[0].status, SubsystemStatus::SkippedPrivileges);
+    }
+
+    #[test]
+    fn should_clear_runtime_states_only_when_daemons_stopped_cleanly() {
+        assert!(should_clear_runtime_states(true, false, &[]));
+        assert!(!should_clear_runtime_states(false, false, &[]));
+        assert!(!should_clear_runtime_states(true, true, &[]));
+        assert!(!should_clear_runtime_states(false, true, &[]));
+        assert!(!should_clear_runtime_states(
+            true,
+            false,
+            &["stop failed".to_string()]
+        ));
+        assert!(!should_clear_runtime_states(
+            false,
+            false,
+            &["stop failed".to_string()]
+        ));
+    }
+
+    #[test]
+    fn windows_dns_flush_item_maps_ok_inactive_and_errors() {
+        let ok = windows_dns_flush_item(Ok(()));
+        assert_eq!(ok.id, "dns_cache");
+        assert_eq!(ok.status, SubsystemStatus::Reset);
+        assert!(ok.detail.is_none());
+
+        for code in [1062, 1722, 1753] {
+            let inactive =
+                windows_dns_flush_item(Err((Some(code), format!("win32 error {code}"))));
+            assert_eq!(inactive.id, "dns_cache");
+            assert_eq!(inactive.status, SubsystemStatus::AlreadyDefault);
+            assert!(inactive
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("inactive")));
+        }
+
+        let failed = windows_dns_flush_item(Err((
+            Some(5),
+            "DnsFlushResolverCache failed: access denied".to_string(),
+        )));
+        assert_eq!(failed.id, "dns_cache");
+        assert_eq!(failed.status, SubsystemStatus::Failed);
+        assert_eq!(
+            failed.detail.as_deref(),
+            Some("DnsFlushResolverCache failed: access denied")
+        );
+
+        let missing_dll =
+            windows_dns_flush_item(Err((None, "failed to load dnsapi.dll".to_string())));
+        assert_eq!(missing_dll.status, SubsystemStatus::Failed);
+        assert_eq!(
+            missing_dll.detail.as_deref(),
+            Some("failed to load dnsapi.dll")
+        );
     }
 }

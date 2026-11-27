@@ -10,7 +10,7 @@ members = [
 default-members = ["core"]
 
 [workspace.package]
-version = "0.6.2"
+version = "0.6.3"
 edition = "2021"
 authors = ["Vuln-Inc"]
 license = "MIT"
@@ -18,8 +18,8 @@ repository = "https://github.com/Vuln-Inc/vdpi"
 homepage = "https://github.com/Vuln-Inc/vdpi"
 
 [workspace.dependencies]
-vdpi-core = { version = "0.6.2", path = "core/engine" }
-vdpi-tun = { version = "0.6.2", path = "core/tun" }
+vdpi-core = { version = "0.6.3", path = "core/engine" }
+vdpi-tun = { version = "0.6.3", path = "core/tun" }
 
 [profile.release]
 opt-level = 3

@@ -4,6 +4,7 @@ pub mod config;
 pub mod config_file;
 pub mod health;
 pub mod i18n;
+pub mod logging;
 pub mod platform;
 pub mod proxy;
 pub mod server;

@@ -34,6 +34,7 @@ const DIAGNOSTICS_USER_AGENT: &str = concat!("vdpi-desktop/", env!("CARGO_PKG_VE
 enum HttpProbePath {
     Proxy(SocketAddr),
     Tun,
+    DirectNonLoopbackProxy,
     Direct,
 }
 
@@ -42,6 +43,10 @@ impl HttpProbePath {
         match self {
             Self::Proxy(addr) => format!("Via local proxy {addr}"),
             Self::Tun => "Via active TUN engine".to_string(),
+            Self::DirectNonLoopbackProxy => {
+                "Direct (Proxy engine bound to non-loopback address - anti-DPI bypass not tested)"
+                    .to_string()
+            }
             Self::Direct => {
                 "Direct (vdpi not running - anti-DPI bypass not tested)".to_string()
             }
@@ -49,7 +54,7 @@ impl HttpProbePath {
     }
 
     fn is_direct(&self) -> bool {
-        matches!(self, Self::Direct)
+        matches!(self, Self::Direct | Self::DirectNonLoopbackProxy)
     }
 }
 
@@ -70,6 +75,7 @@ pub async fn run_desktop_diagnostics(status: &DesktopStatusSnapshotDto) -> Diagn
     .unwrap_or_default();
 
     let probe_path = resolve_http_probe_path(status);
+    let http_client = build_http_probe_client(&probe_path);
 
     let (vpn_check, dns_check, discord_check, roblox_check) = tokio::join!(
         run_vpn_coexistence_check(status, cfg.vpn_coexistence),
@@ -80,6 +86,7 @@ pub async fn run_desktop_diagnostics(status: &DesktopStatusSnapshotDto) -> Diagn
             DISCORD_GATEWAY_URL,
             DISCORD_GATEWAY_TARGET,
             &probe_path,
+            http_client.as_ref(),
         ),
         run_http_reachability_check(
             "roblox_clientsettings",
@@ -87,6 +94,7 @@ pub async fn run_desktop_diagnostics(status: &DesktopStatusSnapshotDto) -> Diagn
             ROBLOX_CLIENT_SETTINGS_URL,
             ROBLOX_CLIENT_SETTINGS_TARGET,
             &probe_path,
+            http_client.as_ref(),
         ),
     );
 
@@ -260,7 +268,7 @@ fn resolve_http_probe_path(status: &DesktopStatusSnapshotDto) -> HttpProbePath {
             if let Some(proxy_addr) = parse_loopback_proxy_addr(&live.addr, live.port) {
                 HttpProbePath::Proxy(proxy_addr)
             } else {
-                HttpProbePath::Direct
+                HttpProbePath::DirectNonLoopbackProxy
             }
         }
         Some(live) if live.engine == EngineModeDto::Tun => HttpProbePath::Tun,
@@ -708,7 +716,9 @@ fn build_http_probe_client(path: &HttpProbePath) -> Result<reqwest::Client, Stri
                 .map_err(|err| format!("invalid local proxy URL: {err}"))?;
             builder.proxy(proxy)
         }
-        HttpProbePath::Tun | HttpProbePath::Direct => builder.no_proxy(),
+        HttpProbePath::Tun
+        | HttpProbePath::DirectNonLoopbackProxy
+        | HttpProbePath::Direct => builder.no_proxy(),
     };
 
     builder.build().map_err(|err| err.to_string())
@@ -804,10 +814,11 @@ async fn run_http_reachability_check(
     url: &str,
     display_target: &str,
     path: &HttpProbePath,
+    client: Result<&reqwest::Client, &String>,
 ) -> DiagnosticCheckItemDto {
     let started = Instant::now();
 
-    let client = match build_http_probe_client(path) {
+    let client = match client {
         Ok(c) => c,
         Err(err) => {
             return DiagnosticCheckItemDto {
@@ -817,7 +828,7 @@ async fn run_http_reachability_check(
                 status: DiagStatusDto::Fail,
                 latency_ms: Some(elapsed_ms(started)),
                 summary: "HTTPS client unavailable".to_string(),
-                detail: Some(sanitize_single_line(&redact_urls_in_text(&err))),
+                detail: Some(sanitize_single_line(&redact_urls_in_text(err))),
             };
         }
     };
@@ -1025,7 +1036,9 @@ fn evaluate_service_hygiene_check(status: &DesktopStatusSnapshotDto) -> Diagnost
                     .to_string(),
             )
         }
-        ServiceStateDto::Running if status.live.is_none() && vpn_conflict.is_some() => {
+        ServiceStateDto::Running
+            if !status.live.as_ref().is_some_and(|l| l.running) && vpn_conflict.is_some() =>
+        {
             let vpn = vpn_conflict.unwrap();
             (
                 DiagStatusDto::Warn,
@@ -1908,6 +1921,34 @@ mod tests {
             HttpProbePath::Direct.description(),
             "Direct (vdpi not running - anti-DPI bypass not tested)"
         );
+
+        // Proxy bound to a non-loopback local IP must NOT claim "vdpi not running",
+        // while still keeping probes direct (SSRF-safe) and warning on HTTP 2xx.
+        for non_loopback in ["192.168.1.50", "10.0.0.12", "fd00::1"] {
+            let mut lan_proxy = sample_live_telemetry(EngineModeDto::Proxy);
+            lan_proxy.addr = non_loopback.to_string();
+            lan_proxy.port = 8080;
+            let lan_status = sample_status(EngineModeDto::Proxy, Some(lan_proxy));
+            let resolved = resolve_http_probe_path(&lan_status);
+            assert_eq!(resolved, HttpProbePath::DirectNonLoopbackProxy);
+            assert!(resolved.is_direct());
+            let desc = resolved.description();
+            assert!(!desc.contains("vdpi not running"), "unexpected desc: {desc}");
+            assert!(desc.contains("non-loopback"), "unexpected desc: {desc}");
+        }
+
+        // Shared reqwest::Client builder succeeds for every HttpProbePath variant.
+        for path in [
+            HttpProbePath::Proxy(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080)),
+            HttpProbePath::Tun,
+            HttpProbePath::DirectNonLoopbackProxy,
+            HttpProbePath::Direct,
+        ] {
+            assert!(
+                build_http_probe_client(&path).is_ok(),
+                "expected reqwest client builder to succeed for {path:?}"
+            );
+        }
     }
 
     #[test]
@@ -1926,6 +1967,20 @@ mod tests {
             direct_ok.detail.as_deref(),
             Some("Direct (vdpi not running - anti-DPI bypass not tested)")
         );
+
+        // Non-loopback Proxy direct HTTP 200 also reports Warn without falsely claiming vdpi is stopped.
+        let non_loopback_ok = evaluate_http_probe_outcome(
+            "discord_gateway",
+            "Discord Web & Gateway",
+            DISCORD_GATEWAY_TARGET,
+            &HttpProbePath::DirectNonLoopbackProxy,
+            HttpProbeOutcome::Response(200),
+            Some(41),
+        );
+        assert_eq!(non_loopback_ok.status, DiagStatusDto::Warn);
+        let non_loopback_detail = non_loopback_ok.detail.as_deref().unwrap_or("");
+        assert!(!non_loopback_detail.contains("vdpi not running"));
+        assert!(non_loopback_detail.contains("non-loopback"));
 
         // Active TUN and Proxy HTTP 2xx report Pass.
         let tun_ok = evaluate_http_probe_outcome(
@@ -2164,6 +2219,22 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("yielded"));
+
+        // Running service with live = Some(running = false) and active vpn_conflict
+        // must also surface paused/yielded VPN conflict guidance (matching line 850).
+        let mut inactive_live = sample_live_telemetry(EngineModeDto::Tun);
+        inactive_live.running = false;
+        let mut vpn_yielded_inactive_live =
+            sample_status(EngineModeDto::Tun, Some(inactive_live));
+        vpn_yielded_inactive_live.service_state = ServiceStateDto::Running;
+        vpn_yielded_inactive_live.vpn_conflict = Some("WireGuard".to_string());
+        let vpn_yielded_inactive = evaluate_service_hygiene_check(&vpn_yielded_inactive_live);
+        assert_eq!(vpn_yielded_inactive.status, DiagStatusDto::Warn);
+        assert!(vpn_yielded_inactive.summary.contains("protection paused"));
+        assert!(vpn_yielded_inactive.summary.contains("WireGuard"));
+        assert!(!vpn_yielded_inactive
+            .summary
+            .contains("live telemetry unavailable"));
 
         // Running service with live = None and no vpn_conflict still reports unavailable telemetry.
         let mut running_no_live = sample_status(EngineModeDto::Tun, None);

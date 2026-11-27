@@ -39,11 +39,20 @@ use windows_sys::Win32::System::Registry::{
 };
 
 /// Maximum retries when `GetExtendedTcpTable`/`GetExtendedUdpTable` grows between
-/// size-query and data-fetch calls (`ERROR_INSUFFICIENT_BUFFER`).
+/// calls (`ERROR_INSUFFICIENT_BUFFER`).
 const MAX_TABLE_RETRIES: usize = 3;
 
-/// Extra byte headroom added on table buffer allocations to avoid resize races.
+/// Initial size (32 KiB) of each persistent IP Helper table buffer so common
+/// `GetExtendedTcpTable`/`GetExtendedUdpTable` calls complete in one syscall
+/// without a null size probe or per-flow allocation.
+const INITIAL_TABLE_BUFFER_BYTES: usize = 32 * 1024;
+
+/// Extra byte headroom added on table buffer growth to avoid resize races.
 const TABLE_BUFFER_HEADROOM: usize = 4096;
+
+/// Time-to-live for cached `GetExtendedTcpTable`/`GetExtendedUdpTable` owner-PID
+/// snapshots shared across connection bursts.
+const IP_TABLE_SNAPSHOT_TTL: Duration = Duration::from_millis(50);
 
 /// Upper bound on Registry Uninstall subkeys enumerated per hive.
 const MAX_UNINSTALL_SUBKEYS: u32 = 4096;
@@ -53,7 +62,11 @@ const MAX_VERSION_SUBDIRS: usize = 64;
 
 /// Time-to-live for the cached `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)` PID map
 /// used by `pid_to_exe_name` to resolve socket owners without opening process handles.
-const PID_SNAPSHOT_TTL: Duration = Duration::from_millis(300);
+const PID_SNAPSHOT_TTL: Duration = Duration::from_millis(2500);
+
+/// Minimum cooldown between `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)` refreshes
+/// on missing/exited PIDs so unknown PIDs cannot thrash the kernel snapshot API.
+const PID_SNAPSHOT_MISS_REFRESH_COOLDOWN: Duration = Duration::from_millis(300);
 
 /// Windows OS internals, background hosts, CLI tools, peripheral helpers,
 /// game overlays, and vdpi binaries excluded from app discovery.
@@ -516,7 +529,88 @@ struct PidSnapshotCache {
     captured_at: Instant,
 }
 
-static PID_SNAPSHOT_CACHE: OnceLock<Mutex<Option<PidSnapshotCache>>> = OnceLock::new();
+struct PidSnapshotStore {
+    cache: Mutex<Option<PidSnapshotCache>>,
+    refresh_lock: Mutex<()>,
+}
+
+impl PidSnapshotStore {
+    fn new() -> Self {
+        Self {
+            cache: Mutex::new(None),
+            refresh_lock: Mutex::new(()),
+        }
+    }
+
+    fn try_cached(
+        &self,
+        pid: u32,
+        ttl: Duration,
+        miss_cooldown: Duration,
+    ) -> Option<Option<String>> {
+        let now = Instant::now();
+        let guard = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cached = guard.as_ref()?;
+        let age = now.saturating_duration_since(cached.captured_at);
+        if age < ttl {
+            if let Some(name) = cached.map.get(&pid) {
+                return Some(Some(name.clone()));
+            }
+            if age < miss_cooldown {
+                return Some(None);
+            }
+        }
+        None
+    }
+
+    fn resolve_with<F>(
+        &self,
+        pid: u32,
+        ttl: Duration,
+        miss_cooldown: Duration,
+        mut capture_fn: F,
+    ) -> Option<String>
+    where
+        F: FnMut() -> Option<HashMap<u32, String>>,
+    {
+        if pid == 0 {
+            return None;
+        }
+
+        if let Some(hit) = self.try_cached(pid, ttl, miss_cooldown) {
+            return hit;
+        }
+
+        let _refresh_guard = self
+            .refresh_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if let Some(hit) = self.try_cached(pid, ttl, miss_cooldown) {
+            return hit;
+        }
+
+        let captured_at = Instant::now();
+        let fresh = capture_fn()?;
+        let found = fresh.get(&pid).cloned();
+        {
+            let mut guard = self
+                .cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *guard = Some(PidSnapshotCache {
+                map: fresh,
+                captured_at,
+            });
+        }
+        found
+    }
+}
+
+static PID_SNAPSHOT_CACHE: OnceLock<PidSnapshotStore> = OnceLock::new();
 
 fn capture_toolhelp_pid_map() -> Option<HashMap<u32, String>> {
     // SAFETY: `CreateToolhelp32Snapshot` returns a snapshot handle or `INVALID_HANDLE_VALUE`,
@@ -551,42 +645,24 @@ fn capture_toolhelp_pid_map() -> Option<HashMap<u32, String>> {
 
 /// Resolves a Windows process ID to its executable filename (e.g. `"Discord.exe"`).
 ///
-/// Uses a short-TTL (300ms) `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)` PID map
-/// and refreshes the snapshot on cache miss or expiry. Never calls `OpenProcess`
-/// on any PID — if a PID is absent from a fresh snapshot (e.g. already exited or
-/// kernel-hidden anti-cheat process), returns `None`.
+/// Uses a cached `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)` PID map
+/// (2500ms positive TTL) with singleflight refresh serialization, pre-capture
+/// timestamping, and a 300ms minimum refresh cooldown for missing/exited PIDs.
+/// Never calls `OpenProcess` on any PID — if a PID is absent from a fresh
+/// snapshot (e.g. already exited or kernel-hidden anti-cheat process), returns `None`.
 fn pid_to_exe_name(pid: u32) -> Option<String> {
     if pid == 0 {
         return None;
     }
 
-    let cache = PID_SNAPSHOT_CACHE.get_or_init(|| Mutex::new(None));
-    {
-        let now = Instant::now();
-        let guard = cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(ref cached) = *guard {
-            if now.saturating_duration_since(cached.captured_at) < PID_SNAPSHOT_TTL {
-                if let Some(name) = cached.map.get(&pid) {
-                    return Some(name.clone());
-                }
-            }
-        }
-    }
-
-    let fresh = capture_toolhelp_pid_map()?;
-    let found = fresh.get(&pid).cloned();
-    {
-        let mut guard = cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *guard = Some(PidSnapshotCache {
-            map: fresh,
-            captured_at: Instant::now(),
-        });
-    }
-    found
+    PID_SNAPSHOT_CACHE
+        .get_or_init(PidSnapshotStore::new)
+        .resolve_with(
+            pid,
+            PID_SNAPSHOT_TTL,
+            PID_SNAPSHOT_MISS_REFRESH_COOLDOWN,
+            capture_toolhelp_pid_map,
+        )
 }
 
 fn discover_running_processes(
@@ -1521,31 +1597,45 @@ pub(super) fn discover_platform_apps() -> Vec<DiscoveredApp> {
 }
 
 /// Fetches a variable-length IP Helper table (`GetExtendedTcpTable` or
-/// `GetExtendedUdpTable`) into an 8-byte aligned buffer, retrying up to
-/// [`MAX_TABLE_RETRIES`] times on `ERROR_INSUFFICIENT_BUFFER`.
-fn fetch_iphlpapi_table<F>(mut fetch_fn: F) -> Option<(Vec<u64>, usize)>
+/// `GetExtendedUdpTable`) into a persistent, 8-byte aligned buffer starting at
+/// [`INITIAL_TABLE_BUFFER_BYTES`] (32 KiB) without a null size probe, growing
+/// and retrying up to [`MAX_TABLE_RETRIES`] times on `ERROR_INSUFFICIENT_BUFFER`.
+fn fetch_iphlpapi_table_into<F>(buf: &mut Vec<u64>, mut fetch_fn: F) -> Option<usize>
 where
     F: FnMut(*mut c_void, *mut u32) -> u32,
 {
-    let mut size: u32 = 0;
-    let first = fetch_fn(std::ptr::null_mut(), &mut size);
-    if first != ERROR_INSUFFICIENT_BUFFER || size == 0 {
-        return None;
+    let min_words = INITIAL_TABLE_BUFFER_BYTES
+        .div_ceil(std::mem::size_of::<u64>())
+        .max(1);
+    if buf.len() < min_words {
+        buf.resize(min_words, 0);
     }
 
-    for _ in 0..MAX_TABLE_RETRIES {
-        let alloc_bytes = (size as usize).saturating_add(TABLE_BUFFER_HEADROOM);
-        let word_len = alloc_bytes.div_ceil(std::mem::size_of::<u64>()).max(1);
-        let mut buf = vec![0u64; word_len];
-        let mut buf_size = (buf.len() * std::mem::size_of::<u64>()) as u32;
+    for _ in 0..=MAX_TABLE_RETRIES {
+        let buf_bytes = buf.len().saturating_mul(std::mem::size_of::<u64>());
+        let Ok(mut buf_size) = u32::try_from(buf_bytes) else {
+            return None;
+        };
+        buf[0] = 0;
 
         let status = fetch_fn(buf.as_mut_ptr().cast::<c_void>(), &mut buf_size);
         if status == NO_ERROR {
-            let valid_bytes = (buf_size as usize).min(buf.len() * std::mem::size_of::<u64>());
-            return Some((buf, valid_bytes));
+            let valid_bytes = (buf_size as usize).min(buf_bytes);
+            return Some(valid_bytes);
         }
         if status == ERROR_INSUFFICIENT_BUFFER && buf_size > 0 {
-            size = buf_size;
+            let alloc_bytes = (buf_size as usize).saturating_add(TABLE_BUFFER_HEADROOM);
+            let needed_words = alloc_bytes
+                .div_ceil(std::mem::size_of::<u64>())
+                .max(min_words);
+            if needed_words > buf.len() {
+                buf.resize(needed_words, 0);
+            } else {
+                let extra_words = TABLE_BUFFER_HEADROOM
+                    .div_ceil(std::mem::size_of::<u64>())
+                    .max(1);
+                buf.resize(buf.len().saturating_add(extra_words), 0);
+            }
             continue;
         }
         return None;
@@ -1554,22 +1644,200 @@ where
     None
 }
 
-fn lookup_tcp_v4_pid(target_ip: Ipv4Addr, local_port: u16) -> Option<u32> {
-    let (buf, valid_bytes) = fetch_iphlpapi_table(|ptr, size_ptr| {
-        // SAFETY: `ptr` is either null (size query) or an 8-byte aligned writable
-        // buffer of `*size_ptr` bytes; `size_ptr` is a valid aligned `*mut u32`.
-        unsafe {
-            GetExtendedTcpTable(
-                ptr,
-                size_ptr,
-                0,
-                u32::from(AF_INET),
-                TCP_TABLE_OWNER_PID_ALL,
-                0,
-            )
-        }
-    })?;
+struct CachedIpTable {
+    buf: Vec<u64>,
+    valid_bytes: usize,
+    captured_at: Option<Instant>,
+    generation: u64,
+}
 
+enum IpTableProbe<T> {
+    Hit(T),
+    DefinitiveMiss,
+    NeedsRefresh(u64),
+}
+
+struct IpTableCache {
+    snapshot: Mutex<CachedIpTable>,
+    refresh: Mutex<Vec<u64>>,
+}
+
+impl IpTableCache {
+    fn new() -> Self {
+        Self {
+            snapshot: Mutex::new(CachedIpTable {
+                buf: Vec::new(),
+                valid_bytes: 0,
+                captured_at: None,
+                generation: 0,
+            }),
+            refresh: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn try_lookup_fresh<F, T>(&self, ttl: Duration, mut scan_fn: F) -> Option<T>
+    where
+        F: FnMut(&[u64], usize) -> Option<T>,
+    {
+        let now = Instant::now();
+        let guard = self
+            .snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let captured_at = guard.captured_at?;
+        if now.saturating_duration_since(captured_at) < ttl {
+            scan_fn(&guard.buf, guard.valid_bytes)
+        } else {
+            None
+        }
+    }
+
+    fn probe_snapshot<F, T>(
+        &self,
+        ttl: Duration,
+        request_started_at: Instant,
+        seen_generation: Option<u64>,
+        scan_fn: &mut F,
+    ) -> IpTableProbe<T>
+    where
+        F: FnMut(&[u64], usize) -> Option<T>,
+    {
+        let now = Instant::now();
+        let guard = self
+            .snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current_gen = guard.generation;
+        let Some(captured_at) = guard.captured_at else {
+            return IpTableProbe::NeedsRefresh(current_gen);
+        };
+        if now.saturating_duration_since(captured_at) >= ttl {
+            return IpTableProbe::NeedsRefresh(current_gen);
+        }
+        if let Some(found) = scan_fn(&guard.buf, guard.valid_bytes) {
+            return IpTableProbe::Hit(found);
+        }
+        if seen_generation.is_some_and(|seen| current_gen != seen)
+            && captured_at >= request_started_at
+        {
+            IpTableProbe::DefinitiveMiss
+        } else {
+            IpTableProbe::NeedsRefresh(current_gen)
+        }
+    }
+
+    fn lookup_with<Fetch, Scan, T>(
+        &self,
+        ttl: Duration,
+        fetch_fn: Fetch,
+        mut scan_fn: Scan,
+    ) -> Option<T>
+    where
+        Fetch: FnMut(*mut c_void, *mut u32) -> u32,
+        Scan: FnMut(&[u64], usize) -> Option<T>,
+    {
+        let request_started_at = Instant::now();
+        let seen_gen = match self.probe_snapshot(ttl, request_started_at, None, &mut scan_fn) {
+            IpTableProbe::Hit(val) => return Some(val),
+            IpTableProbe::DefinitiveMiss => return None,
+            IpTableProbe::NeedsRefresh(generation) => generation,
+        };
+
+        let mut scratch = self
+            .refresh
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        match self.probe_snapshot(ttl, request_started_at, Some(seen_gen), &mut scan_fn) {
+            IpTableProbe::Hit(val) => return Some(val),
+            IpTableProbe::DefinitiveMiss => return None,
+            IpTableProbe::NeedsRefresh(_) => {}
+        }
+
+        let captured_at = Instant::now();
+        let valid_bytes = fetch_iphlpapi_table_into(&mut scratch, fetch_fn)?;
+        let found = scan_fn(&scratch, valid_bytes);
+
+        {
+            let mut snap = self
+                .snapshot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::swap(&mut snap.buf, &mut *scratch);
+            snap.valid_bytes = valid_bytes;
+            snap.captured_at = Some(captured_at);
+            snap.generation = snap.generation.wrapping_add(1);
+        }
+
+        found
+    }
+}
+
+static TCP_V4_TABLE_CACHE: OnceLock<IpTableCache> = OnceLock::new();
+static TCP_V6_TABLE_CACHE: OnceLock<IpTableCache> = OnceLock::new();
+static UDP_V4_TABLE_CACHE: OnceLock<IpTableCache> = OnceLock::new();
+static UDP_V6_TABLE_CACHE: OnceLock<IpTableCache> = OnceLock::new();
+
+/// Returns `true` for active TCP connection states (`SYN_SENT`..=`LAST_ACK`,
+/// i.e. `dwState` in `3..=10`), distinguishing live connections from
+/// `CLOSED (1)`, `LISTEN (2)`, `TIME_WAIT (11)`, and `DELETE_TCB (12)`.
+fn is_active_tcp_state(dw_state: u32) -> bool {
+    (3..=10).contains(&dw_state)
+}
+
+/// Priority score for TCP table row selection: active connection states (`3..=10`)
+/// always outrank `LISTEN (2)`, which outranks `TIME_WAIT (11)` / `CLOSED (1)`,
+/// and exact local IP matches outrank unspecified wildcard (`0.0.0.0` / `::`) rows
+/// within the same activity tier.
+fn tcp_row_priority(is_exact_ip: bool, dw_state: u32) -> u8 {
+    match (is_exact_ip, dw_state) {
+        (true, 3..=10) => 6,
+        (false, 3..=10) => 5,
+        (true, 2) => 4,
+        (true, _) => 3,
+        (false, 2) => 2,
+        (false, _) => 1,
+    }
+}
+
+fn select_tcp_v4_pid(
+    rows: &[MIB_TCPROW_OWNER_PID],
+    target_ip: Ipv4Addr,
+    local_port: u16,
+) -> Option<u32> {
+    let mut best_prio: u8 = 0;
+    let mut best_pid: Option<u32> = None;
+
+    for row in rows {
+        let row_port = u16::from_be(row.dwLocalPort as u16);
+        if row_port != local_port || row.dwOwningPid == 0 {
+            continue;
+        }
+        let row_ip = Ipv4Addr::from(row.dwLocalAddr.to_ne_bytes());
+        let is_exact = row_ip == target_ip;
+        if !is_exact && !row_ip.is_unspecified() {
+            continue;
+        }
+        if is_exact && is_active_tcp_state(row.dwState) {
+            return Some(row.dwOwningPid);
+        }
+        let prio = tcp_row_priority(is_exact, row.dwState);
+        if prio > best_prio {
+            best_prio = prio;
+            best_pid = Some(row.dwOwningPid);
+        }
+    }
+
+    best_pid
+}
+
+fn scan_tcp_v4_table(
+    buf: &[u64],
+    valid_bytes: usize,
+    target_ip: Ipv4Addr,
+    local_port: u16,
+) -> Option<u32> {
+    let valid_bytes = valid_bytes.min(buf.len().saturating_mul(std::mem::size_of::<u64>()));
     let header_offset = std::mem::offset_of!(MIB_TCPTABLE_OWNER_PID, table);
     if valid_bytes < header_offset {
         return None;
@@ -1591,40 +1859,70 @@ fn lookup_tcp_v4_pid(target_ip: Ipv4Addr, local_port: u16) -> Option<u32> {
         std::slice::from_raw_parts(rows_ptr, count)
     };
 
-    let mut wildcard_pid: Option<u32> = None;
+    select_tcp_v4_pid(rows, target_ip, local_port)
+}
+
+fn lookup_tcp_v4_pid(target_ip: Ipv4Addr, local_port: u16) -> Option<u32> {
+    TCP_V4_TABLE_CACHE
+        .get_or_init(IpTableCache::new)
+        .lookup_with(
+            IP_TABLE_SNAPSHOT_TTL,
+            |ptr, size_ptr| {
+                // SAFETY: `ptr` is an 8-byte aligned writable buffer of `*size_ptr`
+                // bytes; `size_ptr` is a valid aligned `*mut u32`.
+                unsafe {
+                    GetExtendedTcpTable(
+                        ptr,
+                        size_ptr,
+                        0,
+                        u32::from(AF_INET),
+                        TCP_TABLE_OWNER_PID_ALL,
+                        0,
+                    )
+                }
+            },
+            |buf, valid_bytes| scan_tcp_v4_table(buf, valid_bytes, target_ip, local_port),
+        )
+}
+
+fn select_tcp_v6_pid(
+    rows: &[MIB_TCP6ROW_OWNER_PID],
+    target_ip: Ipv6Addr,
+    local_port: u16,
+) -> Option<u32> {
+    let mut best_prio: u8 = 0;
+    let mut best_pid: Option<u32> = None;
+
     for row in rows {
         let row_port = u16::from_be(row.dwLocalPort as u16);
         if row_port != local_port || row.dwOwningPid == 0 {
             continue;
         }
-        let row_ip = Ipv4Addr::from(row.dwLocalAddr.to_ne_bytes());
-        if row_ip == target_ip {
+        let row_ip = Ipv6Addr::from(row.ucLocalAddr);
+        let is_exact = row_ip == target_ip;
+        if !is_exact && !row_ip.is_unspecified() {
+            continue;
+        }
+        if is_exact && is_active_tcp_state(row.dwState) {
             return Some(row.dwOwningPid);
         }
-        if row_ip.is_unspecified() && wildcard_pid.is_none() {
-            wildcard_pid = Some(row.dwOwningPid);
+        let prio = tcp_row_priority(is_exact, row.dwState);
+        if prio > best_prio {
+            best_prio = prio;
+            best_pid = Some(row.dwOwningPid);
         }
     }
 
-    wildcard_pid
+    best_pid
 }
 
-fn lookup_tcp_v6_pid(target_ip: Ipv6Addr, local_port: u16) -> Option<u32> {
-    let (buf, valid_bytes) = fetch_iphlpapi_table(|ptr, size_ptr| {
-        // SAFETY: `ptr` is either null (size query) or an 8-byte aligned writable
-        // buffer of `*size_ptr` bytes; `size_ptr` is a valid aligned `*mut u32`.
-        unsafe {
-            GetExtendedTcpTable(
-                ptr,
-                size_ptr,
-                0,
-                u32::from(AF_INET6),
-                TCP_TABLE_OWNER_PID_ALL,
-                0,
-            )
-        }
-    })?;
-
+fn scan_tcp_v6_table(
+    buf: &[u64],
+    valid_bytes: usize,
+    target_ip: Ipv6Addr,
+    local_port: u16,
+) -> Option<u32> {
+    let valid_bytes = valid_bytes.min(buf.len().saturating_mul(std::mem::size_of::<u64>()));
     let header_offset = std::mem::offset_of!(MIB_TCP6TABLE_OWNER_PID, table);
     if valid_bytes < header_offset {
         return None;
@@ -1644,31 +1942,39 @@ fn lookup_tcp_v6_pid(target_ip: Ipv6Addr, local_port: u16) -> Option<u32> {
         std::slice::from_raw_parts(rows_ptr, count)
     };
 
-    let mut wildcard_pid: Option<u32> = None;
-    for row in rows {
-        let row_port = u16::from_be(row.dwLocalPort as u16);
-        if row_port != local_port || row.dwOwningPid == 0 {
-            continue;
-        }
-        let row_ip = Ipv6Addr::from(row.ucLocalAddr);
-        if row_ip == target_ip {
-            return Some(row.dwOwningPid);
-        }
-        if row_ip.is_unspecified() && wildcard_pid.is_none() {
-            wildcard_pid = Some(row.dwOwningPid);
-        }
-    }
-
-    wildcard_pid
+    select_tcp_v6_pid(rows, target_ip, local_port)
 }
 
-fn lookup_udp_v4_pid(target_ip: Ipv4Addr, local_port: u16) -> Option<u32> {
-    let (buf, valid_bytes) = fetch_iphlpapi_table(|ptr, size_ptr| {
-        // SAFETY: `ptr` is either null (size query) or an 8-byte aligned writable
-        // buffer of `*size_ptr` bytes; `size_ptr` is a valid aligned `*mut u32`.
-        unsafe { GetExtendedUdpTable(ptr, size_ptr, 0, u32::from(AF_INET), UDP_TABLE_OWNER_PID, 0) }
-    })?;
+fn lookup_tcp_v6_pid(target_ip: Ipv6Addr, local_port: u16) -> Option<u32> {
+    TCP_V6_TABLE_CACHE
+        .get_or_init(IpTableCache::new)
+        .lookup_with(
+            IP_TABLE_SNAPSHOT_TTL,
+            |ptr, size_ptr| {
+                // SAFETY: `ptr` is an 8-byte aligned writable buffer of `*size_ptr`
+                // bytes; `size_ptr` is a valid aligned `*mut u32`.
+                unsafe {
+                    GetExtendedTcpTable(
+                        ptr,
+                        size_ptr,
+                        0,
+                        u32::from(AF_INET6),
+                        TCP_TABLE_OWNER_PID_ALL,
+                        0,
+                    )
+                }
+            },
+            |buf, valid_bytes| scan_tcp_v6_table(buf, valid_bytes, target_ip, local_port),
+        )
+}
 
+fn scan_udp_v4_table(
+    buf: &[u64],
+    valid_bytes: usize,
+    target_ip: Ipv4Addr,
+    local_port: u16,
+) -> Option<u32> {
+    let valid_bytes = valid_bytes.min(buf.len().saturating_mul(std::mem::size_of::<u64>()));
     let header_offset = std::mem::offset_of!(MIB_UDPTABLE_OWNER_PID, table);
     if valid_bytes < header_offset {
         return None;
@@ -1706,22 +2012,27 @@ fn lookup_udp_v4_pid(target_ip: Ipv4Addr, local_port: u16) -> Option<u32> {
     wildcard_pid
 }
 
-fn lookup_udp_v6_pid(target_ip: Ipv6Addr, local_port: u16) -> Option<u32> {
-    let (buf, valid_bytes) = fetch_iphlpapi_table(|ptr, size_ptr| {
-        // SAFETY: `ptr` is either null (size query) or an 8-byte aligned writable
-        // buffer of `*size_ptr` bytes; `size_ptr` is a valid aligned `*mut u32`.
-        unsafe {
-            GetExtendedUdpTable(
-                ptr,
-                size_ptr,
-                0,
-                u32::from(AF_INET6),
-                UDP_TABLE_OWNER_PID,
-                0,
-            )
-        }
-    })?;
+fn lookup_udp_v4_pid(target_ip: Ipv4Addr, local_port: u16) -> Option<u32> {
+    UDP_V4_TABLE_CACHE
+        .get_or_init(IpTableCache::new)
+        .lookup_with(
+            IP_TABLE_SNAPSHOT_TTL,
+            |ptr, size_ptr| {
+                // SAFETY: `ptr` is an 8-byte aligned writable buffer of `*size_ptr`
+                // bytes; `size_ptr` is a valid aligned `*mut u32`.
+                unsafe { GetExtendedUdpTable(ptr, size_ptr, 0, u32::from(AF_INET), UDP_TABLE_OWNER_PID, 0) }
+            },
+            |buf, valid_bytes| scan_udp_v4_table(buf, valid_bytes, target_ip, local_port),
+        )
+}
 
+fn scan_udp_v6_table(
+    buf: &[u64],
+    valid_bytes: usize,
+    target_ip: Ipv6Addr,
+    local_port: u16,
+) -> Option<u32> {
+    let valid_bytes = valid_bytes.min(buf.len().saturating_mul(std::mem::size_of::<u64>()));
     let header_offset = std::mem::offset_of!(MIB_UDP6TABLE_OWNER_PID, table);
     if valid_bytes < header_offset {
         return None;
@@ -1759,6 +2070,29 @@ fn lookup_udp_v6_pid(target_ip: Ipv6Addr, local_port: u16) -> Option<u32> {
     wildcard_pid
 }
 
+fn lookup_udp_v6_pid(target_ip: Ipv6Addr, local_port: u16) -> Option<u32> {
+    UDP_V6_TABLE_CACHE
+        .get_or_init(IpTableCache::new)
+        .lookup_with(
+            IP_TABLE_SNAPSHOT_TTL,
+            |ptr, size_ptr| {
+                // SAFETY: `ptr` is an 8-byte aligned writable buffer of `*size_ptr`
+                // bytes; `size_ptr` is a valid aligned `*mut u32`.
+                unsafe {
+                    GetExtendedUdpTable(
+                        ptr,
+                        size_ptr,
+                        0,
+                        u32::from(AF_INET6),
+                        UDP_TABLE_OWNER_PID,
+                        0,
+                    )
+                }
+            },
+            |buf, valid_bytes| scan_udp_v6_table(buf, valid_bytes, target_ip, local_port),
+        )
+}
+
 /// Resolves a local TCP or UDP endpoint `(local_ip, local_port, is_udp)` to the
 /// owning process executable filename (e.g. `"chrome.exe"`).
 pub(super) fn lookup_local_port_process(
@@ -1772,11 +2106,45 @@ pub(super) fn lookup_local_port_process(
 
     let canonical = local_ip.to_canonical();
     let pid = match (canonical, is_udp) {
-        (IpAddr::V4(v4), false) => lookup_tcp_v4_pid(v4, local_port)
-            .or_else(|| lookup_tcp_v6_pid(v4.to_ipv6_mapped(), local_port)),
+        (IpAddr::V4(v4), false) => {
+            let mapped = v4.to_ipv6_mapped();
+            TCP_V4_TABLE_CACHE
+                .get()
+                .and_then(|cache| {
+                    cache.try_lookup_fresh(IP_TABLE_SNAPSHOT_TTL, |buf, len| {
+                        scan_tcp_v4_table(buf, len, v4, local_port)
+                    })
+                })
+                .or_else(|| {
+                    TCP_V6_TABLE_CACHE.get().and_then(|cache| {
+                        cache.try_lookup_fresh(IP_TABLE_SNAPSHOT_TTL, |buf, len| {
+                            scan_tcp_v6_table(buf, len, mapped, local_port)
+                        })
+                    })
+                })
+                .or_else(|| lookup_tcp_v4_pid(v4, local_port))
+                .or_else(|| lookup_tcp_v6_pid(mapped, local_port))
+        }
         (IpAddr::V6(v6), false) => lookup_tcp_v6_pid(v6, local_port),
-        (IpAddr::V4(v4), true) => lookup_udp_v4_pid(v4, local_port)
-            .or_else(|| lookup_udp_v6_pid(v4.to_ipv6_mapped(), local_port)),
+        (IpAddr::V4(v4), true) => {
+            let mapped = v4.to_ipv6_mapped();
+            UDP_V4_TABLE_CACHE
+                .get()
+                .and_then(|cache| {
+                    cache.try_lookup_fresh(IP_TABLE_SNAPSHOT_TTL, |buf, len| {
+                        scan_udp_v4_table(buf, len, v4, local_port)
+                    })
+                })
+                .or_else(|| {
+                    UDP_V6_TABLE_CACHE.get().and_then(|cache| {
+                        cache.try_lookup_fresh(IP_TABLE_SNAPSHOT_TTL, |buf, len| {
+                            scan_udp_v6_table(buf, len, mapped, local_port)
+                        })
+                    })
+                })
+                .or_else(|| lookup_udp_v4_pid(v4, local_port))
+                .or_else(|| lookup_udp_v6_pid(mapped, local_port))
+        }
         (IpAddr::V6(v6), true) => lookup_udp_v6_pid(v6, local_port),
     }?;
 
@@ -2487,5 +2855,413 @@ mod tests {
                 && a.category == AppCategory::Running
                 && a.path.as_deref() == Some(league_path)
         }));
+    }
+
+    fn make_tcp_v4_row(ip: Ipv4Addr, port: u16, state: u32, pid: u32) -> MIB_TCPROW_OWNER_PID {
+        MIB_TCPROW_OWNER_PID {
+            dwState: state,
+            dwLocalAddr: u32::from_ne_bytes(ip.octets()),
+            dwLocalPort: u32::from(port.to_be()),
+            dwRemoteAddr: 0,
+            dwRemotePort: 0,
+            dwOwningPid: pid,
+        }
+    }
+
+    fn make_tcp_v6_row(ip: Ipv6Addr, port: u16, state: u32, pid: u32) -> MIB_TCP6ROW_OWNER_PID {
+        MIB_TCP6ROW_OWNER_PID {
+            ucLocalAddr: ip.octets(),
+            dwLocalScopeId: 0,
+            dwLocalPort: u32::from(port.to_be()),
+            ucRemoteAddr: [0; 16],
+            dwRemoteScopeId: 0,
+            dwRemotePort: 0,
+            dwState: state,
+            dwOwningPid: pid,
+        }
+    }
+
+    fn write_tcp_v4_table(
+        ptr: *mut c_void,
+        size_ptr: *mut u32,
+        rows: &[MIB_TCPROW_OWNER_PID],
+    ) -> u32 {
+        let header_offset = std::mem::offset_of!(MIB_TCPTABLE_OWNER_PID, table);
+        let needed = header_offset + std::mem::size_of_val(rows);
+        let avail = unsafe { *size_ptr } as usize;
+        if ptr.is_null() || avail < needed {
+            unsafe {
+                *size_ptr = needed as u32;
+            }
+            return ERROR_INSUFFICIENT_BUFFER;
+        }
+        unsafe {
+            let table_ptr = ptr.cast::<MIB_TCPTABLE_OWNER_PID>();
+            (*table_ptr).dwNumEntries = rows.len() as u32;
+            let dst = std::ptr::addr_of_mut!((*table_ptr).table).cast::<MIB_TCPROW_OWNER_PID>();
+            std::ptr::copy_nonoverlapping(rows.as_ptr(), dst, rows.len());
+            *size_ptr = needed as u32;
+        }
+        NO_ERROR
+    }
+
+    #[test]
+    fn pid_snapshot_store_singleflight_cooldown_and_pre_capture_timestamp() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        assert_eq!(PID_SNAPSHOT_TTL, Duration::from_millis(2500));
+        assert_eq!(
+            PID_SNAPSHOT_MISS_REFRESH_COOLDOWN,
+            Duration::from_millis(300)
+        );
+
+        // PID 0 short-circuits without invoking snapshot capture.
+        let store = Arc::new(PidSnapshotStore::new());
+        let zero_calls = Arc::new(AtomicUsize::new(0));
+        let zc = Arc::clone(&zero_calls);
+        assert_eq!(
+            store.resolve_with(0, PID_SNAPSHOT_TTL, PID_SNAPSHOT_MISS_REFRESH_COOLDOWN, || {
+                zc.fetch_add(1, Ordering::SeqCst);
+                Some(HashMap::new())
+            }),
+            None
+        );
+        assert_eq!(zero_calls.load(Ordering::SeqCst), 0);
+
+        // Concurrent burst on cold store shares one snapshot capture (singleflight).
+        let burst_calls = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(8));
+        let mut handles = Vec::with_capacity(8);
+        for _ in 0..8 {
+            let s = Arc::clone(&store);
+            let c = Arc::clone(&burst_calls);
+            let b = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                b.wait();
+                s.resolve_with(
+                    42,
+                    Duration::from_secs(5),
+                    Duration::from_millis(300),
+                    || {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(25));
+                        let mut map = HashMap::new();
+                        map.insert(42, "discord.exe".to_string());
+                        Some(map)
+                    },
+                )
+            }));
+        }
+        for handle in handles {
+            assert_eq!(
+                handle.join().expect("thread join").as_deref(),
+                Some("discord.exe")
+            );
+        }
+        assert_eq!(burst_calls.load(Ordering::SeqCst), 1);
+
+        // Missing/exited PIDs respect the minimum refresh cooldown instead of thrashing,
+        // while still discovering newly spawned PIDs once the cooldown elapses.
+        let cooldown_store = PidSnapshotStore::new();
+        let cooldown_calls = AtomicUsize::new(0);
+        let capture_map = || {
+            let n = cooldown_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut map = HashMap::new();
+            map.insert(42, "discord.exe".to_string());
+            if n >= 2 {
+                map.insert(777, "chrome.exe".to_string());
+            }
+            Some(map)
+        };
+        let ttl = Duration::from_millis(600);
+        let cooldown = Duration::from_millis(90);
+
+        for _ in 0..5 {
+            assert_eq!(
+                cooldown_store.resolve_with(99999, ttl, cooldown, &capture_map),
+                None
+            );
+        }
+        assert_eq!(cooldown_calls.load(Ordering::SeqCst), 1);
+
+        thread::sleep(Duration::from_millis(110));
+        // Known PID still served from warm cache (< 600ms TTL).
+        assert_eq!(
+            cooldown_store
+                .resolve_with(42, ttl, cooldown, &capture_map)
+                .as_deref(),
+            Some("discord.exe")
+        );
+        assert_eq!(cooldown_calls.load(Ordering::SeqCst), 1);
+        // Newly spawned PID triggers one refresh after cooldown elapses.
+        assert_eq!(
+            cooldown_store
+                .resolve_with(777, ttl, cooldown, &capture_map)
+                .as_deref(),
+            Some("chrome.exe")
+        );
+        assert_eq!(cooldown_calls.load(Ordering::SeqCst), 2);
+
+        // `captured_at` is stamped BEFORE calling `capture_fn`: a 45ms capture with a
+        // 60ms TTL must expire after sleeping 25ms (45 + 25 = 70ms >= 60ms).
+        let stamp_store = PidSnapshotStore::new();
+        let stamp_calls = AtomicUsize::new(0);
+        let slow_capture = || {
+            stamp_calls.fetch_add(1, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(45));
+            let mut map = HashMap::new();
+            map.insert(10, "app.exe".to_string());
+            Some(map)
+        };
+        assert_eq!(
+            stamp_store
+                .resolve_with(
+                    10,
+                    Duration::from_millis(60),
+                    Duration::from_millis(60),
+                    &slow_capture
+                )
+                .as_deref(),
+            Some("app.exe")
+        );
+        assert_eq!(stamp_calls.load(Ordering::SeqCst), 1);
+
+        thread::sleep(Duration::from_millis(25));
+        assert_eq!(
+            stamp_store
+                .resolve_with(
+                    10,
+                    Duration::from_millis(60),
+                    Duration::from_millis(60),
+                    &slow_capture
+                )
+                .as_deref(),
+            Some("app.exe")
+        );
+        assert_eq!(stamp_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn fetch_iphlpapi_table_into_reuses_32kib_buffer_without_null_probe_and_grows() {
+        assert_eq!(INITIAL_TABLE_BUFFER_BYTES, 32 * 1024);
+        assert_eq!(IP_TABLE_SNAPSHOT_TTL, Duration::from_millis(50));
+
+        let rows = [make_tcp_v4_row(Ipv4Addr::LOCALHOST, 5555, 5, 1234)];
+        let mut buf: Vec<u64> = Vec::new();
+        let mut calls = 0usize;
+
+        let len1 = fetch_iphlpapi_table_into(&mut buf, |ptr, size_ptr| {
+            calls += 1;
+            assert!(!ptr.is_null(), "must not null-probe before fetching");
+            let avail = unsafe { *size_ptr } as usize;
+            assert!(avail >= INITIAL_TABLE_BUFFER_BYTES);
+            write_tcp_v4_table(ptr, size_ptr, &rows)
+        })
+        .expect("initial fetch should succeed in one call");
+        assert_eq!(calls, 1);
+        assert_eq!(
+            scan_tcp_v4_table(&buf, len1, Ipv4Addr::LOCALHOST, 5555),
+            Some(1234)
+        );
+
+        let ptr_before = buf.as_ptr();
+        let cap_before = buf.capacity();
+        let len2 = fetch_iphlpapi_table_into(&mut buf, |ptr, size_ptr| {
+            calls += 1;
+            assert!(!ptr.is_null());
+            write_tcp_v4_table(ptr, size_ptr, &rows)
+        })
+        .expect("reused buffer fetch should succeed");
+        assert_eq!(calls, 2);
+        assert_eq!(buf.as_ptr(), ptr_before);
+        assert_eq!(buf.capacity(), cap_before);
+        assert_eq!(
+            scan_tcp_v4_table(&buf, len2, Ipv4Addr::LOCALHOST, 5555),
+            Some(1234)
+        );
+
+        // Oversized table triggers growth + retry, then subsequent calls reuse the grown buffer.
+        let required_bytes: usize = 48 * 1024;
+        let len3 = fetch_iphlpapi_table_into(&mut buf, |ptr, size_ptr| {
+            calls += 1;
+            let avail = unsafe { *size_ptr } as usize;
+            if avail < required_bytes {
+                unsafe {
+                    *size_ptr = required_bytes as u32;
+                }
+                ERROR_INSUFFICIENT_BUFFER
+            } else {
+                assert!(avail >= required_bytes + TABLE_BUFFER_HEADROOM);
+                write_tcp_v4_table(ptr, size_ptr, &rows)
+            }
+        })
+        .expect("grown buffer fetch should succeed");
+        assert_eq!(calls, 4);
+        assert_eq!(
+            scan_tcp_v4_table(&buf, len3, Ipv4Addr::LOCALHOST, 5555),
+            Some(1234)
+        );
+
+        let grown_cap = buf.capacity();
+        let _ = fetch_iphlpapi_table_into(&mut buf, |ptr, size_ptr| {
+            calls += 1;
+            let avail = unsafe { *size_ptr } as usize;
+            assert!(avail >= required_bytes + TABLE_BUFFER_HEADROOM);
+            write_tcp_v4_table(ptr, size_ptr, &rows)
+        })
+        .expect("subsequent fetch should reuse grown buffer in one call");
+        assert_eq!(calls, 5);
+        assert_eq!(buf.capacity(), grown_cap);
+    }
+
+    #[test]
+    fn ip_table_cache_singleflight_burst_and_ttl_refresh() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let cache = Arc::new(IpTableCache::new());
+        let rows = Arc::new(Mutex::new(
+            (0..8u16)
+                .map(|i| make_tcp_v4_row(Ipv4Addr::LOCALHOST, 50001 + i, 5, 101 + u32::from(i)))
+                .collect::<Vec<_>>(),
+        ));
+        let fetch_calls = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(8));
+        let ttl = Duration::from_millis(80);
+
+        let mut handles = Vec::with_capacity(8);
+        for i in 0..8u16 {
+            let c = Arc::clone(&cache);
+            let r = Arc::clone(&rows);
+            let f = Arc::clone(&fetch_calls);
+            let b = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                b.wait();
+                let pid = c.lookup_with(
+                    ttl,
+                    |ptr, size_ptr| {
+                        f.fetch_add(1, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(20));
+                        let table = r.lock().unwrap();
+                        write_tcp_v4_table(ptr, size_ptr, &table)
+                    },
+                    |buf, valid_bytes| {
+                        scan_tcp_v4_table(buf, valid_bytes, Ipv4Addr::LOCALHOST, 50001 + i)
+                    },
+                );
+                (i, pid)
+            }));
+        }
+
+        for handle in handles {
+            let (i, pid) = handle.join().expect("thread join");
+            assert_eq!(pid, Some(101 + u32::from(i)));
+        }
+        assert_eq!(fetch_calls.load(Ordering::SeqCst), 1);
+
+        // Subsequent lookup within TTL hits cached table without dumping again.
+        let warm = cache.lookup_with(
+            ttl,
+            |ptr, size_ptr| {
+                fetch_calls.fetch_add(1, Ordering::SeqCst);
+                let table = rows.lock().unwrap();
+                write_tcp_v4_table(ptr, size_ptr, &table)
+            },
+            |buf, valid_bytes| scan_tcp_v4_table(buf, valid_bytes, Ipv4Addr::LOCALHOST, 50003),
+        );
+        assert_eq!(warm, Some(103));
+        assert_eq!(fetch_calls.load(Ordering::SeqCst), 1);
+
+        // Brand-new socket created after snapshot refreshes on miss and resolves immediately.
+        rows.lock()
+            .unwrap()
+            .push(make_tcp_v4_row(Ipv4Addr::LOCALHOST, 50099, 5, 999));
+        let fresh = cache.lookup_with(
+            ttl,
+            |ptr, size_ptr| {
+                fetch_calls.fetch_add(1, Ordering::SeqCst);
+                let table = rows.lock().unwrap();
+                write_tcp_v4_table(ptr, size_ptr, &table)
+            },
+            |buf, valid_bytes| scan_tcp_v4_table(buf, valid_bytes, Ipv4Addr::LOCALHOST, 50099),
+        );
+        assert_eq!(fresh, Some(999));
+        assert_eq!(fetch_calls.load(Ordering::SeqCst), 2);
+
+        // After TTL expires, even an already-known port triggers a fresh dump.
+        thread::sleep(Duration::from_millis(100));
+        let expired = cache.lookup_with(
+            ttl,
+            |ptr, size_ptr| {
+                fetch_calls.fetch_add(1, Ordering::SeqCst);
+                let table = rows.lock().unwrap();
+                write_tcp_v4_table(ptr, size_ptr, &table)
+            },
+            |buf, valid_bytes| scan_tcp_v4_table(buf, valid_bytes, Ipv4Addr::LOCALHOST, 50001),
+        );
+        assert_eq!(expired, Some(101));
+        assert_eq!(fetch_calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn tcp_row_selection_prefers_active_states_over_listen_time_wait_and_closed() {
+        let ip4 = Ipv4Addr::new(192, 168, 1, 10);
+        let ip6 = Ipv6Addr::LOCALHOST;
+
+        // Stale TIME_WAIT (11), CLOSED (1), and LISTEN (2) rows before an active state
+        // must never shadow live connections (dwState in 3..=10).
+        for active_state in 3..=10u32 {
+            let v4_rows = [
+                make_tcp_v4_row(ip4, 44321, 11, 111),           // TIME_WAIT
+                make_tcp_v4_row(ip4, 44321, 1, 222),            // CLOSED
+                make_tcp_v4_row(ip4, 44321, 2, 333),            // LISTEN
+                make_tcp_v4_row(ip4, 44321, active_state, 444), // active
+            ];
+            assert_eq!(
+                select_tcp_v4_pid(&v4_rows, ip4, 44321),
+                Some(444),
+                "IPv4 active state {active_state} must beat TIME_WAIT/CLOSED/LISTEN"
+            );
+
+            let v6_rows = [
+                make_tcp_v6_row(ip6, 44321, 11, 111),
+                make_tcp_v6_row(ip6, 44321, 1, 222),
+                make_tcp_v6_row(ip6, 44321, 2, 333),
+                make_tcp_v6_row(ip6, 44321, active_state, 444),
+            ];
+            assert_eq!(
+                select_tcp_v6_pid(&v6_rows, ip6, 44321),
+                Some(444),
+                "IPv6 active state {active_state} must beat TIME_WAIT/CLOSED/LISTEN"
+            );
+        }
+
+        // Without an active row, LISTEN beats TIME_WAIT and exact IP beats wildcard.
+        let v4_inactive = [
+            make_tcp_v4_row(Ipv4Addr::UNSPECIFIED, 8080, 2, 10),
+            make_tcp_v4_row(ip4, 8080, 11, 20),
+            make_tcp_v4_row(ip4, 8080, 2, 30),
+        ];
+        assert_eq!(select_tcp_v4_pid(&v4_inactive, ip4, 8080), Some(30));
+
+        let v6_inactive = [
+            make_tcp_v6_row(Ipv6Addr::UNSPECIFIED, 8080, 2, 10),
+            make_tcp_v6_row(ip6, 8080, 11, 20),
+            make_tcp_v6_row(ip6, 8080, 2, 30),
+        ];
+        assert_eq!(select_tcp_v6_pid(&v6_inactive, ip6, 8080), Some(30));
+
+        // Standalone TIME_WAIT / wildcard LISTEN still resolve as fallback, and PID 0 is ignored.
+        let v4_fallback = [
+            make_tcp_v4_row(ip4, 9000, 5, 0),
+            make_tcp_v4_row(ip4, 9000, 11, 77),
+        ];
+        assert_eq!(select_tcp_v4_pid(&v4_fallback, ip4, 9000), Some(77));
+
+        let v6_wildcard = [make_tcp_v6_row(Ipv6Addr::UNSPECIFIED, 9001, 2, 88)];
+        assert_eq!(select_tcp_v6_pid(&v6_wildcard, ip6, 9001), Some(88));
     }
 }

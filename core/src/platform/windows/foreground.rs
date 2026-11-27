@@ -1,26 +1,30 @@
 //! Keep the foreground fail-open PAC proxy lease tied to a detached process. Closing a
 //! Windows console can terminate its processes without running any Rust cleanup.
 use super::{
-    broadcast_environment_change, build_windows_pac_url, internet_settings_key,
+    broadcast_environment_change, build_windows_pac_url_with_nonce, clear_all_windows_proxies,
+    ensure_safe_state_dir, internet_settings_key, is_reparse_point_attrs,
     is_vdpi_owned_no_proxy_env, is_vdpi_owned_pac_url, is_vdpi_owned_proxy_env,
-    is_vdpi_owned_wininet_server, notify_wininet_refresh, reset_winhttp_proxy_if_vdpi,
-    sanitize_captured_wininet_state, sync_wininet_connection_blobs,
+    is_vdpi_owned_wininet_server, load_saved_windows_proxy_state, next_session_pac_nonce,
+    notify_wininet_refresh, path_attributes_no_follow, read_windows_proxy_state_from_path,
+    reject_reparse_point, reject_reparse_point_or_dir, remove_windows_proxy_state_at_path,
+    reset_winhttp_proxy_if_vdpi, sanitize_captured_wininet_state, sync_wininet_connection_blobs,
     sync_wininet_connection_blobs_restore_manual, SavedWindowsProxyState, SavedWininetHiveState,
-    ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, NO_PROXY_ENV_VARS,
-    PROXY_ENV_VARS, WINDOWS_PROXY_STATE_FILENAME,
+    ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_FLAG_OPEN_REPARSE_POINT, NO_PROXY_ENV_VARS, PROXY_ENV_VARS, WINDOWS_PROXY_STATE_FILENAME,
 };
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::SocketAddr;
-use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS};
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
@@ -31,6 +35,8 @@ pub const GUARD_ARG: &str = "--internal-foreground-proxy-guard";
 const READY: &str = "ready";
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+const GUARD_EXIT_TIMEOUT: Duration = Duration::from_secs(3);
+const GUARD_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 static STATE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Serialize, Deserialize)]
@@ -69,28 +75,156 @@ fn spawn_guard_process(exe: &Path) -> io::Result<Child> {
     }
 }
 
+fn wait_child_bounded_with<S>(
+    timeout: Duration,
+    poll_interval: Duration,
+    mut try_wait_fn: impl FnMut() -> io::Result<Option<S>>,
+    mut sleep_fn: impl FnMut(Duration),
+) -> io::Result<Option<S>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = try_wait_fn()? {
+            return Ok(Some(status));
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+        sleep_fn(poll_interval.min(deadline.saturating_duration_since(now)));
+    }
+}
+
+fn reap_failed_guard_child(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
+    match wait_child_bounded_with(
+        timeout,
+        GUARD_WAIT_POLL_INTERVAL,
+        || child.try_wait(),
+        std::thread::sleep,
+    ) {
+        Ok(Some(status)) => Some(status),
+        Ok(None) | Err(_) => {
+            let _ = child.kill();
+            child.wait().ok()
+        }
+    }
+}
+
+fn format_guard_startup_failure(
+    io_err: Option<&io::Error>,
+    response: &str,
+    exit_status: Option<ExitStatus>,
+) -> anyhow::Error {
+    let trimmed = response.trim();
+    if !trimmed.is_empty() {
+        return anyhow::anyhow!("Windows proxy could not start safely: {trimmed}");
+    }
+    match (exit_status, io_err) {
+        (Some(status), Some(err)) => anyhow::anyhow!(
+            "Windows proxy could not start safely: guard exited ({status}) while communicating ({err})"
+        ),
+        (Some(status), None) => anyhow::anyhow!(
+            "Windows proxy could not start safely: guard exited ({status}) without reporting readiness"
+        ),
+        (None, Some(err)) => anyhow::anyhow!(
+            "Windows proxy could not start safely: guard communication failed ({err})"
+        ),
+        (None, None) => anyhow::anyhow!(
+            "Windows proxy could not start safely: guard closed stdout without reporting readiness"
+        ),
+    }
+}
+
+fn activate_with_child(mut child: Child, payload: &[u8]) -> Result<ForegroundProxy> {
+    let write_err = {
+        let pipe = child.stdin.as_mut().expect("guard stdin was piped");
+        pipe.write_all(payload).and_then(|()| pipe.flush()).err()
+    };
+
+    if let Some(err) = write_err {
+        drop(child.stdin.take());
+        let mut response = String::new();
+        if let Some(stdout) = child.stdout.take() {
+            let _ = BufReader::new(stdout).read_line(&mut response);
+        }
+        let exit_status = reap_failed_guard_child(&mut child, GUARD_EXIT_TIMEOUT);
+        return Err(format_guard_startup_failure(
+            Some(&err),
+            &response,
+            exit_status,
+        ));
+    }
+
+    let mut response = String::new();
+    let read_res = BufReader::new(child.stdout.take().expect("guard stdout was piped"))
+        .read_line(&mut response);
+    if let Err(err) = read_res {
+        drop(child.stdin.take());
+        let exit_status = reap_failed_guard_child(&mut child, GUARD_EXIT_TIMEOUT);
+        return Err(format_guard_startup_failure(
+            Some(&err),
+            &response,
+            exit_status,
+        ));
+    }
+    if response.trim() != READY {
+        drop(child.stdin.take());
+        let exit_status = reap_failed_guard_child(&mut child, GUARD_EXIT_TIMEOUT);
+        return Err(format_guard_startup_failure(None, &response, exit_status));
+    }
+    Ok(ForegroundProxy(child))
+}
+
 impl ForegroundProxy {
     pub fn activate(endpoint: SocketAddr, env_proxy: bool, bypass: &[String]) -> Result<Self> {
         let exe = std::env::current_exe()?;
-        let mut guard =
-            Self(spawn_guard_process(&exe).context("starting the Windows proxy cleanup process")?);
-        let pipe = guard.0.stdin.as_mut().expect("guard stdin was piped");
-        serde_json::to_writer(
-            &mut *pipe,
-            &Request {
-                endpoint,
-                env_proxy,
-                bypass: bypass.to_vec(),
-            },
-        )?;
-        pipe.write_all(b"\n")?;
-        let mut response = String::new();
-        BufReader::new(guard.0.stdout.take().expect("guard stdout was piped"))
-            .read_line(&mut response)?;
-        if response.trim() != READY {
-            bail!("Windows proxy could not start safely: {}", response.trim());
+        let mut payload = serde_json::to_vec(&Request {
+            endpoint,
+            env_proxy,
+            bypass: bypass.to_vec(),
+        })?;
+        payload.push(b'\n');
+        let child =
+            spawn_guard_process(&exe).context("starting the Windows proxy cleanup process")?;
+        activate_with_child(child, &payload)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shutdown_guard_child_with<C>(
+    ctx: &mut C,
+    timeout: Duration,
+    poll_interval: Duration,
+    mut try_wait_fn: impl FnMut(&mut C) -> io::Result<Option<ExitStatus>>,
+    mut kill_fn: impl FnMut(&mut C) -> io::Result<()>,
+    mut wait_fn: impl FnMut(&mut C) -> io::Result<ExitStatus>,
+    sleep_fn: impl FnMut(Duration),
+    mut fallback_clear: impl FnMut(),
+) {
+    match wait_child_bounded_with(timeout, poll_interval, || try_wait_fn(ctx), sleep_fn) {
+        Ok(Some(status)) if status.success() => {}
+        Ok(Some(status)) => {
+            tracing::warn!(?status, "Windows foreground proxy cleanup failed");
         }
-        Ok(guard)
+        Ok(None) => {
+            tracing::warn!(
+                timeout_secs = timeout.as_secs(),
+                "Windows foreground proxy cleanup timed out; killing guard and running fallback cleanup"
+            );
+            if let Err(err) = kill_fn(ctx) {
+                tracing::warn!(error = %err, "failed to kill hung Windows foreground proxy guard");
+            }
+            let _ = wait_fn(ctx);
+            fallback_clear();
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "failed polling Windows foreground proxy cleanup process; killing guard and running fallback cleanup"
+            );
+            let _ = kill_fn(ctx);
+            let _ = wait_fn(ctx);
+            fallback_clear();
+        }
     }
 }
 
@@ -98,10 +232,23 @@ impl Drop for ForegroundProxy {
     fn drop(&mut self) {
         // The operating system closes this pipe on abrupt parent exit as well.
         drop(self.0.stdin.take());
-        match self.0.wait() {
-            Ok(status) if status.success() => {}
-            result => tracing::warn!(?result, "Windows foreground proxy cleanup failed"),
-        }
+        shutdown_guard_child_with(
+            &mut self.0,
+            GUARD_EXIT_TIMEOUT,
+            GUARD_WAIT_POLL_INTERVAL,
+            Child::try_wait,
+            Child::kill,
+            Child::wait,
+            std::thread::sleep,
+            || {
+                if let Err(err) = clear_all_windows_proxies() {
+                    tracing::warn!(
+                        error = %err,
+                        "fallback Windows proxy cleanup failed after guard timeout"
+                    );
+                }
+            },
+        );
     }
 }
 
@@ -118,24 +265,89 @@ pub fn run_guard() -> Result<()> {
     result
 }
 
+fn resolve_foreground_state_dir_from(
+    local_appdata: Option<OsString>,
+    userprofile: Option<OsString>,
+) -> Result<PathBuf> {
+    if let Some(base) = local_appdata.filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(base).join("vdpi"));
+    }
+    if let Some(home) = userprofile.filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(home).join(".vdpi"));
+    }
+    bail!("LOCALAPPDATA and USERPROFILE are unavailable");
+}
+
+fn foreground_state_dir() -> Result<PathBuf> {
+    resolve_foreground_state_dir_from(
+        std::env::var_os("LOCALAPPDATA"),
+        std::env::var_os("USERPROFILE"),
+    )
+}
+
+fn acquire_proxy_lease_lock_with(
+    lock_path: &Path,
+    delays_ms: &[u64],
+    sleep_fn: impl FnMut(Duration),
+) -> Result<fs::File> {
+    if let Some(parent) = lock_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        ensure_safe_state_dir(parent, false)?;
+    }
+    reject_reparse_point_or_dir(lock_path)?;
+    let file = retry_on_transient_av_lock_with(
+        delays_ms,
+        || {
+            if let Some(attrs) = path_attributes_no_follow(lock_path)? {
+                if is_reparse_point_attrs(attrs) || (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "refusing to open NTFS reparse point or directory as proxy lease lock: {}",
+                            lock_path.display()
+                        ),
+                    ));
+                }
+            }
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .share_mode(0)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(lock_path)
+        },
+        sleep_fn,
+    )
+    .context("acquiring the Windows proxy lease (another vdpi may already be running)")?;
+    let meta = file
+        .metadata()
+        .with_context(|| format!("inspecting proxy lease lock metadata {}", lock_path.display()))?;
+    if is_reparse_point_attrs(meta.file_attributes()) || !meta.is_file() {
+        bail!(
+            "refusing to use NTFS reparse point or non-file as proxy lease lock: {}",
+            lock_path.display()
+        );
+    }
+    Ok(file)
+}
+
+fn acquire_proxy_lease_lock(lock_path: &Path) -> Result<fs::File> {
+    acquire_proxy_lease_lock_with(lock_path, &LEASE_LOCK_RETRY_DELAYS_MS, std::thread::sleep)
+}
+
 fn guard_inner() -> Result<()> {
     let mut input = io::stdin().lock();
     let mut request = String::new();
     input.read_line(&mut request)?;
     let request: Request = serde_json::from_str(&request).context("invalid proxy lease request")?;
-    let base = std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is unavailable")?;
-    let dir = PathBuf::from(base).join("vdpi");
-    fs::create_dir_all(&dir)?;
-    let _lease_lock = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .share_mode(0)
-        .open(dir.join("proxy-lease.lock"))
-        .context("acquiring the Windows proxy lease (another vdpi may already be running)")?;
+    let dir = foreground_state_dir()?;
+    ensure_safe_state_dir(&dir, false)?;
+    let lease_lock = acquire_proxy_lease_lock(&dir.join("proxy-lease.lock"))?;
 
     let _ = (request.env_proxy, &request.bypass);
-    let pac_url = build_windows_pac_url(request.endpoint.ip(), request.endpoint.port());
+    let pac_nonce = next_session_pac_nonce();
+    let pac_url =
+        build_windows_pac_url_with_nonce(request.endpoint.ip(), request.endpoint.port(), &pac_nonce);
     let inet = Key::open(super::INTERNET_SETTINGS_SUBKEY)?;
     let prior_proxy_server = inet.read("ProxyServer")?.and_then(|v| v.as_string());
     let prior_proxy_override = inet.read("ProxyOverride")?.and_then(|v| v.as_string());
@@ -152,6 +364,15 @@ fn guard_inner() -> Result<()> {
         ],
     )?;
 
+    let had_stale_vdpi_pac = proxy
+        .changes
+        .iter()
+        .find(|c| c.name == "AutoConfigURL")
+        .and_then(|c| c.before.as_ref())
+        .and_then(Value::as_string)
+        .as_deref()
+        .is_some_and(|s| s.trim().eq_ignore_ascii_case(&pac_url) || is_vdpi_owned_pac_url(s));
+
     // Persist the sanitized pre-vdpi WinINET snapshot before mutating HKCU so even if
     // Defender quarantines vdpi.exe and kills both parent and guard simultaneously, a user's
     // original corporate PAC/manual proxy is preserved for subsequent restore.
@@ -164,14 +385,19 @@ fn guard_inner() -> Result<()> {
     let created_state_file = persist_proxy_state_if_absent(&state_path, captured_snapshot)?;
 
     normalize_stale_wininet_before(&mut proxy.changes, prior_proxy_server.as_deref(), &pac_url);
-    if !created_state_file {
-        if let Some(saved_prior) = load_saved_hkcu_state(&state_path) {
-            apply_saved_prior_wininet_before(
-                &mut proxy.changes,
-                &saved_prior,
-                prior_proxy_server.as_deref(),
-            );
-        }
+    let saved_prior = if !created_state_file {
+        load_saved_hkcu_state_with_fallback(&state_path)
+    } else if had_stale_vdpi_pac || had_vdpi_manual {
+        load_saved_global_hkcu_state()
+    } else {
+        None
+    };
+    if let Some(saved_prior) = saved_prior {
+        apply_saved_prior_wininet_before(
+            &mut proxy.changes,
+            &saved_prior,
+            prior_proxy_server.as_deref(),
+        );
     }
 
     // Delete any stale vdpi-owned manual ProxyServer/ProxyOverride even if ProxyEnable is already 0.
@@ -193,6 +419,7 @@ fn guard_inner() -> Result<()> {
     with_proxy_lease(
         &mut proxy,
         Some((state_path.as_path(), created_state_file)),
+        Some(lease_lock),
         || {
             let _ = sync_wininet_connection_blobs(
                 &hkcu_inet_key,
@@ -220,7 +447,7 @@ fn guard_inner() -> Result<()> {
                 .flatten()
                 .and_then(|v| v.as_string())
                 .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
+                .filter(|s| !s.is_empty() && !is_vdpi_owned_pac_url(s));
             let live_enable = inet
                 .read("ProxyEnable")
                 .ok()
@@ -378,10 +605,24 @@ fn snapshot_from_before(
         proxy_server: prior_proxy_server.map(ToString::to_string),
         proxy_override: prior_proxy_override.map(ToString::to_string),
         auto_config_url,
+        auto_detect: None,
     }
 }
 
+fn is_empty_wininet_state(state: &SavedWininetHiveState) -> bool {
+    !state.proxy_enable
+        && state.proxy_server.is_none()
+        && state.proxy_override.is_none()
+        && state.auto_config_url.is_none()
+        && state.auto_detect.is_none()
+}
+
+fn path_exists_no_follow(path: &Path) -> bool {
+    matches!(path_attributes_no_follow(path), Ok(Some(_)))
+}
+
 const AV_LOCK_RETRY_DELAYS_MS: [u64; 5] = [10, 25, 50, 100, 200];
+const LEASE_LOCK_RETRY_DELAYS_MS: [u64; 6] = [25, 50, 100, 200, 300, 500];
 
 fn is_transient_av_lock_error(err: &io::Error) -> bool {
     matches!(
@@ -428,14 +669,29 @@ fn publish_proxy_state_if_absent_with(
             Ok(false)
         }
         Err(_) => {
-            if state_path.exists() {
+            if let Err(err) = reject_reparse_point_or_dir(state_path) {
+                let _ = fs::remove_file(tmp_path);
+                return Err(err);
+            }
+            if path_exists_no_follow(state_path) {
                 let _ = fs::remove_file(tmp_path);
                 return Ok(false);
             }
             let rename_res = retry_on_transient_av_lock_with(
                 delays_ms,
                 || {
-                    if state_path.exists() {
+                    if let Some(attrs) = path_attributes_no_follow(state_path)? {
+                        if is_reparse_point_attrs(attrs)
+                            || (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!(
+                                    "refusing to overwrite NTFS reparse point or directory at {}",
+                                    state_path.display()
+                                ),
+                            ));
+                        }
                         return Err(io::Error::from(io::ErrorKind::AlreadyExists));
                     }
                     rename_fn()
@@ -450,7 +706,9 @@ fn publish_proxy_state_if_absent_with(
                 }
                 Err(rename_err) => {
                     let _ = fs::remove_file(tmp_path);
-                    if state_path.exists() {
+                    if reject_reparse_point_or_dir(state_path).is_ok()
+                        && path_exists_no_follow(state_path)
+                    {
                         return Ok(false);
                     }
                     Err(rename_err).with_context(|| {
@@ -469,20 +727,27 @@ fn persist_proxy_state_if_absent(
     state_path: &Path,
     raw_snapshot: SavedWininetHiveState,
 ) -> Result<bool> {
-    if state_path.exists() {
-        return Ok(false);
-    }
-
-    let mut state = SavedWindowsProxyState::default();
-    state.record_hive_if_absent("HKCU", raw_snapshot);
-    let json = serde_json::to_string(&state).context("serializing Windows proxy state")?;
-
     let parent = state_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)
-        .with_context(|| format!("creating proxy state directory {}", parent.display()))?;
+    ensure_safe_state_dir(parent, false)?;
+    reject_reparse_point_or_dir(state_path)?;
+    if path_attributes_no_follow(state_path)
+        .with_context(|| format!("inspecting Windows proxy state {}", state_path.display()))?
+        .is_some()
+    {
+        return Ok(false);
+    }
+
+    let sanitized = sanitize_captured_wininet_state(raw_snapshot);
+    if is_empty_wininet_state(&sanitized) {
+        return Ok(false);
+    }
+
+    let mut state = SavedWindowsProxyState::default();
+    state.record_hive_if_absent("HKCU", sanitized);
+    let json = serde_json::to_string(&state).context("serializing Windows proxy state")?;
 
     let file_name = state_path
         .file_name()
@@ -497,6 +762,7 @@ fn persist_proxy_state_if_absent(
         let mut tmp_file = OpenOptions::new()
             .write(true)
             .create_new(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(&tmp_path)
             .with_context(|| format!("creating temporary proxy state {}", tmp_path.display()))?;
         tmp_file
@@ -512,6 +778,13 @@ fn persist_proxy_state_if_absent(
         return Err(err);
     }
 
+    if let Err(err) =
+        reject_reparse_point(parent).and_then(|()| reject_reparse_point_or_dir(state_path))
+    {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
     publish_proxy_state_if_absent_with(
         &tmp_path,
         state_path,
@@ -523,11 +796,36 @@ fn persist_proxy_state_if_absent(
 }
 
 fn load_saved_hkcu_state(state_path: &Path) -> Option<SavedWininetHiveState> {
-    let raw = fs::read_to_string(state_path).ok()?;
-    let parsed: SavedWindowsProxyState = serde_json::from_str(&raw).ok()?;
+    let parsed = read_windows_proxy_state_from_path(state_path)?;
     parsed
         .state_for_root("HKCU")
         .map(sanitize_captured_wininet_state)
+}
+
+fn load_saved_global_hkcu_state() -> Option<SavedWininetHiveState> {
+    load_saved_windows_proxy_state()
+        .state_for_root("HKCU")
+        .map(sanitize_captured_wininet_state)
+        .filter(|state| !is_empty_wininet_state(state))
+}
+
+fn load_saved_hkcu_state_with_fallback_using(
+    state_path: &Path,
+    load_global: impl FnOnce() -> SavedWindowsProxyState,
+) -> Option<SavedWininetHiveState> {
+    if let Some(local) =
+        load_saved_hkcu_state(state_path).filter(|state| !is_empty_wininet_state(state))
+    {
+        return Some(local);
+    }
+    load_global()
+        .state_for_root("HKCU")
+        .map(sanitize_captured_wininet_state)
+        .filter(|state| !is_empty_wininet_state(state))
+}
+
+fn load_saved_hkcu_state_with_fallback(state_path: &Path) -> Option<SavedWininetHiveState> {
+    load_saved_hkcu_state_with_fallback_using(state_path, load_saved_windows_proxy_state)
 }
 
 fn apply_saved_prior_wininet_before(
@@ -579,9 +877,25 @@ fn should_remove_state_file_on_cleanup(
     inet_restored_ok && (applied_all || created_state_file)
 }
 
-fn with_proxy_lease(
+fn should_sync_blobs_for_live_auto_config(key: &Key) -> bool {
+    match key.read("AutoConfigURL") {
+        Ok(None) => true,
+        Ok(Some(val)) => match val.as_string() {
+            Some(url) => {
+                let trimmed = url.trim();
+                trimmed.is_empty() || is_vdpi_owned_pac_url(trimmed)
+            }
+            None => false,
+        },
+        Err(_) => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn with_proxy_lease<L>(
     proxy: &mut Settings<'_>,
     state_file: Option<(&Path, bool)>,
+    mut lease_lock: Option<L>,
     sync_on_activate: impl Fn(),
     sync_on_restore: impl Fn(),
     refresh_inet: impl Fn(),
@@ -594,23 +908,54 @@ fn with_proxy_lease(
         refresh_inet();
         wait()
     })();
+    let had_applied = proxy.applied > 0;
     let applied_all = proxy.applied == proxy.changes.len();
     let inet_restored = proxy.restore(Some("AutoConfigURL"));
-    if matches!(inet_restored, Ok(true)) {
+    if !had_applied {
+        drop(lease_lock.take());
+        return outcome.and(inet_restored.map(|_| ()));
+    }
+    let restored_cleanly = matches!(inet_restored, Ok(true));
+    if restored_cleanly || should_sync_blobs_for_live_auto_config(proxy.key) {
         sync_on_restore();
     }
-    refresh_inet();
-    reset_winhttp();
     if let Some((path, created_state_file)) = state_file {
         if should_remove_state_file_on_cleanup(
-            inet_restored.is_ok(),
+            restored_cleanly,
             applied_all,
             created_state_file,
         ) {
-            let _ = fs::remove_file(path);
+            let _ = remove_windows_proxy_state_at_path(path);
         }
     }
+    // Release the lease lock right after Registry, connection-blob, and state-file cleanup
+    // so rapid VPN yield -> resume handoffs do not block on WinINET/WinHTTP refresh calls.
+    drop(lease_lock.take());
+    refresh_inet();
+    reset_winhttp();
     outcome.and(inet_restored.map(|_| ()))
+}
+
+fn registry_values_match(name: &str, current: Option<&Value>, expected: Option<&Value>) -> bool {
+    match (current, expected) {
+        (None, None) => true,
+        (Some(curr), Some(exp)) => {
+            if let (Some(curr_s), Some(exp_s)) = (curr.as_string(), exp.as_string()) {
+                let curr_trimmed = curr_s.trim();
+                let exp_trimmed = exp_s.trim();
+                if name.eq_ignore_ascii_case("AutoConfigURL") {
+                    curr_trimmed.eq_ignore_ascii_case(exp_trimmed)
+                } else {
+                    curr_trimmed == exp_trimmed
+                }
+            } else if let (Some(curr_d), Some(exp_d)) = (curr.as_dword(), exp.as_dword()) {
+                curr_d == exp_d
+            } else {
+                curr == exp
+            }
+        }
+        _ => false,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -699,16 +1044,23 @@ impl<'a> Settings<'a> {
     }
 
     fn restore(&mut self, owner: Option<&str>) -> Result<bool> {
+        if self.applied == 0 {
+            return Ok(false);
+        }
+        let applied_count = self.applied;
+        self.applied = 0;
         let mut failure = None;
-        let applied = &self.changes[..self.applied];
+        let applied = &self.changes[..applied_count];
         if let Some(owner) = applied.iter().find(|change| Some(change.name) == owner) {
-            if self.key.read(owner.name)? != owner.after {
+            let current = self.key.read(owner.name)?;
+            if !registry_values_match(owner.name, current.as_ref(), owner.after.as_ref()) {
                 return Ok(false);
             }
         }
         for change in applied.iter().rev() {
             let result = (|| -> Result<()> {
-                if self.key.read(change.name)? == change.after {
+                let current = self.key.read(change.name)?;
+                if registry_values_match(change.name, current.as_ref(), change.after.as_ref()) {
                     self.key.write(change.name, change.before.as_ref())?;
                 }
                 Ok(())
@@ -717,7 +1069,6 @@ impl<'a> Settings<'a> {
                 failure = Some(e);
             }
         }
-        self.applied = 0;
         failure.map_or(Ok(true), Err)
     }
 }
@@ -823,8 +1174,10 @@ fn wide(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::os::windows::process::ExitStatusExt;
     use std::sync::atomic::AtomicUsize;
-    use std::time::Instant;
+    use std::sync::{Arc, Mutex};
 
     const ROLE: &str = "VDPI_TEST_PROXY_ROLE";
     const PATH: &str = "VDPI_TEST_PROXY_KEY";
@@ -909,6 +1262,7 @@ mod tests {
                 with_proxy_lease(
                     &mut changes,
                     None,
+                    None::<()>,
                     || {},
                     || {},
                     || {},
@@ -964,12 +1318,12 @@ mod tests {
 
     #[test]
     fn normalizes_stale_vdpi_before_state_without_clobbering_external_proxy() {
-        let pac_url = "http://127.0.0.1:8080/vdpi.pac";
+        let pac_url = "http://127.0.0.1:8080/vdpi.pac?v=session-1";
 
         let mut stale_pac_and_legacy_manual = vec![
             Change {
                 name: "AutoConfigURL",
-                before: Some(Value::string("http://[::1]:18080/vdpi.pac")),
+                before: Some(Value::string("http://[::1]:18080/vdpi.pac?v=old-nonce")),
                 after: Some(Value::string(pac_url)),
             },
             Change {
@@ -1023,6 +1377,7 @@ mod tests {
             proxy_server: Some(" proxy.corp.local:3128 ".into()),
             proxy_override: Some(" *.corp.local;<local> ".into()),
             auto_config_url: Some(" http://pac.corp.local/proxy.pac ".into()),
+            auto_detect: None,
         };
         let created = persist_proxy_state_if_absent(&state_path, corp_snapshot).unwrap();
         assert!(created);
@@ -1042,6 +1397,7 @@ mod tests {
             proxy_server: Some("proxy.corp.local:3128".into()),
             proxy_override: Some("*.corp.local;<local>".into()),
             auto_config_url: Some("http://pac.corp.local/proxy.pac".into()),
+            auto_detect: None,
         };
         assert_eq!(parsed.state_for_root("HKCU"), Some(expected_corp.clone()));
         assert!(parsed.proxy_enable);
@@ -1059,25 +1415,52 @@ mod tests {
             proxy_server: Some("127.0.0.1:8080".into()),
             proxy_override: None,
             auto_config_url: Some("http://127.0.0.1:8080/vdpi.pac".into()),
+            auto_detect: None,
         };
         let second_created =
             persist_proxy_state_if_absent(&state_path, stale_vdpi_snapshot).unwrap();
         assert!(!second_created);
         assert_eq!(load_saved_hkcu_state(&state_path), Some(expected_corp));
 
-        // Fresh capture containing vdpi-owned PAC and loopback manual proxy must be sanitized.
-        let sanitized_dir = TestDir::new("sanitize-state");
-        let sanitized_path = sanitized_dir.0.join(WINDOWS_PROXY_STATE_FILENAME);
+        // Fresh capture that sanitizes to a completely empty snapshot must skip writing
+        // `windows-proxy-state.json` to avoid unnecessary disk churn.
+        let empty_dir = TestDir::new("skip-empty-state");
+        let empty_path = empty_dir.0.join(WINDOWS_PROXY_STATE_FILENAME);
         let poisoned = SavedWininetHiveState {
             proxy_enable: true,
             proxy_server: Some("127.0.0.1:8080".into()),
             proxy_override: Some("localhost;<local>".into()),
-            auto_config_url: Some("http://[::1]:18080/vdpi.pac".into()),
+            auto_config_url: Some("http://[::1]:18080/vdpi.pac?v=stale".into()),
+            auto_detect: None,
         };
-        assert!(persist_proxy_state_if_absent(&sanitized_path, poisoned).unwrap());
+        assert!(!persist_proxy_state_if_absent(&empty_path, poisoned).unwrap());
+        assert!(!empty_path.exists());
+        assert!(
+            !persist_proxy_state_if_absent(&empty_path, SavedWininetHiveState::default()).unwrap()
+        );
+        assert!(!empty_path.exists());
+
+        // Mixed capture with corporate ProxyServer and poisoned vdpi PAC must strip the vdpi PAC
+        // while still persisting the corporate fields.
+        let mixed_dir = TestDir::new("sanitize-mixed-state");
+        let mixed_path = mixed_dir.0.join(WINDOWS_PROXY_STATE_FILENAME);
+        let mixed = SavedWininetHiveState {
+            proxy_enable: false,
+            proxy_server: Some(" proxy.corp.local:3128 ".into()),
+            proxy_override: Some(" *.corp.local ".into()),
+            auto_config_url: Some("http://127.0.0.1:18080/vdpi.pac?v=stale".into()),
+            auto_detect: None,
+        };
+        assert!(persist_proxy_state_if_absent(&mixed_path, mixed).unwrap());
         assert_eq!(
-            load_saved_hkcu_state(&sanitized_path),
-            Some(SavedWininetHiveState::default())
+            load_saved_hkcu_state(&mixed_path),
+            Some(SavedWininetHiveState {
+                proxy_enable: false,
+                proxy_server: Some("proxy.corp.local:3128".into()),
+                proxy_override: Some("*.corp.local".into()),
+                auto_config_url: None,
+                auto_detect: None,
+            })
         );
     }
 
@@ -1092,6 +1475,7 @@ mod tests {
             proxy_server: Some("proxy.corp.local:3128".into()),
             proxy_override: Some("*.corp.local;<local>".into()),
             auto_config_url: Some("http://pac.corp.local/proxy.pac".into()),
+            auto_detect: None,
         };
         assert!(persist_proxy_state_if_absent(&state_path, original_corp).unwrap());
         let saved_prior = load_saved_hkcu_state(&state_path).unwrap();
@@ -1199,6 +1583,7 @@ mod tests {
         with_proxy_lease(
             &mut settings,
             Some((state_path.as_path(), created)),
+            None::<()>,
             || {
                 activate_sync_count.fetch_add(1, Ordering::SeqCst);
             },
@@ -1414,5 +1799,642 @@ mod tests {
             fs::read_to_string(&state_path4).unwrap(),
             "{\"existing\":true}"
         );
+    }
+
+    #[test]
+    fn resolves_foreground_state_dir_with_empty_localappdata_fallback() {
+        let local = resolve_foreground_state_dir_from(
+            Some(OsString::from(r"C:\Users\Alice\AppData\Local")),
+            Some(OsString::from(r"C:\Users\Alice")),
+        )
+        .unwrap();
+        assert_eq!(local, PathBuf::from(r"C:\Users\Alice\AppData\Local\vdpi"));
+
+        let fallback_empty = resolve_foreground_state_dir_from(
+            Some(OsString::from("")),
+            Some(OsString::from(r"C:\Users\Alice")),
+        )
+        .unwrap();
+        assert_eq!(fallback_empty, PathBuf::from(r"C:\Users\Alice\.vdpi"));
+
+        let fallback_none =
+            resolve_foreground_state_dir_from(None, Some(OsString::from(r"C:\Users\Alice")))
+                .unwrap();
+        assert_eq!(fallback_none, PathBuf::from(r"C:\Users\Alice\.vdpi"));
+
+        assert!(resolve_foreground_state_dir_from(
+            Some(OsString::from("")),
+            Some(OsString::from("")),
+        )
+        .is_err());
+        assert!(resolve_foreground_state_dir_from(None, None).is_err());
+    }
+
+    #[test]
+    fn acquire_proxy_lease_lock_retries_transient_lock_and_rejects_directory() {
+        let dir = TestDir::new("lease-lock-retry");
+        let lock_path = dir.0.join("proxy-lease.lock");
+
+        let holder = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(0)
+            .open(&lock_path)
+            .unwrap();
+        let mut holder = Some(holder);
+        let mut sleeps = Vec::new();
+        let acquired =
+            acquire_proxy_lease_lock_with(&lock_path, &LEASE_LOCK_RETRY_DELAYS_MS, |delay| {
+                sleeps.push(delay);
+                if sleeps.len() == 2 {
+                    drop(holder.take());
+                }
+            })
+            .unwrap();
+        drop(acquired);
+        assert_eq!(
+            sleeps,
+            vec![Duration::from_millis(25), Duration::from_millis(50)]
+        );
+        assert_eq!(LEASE_LOCK_RETRY_DELAYS_MS, [25, 50, 100, 200, 300, 500]);
+
+        let dir_lock = dir.0.join("dir-as-lock");
+        fs::create_dir(&dir_lock).unwrap();
+        let mut dir_sleeps = Vec::new();
+        let err =
+            acquire_proxy_lease_lock_with(&dir_lock, &LEASE_LOCK_RETRY_DELAYS_MS, |delay| {
+                dir_sleeps.push(delay);
+            })
+            .unwrap_err();
+        assert!(dir_sleeps.is_empty());
+        assert!(err.to_string().contains("directory"));
+    }
+
+    #[test]
+    fn settings_restore_skips_when_nothing_applied_and_matches_values_semantically() {
+        let seq = STATE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let reg_path = format!(
+            r"Software\vdpi-settings-restore-test-{}-{seq}",
+            std::process::id()
+        );
+        let _reg_cleanup = TestRegKey::create(&reg_path);
+        let key = Key::open(&reg_path).unwrap();
+
+        let original_pac = Value::string("http://pac.corp.local/proxy.pac");
+        let local_pac = Value::string("http://127.0.0.1:18080/vdpi.pac?v=abc");
+        key.write("AutoConfigURL", Some(&original_pac)).unwrap();
+        key.write("ProxyEnable", Some(&Value::dword(1))).unwrap();
+
+        // 1. `restore` when `applied == 0` must immediately return `Ok(false)` without touching registry.
+        let mut unapplied = Settings::prepare(
+            &key,
+            [
+                ("AutoConfigURL", Some(local_pac.clone())),
+                ("ProxyEnable", Some(Value::dword(0))),
+            ],
+        )
+        .unwrap();
+        assert!(!unapplied.restore(Some("AutoConfigURL")).unwrap());
+        assert_eq!(unapplied.applied, 0);
+        assert_eq!(key.read("AutoConfigURL").unwrap().as_ref(), Some(&original_pac));
+        assert_eq!(
+            key.read("ProxyEnable").unwrap().as_ref(),
+            Some(&Value::dword(1))
+        );
+
+        // 2. Semantic match for `AutoConfigURL` handles REG_EXPAND_SZ, whitespace, ASCII case,
+        //    and missing NUL terminator, restoring original values and resetting `applied = 0`.
+        let mut semantic = Settings::prepare(
+            &key,
+            [
+                ("AutoConfigURL", Some(local_pac.clone())),
+                ("ProxyEnable", Some(Value::dword(0))),
+            ],
+        )
+        .unwrap();
+        semantic.apply().unwrap();
+        let expand_pac = Value {
+            kind: REG_EXPAND_SZ,
+            data: "  HTTP://127.0.0.1:18080/VDPI.PAC?V=ABC  "
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect(),
+        };
+        key.write("AutoConfigURL", Some(&expand_pac)).unwrap();
+        assert!(semantic.restore(Some("AutoConfigURL")).unwrap());
+        assert_eq!(semantic.applied, 0);
+        assert_eq!(key.read("AutoConfigURL").unwrap().as_ref(), Some(&original_pac));
+        assert_eq!(
+            key.read("ProxyEnable").unwrap().as_ref(),
+            Some(&Value::dword(1))
+        );
+
+        // 3. When an external owner takes over `AutoConfigURL`, `restore` returns `Ok(false)` and
+        //    still resets `applied = 0`.
+        let mut external = Settings::prepare(
+            &key,
+            [
+                ("AutoConfigURL", Some(local_pac)),
+                ("ProxyEnable", Some(Value::dword(0))),
+            ],
+        )
+        .unwrap();
+        external.apply().unwrap();
+        let external_pac = Value::string("http://vpn.corp.local/vpn.pac");
+        key.write("AutoConfigURL", Some(&external_pac)).unwrap();
+        assert!(!external.restore(Some("AutoConfigURL")).unwrap());
+        assert_eq!(external.applied, 0);
+        assert_eq!(key.read("AutoConfigURL").unwrap().as_ref(), Some(&external_pac));
+    }
+
+    #[test]
+    fn with_proxy_lease_skips_cleanup_when_apply_writes_nothing() {
+        let seq = STATE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let reg_path = format!(
+            r"Software\vdpi-lease-noapply-test-{}-{seq}",
+            std::process::id()
+        );
+        let _reg_cleanup = TestRegKey::create(&reg_path);
+        let rw_key = Key::open(&reg_path).unwrap();
+        let original_pac = Value::string("http://pac.corp.local/proxy.pac");
+        rw_key.write("AutoConfigURL", Some(&original_pac)).unwrap();
+        rw_key.write("ProxyEnable", Some(&Value::dword(1))).unwrap();
+
+        let dir = TestDir::new("lease-noapply");
+        let state_path = dir.0.join(WINDOWS_PROXY_STATE_FILENAME);
+        let existing_corp = SavedWininetHiveState {
+            proxy_enable: true,
+            proxy_server: Some("proxy.corp.local:3128".into()),
+            proxy_override: None,
+            auto_config_url: Some("http://pac.corp.local/proxy.pac".into()),
+            auto_detect: None,
+        };
+        assert!(persist_proxy_state_if_absent(&state_path, existing_corp).unwrap());
+
+        // Open read-only handle so the first Registry write fails with ACCESS_DENIED (`applied == 0`).
+        let mut ro_hkey: HKEY = null_mut();
+        let rc = unsafe {
+            RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                wide(&reg_path).as_ptr(),
+                0,
+                KEY_QUERY_VALUE,
+                &mut ro_hkey,
+            )
+        };
+        assert_eq!(rc, ERROR_SUCCESS);
+        let ro_key = Key(ro_hkey);
+
+        let mut settings = Settings::prepare(
+            &ro_key,
+            [
+                ("AutoConfigURL", Some(Value::string("http://127.0.0.1:18080/vdpi.pac?v=1"))),
+                ("ProxyEnable", Some(Value::dword(0))),
+            ],
+        )
+        .unwrap();
+
+        let activate_sync_count = AtomicUsize::new(0);
+        let restore_sync_count = AtomicUsize::new(0);
+        let refresh_count = AtomicUsize::new(0);
+        let winhttp_reset_count = AtomicUsize::new(0);
+
+        let res = with_proxy_lease(
+            &mut settings,
+            Some((state_path.as_path(), false)),
+            None::<()>,
+            || {
+                activate_sync_count.fetch_add(1, Ordering::SeqCst);
+            },
+            || {
+                restore_sync_count.fetch_add(1, Ordering::SeqCst);
+            },
+            || {
+                refresh_count.fetch_add(1, Ordering::SeqCst);
+            },
+            || {
+                winhttp_reset_count.fetch_add(1, Ordering::SeqCst);
+            },
+            || Ok(()),
+        );
+        assert!(res.is_err());
+        assert_eq!(activate_sync_count.load(Ordering::SeqCst), 0);
+        assert_eq!(restore_sync_count.load(Ordering::SeqCst), 0);
+        assert_eq!(refresh_count.load(Ordering::SeqCst), 0);
+        assert_eq!(winhttp_reset_count.load(Ordering::SeqCst), 0);
+        assert!(state_path.is_file());
+    }
+
+    #[test]
+    fn with_proxy_lease_preserves_state_file_on_skipped_restore_and_syncs_blobs_when_pac_missing_or_vdpi()
+    {
+        let seq = STATE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let reg_path = format!(
+            r"Software\vdpi-lease-skip-test-{}-{seq}",
+            std::process::id()
+        );
+        let _reg_cleanup = TestRegKey::create(&reg_path);
+        let key = Key::open(&reg_path).unwrap();
+
+        let dir = TestDir::new("lease-skip-restore");
+        let state_path = dir.0.join(WINDOWS_PROXY_STATE_FILENAME);
+        let original_pac = Value::string("http://pac.corp.local/proxy.pac");
+        let local_pac = Value::string("http://127.0.0.1:18080/vdpi.pac?v=1");
+        let corp_snapshot = SavedWininetHiveState {
+            proxy_enable: true,
+            proxy_server: Some("proxy.corp.local:3128".into()),
+            proxy_override: None,
+            auto_config_url: Some("http://pac.corp.local/proxy.pac".into()),
+            auto_detect: None,
+        };
+        assert!(persist_proxy_state_if_absent(&state_path, corp_snapshot).unwrap());
+
+        // Case A: external PAC takes over -> restore skipped, state file preserved, blobs untouched.
+        key.write("AutoConfigURL", Some(&original_pac)).unwrap();
+        key.write("ProxyEnable", Some(&Value::dword(1))).unwrap();
+        let mut settings_a = Settings::prepare(
+            &key,
+            [
+                ("AutoConfigURL", Some(local_pac.clone())),
+                ("ProxyEnable", Some(Value::dword(0))),
+            ],
+        )
+        .unwrap();
+        let restore_sync_a = AtomicUsize::new(0);
+        let external_pac = Value::string("http://vpn.corp.local/vpn.pac");
+        with_proxy_lease(
+            &mut settings_a,
+            Some((state_path.as_path(), true)),
+            None::<()>,
+            || {},
+            || {
+                restore_sync_a.fetch_add(1, Ordering::SeqCst);
+            },
+            || {},
+            || {},
+            || {
+                key.write("AutoConfigURL", Some(&external_pac))?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(restore_sync_a.load(Ordering::SeqCst), 0);
+        assert!(state_path.is_file());
+        assert_eq!(key.read("AutoConfigURL").unwrap().as_ref(), Some(&external_pac));
+
+        // Case B: AutoConfigURL deleted while running -> restore skipped, state file preserved,
+        // but `sync_on_restore` still runs to scrub vdpi PAC from connection blobs.
+        key.write("AutoConfigURL", Some(&original_pac)).unwrap();
+        let mut settings_b = Settings::prepare(
+            &key,
+            [
+                ("AutoConfigURL", Some(local_pac.clone())),
+                ("ProxyEnable", Some(Value::dword(0))),
+            ],
+        )
+        .unwrap();
+        let restore_sync_b = AtomicUsize::new(0);
+        with_proxy_lease(
+            &mut settings_b,
+            Some((state_path.as_path(), true)),
+            None::<()>,
+            || {},
+            || {
+                restore_sync_b.fetch_add(1, Ordering::SeqCst);
+            },
+            || {},
+            || {},
+            || {
+                key.write("AutoConfigURL", None)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(restore_sync_b.load(Ordering::SeqCst), 1);
+        assert!(state_path.is_file());
+
+        // Case C: AutoConfigURL changed to another vdpi-owned PAC -> restore skipped, state file
+        // preserved, and `sync_on_restore` still runs for blob cleanup.
+        key.write("AutoConfigURL", Some(&original_pac)).unwrap();
+        let mut settings_c = Settings::prepare(
+            &key,
+            [
+                ("AutoConfigURL", Some(local_pac)),
+                ("ProxyEnable", Some(Value::dword(0))),
+            ],
+        )
+        .unwrap();
+        let restore_sync_c = AtomicUsize::new(0);
+        with_proxy_lease(
+            &mut settings_c,
+            Some((state_path.as_path(), true)),
+            None::<()>,
+            || {},
+            || {
+                restore_sync_c.fetch_add(1, Ordering::SeqCst);
+            },
+            || {},
+            || {},
+            || {
+                key.write(
+                    "AutoConfigURL",
+                    Some(&Value::string("http://127.0.0.1:19090/vdpi.pac?v=other")),
+                )?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(restore_sync_c.load(Ordering::SeqCst), 1);
+        assert!(state_path.is_file());
+    }
+
+    #[test]
+    fn with_proxy_lease_releases_lock_before_refresh_and_winhttp_cleanup() {
+        struct LockDropTracker {
+            events: Arc<Mutex<Vec<&'static str>>>,
+            state_path: PathBuf,
+        }
+        impl Drop for LockDropTracker {
+            fn drop(&mut self) {
+                assert!(
+                    !self.state_path.exists(),
+                    "state file must be removed before releasing proxy-lease.lock"
+                );
+                self.events.lock().unwrap().push("lock_dropped");
+            }
+        }
+
+        let seq = STATE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let reg_path = format!(
+            r"Software\vdpi-lease-order-test-{}-{seq}",
+            std::process::id()
+        );
+        let _reg_cleanup = TestRegKey::create(&reg_path);
+        let key = Key::open(&reg_path).unwrap();
+        let dir = TestDir::new("lease-lock-order");
+        let state_path = dir.0.join(WINDOWS_PROXY_STATE_FILENAME);
+        let corp = SavedWininetHiveState {
+            proxy_enable: false,
+            proxy_server: None,
+            proxy_override: None,
+            auto_config_url: Some("http://pac.corp.local/proxy.pac".into()),
+            auto_detect: None,
+        };
+        assert!(persist_proxy_state_if_absent(&state_path, corp).unwrap());
+
+        let mut settings = Settings::prepare(
+            &key,
+            [
+                ("AutoConfigURL", Some(Value::string("http://127.0.0.1:18080/vdpi.pac?v=2"))),
+                ("ProxyEnable", Some(Value::dword(0))),
+            ],
+        )
+        .unwrap();
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let tracker = LockDropTracker {
+            events: Arc::clone(&events),
+            state_path: state_path.clone(),
+        };
+        with_proxy_lease(
+            &mut settings,
+            Some((state_path.as_path(), true)),
+            Some(tracker),
+            || events.lock().unwrap().push("activate_sync"),
+            || events.lock().unwrap().push("restore_sync"),
+            || events.lock().unwrap().push("refresh"),
+            || events.lock().unwrap().push("winhttp"),
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "activate_sync",
+                "refresh",
+                "restore_sync",
+                "lock_dropped",
+                "refresh",
+                "winhttp",
+            ]
+        );
+    }
+
+    #[test]
+    fn shutdown_guard_child_bounded_timeout_kills_and_runs_fallback() {
+        struct FakeGuard {
+            polls: usize,
+            exit_on_poll: Option<usize>,
+            fail_try_wait: bool,
+            killed: usize,
+            waited: usize,
+        }
+
+        // 1. Clean exit within deadline does not kill or run fallback cleanup.
+        let mut clean = FakeGuard {
+            polls: 0,
+            exit_on_poll: Some(2),
+            fail_try_wait: false,
+            killed: 0,
+            waited: 0,
+        };
+        let mut fallback_clean = 0usize;
+        shutdown_guard_child_with(
+            &mut clean,
+            Duration::from_millis(100),
+            Duration::from_millis(5),
+            |g| {
+                g.polls += 1;
+                if g.exit_on_poll == Some(g.polls) {
+                    Ok(Some(ExitStatus::from_raw(0)))
+                } else {
+                    Ok(None)
+                }
+            },
+            |g| {
+                g.killed += 1;
+                Ok(())
+            },
+            |g| {
+                g.waited += 1;
+                Ok(ExitStatus::from_raw(0))
+            },
+            |_| {},
+            || fallback_clean += 1,
+        );
+        assert_eq!(clean.polls, 2);
+        assert_eq!(clean.killed, 0);
+        assert_eq!(clean.waited, 0);
+        assert_eq!(fallback_clean, 0);
+
+        // 2. Timeout kills hung guard, reaps via wait(), and invokes fallback proxy cleanup.
+        let mut hung = FakeGuard {
+            polls: 0,
+            exit_on_poll: None,
+            fail_try_wait: false,
+            killed: 0,
+            waited: 0,
+        };
+        let mut fallback_hung = 0usize;
+        shutdown_guard_child_with(
+            &mut hung,
+            Duration::from_millis(30),
+            Duration::from_millis(10),
+            |g| {
+                g.polls += 1;
+                Ok(None)
+            },
+            |g| {
+                g.killed += 1;
+                Ok(())
+            },
+            |g| {
+                g.waited += 1;
+                Ok(ExitStatus::from_raw(1))
+            },
+            std::thread::sleep,
+            || fallback_hung += 1,
+        );
+        assert!(hung.polls >= 1);
+        assert_eq!(hung.killed, 1);
+        assert_eq!(hung.waited, 1);
+        assert_eq!(fallback_hung, 1);
+
+        // 3. `try_wait` error also kills, waits, and invokes fallback proxy cleanup.
+        let mut errored = FakeGuard {
+            polls: 0,
+            exit_on_poll: None,
+            fail_try_wait: true,
+            killed: 0,
+            waited: 0,
+        };
+        let mut fallback_err = 0usize;
+        shutdown_guard_child_with(
+            &mut errored,
+            Duration::from_millis(30),
+            Duration::from_millis(10),
+            |g| {
+                g.polls += 1;
+                if g.fail_try_wait {
+                    Err(io::Error::other("poll failed"))
+                } else {
+                    Ok(None)
+                }
+            },
+            |g| {
+                g.killed += 1;
+                Ok(())
+            },
+            |g| {
+                g.waited += 1;
+                Ok(ExitStatus::from_raw(1))
+            },
+            |_| {},
+            || fallback_err += 1,
+        );
+        assert_eq!(errored.killed, 1);
+        assert_eq!(errored.waited, 1);
+        assert_eq!(fallback_err, 1);
+    }
+
+    #[test]
+    fn format_guard_startup_failure_prefers_stdout_error_over_broken_pipe() {
+        let pipe_err = io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe");
+        let err = format_guard_startup_failure(
+            Some(&pipe_err),
+            "acquiring the Windows proxy lease (another vdpi may already be running)\n",
+            Some(ExitStatus::from_raw(1)),
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("acquiring the Windows proxy lease"));
+        assert!(!msg.contains("broken pipe"));
+
+        let silent_err =
+            format_guard_startup_failure(Some(&pipe_err), "   \n", Some(ExitStatus::from_raw(7)));
+        let silent_msg = silent_err.to_string();
+        assert!(silent_msg.contains("guard exited"));
+        assert!(silent_msg.contains("broken pipe"));
+    }
+
+    #[test]
+    fn hydrates_saved_prior_from_global_fallback_when_local_state_absent_or_empty() {
+        let dir = TestDir::new("global-fallback");
+        let missing_local = dir.0.join(WINDOWS_PROXY_STATE_FILENAME);
+
+        let mut programdata_state = SavedWindowsProxyState::default();
+        programdata_state.record_hive_if_absent(
+            "HKCU",
+            SavedWininetHiveState {
+                proxy_enable: true,
+                proxy_server: Some("proxy.corp.local:3128".into()),
+                proxy_override: Some("*.corp.local".into()),
+                auto_config_url: Some("http://pac.corp.local/proxy.pac".into()),
+                auto_detect: None,
+            },
+        );
+
+        let hydrated =
+            load_saved_hkcu_state_with_fallback_using(&missing_local, || programdata_state.clone())
+                .unwrap();
+        assert_eq!(
+            hydrated.auto_config_url.as_deref(),
+            Some("http://pac.corp.local/proxy.pac")
+        );
+        assert!(hydrated.proxy_enable);
+        assert_eq!(hydrated.proxy_server.as_deref(), Some("proxy.corp.local:3128"));
+
+        // Empty local state file still falls back to ProgramData backup.
+        let empty_local_json = serde_json::to_string(&SavedWindowsProxyState::default()).unwrap();
+        fs::write(&missing_local, empty_local_json).unwrap();
+        let hydrated_empty =
+            load_saved_hkcu_state_with_fallback_using(&missing_local, || programdata_state.clone())
+                .unwrap();
+        assert_eq!(
+            hydrated_empty.auto_config_url.as_deref(),
+            Some("http://pac.corp.local/proxy.pac")
+        );
+
+        // Non-empty local state takes precedence over global fallback.
+        let mut local_state = SavedWindowsProxyState::default();
+        local_state.record_hive_if_absent(
+            "HKCU",
+            SavedWininetHiveState {
+                proxy_enable: false,
+                proxy_server: None,
+                proxy_override: None,
+                auto_config_url: Some("http://local.corp/custom.pac".into()),
+                auto_detect: None,
+            },
+        );
+        fs::write(
+            &missing_local,
+            serde_json::to_string(&local_state).unwrap(),
+        )
+        .unwrap();
+        let hydrated_local =
+            load_saved_hkcu_state_with_fallback_using(&missing_local, || programdata_state)
+                .unwrap();
+        assert_eq!(
+            hydrated_local.auto_config_url.as_deref(),
+            Some("http://local.corp/custom.pac")
+        );
+    }
+
+    #[test]
+    fn pac_url_with_session_nonce_is_vdpi_owned_and_unique_per_session() {
+        let nonce_a = next_session_pac_nonce();
+        let nonce_b = next_session_pac_nonce();
+        assert!(!nonce_a.is_empty());
+        assert_ne!(nonce_a, nonce_b);
+
+        let url_a = build_windows_pac_url_with_nonce(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080, &nonce_a);
+        let url_b = build_windows_pac_url_with_nonce(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080, &nonce_b);
+        assert!(url_a.starts_with("http://127.0.0.1:8080/vdpi.pac?v="));
+        assert!(url_b.starts_with("http://127.0.0.1:8080/vdpi.pac?v="));
+        assert_ne!(url_a, url_b);
+        assert!(is_vdpi_owned_pac_url(&url_a));
+        assert!(is_vdpi_owned_pac_url(&url_b));
     }
 }

@@ -1560,11 +1560,40 @@ fn write_file_atomic(path: &Path, contents: &str, mode: u32) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn can_remove_ipv6_routing(ipv6_action: FamilyRoutingAction, ipv4_routing_active: bool) -> bool {
+    ipv6_action == FamilyRoutingAction::Remove && ipv4_routing_active
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn cleanup_runtime_files_at(entries: &[(&Path, bool)], errors: &mut Vec<String>) -> bool {
+    let mut changed = false;
+    for &(path, existed_before) in entries {
+        match fs::remove_file(path) {
+            Ok(()) => {
+                if existed_before {
+                    changed = true;
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if existed_before {
+                    changed = true;
+                }
+            }
+            Err(err) => {
+                errors.push(format!("failed to remove {}: {err}", path.display()));
+            }
+        }
+    }
+    changed
+}
+
 #[cfg(target_os = "linux")]
 mod imp {
     use super::{
-        build_policy_rules_for_families, compute_desired_ipv6_active, detect_wake_or_time_jump,
-        fallback_user_runtime_dir, is_relevant_route_monitor_line, is_valid_resolv_symlink_target,
+        build_policy_rules_for_families, can_remove_ipv6_routing, cleanup_runtime_files_at,
+        compute_desired_ipv6_active, detect_wake_or_time_jump, fallback_user_runtime_dir,
+        is_relevant_route_monitor_line, is_valid_resolv_symlink_target,
         is_valid_state_nm_conf_path, is_valid_state_resolv_backup_path,
         is_vdpi_managed_resolv_conf, needs_resolv_conf_override_with_systemd_resolved,
         nm_config_disables_dns_management, parse_default_route_dev_and_gateway,
@@ -2131,7 +2160,13 @@ mod imp {
                         }
                     }
                 }
-                FamilyRoutingAction::Remove => false,
+                FamilyRoutingAction::Remove => {
+                    if can_remove_ipv6_routing(plan.ipv6_action, self.ipv4_routing_active) {
+                        false
+                    } else {
+                        current_v6_active
+                    }
+                }
                 FamilyRoutingAction::Keep => current_v6_active,
             };
 
@@ -2192,17 +2227,32 @@ mod imp {
                 routing_mutations_ok = false;
             }
 
-            if plan.ipv6_action == FamilyRoutingAction::Remove {
+            if can_remove_ipv6_routing(plan.ipv6_action, self.ipv4_routing_active) {
                 if let Err(err) = remove_ipv6_routing(&self.iface, VDPI_ROUTE_TABLE, VDPI_SO_MARK) {
                     routing_mutations_ok = false;
                     next_v6_active = true;
                     self.ipv6_active.store(true, Ordering::Release);
-                    let mut state_guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    state_guard.ipv6_enabled = true;
+                    {
+                        let mut state_guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                        state_guard.ipv6_enabled = true;
+                        if !self.stop.load(Ordering::Acquire)
+                            && !self.dns_reverted.load(Ordering::Acquire)
+                        {
+                            sync_linux_dns_on_transition(
+                                &self.iface,
+                                LINUX_TUN_DNS_V4,
+                                Some(LINUX_TUN_DNS_V6),
+                                true,
+                                false,
+                                &self.state_path,
+                                &state_guard,
+                            );
+                        }
+                    }
                     warn!(
                         iface = %self.iface,
                         error = %err,
-                        "failed to remove Linux IPv6 TUN routing after uplink change; will retry on next route event"
+                        "failed to remove Linux IPv6 TUN routing after uplink change; rolled back IPv6 DNS/state and will retry on next route event"
                     );
                 } else {
                     info!(
@@ -2212,6 +2262,9 @@ mod imp {
                         "removed Linux IPv6 TUN address, default route, and -6 policy rules after uplink change"
                     );
                 }
+            } else if plan.ipv6_action == FamilyRoutingAction::Remove && !self.ipv4_routing_active {
+                // IPv4 installation failed so IPv6 removal was deferred; retry on next event.
+                routing_mutations_ok = false;
             }
 
             // Only advance `self.last_signature` after all Phase 1/3 routing mutations succeed so
@@ -3613,9 +3666,11 @@ mod imp {
         };
         match fs::remove_file(nm_path) {
             Ok(()) => {
-                if let Err(err) = reload_network_manager_dns() {
-                    warn!(error = %err, "failed to reload NetworkManager during DNS cleanup");
-                    cleanup_errors.push(format!("{err:#}"));
+                if is_network_manager_running() {
+                    if let Err(err) = reload_network_manager_dns() {
+                        warn!(error = %err, "failed to reload NetworkManager during DNS cleanup");
+                        cleanup_errors.push(format!("{err:#}"));
+                    }
                 }
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -3947,6 +4002,9 @@ mod imp {
         let had_bricked_resolv = fs::read_to_string(RESOLV_CONF_PATH)
             .ok()
             .is_some_and(|c| resolv_conf_needs_stateless_recovery(&c));
+        let had_state_file = Path::new(LINUX_TUN_STATE_PATH).exists();
+        let had_lock_file = Path::new(LINUX_TUN_LOCK_PATH).exists();
+        let had_runtime_files = had_state_file || had_lock_file;
 
         // 1. Run standard cleanup plus stateless sweep of ip -4/-6 rules, table 202, and vdpi0.
         if let Err(err) = cleanup_linux_tun_state() {
@@ -4085,17 +4143,17 @@ mod imp {
         }
 
         // 5. Clean stale runtime files and (only after /etc/resolv.conf is recovered) persistent
-        //    resolv backup/metadata files.
-        for path in [LINUX_TUN_STATE_PATH, LINUX_TUN_LOCK_PATH] {
-            match fs::remove_file(path) {
-                Ok(()) => {
-                    tun_changed = true;
-                }
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    errors.push(format!("failed to remove {path}: {err}"));
-                }
-            }
+        //    resolv backup/metadata files. Only mark `tun_changed` when runtime files existed
+        //    before `cleanup_linux_tun_state()` created its own lock file.
+        let runtime_files_changed = cleanup_runtime_files_at(
+            &[
+                (Path::new(LINUX_TUN_STATE_PATH), had_state_file),
+                (Path::new(LINUX_TUN_LOCK_PATH), had_lock_file),
+            ],
+            &mut errors,
+        );
+        if had_runtime_files && runtime_files_changed {
+            tun_changed = true;
         }
 
         let resolv_recovered = !fs::read_to_string(resolv_path)
@@ -5557,6 +5615,77 @@ default via fe80::0001 dev wlan0 proto ra metric 600 pref medium
             );
             assert_eq!(fs::read_link(&resolv).unwrap(), stub);
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ipv6_removal_guard_requires_active_ipv4_routing() {
+        assert!(!can_remove_ipv6_routing(FamilyRoutingAction::Remove, false));
+        assert!(can_remove_ipv6_routing(FamilyRoutingAction::Remove, true));
+        assert!(!can_remove_ipv6_routing(FamilyRoutingAction::Keep, true));
+        assert!(!can_remove_ipv6_routing(FamilyRoutingAction::Install, true));
+    }
+
+    #[test]
+    fn runtime_file_cleanup_does_not_report_changed_on_clean_host_lock_creation() {
+        let dir = unique_test_dir("runtime-file-cleanup");
+        let state_path = dir.join("tun-state.json");
+        let lock_path = dir.join("tun.lock");
+
+        // Clean host: neither file existed before cleanup_linux_tun_state(), which then created
+        // tun.lock. Removing tun.lock must NOT report tun_changed = true.
+        let had_state_before = state_path.exists();
+        let had_lock_before = lock_path.exists();
+        assert!(!had_state_before && !had_lock_before);
+        fs::write(&lock_path, "").unwrap();
+
+        let mut errors = Vec::new();
+        let changed = cleanup_runtime_files_at(
+            &[
+                (state_path.as_path(), had_state_before),
+                (lock_path.as_path(), had_lock_before),
+            ],
+            &mut errors,
+        );
+        assert!(!changed);
+        assert!(errors.is_empty());
+        assert!(!lock_path.exists());
+
+        // Stale state file existed before cleanup_linux_tun_state() removed it -> reports changed.
+        fs::write(&state_path, "{}").unwrap();
+        let had_state_before = state_path.exists();
+        let had_lock_before = lock_path.exists();
+        assert!(had_state_before && !had_lock_before);
+        // Simulate cleanup_linux_tun_state() deleting state_path and creating lock_path.
+        fs::remove_file(&state_path).unwrap();
+        fs::write(&lock_path, "").unwrap();
+
+        let changed = cleanup_runtime_files_at(
+            &[
+                (state_path.as_path(), had_state_before),
+                (lock_path.as_path(), had_lock_before),
+            ],
+            &mut errors,
+        );
+        assert!(changed);
+        assert!(errors.is_empty());
+        assert!(!lock_path.exists());
+
+        // Stale lock file existed beforehand -> removing it reports changed.
+        fs::write(&lock_path, "").unwrap();
+        let had_lock_before = lock_path.exists();
+        assert!(had_lock_before);
+        let changed = cleanup_runtime_files_at(
+            &[
+                (state_path.as_path(), false),
+                (lock_path.as_path(), had_lock_before),
+            ],
+            &mut errors,
+        );
+        assert!(changed);
+        assert!(errors.is_empty());
+        assert!(!lock_path.exists());
 
         let _ = fs::remove_dir_all(&dir);
     }

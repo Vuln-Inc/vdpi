@@ -198,6 +198,12 @@ pub fn classify_vpn_adapter_name(name: &str, description: &str) -> Option<&'stat
     if has_any(&["zerotier"]) || is_zerotier_iface_name(&name_lower) {
         return Some("ZeroTier");
     }
+    if has_any(&["radmin", "famatech"]) {
+        return Some("Radmin VPN");
+    }
+    if has_any(&["hamachi", "logmein"]) {
+        return Some("Hamachi");
+    }
     if has_any(&["amnezia", "awg-quick"]) || is_amneziawg_iface_name(&name_lower) {
         return Some("AmneziaVPN");
     }
@@ -236,6 +242,13 @@ pub fn classify_vpn_adapter_name(name: &str, description: &str) -> Option<&'stat
     }
 
     None
+}
+
+/// Returns `true` for LAN-mesh-only overlay providers that emulate Ethernet
+/// adapters and may install high-metric dummy `0.0.0.0/0` routes without ever
+/// acting as a full-tunnel internet VPN.
+pub fn is_lan_overlay_only_provider(provider: &str) -> bool {
+    matches!(provider, "Radmin VPN" | "Hamachi")
 }
 
 /// Detects an active VPN or split-tunnel overlay on the current host in
@@ -344,9 +357,13 @@ pub(crate) struct GlobalRouteFlags {
     pub(crate) v6_lower_half: bool, // ::/1
     pub(crate) v6_upper_half: bool, // 8000::/1
     #[cfg(any(target_os = "windows", target_os = "linux", test))]
-    pub(crate) best_v4_metric: Option<u32>,
+    pub(crate) best_v4_default_metric: Option<u32>,
     #[cfg(any(target_os = "windows", target_os = "linux", test))]
-    pub(crate) best_v6_metric: Option<u32>,
+    pub(crate) best_v4_split_metric: Option<u32>,
+    #[cfg(any(target_os = "windows", target_os = "linux", test))]
+    pub(crate) best_v6_default_metric: Option<u32>,
+    #[cfg(any(target_os = "windows", target_os = "linux", test))]
+    pub(crate) best_v6_split_metric: Option<u32>,
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
@@ -372,16 +389,32 @@ impl GlobalRouteFlags {
     }
 
     #[cfg(any(target_os = "windows", target_os = "linux", test))]
-    fn record_v4_metric(&mut self, metric: u32) {
-        self.best_v4_metric = Some(match self.best_v4_metric {
+    fn record_v4_default_metric(&mut self, metric: u32) {
+        self.best_v4_default_metric = Some(match self.best_v4_default_metric {
             Some(existing) => existing.min(metric),
             None => metric,
         });
     }
 
     #[cfg(any(target_os = "windows", target_os = "linux", test))]
-    fn record_v6_metric(&mut self, metric: u32) {
-        self.best_v6_metric = Some(match self.best_v6_metric {
+    fn record_v4_split_metric(&mut self, metric: u32) {
+        self.best_v4_split_metric = Some(match self.best_v4_split_metric {
+            Some(existing) => existing.min(metric),
+            None => metric,
+        });
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "linux", test))]
+    fn record_v6_default_metric(&mut self, metric: u32) {
+        self.best_v6_default_metric = Some(match self.best_v6_default_metric {
+            Some(existing) => existing.min(metric),
+            None => metric,
+        });
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "linux", test))]
+    fn record_v6_split_metric(&mut self, metric: u32) {
+        self.best_v6_split_metric = Some(match self.best_v6_split_metric {
             Some(existing) => existing.min(metric),
             None => metric,
         });
@@ -395,22 +428,44 @@ impl GlobalRouteFlags {
         self.v6_default |= other.v6_default;
         self.v6_lower_half |= other.v6_lower_half;
         self.v6_upper_half |= other.v6_upper_half;
-        if let Some(m) = other.best_v4_metric {
-            self.record_v4_metric(m);
+        if let Some(m) = other.best_v4_default_metric {
+            self.record_v4_default_metric(m);
         }
-        if let Some(m) = other.best_v6_metric {
-            self.record_v6_metric(m);
+        if let Some(m) = other.best_v4_split_metric {
+            self.record_v4_split_metric(m);
+        }
+        if let Some(m) = other.best_v6_default_metric {
+            self.record_v6_default_metric(m);
+        }
+        if let Some(m) = other.best_v6_split_metric {
+            self.record_v6_split_metric(m);
         }
     }
 
     #[cfg(any(target_os = "linux", test))]
     fn best_any_metric(self) -> Option<u32> {
-        match (self.best_v4_metric, self.best_v6_metric) {
-            (Some(v4), Some(v6)) => Some(v4.min(v6)),
-            (Some(v4), None) => Some(v4),
-            (None, Some(v6)) => Some(v6),
-            (None, None) => None,
+        let mut best: Option<u32> = None;
+        let mut consider = |opt: Option<u32>| {
+            if let Some(m) = opt {
+                best = Some(match best {
+                    Some(cur) => cur.min(m),
+                    None => m,
+                });
+            }
+        };
+        if self.v4_default {
+            consider(self.best_v4_default_metric);
         }
+        if self.has_v4_split_default() {
+            consider(self.best_v4_split_metric);
+        }
+        if self.v6_default {
+            consider(self.best_v6_default_metric);
+        }
+        if self.has_v6_split_default() {
+            consider(self.best_v6_split_metric);
+        }
+        best
     }
 }
 
@@ -426,6 +481,10 @@ const WIN_IF_TYPE_LOOPBACK: u32 = 24;
 const WIN_IF_TYPE_PROP_VIRTUAL: u32 = 53;
 #[cfg(any(target_os = "windows", test))]
 const WIN_IF_TYPE_TUNNEL: u32 = 131;
+/// Effective `/0` metric threshold at or above which a sole-default Windows route
+/// is treated as a dummy/standby sentinel rather than an active kill-switch VPN.
+#[cfg(any(target_os = "windows", test))]
+const WIN_STANDBY_SENTINEL_METRIC: u32 = 4000;
 
 #[cfg(any(target_os = "windows", test))]
 fn is_windows_loopback_or_transition_tunnel(adapter: &WindowsAdapter) -> bool {
@@ -445,6 +504,28 @@ fn is_windows_loopback_or_transition_tunnel(adapter: &WindowsAdapter) -> bool {
     TRANSITION_TUNNELS
         .iter()
         .any(|needle| name_lower.contains(needle) || desc_lower.contains(needle))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn is_windows_internal_hypervisor_switch(adapter: &WindowsAdapter) -> bool {
+    let name_lower = adapter.friendly_name.trim().to_ascii_lowercase();
+    let desc_lower = adapter.description.trim().to_ascii_lowercase();
+    const INTERNAL_SWITCH_SUBSTRINGS: &[&str] = &[
+        "default switch",
+        "docker",
+        "vmnet",
+        "vboxnet",
+        "host-only",
+    ];
+    if INTERNAL_SWITCH_SUBSTRINGS
+        .iter()
+        .any(|needle| name_lower.contains(needle) || desc_lower.contains(needle))
+    {
+        return true;
+    }
+    has_ascii_token(&name_lower, "wsl")
+        || has_ascii_token(&desc_lower, "wsl")
+        || name_lower.starts_with("wsl")
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -488,14 +569,14 @@ fn windows_winning_effective_metric(
         record(
             adapter
                 .ipv4_metric
-                .saturating_add(flags.best_v4_metric.unwrap_or(0)),
+                .saturating_add(flags.best_v4_split_metric.unwrap_or(0)),
         );
     } else if flags.v4_default {
         let eff = adapter
             .ipv4_metric
-            .saturating_add(flags.best_v4_metric.unwrap_or(0));
+            .saturating_add(flags.best_v4_default_metric.unwrap_or(0));
         let wins = match other_best_v4_metric {
-            None => true,
+            None => eff < WIN_STANDBY_SENTINEL_METRIC,
             Some(phys) if allow_tie => eff <= phys,
             Some(phys) => eff < phys,
         };
@@ -505,20 +586,22 @@ fn windows_winning_effective_metric(
     }
 
     if flags.has_v6_split_default() {
-        record(
-            adapter
-                .ipv6_metric
-                .saturating_add(flags.best_v6_metric.unwrap_or(0)),
-        );
+        if other_best_v6_metric.is_some() || other_best_v4_metric.is_none() {
+            record(
+                adapter
+                    .ipv6_metric
+                    .saturating_add(flags.best_v6_split_metric.unwrap_or(0)),
+            );
+        }
     } else if flags.v6_default {
         let eff = adapter
             .ipv6_metric
-            .saturating_add(flags.best_v6_metric.unwrap_or(0));
+            .saturating_add(flags.best_v6_default_metric.unwrap_or(0));
         // On IPv4-only hosts (other_best_v6_metric == None && other_best_v4_metric.is_some()),
         // an adapter carrying only an IPv6 `::/0` route must not false-positive as a full-tunnel
         // VPN when it does not also capture IPv4 traffic.
         let wins = match other_best_v6_metric {
-            None => other_best_v4_metric.is_none(),
+            None => other_best_v4_metric.is_none() && eff < WIN_STANDBY_SENTINEL_METRIC,
             Some(phys) if allow_tie => eff <= phys,
             Some(phys) => eff < phys,
         };
@@ -542,13 +625,13 @@ pub(crate) fn evaluate_windows_vpn_scope(
     }
 
     let lookup_flags = |adapter: &WindowsAdapter| -> GlobalRouteFlags {
+        let mut merged = GlobalRouteFlags::default();
         if let Some(&flags) = (adapter.luid != 0)
             .then(|| routes_by_luid.get(&adapter.luid))
             .flatten()
         {
-            return flags;
+            merged.merge_from(flags);
         }
-        let mut merged = GlobalRouteFlags::default();
         for idx in [adapter.if_index, adapter.ipv6_if_index] {
             let Some(&flags) = (idx != 0).then(|| routes_by_index.get(&idx)).flatten() else {
                 continue;
@@ -578,7 +661,7 @@ pub(crate) fn evaluate_windows_vpn_scope(
         if flags.v4_default {
             let eff = adapter
                 .ipv4_metric
-                .saturating_add(flags.best_v4_metric.unwrap_or(0));
+                .saturating_add(flags.best_v4_default_metric.unwrap_or(0));
             other_best_v4_metric = Some(match other_best_v4_metric {
                 Some(cur) => cur.min(eff),
                 None => eff,
@@ -587,7 +670,7 @@ pub(crate) fn evaluate_windows_vpn_scope(
         if flags.v6_default {
             let eff = adapter
                 .ipv6_metric
-                .saturating_add(flags.best_v6_metric.unwrap_or(0));
+                .saturating_add(flags.best_v6_default_metric.unwrap_or(0));
             other_best_v6_metric = Some(match other_best_v6_metric {
                 Some(cur) => cur.min(eff),
                 None => eff,
@@ -596,13 +679,16 @@ pub(crate) fn evaluate_windows_vpn_scope(
     }
 
     // Fallback for VM guests (Hyper-V, VMware, VirtualBox) where the primary internet
-    // adapter is matched by `is_excluded_non_vpn_adapter`: if Pass 1 found zero physical
-    // defaults, scan non-VPN host/VM adapters so standby VPN `/0` routes do not
-    // false-positive as sole-default / kill-switch full tunnels.
-    if other_best_v4_metric.is_none() && other_best_v6_metric.is_none() {
+    // adapter is matched by `is_excluded_non_vpn_adapter`: evaluate IPv4 and IPv6
+    // independently and exclude internal host-side hypervisor switches so standby VPN
+    // `/0` routes do not false-positive as sole-default / kill-switch full tunnels.
+    let need_v4 = other_best_v4_metric.is_none();
+    let need_v6 = other_best_v6_metric.is_none();
+    if need_v4 || need_v6 {
         for adapter in adapters {
             if is_self_interface(&adapter.friendly_name, self_tun_name)
                 || is_windows_loopback_or_transition_tunnel(adapter)
+                || is_windows_internal_hypervisor_switch(adapter)
             {
                 continue;
             }
@@ -616,19 +702,19 @@ pub(crate) fn evaluate_windows_vpn_scope(
             }
 
             let flags = lookup_flags(adapter);
-            if flags.v4_default {
+            if need_v4 && flags.v4_default {
                 let eff = adapter
                     .ipv4_metric
-                    .saturating_add(flags.best_v4_metric.unwrap_or(0));
+                    .saturating_add(flags.best_v4_default_metric.unwrap_or(0));
                 other_best_v4_metric = Some(match other_best_v4_metric {
                     Some(cur) => cur.min(eff),
                     None => eff,
                 });
             }
-            if flags.v6_default {
+            if need_v6 && flags.v6_default {
                 let eff = adapter
                     .ipv6_metric
-                    .saturating_add(flags.best_v6_metric.unwrap_or(0));
+                    .saturating_add(flags.best_v6_default_metric.unwrap_or(0));
                 other_best_v6_metric = Some(match other_best_v6_metric {
                     Some(cur) => cur.min(eff),
                     None => eff,
@@ -659,7 +745,9 @@ pub(crate) fn evaluate_windows_vpn_scope(
         let classified = classify_vpn_adapter_name(&adapter.friendly_name, &adapter.description);
 
         if let Some(provider) = classified {
-            if let Some(effective_metric) = windows_winning_effective_metric(
+            if is_lan_overlay_only_provider(provider) {
+                split_overlays.push(provider.to_string());
+            } else if let Some(effective_metric) = windows_winning_effective_metric(
                 adapter,
                 flags,
                 other_best_v4_metric,
@@ -759,27 +847,27 @@ mod win_detect {
             match self {
                 Self::V4Default => {
                     flags.v4_default = true;
-                    flags.record_v4_metric(metric);
+                    flags.record_v4_default_metric(metric);
                 }
                 Self::V4LowerHalf => {
                     flags.v4_lower_half = true;
-                    flags.record_v4_metric(metric);
+                    flags.record_v4_split_metric(metric);
                 }
                 Self::V4UpperHalf => {
                     flags.v4_upper_half = true;
-                    flags.record_v4_metric(metric);
+                    flags.record_v4_split_metric(metric);
                 }
                 Self::V6Default => {
                     flags.v6_default = true;
-                    flags.record_v6_metric(metric);
+                    flags.record_v6_default_metric(metric);
                 }
                 Self::V6LowerHalf => {
                     flags.v6_lower_half = true;
-                    flags.record_v6_metric(metric);
+                    flags.record_v6_split_metric(metric);
                 }
                 Self::V6UpperHalf => {
                     flags.v6_upper_half = true;
-                    flags.record_v6_metric(metric);
+                    flags.record_v6_split_metric(metric);
                 }
             }
         }
@@ -896,6 +984,9 @@ mod win_detect {
         };
 
         for row in rows {
+            if row.Loopback || row.ValidLifetime == 0 {
+                continue;
+            }
             let prefix_len = row.DestinationPrefix.PrefixLength;
             if prefix_len > 1 {
                 continue;
@@ -1140,14 +1231,20 @@ fn parse_macos_netstat_routes_detailed(
         }
 
         if is_macos_vpn_iface(iface) {
+            let is_ts = parsed.tailscale_ifaces.contains_key(iface);
+            let provider = infer_macos_provider(iface, is_ts);
+            if is_lan_overlay_only_provider(provider) {
+                continue;
+            }
+            let wins_v4_split = flags.has_v4_split_default();
+            let wins_v6_split =
+                flags.has_v6_split_default() && (other_has_v6_default || !other_has_v4_default);
             let wins_v4_default =
                 flags.v4_default && primary_v4_default.is_some_and(|primary| primary == iface);
             let wins_v6_default = flags.v6_default
                 && (other_has_v6_default || !other_has_v4_default)
                 && primary_v6_default.is_some_and(|primary| primary == iface);
-            if flags.has_split_default() || wins_v4_default || wins_v6_default {
-                let is_ts = parsed.tailscale_ifaces.contains_key(iface);
-                let provider = infer_macos_provider(iface, is_ts);
+            if wins_v4_split || wins_v6_split || wins_v4_default || wins_v6_default {
                 full_tunnels.push((provider, iface.clone(), flags, is_ts));
             }
         }
@@ -1213,7 +1310,7 @@ fn parse_macos_netstat_routes(
 
 #[cfg(any(target_os = "macos", test))]
 fn is_macos_split_overlay_provider(provider: &str) -> bool {
-    matches!(provider, "Tailscale" | "ZeroTier")
+    matches!(provider, "Tailscale" | "ZeroTier") || is_lan_overlay_only_provider(provider)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1402,15 +1499,15 @@ fn parse_linux_proc_route(contents: &str) -> BTreeMap<String, GlobalRouteFlags> 
         if dest == [0, 0, 0, 0] && mask == [0, 0, 0, 0] {
             let entry = routes.entry(iface.to_string()).or_default();
             entry.v4_default = true;
-            entry.record_v4_metric(metric);
+            entry.record_v4_default_metric(metric);
         } else if dest == [0, 0, 0, 0] && mask == [128, 0, 0, 0] {
             let entry = routes.entry(iface.to_string()).or_default();
             entry.v4_lower_half = true;
-            entry.record_v4_metric(metric);
+            entry.record_v4_split_metric(metric);
         } else if dest == [128, 0, 0, 0] && mask == [128, 0, 0, 0] {
             let entry = routes.entry(iface.to_string()).or_default();
             entry.v4_upper_half = true;
-            entry.record_v4_metric(metric);
+            entry.record_v4_split_metric(metric);
         }
     }
 
@@ -1446,15 +1543,15 @@ fn parse_linux_proc_ipv6_route(contents: &str, routes: &mut BTreeMap<String, Glo
         if prefix_len == 0 && dest == "00000000000000000000000000000000" {
             let entry = routes.entry(iface.to_string()).or_default();
             entry.v6_default = true;
-            entry.record_v6_metric(metric);
+            entry.record_v6_default_metric(metric);
         } else if prefix_len == 1 && dest == "00000000000000000000000000000000" {
             let entry = routes.entry(iface.to_string()).or_default();
             entry.v6_lower_half = true;
-            entry.record_v6_metric(metric);
+            entry.record_v6_split_metric(metric);
         } else if prefix_len == 1 && dest.eq_ignore_ascii_case("80000000000000000000000000000000") {
             let entry = routes.entry(iface.to_string()).or_default();
             entry.v6_upper_half = true;
-            entry.record_v6_metric(metric);
+            entry.record_v6_split_metric(metric);
         }
     }
 }
@@ -1603,35 +1700,35 @@ fn parse_linux_ip_route_table(
             let entry = routes.entry(iface.to_string()).or_default();
             if is_ipv6 {
                 entry.v6_default = true;
-                entry.record_v6_metric(metric);
+                entry.record_v6_default_metric(metric);
             } else {
                 entry.v4_default = true;
-                entry.record_v4_metric(metric);
+                entry.record_v4_default_metric(metric);
             }
         } else if dest == "0.0.0.0/0" {
             let entry = routes.entry(iface.to_string()).or_default();
             entry.v4_default = true;
-            entry.record_v4_metric(metric);
+            entry.record_v4_default_metric(metric);
         } else if dest == "0.0.0.0/1" {
             let entry = routes.entry(iface.to_string()).or_default();
             entry.v4_lower_half = true;
-            entry.record_v4_metric(metric);
+            entry.record_v4_split_metric(metric);
         } else if dest == "128.0.0.0/1" {
             let entry = routes.entry(iface.to_string()).or_default();
             entry.v4_upper_half = true;
-            entry.record_v4_metric(metric);
+            entry.record_v4_split_metric(metric);
         } else if dest == "::/0" {
             let entry = routes.entry(iface.to_string()).or_default();
             entry.v6_default = true;
-            entry.record_v6_metric(metric);
+            entry.record_v6_default_metric(metric);
         } else if dest == "::/1" {
             let entry = routes.entry(iface.to_string()).or_default();
             entry.v6_lower_half = true;
-            entry.record_v6_metric(metric);
+            entry.record_v6_split_metric(metric);
         } else if dest.eq_ignore_ascii_case("8000::/1") {
             let entry = routes.entry(iface.to_string()).or_default();
             entry.v6_upper_half = true;
-            entry.record_v6_metric(metric);
+            entry.record_v6_split_metric(metric);
         }
     }
 }
@@ -1665,14 +1762,14 @@ fn evaluate_linux_vpn_scope(
             || kind != LinuxIfaceKind::Other;
         if !is_vpn {
             if flags.v4_default {
-                let m = flags.best_v4_metric.unwrap_or(0);
+                let m = flags.best_v4_default_metric.unwrap_or(0);
                 other_best_v4_metric = Some(match other_best_v4_metric {
                     Some(cur) => cur.min(m),
                     None => m,
                 });
             }
             if flags.v6_default {
-                let m = flags.best_v6_metric.unwrap_or(0);
+                let m = flags.best_v6_default_metric.unwrap_or(0);
                 other_best_v6_metric = Some(match other_best_v6_metric {
                     Some(cur) => cur.min(m),
                     None => m,
@@ -1719,17 +1816,20 @@ fn evaluate_linux_vpn_scope(
         }
 
         // Compare `main`-table `/0` VPN route metrics against physical NIC `/0`
-        // metrics when not routed via a policy table or `/1` split-default.
-        if !via_policy_table && !flags.has_split_default() {
+        // metrics when not routed via a policy table or an applicable `/1` split-default.
+        let v6_allowed = other_best_v6_metric.is_some() || other_best_v4_metric.is_none();
+        let has_winning_split_default =
+            flags.has_v4_split_default() || (flags.has_v6_split_default() && v6_allowed);
+        if !via_policy_table && !has_winning_split_default {
             let v4_wins = flags.v4_default
                 && match other_best_v4_metric {
                     None => true,
-                    Some(phys) => flags.best_v4_metric.unwrap_or(0) <= phys,
+                    Some(phys) => flags.best_v4_default_metric.unwrap_or(0) <= phys,
                 };
             let v6_wins = flags.v6_default
                 && match other_best_v6_metric {
                     None => other_best_v4_metric.is_none(),
-                    Some(phys) => flags.best_v6_metric.unwrap_or(0) <= phys,
+                    Some(phys) => flags.best_v6_default_metric.unwrap_or(0) <= phys,
                 };
             if !v4_wins && !v6_wins {
                 continue;
@@ -1751,6 +1851,9 @@ fn evaluate_linux_vpn_scope(
         };
 
         if let Some(provider) = provider {
+            if is_lan_overlay_only_provider(provider) {
+                continue;
+            }
             full_tunnels.push(FullTunnelHit {
                 provider,
                 iface: iface.clone(),
@@ -2046,6 +2149,26 @@ mod tests {
                 Some("ZeroTier"),
             ),
             ("zt3jn4x8ab", "", Some("ZeroTier")),
+            (
+                "Radmin VPN",
+                "Radmin VPN Ethernet Adapter",
+                Some("Radmin VPN"),
+            ),
+            (
+                "Ethernet 6",
+                "Famatech Radmin VPN Ethernet Adapter",
+                Some("Radmin VPN"),
+            ),
+            (
+                "Hamachi",
+                "LogMeIn Hamachi Virtual Ethernet Adapter",
+                Some("Hamachi"),
+            ),
+            (
+                "Ethernet 7",
+                "LogMeIn Virtual Network Adapter",
+                Some("Hamachi"),
+            ),
             ("AmneziaWG", "AmneziaWG Tunnel", Some("AmneziaVPN")),
             ("AdGuard VPN", "AdGuard Wintun Adapter", Some("AdGuard VPN")),
             ("Outline", "TAP-Windows Adapter V9", Some("Outline VPN")),
@@ -2077,6 +2200,12 @@ mod tests {
                 "name={name:?} desc={desc:?}"
             );
         }
+
+        assert!(is_lan_overlay_only_provider("Radmin VPN"));
+        assert!(is_lan_overlay_only_provider("Hamachi"));
+        assert!(!is_lan_overlay_only_provider("Mullvad"));
+        assert!(!is_lan_overlay_only_provider("Tailscale"));
+        assert!(!is_lan_overlay_only_provider("ZeroTier"));
     }
 
     #[test]
@@ -2452,7 +2581,7 @@ default            192.168.1.1        UGScIg                en0
         fn v4_default(metric: u32) -> GlobalRouteFlags {
             GlobalRouteFlags {
                 v4_default: true,
-                best_v4_metric: Some(metric),
+                best_v4_default_metric: Some(metric),
                 ..GlobalRouteFlags::default()
             }
         }
@@ -2461,7 +2590,7 @@ default            192.168.1.1        UGScIg                en0
             GlobalRouteFlags {
                 v4_lower_half: true,
                 v4_upper_half: true,
-                best_v4_metric: Some(metric),
+                best_v4_split_metric: Some(metric),
                 ..GlobalRouteFlags::default()
             }
         }
@@ -2469,7 +2598,16 @@ default            192.168.1.1        UGScIg                en0
         fn v6_default(metric: u32) -> GlobalRouteFlags {
             GlobalRouteFlags {
                 v6_default: true,
-                best_v6_metric: Some(metric),
+                best_v6_default_metric: Some(metric),
+                ..GlobalRouteFlags::default()
+            }
+        }
+
+        fn v6_split(metric: u32) -> GlobalRouteFlags {
+            GlobalRouteFlags {
+                v6_lower_half: true,
+                v6_upper_half: true,
+                best_v6_split_metric: Some(metric),
                 ..GlobalRouteFlags::default()
             }
         }
@@ -2602,8 +2740,8 @@ default            192.168.1.1        UGScIg                en0
                         GlobalRouteFlags {
                             v4_default: true,
                             v6_default: true,
-                            best_v4_metric: Some(0),
-                            best_v6_metric: Some(0),
+                            best_v4_default_metric: Some(0),
+                            best_v6_default_metric: Some(0),
                             ..GlobalRouteFlags::default()
                         },
                     ),
@@ -2612,8 +2750,8 @@ default            192.168.1.1        UGScIg                en0
                         GlobalRouteFlags {
                             v4_default: true,
                             v6_default: true,
-                            best_v4_metric: Some(10),
-                            best_v6_metric: Some(0),
+                            best_v4_default_metric: Some(10),
+                            best_v6_default_metric: Some(0),
                             ..GlobalRouteFlags::default()
                         },
                     ),
@@ -2953,6 +3091,418 @@ default            192.168.1.1        UGScIg                en0
                     kill_switch: false,
                 },
             },
+            Case {
+                name: "radmin vpn (iftype 6, eff 9257) with ethernet up stays split overlay",
+                adapters: vec![
+                    eth.clone(),
+                    adapter(
+                        "Radmin VPN",
+                        "Radmin VPN Ethernet Adapter",
+                        50,
+                        500,
+                        WIN_IF_TYPE_ETHERNET,
+                        57,
+                        57,
+                    ),
+                ],
+                luid_routes: vec![(1, v4_default(0)), (50, v4_default(9200))],
+                index_routes: vec![],
+                self_tun: Some("vdpi0"),
+                expected: VpnScope::SplitOverlay {
+                    providers: vec!["Radmin VPN".to_string()],
+                },
+            },
+            Case {
+                name: "radmin vpn (iftype 6, eff 9257) with ethernet down NEVER false-yields",
+                adapters: vec![adapter(
+                    "Radmin VPN",
+                    "Famatech Radmin VPN Ethernet Adapter",
+                    50,
+                    500,
+                    WIN_IF_TYPE_ETHERNET,
+                    57,
+                    57,
+                )],
+                luid_routes: vec![(50, v4_default(9200))],
+                index_routes: vec![],
+                self_tun: Some("vdpi0"),
+                expected: VpnScope::SplitOverlay {
+                    providers: vec!["Radmin VPN".to_string()],
+                },
+            },
+            Case {
+                name: "radmin vpn (iftype 6, eff 9257) does NOT pollute pass 1 kill-switch detection",
+                adapters: vec![
+                    adapter(
+                        "Radmin VPN",
+                        "Radmin VPN Ethernet Adapter",
+                        50,
+                        500,
+                        WIN_IF_TYPE_ETHERNET,
+                        57,
+                        57,
+                    ),
+                    adapter(
+                        "Mullvad",
+                        "WireGuard Tunnel",
+                        51,
+                        501,
+                        WIN_IF_TYPE_PROP_VIRTUAL,
+                        5,
+                        5,
+                    ),
+                ],
+                luid_routes: vec![(50, v4_default(9200)), (51, v4_default(0))],
+                index_routes: vec![],
+                self_tun: Some("vdpi0"),
+                expected: VpnScope::FullTunnel {
+                    provider: "Mullvad".to_string(),
+                    iface: "Mullvad".to_string(),
+                    kill_switch: true,
+                },
+            },
+            Case {
+                name: "hamachi (iftype 6, eff 9000) with ethernet down stays split overlay",
+                adapters: vec![adapter(
+                    "Hamachi",
+                    "LogMeIn Hamachi Virtual Ethernet Adapter",
+                    52,
+                    502,
+                    WIN_IF_TYPE_ETHERNET,
+                    9000,
+                    9000,
+                )],
+                luid_routes: vec![(52, v4_default(0))],
+                index_routes: vec![],
+                self_tun: Some("vdpi0"),
+                expected: VpnScope::SplitOverlay {
+                    providers: vec!["Hamachi".to_string()],
+                },
+            },
+            Case {
+                name: "standby vpn sentinel metric >= 4000 while offline does NOT false-yield",
+                adapters: vec![adapter(
+                    "Mullvad",
+                    "WireGuard Tunnel",
+                    53,
+                    503,
+                    WIN_IF_TYPE_PROP_VIRTUAL,
+                    200,
+                    200,
+                )],
+                luid_routes: vec![(53, v4_default(3800))],
+                index_routes: vec![],
+                self_tun: Some("vdpi0"),
+                expected: VpnScope::SplitOverlay {
+                    providers: vec!["Mullvad".to_string()],
+                },
+            },
+            Case {
+                name: "standby v6 vpn sentinel metric >= 4000 while offline does NOT false-yield",
+                adapters: vec![adapter(
+                    "Mullvad",
+                    "WireGuard Tunnel",
+                    54,
+                    504,
+                    WIN_IF_TYPE_PROP_VIRTUAL,
+                    4000,
+                    4000,
+                )],
+                luid_routes: vec![(54, v6_default(0))],
+                index_routes: vec![],
+                self_tun: Some("vdpi0"),
+                expected: VpnScope::SplitOverlay {
+                    providers: vec!["Mullvad".to_string()],
+                },
+            },
+            Case {
+                name: "standby unnamed tunnel sentinel metric >= 4000 while offline returns None",
+                adapters: vec![adapter(
+                    "Standby Tunnel",
+                    "Custom Virtual Tunnel Adapter",
+                    55,
+                    505,
+                    WIN_IF_TYPE_TUNNEL,
+                    4500,
+                    4500,
+                )],
+                luid_routes: vec![(55, v4_default(0))],
+                index_routes: vec![],
+                self_tun: Some("vdpi0"),
+                expected: VpnScope::None,
+            },
+            Case {
+                name: "half /1 route metric 0 does NOT contaminate standby /0 metric 500",
+                adapters: vec![
+                    eth.clone(),
+                    adapter(
+                        "Mullvad",
+                        "WireGuard Tunnel",
+                        56,
+                        506,
+                        WIN_IF_TYPE_PROP_VIRTUAL,
+                        10,
+                        10,
+                    ),
+                ],
+                luid_routes: vec![
+                    (1, v4_default(0)),
+                    (
+                        56,
+                        GlobalRouteFlags {
+                            v4_default: true,
+                            v4_lower_half: true,
+                            v4_upper_half: false,
+                            best_v4_default_metric: Some(500),
+                            best_v4_split_metric: Some(0),
+                            ..GlobalRouteFlags::default()
+                        },
+                    ),
+                ],
+                index_routes: vec![],
+                self_tun: Some("vdpi0"),
+                expected: VpnScope::SplitOverlay {
+                    providers: vec!["Mullvad".to_string()],
+                },
+            },
+            Case {
+                name: "ipv6 split-default ::/1 + 8000::/1 on ipv4-only host does NOT yield",
+                adapters: vec![
+                    eth.clone(),
+                    adapter(
+                        "Tailscale",
+                        "Tailscale Tunnel",
+                        57,
+                        507,
+                        WIN_IF_TYPE_PROP_VIRTUAL,
+                        50,
+                        5,
+                    ),
+                ],
+                luid_routes: vec![(1, v4_default(0)), (57, v6_split(0))],
+                index_routes: vec![],
+                self_tun: Some("vdpi0"),
+                expected: VpnScope::SplitOverlay {
+                    providers: vec!["Tailscale".to_string()],
+                },
+            },
+            Case {
+                name: "ipv6 split-default ::/1 + 8000::/1 on dual-stack host DOES yield",
+                adapters: vec![
+                    eth.clone(),
+                    adapter(
+                        "Tailscale",
+                        "Tailscale Tunnel",
+                        58,
+                        508,
+                        WIN_IF_TYPE_PROP_VIRTUAL,
+                        50,
+                        5,
+                    ),
+                ],
+                luid_routes: vec![
+                    (
+                        1,
+                        GlobalRouteFlags {
+                            v4_default: true,
+                            v6_default: true,
+                            best_v4_default_metric: Some(0),
+                            best_v6_default_metric: Some(0),
+                            ..GlobalRouteFlags::default()
+                        },
+                    ),
+                    (58, v6_split(0)),
+                ],
+                index_routes: vec![],
+                self_tun: Some("vdpi0"),
+                expected: VpnScope::FullTunnel {
+                    provider: "Tailscale".to_string(),
+                    iface: "Tailscale".to_string(),
+                    kill_switch: false,
+                },
+            },
+            Case {
+                name: "pass 1 vm fallback fills missing v4 independently even when physical v6 exists",
+                adapters: vec![
+                    eth.clone(),
+                    adapter(
+                        "Ethernet 2",
+                        "Microsoft Hyper-V Network Adapter",
+                        60,
+                        600,
+                        WIN_IF_TYPE_ETHERNET,
+                        25,
+                        25,
+                    ),
+                    adapter(
+                        "Mullvad",
+                        "WireGuard Tunnel",
+                        61,
+                        601,
+                        WIN_IF_TYPE_PROP_VIRTUAL,
+                        200,
+                        200,
+                    ),
+                ],
+                luid_routes: vec![
+                    (1, v6_default(0)),
+                    (60, v4_default(0)),
+                    (61, v4_default(50)),
+                ],
+                index_routes: vec![],
+                self_tun: Some("vdpi0"),
+                expected: VpnScope::SplitOverlay {
+                    providers: vec!["Mullvad".to_string()],
+                },
+            },
+            Case {
+                name: "pass 1 vm fallback fills missing v6 independently even when physical v4 exists",
+                adapters: vec![
+                    eth.clone(),
+                    adapter(
+                        "Ethernet 2",
+                        "Microsoft Hyper-V Network Adapter",
+                        62,
+                        602,
+                        WIN_IF_TYPE_ETHERNET,
+                        25,
+                        25,
+                    ),
+                    adapter(
+                        "Mullvad",
+                        "WireGuard Tunnel",
+                        63,
+                        603,
+                        WIN_IF_TYPE_PROP_VIRTUAL,
+                        200,
+                        200,
+                    ),
+                ],
+                luid_routes: vec![
+                    (1, v4_default(0)),
+                    (62, v6_default(0)),
+                    (63, v6_default(50)),
+                ],
+                index_routes: vec![],
+                self_tun: Some("vdpi0"),
+                expected: VpnScope::SplitOverlay {
+                    providers: vec!["Mullvad".to_string()],
+                },
+            },
+            Case {
+                name: "pass 1 vm fallback excludes internal hypervisor switches so kill-switch still fires",
+                adapters: vec![
+                    adapter(
+                        "vEthernet (Default Switch)",
+                        "Hyper-V Virtual Ethernet Adapter",
+                        70,
+                        700,
+                        WIN_IF_TYPE_ETHERNET,
+                        15,
+                        15,
+                    ),
+                    adapter(
+                        "vEthernet (WSL)",
+                        "Hyper-V Virtual Ethernet Adapter #2",
+                        71,
+                        701,
+                        WIN_IF_TYPE_ETHERNET,
+                        15,
+                        15,
+                    ),
+                    adapter(
+                        "docker0",
+                        "Docker Virtual Adapter",
+                        72,
+                        702,
+                        WIN_IF_TYPE_ETHERNET,
+                        15,
+                        15,
+                    ),
+                    adapter(
+                        "VMware Network Adapter VMnet8",
+                        "VMware Virtual Ethernet Adapter for VMnet8",
+                        73,
+                        703,
+                        WIN_IF_TYPE_ETHERNET,
+                        15,
+                        15,
+                    ),
+                    adapter(
+                        "VirtualBox Host-Only Network",
+                        "VirtualBox Host-Only Ethernet Adapter",
+                        74,
+                        704,
+                        WIN_IF_TYPE_ETHERNET,
+                        15,
+                        15,
+                    ),
+                    adapter(
+                        "Mullvad",
+                        "WireGuard Tunnel",
+                        75,
+                        705,
+                        WIN_IF_TYPE_PROP_VIRTUAL,
+                        5,
+                        5,
+                    ),
+                ],
+                luid_routes: vec![
+                    (70, v4_default(0)),
+                    (71, v4_default(0)),
+                    (72, v4_default(0)),
+                    (73, v4_default(0)),
+                    (74, v4_default(0)),
+                    (75, v4_default(0)),
+                ],
+                index_routes: vec![],
+                self_tun: Some("vdpi0"),
+                expected: VpnScope::FullTunnel {
+                    provider: "Mullvad".to_string(),
+                    iface: "Mullvad".to_string(),
+                    kill_switch: true,
+                },
+            },
+            Case {
+                name: "lookup_flags merges routes_by_luid and routes_by_index",
+                adapters: vec![
+                    eth.clone(),
+                    adapter(
+                        "Mullvad",
+                        "WireGuard Tunnel",
+                        80,
+                        800,
+                        WIN_IF_TYPE_PROP_VIRTUAL,
+                        200,
+                        200,
+                    ),
+                ],
+                luid_routes: vec![
+                    (1, v4_default(0)),
+                    (
+                        80,
+                        GlobalRouteFlags {
+                            v4_lower_half: true,
+                            best_v4_split_metric: Some(5),
+                            ..GlobalRouteFlags::default()
+                        },
+                    ),
+                ],
+                index_routes: vec![(
+                    800,
+                    GlobalRouteFlags {
+                        v4_upper_half: true,
+                        best_v4_split_metric: Some(5),
+                        ..GlobalRouteFlags::default()
+                    },
+                )],
+                self_tun: Some("vdpi0"),
+                expected: VpnScope::FullTunnel {
+                    provider: "Mullvad".to_string(),
+                    iface: "Mullvad".to_string(),
+                    kill_switch: false,
+                },
+            },
         ];
 
         for case in cases {
@@ -2962,6 +3512,84 @@ default            192.168.1.1        UGScIg                en0
                 evaluate_windows_vpn_scope(&case.adapters, &luid_map, &index_map, case.self_tun);
             assert_eq!(actual, case.expected, "case failed: {}", case.name);
         }
+    }
+
+    #[test]
+    fn cross_platform_v6_split_default_guard_and_half_split_metric_separation() {
+        // macOS: IPv6-only ::/1 + 8000::/1 on an IPv4-only host must not yield.
+        let mac_inet = "\
+Internet:
+Destination        Gateway            Flags               Netif Expire
+default            192.168.1.1        UGScg                 en0
+";
+        let mac_inet6 = "\
+Internet6:
+Destination                             Gateway                         Flags         Netif Expire
+::/1                                    link#22                         UCS           utun5
+8000::/1                                link#22                         UCS           utun5
+";
+        assert_eq!(
+            parse_macos_netstat_routes(mac_inet, mac_inet6, None),
+            VpnScope::None
+        );
+
+        // Linux: half-/1 route with metric 0 must not contaminate standby /0 metric 500.
+        let z = hex_ipv4_host_order([0, 0, 0, 0]);
+        let half = hex_ipv4_host_order([128, 0, 0, 0]);
+        let gw_eth = hex_ipv4_host_order([192, 168, 1, 1]);
+        let gw_wg = hex_ipv4_host_order([10, 8, 0, 1]);
+        let half_split_proc = format!(
+            "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
+             eth0\t{z}\t{gw_eth}\t0003\t0\t0\t100\t{z}\t0\t0\t0\n\
+             wg0\t{z}\t{gw_wg}\t0003\t0\t0\t500\t{z}\t0\t0\t0\n\
+             wg0\t{z}\t{gw_wg}\t0003\t0\t0\t0\t{half}\t0\t0\t0\n"
+        );
+        let parsed = parse_linux_proc_route(&half_split_proc);
+        let wg_flags = parsed.get("wg0").copied().expect("wg0 flags present");
+        assert_eq!(wg_flags.best_v4_default_metric, Some(500));
+        assert_eq!(wg_flags.best_v4_split_metric, Some(0));
+        assert!(!wg_flags.has_v4_split_default());
+        assert_eq!(
+            evaluate_linux_vpn_scope(
+                &[
+                    LinuxUpIface::other("eth0"),
+                    LinuxUpIface::with_kind("wg0", LinuxIfaceKind::WireGuard),
+                ],
+                &parsed,
+                &BTreeMap::new(),
+                &LinuxIpRuleSummary::default(),
+                Some("vdpi0"),
+            ),
+            VpnScope::SplitOverlay {
+                providers: vec!["WireGuard".to_string()],
+            }
+        );
+
+        // Linux: IPv6-only ::/1 + 8000::/1 on an IPv4-only host must not yield.
+        let v4_only_proc = format!(
+            "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
+             eth0\t{z}\t{gw_eth}\t0003\t0\t0\t100\t{z}\t0\t0\t0\n"
+        );
+        let mut combined_routes = parse_linux_proc_route(&v4_only_proc);
+        let v6_split_table = "\
+00000000000000000000000000000000 01 00000000000000000000000000000000 00 00000000000000000000000000000000 00000001 00000000 00000000 00000001 wg0\n\
+80000000000000000000000000000000 01 00000000000000000000000000000000 00 00000000000000000000000000000000 00000001 00000000 00000000 00000001 wg0\n";
+        parse_linux_proc_ipv6_route(v6_split_table, &mut combined_routes);
+        assert_eq!(
+            evaluate_linux_vpn_scope(
+                &[
+                    LinuxUpIface::other("eth0"),
+                    LinuxUpIface::with_kind("wg0", LinuxIfaceKind::WireGuard),
+                ],
+                &combined_routes,
+                &BTreeMap::new(),
+                &LinuxIpRuleSummary::default(),
+                Some("vdpi0"),
+            ),
+            VpnScope::SplitOverlay {
+                providers: vec!["WireGuard".to_string()],
+            }
+        );
     }
 
     #[test]

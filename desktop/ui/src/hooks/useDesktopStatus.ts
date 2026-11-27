@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   getSettings,
   getStatus,
@@ -78,6 +78,8 @@ const MIN_HISTORY_SAMPLE_GAP_MS = 500;
 const MAX_ACTIVITY_EVENTS = 100;
 const MAX_TOASTS = 4;
 const FALLBACK_POLL_INTERVAL_MS = 2000;
+const FALLBACK_POLL_ERROR_THRESHOLD = 3;
+const VISIBILITY_REFRESH_DEBOUNCE_MS = 1500;
 const SETTINGS_RETRY_COOLDOWN_MS = 5000;
 const DEFAULT_TOAST_DURATION_MS = 4500;
 const ERROR_TOAST_DURATION_MS = 6500;
@@ -190,7 +192,9 @@ function isLifecyclePendingOperation(
     pendingOperation === "installing" ||
     pendingOperation === "upgrading" ||
     pendingOperation === "repairing" ||
-    pendingOperation === "uninstalling"
+    pendingOperation === "uninstalling" ||
+    pendingOperation === "switching_engine" ||
+    pendingOperation === "resetting_network"
   );
 }
 
@@ -338,6 +342,14 @@ export function useDesktopStatus(): UseDesktopStatusResult {
 
   const mountedRef = useRef(true);
   const prevObservedRef = useRef<ObservedSnapshotState | null>(null);
+  const consecutiveNotLiveRef = useRef(0);
+  const lastLiveCountersRef = useRef<{
+    engine: EngineMode;
+    bytesRx: number | null;
+    bytesTx: number | null;
+  } | null>(null);
+  const consecutivePollFailuresRef = useRef(0);
+  const lastPushAtMsRef = useRef(0);
   const lastSeqRef = useRef<number | null>(null);
   const statusSeqRef = useRef(0);
   const settingsSeqRef = useRef(0);
@@ -421,11 +433,13 @@ export function useDesktopStatus(): UseDesktopStatusResult {
 
       const nowMs = Date.now();
       const hadStatusError = statusErrorRef.current !== null;
+      consecutivePollFailuresRef.current = 0;
       statusErrorRef.current = null;
       setStatus(snapshot);
       setStatusError(null);
 
-      // Retry getSettings() on recovery whenever settings failed or have not yet loaded.
+      // Retry getSettings() on recovery whenever settings failed, have not yet loaded,
+      // or configuredEngine diverged from the cached settings payload.
       if (!settingsInFlightRef.current) {
         const needsInitialRecovery =
           settingsRef.current === null && hadStatusError;
@@ -434,7 +448,17 @@ export function useDesktopStatus(): UseDesktopStatusResult {
           (hadStatusError ||
             nowMs - lastSettingsRetryAtRef.current >=
               SETTINGS_RETRY_COOLDOWN_MS);
-        if (needsInitialRecovery || hasRetryableSettingsError) {
+        const engineDiverged =
+          settingsRef.current !== null &&
+          snapshot.configuredEngine !== settingsRef.current.engine &&
+          (settingsErrorRef.current === null ||
+            nowMs - lastSettingsRetryAtRef.current >=
+              SETTINGS_RETRY_COOLDOWN_MS);
+        if (
+          needsInitialRecovery ||
+          hasRetryableSettingsError ||
+          engineDiverged
+        ) {
           void refreshSettings();
         }
       }
@@ -447,22 +471,45 @@ export function useDesktopStatus(): UseDesktopStatusResult {
       const isLiveRunning = observed.liveRunning;
 
       if (!isLiveRunning) {
-        setHistory((prev) => (prev.length === 0 ? prev : []));
+        consecutiveNotLiveRef.current += 1;
+        if (
+          snapshot.serviceState !== "running" ||
+          consecutiveNotLiveRef.current >= 2
+        ) {
+          lastLiveCountersRef.current = null;
+          setHistory((prev) => (prev.length === 0 ? prev : []));
+        }
       } else {
+        const missedSingleProbe =
+          consecutiveNotLiveRef.current === 1 &&
+          snapshot.serviceState === "running";
+        consecutiveNotLiveRef.current = 0;
         const rxBps = sanitizeRate(snapshot.live?.rxRateBps);
         const txBps = sanitizeRate(snapshot.live?.txRateBps);
+        const priorLive = lastLiveCountersRef.current;
 
         const engineSwitched =
-          prevObserved !== null && prevObserved.engine !== observed.engine;
-        const sessionRestarted =
-          prevObserved !== null &&
-          (!prevObserved.liveRunning ||
-            (prevObserved.bytesRx !== null &&
-              observed.bytesRx !== null &&
-              observed.bytesRx < prevObserved.bytesRx) ||
-            (prevObserved.bytesTx !== null &&
+          (prevObserved !== null && prevObserved.engine !== observed.engine) ||
+          (priorLive !== null && priorLive.engine !== observed.engine);
+        const countersReset =
+          priorLive !== null &&
+          ((priorLive.bytesRx !== null &&
+            observed.bytesRx !== null &&
+            observed.bytesRx < priorLive.bytesRx) ||
+            (priorLive.bytesTx !== null &&
               observed.bytesTx !== null &&
-              observed.bytesTx < prevObserved.bytesTx));
+              observed.bytesTx < priorLive.bytesTx));
+        const sessionRestarted =
+          (prevObserved !== null &&
+            !prevObserved.liveRunning &&
+            !missedSingleProbe) ||
+          countersReset;
+
+        lastLiveCountersRef.current = {
+          engine: observed.engine,
+          bytesRx: observed.bytesRx,
+          bytesTx: observed.bytesTx,
+        };
 
         setHistory((prev) => {
           if (engineSwitched || sessionRestarted) {
@@ -757,6 +804,7 @@ export function useDesktopStatus(): UseDesktopStatusResult {
             if (disposed) {
               return;
             }
+            consecutivePollFailuresRef.current = 0;
             const hasSnapshotSeq =
               typeof snapshot.snapshotSeq === "number" &&
               Number.isFinite(snapshot.snapshotSeq);
@@ -764,8 +812,20 @@ export function useDesktopStatus(): UseDesktopStatusResult {
               applySnapshot(snapshot);
             }
           })
-          .catch(() => {
-            // Preserve last known snapshot across transient fallback poll errors.
+          .catch((err: unknown) => {
+            if (disposed || !mountedRef.current) {
+              return;
+            }
+            consecutivePollFailuresRef.current += 1;
+            if (
+              consecutivePollFailuresRef.current >=
+                FALLBACK_POLL_ERROR_THRESHOLD &&
+              seq === statusSeqRef.current
+            ) {
+              const msg = toErrorMessage(err);
+              statusErrorRef.current = msg;
+              setStatusError(msg);
+            }
           })
           .finally(() => {
             pollInFlight = false;
@@ -787,7 +847,12 @@ export function useDesktopStatus(): UseDesktopStatusResult {
       for (const [id, entry] of Array.from(toastTimersRef.current.entries())) {
         startToastTimerEntry(id, entry);
       }
-      void refreshStatus();
+      if (
+        Date.now() - lastPushAtMsRef.current >=
+        VISIBILITY_REFRESH_DEBOUNCE_MS
+      ) {
+        void refreshStatus();
+      }
       if (
         (settingsRef.current === null || settingsErrorRef.current !== null) &&
         !settingsInFlightRef.current
@@ -821,6 +886,8 @@ export function useDesktopStatus(): UseDesktopStatusResult {
               return;
             }
             receivedPush = true;
+            lastPushAtMsRef.current = Date.now();
+            consecutivePollFailuresRef.current = 0;
             fallbackPollingWanted = false;
             stopPolling();
             applySnapshot(snapshot);
@@ -842,7 +909,7 @@ export function useDesktopStatus(): UseDesktopStatusResult {
         return;
       }
 
-      if (!inTauri && !receivedPush) {
+      if ((!inTauri || !unlisten) && !receivedPush) {
         startFallbackPolling();
       }
     })();
@@ -876,25 +943,46 @@ export function useDesktopStatus(): UseDesktopStatusResult {
 
   const error = statusError ?? settingsError;
 
-  return {
-    status,
-    settings,
-    loading,
-    error,
-    statusError,
-    settingsError,
-    history,
-    activity,
-    toasts,
-    refreshStatus,
-    refreshSettings,
-    applySnapshot,
-    pushToast,
-    dismissToast,
-    pauseToastTimer,
-    resumeToastTimer,
-    clearActivity,
-  };
+  return useMemo<UseDesktopStatusResult>(
+    () => ({
+      status,
+      settings,
+      loading,
+      error,
+      statusError,
+      settingsError,
+      history,
+      activity,
+      toasts,
+      refreshStatus,
+      refreshSettings,
+      applySnapshot,
+      pushToast,
+      dismissToast,
+      pauseToastTimer,
+      resumeToastTimer,
+      clearActivity,
+    }),
+    [
+      status,
+      settings,
+      loading,
+      error,
+      statusError,
+      settingsError,
+      history,
+      activity,
+      toasts,
+      refreshStatus,
+      refreshSettings,
+      applySnapshot,
+      pushToast,
+      dismissToast,
+      pauseToastTimer,
+      resumeToastTimer,
+      clearActivity,
+    ],
+  );
 }
 
 export default useDesktopStatus;

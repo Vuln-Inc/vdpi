@@ -459,6 +459,11 @@ pub fn extract_http_host_split(buf: &[u8]) -> Option<(String, usize)> {
 /// RFC 5389 / RFC 8489 STUN fixed magic cookie (`0x2112A442`) at bytes `4..8`.
 const STUN_MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xa4, 0x42];
 
+/// 16-byte RakNet offline packet magic (`00 ff ff 00 fe fe fe fe fd fd fd fd 12 34 56 78`).
+const RAKNET_OFFLINE_MAGIC: [u8; 16] = [
+    0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78,
+];
+
 /// Detects whether a UDP datagram is an RFC 5389 / RFC 8489 STUN packet.
 ///
 /// Valid STUN headers are at least 20 bytes long, clear the two most significant bits
@@ -468,14 +473,39 @@ pub fn is_stun_packet(payload: &[u8]) -> bool {
     payload.len() >= 20 && (payload[0] & 0xc0) == 0x00 && payload[4..8] == STUN_MAGIC_COOKIE
 }
 
+/// Detects whether a UDP datagram is a RakNet offline handshake / ping packet
+/// (e.g. Roblox / Minecraft Bedrock) carrying the 16-byte RakNet offline magic
+/// (`00 ff ff 00 fe fe fe fe fd fd fd fd 12 34 56 78`).
+pub fn is_raknet_offline_packet(payload: &[u8]) -> bool {
+    payload.get(1..17) == Some(RAKNET_OFFLINE_MAGIC.as_slice())
+        || payload.get(2..18) == Some(RAKNET_OFFLINE_MAGIC.as_slice())
+        || payload.get(9..25) == Some(RAKNET_OFFLINE_MAGIC.as_slice())
+        || payload.get(17..33) == Some(RAKNET_OFFLINE_MAGIC.as_slice())
+}
+
+/// Decodes a QUIC variable-length integer (RFC 9000 Section 16), returning `(value, bytes_consumed)`.
+fn decode_quic_varint(buf: &[u8]) -> Option<(u64, usize)> {
+    let first = *buf.first()?;
+    let len = 1usize << (first >> 6);
+    if buf.len() < len {
+        return None;
+    }
+    let mut val = u64::from(first & 0x3f);
+    for &b in &buf[1..len] {
+        val = (val << 8) | u64::from(b);
+    }
+    Some((val, len))
+}
+
 /// Detects whether a UDP datagram carries a QUIC Long Header Initial packet
 /// (RFC 9000 v1, RFC 9369 v2, IETF draft versions, Meta `mvfst` versions, or RFC 9000
 /// greased versions, including RFC 9287 greased fixed-bit packets).
 ///
-/// Rejects RFC 5389 STUN packets, QUIC Short-Header 1-RTT packets, Version Negotiation,
-/// and non-Initial Long-Header packet types (0-RTT, Handshake, Retry).
+/// Rejects RFC 5389 STUN packets, RakNet offline/connected/ACK/NACK frames, QUIC
+/// Short-Header 1-RTT packets, Version Negotiation, non-Initial Long-Header packet
+/// types (0-RTT, Handshake, Retry), and truncated/malformed Initial headers.
 pub fn is_quic_long_header_initial(payload: &[u8]) -> bool {
-    if payload.len() < 7 || is_stun_packet(payload) {
+    if payload.len() < 7 || is_stun_packet(payload) || is_raknet_offline_packet(payload) {
         return false;
     }
 
@@ -511,7 +541,51 @@ pub fn is_quic_long_header_initial(payload: &[u8]) -> bool {
         return false;
     }
     let scid_len = payload[scid_len_pos] as usize;
-    scid_len <= 20 && scid_len_pos + 1 + scid_len <= payload.len()
+    if scid_len > 20 {
+        return false;
+    }
+    let Some(pos) = scid_len_pos
+        .checked_add(1)
+        .and_then(|p| p.checked_add(scid_len))
+    else {
+        return false;
+    };
+    if pos >= payload.len() {
+        return false;
+    }
+
+    // Validate RFC 9000 Section 17.2.2 Initial header tail: Token Length + Token + Length.
+    let Some((token_len_u64, token_varint_len)) = decode_quic_varint(&payload[pos..]) else {
+        return false;
+    };
+    let Ok(token_len) = usize::try_from(token_len_u64) else {
+        return false;
+    };
+    let Some(length_pos) = pos
+        .checked_add(token_varint_len)
+        .and_then(|p| p.checked_add(token_len))
+    else {
+        return false;
+    };
+    if length_pos >= payload.len() {
+        return false;
+    }
+
+    let Some((pkt_len_u64, pkt_len_varint_len)) = decode_quic_varint(&payload[length_pos..]) else {
+        return false;
+    };
+    let Ok(pkt_len) = usize::try_from(pkt_len_u64) else {
+        return false;
+    };
+    let Some(body_start) = length_pos.checked_add(pkt_len_varint_len) else {
+        return false;
+    };
+    // Initial payload must hold at least 1-byte Packet Number + 16-byte AEAD tag (17 bytes)
+    // and fit within the UDP datagram (allowing coalesced QUIC packets after `body_end`).
+    pkt_len >= 17
+        && body_start
+            .checked_add(pkt_len)
+            .is_some_and(|body_end| body_end <= payload.len())
 }
 
 /// Helper used in tests and diagnostics to craft a standards-compliant TLS 1.3/1.2 ClientHello
@@ -723,13 +797,22 @@ mod tests {
         scid: &[u8],
         body_len: usize,
     ) -> Vec<u8> {
-        let mut pkt = Vec::with_capacity(7 + dcid.len() + scid.len() + body_len);
+        let mut pkt = Vec::with_capacity(10 + dcid.len() + scid.len() + body_len);
         pkt.push(first_byte);
         pkt.extend_from_slice(&version.to_be_bytes());
         pkt.push(dcid.len() as u8);
         pkt.extend_from_slice(dcid);
         pkt.push(scid.len() as u8);
         pkt.extend_from_slice(scid);
+        // Token Length = 0 (1-byte QUIC varint)
+        pkt.push(0x00);
+        // Remaining Initial Length (1-byte or 2-byte QUIC varint)
+        if body_len < 64 {
+            pkt.push(body_len as u8);
+        } else {
+            let encoded = (body_len as u16) | 0x4000;
+            pkt.extend_from_slice(&encoded.to_be_bytes());
+        }
         pkt.resize(pkt.len() + body_len, 0u8);
         pkt
     }
@@ -836,5 +919,86 @@ mod tests {
         let quic_initial = build_quic_long_header(0xc0, 0x0000_0001, &[0x11; 8], &[], 1200);
         assert!(is_quic_long_header_initial(&quic_initial));
         assert!(!is_stun_packet(&quic_initial));
+    }
+
+    #[test]
+    fn discriminates_raknet_frames_and_malformed_quic_tails_from_quic_initial() {
+        // RakNet OpenConnectionRequest1 (0x05 + 16-byte offline magic at offset 1 + MTU padding)
+        let mut open_req1 = vec![0x05u8];
+        open_req1.extend_from_slice(&RAKNET_OFFLINE_MAGIC);
+        open_req1.push(0x0b); // protocol version
+        open_req1.resize(1200, 0u8);
+        assert!(is_raknet_offline_packet(&open_req1));
+        assert!(!is_quic_long_header_initial(&open_req1));
+
+        // RakNet UnconnectedPing (0x01 + 8-byte timestamp + 16-byte offline magic at offset 9)
+        let mut ping = vec![0x01u8];
+        ping.extend_from_slice(&[0u8; 8]);
+        ping.extend_from_slice(&RAKNET_OFFLINE_MAGIC);
+        ping.extend_from_slice(&[0xaa; 8]);
+        assert!(is_raknet_offline_packet(&ping));
+        assert!(!is_quic_long_header_initial(&ping));
+
+        // RakNet IncompatibleProtocolVersion (0x19 + 1-byte proto + magic at offset 2)
+        let mut incompat = vec![0x19u8, 0x0b];
+        incompat.extend_from_slice(&RAKNET_OFFLINE_MAGIC);
+        incompat.extend_from_slice(&[0xbb; 8]);
+        assert!(is_raknet_offline_packet(&incompat));
+        assert!(!is_quic_long_header_initial(&incompat));
+
+        // RakNet UnconnectedPong (0x1c + 8-byte ts + 8-byte guid + magic at offset 17)
+        let mut pong = vec![0x1cu8];
+        pong.extend_from_slice(&[0u8; 16]);
+        pong.extend_from_slice(&RAKNET_OFFLINE_MAGIC);
+        assert!(is_raknet_offline_packet(&pong));
+        assert!(!is_quic_long_header_initial(&pong));
+
+        // Even if byte 0 starts with 0xc0 (QUIC-like), RakNet offline magic must be rejected.
+        let mut spoofed_offline = open_req1.clone();
+        spoofed_offline[0] = 0xc0;
+        assert!(is_raknet_offline_packet(&spoofed_offline));
+        assert!(!is_quic_long_header_initial(&spoofed_offline));
+
+        // RakNet ACK (0xc0), NACK (0xa0), and connected frames (0x84) — including payloads
+        // whose bytes 1..5 collide with QUIC v1 or greased QUIC version numbers — must be rejected.
+        let raknet_ack = [0xc0, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00];
+        let raknet_ack_v1_collision = [0xc0, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x05];
+        let raknet_nack = [0xa0, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00];
+        let raknet_connected = [
+            0x84, 0x00, 0x00, 0x00, 0x60, 0x00, 0x40, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04,
+        ];
+        // Greased version collision (0x1a2a3a4a) with truncated/non-QUIC tail
+        let raknet_connected_greased = [
+            0x84, 0x1a, 0x2a, 0x3a, 0x4a, 0x04, 0x11, 0x22, 0x33, 0x44, 0x00, 0x00, 0x05, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        assert!(!is_raknet_offline_packet(&raknet_ack));
+        assert!(!is_quic_long_header_initial(&raknet_ack));
+        assert!(!is_quic_long_header_initial(&raknet_ack_v1_collision));
+        assert!(!is_quic_long_header_initial(&raknet_nack));
+        assert!(!is_quic_long_header_initial(&raknet_connected));
+        assert!(!is_quic_long_header_initial(&raknet_connected_greased));
+
+        // QUIC Initial with valid non-zero retry token and coalesced trailing bytes succeeds.
+        let mut with_token = vec![0xc0, 0x00, 0x00, 0x00, 0x01, 0x04, 1, 2, 3, 4, 0x00];
+        with_token.push(0x04); // Token Length = 4
+        with_token.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        with_token.push(24); // Length = 24 (>= 17)
+        with_token.extend_from_slice(&[0x55; 24]);
+        with_token.extend_from_slice(&[0xe0, 0x00, 0x00, 0x00, 0x01]); // Coalesced Handshake
+        assert!(is_quic_long_header_initial(&with_token));
+        assert!(!is_raknet_offline_packet(&with_token));
+
+        // Truncated token, truncated Length payload, and sub-AEAD (< 17 byte) Length must fail.
+        let mut truncated_token = vec![0xc0, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x10];
+        truncated_token.extend_from_slice(&[0xaa; 8]);
+        assert!(!is_quic_long_header_initial(&truncated_token));
+
+        let mut truncated_body = build_quic_long_header(0xc0, 0x0000_0001, &[0x11; 8], &[], 32);
+        truncated_body.pop();
+        assert!(!is_quic_long_header_initial(&truncated_body));
+
+        let too_short_aead = build_quic_long_header(0xc0, 0x0000_0001, &[0x11; 8], &[], 16);
+        assert!(!is_quic_long_header_initial(&too_short_aead));
     }
 }

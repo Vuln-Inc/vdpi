@@ -19,7 +19,6 @@ use crate::server::{bind_listeners, serve_until_shutdown};
 use crate::service::{clear_runtime_state, write_runtime_state_with_meta};
 use anyhow::{bail, Context, Result};
 use std::ffi::c_void;
-use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::ptr;
@@ -79,8 +78,10 @@ const SERVICE_ACCEPT_STOP: Dword = 0x0000_0001;
 const SERVICE_ACCEPT_SHUTDOWN: Dword = 0x0000_0004;
 const SERVICE_ACCEPT_POWEREVENT: Dword = 0x0000_0040;
 const SERVICE_ACCEPT_SESSIONCHANGE: Dword = 0x0000_0080;
+const SERVICE_ACCEPT_PRESHUTDOWN: Dword = 0x0000_0100;
 const SERVICE_ACCEPTED_CONTROLS: Dword = SERVICE_ACCEPT_STOP
     | SERVICE_ACCEPT_SHUTDOWN
+    | SERVICE_ACCEPT_PRESHUTDOWN
     | SERVICE_ACCEPT_POWEREVENT
     | SERVICE_ACCEPT_SESSIONCHANGE;
 
@@ -89,13 +90,22 @@ const SERVICE_CONTROL_INTERROGATE: Dword = 0x0000_0004;
 const SERVICE_CONTROL_SHUTDOWN: Dword = 0x0000_0005;
 const SERVICE_CONTROL_POWEREVENT: Dword = 0x0000_000D;
 const SERVICE_CONTROL_SESSIONCHANGE: Dword = 0x0000_000E;
+const SERVICE_CONTROL_PRESHUTDOWN: Dword = 0x0000_000F;
 
 const PBT_APMRESUMESUSPEND: Dword = 0x0000_0007;
 const PBT_APMRESUMEAUTOMATIC: Dword = 0x0000_0012;
 const DEVICE_NOTIFY_CALLBACK: Dword = 0x0000_0002;
 
+const WTS_CONSOLE_CONNECT: Dword = 0x0000_0001;
+const WTS_REMOTE_CONNECT: Dword = 0x0000_0003;
 const WTS_SESSION_LOGON: Dword = 0x0000_0005;
 const WTS_SESSION_UNLOCK: Dword = 0x0000_0008;
+
+const SERVICE_WAIT_HINT_MS: Dword = 15_000;
+const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(15);
+const SERVICE_START_RUNNING_TIMEOUT: Duration = Duration::from_secs(20);
+const SERVICE_PROCESS_EXIT_WAIT_MS: Dword = 5_000;
+const SYNCHRONIZE: Dword = 0x0010_0000;
 
 const SERVICE_CONFIG_DESCRIPTION: Dword = 1;
 const SERVICE_CONFIG_FAILURE_ACTIONS: Dword = 2;
@@ -223,6 +233,12 @@ struct QueryServiceConfigW {
 extern "system" {
     fn GetLastError() -> Dword;
     fn GetSystemDirectoryW(lp_buffer: *mut u16, u_size: Dword) -> Dword;
+    fn OpenProcess(
+        dw_desired_access: Dword,
+        b_inherit_handle: Bool,
+        dw_process_id: Dword,
+    ) -> *mut c_void;
+    fn ProcessIdToSessionId(dw_process_id: Dword, p_session_id: *mut Dword) -> Bool;
     fn WaitForSingleObject(h_handle: *mut c_void, dw_milliseconds: Dword) -> Dword;
     fn GetExitCodeProcess(h_process: *mut c_void, lp_exit_code: *mut Dword) -> Bool;
     fn CloseHandle(h_object: *mut c_void) -> Bool;
@@ -344,6 +360,14 @@ fn should_deactivate_proxy_on_stop(reason: StopReason) -> bool {
     matches!(reason, StopReason::Stop | StopReason::Shutdown)
 }
 
+fn stop_reason_for_control(control: Dword) -> StopReason {
+    match control {
+        SERVICE_CONTROL_SHUTDOWN | SERVICE_CONTROL_PRESHUTDOWN => StopReason::Shutdown,
+        SERVICE_CONTROL_UPGRADE_STOP => StopReason::Upgrade,
+        _ => StopReason::Stop,
+    }
+}
+
 fn should_fallback_upgrade_control(win32_err: Dword) -> bool {
     win32_err == ERROR_INVALID_SERVICE_CONTROL || win32_err == ERROR_CALL_NOT_IMPLEMENTED
 }
@@ -351,6 +375,16 @@ fn should_fallback_upgrade_control(win32_err: Dword) -> bool {
 const RECONCILE_EVENT_SESSION_LOGON: u32 = 1 << 0;
 const RECONCILE_EVENT_SESSION_UNLOCK: u32 = 1 << 1;
 const RECONCILE_EVENT_POWER_RESUME: u32 = 1 << 2;
+
+fn reconcile_event_for_session_change(event_type: Dword) -> Option<u32> {
+    match event_type {
+        WTS_CONSOLE_CONNECT | WTS_REMOTE_CONNECT | WTS_SESSION_LOGON => {
+            Some(RECONCILE_EVENT_SESSION_LOGON)
+        }
+        WTS_SESSION_UNLOCK => Some(RECONCILE_EVENT_SESSION_UNLOCK),
+        _ => None,
+    }
+}
 
 struct ControlChannels {
     stop_tx: watch::Sender<Option<StopReason>>,
@@ -362,6 +396,25 @@ static SERVICE_CONFIG: OnceLock<Mutex<Option<RuntimeConfig>>> = OnceLock::new();
 static SERVICE_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static CONTROL_CHANNELS: OnceLock<Mutex<Option<ControlChannels>>> = OnceLock::new();
 static SERVICE_STATUS_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static PENDING_CHECKPOINT: AtomicU32 = AtomicU32::new(0);
+
+fn next_pending_checkpoint() -> Dword {
+    PENDING_CHECKPOINT
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1)
+        .max(1)
+}
+
+fn report_pending_status(handle: ServiceStatusHandle, state: Dword) {
+    report_service_status(
+        handle,
+        state,
+        0,
+        NO_ERROR,
+        next_pending_checkpoint(),
+        SERVICE_WAIT_HINT_MS,
+    );
+}
 
 #[derive(Debug, Clone)]
 pub struct WindowsServiceInfo {
@@ -464,14 +517,55 @@ impl Drop for ComStaGuard {
     }
 }
 
+fn is_ci_env_value(val: Option<&std::ffi::OsStr>) -> bool {
+    let Some(raw) = val else {
+        return false;
+    };
+    let lossy = raw.to_string_lossy();
+    let trimmed = lossy.trim();
+    !trimmed.is_empty() && trimmed != "0" && !trimmed.eq_ignore_ascii_case("false")
+}
+
+fn current_process_session_id() -> Option<Dword> {
+    let mut session_id: Dword = 0;
+    // SAFETY: `session_id` is a valid writable `u32` out-parameter for `ProcessIdToSessionId`.
+    let ok = unsafe { ProcessIdToSessionId(std::process::id(), &mut session_id) };
+    (ok != 0).then_some(session_id)
+}
+
+fn should_block_uac_elevation(
+    ci_env: Option<&std::ffi::OsStr>,
+    session_id: Option<Dword>,
+    args: &[String],
+    process_args: &[String],
+) -> bool {
+    if is_ci_env_value(ci_env) {
+        return true;
+    }
+    if session_id == Some(0) {
+        return true;
+    }
+    args.iter().any(|a| a == "--non-interactive")
+        || process_args.iter().any(|a| a == "--non-interactive")
+}
+
 /// Relaunches the current `vdpi.exe` with explicit CLI arguments under UAC elevation (`runas`)
 /// and waits for the elevated process to finish.
 pub fn relaunch_elevated_and_wait(args: &[String]) -> Result<()> {
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+    let process_args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    if should_block_uac_elevation(
+        std::env::var_os("CI").as_deref(),
+        current_process_session_id(),
+        args,
+        &process_args,
+    ) {
         bail!(
             "Administrator privileges are required, and UAC elevation cannot be prompted in a \
-             non-interactive or piped session (e.g. CI/SSH). Re-run from an elevated \
-             Administrator terminal."
+             non-interactive or headless session (CI, Session 0, or --non-interactive). \
+             Re-run from an elevated Administrator terminal."
         );
     }
 
@@ -615,8 +709,9 @@ unsafe extern "system" fn service_main(_argc: Dword, _argv: *mut *mut u16) {
         return;
     }
     SERVICE_STATUS_HANDLE.store(handle, Ordering::SeqCst);
+    PENDING_CHECKPOINT.store(0, Ordering::SeqCst);
 
-    report_service_status(handle, SERVICE_START_PENDING, 0, NO_ERROR, 1, 5000);
+    report_pending_status(handle, SERVICE_START_PENDING);
 
     let cfg = SERVICE_CONFIG
         .get()
@@ -633,12 +728,14 @@ unsafe extern "system" fn service_main(_argc: Dword, _argv: *mut *mut u16) {
 
     match run_result {
         Ok(()) => {
+            crate::logging::flush_global_service_log();
             report_service_status(handle, SERVICE_STOPPED, 0, NO_ERROR, 0, 0);
         }
         Err(err) => {
             error!(error = %err, "vdpi Windows service terminated with error");
             let lock = SERVICE_ERROR.get_or_init(|| Mutex::new(None));
             *lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(err.to_string());
+            crate::logging::flush_global_service_log();
             report_service_status(handle, SERVICE_STOPPED, 0, 1, 0, 0);
         }
     }
@@ -933,6 +1030,7 @@ impl TunSupervisor {
             .await
         {
             Ok(()) => {
+                let _ = tokio::task::spawn_blocking(flush_dns_resolver_cache).await;
                 if self.offline_standby_logged {
                     info!("physical network uplink restored; Windows TUN session is active");
                     self.offline_standby_logged = false;
@@ -999,7 +1097,7 @@ impl TunSupervisor {
 }
 
 const SERVICE_MAX_BLOCKING_THREADS: usize = 16;
-const TUN_RECONCILE_ACTIVE_INTERVAL: Duration = Duration::from_secs(3);
+const TUN_RECONCILE_ACTIVE_INTERVAL: Duration = Duration::from_secs(10);
 const TUN_RECONCILE_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
 const PROXY_VPN_POLL_ACTIVE_INTERVAL: Duration = Duration::from_secs(3);
 const PROXY_VPN_POLL_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
@@ -1166,9 +1264,10 @@ async fn run_tun_service_runtime(
     let mut slot = TunSlot::empty();
     let mut last_start_attempt = None;
     let mut offline_standby_logged = false;
+    report_pending_status(handle, SERVICE_START_PENDING);
     if !vpn_guard.is_yielded() {
         last_start_attempt = Some(Instant::now());
-        if let Err(err) = slot
+        match slot
             .start(
                 &binder,
                 cfg.tun_ipv6,
@@ -1179,16 +1278,21 @@ async fn run_tun_service_runtime(
             )
             .await
         {
-            slot.stop().await;
-            if is_transient_offline_tun_error(&err) {
-                let _ = tokio::task::spawn_blocking(cleanup_orphan_wintun_adapter).await;
-                warn!(
-                    error = %err,
-                    "no active physical network uplink at startup; holding Windows TUN in standby and polling for connectivity"
-                );
-                offline_standby_logged = true;
-            } else {
-                return Ok(TunRunOutcome::FallbackToProxy(err));
+            Ok(()) => {
+                let _ = tokio::task::spawn_blocking(flush_dns_resolver_cache).await;
+            }
+            Err(err) => {
+                slot.stop().await;
+                if is_transient_offline_tun_error(&err) {
+                    let _ = tokio::task::spawn_blocking(cleanup_orphan_wintun_adapter).await;
+                    warn!(
+                        error = %err,
+                        "no active physical network uplink at startup; holding Windows TUN in standby and polling for connectivity"
+                    );
+                    offline_standby_logged = true;
+                } else {
+                    return Ok(TunRunOutcome::FallbackToProxy(err));
+                }
             }
         }
     } else {
@@ -1196,6 +1300,8 @@ async fn run_tun_service_runtime(
         // blackhole traffic while TUN is held in VPN standby.
         let _ = tokio::task::spawn_blocking(cleanup_orphan_wintun_adapter).await;
     }
+
+    report_pending_status(handle, SERVICE_START_PENDING);
 
     // Clear any leftover WinINET/WinHTTP/user-env proxy settings once when running in TUN mode.
     let _ = tokio::task::spawn_blocking(clear_all_windows_proxies).await;
@@ -1375,16 +1481,30 @@ async fn run_tun_service_runtime(
         ?reason,
         "stopping Windows TUN service and tearing down adapter"
     );
-    report_service_status(handle, SERVICE_STOP_PENDING, 0, NO_ERROR, 2, 5000);
+    report_pending_status(handle, SERVICE_STOP_PENDING);
     let _ = health_shutdown_tx.send(true);
     clear_runtime_state(std::process::id());
     // Always tear down WindowsTunSession cleanly on Stop, Shutdown, and Upgrade.
+    let had_session = slot.session.is_some();
     slot.stop().await;
+    if !had_session {
+        let _ = tokio::task::spawn_blocking(cleanup_orphan_wintun_adapter).await;
+    }
+    let _ = tokio::task::spawn_blocking(flush_dns_resolver_cache).await;
+    report_pending_status(handle, SERVICE_STOP_PENDING);
     sync_tun_telemetry(&supervisor.ctx, &supervisor.tun_stats);
     if let Err(err) = supervisor.ctx.flush_persisted_cache().await {
         warn!(error = %err, "failed to flush adaptive cache on Windows TUN service shutdown");
     }
-    let _ = tokio::time::timeout(Duration::from_secs(2), health_task).await;
+    let mut health_task = health_task;
+    if tokio::time::timeout(Duration::from_secs(2), &mut health_task)
+        .await
+        .is_err()
+    {
+        warn!("timed out waiting for Windows TUN health listener to stop; aborting");
+        health_task.abort();
+        let _ = tokio::time::timeout(Duration::from_millis(250), health_task).await;
+    }
 
     Ok(TunRunOutcome::Stopped)
 }
@@ -1396,6 +1516,7 @@ async fn run_proxy_service_runtime(
     mut reconcile_rx: watch::Receiver<u64>,
     reconcile_events: Arc<AtomicU32>,
 ) -> Result<()> {
+    report_pending_status(handle, SERVICE_START_PENDING);
     // Clean up any orphaned vdpi0 Wintun adapter left behind by a prior TUN run or crash
     // (covers direct Proxy mode startup, missing wintun.dll fallback, and TUN init fallback).
     let _ = tokio::task::spawn_blocking(cleanup_orphan_wintun_adapter).await;
@@ -1406,6 +1527,19 @@ async fn run_proxy_service_runtime(
 
     let primary_addr = bound.primary_addr;
     let socks_addr = bound.socks_addr;
+
+    // Spawn the proxy/PAC/health HTTP server IMMEDIATELY after binding listeners and BEFORE
+    // activating WinINET/PAC or reporting SERVICE_RUNNING so browsers fetching /vdpi.pac or
+    // /vdpi-health never race against an unserved socket.
+    let (server_shutdown_tx, server_shutdown_rx) = watch::channel(false);
+    let shutdown_ctx = ctx.clone();
+    let server_task = tokio::spawn(serve_until_shutdown(
+        bound,
+        ctx.clone(),
+        server_shutdown_rx.clone(),
+    ));
+
+    report_pending_status(handle, SERVICE_START_PENDING);
 
     let mut vpn_guard = VpnGuard::new(cfg.vpn_coexistence);
     let mut last_warned_provider: Option<String> = None;
@@ -1453,17 +1587,28 @@ async fn run_proxy_service_runtime(
             .await;
             Some(standby)
         } else {
-            Some(
-                WindowsProxySession::activate(
-                    primary_addr.ip(),
-                    primary_addr.port(),
-                    socks_addr.map(|a| a.port()),
-                    cfg.socks_system_proxy,
-                    cfg.env_proxy,
-                    &cfg.bypass_domains,
-                )?
-                .with_vpn_coexistence(cfg.vpn_coexistence),
-            )
+            match WindowsProxySession::activate(
+                primary_addr.ip(),
+                primary_addr.port(),
+                socks_addr.map(|a| a.port()),
+                cfg.socks_system_proxy,
+                cfg.env_proxy,
+                &cfg.bypass_domains,
+            ) {
+                Ok(session) => Some(session.with_vpn_coexistence(cfg.vpn_coexistence)),
+                Err(err) => {
+                    let _ = server_shutdown_tx.send(true);
+                    let mut server_task = server_task;
+                    if tokio::time::timeout(Duration::from_secs(2), &mut server_task)
+                        .await
+                        .is_err()
+                    {
+                        server_task.abort();
+                        let _ = tokio::time::timeout(Duration::from_millis(250), server_task).await;
+                    }
+                    return Err(err);
+                }
+            }
         }
     } else {
         None
@@ -1494,15 +1639,16 @@ async fn run_proxy_service_runtime(
         "vdpi Windows service is running"
     );
 
-    let (server_shutdown_tx, server_shutdown_rx) = watch::channel(false);
-
     let watchdog_session = proxy_session.clone();
     let watchdog_ctx = ctx.clone();
-    let mut watchdog_shutdown = server_shutdown_rx.clone();
+    let mut watchdog_shutdown = server_shutdown_rx;
     let watchdog = tokio::spawn(async move {
         let mut reconcile_open = true;
         let mut last_proxy_reconcile = Instant::now();
         loop {
+            if *watchdog_shutdown.borrow() {
+                break;
+            }
             let poll_interval = proxy_vpn_poll_interval(vpn_guard.is_yielded());
             let mut forced_reconcile = false;
             let mut power_or_unlock = false;
@@ -1540,9 +1686,16 @@ async fn run_proxy_service_runtime(
                 } => {}
             }
 
+            if *watchdog_shutdown.borrow() {
+                break;
+            }
+
             let Some(ref session) = watchdog_session else {
                 if power_or_unlock {
                     watchdog_ctx.dns.clear_cache().await;
+                    if *watchdog_shutdown.borrow() {
+                        break;
+                    }
                     let _ = tokio::task::spawn_blocking(flush_dns_resolver_cache).await;
                 }
                 continue;
@@ -1554,11 +1707,20 @@ async fn run_proxy_service_runtime(
 
             if vpn_guard.policy() == VpnCoexistence::Off {
                 if forced_reconcile || last_proxy_reconcile.elapsed() >= PROXY_RECONCILE_INTERVAL {
+                    if *watchdog_shutdown.borrow() {
+                        break;
+                    }
                     let s = session.clone();
-                    let _ = tokio::task::spawn_blocking(move || s.reconcile()).await;
+                    let shutdown_flag = watchdog_shutdown.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if !*shutdown_flag.borrow() {
+                            s.reconcile();
+                        }
+                    })
+                    .await;
                     last_proxy_reconcile = Instant::now();
                 }
-                if power_or_unlock {
+                if power_or_unlock && !*watchdog_shutdown.borrow() {
                     let _ = tokio::task::spawn_blocking(flush_dns_resolver_cache).await;
                 }
                 continue;
@@ -1567,6 +1729,9 @@ async fn run_proxy_service_runtime(
             let scope = tokio::task::spawn_blocking(|| detect_active_vpn(None))
                 .await
                 .unwrap_or(VpnScope::None);
+            if *watchdog_shutdown.borrow() {
+                break;
+            }
             let mut dns_flushed = false;
             match vpn_guard.evaluate(&scope, Instant::now()) {
                 GuardAction::YieldTun { provider } => {
@@ -1575,8 +1740,20 @@ async fn run_proxy_service_runtime(
                         provider = %provider,
                         "full-tunnel VPN detected; yielding Windows system proxy"
                     );
+                    if *watchdog_shutdown.borrow() {
+                        break;
+                    }
                     let s = session.clone();
-                    let _ = tokio::task::spawn_blocking(move || s.yield_for_vpn()).await;
+                    let shutdown_flag = watchdog_shutdown.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if !*shutdown_flag.borrow() {
+                            s.yield_for_vpn();
+                        }
+                    })
+                    .await;
+                    if *watchdog_shutdown.borrow() {
+                        break;
+                    }
                     watchdog_ctx.dns.clear_cache().await;
                     let _ = tokio::task::spawn_blocking(flush_dns_resolver_cache).await;
                     dns_flushed = true;
@@ -1587,10 +1764,16 @@ async fn run_proxy_service_runtime(
                         "full-tunnel VPN cleared after cooldown; restoring Windows system proxy"
                     );
                     watchdog_ctx.dns.clear_cache().await;
+                    if *watchdog_shutdown.borrow() {
+                        break;
+                    }
                     let s = session.clone();
+                    let shutdown_flag = watchdog_shutdown.clone();
                     let _ = tokio::task::spawn_blocking(move || {
-                        s.reconcile();
-                        flush_dns_resolver_cache();
+                        if !*shutdown_flag.borrow() {
+                            s.reconcile();
+                            flush_dns_resolver_cache();
+                        }
                     })
                     .await;
                     last_proxy_reconcile = Instant::now();
@@ -1607,8 +1790,17 @@ async fn run_proxy_service_runtime(
                     if forced_reconcile
                         || last_proxy_reconcile.elapsed() >= PROXY_RECONCILE_INTERVAL
                     {
+                        if *watchdog_shutdown.borrow() {
+                            break;
+                        }
                         let s = session.clone();
-                        let _ = tokio::task::spawn_blocking(move || s.reconcile()).await;
+                        let shutdown_flag = watchdog_shutdown.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            if !*shutdown_flag.borrow() {
+                                s.reconcile();
+                            }
+                        })
+                        .await;
                         last_proxy_reconcile = Instant::now();
                     }
                 }
@@ -1620,13 +1812,19 @@ async fn run_proxy_service_runtime(
                         vpn_guard.is_yielded(),
                         forced_reconcile,
                     ) {
+                        if *watchdog_shutdown.borrow() {
+                            break;
+                        }
                         // A forced reconcile (e.g. WTS_SESSION_LOGON after boot-before-logon)
                         // may have just loaded an interactive user hive that still holds a
                         // stale shutdown AutoConfigURL; re-yield and flush DNS immediately.
                         let s = session.clone();
+                        let shutdown_flag = watchdog_shutdown.clone();
                         let _ = tokio::task::spawn_blocking(move || {
-                            s.yield_for_vpn();
-                            flush_dns_resolver_cache();
+                            if !*shutdown_flag.borrow() {
+                                s.yield_for_vpn();
+                                flush_dns_resolver_cache();
+                            }
                         })
                         .await;
                         dns_flushed = true;
@@ -1634,20 +1832,26 @@ async fn run_proxy_service_runtime(
                         && (forced_reconcile
                             || last_proxy_reconcile.elapsed() >= PROXY_RECONCILE_INTERVAL)
                     {
+                        if *watchdog_shutdown.borrow() {
+                            break;
+                        }
                         let s = session.clone();
-                        let _ = tokio::task::spawn_blocking(move || s.reconcile()).await;
+                        let shutdown_flag = watchdog_shutdown.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            if !*shutdown_flag.borrow() {
+                                s.reconcile();
+                            }
+                        })
+                        .await;
                         last_proxy_reconcile = Instant::now();
                     }
                 }
             }
-            if power_or_unlock && !dns_flushed {
+            if power_or_unlock && !dns_flushed && !*watchdog_shutdown.borrow() {
                 let _ = tokio::task::spawn_blocking(flush_dns_resolver_cache).await;
             }
         }
     });
-
-    let shutdown_ctx = ctx.clone();
-    let server_task = tokio::spawn(serve_until_shutdown(bound, ctx, server_shutdown_rx));
 
     let reason = loop {
         if let Some(r) = *stop_rx.borrow() {
@@ -1658,10 +1862,19 @@ async fn run_proxy_service_runtime(
         }
     };
 
-    report_service_status(handle, SERVICE_STOP_PENDING, 0, NO_ERROR, 2, 5000);
+    report_pending_status(handle, SERVICE_STOP_PENDING);
     let _ = server_shutdown_tx.send(true);
-    let _ = watchdog.await;
+    let mut watchdog = watchdog;
+    if tokio::time::timeout(Duration::from_millis(750), &mut watchdog)
+        .await
+        .is_err()
+    {
+        warn!("timed out waiting for Windows proxy watchdog to stop; aborting");
+        watchdog.abort();
+        let _ = tokio::time::timeout(Duration::from_millis(100), watchdog).await;
+    }
     clear_runtime_state(std::process::id());
+    report_pending_status(handle, SERVICE_STOP_PENDING);
 
     if should_deactivate_proxy_on_stop(reason) {
         if let Some(session) = proxy_session {
@@ -1678,7 +1891,16 @@ async fn run_proxy_service_runtime(
         );
     }
 
-    let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
+    report_pending_status(handle, SERVICE_STOP_PENDING);
+    let mut server_task = server_task;
+    if tokio::time::timeout(Duration::from_secs(2), &mut server_task)
+        .await
+        .is_err()
+    {
+        warn!("timed out waiting for Windows proxy server task to stop; aborting");
+        server_task.abort();
+        let _ = tokio::time::timeout(Duration::from_millis(250), server_task).await;
+    }
     if let Err(err) = shutdown_ctx.flush_persisted_cache().await {
         warn!(error = %err, "failed to flush adaptive cache on Windows proxy service shutdown");
     }
@@ -1843,16 +2065,15 @@ unsafe extern "system" fn service_control_handler(
     _context: *mut c_void,
 ) -> Dword {
     match control {
-        SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN | SERVICE_CONTROL_UPGRADE_STOP => {
+        SERVICE_CONTROL_STOP
+        | SERVICE_CONTROL_SHUTDOWN
+        | SERVICE_CONTROL_PRESHUTDOWN
+        | SERVICE_CONTROL_UPGRADE_STOP => {
             let handle = SERVICE_STATUS_HANDLE.load(Ordering::SeqCst);
             if !handle.is_null() {
-                report_service_status(handle, SERVICE_STOP_PENDING, 0, NO_ERROR, 1, 5000);
+                report_pending_status(handle, SERVICE_STOP_PENDING);
             }
-            let reason = match control {
-                SERVICE_CONTROL_SHUTDOWN => StopReason::Shutdown,
-                SERVICE_CONTROL_UPGRADE_STOP => StopReason::Upgrade,
-                _ => StopReason::Stop,
-            };
+            let reason = stop_reason_for_control(control);
             if let Some(lock) = CONTROL_CHANNELS.get() {
                 if let Some(ref ch) = *lock.lock().unwrap_or_else(|e| e.into_inner()) {
                     let _ = ch.stop_tx.send(Some(reason));
@@ -1861,10 +2082,8 @@ unsafe extern "system" fn service_control_handler(
             NO_ERROR
         }
         SERVICE_CONTROL_SESSIONCHANGE => {
-            if event_type == WTS_SESSION_LOGON {
-                trigger_reconcile(RECONCILE_EVENT_SESSION_LOGON);
-            } else if event_type == WTS_SESSION_UNLOCK {
-                trigger_reconcile(RECONCILE_EVENT_SESSION_UNLOCK);
+            if let Some(bits) = reconcile_event_for_session_change(event_type) {
+                trigger_reconcile(bits);
             }
             NO_ERROR
         }
@@ -1999,22 +2218,29 @@ pub fn start_windows_service() -> Result<bool> {
         return Ok(true);
     }
     if current.dw_current_state == SERVICE_START_PENDING {
-        wait_for_service_running(svc.0, Duration::from_secs(10))?;
+        wait_for_service_running(svc.0, SERVICE_START_RUNNING_TIMEOUT)?;
         return Ok(true);
     }
     if current.dw_current_state == SERVICE_STOP_PENDING {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut observed_pid = current.dw_process_id;
+        let deadline = Instant::now() + SERVICE_STOP_TIMEOUT;
         while Instant::now() < deadline {
             thread::sleep(Duration::from_millis(100));
-            let state = query_service_status_process(svc.0)?.dw_current_state;
-            if state == SERVICE_RUNNING {
+            let ssp = query_service_status_process(svc.0)?;
+            if ssp.dw_process_id != 0 {
+                observed_pid = ssp.dw_process_id;
+            }
+            if ssp.dw_current_state == SERVICE_RUNNING {
                 return Ok(true);
             }
-            if state == SERVICE_START_PENDING {
-                wait_for_service_running(svc.0, Duration::from_secs(10))?;
+            if ssp.dw_current_state == SERVICE_START_PENDING {
+                wait_for_service_running(svc.0, SERVICE_START_RUNNING_TIMEOUT)?;
                 return Ok(true);
             }
-            if state != SERVICE_STOP_PENDING {
+            if ssp.dw_current_state != SERVICE_STOP_PENDING {
+                if ssp.dw_current_state == SERVICE_STOPPED {
+                    wait_for_process_exit(observed_pid, SERVICE_PROCESS_EXIT_WAIT_MS);
+                }
                 break;
             }
         }
@@ -2028,7 +2254,7 @@ pub fn start_windows_service() -> Result<bool> {
         }
     }
 
-    wait_for_service_running(svc.0, Duration::from_secs(10))?;
+    wait_for_service_running(svc.0, SERVICE_START_RUNNING_TIMEOUT)?;
     Ok(true)
 }
 
@@ -2108,7 +2334,7 @@ pub(crate) fn install_or_update_windows_service_with_start(
             }
         }
 
-        wait_for_service_running(svc.0, Duration::from_secs(10))?;
+        wait_for_service_running(svc.0, SERVICE_START_RUNNING_TIMEOUT)?;
     }
     Ok(())
 }
@@ -2345,18 +2571,39 @@ fn zero_service_status() -> ServiceStatus {
     }
 }
 
+fn wait_for_process_exit(pid: Dword, timeout_ms: Dword) {
+    if pid == 0 {
+        return;
+    }
+    // SAFETY: `OpenProcess(SYNCHRONIZE, ...)` returns either NULL (already exited or
+    // inaccessible) or a valid kernel handle that is closed unconditionally below.
+    let proc_handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+    if proc_handle.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = WaitForSingleObject(proc_handle, timeout_ms);
+        let _ = CloseHandle(proc_handle);
+    }
+}
+
 fn stop_service_handle(svc: ScHandle) -> Result<()> {
     stop_service_handle_with_mode(svc, false)
 }
 
 fn stop_service_handle_with_mode(svc: ScHandle, prefer_upgrade_control: bool) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + SERVICE_STOP_TIMEOUT;
     let mut stop_sent = false;
     let mut use_upgrade_control = prefer_upgrade_control;
+    let mut observed_pid: Dword = 0;
 
     loop {
         let ssp = query_service_status_process(svc)?;
+        if ssp.dw_process_id != 0 {
+            observed_pid = ssp.dw_process_id;
+        }
         if ssp.dw_current_state == SERVICE_STOPPED {
+            wait_for_process_exit(observed_pid, SERVICE_PROCESS_EXIT_WAIT_MS);
             return Ok(());
         }
 
@@ -2369,12 +2616,14 @@ fn stop_service_handle_with_mode(svc: ScHandle, prefer_upgrade_control: bool) ->
                 let ok = unsafe { ControlService(svc, SERVICE_CONTROL_UPGRADE_STOP, &mut status) };
                 if ok != 0 {
                     if status.dw_current_state == SERVICE_STOPPED {
+                        wait_for_process_exit(observed_pid, SERVICE_PROCESS_EXIT_WAIT_MS);
                         return Ok(());
                     }
                     stop_sent = true;
                 } else {
                     let err = unsafe { GetLastError() };
                     if err == ERROR_SERVICE_NOT_ACTIVE {
+                        wait_for_process_exit(observed_pid, SERVICE_PROCESS_EXIT_WAIT_MS);
                         return Ok(());
                     }
                     if should_fallback_upgrade_control(err) {
@@ -2390,12 +2639,14 @@ fn stop_service_handle_with_mode(svc: ScHandle, prefer_upgrade_control: bool) ->
                 let ok = unsafe { ControlService(svc, SERVICE_CONTROL_STOP, &mut status) };
                 if ok != 0 {
                     if status.dw_current_state == SERVICE_STOPPED {
+                        wait_for_process_exit(observed_pid, SERVICE_PROCESS_EXIT_WAIT_MS);
                         return Ok(());
                     }
                     stop_sent = true;
                 } else {
                     let err = unsafe { GetLastError() };
                     if err == ERROR_SERVICE_NOT_ACTIVE {
+                        wait_for_process_exit(observed_pid, SERVICE_PROCESS_EXIT_WAIT_MS);
                         return Ok(());
                     }
                     if err != ERROR_SERVICE_CANNOT_ACCEPT_CTRL {
@@ -2537,13 +2788,56 @@ mod tests {
     fn service_control_constants_and_dependencies_match_win32_spec() {
         assert_eq!(SERVICE_CONTROL_UPGRADE_STOP, 128);
         assert_eq!(SERVICE_CONTROL_POWEREVENT, 0x0000_000D);
+        assert_eq!(SERVICE_CONTROL_PRESHUTDOWN, 0x0000_000F);
         assert_eq!(SERVICE_ACCEPT_POWEREVENT, 0x0000_0040);
+        assert_eq!(SERVICE_ACCEPT_PRESHUTDOWN, 0x0000_0100);
         assert_eq!(PBT_APMRESUMESUSPEND, 0x0007);
         assert_eq!(PBT_APMRESUMEAUTOMATIC, 0x0012);
+        assert_eq!(WTS_CONSOLE_CONNECT, 0x0001);
+        assert_eq!(WTS_REMOTE_CONNECT, 0x0003);
+        assert_eq!(WTS_SESSION_LOGON, 0x0005);
+        assert_eq!(WTS_SESSION_UNLOCK, 0x0008);
+        assert_eq!(SERVICE_WAIT_HINT_MS, 15_000);
+        assert_eq!(SERVICE_START_RUNNING_TIMEOUT, Duration::from_secs(20));
+        assert_eq!(SERVICE_PROCESS_EXIT_WAIT_MS, 5_000);
+        assert_eq!(SYNCHRONIZE, 0x0010_0000);
         assert_ne!(SERVICE_ACCEPTED_CONTROLS & SERVICE_ACCEPT_STOP, 0);
         assert_ne!(SERVICE_ACCEPTED_CONTROLS & SERVICE_ACCEPT_SHUTDOWN, 0);
+        assert_ne!(SERVICE_ACCEPTED_CONTROLS & SERVICE_ACCEPT_PRESHUTDOWN, 0);
         assert_ne!(SERVICE_ACCEPTED_CONTROLS & SERVICE_ACCEPT_SESSIONCHANGE, 0);
         assert_ne!(SERVICE_ACCEPTED_CONTROLS & SERVICE_ACCEPT_POWEREVENT, 0);
+
+        assert_eq!(
+            stop_reason_for_control(SERVICE_CONTROL_PRESHUTDOWN),
+            StopReason::Shutdown
+        );
+        assert_eq!(
+            stop_reason_for_control(SERVICE_CONTROL_SHUTDOWN),
+            StopReason::Shutdown
+        );
+        assert_eq!(
+            stop_reason_for_control(SERVICE_CONTROL_UPGRADE_STOP),
+            StopReason::Upgrade
+        );
+        assert_eq!(stop_reason_for_control(SERVICE_CONTROL_STOP), StopReason::Stop);
+
+        assert_eq!(
+            reconcile_event_for_session_change(WTS_CONSOLE_CONNECT),
+            Some(RECONCILE_EVENT_SESSION_LOGON)
+        );
+        assert_eq!(
+            reconcile_event_for_session_change(WTS_REMOTE_CONNECT),
+            Some(RECONCILE_EVENT_SESSION_LOGON)
+        );
+        assert_eq!(
+            reconcile_event_for_session_change(WTS_SESSION_LOGON),
+            Some(RECONCILE_EVENT_SESSION_LOGON)
+        );
+        assert_eq!(
+            reconcile_event_for_session_change(WTS_SESSION_UNLOCK),
+            Some(RECONCILE_EVENT_SESSION_UNLOCK)
+        );
+        assert_eq!(reconcile_event_for_session_change(0x99), None);
 
         assert_eq!(SERVICE_DEPENDENCIES, "Tcpip\0Nsi\0Dnscache\0\0");
         let deps_wide: Vec<u16> = SERVICE_DEPENDENCIES.encode_utf16().collect();
@@ -2587,7 +2881,7 @@ mod tests {
         assert!((2..=4).contains(&workers));
         assert_eq!(SERVICE_MAX_BLOCKING_THREADS, 16);
 
-        assert_eq!(tun_reconcile_interval(true, false), Duration::from_secs(3));
+        assert_eq!(tun_reconcile_interval(true, false), Duration::from_secs(10));
         assert_eq!(tun_reconcile_interval(true, true), Duration::from_secs(1));
         assert_eq!(tun_reconcile_interval(false, false), Duration::from_secs(1));
         assert_eq!(tun_reconcile_interval(false, true), Duration::from_secs(1));
@@ -2871,5 +3165,67 @@ mod tests {
                 .join("vdpi")
                 .join("adaptive-cache.json")
         );
+    }
+
+    #[test]
+    fn uac_elevation_blocks_only_ci_session0_or_non_interactive() {
+        use std::ffi::OsStr;
+
+        // Interactive desktop session (including Git Bash / Mintty named-pipe PTYs): allowed.
+        assert!(!should_block_uac_elevation(
+            None,
+            Some(1),
+            &["install".to_string()],
+            &["install".to_string()],
+        ));
+        assert!(!should_block_uac_elevation(
+            Some(OsStr::new("false")),
+            Some(2),
+            &[],
+            &[],
+        ));
+        assert!(!should_block_uac_elevation(
+            Some(OsStr::new("0")),
+            Some(1),
+            &[],
+            &[],
+        ));
+        assert!(!should_block_uac_elevation(
+            Some(OsStr::new("   ")),
+            Some(1),
+            &[],
+            &[],
+        ));
+
+        // CI env var blocks UAC.
+        assert!(should_block_uac_elevation(
+            Some(OsStr::new("true")),
+            Some(1),
+            &[],
+            &[],
+        ));
+        assert!(should_block_uac_elevation(
+            Some(OsStr::new("1")),
+            Some(1),
+            &[],
+            &[],
+        ));
+
+        // Session 0 (headless service/scheduled task) blocks UAC.
+        assert!(should_block_uac_elevation(None, Some(0), &[], &[]));
+
+        // Explicit --non-interactive in either relaunch args or parent process args blocks UAC.
+        assert!(should_block_uac_elevation(
+            None,
+            Some(1),
+            &["update".to_string(), "--non-interactive".to_string()],
+            &[],
+        ));
+        assert!(should_block_uac_elevation(
+            None,
+            Some(1),
+            &["install".to_string()],
+            &["--non-interactive".to_string(), "install".to_string()],
+        ));
     }
 }

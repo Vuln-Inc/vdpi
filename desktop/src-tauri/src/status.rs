@@ -1,11 +1,14 @@
+use std::collections::HashMap;
 #[cfg(any(target_os = "windows", test))]
 use std::ffi::OsStr;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 #[cfg(any(target_os = "windows", test))]
 use std::path::Component;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use tracing::warn;
 use vdpi::config_file::{self, FileConfig};
@@ -21,8 +24,8 @@ use crate::models::{
     LiveTelemetryDto, ServiceStateDto, WintunStatusDto,
 };
 use crate::state::{
-    engine_mode_to_dto, service_state_to_dto, split_tunnel_mode_to_dto, vpn_coexistence_to_dto,
-    BinaryFileMetadata, DesktopAppState, StaticProbeEntry,
+    engine_mode_from_dto, engine_mode_to_dto, service_state_to_dto, split_tunnel_mode_to_dto,
+    vpn_coexistence_to_dto, BinaryFileMetadata, DesktopAppState, StaticProbeEntry,
 };
 
 #[cfg(any(target_os = "windows", test))]
@@ -42,6 +45,11 @@ pub(crate) enum WintunPreflightResult {
 }
 
 const LIVE_PROBE_BUDGET: Duration = Duration::from_millis(500);
+const PROBE_CONNECT_CAP: Duration = Duration::from_millis(200);
+const MAX_HEALTH_RESPONSE_BYTES: usize = 8 * 1024;
+const TUN_HEALTH_FALLBACK_PORTS: [u16; 4] = [DEFAULT_TUN_HEALTH_PORT, 18090, 18091, 28089];
+const VERSION_PROBE_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(300);
+const PRESENCE_FLIP_REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
 
 /// Returns the normalized desktop platform tag (`"windows"`, `"macos"`, or `"linux"`).
 pub fn current_platform() -> &'static str {
@@ -124,39 +132,27 @@ fn probe_wintun_status_cached(
     {
         match vdpi::platform::windows_tun::expected_wintun_dll_sha256() {
             Ok(expected_sha256) => {
-                if service_state != ServiceState::NotInstalled {
-                    let (primaries, candidates) = collect_windows_service_wintun_candidates();
-                    evaluate_wintun_candidates_cached_with_primaries(
-                        state,
-                        configured_engine,
-                        &primaries,
-                        &candidates,
-                        true,
-                        |path| {
-                            vdpi::platform::windows_tun::verify_wintun_dll_sha256(
-                                path,
-                                expected_sha256,
-                            )
-                            .is_ok()
-                        },
-                    )
+                let service_installed = service_state != ServiceState::NotInstalled;
+                let (service_primaries, service_candidates) = if service_installed {
+                    collect_windows_service_wintun_candidates()
                 } else {
-                    let (primaries, candidates) = collect_windows_bundle_wintun_candidates();
-                    evaluate_wintun_candidates_cached_with_primaries(
-                        state,
-                        configured_engine,
-                        &primaries,
-                        &candidates,
-                        false,
-                        |path| {
-                            vdpi::platform::windows_tun::verify_wintun_dll_sha256(
-                                path,
-                                expected_sha256,
-                            )
-                            .is_ok()
-                        },
-                    )
-                }
+                    (Vec::new(), Vec::new())
+                };
+                evaluate_windows_wintun_status_cached_with(
+                    state,
+                    configured_engine,
+                    service_installed,
+                    &service_primaries,
+                    &service_candidates,
+                    collect_windows_bundle_wintun_candidates,
+                    |path| {
+                        vdpi::platform::windows_tun::verify_wintun_dll_sha256(
+                            path,
+                            expected_sha256,
+                        )
+                        .is_ok()
+                    },
+                )
             }
             Err(_) => WintunStatusDto {
                 required: configured_engine == EngineMode::Tun,
@@ -320,20 +316,30 @@ fn resolve_windows_program_data_dir_from(
 
 #[cfg(target_os = "windows")]
 fn trusted_windows_program_files_dir() -> PathBuf {
-    use windows_sys::Win32::UI::Shell::FOLDERID_ProgramFiles;
-    resolve_windows_program_files_dir_from(
-        query_windows_known_folder(&FOLDERID_ProgramFiles),
-        std::env::var_os("SystemDrive").as_deref(),
-    )
+    static CACHED: OnceLock<PathBuf> = OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            use windows_sys::Win32::UI::Shell::FOLDERID_ProgramFiles;
+            resolve_windows_program_files_dir_from(
+                query_windows_known_folder(&FOLDERID_ProgramFiles),
+                std::env::var_os("SystemDrive").as_deref(),
+            )
+        })
+        .clone()
 }
 
 #[cfg(target_os = "windows")]
 fn trusted_windows_program_data_dir() -> PathBuf {
-    use windows_sys::Win32::UI::Shell::FOLDERID_ProgramData;
-    resolve_windows_program_data_dir_from(
-        query_windows_known_folder(&FOLDERID_ProgramData),
-        std::env::var_os("SystemDrive").as_deref(),
-    )
+    static CACHED: OnceLock<PathBuf> = OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            use windows_sys::Win32::UI::Shell::FOLDERID_ProgramData;
+            resolve_windows_program_data_dir_from(
+                query_windows_known_folder(&FOLDERID_ProgramData),
+                std::env::var_os("SystemDrive").as_deref(),
+            )
+        })
+        .clone()
 }
 
 #[cfg(target_os = "windows")]
@@ -622,11 +628,11 @@ fn evaluate_wintun_candidates_with_sha256(
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn evaluate_wintun_candidates_cached_with_primaries<FVerify>(
+fn evaluate_wintun_existing_cached_with_primaries<FVerify>(
     state: &DesktopAppState,
     configured_engine: EngineMode,
     primary_paths: &[PathBuf],
-    candidates: &[PathBuf],
+    existing_files: Vec<BinaryFileMetadata>,
     strict_primary: bool,
     verify_sha256: FVerify,
 ) -> WintunStatusDto
@@ -634,7 +640,6 @@ where
     FVerify: Fn(&Path) -> bool,
 {
     let required = configured_engine == EngineMode::Tun;
-    let existing_files = snapshot_existing_wintun_metadata(candidates);
 
     if let Some(cached) =
         state.cached_wintun_status_with_mode(&existing_files, required, strict_primary)
@@ -646,6 +651,80 @@ where
     let result = wintun_outcome_to_status_dto(required, outcome);
     state.set_cached_wintun_status_with_mode(existing_files, result.clone(), strict_primary);
     result
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn evaluate_wintun_candidates_cached_with_primaries<FVerify>(
+    state: &DesktopAppState,
+    configured_engine: EngineMode,
+    primary_paths: &[PathBuf],
+    candidates: &[PathBuf],
+    strict_primary: bool,
+    verify_sha256: FVerify,
+) -> WintunStatusDto
+where
+    FVerify: Fn(&Path) -> bool,
+{
+    let existing_files = snapshot_existing_wintun_metadata(candidates);
+    evaluate_wintun_existing_cached_with_primaries(
+        state,
+        configured_engine,
+        primary_paths,
+        existing_files,
+        strict_primary,
+        verify_sha256,
+    )
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn evaluate_windows_wintun_status_cached_with<FBundle, FVerify>(
+    state: &DesktopAppState,
+    configured_engine: EngineMode,
+    service_installed: bool,
+    service_primaries: &[PathBuf],
+    service_candidates: &[PathBuf],
+    collect_bundle: FBundle,
+    verify_sha256: FVerify,
+) -> WintunStatusDto
+where
+    FBundle: FnOnce() -> (Vec<PathBuf>, Vec<PathBuf>),
+    FVerify: Fn(&Path) -> bool,
+{
+    if service_installed {
+        let service_existing = snapshot_existing_wintun_metadata(service_candidates);
+        // When the service is installed in Proxy mode and no service `wintun.dll`
+        // exists on disk yet, fall back to checking the portable/app bundle's
+        // `wintun.dll` so the UI allows switching `Proxy -> TUN`.
+        if configured_engine == EngineMode::Proxy && service_existing.is_empty() {
+            let (bundle_primaries, bundle_candidates) = collect_bundle();
+            return evaluate_wintun_candidates_cached_with_primaries(
+                state,
+                configured_engine,
+                &bundle_primaries,
+                &bundle_candidates,
+                false,
+                verify_sha256,
+            );
+        }
+        evaluate_wintun_existing_cached_with_primaries(
+            state,
+            configured_engine,
+            service_primaries,
+            service_existing,
+            true,
+            verify_sha256,
+        )
+    } else {
+        let (bundle_primaries, bundle_candidates) = collect_bundle();
+        evaluate_wintun_candidates_cached_with_primaries(
+            state,
+            configured_engine,
+            &bundle_primaries,
+            &bundle_candidates,
+            false,
+            verify_sha256,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -734,12 +813,79 @@ fn system_service_installed_from_service_state(service_state: ServiceState) -> b
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn split_windows_cmdline_tokens(cmdline: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    for ch in cmdline.chars() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            c if c.is_whitespace() && !in_quotes => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn infer_engine_from_windows_service_bin_path(binary_path: &str) -> Option<EngineMode> {
+    let tokens = split_windows_cmdline_tokens(binary_path);
+    let args = tokens.get(1..)?;
+    let mut detected = None;
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg.eq_ignore_ascii_case("--tun") {
+            detected = Some(EngineMode::Tun);
+        } else if arg.eq_ignore_ascii_case("--proxy") {
+            detected = Some(EngineMode::Proxy);
+        } else if arg.len() > 9 && arg[..9].eq_ignore_ascii_case("--engine=") {
+            let val = &arg[9..];
+            if val.eq_ignore_ascii_case("tun") {
+                detected = Some(EngineMode::Tun);
+            } else if val.eq_ignore_ascii_case("proxy") {
+                detected = Some(EngineMode::Proxy);
+            }
+        } else if arg.eq_ignore_ascii_case("--engine") {
+            if let Some(val) = args.get(i + 1) {
+                if val.eq_ignore_ascii_case("tun") {
+                    detected = Some(EngineMode::Tun);
+                } else if val.eq_ignore_ascii_case("proxy") {
+                    detected = Some(EngineMode::Proxy);
+                }
+                i += 1;
+            }
+        }
+        i += 1;
+    }
+    detected
+}
+
 fn default_engine_for_service_mode(system_service_installed: bool) -> EngineMode {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if system_service_installed {
         return EngineMode::Tun;
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    if system_service_installed {
+        let info = vdpi::platform::windows_service::query_windows_service_status();
+        if let Some(engine) = info
+            .binary_path
+            .as_deref()
+            .and_then(infer_engine_from_windows_service_bin_path)
+        {
+            return engine;
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     let _ = system_service_installed;
     RuntimeConfig::default().engine
 }
@@ -949,6 +1095,93 @@ fn probe_connect_ip(addr: IpAddr) -> Option<IpAddr> {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn is_runtime_state_pid_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_ACCESS_DENIED, INVALID_HANDLE_VALUE, STILL_ACTIVE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: `OpenProcess` with `PROCESS_QUERY_LIMITED_INFORMATION` only checks
+    // whether the PID published in `state.json` is still running; handle is always closed.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle == 0 || handle == INVALID_HANDLE_VALUE {
+        // `ERROR_ACCESS_DENIED` indicates the process exists (e.g. a `LocalSystem`
+        // service inspected from an unelevated desktop session).
+        let err = unsafe { GetLastError() };
+        return err == ERROR_ACCESS_DENIED;
+    }
+    let mut exit_code: u32 = 0;
+    // SAFETY: `handle` is a valid process handle and `exit_code` is a valid out-pointer.
+    let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+    // SAFETY: `handle` was returned by `OpenProcess` and is owned here.
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    ok != 0 && exit_code == STILL_ACTIVE as u32
+}
+
+#[cfg(unix)]
+fn is_runtime_state_pid_alive(pid: u32) -> bool {
+    let Ok(raw_pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if raw_pid <= 0 {
+        return false;
+    }
+    // SAFETY: `kill(pid, 0)` only probes process existence without sending a signal.
+    let rc = unsafe { libc::kill(raw_pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(any(target_os = "windows", unix)))]
+fn is_runtime_state_pid_alive(pid: u32) -> bool {
+    pid != 0
+}
+
+fn filter_live_runtime_states_with<FAlive>(
+    states: Vec<RuntimeState>,
+    mut is_alive: FAlive,
+) -> Vec<RuntimeState>
+where
+    FAlive: FnMut(u32) -> bool,
+{
+    states.into_iter().filter(|s| is_alive(s.pid)).collect()
+}
+
+fn read_live_runtime_states() -> Vec<RuntimeState> {
+    filter_live_runtime_states_with(service::read_runtime_states(), is_runtime_state_pid_alive)
+}
+
+fn push_fast_probe_candidate(
+    seen: &mut Vec<(IpAddr, u16)>,
+    out: &mut Vec<FastProbeCandidate>,
+    addr: IpAddr,
+    port: u16,
+    socks_port: Option<u16>,
+) {
+    if port == 0 {
+        return;
+    }
+    let Some(connect_ip) = probe_connect_ip(addr) else {
+        return;
+    };
+    if seen.contains(&(connect_ip, port)) {
+        return;
+    }
+    seen.push((connect_ip, port));
+    out.push(FastProbeCandidate {
+        addr,
+        port,
+        socks_port,
+    });
+}
+
 fn build_fast_probe_candidates(
     cfg: &RuntimeConfig,
     states: &[RuntimeState],
@@ -966,54 +1199,232 @@ fn build_fast_probe_candidates(
     let mut seen: Vec<(IpAddr, u16)> = Vec::new();
     let mut out = Vec::new();
 
-    for (addr, port, socks_port) in states
-        .iter()
-        .map(|s| (s.addr, s.port, s.socks_port))
-        .chain(std::iter::once((cfg.addr, cfg.port, primary_socks)))
-        .chain(std::iter::once((
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            DEFAULT_TUN_HEALTH_PORT,
-            None,
-        )))
-    {
-        if port == 0 {
-            continue;
+    // 1. Live `state.json` ports first (PID-filtered by callers so stale files are excluded).
+    for state in states {
+        push_fast_probe_candidate(&mut seen, &mut out, state.addr, state.port, state.socks_port);
+    }
+
+    // 2. Engine-aware fallback order: avoid 200ms closed-port SYN stalls on 8080 in TUN mode
+    //    and honor custom `config.toml` bind/port in Proxy mode, while covering rotated TUN
+    //    health ports (`18089`, `18090`, `18091`, `28089`).
+    let loopback_v4 = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    match cfg.engine {
+        EngineMode::Tun => {
+            for port in TUN_HEALTH_FALLBACK_PORTS {
+                push_fast_probe_candidate(&mut seen, &mut out, loopback_v4, port, None);
+            }
+            push_fast_probe_candidate(&mut seen, &mut out, cfg.addr, cfg.port, primary_socks);
         }
-        let Some(connect_ip) = probe_connect_ip(addr) else {
-            continue;
-        };
-        if seen.contains(&(connect_ip, port)) {
-            continue;
+        EngineMode::Proxy => {
+            push_fast_probe_candidate(&mut seen, &mut out, cfg.addr, cfg.port, primary_socks);
+            for port in TUN_HEALTH_FALLBACK_PORTS {
+                push_fast_probe_candidate(&mut seen, &mut out, loopback_v4, port, None);
+            }
         }
-        seen.push((connect_ip, port));
-        out.push(FastProbeCandidate {
-            addr,
-            port,
-            socks_port,
-        });
     }
 
     out
 }
 
-fn probe_live_engine_fast(cfg: &RuntimeConfig) -> Option<LiveEngineStatus> {
-    let states = service::read_runtime_states();
-    let deadline = Instant::now() + LIVE_PROBE_BUDGET;
+fn probe_local_health_with_deadline(
+    addr: IpAddr,
+    port: u16,
+    socks_port: Option<u16>,
+    deadline: Instant,
+) -> Option<LiveEngineStatus> {
+    const HEALTH_REQUEST: &[u8] =
+        b"GET /vdpi-health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
 
-    for candidate in build_fast_probe_candidates(cfg, &states) {
+    if port == 0 {
+        return None;
+    }
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return None;
+    }
+
+    let connect_ip = probe_connect_ip(addr)?;
+    let sock = SocketAddr::new(connect_ip, port);
+
+    let connect_timeout = remaining.min(PROBE_CONNECT_CAP);
+    let mut stream = TcpStream::connect_timeout(&sock, connect_timeout).ok()?;
+
+    let write_remaining = deadline.saturating_duration_since(Instant::now());
+    if write_remaining.is_zero() {
+        return None;
+    }
+    let _ = stream.set_write_timeout(Some(write_remaining));
+
+    stream.write_all(HEALTH_REQUEST).ok()?;
+    let _ = stream.flush();
+
+    let mut raw = Vec::with_capacity(512);
+    let mut buf = [0u8; 1024];
+    while raw.len() < MAX_HEALTH_RESPONSE_BYTES {
+        let read_remaining = deadline.saturating_duration_since(Instant::now());
+        if read_remaining.is_zero() {
+            break;
+        }
+        let _ = stream.set_read_timeout(Some(read_remaining));
+        let to_read = buf.len().min(MAX_HEALTH_RESPONSE_BYTES - raw.len());
+        match stream.read(&mut buf[..to_read]) {
+            Ok(0) => break,
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+
+    if raw.is_empty() {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&raw);
+    let status_line = text.lines().next()?;
+    let status_rest = status_line
+        .strip_prefix("HTTP/1.1 200")
+        .or_else(|| status_line.strip_prefix("HTTP/1.0 200"))?;
+    if !status_rest.is_empty() && !status_rest.starts_with(' ') {
+        return None;
+    }
+    let (_, body) = text.split_once("\r\n\r\n")?;
+
+    service::parse_health_json(body, addr, port, socks_port)
+}
+
+fn probe_live_engine_fast_with_states_and_budget(
+    cfg: &RuntimeConfig,
+    states: &[RuntimeState],
+    budget: Duration,
+) -> Option<LiveEngineStatus> {
+    let deadline = Instant::now() + budget;
+
+    for candidate in build_fast_probe_candidates(cfg, states) {
         if Instant::now() >= deadline {
             break;
         }
-        if let Some(status) = service::probe_live_engine(
+        if let Some(status) = probe_local_health_with_deadline(
             candidate.addr,
             candidate.port,
-            candidate.socks_port.unwrap_or(0),
+            candidate.socks_port,
+            deadline,
         ) {
             return Some(status);
         }
     }
 
     None
+}
+
+fn probe_live_engine_fast(cfg: &RuntimeConfig) -> Option<LiveEngineStatus> {
+    let states = read_live_runtime_states();
+    probe_live_engine_fast_with_states_and_budget(cfg, &states, LIVE_PROBE_BUDGET)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CachedProbeTarget {
+    addr: IpAddr,
+    port: u16,
+    socks_port: Option<u16>,
+}
+
+fn effective_probe_target_cache() -> &'static Mutex<HashMap<String, CachedProbeTarget>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CachedProbeTarget>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn store_cached_probe_target(config_path: &str, runtime: &RuntimeConfig) {
+    let mut guard = effective_probe_target_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.len() >= 32 && !guard.contains_key(config_path) {
+        guard.clear();
+    }
+    guard.insert(
+        config_path.to_string(),
+        CachedProbeTarget {
+            addr: runtime.addr,
+            port: runtime.port,
+            socks_port: runtime.socks_port,
+        },
+    );
+}
+
+fn load_cached_probe_target(config_path: &str) -> Option<CachedProbeTarget> {
+    effective_probe_target_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(config_path)
+        .copied()
+}
+
+fn should_skip_closed_port_probe(
+    cached_service_state: Option<ServiceStateDto>,
+    has_live_runtime_states: bool,
+    force_full_refresh: bool,
+) -> bool {
+    !force_full_refresh
+        && !has_live_runtime_states
+        && matches!(
+            cached_service_state,
+            Some(ServiceStateDto::Stopped | ServiceStateDto::NotInstalled)
+        )
+}
+
+fn resolve_effective_probe_runtime_config(default_cfg: &RuntimeConfig) -> RuntimeConfig {
+    let system_installed = is_system_service_installed();
+    let sys_path = config_file::system_config_path();
+    let user_path = config_file::user_config_path();
+    let loaded = load_effective_file_config_from_paths(system_installed, &sys_path, &user_path);
+    let default_engine = loaded
+        .config
+        .engine
+        .unwrap_or_else(|| default_engine_for_service_mode(system_installed));
+    let mut runtime = RuntimeConfig {
+        engine: default_engine,
+        ..default_cfg.clone()
+    };
+    loaded.config.apply_to_runtime(&mut runtime);
+    let config_path_str = loaded.path.display().to_string();
+    store_cached_probe_target(&config_path_str, &runtime);
+    runtime
+}
+
+fn probe_live_engine_for_snapshot(
+    state: &DesktopAppState,
+    default_cfg: &RuntimeConfig,
+    force_full_refresh: bool,
+) -> Option<LiveEngineStatus> {
+    let cached_static = state.cached_static_probes(Instant::now());
+    let live_states = read_live_runtime_states();
+
+    if should_skip_closed_port_probe(
+        cached_static.as_ref().map(|entry| entry.service_state),
+        !live_states.is_empty(),
+        force_full_refresh,
+    ) {
+        return None;
+    }
+
+    let probe_cfg = if !force_full_refresh {
+        if let Some(ref entry) = cached_static {
+            let mut runtime = default_cfg.clone();
+            runtime.engine = engine_mode_from_dto(entry.configured_engine);
+            if let Some(target) = load_cached_probe_target(&entry.config_path) {
+                runtime.addr = target.addr;
+                runtime.port = target.port;
+                runtime.socks_port = target.socks_port;
+            }
+            runtime
+        } else {
+            resolve_effective_probe_runtime_config(default_cfg)
+        }
+    } else {
+        resolve_effective_probe_runtime_config(default_cfg)
+    };
+
+    probe_live_engine_fast_with_states_and_budget(&probe_cfg, &live_states, LIVE_PROBE_BUDGET)
 }
 
 fn format_vpn_scope_conflict(scope: &VpnScope) -> Option<String> {
@@ -1074,8 +1485,69 @@ fn locate_installed_binary_path() -> Option<PathBuf> {
     }
 }
 
-fn resolve_installed_version_with<FLocate, FProbe>(
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NegativeVersionEntry {
+    len: u64,
+    mtime: Option<SystemTime>,
+    cached_at: Instant,
+}
+
+fn version_negative_cache() -> &'static Mutex<HashMap<PathBuf, NegativeVersionEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, NegativeVersionEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn is_version_probe_negatively_cached(metadata: &BinaryFileMetadata, now: Instant) -> bool {
+    let mut guard = version_negative_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(entry) = guard.get(&metadata.path) else {
+        return false;
+    };
+    let still_fresh = entry.len == metadata.len
+        && entry.mtime == metadata.mtime
+        && now
+            .checked_duration_since(entry.cached_at)
+            .is_some_and(|age| age < VERSION_PROBE_NEGATIVE_CACHE_TTL);
+    if !still_fresh {
+        guard.remove(&metadata.path);
+    }
+    still_fresh
+}
+
+fn record_negative_version_probe(metadata: &BinaryFileMetadata, now: Instant) {
+    let mut guard = version_negative_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.len() >= 64 && !guard.contains_key(&metadata.path) {
+        guard.retain(|_, entry| {
+            now.checked_duration_since(entry.cached_at)
+                .is_some_and(|age| age < VERSION_PROBE_NEGATIVE_CACHE_TTL)
+        });
+        if guard.len() >= 64 {
+            guard.clear();
+        }
+    }
+    guard.insert(
+        metadata.path.clone(),
+        NegativeVersionEntry {
+            len: metadata.len,
+            mtime: metadata.mtime,
+            cached_at: now,
+        },
+    );
+}
+
+fn clear_negative_version_probe(path: &Path) {
+    let mut guard = version_negative_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.remove(path);
+}
+
+fn resolve_installed_version_with_at<FLocate, FProbe>(
     state: &DesktopAppState,
+    now: Instant,
     locate_binary: FLocate,
     probe_version: FProbe,
 ) -> Option<String>
@@ -1090,6 +1562,7 @@ where
 
     let Some(metadata) = BinaryFileMetadata::from_path(&binary_path) else {
         state.clear_cached_installed_version();
+        clear_negative_version_probe(&binary_path);
         return None;
     };
 
@@ -1097,19 +1570,40 @@ where
         return cached;
     }
 
+    if is_version_probe_negatively_cached(&metadata, now) {
+        return None;
+    }
+
     let version = probe_version(&binary_path);
     if version.is_some() {
+        clear_negative_version_probe(&metadata.path);
         state.set_cached_installed_version(metadata, version.clone());
     } else {
-        state.clear_cached_installed_version();
+        // Negative-cache unchanged failing binaries for 5 minutes instead of
+        // clearing cache and re-spawning `vdpi.exe --version` every poll/refresh.
+        record_negative_version_probe(&metadata, now);
     }
     version
 }
 
+fn resolve_installed_version_with<FLocate, FProbe>(
+    state: &DesktopAppState,
+    locate_binary: FLocate,
+    probe_version: FProbe,
+) -> Option<String>
+where
+    FLocate: FnOnce() -> Option<PathBuf>,
+    FProbe: FnOnce(&Path) -> Option<String>,
+{
+    resolve_installed_version_with_at(state, Instant::now(), locate_binary, probe_version)
+}
+
 fn resolve_installed_version_cached(state: &DesktopAppState) -> Option<String> {
-    resolve_installed_version_with(state, locate_installed_binary_path, |_| {
-        service::detect_installed_info().and_then(|info| info.installed_version)
-    })
+    resolve_installed_version_with(
+        state,
+        locate_installed_binary_path,
+        service::probe_binary_version,
+    )
 }
 
 /// Quickly probes the running local daemon's health endpoint (bounded by
@@ -1156,8 +1650,9 @@ pub(crate) fn probe_bundled_cli_version(path: &Path) -> Option<String> {
     }
 }
 
-fn resolve_bundled_engine_with<FLocate, FProbe>(
+fn resolve_bundled_engine_with_at<FLocate, FProbe>(
     state: &DesktopAppState,
+    now: Instant,
     locate_bundled: FLocate,
     probe_version: FProbe,
 ) -> (bool, Option<String>)
@@ -1172,6 +1667,7 @@ where
 
     let Some(metadata) = BinaryFileMetadata::from_path(&binary_path) else {
         state.clear_cached_bundled_version();
+        clear_negative_version_probe(&binary_path);
         return (false, None);
     };
 
@@ -1179,13 +1675,32 @@ where
         return (true, cached);
     }
 
+    if is_version_probe_negatively_cached(&metadata, now) {
+        return (true, None);
+    }
+
     let version = probe_version(&binary_path);
     if version.is_some() {
+        clear_negative_version_probe(&metadata.path);
         state.set_cached_bundled_version(metadata, version.clone());
     } else {
-        state.clear_cached_bundled_version();
+        // Negative-cache unchanged failing binaries for 5 minutes instead of
+        // clearing cache and re-spawning `vdpi.exe --version` every poll/refresh.
+        record_negative_version_probe(&metadata, now);
     }
     (true, version)
+}
+
+fn resolve_bundled_engine_with<FLocate, FProbe>(
+    state: &DesktopAppState,
+    locate_bundled: FLocate,
+    probe_version: FProbe,
+) -> (bool, Option<String>)
+where
+    FLocate: FnOnce() -> Option<PathBuf>,
+    FProbe: FnOnce(&Path) -> Option<String>,
+{
+    resolve_bundled_engine_with_at(state, Instant::now(), locate_bundled, probe_version)
 }
 
 fn resolve_bundled_engine_cached(state: &DesktopAppState) -> (bool, Option<String>) {
@@ -1301,6 +1816,25 @@ fn compute_live_version_stale(
     }
 }
 
+fn resolve_static_vpn_conflict_with<FDetect>(
+    vpn_coexistence: VpnCoexistence,
+    live_status: Option<&LiveEngineStatus>,
+    detect: FDetect,
+) -> Option<String>
+where
+    FDetect: FnOnce(Option<&str>) -> Option<String>,
+{
+    if vpn_coexistence == VpnCoexistence::Off {
+        None
+    } else if let Some(live) = live_status {
+        // When a live daemon responded to `/vdpi-health`, its reported `vpn_conflict`
+        // is authoritative — skip redundant local VPN interface/route detection.
+        live.vpn_conflict.clone()
+    } else {
+        detect(None)
+    }
+}
+
 fn collect_static_probe_entry(
     state: &DesktopAppState,
     default_cfg: &RuntimeConfig,
@@ -1314,12 +1848,18 @@ fn collect_static_probe_entry(
     let loaded =
         load_effective_file_config_from_paths(system_service_installed, &sys_path, &user_path);
 
-    let default_engine = default_engine_for_service_mode(system_service_installed);
+    let default_engine = loaded
+        .config
+        .engine
+        .unwrap_or_else(|| default_engine_for_service_mode(system_service_installed));
     let mut runtime = RuntimeConfig {
         engine: default_engine,
         ..default_cfg.clone()
     };
     loaded.config.apply_to_runtime(&mut runtime);
+
+    let config_path = loaded.path.display().to_string();
+    store_cached_probe_target(&config_path, &runtime);
 
     let configured_engine = runtime.engine;
     let fallback_dns = compute_fallback_dns(&loaded.config, &default_cfg.dns_addr);
@@ -1332,17 +1872,11 @@ fn collect_static_probe_entry(
         .display()
         .to_string();
 
-    let vpn_conflict = if runtime.vpn_coexistence == VpnCoexistence::Off {
-        None
-    } else {
-        live_status
-            .and_then(|live| live.vpn_conflict.clone())
-            .or_else(|| {
-                detect_vpn_conflict_summary(
-                    live_status.and_then(|live| live.tun_interface.as_deref()),
-                )
-            })
-    };
+    let vpn_conflict = resolve_static_vpn_conflict_with(
+        runtime.vpn_coexistence,
+        live_status,
+        detect_vpn_conflict_summary,
+    );
 
     StaticProbeEntry {
         installed_version,
@@ -1350,7 +1884,7 @@ fn collect_static_probe_entry(
         can_install_from_bundle,
         running_from_readonly_dmg,
         wintun,
-        config_path: loaded.path.display().to_string(),
+        config_path,
         logs_dir,
         tray_supported,
         split_tunnel_mode: split_tunnel_mode_to_dto(runtime.split_tunnel.mode),
@@ -1417,10 +1951,49 @@ fn map_live_telemetry(
     }
 }
 
+struct PresenceFlipRateLimiter {
+    epoch: OnceLock<Instant>,
+    last_refresh_ms: AtomicU64,
+}
+
+impl PresenceFlipRateLimiter {
+    const fn new() -> Self {
+        Self {
+            epoch: OnceLock::new(),
+            last_refresh_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn try_acquire(&self, now: Instant, cooldown: Duration) -> bool {
+        let epoch = *self.epoch.get_or_init(|| now);
+        let now_ms = now
+            .checked_duration_since(epoch)
+            .map_or(0, |d| d.as_millis().min(u64::MAX as u128 - 1) as u64)
+            .saturating_add(1);
+        let cooldown_ms = cooldown.as_millis().min(u64::MAX as u128) as u64;
+        loop {
+            let prev = self.last_refresh_ms.load(Ordering::Acquire);
+            if prev != 0 && now_ms.saturating_sub(prev) < cooldown_ms {
+                return false;
+            }
+            if self
+                .last_refresh_ms
+                .compare_exchange(prev, now_ms, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+}
+
+static PRESENCE_FLIP_RATE_LIMITER: PresenceFlipRateLimiter = PresenceFlipRateLimiter::new();
+
 fn collect_status_snapshot_inner<FNow, FLive, FStatic>(
     state: &DesktopAppState,
     mut force_full_refresh: bool,
     bypass_mutating_guard: bool,
+    presence_flip_limiter: &PresenceFlipRateLimiter,
     now_fn: FNow,
     probe_live: FLive,
     probe_static: FStatic,
@@ -1461,12 +2034,23 @@ where
         .as_ref()
         .and_then(|s| s.live.as_ref())
         .and_then(|l| l.version.as_deref());
+    let prev_live_engine = prev_snap
+        .as_ref()
+        .and_then(|s| s.live.as_ref())
+        .map(|l| l.engine);
     let curr_live_version = live_status.as_ref().and_then(|l| l.version.as_deref());
+    let curr_live_engine = live_status.as_ref().map(|l| engine_mode_to_dto(l.engine));
+    let both_live = prev_live_present == Some(true) && live_status.is_some();
     let live_presence_flipped =
         prev_live_present.is_some_and(|was_live| was_live != live_status.is_some());
-    let live_version_changed = prev_snap.is_some() && prev_live_version != curr_live_version;
-    if (!mutating_install || bypass_mutating_guard)
-        && (live_presence_flipped || live_version_changed)
+    let live_version_changed = both_live && prev_live_version != curr_live_version;
+    let live_engine_changed = both_live && prev_live_engine != curr_live_engine;
+    if !force_full_refresh
+        && (!mutating_install || bypass_mutating_guard)
+        && (live_version_changed
+            || live_engine_changed
+            || (live_presence_flipped
+                && presence_flip_limiter.try_acquire(sampled_at, PRESENCE_FLIP_REFRESH_COOLDOWN)))
     {
         force_full_refresh = true;
     }
@@ -1503,10 +2087,12 @@ where
         }
     };
 
-    let vpn_conflict = live
-        .as_ref()
-        .and_then(|l| l.vpn_conflict.clone())
-        .or_else(|| static_entry.vpn_conflict.clone());
+    // When live telemetry is present, treat `live.vpn_conflict` as authoritative so
+    // clearing a VPN conflict never lingers behind a 45s stale `static_entry.vpn_conflict`.
+    let vpn_conflict = match live.as_ref() {
+        Some(l) => l.vpn_conflict.clone(),
+        None => static_entry.vpn_conflict.clone(),
+    };
 
     let live_version = live.as_ref().and_then(|l| l.version.as_deref());
     let cli_version_relation = compute_cli_version_relation(
@@ -1549,9 +2135,11 @@ where
     snapshot
 }
 
-fn collect_status_snapshot_with<FNow, FLive, FStatic>(
+#[cfg(test)]
+fn collect_status_snapshot_with_limiter<FNow, FLive, FStatic>(
     state: &DesktopAppState,
     force_full_refresh: bool,
+    presence_flip_limiter: &PresenceFlipRateLimiter,
     now_fn: FNow,
     probe_live: FLive,
     probe_static: FStatic,
@@ -1565,6 +2153,31 @@ where
         state,
         force_full_refresh,
         false,
+        presence_flip_limiter,
+        now_fn,
+        probe_live,
+        probe_static,
+    )
+}
+
+#[cfg(test)]
+fn collect_status_snapshot_with<FNow, FLive, FStatic>(
+    state: &DesktopAppState,
+    force_full_refresh: bool,
+    now_fn: FNow,
+    probe_live: FLive,
+    probe_static: FStatic,
+) -> Arc<DesktopStatusSnapshotDto>
+where
+    FNow: Fn() -> Instant,
+    FLive: FnOnce(&RuntimeConfig) -> Option<LiveEngineStatus>,
+    FStatic: FnOnce(&RuntimeConfig, Option<&LiveEngineStatus>, Instant) -> StaticProbeEntry,
+{
+    let limiter = PresenceFlipRateLimiter::new();
+    collect_status_snapshot_with_limiter(
+        state,
+        force_full_refresh,
+        &limiter,
         now_fn,
         probe_live,
         probe_static,
@@ -1578,17 +2191,19 @@ where
 /// Acquires `state.snapshot_lock` so concurrent polls never race `RateTracker`.
 /// Regular ticks (`force_full_refresh == false`) reuse `state.static_probe_cache`
 /// within its 45-second TTL and run only the fast loopback `/vdpi-health` probe,
-/// escalating immediately to a full refresh whenever live daemon presence flips
-/// (`Some -> None` or `None -> Some`) or `live.version` changes.
+/// escalating immediately to a full refresh whenever live daemon version/engine
+/// changes or live presence flips (rate-limited to at most once per 5 seconds).
 pub fn collect_status_snapshot(
     state: &DesktopAppState,
     force_full_refresh: bool,
 ) -> Arc<DesktopStatusSnapshotDto> {
-    collect_status_snapshot_with(
+    collect_status_snapshot_inner(
         state,
         force_full_refresh,
+        false,
+        &PRESENCE_FLIP_RATE_LIMITER,
         Instant::now,
-        probe_live_engine_fast,
+        |default_cfg| probe_live_engine_for_snapshot(state, default_cfg, force_full_refresh),
         |default_cfg, live_status, now| {
             collect_static_probe_entry(state, default_cfg, live_status, now)
         },
@@ -1607,8 +2222,9 @@ pub(crate) fn collect_status_snapshot_for_readiness(
         state,
         force_full_refresh,
         true,
+        &PRESENCE_FLIP_RATE_LIMITER,
         Instant::now,
-        probe_live_engine_fast,
+        |default_cfg| probe_live_engine_for_snapshot(state, default_cfg, force_full_refresh),
         |default_cfg, live_status, now| {
             collect_static_probe_entry(state, default_cfg, live_status, now)
         },
@@ -1629,8 +2245,8 @@ fn build_settings_payload_from_config(
     let dns_addr = runtime.dns_addr.clone();
     let dns_display = dns::redact_dns_for_display(&dns_addr);
     let dns_is_custom_url = is_custom_doh_url(&dns_addr);
-    let doh_enabled = runtime.enable_doh;
-    let effective_doh = dns::is_effective_doh_target(&dns_addr, doh_enabled);
+    let doh_enabled = file_cfg.doh.unwrap_or(runtime.enable_doh);
+    let effective_doh = dns::is_effective_doh_target(&dns_addr, runtime.enable_doh);
 
     DesktopSettingsPayloadDto {
         engine: engine_mode_to_dto(runtime.engine),
@@ -1659,7 +2275,10 @@ pub fn build_settings_payload(prefs: GuiPreferencesDto) -> DesktopSettingsPayloa
     let sys_path = config_file::system_config_path();
     let user_path = config_file::user_config_path();
     let loaded = load_effective_file_config_from_paths(system_installed, &sys_path, &user_path);
-    let default_engine = default_engine_for_service_mode(system_installed);
+    let default_engine = loaded
+        .config
+        .engine
+        .unwrap_or_else(|| default_engine_for_service_mode(system_installed));
     build_settings_payload_from_config(&loaded.config, default_engine, prefs)
 }
 
@@ -2297,8 +2916,8 @@ mod tests {
         assert_eq!(w4.message.as_deref(), Some(WINTUN_HASH_MISMATCH_MESSAGE));
         assert_eq!(wintun_hashes.load(Ordering::SeqCst), 2);
 
-        // Explicit `invalidate_static_cache()` forces both version and Wintun re-probes.
-        state.invalidate_static_cache();
+        // Explicit `invalidate_all_caches()` forces both version and Wintun re-probes.
+        state.invalidate_all_caches();
         let v4 = resolve_installed_version_with(
             &state,
             || Some(fake_bin.clone()),
@@ -2327,11 +2946,14 @@ mod tests {
         assert_eq!(w6.message.as_deref(), Some(WINTUN_MISSING_MESSAGE));
         assert_eq!(wintun_hashes.load(Ordering::SeqCst), 3);
 
-        // Transient `None` version probe must NOT poison BinaryMetadataCache;
-        // subsequent probes on the same unchanged file retry and cache `Some`.
-        state.invalidate_static_cache();
-        let transient_fail = resolve_installed_version_with(
+        // Failing `None` version probe is negative-cached for 5 minutes so unchanged
+        // failing binaries do not trigger recurring `vdpi.exe --version` spawns every poll;
+        // once the negative TTL expires (or the binary changes on disk), it retries and recovers.
+        state.invalidate_all_caches();
+        let neg_t0 = Instant::now();
+        let transient_fail = resolve_installed_version_with_at(
             &state,
+            neg_t0,
             || Some(fake_bin.clone()),
             |_| {
                 version_probes.fetch_add(1, Ordering::SeqCst);
@@ -2341,8 +2963,23 @@ mod tests {
         assert!(transient_fail.is_none());
         assert_eq!(version_probes.load(Ordering::SeqCst), 4);
 
-        let recovered = resolve_installed_version_with(
+        // Immediate retry within 5-minute negative TTL hits negative cache without spawning.
+        let neg_cached = resolve_installed_version_with_at(
             &state,
+            neg_t0 + Duration::from_secs(30),
+            || Some(fake_bin.clone()),
+            |_| {
+                version_probes.fetch_add(1, Ordering::SeqCst);
+                Some("0.7.0".to_string())
+            },
+        );
+        assert!(neg_cached.is_none());
+        assert_eq!(version_probes.load(Ordering::SeqCst), 4);
+
+        // After negative TTL expires, re-probes and caches `Some`.
+        let recovered = resolve_installed_version_with_at(
+            &state,
+            neg_t0 + VERSION_PROBE_NEGATIVE_CACHE_TTL + Duration::from_secs(1),
             || Some(fake_bin.clone()),
             |_| {
                 version_probes.fetch_add(1, Ordering::SeqCst);
@@ -2352,8 +2989,9 @@ mod tests {
         assert_eq!(recovered.as_deref(), Some("0.7.0"));
         assert_eq!(version_probes.load(Ordering::SeqCst), 5);
 
-        let cached_after_recovery = resolve_installed_version_with(
+        let cached_after_recovery = resolve_installed_version_with_at(
             &state,
+            neg_t0 + VERSION_PROBE_NEGATIVE_CACHE_TTL + Duration::from_secs(2),
             || Some(fake_bin.clone()),
             |_| {
                 version_probes.fetch_add(1, Ordering::SeqCst);
@@ -2362,6 +3000,34 @@ mod tests {
         );
         assert_eq!(cached_after_recovery.as_deref(), Some("0.7.0"));
         assert_eq!(version_probes.load(Ordering::SeqCst), 5);
+
+        // File replacement (new length) bypasses an active negative cache immediately.
+        state.invalidate_all_caches();
+        let fail_t = Instant::now();
+        assert!(resolve_installed_version_with_at(
+            &state,
+            fail_t,
+            || Some(fake_bin.clone()),
+            |_| {
+                version_probes.fetch_add(1, Ordering::SeqCst);
+                None
+            },
+        )
+        .is_none());
+        assert_eq!(version_probes.load(Ordering::SeqCst), 6);
+        fs::write(&fake_bin, b"vdpi-v0.8.0-repaired-binary-with-new-len")
+            .expect("rewrite repaired binary");
+        let after_replace = resolve_installed_version_with_at(
+            &state,
+            fail_t + Duration::from_secs(1),
+            || Some(fake_bin.clone()),
+            |_| {
+                version_probes.fetch_add(1, Ordering::SeqCst);
+                Some("0.8.0".to_string())
+            },
+        );
+        assert_eq!(after_replace.as_deref(), Some("0.8.0"));
+        assert_eq!(version_probes.load(Ordering::SeqCst), 7);
     }
 
     #[test]
@@ -2495,11 +3161,14 @@ mod tests {
         ];
 
         let candidates = build_fast_probe_candidates(&cfg, &states);
-        assert_eq!(candidates.len(), 3);
+        assert_eq!(candidates.len(), 6);
         assert_eq!(candidates[0].port, 19000);
         assert_eq!(candidates[0].socks_port, Some(19001));
         assert_eq!(candidates[1].port, cfg.port);
         assert_eq!(candidates[2].port, DEFAULT_TUN_HEALTH_PORT);
+        assert_eq!(candidates[3].port, 18090);
+        assert_eq!(candidates[4].port, 18091);
+        assert_eq!(candidates[5].port, 28089);
     }
 
     #[test]
@@ -2954,7 +3623,7 @@ mod tests {
 
         // Replacing primary installed DLL with valid bytes succeeds after cache invalidation.
         fs::write(&primary_dll, valid_bytes).expect("write valid primary dll");
-        state.invalidate_static_cache();
+        state.invalidate_all_caches();
         let passed = evaluate_service_wintun_candidates_cached_with(
             &state,
             EngineMode::Tun,
@@ -3093,10 +3762,13 @@ mod tests {
         assert_eq!(ver3.as_deref(), Some("0.6.2"));
         assert_eq!(probes.load(Ordering::SeqCst), 2);
 
-        // Explicit cache invalidation forces re-probe; transient None must NOT poison cache.
-        state.invalidate_static_cache();
-        let (present_none, ver_none) = resolve_bundled_engine_with(
+        // Explicit cache invalidation forces re-probe; failing None is negative-cached for 5 minutes
+        // and recovers automatically once the negative TTL expires.
+        state.invalidate_all_caches();
+        let neg_t0 = Instant::now();
+        let (present_none, ver_none) = resolve_bundled_engine_with_at(
             &state,
+            neg_t0,
             || Some(bundled_bin.clone()),
             |_| {
                 probes.fetch_add(1, Ordering::SeqCst);
@@ -3107,8 +3779,22 @@ mod tests {
         assert!(ver_none.is_none());
         assert_eq!(probes.load(Ordering::SeqCst), 3);
 
-        let (present_rec, ver_rec) = resolve_bundled_engine_with(
+        let (present_neg_hit, ver_neg_hit) = resolve_bundled_engine_with_at(
             &state,
+            neg_t0 + Duration::from_secs(45),
+            || Some(bundled_bin.clone()),
+            |_| {
+                probes.fetch_add(1, Ordering::SeqCst);
+                Some("0.6.2".to_string())
+            },
+        );
+        assert!(present_neg_hit);
+        assert!(ver_neg_hit.is_none());
+        assert_eq!(probes.load(Ordering::SeqCst), 3);
+
+        let (present_rec, ver_rec) = resolve_bundled_engine_with_at(
+            &state,
+            neg_t0 + VERSION_PROBE_NEGATIVE_CACHE_TTL + Duration::from_secs(1),
             || Some(bundled_bin.clone()),
             |_| {
                 probes.fetch_add(1, Ordering::SeqCst);
@@ -3237,5 +3923,421 @@ mod tests {
         assert_eq!(static_calls.load(Ordering::SeqCst), 2);
         assert_eq!(s3.installed_version.as_deref(), Some("0.6.1"));
         assert!(!s3.live_version_stale);
+    }
+
+    #[test]
+    fn fast_probe_candidates_use_engine_aware_order_custom_port_and_pid_filtering() {
+        // TUN mode places 18089 + fallback TUN ports BEFORE the proxy config port,
+        // while still keeping live `state.json` entries first.
+        let tun_cfg = RuntimeConfig {
+            engine: EngineMode::Tun,
+            port: 18080,
+            ..RuntimeConfig::default()
+        };
+        let tun_candidates = build_fast_probe_candidates(&tun_cfg, &[]);
+        let tun_ports: Vec<u16> = tun_candidates.iter().map(|c| c.port).collect();
+        assert_eq!(tun_ports, vec![18089, 18090, 18091, 28089, 18080]);
+
+        // Proxy mode places effective `config.toml` addr:port FIRST, followed by TUN fallback ports.
+        let proxy_cfg = RuntimeConfig {
+            engine: EngineMode::Proxy,
+            port: 19999,
+            socks_port: Some(11080),
+            ..RuntimeConfig::default()
+        };
+        let proxy_candidates = build_fast_probe_candidates(&proxy_cfg, &[]);
+        let proxy_ports: Vec<u16> = proxy_candidates.iter().map(|c| c.port).collect();
+        assert_eq!(proxy_ports, vec![19999, 18089, 18090, 18091, 28089]);
+        assert_eq!(proxy_candidates[0].socks_port, Some(11080));
+
+        // PID liveness filter retains only running PIDs and strips stale `state.json` entries.
+        let raw_states = vec![
+            RuntimeState {
+                pid: 0,
+                addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port: 19001,
+                socks_port: None,
+                engine: EngineMode::Proxy,
+                tun_interface: None,
+                env_activated_at: None,
+            },
+            RuntimeState {
+                pid: 4242,
+                addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port: 19002,
+                socks_port: Some(19003),
+                engine: EngineMode::Tun,
+                tun_interface: Some("vdpi0".to_string()),
+                env_activated_at: None,
+            },
+            RuntimeState {
+                pid: 9999,
+                addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port: 19004,
+                socks_port: None,
+                engine: EngineMode::Proxy,
+                tun_interface: None,
+                env_activated_at: None,
+            },
+        ];
+        let live_only = filter_live_runtime_states_with(raw_states, |pid| pid == 4242);
+        assert_eq!(live_only.len(), 1);
+        assert_eq!(live_only[0].pid, 4242);
+        let tun_with_live = build_fast_probe_candidates(&tun_cfg, &live_only);
+        assert_eq!(tun_with_live[0].port, 19002);
+        assert_eq!(tun_with_live[1].port, 18089);
+
+        // Stopped/NotInstalled service with no live `state.json` skips closed-port TCP probes
+        // unless `force_full_refresh` is true.
+        assert!(should_skip_closed_port_probe(
+            Some(ServiceStateDto::Stopped),
+            false,
+            false
+        ));
+        assert!(should_skip_closed_port_probe(
+            Some(ServiceStateDto::NotInstalled),
+            false,
+            false
+        ));
+        assert!(!should_skip_closed_port_probe(
+            Some(ServiceStateDto::Stopped),
+            true,
+            false
+        ));
+        assert!(!should_skip_closed_port_probe(
+            Some(ServiceStateDto::Stopped),
+            false,
+            true
+        ));
+        assert!(!should_skip_closed_port_probe(
+            Some(ServiceStateDto::Running),
+            false,
+            false
+        ));
+        assert!(!should_skip_closed_port_probe(None, false, false));
+
+        // Expired deadline returns None immediately without attempting TCP connect.
+        let expired = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap_or_else(Instant::now);
+        assert!(probe_local_health_with_deadline(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            DEFAULT_TUN_HEALTH_PORT,
+            None,
+            expired,
+        )
+        .is_none());
+
+        // Live health endpoint responds within budget and parses telemetry.
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind test");
+        let port = listener.local_addr().expect("local addr").port();
+        let server = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut req = [0u8; 256];
+                let _ = stream.read(&mut req);
+                let body = r#"{"status":"ok","service":"vdpi","engine":"tun","version":"0.6.3"}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        let live = probe_local_health_with_deadline(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port,
+            None,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .expect("probe should parse live /vdpi-health response");
+        assert_eq!(live.engine, EngineMode::Tun);
+        assert_eq!(live.version.as_deref(), Some("0.6.3"));
+        server.join().expect("join health server");
+    }
+
+    #[test]
+    fn collect_status_snapshot_escalates_on_live_engine_change_and_rate_limits_presence_flips() {
+        let state = DesktopAppState::default();
+        let limiter = PresenceFlipRateLimiter::new();
+        let static_calls = AtomicUsize::new(0);
+        let t0 = Instant::now();
+
+        // Tick 1: cold cache with live TUN engine.
+        let s1 = collect_status_snapshot_with_limiter(
+            &state,
+            false,
+            &limiter,
+            || t0,
+            |_| Some(sample_live_status(Some("1.1.1.1"), Some(true))),
+            |_, _, now| {
+                static_calls.fetch_add(1, Ordering::SeqCst);
+                sample_static_entry(now, true, None)
+            },
+        );
+        assert_eq!(static_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(s1.live.as_ref().expect("live").engine, EngineModeDto::Tun);
+
+        // Tick 2 (+1.5s): live engine flips Tun -> Proxy while staying online -> immediate full refresh.
+        let s2 = collect_status_snapshot_with_limiter(
+            &state,
+            false,
+            &limiter,
+            || t0 + Duration::from_millis(1_500),
+            |_| {
+                let mut live = sample_live_status(Some("1.1.1.1"), Some(true));
+                live.engine = EngineMode::Proxy;
+                Some(live)
+            },
+            |_, _, now| {
+                static_calls.fetch_add(1, Ordering::SeqCst);
+                let mut entry = sample_static_entry(now, true, None);
+                entry.configured_engine = EngineModeDto::Proxy;
+                entry
+            },
+        );
+        assert_eq!(static_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(s2.configured_engine, EngineModeDto::Proxy);
+
+        // Tick 3 (+3s): first presence flip (Some -> None) escalates to full refresh.
+        let _s3 = collect_status_snapshot_with_limiter(
+            &state,
+            false,
+            &limiter,
+            || t0 + Duration::from_secs(3),
+            |_| None,
+            |_, _, now| {
+                static_calls.fetch_add(1, Ordering::SeqCst);
+                sample_static_entry(now, true, None)
+            },
+        );
+        assert_eq!(static_calls.load(Ordering::SeqCst), 3);
+
+        // Tick 4 (+4.5s, 1.5s after Tick 3): rapid blip back online is rate-limited (< 5s).
+        let _s4 = collect_status_snapshot_with_limiter(
+            &state,
+            false,
+            &limiter,
+            || t0 + Duration::from_millis(4_500),
+            |_| Some(sample_live_status(Some("1.1.1.1"), Some(true))),
+            |_, _, now| {
+                static_calls.fetch_add(1, Ordering::SeqCst);
+                sample_static_entry(now, true, None)
+            },
+        );
+        assert_eq!(static_calls.load(Ordering::SeqCst), 3);
+
+        // Tick 5 (+6s, 3s after Tick 3): another flip within 5s cooldown stays rate-limited.
+        let _s5 = collect_status_snapshot_with_limiter(
+            &state,
+            false,
+            &limiter,
+            || t0 + Duration::from_secs(6),
+            |_| None,
+            |_, _, now| {
+                static_calls.fetch_add(1, Ordering::SeqCst);
+                sample_static_entry(now, true, None)
+            },
+        );
+        assert_eq!(static_calls.load(Ordering::SeqCst), 3);
+
+        // Tick 6 (+8s, 5s after Tick 3): cooldown elapsed, presence flip escalates again.
+        let _s6 = collect_status_snapshot_with_limiter(
+            &state,
+            false,
+            &limiter,
+            || t0 + Duration::from_secs(8),
+            |_| Some(sample_live_status(Some("1.1.1.1"), Some(true))),
+            |_, _, now| {
+                static_calls.fetch_add(1, Ordering::SeqCst);
+                sample_static_entry(now, true, None)
+            },
+        );
+        assert_eq!(static_calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn live_vpn_conflict_is_authoritative_without_redundant_detection_or_stale_fallback() {
+        let detect_calls = AtomicUsize::new(0);
+        let live_clear = sample_live_status(Some("1.1.1.1"), Some(true));
+        let mut live_with_vpn = sample_live_status(Some("1.1.1.1"), Some(true));
+        live_with_vpn.vpn_conflict = Some("Mullvad".to_string());
+
+        // When live_status is Some, never invoke local VPN detection — even when live.vpn_conflict is None.
+        assert_eq!(
+            resolve_static_vpn_conflict_with(VpnCoexistence::AutoYield, Some(&live_clear), |_| {
+                detect_calls.fetch_add(1, Ordering::SeqCst);
+                Some("StaleLocalDetect".to_string())
+            }),
+            None
+        );
+        assert_eq!(
+            resolve_static_vpn_conflict_with(
+                VpnCoexistence::AutoYield,
+                Some(&live_with_vpn),
+                |_| {
+                    detect_calls.fetch_add(1, Ordering::SeqCst);
+                    Some("StaleLocalDetect".to_string())
+                }
+            ),
+            Some("Mullvad".to_string())
+        );
+        assert_eq!(detect_calls.load(Ordering::SeqCst), 0);
+
+        // VpnCoexistence::Off always suppresses detection even when offline.
+        assert_eq!(
+            resolve_static_vpn_conflict_with(VpnCoexistence::Off, None, |_| {
+                detect_calls.fetch_add(1, Ordering::SeqCst);
+                Some("Mullvad".to_string())
+            }),
+            None
+        );
+        assert_eq!(detect_calls.load(Ordering::SeqCst), 0);
+
+        // Offline with coexistence enabled invokes local detection once.
+        assert_eq!(
+            resolve_static_vpn_conflict_with(VpnCoexistence::Warn, None, |_| {
+                detect_calls.fetch_add(1, Ordering::SeqCst);
+                Some("WireGuard".to_string())
+            }),
+            Some("WireGuard".to_string())
+        );
+        assert_eq!(detect_calls.load(Ordering::SeqCst), 1);
+
+        // In snapshot collection, clearing live.vpn_conflict clears snapshot.vpn_conflict
+        // immediately instead of falling back to a 45s-stale static_entry.vpn_conflict.
+        let state = DesktopAppState::default();
+        let t0 = Instant::now();
+        let s1 = collect_status_snapshot_with(
+            &state,
+            false,
+            || t0,
+            |_| Some(live_with_vpn.clone()),
+            |_, _, now| {
+                let mut entry = sample_static_entry(now, true, None);
+                entry.vpn_conflict = Some("Mullvad".to_string());
+                entry
+            },
+        );
+        assert_eq!(s1.vpn_conflict.as_deref(), Some("Mullvad"));
+
+        let s2 = collect_status_snapshot_with(
+            &state,
+            false,
+            || t0 + Duration::from_secs(2),
+            |_| Some(live_clear),
+            |_, _, now| sample_static_entry(now, true, None),
+        );
+        assert!(
+            s2.vpn_conflict.is_none(),
+            "live vpn_conflict=None must immediately clear stale static_entry.vpn_conflict"
+        );
+    }
+
+    #[test]
+    fn windows_service_bin_path_infers_default_engine_when_config_omits_engine() {
+        assert_eq!(
+            infer_engine_from_windows_service_bin_path(
+                r#""C:\Program Files\vdpi\bin\vdpi.exe" --service --tun --quiet"#
+            ),
+            Some(EngineMode::Tun)
+        );
+        assert_eq!(
+            infer_engine_from_windows_service_bin_path(
+                r#""C:\Program Files\vdpi\bin\vdpi.exe" --service --proxy --port 8080 --quiet"#
+            ),
+            Some(EngineMode::Proxy)
+        );
+        assert_eq!(
+            infer_engine_from_windows_service_bin_path(
+                r#""C:\my --tun folder\vdpi.exe" --service --proxy --quiet"#
+            ),
+            Some(EngineMode::Proxy)
+        );
+        assert_eq!(
+            infer_engine_from_windows_service_bin_path(
+                r#""C:\Program Files\vdpi\bin\vdpi.exe" --service --engine=tun"#
+            ),
+            Some(EngineMode::Tun)
+        );
+        assert_eq!(
+            infer_engine_from_windows_service_bin_path(
+                r#""C:\Program Files\vdpi\bin\vdpi.exe" --service --engine proxy"#
+            ),
+            Some(EngineMode::Proxy)
+        );
+        assert_eq!(
+            infer_engine_from_windows_service_bin_path(
+                r#""C:\Program Files\vdpi\bin\vdpi.exe" --service --quiet"#
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn windows_proxy_service_falls_back_to_portable_bundle_wintun_when_service_dll_absent() {
+        let dir = TestDir::new("wintun-proxy-portable");
+        let service_dll = dir.path().join("service").join("wintun.dll");
+        let bundle_dir = dir.path().join("bundle");
+        fs::create_dir_all(&bundle_dir).expect("create bundle dir");
+        let bundle_dll = bundle_dir.join("wintun.dll");
+
+        let valid_bytes = b"MZ-verified-portable-wintun";
+        let expected_sha256 = vdpi::update::sha256_hex(valid_bytes);
+        fs::write(&bundle_dll, valid_bytes).expect("write valid bundle dll");
+
+        let state = DesktopAppState::default();
+        let service_primaries = vec![service_dll.clone()];
+        let service_candidates = vec![service_dll.clone()];
+        let bundle_primaries = vec![bundle_dll.clone()];
+        let bundle_candidates = vec![bundle_dll.clone()];
+
+        // Service installed in Proxy mode + service wintun.dll absent -> falls back to
+        // portable bundle wintun.dll so UI allows switching Proxy -> TUN.
+        let proxy_ready = evaluate_windows_wintun_status_cached_with(
+            &state,
+            EngineMode::Proxy,
+            true,
+            &service_primaries,
+            &service_candidates,
+            || (bundle_primaries.clone(), bundle_candidates.clone()),
+            |p| vdpi::platform::windows_tun::verify_wintun_dll_sha256(p, &expected_sha256).is_ok(),
+        );
+        assert!(!proxy_ready.required);
+        assert!(proxy_ready.ready);
+        assert!(proxy_ready.message.is_none());
+
+        // Service installed in TUN mode + service wintun.dll absent -> must NOT fall back to bundle.
+        let tun_missing = evaluate_windows_wintun_status_cached_with(
+            &state,
+            EngineMode::Tun,
+            true,
+            &service_primaries,
+            &service_candidates,
+            || (bundle_primaries.clone(), bundle_candidates.clone()),
+            |p| vdpi::platform::windows_tun::verify_wintun_dll_sha256(p, &expected_sha256).is_ok(),
+        );
+        assert!(tun_missing.required);
+        assert!(!tun_missing.ready);
+        assert_eq!(tun_missing.message.as_deref(), Some(WINTUN_MISSING_MESSAGE));
+
+        // Service installed in Proxy mode + corrupted service wintun.dll present -> fails closed.
+        fs::create_dir_all(service_dll.parent().unwrap()).expect("create service dir");
+        fs::write(&service_dll, b"corrupted-service-dll").expect("write bad service dll");
+        let proxy_corrupt = evaluate_windows_wintun_status_cached_with(
+            &state,
+            EngineMode::Proxy,
+            true,
+            &service_primaries,
+            &service_candidates,
+            || (bundle_primaries.clone(), bundle_candidates.clone()),
+            |p| vdpi::platform::windows_tun::verify_wintun_dll_sha256(p, &expected_sha256).is_ok(),
+        );
+        assert!(!proxy_corrupt.required);
+        assert!(!proxy_corrupt.ready);
+        assert_eq!(
+            proxy_corrupt.message.as_deref(),
+            Some(WINTUN_HASH_MISMATCH_MESSAGE)
+        );
     }
 }

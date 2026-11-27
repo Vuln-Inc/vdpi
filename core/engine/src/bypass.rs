@@ -4,8 +4,8 @@ use std::borrow::Cow;
 use std::net::{IpAddr, Ipv4Addr};
 
 /// Built-in domains and wildcards that should never undergo TLS ClientHello fragmentation
-/// (local mDNS, private networks, Tailscale, government portals, payment gateways,
-/// banking WAFs, and anti-cheat/game services).
+/// (local mDNS, private networks, Tailscale, Radmin, OS captive-portal/update/auth services,
+/// government portals, payment gateways, banking WAFs, and anti-cheat/game services).
 pub const DEFAULT_BYPASS_PATTERNS: &[&str] = &[
     // Local / private networks & Tailscale
     "localhost",
@@ -113,28 +113,29 @@ pub const DEFAULT_BYPASS_PATTERNS: &[&str] = &[
     "*.rgpub.io",
     "*.rdatasrv.net",
     "*.leagueoflegends.com",
-    // Third-party VPN control-plane, auth & bootstrap APIs
-    "*.mullvad.net",
-    "*.protonvpn.com",
-    "*.proton.me",
-    "*.nordvpn.com",
-    "*.surfshark.com",
+    // Unblocked mesh/VPN control-plane & bootstrap APIs (consumer VPN & Proton web domains
+    // are intentionally omitted so BTK/ISP-blocked Proton Mail/Drive/VPN sites remain
+    // reachable through vdpi)
     "*.cloudflareclient.com",
     "*.tailscale.com",
+    "*.tailscale.io",
+    "*.radmin-vpn.com",
+    "*.radmin.com",
+    "*.famatech.com",
     "*.expressvpn.com",
     "*.expressvpn.net",
     "*.expressapisv2.net",
     "*.xvnet.net",
     "*.xvtel.com",
-    "*.windscribe.com",
-    "*.cyberghostvpn.com",
-    "*.privateinternetaccess.com",
-    "*.pia-dns.com",
-    "*.ipvanish.com",
-    "*.tunnelbear.com",
-    "*.adguard-vpn.com",
-    "*.hotspotshield.com",
-    "*.warp.plus",
+    // Core unblocked Windows / Microsoft OS update, telemetry, auth & push domains
+    "*.windowsupdate.com",
+    "*.update.microsoft.com",
+    "*.delivery.mp.microsoft.com",
+    "*.smartscreen.microsoft.com",
+    "*.wns.windows.com",
+    "*.gvt2.com",
+    "*.msftauth.net",
+    "*.msauth.net",
 ];
 
 /// Classification of a connection target for DPI bypass decisions.
@@ -495,11 +496,16 @@ fn is_local_hostname(host: &str) -> bool {
     (!host.contains('.') && !host.contains(':')) || is_local_namespace(host)
 }
 
-/// Converts a proxy bypass wildcard (like `*.gov`, `.example.com`, or `*.example.com`)
-/// into an anchored case-insensitive regex, returning `None` for empty patterns.
+/// Converts a proxy bypass wildcard (like `*.gov`, `.example.com`, `*.example.com`,
+/// or multi-wildcard globs like `*.cdn-*.example.com`) into an anchored case-insensitive
+/// regex, returning `None` for empty patterns.
 fn wildcard_to_regex(pattern: &str) -> Option<String> {
     let p = pattern.trim().to_ascii_lowercase();
-    if let Some(suffix) = p.strip_prefix("*.").or_else(|| p.strip_prefix('.')) {
+    if let Some(suffix) = p
+        .strip_prefix("*.")
+        .or_else(|| p.strip_prefix('.'))
+        .filter(|suffix| !suffix.contains('*'))
+    {
         let suffix = suffix.trim_end_matches('.');
         if suffix.is_empty() {
             return None;
@@ -645,7 +651,7 @@ fn compile_include_override_matchers(include_domains: &[String]) -> (Vec<Regex>,
     (include_regexes, include_candidates)
 }
 
-/// Filters `domains` (bare domain suffixes such as `"riotgames.com"` or `"mullvad.net"`),
+/// Filters `domains` (bare domain suffixes such as `"riotgames.com"` or `"tailscale.com"`),
 /// omitting any non-local domain overridden by `include_domains`.
 pub fn filter_pac_default_bypass_domains<'a>(
     domains: &[&'a str],
@@ -692,12 +698,14 @@ pub fn build_no_proxy_value_with_includes(
         "127.0.0.0/8".into(),
         "::1".into(),
         "0.0.0.0".into(),
+        "0.0.0.0/8".into(),
         "10.0.0.0/8".into(),
         "172.16.0.0/12".into(),
         "192.0.0.0/24".into(),
         "192.168.0.0/16".into(),
         "169.254.0.0/16".into(),
         "100.64.0.0/10".into(),
+        "198.18.0.0/15".into(),
         "fc00::/7".into(),
         "fe80::/10".into(),
     ];
@@ -1282,7 +1290,9 @@ mod tests {
         for expected in [
             "127.0.0.1",
             "127.0.0.0/8",
+            "0.0.0.0/8",
             "192.0.0.0/24",
+            "198.18.0.0/15",
             "msftncsi.com",
             "dns.msftncsi.com",
             "ipv6.msftconnecttest.com",
@@ -1338,7 +1348,9 @@ mod tests {
             "localhost",
             "127.0.0.1",
             "127.0.0.0/8",
+            "0.0.0.0/8",
             "192.0.0.0/24",
+            "198.18.0.0/15",
             ".localhost",
             ".localdomain",
             ".local",
@@ -1529,7 +1541,7 @@ mod tests {
     }
 
     #[test]
-    fn bypasses_extended_riot_and_vpn_bootstrap_domains_and_filters_pac_defaults() {
+    fn bypasses_extended_riot_mesh_expressvpn_and_os_domains_while_desyncing_blocked_vpns() {
         let policy = BypassPolicy::new(&[], &[]).unwrap();
 
         for host in [
@@ -1541,20 +1553,40 @@ mod tests {
             "data.rdatasrv.net",
             "leagueoflegends.com",
             "auth.leagueoflegends.com",
-            "mullvad.net",
-            "api.mullvad.net",
-            "protonvpn.com",
-            "api.protonvpn.com",
-            "proton.me",
-            "vpn-api.proton.me",
-            "nordvpn.com",
-            "api.nordvpn.com",
-            "surfshark.com",
-            "api.surfshark.com",
             "cloudflareclient.com",
             "api.cloudflareclient.com",
             "tailscale.com",
             "controlplane.tailscale.com",
+            "tailscale.io",
+            "log.tailscale.io",
+            "radmin-vpn.com",
+            "api.radmin-vpn.com",
+            "radmin.com",
+            "www.radmin.com",
+            "famatech.com",
+            "auth.famatech.com",
+            "expressvpn.com",
+            "www.expressvpn.com",
+            "expressapisv2.net",
+            "api.expressapisv2.net",
+            "xvnet.net",
+            "edge.xvnet.net",
+            "windowsupdate.com",
+            "ctldl.windowsupdate.com",
+            "update.microsoft.com",
+            "fe2.update.microsoft.com",
+            "delivery.mp.microsoft.com",
+            "fe3cr.delivery.mp.microsoft.com",
+            "smartscreen.microsoft.com",
+            "nav.smartscreen.microsoft.com",
+            "wns.windows.com",
+            "db5.notify.wns.windows.com",
+            "gvt2.com",
+            "edgedl.me.gvt2.com",
+            "msftauth.net",
+            "aadcdn.msftauth.net",
+            "msauth.net",
+            "aadcdn.msauth.net",
         ] {
             assert_eq!(
                 policy.classify(Some(host), None),
@@ -1564,18 +1596,42 @@ mod tests {
             assert!(!policy.should_desync(Some(host), None));
         }
 
-        for unrelated in [
+        // BTK/ISP-blocked consumer VPN & Proton web domains must remain desync-eligible.
+        for desync_host in [
+            "proton.me",
+            "mail.proton.me",
+            "drive.proton.me",
+            "vpn-api.proton.me",
+            "protonvpn.com",
+            "api.protonvpn.com",
+            "mullvad.net",
+            "api.mullvad.net",
+            "nordvpn.com",
+            "api.nordvpn.com",
+            "surfshark.com",
+            "api.surfshark.com",
+            "windscribe.com",
+            "cyberghostvpn.com",
+            "privateinternetaccess.com",
+            "pia-dns.com",
+            "ipvanish.com",
+            "tunnelbear.com",
+            "adguard-vpn.com",
+            "hotspotshield.com",
+            "warp.plus",
             "notriotgames.net",
             "fakevalorant.com",
-            "fakemullvad.net",
-            "notproton.me",
             "mytailscale.com",
+            "mytailscale.io",
+            "notradmin.com",
+            "fakewindowsupdate.com",
         ] {
             assert_eq!(
-                policy.classify(Some(unrelated), None),
+                policy.classify(Some(desync_host), None),
                 BypassClass::DesyncEligible,
-                "expected DesyncEligible for {unrelated}"
+                "expected DesyncEligible for {desync_host}"
             );
+            assert!(policy.should_desync(Some(desync_host), None));
         }
 
         let no_proxy = build_no_proxy_value(&[]);
@@ -1585,13 +1641,23 @@ mod tests {
             ".valorant.com",
             ".rdatasrv.net",
             ".leagueoflegends.com",
-            ".mullvad.net",
-            ".protonvpn.com",
-            ".proton.me",
-            ".nordvpn.com",
-            ".surfshark.com",
             ".cloudflareclient.com",
             ".tailscale.com",
+            ".tailscale.io",
+            ".radmin-vpn.com",
+            ".radmin.com",
+            ".famatech.com",
+            ".expressvpn.com",
+            ".expressapisv2.net",
+            ".xvnet.net",
+            ".windowsupdate.com",
+            ".update.microsoft.com",
+            ".delivery.mp.microsoft.com",
+            ".smartscreen.microsoft.com",
+            ".wns.windows.com",
+            ".gvt2.com",
+            ".msftauth.net",
+            ".msauth.net",
         ] {
             assert!(
                 entries.contains(&expected),
@@ -1599,17 +1665,96 @@ mod tests {
             );
         }
 
-        let pac_domains = ["riotgames.com", "valorant.com", "mullvad.net", "proton.me"];
+        for omitted in [
+            ".proton.me",
+            ".protonvpn.com",
+            ".mullvad.net",
+            ".nordvpn.com",
+            ".surfshark.com",
+            ".windscribe.com",
+            ".cyberghostvpn.com",
+            ".privateinternetaccess.com",
+            ".pia-dns.com",
+            ".ipvanish.com",
+            ".tunnelbear.com",
+            ".adguard-vpn.com",
+            ".hotspotshield.com",
+            ".warp.plus",
+        ] {
+            assert!(
+                !entries.contains(&omitted),
+                "expected NO_PROXY not to contain `{omitted}`, got: {no_proxy}"
+            );
+        }
+
+        let pac_domains = ["riotgames.com", "valorant.com", "tailscale.com", "radmin.com"];
         assert_eq!(
             filter_pac_default_bypass_domains(&pac_domains, &[]),
-            vec!["riotgames.com", "valorant.com", "mullvad.net", "proton.me"]
+            vec!["riotgames.com", "valorant.com", "tailscale.com", "radmin.com"]
         );
         assert_eq!(
             filter_pac_default_bypass_domains(
                 &pac_domains,
-                &["auth.riotgames.com".into(), r"\.proton\.me$".into()]
+                &["auth.riotgames.com".into(), r"\.radmin\.com$".into()]
             ),
-            vec!["valorant.com", "mullvad.net"]
+            vec!["valorant.com", "tailscale.com"]
         );
+    }
+
+    #[test]
+    fn wildcard_to_regex_handles_multi_wildcard_globs_without_escaping_inner_stars() {
+        assert_eq!(
+            wildcard_to_regex("*.cdn-*.example.com").as_deref(),
+            Some(r"^.*\.cdn\-.*\.example\.com$")
+        );
+        assert_eq!(
+            wildcard_to_regex("*.edge.*.example.net.").as_deref(),
+            Some(r"^.*\.edge\..*\.example\.net$")
+        );
+        assert_eq!(
+            wildcard_to_regex("*.example.com").as_deref(),
+            Some(r"^(?:.+\.)?example\.com$")
+        );
+        assert_eq!(
+            wildcard_to_regex(".example.com").as_deref(),
+            Some(r"^(?:.+\.)?example\.com$")
+        );
+        assert_eq!(wildcard_to_regex("*."), None);
+        assert_eq!(wildcard_to_regex("."), None);
+
+        let policy = BypassPolicy::new(
+            &[
+                "*.cdn-*.example.com".into(),
+                "*.edge.*.example.net".into(),
+            ],
+            &[],
+        )
+        .unwrap();
+
+        for matched in [
+            "a.cdn-1.example.com",
+            "eu.west.cdn-prod.example.com",
+            "pop.edge.eu.example.net",
+            "POP.EDGE.US-EAST.EXAMPLE.NET",
+        ] {
+            assert_eq!(
+                policy.classify(Some(matched), None),
+                BypassClass::SensitiveDirect,
+                "expected SensitiveDirect for multi-wildcard host {matched}"
+            );
+        }
+
+        for unmatched in [
+            "a.other-1.example.com",
+            "a.cdn-1.example.com.evil.org",
+            "pop.origin.eu.example.net",
+            "example.com",
+        ] {
+            assert_eq!(
+                policy.classify(Some(unmatched), None),
+                BypassClass::DesyncEligible,
+                "expected DesyncEligible for non-matching host {unmatched}"
+            );
+        }
     }
 }

@@ -7,7 +7,7 @@
 Rust ile yazılmış, kendi kendini uyarlayan anti-DPI motoru; Windows, macOS, Linux, Android ve iOS üzerinde yerel olarak çalışır.  
 Yerel Masaüstü Arayüzü (GUI), etkileşimli Kontrol Merkezi TUI ve root gerektirmeyen mobil uygulamalarla gelir - uzak sunucu ve telemetri olmadan şeffaf sistem geneli TUN bağdaştırıcısı veya hafif yerel vekil sunucu (Proxy) olarak çalışır.
 
-[![Sürüm](https://img.shields.io/badge/Release-v0.6.2-38bdf8?style=for-the-badge&logo=github)](https://github.com/Vuln-Inc/vdpi/releases/latest)
+[![Sürüm](https://img.shields.io/badge/Release-v0.6.3-38bdf8?style=for-the-badge&logo=github)](https://github.com/Vuln-Inc/vdpi/releases/latest)
 [![Lisans: MIT](https://img.shields.io/badge/License-MIT-34d399?style=for-the-badge)](./LICENSE)
 [![Platformlar](https://img.shields.io/badge/Platforms-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Android%20%7C%20iOS-818cf8?style=for-the-badge)](#hızlı-kurulum)
 

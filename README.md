@@ -7,7 +7,7 @@
 Self-healing anti-DPI engine in Rust, native across Windows, macOS, Linux, Android, and iOS.  
 Ships as a native Desktop GUI, an interactive Control Center TUI, and zero-root mobile apps - running as a transparent system-wide TUN adapter or a lightweight local proxy with zero remote servers and zero telemetry.
 
-[![Release](https://img.shields.io/badge/Release-v0.6.2-38bdf8?style=for-the-badge&logo=github)](https://github.com/Vuln-Inc/vdpi/releases/latest)
+[![Release](https://img.shields.io/badge/Release-v0.6.3-38bdf8?style=for-the-badge&logo=github)](https://github.com/Vuln-Inc/vdpi/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-34d399?style=for-the-badge)](./LICENSE)
 [![Platforms](https://img.shields.io/badge/Platforms-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Android%20%7C%20iOS-818cf8?style=for-the-badge)](#quick-install)
 

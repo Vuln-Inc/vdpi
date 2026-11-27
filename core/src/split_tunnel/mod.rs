@@ -21,9 +21,9 @@ pub mod tui;
 pub const DEFAULT_SOCKET_CACHE_TTL: Duration = Duration::from_millis(1500);
 
 /// Default cache time-to-live for negative (`None`) local socket lookups so
-/// short-lived or racing sockets are re-checked quickly instead of staying
-/// unclassified for the full positive TTL.
-pub const DEFAULT_NEGATIVE_SOCKET_CACHE_TTL: Duration = Duration::from_millis(100);
+/// short-lived or racing sockets are re-checked sooner than the full positive TTL
+/// without thrashing OS socket/process tables.
+pub const DEFAULT_NEGATIVE_SOCKET_CACHE_TTL: Duration = Duration::from_millis(500);
 
 /// Default maximum number of entries retained in [`ProcessSocketResolver`].
 pub const DEFAULT_SOCKET_CACHE_MAX_ENTRIES: usize = 1024;
@@ -1061,7 +1061,7 @@ impl Default for ProcessSocketResolver {
 }
 
 impl ProcessSocketResolver {
-    /// Creates a resolver with the default 1500ms positive TTL, 100ms negative TTL,
+    /// Creates a resolver with the default 1500ms positive TTL, 500ms negative TTL,
     /// and 1024-entry capacity backed by the host platform socket table lookup.
     pub fn new() -> Self {
         Self::with_config(DEFAULT_SOCKET_CACHE_TTL, DEFAULT_SOCKET_CACHE_MAX_ENTRIES)
@@ -1095,16 +1095,19 @@ impl ProcessSocketResolver {
     }
 
     /// Resolves the executable name owning `(local_ip, local_port, is_udp)`,
-    /// serving fresh hits from the in-memory TTL cache and querying the OS
-    /// socket table outside the cache lock on misses or expired entries.
+    /// canonicalizing IPv4-mapped IPv6 addresses, serving fresh hits from the
+    /// in-memory TTL cache, and querying the OS socket table outside the cache
+    /// lock on misses or expired entries.
     pub fn resolve(&self, local_ip: IpAddr, local_port: u16, is_udp: bool) -> Option<String> {
+        let canonical_ip = local_ip.to_canonical();
         let key = SocketCacheKey {
-            local_ip,
+            local_ip: canonical_ip,
             local_port,
             is_udp,
         };
 
-        if !self.ttl.is_zero() && self.max_entries > 0 {
+        let cache_enabled = !self.ttl.is_zero() && self.max_entries > 0;
+        let now = if cache_enabled {
             let now = Instant::now();
             let guard = self
                 .cache
@@ -1115,44 +1118,52 @@ impl ProcessSocketResolver {
                     return entry.app_name.clone();
                 }
             }
-        }
+            Some(now)
+        } else {
+            None
+        };
 
-        let resolved = (self.lookup_fn)(local_ip, local_port, is_udp);
+        let resolved = (self.lookup_fn)(canonical_ip, local_port, is_udp);
 
-        if !self.ttl.is_zero() && self.max_entries > 0 {
-            let cached_at = Instant::now();
+        if let Some(cached_at) = now {
             let mut guard = self
                 .cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !guard.contains_key(&key) && guard.len() >= self.max_entries {
-                let ttl = self.ttl;
-                let negative_ttl = self.negative_ttl;
-                guard.retain(|_, entry| {
-                    let entry_ttl = if entry.app_name.is_some() {
-                        ttl
-                    } else {
-                        negative_ttl
-                    };
-                    cached_at.saturating_duration_since(entry.cached_at) < entry_ttl
-                });
-                if guard.len() >= self.max_entries {
-                    if let Some(oldest_key) = guard
-                        .iter()
-                        .min_by_key(|(_, entry)| entry.cached_at)
-                        .map(|(k, _)| *k)
-                    {
-                        guard.remove(&oldest_key);
+            let should_insert = guard
+                .get(&key)
+                .is_none_or(|existing| existing.cached_at <= cached_at);
+            if should_insert {
+                if !guard.contains_key(&key) && guard.len() >= self.max_entries {
+                    let prune_now = Instant::now();
+                    let ttl = self.ttl;
+                    let negative_ttl = self.negative_ttl;
+                    guard.retain(|_, entry| {
+                        let entry_ttl = if entry.app_name.is_some() {
+                            ttl
+                        } else {
+                            negative_ttl
+                        };
+                        prune_now.saturating_duration_since(entry.cached_at) < entry_ttl
+                    });
+                    if guard.len() >= self.max_entries {
+                        if let Some(oldest_key) = guard
+                            .iter()
+                            .min_by_key(|(_, entry)| entry.cached_at)
+                            .map(|(k, _)| *k)
+                        {
+                            guard.remove(&oldest_key);
+                        }
                     }
                 }
+                guard.insert(
+                    key,
+                    SocketCacheEntry {
+                        app_name: resolved.clone(),
+                        cached_at,
+                    },
+                );
             }
-            guard.insert(
-                key,
-                SocketCacheEntry {
-                    app_name: resolved.clone(),
-                    cached_at,
-                },
-            );
         }
 
         resolved
@@ -1281,6 +1292,13 @@ pub fn should_bypass_app_with_companions(
     }
 }
 
+fn has_configured_split_apps(split: &vdpi_core::config::SplitTunnelConfig) -> bool {
+    split
+        .apps
+        .iter()
+        .any(|app| !NormalizedApp::from_raw(app).is_empty())
+}
+
 fn build_tun_app_bypass_hook_with_resolver<F>(
     split: &vdpi_core::config::SplitTunnelConfig,
     resolver: F,
@@ -1288,21 +1306,40 @@ fn build_tun_app_bypass_hook_with_resolver<F>(
 where
     F: Fn(IpAddr, u16, bool) -> Option<String> + Send + Sync + 'static,
 {
-    if !split.is_active() {
-        return None;
+    match split.mode {
+        vdpi_core::config::SplitTunnelMode::All => None,
+        vdpi_core::config::SplitTunnelMode::Exclude => {
+            if !has_configured_split_apps(split) {
+                return None;
+            }
+            let cfg = split.clone();
+            Some(vdpi_tun::config::AppBypassHook::new(
+                move |src_ip, src_port, is_udp| {
+                    let app = resolver(src_ip, src_port, is_udp);
+                    should_bypass_app_with_companions(&cfg, app.as_deref())
+                },
+            ))
+        }
+        vdpi_core::config::SplitTunnelMode::Include => {
+            if !has_configured_split_apps(split) {
+                return Some(vdpi_tun::config::AppBypassHook::new(|_, _, _| true));
+            }
+            let cfg = split.clone();
+            Some(vdpi_tun::config::AppBypassHook::new(
+                move |src_ip, src_port, is_udp| {
+                    let app = resolver(src_ip, src_port, is_udp);
+                    should_bypass_app_with_companions(&cfg, app.as_deref())
+                },
+            ))
+        }
     }
-    let cfg = split.clone();
-    Some(vdpi_tun::config::AppBypassHook::new(
-        move |src_ip, src_port, is_udp| {
-            let app = resolver(src_ip, src_port, is_udp);
-            should_bypass_app_with_companions(&cfg, app.as_deref())
-        },
-    ))
 }
 
 /// Builds an optional per-flow TUN bypass hook from `split` for desktop TUN
-/// sessions. Returns `None` when split tunneling is in `All` mode so the TUN
-/// hot path incurs zero overhead.
+/// sessions. Returns `None` when split tunneling is in `All` mode or in
+/// `Exclude` mode with no normalized target apps (zero OS lookups), and returns
+/// a constant-`true` hook in `Include` mode with no normalized target apps
+/// without touching OS socket/process tables.
 pub fn build_tun_app_bypass_hook(
     split: &vdpi_core::config::SplitTunnelConfig,
 ) -> Option<vdpi_tun::config::AppBypassHook> {
@@ -1718,6 +1755,8 @@ mod tests {
 
     #[test]
     fn negative_socket_cache_expires_faster_than_positive_hits() {
+        assert_eq!(DEFAULT_NEGATIVE_SOCKET_CACHE_TTL, Duration::from_millis(500));
+
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_ref = Arc::clone(&calls);
 
@@ -1739,18 +1778,93 @@ mod tests {
         assert_eq!(resolver.resolve(ip, 40001, false).as_deref(), Some("discord.exe"));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
 
-        // Within 100ms both stay cached
+        // Within 500ms (even past the old 100ms mark) both stay cached
+        thread::sleep(Duration::from_millis(150));
         assert_eq!(resolver.resolve(ip, 40000, false), None);
         assert_eq!(resolver.resolve(ip, 40001, false).as_deref(), Some("discord.exe"));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
 
-        // After 130ms (> 100ms negative TTL, < 1500ms positive TTL), only None expires
-        thread::sleep(Duration::from_millis(130));
+        // After ~550ms (> 500ms negative TTL, < 1500ms positive TTL), only None expires
+        thread::sleep(Duration::from_millis(400));
         assert_eq!(resolver.resolve(ip, 40001, false).as_deref(), Some("discord.exe"));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
 
         assert_eq!(resolver.resolve(ip, 40000, false), None);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn process_socket_resolver_canonicalizes_ipv4_mapped_ipv6_and_stamps_before_lookup() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen_ips = Arc::new(Mutex::new(Vec::new()));
+        let calls_ref = Arc::clone(&calls);
+        let seen_ref = Arc::clone(&seen_ips);
+
+        let resolver = ProcessSocketResolver::with_lookup(
+            Duration::from_millis(500),
+            16,
+            move |ip, port, _is_udp| {
+                calls_ref.fetch_add(1, Ordering::SeqCst);
+                seen_ref.lock().unwrap().push(ip);
+                Some(format!("app-{port}.exe"))
+            },
+        );
+
+        let v4 = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let v4_mapped = IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped());
+
+        // Resolving via IPv4-mapped IPv6 passes canonical IPv4 to `lookup_fn` and
+        // shares the exact same cache entry as native IPv4.
+        assert_eq!(
+            resolver.resolve(v4_mapped, 51234, false).as_deref(),
+            Some("app-51234.exe")
+        );
+        assert_eq!(
+            resolver.resolve(v4, 51234, false).as_deref(),
+            Some("app-51234.exe")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*seen_ips.lock().unwrap(), vec![v4]);
+
+        // Reverse order: native IPv4 warms the cache for IPv4-mapped IPv6 too.
+        let lan_v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let lan_mapped = IpAddr::V6(Ipv4Addr::new(10, 0, 0, 2).to_ipv6_mapped());
+        assert_eq!(
+            resolver.resolve(lan_v4, 51235, true).as_deref(),
+            Some("app-51235.exe")
+        );
+        assert_eq!(
+            resolver.resolve(lan_mapped, 51235, true).as_deref(),
+            Some("app-51235.exe")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(*seen_ips.lock().unwrap(), vec![v4, lan_v4]);
+
+        // `cached_at` is captured BEFORE invoking `lookup_fn`: a 45ms lookup with a
+        // 60ms TTL must expire after sleeping 25ms (45 + 25 = 70ms >= 60ms).
+        let slow_calls = Arc::new(AtomicUsize::new(0));
+        let slow_calls_ref = Arc::clone(&slow_calls);
+        let slow_resolver = ProcessSocketResolver::with_lookup(
+            Duration::from_millis(60),
+            16,
+            move |_ip, _port, _is_udp| {
+                slow_calls_ref.fetch_add(1, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(45));
+                Some("slow.exe".to_string())
+            },
+        );
+        assert_eq!(
+            slow_resolver.resolve(v4, 60000, false).as_deref(),
+            Some("slow.exe")
+        );
+        assert_eq!(slow_calls.load(Ordering::SeqCst), 1);
+
+        thread::sleep(Duration::from_millis(25));
+        assert_eq!(
+            slow_resolver.resolve(v4, 60000, false).as_deref(),
+            Some("slow.exe")
+        );
+        assert_eq!(slow_calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -2239,6 +2353,55 @@ mod tests {
         assert!(!include_hook.should_bypass(ip, 2000, false));
         assert!(include_hook.should_bypass(ip, 2001, false));
         assert!(include_hook.should_bypass(ip, 2002, true));
+    }
+
+    #[test]
+    fn build_tun_app_bypass_hook_empty_normalized_apps_skips_os_lookups() {
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+        for empty_apps in [
+            vec![],
+            vec![
+                "".to_string(),
+                "   ".to_string(),
+                ".exe".to_string(),
+                "\"\"".to_string(),
+                r"C:\dir\".to_string(),
+            ],
+        ] {
+            let exclude_calls = Arc::new(AtomicUsize::new(0));
+            let exclude_calls_ref = Arc::clone(&exclude_calls);
+            let exclude_cfg = vdpi_core::config::SplitTunnelConfig {
+                mode: vdpi_core::config::SplitTunnelMode::Exclude,
+                apps: empty_apps.clone(),
+            };
+            let exclude_hook =
+                build_tun_app_bypass_hook_with_resolver(&exclude_cfg, move |_ip, _port, _| {
+                    exclude_calls_ref.fetch_add(1, Ordering::SeqCst);
+                    Some("Discord.exe".to_string())
+                });
+            assert!(
+                exclude_hook.is_none(),
+                "Exclude mode with empty normalized app list {empty_apps:?} must return None"
+            );
+            assert_eq!(exclude_calls.load(Ordering::SeqCst), 0);
+
+            let include_calls = Arc::new(AtomicUsize::new(0));
+            let include_calls_ref = Arc::clone(&include_calls);
+            let include_cfg = vdpi_core::config::SplitTunnelConfig {
+                mode: vdpi_core::config::SplitTunnelMode::Include,
+                apps: empty_apps.clone(),
+            };
+            let include_hook =
+                build_tun_app_bypass_hook_with_resolver(&include_cfg, move |_ip, _port, _| {
+                    include_calls_ref.fetch_add(1, Ordering::SeqCst);
+                    Some("Discord.exe".to_string())
+                })
+                .expect("Include mode with empty normalized app list must return constant-true hook");
+            assert!(include_hook.should_bypass(ip, 1234, false));
+            assert!(include_hook.should_bypass(ip, 5678, true));
+            assert_eq!(include_calls.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[test]

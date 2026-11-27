@@ -66,6 +66,7 @@ export interface SettingsViewProps {
   onResetNetwork?: () => void | Promise<void>;
   onNavigate?: (tab: NavTab) => void;
   onPushToast: (tone: ToastTone, message: string) => void;
+  onModalOpenChange?: (open: boolean) => void;
 }
 
 const DEFAULT_GUI_PREFERENCES: GuiPreferences = {
@@ -589,6 +590,7 @@ function SettingsViewComponent({
   onResetNetwork,
   onNavigate,
   onPushToast,
+  onModalOpenChange,
 }: SettingsViewProps) {
   const { lang } = useLang();
   const mountedRef = useRef(true);
@@ -660,19 +662,37 @@ function SettingsViewComponent({
     updateInfo !== undefined ? updateInfo : localUpdateResult;
 
   useEffect(() => {
-    if (settings?.gui) {
-      const merged: GuiPreferences = {
-        ...settings.gui,
-        language:
-          settings.gui.language ??
-          confirmedPrefsRef.current.language ??
-          readStoredLanguage() ??
-          "system",
-      };
-      setPrefs(merged);
-      confirmedPrefsRef.current = merged;
+    if (!settings?.gui || savingPrefsRef.current) {
+      return;
     }
+    const merged: GuiPreferences = {
+      ...settings.gui,
+      language:
+        settings.gui.language ??
+        confirmedPrefsRef.current.language ??
+        readStoredLanguage() ??
+        "system",
+    };
+    setPrefs(merged);
+    confirmedPrefsRef.current = merged;
   }, [settings?.gui]);
+
+  const modalOpenRef = useRef(false);
+  useEffect(() => {
+    if (modalOpenRef.current !== confirmUninstallOpen) {
+      modalOpenRef.current = confirmUninstallOpen;
+      onModalOpenChange?.(confirmUninstallOpen);
+    }
+  }, [confirmUninstallOpen, onModalOpenChange]);
+
+  useEffect(() => {
+    return () => {
+      if (modalOpenRef.current) {
+        modalOpenRef.current = false;
+        onModalOpenChange?.(false);
+      }
+    };
+  }, [onModalOpenChange]);
 
   const prefsDisabled = !settings || savingPrefs;
   const isMac = status?.platform === "macos";
@@ -786,23 +806,22 @@ function SettingsViewComponent({
             refreshed = null;
           }
         }
-        if (
-          refreshed &&
-          typeof refreshed === "object" &&
-          "gui" in refreshed &&
-          isGuiPreferences((refreshed as { gui?: unknown }).gui)
-        ) {
-          const persistedGui = (refreshed as { gui: GuiPreferences }).gui;
+        const refreshedGui =
+          refreshed && typeof refreshed === "object" && "gui" in refreshed
+            ? (refreshed as { gui?: unknown }).gui
+            : undefined;
+        if (isGuiPreferences(refreshedGui)) {
           const mergedPersisted: GuiPreferences = {
-            ...persistedGui,
-            language: persistedGui.language ?? previous.language ?? "system",
+            ...refreshedGui,
+            language: refreshedGui.language ?? previous.language ?? "system",
           };
           confirmedPrefsRef.current = mergedPersisted;
           if (mountedRef.current) {
             setPrefs(mergedPersisted);
           }
           onPreferencesPreview?.(mergedPersisted);
-        } else if (!refreshed) {
+        } else {
+          confirmedPrefsRef.current = previous;
           if (mountedRef.current) {
             setPrefs(previous);
           }
@@ -840,6 +859,7 @@ function SettingsViewComponent({
       }
       await onPreferencesChanged(resolved);
     } catch (err) {
+      confirmedPrefsRef.current = previous;
       if (mountedRef.current) {
         setPrefs(previous);
       }

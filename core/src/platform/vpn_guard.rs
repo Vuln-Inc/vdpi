@@ -36,12 +36,21 @@ pub enum GuardAction {
     WarnOnly { provider: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingYield {
+    provider: String,
+    since: Instant,
+}
+
 /// Deterministic state machine governing third-party VPN coexistence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VpnGuard {
     policy: VpnCoexistence,
     state: GuardState,
     recovery_debounce: Duration,
+    yield_confirmation: Duration,
+    pending_yield: Option<PendingYield>,
+    has_observed_active_clear: bool,
 }
 
 impl Default for VpnGuard {
@@ -65,7 +74,18 @@ impl VpnGuard {
             policy,
             state: GuardState::Active,
             recovery_debounce,
+            yield_confirmation: Duration::ZERO,
+            pending_yield: None,
+            has_observed_active_clear: false,
         }
+    }
+
+    /// Configures an optional confirmation window for mid-session non-kill-switch
+    /// full-tunnel detections so transient route flaps do not cause spurious yields.
+    /// Startup full-tunnel detections and `kill_switch` full tunnels still yield at 0ms.
+    pub fn with_yield_confirmation(mut self, yield_confirmation: Duration) -> Self {
+        self.yield_confirmation = yield_confirmation;
+        self
     }
 
     /// Returns the configured VPN coexistence policy.
@@ -83,9 +103,33 @@ impl VpnGuard {
         self.recovery_debounce
     }
 
+    /// Returns the configured mid-session yield confirmation duration.
+    pub const fn yield_confirmation(&self) -> Duration {
+        self.yield_confirmation
+    }
+
     /// Returns `true` while TUN is yielded (`YieldedStandby` or `Recovering`).
     pub const fn is_yielded(&self) -> bool {
         !matches!(self.state, GuardState::Active)
+    }
+
+    /// Returns `true` while awaiting mid-session yield confirmation.
+    pub const fn is_pending_yield(&self) -> bool {
+        self.pending_yield.is_some()
+    }
+
+    /// Rolls an `AutoYield` guard back into `Recovering` starting at `now` (e.g., if
+    /// resuming TUN failed right after [`GuardAction::ResumeTun`]).
+    pub fn rollback_to_recovering_at(&mut self, now: Instant) {
+        self.pending_yield = None;
+        if matches!(self.policy, VpnCoexistence::AutoYield) {
+            self.state = GuardState::Recovering { since: now };
+        }
+    }
+
+    /// Rolls an `AutoYield` guard back into `Recovering` starting at `Instant::now()`.
+    pub fn rollback_to_recovering(&mut self) {
+        self.rollback_to_recovering_at(Instant::now());
     }
 
     /// Advances the state machine using the latest detected [`VpnScope`] and monotonic
@@ -94,10 +138,12 @@ impl VpnGuard {
         match self.policy {
             VpnCoexistence::Off => {
                 self.state = GuardState::Active;
+                self.pending_yield = None;
                 GuardAction::None
             }
             VpnCoexistence::Warn => {
                 self.state = GuardState::Active;
+                self.pending_yield = None;
                 match scope {
                     VpnScope::FullTunnel { provider, .. } => GuardAction::WarnOnly {
                         provider: provider.clone(),
@@ -106,17 +152,23 @@ impl VpnGuard {
                 }
             }
             VpnCoexistence::AutoYield => match scope {
-                VpnScope::FullTunnel { provider, .. } => match &mut self.state {
+                VpnScope::FullTunnel {
+                    provider,
+                    kill_switch,
+                    ..
+                } => match &mut self.state {
                     GuardState::YieldedStandby {
                         provider: active_provider,
                         ..
                     } => {
+                        self.pending_yield = None;
                         if active_provider != provider {
                             active_provider.clone_from(provider);
                         }
                         GuardAction::None
                     }
                     GuardState::Recovering { .. } => {
+                        self.pending_yield = None;
                         self.state = GuardState::YieldedStandby {
                             provider: provider.clone(),
                             since: now,
@@ -124,20 +176,59 @@ impl VpnGuard {
                         GuardAction::None
                     }
                     GuardState::Active => {
-                        self.state = GuardState::YieldedStandby {
-                            provider: provider.clone(),
-                            since: now,
-                        };
-                        GuardAction::YieldTun {
-                            provider: provider.clone(),
+                        let immediate_yield = self.yield_confirmation.is_zero()
+                            || *kill_switch
+                            || !self.has_observed_active_clear;
+                        if immediate_yield {
+                            self.pending_yield = None;
+                            self.state = GuardState::YieldedStandby {
+                                provider: provider.clone(),
+                                since: now,
+                            };
+                            return GuardAction::YieldTun {
+                                provider: provider.clone(),
+                            };
+                        }
+
+                        let confirmed = self.pending_yield.as_ref().is_some_and(|pending| {
+                            pending.provider == *provider
+                                && now.saturating_duration_since(pending.since)
+                                    >= self.yield_confirmation
+                        });
+                        if confirmed {
+                            self.pending_yield = None;
+                            self.state = GuardState::YieldedStandby {
+                                provider: provider.clone(),
+                                since: now,
+                            };
+                            GuardAction::YieldTun {
+                                provider: provider.clone(),
+                            }
+                        } else {
+                            if self
+                                .pending_yield
+                                .as_ref()
+                                .is_none_or(|pending| pending.provider != *provider)
+                            {
+                                self.pending_yield = Some(PendingYield {
+                                    provider: provider.clone(),
+                                    since: now,
+                                });
+                            }
+                            GuardAction::None
                         }
                     }
                 },
                 VpnScope::None | VpnScope::SplitOverlay { .. } => {
+                    self.pending_yield = None;
                     let transition = match &self.state {
-                        GuardState::Active => None,
+                        GuardState::Active => {
+                            self.has_observed_active_clear = true;
+                            None
+                        }
                         GuardState::YieldedStandby { .. } => {
                             if self.recovery_debounce.is_zero() {
+                                self.has_observed_active_clear = true;
                                 Some((GuardState::Active, GuardAction::ResumeTun))
                             } else {
                                 Some((GuardState::Recovering { since: now }, GuardAction::None))
@@ -145,6 +236,7 @@ impl VpnGuard {
                         }
                         GuardState::Recovering { since } => {
                             if now.saturating_duration_since(*since) >= self.recovery_debounce {
+                                self.has_observed_active_clear = true;
                                 Some((GuardState::Active, GuardAction::ResumeTun))
                             } else {
                                 None
@@ -552,5 +644,124 @@ mod tests {
             GuardAction::ResumeTun
         );
         assert_eq!(instant.state(), &GuardState::Active);
+    }
+
+    #[test]
+    fn optional_yield_confirmation_debounces_flaps_while_preserving_startup_and_kill_switch_zero_ms(
+    ) {
+        let t0 = Instant::now();
+        let wg = full_tunnel("WireGuard", "wg0", false);
+        let mullvad_ks = full_tunnel("Mullvad", "Mullvad", true);
+
+        // Startup full-tunnel still yields at 0ms even with yield_confirmation enabled.
+        let mut startup_guard = VpnGuard::new(VpnCoexistence::AutoYield)
+            .with_yield_confirmation(Duration::from_millis(500));
+        assert_eq!(
+            startup_guard.yield_confirmation(),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            startup_guard.evaluate(&wg, t0),
+            GuardAction::YieldTun {
+                provider: "WireGuard".to_string(),
+            }
+        );
+        assert!(!startup_guard.is_pending_yield());
+
+        // Mid-session: after observing a clear state, transient non-kill-switch flap does not yield.
+        let mut guard = VpnGuard::new(VpnCoexistence::AutoYield)
+            .with_yield_confirmation(Duration::from_millis(500));
+        assert_eq!(guard.evaluate(&VpnScope::None, t0), GuardAction::None);
+
+        let t1 = t0 + Duration::from_secs(5);
+        assert_eq!(guard.evaluate(&wg, t1), GuardAction::None);
+        assert_eq!(guard.state(), &GuardState::Active);
+        assert!(!guard.is_yielded());
+        assert!(guard.is_pending_yield());
+
+        // Still inside confirmation window at 499ms.
+        assert_eq!(
+            guard.evaluate(&wg, t1 + Duration::from_millis(499)),
+            GuardAction::None
+        );
+        assert!(guard.is_pending_yield());
+
+        // Flap clears -> cancels pending confirmation cleanly.
+        let t2 = t1 + Duration::from_millis(499);
+        assert_eq!(guard.evaluate(&VpnScope::None, t2), GuardAction::None);
+        assert!(!guard.is_pending_yield());
+
+        // Sustained mid-session full tunnel confirms at exact 500ms boundary.
+        let t3 = t2 + Duration::from_secs(1);
+        assert_eq!(guard.evaluate(&wg, t3), GuardAction::None);
+        assert_eq!(
+            guard.evaluate(&wg, t3 + Duration::from_millis(500)),
+            GuardAction::YieldTun {
+                provider: "WireGuard".to_string(),
+            }
+        );
+        assert!(guard.is_yielded());
+        assert!(!guard.is_pending_yield());
+
+        // Mid-session kill_switch=true still yields immediately at 0ms.
+        let mut ks_guard = VpnGuard::new(VpnCoexistence::AutoYield)
+            .with_yield_confirmation(Duration::from_millis(500));
+        assert_eq!(ks_guard.evaluate(&VpnScope::None, t0), GuardAction::None);
+        assert_eq!(
+            ks_guard.evaluate(&mullvad_ks, t0 + Duration::from_secs(2)),
+            GuardAction::YieldTun {
+                provider: "Mullvad".to_string(),
+            }
+        );
+        assert!(ks_guard.is_yielded());
+    }
+
+    #[test]
+    fn rollback_to_recovering_restarts_debounce_and_preserves_non_autoyield_policies() {
+        let t0 = Instant::now();
+        let wg = full_tunnel("WireGuard", "wg0", false);
+        let mut guard = VpnGuard::new(VpnCoexistence::AutoYield);
+
+        assert_eq!(
+            guard.evaluate(&wg, t0),
+            GuardAction::YieldTun {
+                provider: "WireGuard".to_string(),
+            }
+        );
+        let t_clear = t0 + Duration::from_secs(1);
+        assert_eq!(guard.evaluate(&VpnScope::None, t_clear), GuardAction::None);
+        let t_resume = t_clear + DEFAULT_RECOVERY_DEBOUNCE;
+        assert_eq!(
+            guard.evaluate(&VpnScope::None, t_resume),
+            GuardAction::ResumeTun
+        );
+        assert_eq!(guard.state(), &GuardState::Active);
+
+        // If starting TUN failed right after ResumeTun, roll back to Recovering.
+        guard.rollback_to_recovering_at(t_resume);
+        assert_eq!(guard.state(), &GuardState::Recovering { since: t_resume });
+        assert!(guard.is_yielded());
+        assert_eq!(
+            guard.evaluate(&VpnScope::None, t_resume + Duration::from_millis(2999)),
+            GuardAction::None
+        );
+        assert_eq!(
+            guard.evaluate(&VpnScope::None, t_resume + DEFAULT_RECOVERY_DEBOUNCE),
+            GuardAction::ResumeTun
+        );
+        assert_eq!(guard.state(), &GuardState::Active);
+
+        // Smoke-check Instant::now() wrapper too.
+        guard.rollback_to_recovering();
+        assert!(matches!(guard.state(), GuardState::Recovering { .. }));
+
+        // Off and Warn policies stay Active on rollback.
+        let mut off_guard = VpnGuard::new(VpnCoexistence::Off);
+        off_guard.rollback_to_recovering_at(t0);
+        assert_eq!(off_guard.state(), &GuardState::Active);
+
+        let mut warn_guard = VpnGuard::new(VpnCoexistence::Warn);
+        warn_guard.rollback_to_recovering_at(t0);
+        assert_eq!(warn_guard.state(), &GuardState::Active);
     }
 }

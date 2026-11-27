@@ -2,8 +2,12 @@ use anyhow::{anyhow, Result};
 use smoltcp::{
     iface::{Config as InterfaceConfig, Interface, PollResult, SocketHandle, SocketSet},
     phy::{Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken},
-    socket::tcp::{
-        CongestionControl, Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState,
+    socket::{
+        tcp::{
+            CongestionControl, Socket as TcpSocket, SocketBuffer as TcpSocketBuffer,
+            State as TcpState,
+        },
+        Socket as SmolSocket,
     },
     storage::RingBuffer,
     time::{Duration as SmolDuration, Instant as SmolInstant},
@@ -27,17 +31,24 @@ use tokio::sync::{mpsc, watch, Notify};
 use tracing::{debug, trace};
 
 const INGRESS_DRAIN_LIMIT: usize = 128;
-const POLL_BURST_LIMIT: usize = 16;
-const ZERO_DELAY_BACKOFF_MIN_MS: u64 = 1;
-const ZERO_DELAY_BACKOFF_MAX_MS: u64 = 10;
+const POLL_BURST_LIMIT: usize = 4;
+const ZERO_DELAY_BACKOFF_MIN_MS: u64 = 5;
+const ZERO_DELAY_BACKOFF_MAX_MS: u64 = 25;
 const SMALL_TX_POOL_MAX_BYTES: usize = 128;
+const SMALL_TX_POOL_ADMIT_MAX_BYTES: usize = 512;
 const TX_HEADER_ZERO_LEN: usize = 100;
 const FIN_WAIT_2_TIMEOUT: SmolDuration = SmolDuration::from_secs(15);
 const LISTEN_ORPHAN_TIMEOUT: StdDuration = StdDuration::from_secs(3);
-const TIME_WAIT_REAP_TIMEOUT: StdDuration = StdDuration::from_secs(2);
+const TIME_WAIT_REAP_TIMEOUT: StdDuration = StdDuration::from_millis(250);
 const CLOSING_REAP_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 const DEFERRED_SYN_TTL: StdDuration = StdDuration::from_secs(2);
-const MAX_DEFERRED_SYNS: usize = 32;
+const MAX_DEFERRED_SYNS: usize = 128;
+const SOCKET_POOL_CAP_DESKTOP: usize = 16;
+const SOCKET_POOL_CAP_LOW_MEM: usize = 8;
+const POOL_IDLE_SHRINK_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+const SOCKET_SET_SHRINK_THRESHOLD: usize = 64;
+const REAP_DELAY_FLOOR: StdDuration = StdDuration::from_millis(20);
+const STALE_TIMER_SLACK: StdDuration = StdDuration::from_millis(50);
 const IP_PROTO_TCP: u8 = 6;
 
 /// Monotonic microsecond clock for `smoltcp`, anchored above `Instant::ZERO` so
@@ -341,7 +352,9 @@ impl RxToken for VirtualRxToken<'_> {
     {
         let res = f(&self.buf);
         let cap = self.buf.capacity();
-        if self.recycle.len() < self.recycle_cap && (40..=self.max_buf_cap).contains(&cap) {
+        if self.recycle.len() < self.recycle_cap
+            && (SMALL_TX_POOL_MAX_BYTES..=self.max_buf_cap).contains(&cap)
+        {
             self.recycle.push(self.buf);
         }
         res
@@ -351,6 +364,7 @@ impl RxToken for VirtualRxToken<'_> {
 struct TxBufferPool {
     small: Vec<Vec<u8>>,
     large: Vec<Vec<u8>>,
+    mtu: usize,
     small_cap: usize,
     large_cap: usize,
     max_buf_cap: usize,
@@ -361,6 +375,7 @@ impl TxBufferPool {
         Self {
             small: Vec::with_capacity(small_cap),
             large: Vec::with_capacity(large_cap),
+            mtu,
             small_cap,
             large_cap,
             max_buf_cap: mtu.max(2048),
@@ -370,20 +385,16 @@ impl TxBufferPool {
     #[inline]
     fn checkout(&mut self, len: usize) -> Vec<u8> {
         let reused = if len <= SMALL_TX_POOL_MAX_BYTES {
-            self.small
-                .iter()
-                .rposition(|b| b.capacity() >= len)
-                .map(|idx| self.small.swap_remove(idx))
-                .or_else(|| self.small.pop())
+            self.small.pop()
+        } else if len <= self.mtu {
+            self.large.pop()
         } else {
-            self.large
-                .iter()
-                .rposition(|b| b.capacity() >= len)
-                .map(|idx| self.large.swap_remove(idx))
+            None
         };
 
         match reused {
             Some(mut buf) => {
+                debug_assert!(buf.capacity() >= len);
                 let prev_len = buf.len();
                 if prev_len >= len {
                     buf.truncate(len);
@@ -394,7 +405,16 @@ impl TxBufferPool {
                 }
                 buf
             }
-            None => vec![0u8; len],
+            None => {
+                let alloc_cap = if len <= SMALL_TX_POOL_MAX_BYTES {
+                    SMALL_TX_POOL_MAX_BYTES
+                } else {
+                    len.max(self.mtu)
+                };
+                let mut buf = Vec::with_capacity(alloc_cap);
+                buf.resize(len, 0);
+                buf
+            }
         }
     }
 
@@ -402,15 +422,17 @@ impl TxBufferPool {
     fn recycle_all(&mut self, incoming: &mut Vec<Vec<u8>>) {
         for buf in incoming.drain(..) {
             let cap = buf.capacity();
-            if !(40..=self.max_buf_cap).contains(&cap) {
+            if cap > self.max_buf_cap {
                 continue;
             }
-            if cap <= SMALL_TX_POOL_MAX_BYTES {
-                if self.small.len() < self.small_cap {
-                    self.small.push(buf);
+            if cap >= self.mtu {
+                if self.large.len() < self.large_cap {
+                    self.large.push(buf);
                 }
-            } else if self.large.len() < self.large_cap {
-                self.large.push(buf);
+            } else if (SMALL_TX_POOL_MAX_BYTES..=SMALL_TX_POOL_ADMIT_MAX_BYTES).contains(&cap)
+                && self.small.len() < self.small_cap
+            {
+                self.small.push(buf);
             }
         }
     }
@@ -446,11 +468,11 @@ struct VirtualDevice {
 
 impl VirtualDevice {
     fn new(mtu: usize, tx_queue_high_water: usize, low_memory: bool) -> Self {
-        let tx_queue_high_water = tx_queue_high_water.max(16);
+        let tx_queue_high_water = tx_queue_high_water.clamp(16, 64);
         let (small_cap, large_cap) = if low_memory {
             (16, 8)
         } else {
-            (64, tx_queue_high_water.clamp(32, 128))
+            (64, tx_queue_high_water.clamp(32, 64))
         };
         let recycle_cap = small_cap + large_cap;
         Self {
@@ -537,6 +559,7 @@ struct SocketEntry {
     created_at: StdInstant,
     saw_non_listen: bool,
     fin_wait_2_shortened: bool,
+    is_active: bool,
     closing_since: Option<StdInstant>,
     time_wait_since: Option<StdInstant>,
     /// Reactor-owned mirrors of `TcpSocketControl` state so idle sockets require zero mutex locks.
@@ -546,6 +569,192 @@ struct SocketEntry {
     recv_closing: bool,
     send_closing: bool,
     app_closed_both: bool,
+}
+
+/// Bounded pool of reusable `smoltcp` `TcpSocket` instances (each owning its RX/TX `Vec<u8>`
+/// ring buffers) and `TcpSocketControl` `RingBuffer`s. Eliminates ~1 MiB per-SYN heap
+/// allocation/decommit cycles and Windows NT HeapLock / TLB shootdowns during connection bursts.
+struct SocketBufferPool {
+    sockets: Vec<TcpSocket<'static>>,
+    control_recv: Vec<RingBuffer<'static, u8>>,
+    control_send: Vec<RingBuffer<'static, u8>>,
+    tcp_recv_size: usize,
+    tcp_send_size: usize,
+    control_recv_size: usize,
+    control_send_size: usize,
+    max_sockets: usize,
+    max_control: usize,
+}
+
+impl SocketBufferPool {
+    fn new(
+        tcp_recv_size: usize,
+        tcp_send_size: usize,
+        control_recv_size: usize,
+        control_send_size: usize,
+        low_memory: bool,
+    ) -> Self {
+        let cap = if low_memory {
+            SOCKET_POOL_CAP_LOW_MEM
+        } else {
+            SOCKET_POOL_CAP_DESKTOP
+        };
+        Self {
+            sockets: Vec::with_capacity(cap),
+            control_recv: Vec::with_capacity(cap),
+            control_send: Vec::with_capacity(cap),
+            tcp_recv_size,
+            tcp_send_size,
+            control_recv_size,
+            control_send_size,
+            max_sockets: cap,
+            max_control: cap,
+        }
+    }
+
+    #[inline]
+    fn checkout_socket(&mut self) -> TcpSocket<'static> {
+        self.sockets.pop().unwrap_or_else(|| {
+            TcpSocket::new(
+                TcpSocketBuffer::new(vec![0u8; self.tcp_recv_size]),
+                TcpSocketBuffer::new(vec![0u8; self.tcp_send_size]),
+            )
+        })
+    }
+
+    #[inline]
+    fn return_socket(&mut self, mut socket: TcpSocket<'static>) {
+        if self.sockets.len() >= self.max_sockets {
+            return;
+        }
+        if socket.recv_capacity() != self.tcp_recv_size
+            || socket.send_capacity() != self.tcp_send_size
+        {
+            return;
+        }
+        // Socket is already removed from `SocketSet`, so `abort()` only sets `State::Closed`
+        // (zero RST emitted). The next `socket.listen(...)` unconditionally calls `reset()`,
+        // clearing both smoltcp ring buffers, assembler, RTT estimator, and TCP sequence state.
+        socket.abort();
+        self.sockets.push(socket);
+    }
+
+    #[inline]
+    fn checkout_control_buffers(&mut self) -> (RingBuffer<'static, u8>, RingBuffer<'static, u8>) {
+        let mut recv = self
+            .control_recv
+            .pop()
+            .unwrap_or_else(|| RingBuffer::new(vec![0u8; self.control_recv_size]));
+        let mut send = self
+            .control_send
+            .pop()
+            .unwrap_or_else(|| RingBuffer::new(vec![0u8; self.control_send_size]));
+        recv.clear();
+        send.clear();
+        (recv, send)
+    }
+
+    #[inline]
+    fn return_control_recv(&mut self, mut buf: RingBuffer<'static, u8>) {
+        if self.control_recv.len() < self.max_control && buf.capacity() == self.control_recv_size {
+            buf.clear();
+            self.control_recv.push(buf);
+        }
+    }
+
+    #[inline]
+    fn return_control_send(&mut self, mut buf: RingBuffer<'static, u8>) {
+        if self.control_send.len() < self.max_control && buf.capacity() == self.control_send_size {
+            buf.clear();
+            self.control_send.push(buf);
+        }
+    }
+
+    #[inline]
+    fn reclaim_shared_buffers(&mut self, shared: SharedControl) {
+        match Arc::try_unwrap(shared) {
+            Ok(owned) => {
+                let control = owned
+                    .control
+                    .into_inner()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                self.return_control_recv(control.recv_buffer);
+                self.return_control_send(control.send_buffer);
+            }
+            Err(shared) => {
+                let (recv_buf, send_buf) = {
+                    let mut control = shared.lock_control();
+                    let send_buf = if matches!(control.send_state, HalfState::Closed)
+                        && control.send_buffer.capacity() == self.control_send_size
+                    {
+                        Some(std::mem::replace(
+                            &mut control.send_buffer,
+                            RingBuffer::new(Vec::new()),
+                        ))
+                    } else {
+                        None
+                    };
+                    let recv_buf = if matches!(control.recv_state, HalfState::Closed)
+                        && control.recv_buffer.is_empty()
+                        && control.recv_buffer.capacity() == self.control_recv_size
+                    {
+                        Some(std::mem::replace(
+                            &mut control.recv_buffer,
+                            RingBuffer::new(Vec::new()),
+                        ))
+                    } else {
+                        None
+                    };
+                    (recv_buf, send_buf)
+                };
+                if let Some(buf) = recv_buf {
+                    self.return_control_recv(buf);
+                }
+                if let Some(buf) = send_buf {
+                    self.return_control_send(buf);
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.sockets.is_empty() && self.control_recv.is_empty() && self.control_send.is_empty()
+    }
+
+    #[inline]
+    fn shrink_idle(&mut self) {
+        self.sockets.clear();
+        self.control_recv.clear();
+        self.control_send.clear();
+    }
+}
+
+#[inline]
+fn sync_active_flag(entry: &mut SocketEntry, active_count: &mut usize, now_active: bool) {
+    if entry.is_active != now_active {
+        entry.is_active = now_active;
+        if now_active {
+            *active_count = active_count.saturating_add(1);
+        } else {
+            *active_count = active_count.saturating_sub(1);
+        }
+    }
+}
+
+#[inline]
+fn should_reset_timer(
+    is_elapsed: bool,
+    timer_deadline: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+    desired: tokio::time::Instant,
+) -> bool {
+    is_elapsed
+        || timer_deadline.is_none_or(|cur| {
+            desired < cur
+                || cur <= now
+                || (desired > cur && cur.saturating_duration_since(now) < STALE_TIMER_SLACK)
+        })
 }
 
 enum InboundTcpKind {
@@ -676,6 +885,8 @@ fn evict_reclaimable_socket(
     socket_set: &mut SocketSet<'static>,
     sockets: &mut HashMap<SocketHandle, SocketEntry>,
     active_endpoints: &mut HashSet<(SocketAddr, SocketAddr)>,
+    active_count: &mut usize,
+    buffer_pool: &mut SocketBufferPool,
 ) -> bool {
     let mut best: Option<(SocketHandle, u8, StdInstant)> = None;
     for (&handle, entry) in sockets.iter() {
@@ -697,12 +908,11 @@ fn evict_reclaimable_socket(
     }
 
     if let Some((handle, _, _)) = best {
-        {
-            let socket = socket_set.get_mut::<TcpSocket>(handle);
-            socket.abort();
-        }
         if let Some(entry) = sockets.remove(&handle) {
             active_endpoints.remove(&entry.endpoints);
+            if entry.is_active {
+                *active_count = active_count.saturating_sub(1);
+            }
             let (send_waker, recv_waker) = {
                 let mut control = entry.shared.lock_control();
                 control.send_state = HalfState::Closed;
@@ -715,8 +925,10 @@ fn evict_reclaimable_socket(
             if let Some(w) = recv_waker {
                 w.wake();
             }
+            buffer_pool.reclaim_shared_buffers(entry.shared);
         }
-        socket_set.remove(handle);
+        let SmolSocket::Tcp(socket) = socket_set.remove(handle);
+        buffer_pool.return_socket(socket);
         true
     } else {
         false
@@ -724,7 +936,7 @@ fn evict_reclaimable_socket(
 }
 
 /// Decouples `TcpSocketControl` ring sizes from `smoltcp`'s `TcpSocketBuffer` so iOS
-/// (`<= 32 KiB`) uses 16 KiB control rings, `512 KiB` desktop uses 128 KiB, and
+/// (`<= 32 KiB`) uses 16 KiB control rings, standard/desktop (`< 1 MiB`) uses 64 KiB, and
 /// `>= 1 MiB` desktop buffers use 256 KiB rings to cut lock/notify frequency at 1 Gbps.
 fn control_ring_size(tcp_buffer_size: usize) -> usize {
     if tcp_buffer_size <= 32 * 1024 {
@@ -732,7 +944,7 @@ fn control_ring_size(tcp_buffer_size: usize) -> usize {
     } else if tcp_buffer_size >= 1024 * 1024 {
         tcp_buffer_size.min(256 * 1024)
     } else {
-        tcp_buffer_size.min(128 * 1024)
+        tcp_buffer_size.min(64 * 1024)
     }
 }
 
@@ -782,12 +994,22 @@ fn classify_inbound_tcp(frame: &[u8]) -> InboundTcpKind {
             if ip.next_header() != IpProtocol::Tcp {
                 return InboundTcpKind::Invalid;
             }
+            let src_ip = ip.src_addr();
+            let dst_ip = ip.dst_addr();
+            if src_ip.is_unspecified() || dst_ip.is_unspecified() {
+                return InboundTcpKind::Invalid;
+            }
             let Ok(tcp) = TcpPacket::new_checked(ip.payload()) else {
                 return InboundTcpKind::Invalid;
             };
+            let src_port = tcp.src_port();
+            let dst_port = tcp.dst_port();
+            if src_port == 0 || dst_port == 0 {
+                return InboundTcpKind::Invalid;
+            }
             if tcp.syn() && !tcp.ack() && !tcp.rst() && !tcp.fin() {
-                let src_addr = SocketAddr::new(IpAddr::V4(ip.src_addr()), tcp.src_port());
-                let dst_addr = SocketAddr::new(IpAddr::V4(ip.dst_addr()), tcp.dst_port());
+                let src_addr = SocketAddr::new(IpAddr::V4(src_ip), src_port);
+                let dst_addr = SocketAddr::new(IpAddr::V4(dst_ip), dst_port);
                 InboundTcpKind::InitialSyn(src_addr, dst_addr)
             } else {
                 InboundTcpKind::NonSyn
@@ -797,15 +1019,25 @@ fn classify_inbound_tcp(frame: &[u8]) -> InboundTcpKind {
             let Ok(ip) = Ipv6Packet::new_checked(frame) else {
                 return InboundTcpKind::Invalid;
             };
+            let src_ip = ip.src_addr();
+            let dst_ip = ip.dst_addr();
+            if src_ip.is_unspecified() || dst_ip.is_unspecified() {
+                return InboundTcpKind::Invalid;
+            }
             let Some(tcp_payload) = crate::packet::ipv6_tcp_payload(frame) else {
                 return InboundTcpKind::Invalid;
             };
             let Ok(tcp) = TcpPacket::new_checked(tcp_payload) else {
                 return InboundTcpKind::Invalid;
             };
+            let src_port = tcp.src_port();
+            let dst_port = tcp.dst_port();
+            if src_port == 0 || dst_port == 0 {
+                return InboundTcpKind::Invalid;
+            }
             if tcp.syn() && !tcp.ack() && !tcp.rst() && !tcp.fin() {
-                let src_addr = SocketAddr::new(IpAddr::V6(ip.src_addr()), tcp.src_port());
-                let dst_addr = SocketAddr::new(IpAddr::V6(ip.dst_addr()), tcp.dst_port());
+                let src_addr = SocketAddr::new(IpAddr::V6(src_ip), src_port);
+                let dst_addr = SocketAddr::new(IpAddr::V6(dst_ip), dst_port);
                 InboundTcpKind::InitialSyn(src_addr, dst_addr)
             } else {
                 InboundTcpKind::NonSyn
@@ -914,14 +1146,14 @@ async fn wait_shutdown(rx: &mut watch::Receiver<bool>) {
 }
 
 /// Computes the hard handle ceiling in `smoltcp`'s `SocketSet` (including `TimeWait`/closing
-/// handles). Tightened on `low_memory` (iOS ~50 MB Jetsam ceiling) from `2 * max_tcp_sessions`
-/// (256) to `max_tcp_sessions + 32` (160).
+/// handles): `max_tcp_sessions + 32` on `low_memory` (iOS ~50 MB Jetsam ceiling), and
+/// `max_tcp_sessions + 64` on desktop.
 #[inline]
 fn hard_handle_cap_for(max_tcp_sessions: usize, low_memory: bool) -> usize {
     if low_memory {
         max_tcp_sessions.saturating_add(32)
     } else {
-        max_tcp_sessions.saturating_mul(2)
+        max_tcp_sessions.saturating_add(64)
     }
 }
 
@@ -963,6 +1195,16 @@ pub(crate) fn spawn_tcp_netstack(
         let mut sockets_to_remove: Vec<SocketHandle> = Vec::new();
         let mut deferred_syns: VecDeque<(StdInstant, SocketAddr, Vec<u8>)> = VecDeque::new();
         let mut rx_batch: Vec<Vec<u8>> = Vec::with_capacity(INGRESS_DRAIN_LIMIT);
+        let mut buffer_pool = SocketBufferPool::new(
+            tcp_recv_buffer_size,
+            tcp_send_buffer_size,
+            control_recv_size,
+            control_send_size,
+            low_memory,
+        );
+        let mut active_count: usize = 0;
+        let mut socket_set_peak_slots: usize = 0;
+        let mut idle_since: Option<StdInstant> = None;
         let mut burst_iters: usize = 0;
         let mut zero_delay_spins: u32 = 0;
 
@@ -979,6 +1221,9 @@ pub(crate) fn spawn_tcp_netstack(
                                sockets: &mut HashMap<SocketHandle, SocketEntry>,
                                active_endpoints: &mut HashSet<(SocketAddr, SocketAddr)>,
                                listening_dsts: &mut HashSet<SocketAddr>,
+                               active_count: &mut usize,
+                               socket_set_peak_slots: &mut usize,
+                               buffer_pool: &mut SocketBufferPool,
                                stream_tx: &mpsc::Sender<TunNetstackTcpStream>,
                                notify: &Arc<Notify>,
                                reactor_notified: &Arc<AtomicBool>|
@@ -1007,22 +1252,22 @@ pub(crate) fn spawn_tcp_netstack(
                         // Count only active non-closing sockets (`Listen`, `SynReceived`, `Established`)
                         // against `max_tcp_sessions` so `TimeWait` and closing sockets cannot starve new
                         // connections, while still enforcing a hard handle cap (`max_tcp_sessions + 32`
-                        // on `low_memory`, `2 * max_tcp_sessions` otherwise) via immediate reclaim of
-                        // `TimeWait`/closing handles to protect iOS Jetsam RAM.
+                        // on `low_memory`, `max_tcp_sessions + 64` otherwise) via immediate reclaim of
+                        // `TimeWait`/closing handles.
                         if sockets.len() >= hard_handle_cap {
-                            let _ = evict_reclaimable_socket(socket_set, sockets, active_endpoints);
+                            let _ = evict_reclaimable_socket(
+                                socket_set,
+                                sockets,
+                                active_endpoints,
+                                active_count,
+                                buffer_pool,
+                            );
                         }
-                        let active_count = sockets
-                            .keys()
-                            .filter(|&&h| {
-                                is_active_tcp_state(socket_set.get::<TcpSocket>(h).state())
-                            })
-                            .count();
-                        if active_count >= max_tcp_sessions || sockets.len() >= hard_handle_cap {
+                        if *active_count >= max_tcp_sessions || sockets.len() >= hard_handle_cap {
                             debug!(
                                 %src_addr,
                                 %dst_addr,
-                                active = active_count,
+                                active = *active_count,
                                 total = sockets.len(),
                                 limit = max_tcp_sessions,
                                 "TCP session limit reached; sending RST+ACK"
@@ -1033,21 +1278,28 @@ pub(crate) fn spawn_tcp_netstack(
                             return EnqueueOutcome::Dropped;
                         }
 
-                        let mut socket = TcpSocket::new(
-                            TcpSocketBuffer::new(vec![0u8; tcp_recv_buffer_size]),
-                            TcpSocketBuffer::new(vec![0u8; tcp_send_buffer_size]),
-                        );
+                        let Ok(permit) = stream_tx.try_reserve() else {
+                            debug!(%src_addr, %dst_addr, "accepted TCP queue full; sending RST+ACK");
+                            if let Some(rst) = build_tcp_rst_ack_reply(&frame) {
+                                device.tx_queue.push_back(rst);
+                            }
+                            return EnqueueOutcome::Dropped;
+                        };
+
+                        let mut socket = buffer_pool.checkout_socket();
                         configure_local_tun_socket(&mut socket);
 
                         if let Err(err) = socket.listen(dst_addr) {
                             debug!(%src_addr, %dst_addr, error = ?err, "smoltcp listen failed");
+                            buffer_pool.return_socket(socket);
                             return EnqueueOutcome::Dropped;
                         }
 
+                        let (recv_buffer, send_buffer) = buffer_pool.checkout_control_buffers();
                         let shared = Arc::new(SocketShared::new(TcpSocketControl {
-                            send_buffer: RingBuffer::new(vec![0u8; control_send_size]),
+                            send_buffer,
                             send_waker: None,
-                            recv_buffer: RingBuffer::new(vec![0u8; control_recv_size]),
+                            recv_buffer,
                             recv_waker: None,
                             recv_state: HalfState::Normal,
                             send_state: HalfState::Normal,
@@ -1061,18 +1313,12 @@ pub(crate) fn spawn_tcp_netstack(
                             reactor_notified: Arc::clone(reactor_notified),
                             shared: Arc::clone(&shared),
                         };
-
-                        if stream_tx.try_send(stream).is_err() {
-                            debug!(%src_addr, %dst_addr, "accepted TCP queue full; sending RST+ACK");
-                            if let Some(rst) = build_tcp_rst_ack_reply(&frame) {
-                                device.tx_queue.push_back(rst);
-                            }
-                            return EnqueueOutcome::Dropped;
-                        }
+                        permit.send(stream);
 
                         let handle = socket_set.add(socket);
                         active_endpoints.insert((src_addr, dst_addr));
                         listening_dsts.insert(dst_addr);
+                        *active_count += 1;
                         sockets.insert(
                             handle,
                             SocketEntry {
@@ -1081,6 +1327,7 @@ pub(crate) fn spawn_tcp_netstack(
                                 created_at: wall_now,
                                 saw_non_listen: false,
                                 fin_wait_2_shortened: false,
+                                is_active: true,
                                 closing_since: None,
                                 time_wait_since: None,
                                 tx_has_pending: false,
@@ -1091,6 +1338,7 @@ pub(crate) fn spawn_tcp_netstack(
                                 app_closed_both: false,
                             },
                         );
+                        *socket_set_peak_slots = (*socket_set_peak_slots).max(sockets.len());
                         trace!(%src_addr, %dst_addr, "created TUN TCP socket");
                     }
 
@@ -1136,6 +1384,9 @@ pub(crate) fn spawn_tcp_netstack(
                     &mut sockets,
                     &mut active_endpoints,
                     &mut listening_dsts,
+                    &mut active_count,
+                    &mut socket_set_peak_slots,
+                    &mut buffer_pool,
                     &stream_tx,
                     &notify,
                     &reactor_notified,
@@ -1163,6 +1414,9 @@ pub(crate) fn spawn_tcp_netstack(
                     &mut sockets,
                     &mut active_endpoints,
                     &mut listening_dsts,
+                    &mut active_count,
+                    &mut socket_set_peak_slots,
+                    &mut buffer_pool,
                     &stream_tx,
                     &notify,
                     &reactor_notified,
@@ -1197,6 +1451,9 @@ pub(crate) fn spawn_tcp_netstack(
                     &mut sockets,
                     &mut active_endpoints,
                     &mut listening_dsts,
+                    &mut active_count,
+                    &mut socket_set_peak_slots,
+                    &mut buffer_pool,
                     &stream_tx,
                     &notify,
                     &reactor_notified,
@@ -1319,6 +1576,7 @@ pub(crate) fn spawn_tcp_netstack(
             // 4. Drain smoltcp RX buffers into application buffers, refill TX if freed, reap closed.
             //    Idle sockets bypass mutex locking completely.
             let mut post_poll_mutated = false;
+            let mut rx_drained = false;
             let mut earliest_reap_delay: Option<StdDuration> = None;
             sockets_to_remove.clear();
             listening_dsts.clear();
@@ -1376,13 +1634,16 @@ pub(crate) fn spawn_tcp_netstack(
                     continue;
                 }
 
-                // Rapidly reclaim TIME_WAIT sockets after 2s so bursty mobile apps don't hold
-                // memory or socket handles across 10s smoltcp CLOSE_DELAY windows.
+                // Rapidly reclaim TIME_WAIT sockets after 250ms (local zero-reorder TUN) once
+                // drained, removing directly from `socket_set` without calling `socket.abort()`
+                // so smoltcp never emits an unsolicited RST for gracefully closed connections.
                 if state == TcpState::TimeWait {
                     let since = *entry.time_wait_since.get_or_insert(wall_now);
                     let elapsed = wall_now.saturating_duration_since(since);
-                    if elapsed >= TIME_WAIT_REAP_TIMEOUT {
-                        socket.abort();
+                    if elapsed >= TIME_WAIT_REAP_TIMEOUT
+                        && (!socket.can_recv() || entry.recv_closing)
+                    {
+                        sockets_to_remove.push(handle);
                         let (send_waker, recv_waker) = {
                             let mut control = entry.shared.lock_control();
                             control.send_state = HalfState::Closed;
@@ -1395,11 +1656,13 @@ pub(crate) fn spawn_tcp_netstack(
                         if let Some(waker) = recv_waker {
                             waker.wake();
                         }
-                        post_poll_mutated = true;
                         continue;
                     }
-                    let rem = TIME_WAIT_REAP_TIMEOUT - elapsed;
-                    earliest_reap_delay = Some(earliest_reap_delay.map_or(rem, |d| d.min(rem)));
+                    if elapsed < TIME_WAIT_REAP_TIMEOUT {
+                        let rem = TIME_WAIT_REAP_TIMEOUT - elapsed;
+                        earliest_reap_delay =
+                            Some(earliest_reap_delay.map_or(rem, |d| d.min(rem)));
+                    }
                 } else {
                     entry.time_wait_since = None;
                 }
@@ -1415,10 +1678,16 @@ pub(crate) fn spawn_tcp_netstack(
                 // Fast path for discarded-reader sockets without locking control mutex.
                 if entry.recv_closing && !rx_dirty && !tx_dirty {
                     while socket.can_recv() {
-                        if socket.recv(|buf| (buf.len(), ())).is_err() {
-                            socket.abort();
-                            post_poll_mutated = true;
-                            break;
+                        match socket.recv(|buf| (buf.len(), buf.len())) {
+                            Ok(n) if n > 0 => {
+                                rx_drained = true;
+                            }
+                            Ok(_) => break,
+                            Err(_) => {
+                                socket.abort();
+                                post_poll_mutated = true;
+                                break;
+                            }
                         }
                     }
                 }
@@ -1464,6 +1733,7 @@ pub(crate) fn spawn_tcp_netstack(
                         if state == TcpState::Listen {
                             sockets_to_remove.push(handle);
                         } else {
+                            sync_active_flag(entry, &mut active_count, false);
                             post_poll_mutated = true;
                         }
                         continue;
@@ -1473,10 +1743,16 @@ pub(crate) fn spawn_tcp_netstack(
                     if matches!(control.recv_state, HalfState::Close) {
                         // Reader dropped; discard unread bytes so peer FIN can complete cleanly.
                         while socket.can_recv() {
-                            if socket.recv(|buf| (buf.len(), ())).is_err() {
-                                socket.abort();
-                                post_poll_mutated = true;
-                                break;
+                            match socket.recv(|buf| (buf.len(), buf.len())) {
+                                Ok(n) if n > 0 => {
+                                    rx_drained = true;
+                                }
+                                Ok(_) => break,
+                                Err(_) => {
+                                    socket.abort();
+                                    post_poll_mutated = true;
+                                    break;
+                                }
                             }
                         }
                         control.rx_backpressured = false;
@@ -1488,6 +1764,7 @@ pub(crate) fn spawn_tcp_netstack(
                             }) {
                                 Ok(n) if n > 0 => {
                                     wake_receiver = true;
+                                    rx_drained = true;
                                 }
                                 Ok(_) => break,
                                 Err(err) => {
@@ -1594,6 +1871,28 @@ pub(crate) fn spawn_tcp_netstack(
                 // Bound half-closed / peer-dropped closing states to 5s (disabling keep-alive
                 // probes that would otherwise keep resetting smoltcp's idle timer).
                 let current_state = socket.state();
+                if current_state == TcpState::TimeWait
+                    && (!socket.can_recv() || entry.recv_closing)
+                    && entry.time_wait_since.is_some_and(|since| {
+                        wall_now.saturating_duration_since(since) >= TIME_WAIT_REAP_TIMEOUT
+                    })
+                {
+                    sockets_to_remove.push(handle);
+                    let (send_waker, recv_waker) = {
+                        let mut control = entry.shared.lock_control();
+                        control.send_state = HalfState::Closed;
+                        control.recv_state = HalfState::Closed;
+                        (control.send_waker.take(), control.recv_waker.take())
+                    };
+                    if let Some(waker) = send_waker {
+                        waker.wake();
+                    }
+                    if let Some(waker) = recv_waker {
+                        waker.wake();
+                    }
+                    continue;
+                }
+
                 if entry.app_closed_both
                     && matches!(
                         current_state,
@@ -1612,6 +1911,7 @@ pub(crate) fn spawn_tcp_netstack(
                     let elapsed = wall_now.saturating_duration_since(since);
                     if elapsed >= CLOSING_REAP_TIMEOUT {
                         socket.abort();
+                        sync_active_flag(entry, &mut active_count, false);
                         let (send_waker, recv_waker) = {
                             let mut control = entry.shared.lock_control();
                             control.send_state = HalfState::Closed;
@@ -1631,6 +1931,7 @@ pub(crate) fn spawn_tcp_netstack(
                     earliest_reap_delay = Some(earliest_reap_delay.map_or(rem, |d| d.min(rem)));
                 }
 
+                sync_active_flag(entry, &mut active_count, is_active_tcp_state(current_state));
                 if current_state == TcpState::Listen {
                     listening_dsts.insert(entry.endpoints.1);
                 }
@@ -1639,8 +1940,44 @@ pub(crate) fn spawn_tcp_netstack(
             for handle in sockets_to_remove.drain(..) {
                 if let Some(entry) = sockets.remove(&handle) {
                     active_endpoints.remove(&entry.endpoints);
+                    if entry.is_active {
+                        active_count = active_count.saturating_sub(1);
+                    }
+                    buffer_pool.reclaim_shared_buffers(entry.shared);
                 }
-                socket_set.remove(handle);
+                let SmolSocket::Tcp(socket) = socket_set.remove(handle);
+                buffer_pool.return_socket(socket);
+            }
+
+            debug_assert_eq!(
+                active_count,
+                sockets
+                    .keys()
+                    .filter(|&&h| is_active_tcp_state(socket_set.get::<TcpSocket>(h).state()))
+                    .count()
+            );
+
+            if sockets.is_empty() {
+                if socket_set_peak_slots > SOCKET_SET_SHRINK_THRESHOLD {
+                    socket_set = SocketSet::new(Vec::new());
+                    socket_set_peak_slots = 0;
+                }
+                if !buffer_pool.is_empty() {
+                    let since = *idle_since.get_or_insert(wall_now);
+                    let elapsed = wall_now.saturating_duration_since(since);
+                    if elapsed >= POOL_IDLE_SHRINK_TIMEOUT {
+                        buffer_pool.shrink_idle();
+                        idle_since = None;
+                    } else {
+                        let rem = POOL_IDLE_SHRINK_TIMEOUT - elapsed;
+                        earliest_reap_delay =
+                            Some(earliest_reap_delay.map_or(rem, |d| d.min(rem)));
+                    }
+                } else {
+                    idle_since = None;
+                }
+            } else {
+                idle_since = None;
             }
 
             // 5. Flush ALL emitted outbound packets in one pass onto outbound_tx (zero silent drops).
@@ -1675,8 +2012,12 @@ pub(crate) fn spawn_tcp_netstack(
                 || device.tx_throttled
                 || post_poll_mutated
                 || deferred_ready;
-            let did_smoltcp_progress =
-                enqueued_any || pre_poll_tx || poll_changed || tx_emitted || post_poll_mutated;
+            let did_smoltcp_progress = enqueued_any
+                || pre_poll_tx
+                || poll_changed
+                || tx_emitted
+                || post_poll_mutated
+                || rx_drained;
 
             let immediate_poll = if has_pending_work {
                 zero_delay_spins = 0;
@@ -1724,7 +2065,7 @@ pub(crate) fn spawn_tcp_netstack(
                 effective_delay = Some(effective_delay.map_or(cap, |d| d.min(cap)));
             }
             if let Some(reap_delay) = earliest_reap_delay {
-                let reap_delay = reap_delay.max(StdDuration::from_millis(1));
+                let reap_delay = reap_delay.max(REAP_DELAY_FLOOR);
                 effective_delay = Some(effective_delay.map_or(reap_delay, |d| d.min(reap_delay)));
             }
 
@@ -1733,9 +2074,7 @@ pub(crate) fn spawn_tcp_netstack(
                 Some(delay) => {
                     let now_tokio = tokio::time::Instant::now();
                     let desired = now_tokio + delay;
-                    let needs_reset = timer.is_elapsed()
-                        || timer_deadline.is_none_or(|cur| desired < cur || cur <= now_tokio);
-                    if needs_reset {
+                    if should_reset_timer(timer.is_elapsed(), timer_deadline, now_tokio, desired) {
                         timer.as_mut().reset(desired);
                         timer_deadline = Some(desired);
                     }
@@ -1754,6 +2093,7 @@ pub(crate) fn spawn_tcp_netstack(
                     }
                 }
                 None => {
+                    timer_deadline = None;
                     tokio::select! {
                         biased;
                         _ = wait_shutdown(&mut shutdown_rx) => break 'runner,
@@ -1782,7 +2122,8 @@ mod tests {
         assert_eq!(control_ring_size(16 * 1024), 16 * 1024);
         assert_eq!(control_ring_size(32 * 1024), 16 * 1024);
         assert_eq!(control_ring_size(64 * 1024), 64 * 1024);
-        assert_eq!(control_ring_size(512 * 1024), 128 * 1024);
+        assert_eq!(control_ring_size(448 * 1024), 64 * 1024);
+        assert_eq!(control_ring_size(512 * 1024), 64 * 1024);
         assert_eq!(control_ring_size(1024 * 1024), 256 * 1024);
     }
 
@@ -1803,22 +2144,39 @@ mod tests {
     #[test]
     fn tx_buffer_pool_recycles_small_and_large_buffers_with_zeroed_headers() {
         let mut pool = TxBufferPool::new(16_384, 8, 8);
-        let mut incoming = vec![vec![0xFFu8; 64], vec![0xAAu8; 4096]];
-        let small_ptr = incoming[0].as_ptr();
-        let large_ptr = incoming[1].as_ptr();
+        let mut incoming = vec![
+            vec![0x11u8; 64],
+            vec![0x22u8; 4096],
+            vec![0xFFu8; SMALL_TX_POOL_MAX_BYTES],
+            vec![0xAAu8; 16_384],
+        ];
+        let small_ptr = incoming[2].as_ptr();
+        let large_ptr = incoming[3].as_ptr();
 
         pool.recycle_all(&mut incoming);
         assert!(incoming.is_empty());
+        assert_eq!(pool.small.len(), 1);
+        assert_eq!(pool.large.len(), 1);
 
         let small_out = pool.checkout(40);
         assert_eq!(small_out.len(), 40);
+        assert!(small_out.capacity() >= SMALL_TX_POOL_MAX_BYTES);
         assert_eq!(small_out.as_ptr(), small_ptr);
         assert!(small_out.iter().all(|&b| b == 0));
 
         let large_out = pool.checkout(1500);
         assert_eq!(large_out.len(), 1500);
+        assert!(large_out.capacity() >= 16_384);
         assert_eq!(large_out.as_ptr(), large_ptr);
         assert!(large_out[..TX_HEADER_ZERO_LEN].iter().all(|&b| b == 0));
+
+        let miss_small = pool.checkout(52);
+        assert_eq!(miss_small.len(), 52);
+        assert!(miss_small.capacity() >= SMALL_TX_POOL_MAX_BYTES);
+
+        let miss_large = pool.checkout(1500);
+        assert_eq!(miss_large.len(), 1500);
+        assert!(miss_large.capacity() >= 16_384);
     }
 
     #[tokio::test]
@@ -2442,9 +2800,12 @@ mod tests {
     #[test]
     fn low_memory_hard_handle_cap_and_icmpv6_tx_checksum_and_ipv6_ext_hdr_tcp() {
         assert_eq!(hard_handle_cap_for(128, true), 160);
-        assert_eq!(hard_handle_cap_for(512, false), 1024);
+        assert_eq!(hard_handle_cap_for(512, false), 576);
 
         let dev = VirtualDevice::new(1500, 128, true);
+        assert_eq!(dev.tx_queue_high_water, 64);
+        assert_eq!(VirtualDevice::new(1500, 4, false).tx_queue_high_water, 16);
+        assert_eq!(VirtualDevice::new(1500, 4096, false).tx_queue_high_water, 64);
         let caps = dev.capabilities();
         assert!(matches!(caps.checksum.ipv4, Checksum::Tx));
         assert!(matches!(caps.checksum.tcp, Checksum::Tx));
@@ -2723,6 +3084,330 @@ mod tests {
         }
 
         server_task.await.unwrap();
+        let _ = stop_tx.send(true);
+        let _ = tokio::time::timeout(StdDuration::from_secs(2), runner_handle).await;
+    }
+
+    #[test]
+    fn classify_inbound_tcp_rejects_unspecified_ips_and_zero_ports() {
+        let build_v4 = |src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16, flags: u8| -> Vec<u8> {
+            let mut pkt = vec![0u8; 40];
+            pkt[0] = 0x45;
+            pkt[2..4].copy_from_slice(&40u16.to_be_bytes());
+            pkt[8] = 64;
+            pkt[9] = IP_PROTO_TCP;
+            pkt[12..16].copy_from_slice(&src);
+            pkt[16..20].copy_from_slice(&dst);
+            pkt[20..22].copy_from_slice(&sport.to_be_bytes());
+            pkt[22..24].copy_from_slice(&dport.to_be_bytes());
+            pkt[32] = 0x50;
+            pkt[33] = flags;
+            pkt
+        };
+        let build_v6 = |src: std::net::Ipv6Addr,
+                        dst: std::net::Ipv6Addr,
+                        sport: u16,
+                        dport: u16,
+                        flags: u8|
+         -> Vec<u8> {
+            let mut pkt = vec![0u8; 60];
+            pkt[0] = 0x60;
+            pkt[4..6].copy_from_slice(&20u16.to_be_bytes());
+            pkt[6] = IP_PROTO_TCP;
+            pkt[7] = 64;
+            pkt[8..24].copy_from_slice(&src.octets());
+            pkt[24..40].copy_from_slice(&dst.octets());
+            pkt[40..42].copy_from_slice(&sport.to_be_bytes());
+            pkt[42..44].copy_from_slice(&dport.to_be_bytes());
+            pkt[52] = 0x50;
+            pkt[53] = flags;
+            pkt
+        };
+
+        assert!(matches!(
+            classify_inbound_tcp(&build_v4([0, 0, 0, 0], [1, 1, 1, 1], 1234, 443, 0x02)),
+            InboundTcpKind::Invalid
+        ));
+        assert!(matches!(
+            classify_inbound_tcp(&build_v4([198, 18, 0, 1], [0, 0, 0, 0], 1234, 443, 0x10)),
+            InboundTcpKind::Invalid
+        ));
+        assert!(matches!(
+            classify_inbound_tcp(&build_v4([198, 18, 0, 1], [1, 1, 1, 1], 0, 443, 0x02)),
+            InboundTcpKind::Invalid
+        ));
+        assert!(matches!(
+            classify_inbound_tcp(&build_v4([198, 18, 0, 1], [1, 1, 1, 1], 1234, 0, 0x02)),
+            InboundTcpKind::Invalid
+        ));
+        assert!(matches!(
+            classify_inbound_tcp(&build_v4([198, 18, 0, 1], [1, 1, 1, 1], 1234, 443, 0x02)),
+            InboundTcpKind::InitialSyn(_, _)
+        ));
+        assert!(matches!(
+            classify_inbound_tcp(&build_v4([198, 18, 0, 1], [1, 1, 1, 1], 1234, 443, 0x10)),
+            InboundTcpKind::NonSyn
+        ));
+
+        let v6_src = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let v6_dst = std::net::Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111);
+        let v6_unspec = std::net::Ipv6Addr::UNSPECIFIED;
+        assert!(matches!(
+            classify_inbound_tcp(&build_v6(v6_unspec, v6_dst, 1234, 443, 0x02)),
+            InboundTcpKind::Invalid
+        ));
+        assert!(matches!(
+            classify_inbound_tcp(&build_v6(v6_src, v6_unspec, 1234, 443, 0x10)),
+            InboundTcpKind::Invalid
+        ));
+        assert!(matches!(
+            classify_inbound_tcp(&build_v6(v6_src, v6_dst, 0, 443, 0x02)),
+            InboundTcpKind::Invalid
+        ));
+        assert!(matches!(
+            classify_inbound_tcp(&build_v6(v6_src, v6_dst, 1234, 0, 0x02)),
+            InboundTcpKind::Invalid
+        ));
+        assert!(matches!(
+            classify_inbound_tcp(&build_v6(v6_src, v6_dst, 1234, 443, 0x02)),
+            InboundTcpKind::InitialSyn(_, _)
+        ));
+        assert!(matches!(
+            classify_inbound_tcp(&build_v6(v6_src, v6_dst, 1234, 443, 0x10)),
+            InboundTcpKind::NonSyn
+        ));
+    }
+
+    #[test]
+    fn socket_buffer_pool_recycles_sockets_and_control_rings_and_shrinks_idle() {
+        let mut pool = SocketBufferPool::new(64 * 1024, 64 * 1024, 16 * 1024, 16 * 1024, false);
+        assert!(pool.is_empty());
+
+        let mut sock = pool.checkout_socket();
+        configure_local_tun_socket(&mut sock);
+        let dst: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        sock.listen(dst).unwrap();
+        pool.return_socket(sock);
+        assert_eq!(pool.sockets.len(), 1);
+
+        let mut reused = pool.checkout_socket();
+        assert_eq!(pool.sockets.len(), 0);
+        assert_eq!(reused.state(), TcpState::Closed);
+        assert_eq!(reused.recv_capacity(), 64 * 1024);
+        assert_eq!(reused.send_capacity(), 64 * 1024);
+        configure_local_tun_socket(&mut reused);
+        reused.listen(dst).unwrap();
+        pool.return_socket(reused);
+
+        // Shared Arc with unread recv bytes: send_buffer reclaims safely while unread recv_buffer stays intact.
+        let (mut recv_buf, send_buf) = pool.checkout_control_buffers();
+        assert_eq!(recv_buf.enqueue_slice(b"abc"), 3);
+        let shared = Arc::new(SocketShared::new(TcpSocketControl {
+            send_buffer: send_buf,
+            send_waker: None,
+            recv_buffer: recv_buf,
+            recv_waker: None,
+            recv_state: HalfState::Closed,
+            send_state: HalfState::Closed,
+            rx_backpressured: false,
+        }));
+        let stream_ref = Arc::clone(&shared);
+        pool.reclaim_shared_buffers(shared);
+        assert_eq!(pool.control_send.len(), 1);
+        assert_eq!(pool.control_recv.len(), 0);
+        assert_eq!(stream_ref.lock_control().recv_buffer.len(), 3);
+        drop(stream_ref);
+
+        // Uniquely owned Arc: both control rings reclaim and clear before reuse.
+        let (mut recv_buf2, mut send_buf2) = pool.checkout_control_buffers();
+        assert_eq!(recv_buf2.enqueue_slice(b"hello"), 5);
+        assert_eq!(send_buf2.enqueue_slice(b"world"), 5);
+        let shared2 = Arc::new(SocketShared::new(TcpSocketControl {
+            send_buffer: send_buf2,
+            send_waker: None,
+            recv_buffer: recv_buf2,
+            recv_waker: None,
+            recv_state: HalfState::Closed,
+            send_state: HalfState::Closed,
+            rx_backpressured: false,
+        }));
+        pool.reclaim_shared_buffers(shared2);
+        assert_eq!(pool.control_recv.len(), 1);
+        assert_eq!(pool.control_send.len(), 1);
+
+        let (clean_recv, clean_send) = pool.checkout_control_buffers();
+        assert!(clean_recv.is_empty());
+        assert!(clean_send.is_empty());
+        pool.return_control_recv(clean_recv);
+        pool.return_control_send(clean_send);
+        assert!(!pool.is_empty());
+
+        pool.shrink_idle();
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn should_reset_timer_clears_stale_short_deadlines_and_keeps_far_deadlines() {
+        let now = tokio::time::Instant::now();
+        assert!(should_reset_timer(
+            true,
+            Some(now + StdDuration::from_secs(5)),
+            now,
+            now + StdDuration::from_secs(10),
+        ));
+        assert!(should_reset_timer(
+            false,
+            None,
+            now,
+            now + StdDuration::from_secs(10),
+        ));
+        assert!(should_reset_timer(
+            false,
+            Some(now + StdDuration::from_secs(10)),
+            now,
+            now + StdDuration::from_secs(1),
+        ));
+        assert!(should_reset_timer(
+            false,
+            Some(now),
+            now,
+            now + StdDuration::from_secs(1),
+        ));
+        assert!(should_reset_timer(
+            false,
+            Some(now + StdDuration::from_millis(10)),
+            now,
+            now + StdDuration::from_secs(10),
+        ));
+        assert!(!should_reset_timer(
+            false,
+            Some(now + StdDuration::from_millis(200)),
+            now,
+            now + StdDuration::from_secs(10),
+        ));
+    }
+
+    #[tokio::test]
+    async fn time_wait_reaps_within_250ms_without_unsolicited_rst() {
+        const MTU: usize = 1500;
+        const BUF: usize = 32 * 1024;
+
+        let (in_tx, in_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (stop_tx, stop_rx) = watch::channel(false);
+
+        let (mut stream_rx, runner_handle) =
+            spawn_tcp_netstack(in_rx, out_tx, MTU, BUF, BUF, 4, 64, stop_rx).unwrap();
+
+        let clock = MonotonicClock::new();
+        let mut client_dev = VirtualDevice::new(MTU, 64, true);
+        let mut client_cfg = InterfaceConfig::new(HardwareAddress::Ip);
+        client_cfg.random_seed = 0x4242_1337_cafe_f00d;
+        let mut client_iface = Interface::new(client_cfg, &mut client_dev, clock.now());
+        client_iface.update_ip_addrs(|addrs| {
+            let _ = addrs.push(IpCidr::new(IpAddress::v4(198, 18, 0, 1), 30));
+        });
+        client_iface
+            .routes_mut()
+            .add_default_ipv4_route(Ipv4Address::new(198, 18, 0, 2))
+            .unwrap();
+
+        let mut client_sockets = SocketSet::new(Vec::new());
+        let mut client_sock = TcpSocket::new(
+            TcpSocketBuffer::new(vec![0u8; BUF]),
+            TcpSocketBuffer::new(vec![0u8; BUF]),
+        );
+        configure_local_tun_socket(&mut client_sock);
+        client_sock
+            .connect(
+                client_iface.context(),
+                (Ipv4Address::new(1, 1, 1, 1), 443),
+                49_500,
+            )
+            .unwrap();
+        let client_handle = client_sockets.add(client_sock);
+
+        client_iface.poll(clock.now(), &mut client_dev, &mut client_sockets);
+        in_tx
+            .send(client_dev.tx_queue.pop_front().expect("SYN emitted"))
+            .await
+            .unwrap();
+
+        let mut server_stream = tokio::time::timeout(StdDuration::from_secs(3), stream_rx.recv())
+            .await
+            .expect("accept timeout")
+            .expect("accepted stream");
+
+        // Server initiates active close so the netstack side transitions into TIME_WAIT.
+        let server_task = tokio::spawn(async move {
+            server_stream.write_all(b"BYE").await.unwrap();
+            server_stream.shutdown().await.unwrap();
+        });
+
+        let mut received = Vec::new();
+        let mut client_closed = false;
+        let mut saw_rst = false;
+        let deadline = StdInstant::now() + StdDuration::from_secs(5);
+        loop {
+            assert!(
+                StdInstant::now() < deadline,
+                "TIME_WAIT close timed out (received={received:?})"
+            );
+            while let Ok(pkt) = out_rx.try_recv() {
+                if let Ok(ip) = Ipv4Packet::new_checked(&pkt) {
+                    if let Ok(tcp) = TcpPacket::new_checked(ip.payload()) {
+                        if tcp.rst() {
+                            saw_rst = true;
+                        }
+                    }
+                }
+                client_dev.rx_queue.push_back(pkt);
+            }
+            client_iface.poll(clock.now(), &mut client_dev, &mut client_sockets);
+            {
+                let sock = client_sockets.get_mut::<TcpSocket>(client_handle);
+                while sock.can_recv() {
+                    sock.recv(|buf| {
+                        received.extend_from_slice(buf);
+                        (buf.len(), ())
+                    })
+                    .unwrap();
+                }
+                if received == b"BYE" && !sock.may_recv() && !client_closed {
+                    sock.close();
+                    client_closed = true;
+                }
+            }
+            client_iface.poll(clock.now(), &mut client_dev, &mut client_sockets);
+            while let Some(pkt) = client_dev.tx_queue.pop_front() {
+                in_tx.send(pkt).await.unwrap();
+            }
+            if received == b"BYE"
+                && client_sockets.get::<TcpSocket>(client_handle).state() == TcpState::Closed
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        server_task.await.unwrap();
+
+        // Wait past the 250ms TIME_WAIT_REAP_TIMEOUT and verify zero unsolicited RSTs are emitted.
+        tokio::time::sleep(StdDuration::from_millis(350)).await;
+        while let Ok(pkt) = out_rx.try_recv() {
+            if let Ok(ip) = Ipv4Packet::new_checked(&pkt) {
+                if let Ok(tcp) = TcpPacket::new_checked(ip.payload()) {
+                    if tcp.rst() {
+                        saw_rst = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            !saw_rst,
+            "TIME_WAIT reap must not emit an unsolicited TCP RST"
+        );
+
         let _ = stop_tx.send(true);
         let _ = tokio::time::timeout(StdDuration::from_secs(2), runner_handle).await;
     }

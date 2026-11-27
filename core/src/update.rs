@@ -965,14 +965,22 @@ async fn read_response_text_bounded(
     String::from_utf8(buf).with_context(|| format!("{label} response was not valid UTF-8"))
 }
 
-async fn download_to_file(client: &Client, url: &str, dest: &Path, max_bytes: u64) -> Result<()> {
+async fn download_to_file(
+    client: &mut Client,
+    url: &str,
+    dest: &Path,
+    max_bytes: u64,
+) -> Result<()> {
     validate_github_download_url(url, "release archive")?;
-    let mut resp = client
-        .get(url)
-        .timeout(DOWNLOAD_TIMEOUT)
-        .send()
-        .await
-        .with_context(|| format!("failed to download {url}"))?;
+    let mut resp = send_get_with_no_proxy_fallback(
+        client,
+        RedirectTargetPolicy::GitHubDownload,
+        url,
+        None,
+        Some(DOWNLOAD_TIMEOUT),
+    )
+    .await
+    .with_context(|| format!("failed to download {url}"))?;
 
     if !resp.status().is_success() {
         bail!("failed to download {url} (HTTP {})", resp.status().as_u16());
@@ -1235,24 +1243,12 @@ fn verify_extracted_windows_companions_against(
                 let _ = fs::remove_file(&verified_path);
                 bail!("extracted wintun.dll is empty: {}", verified_path.display());
             }
-            let Some(expected_sums_sha) = expected_wintun_sha.as_deref() else {
+            if sums_text.is_none() && pinned_wintun_sha.is_none() {
                 let _ = fs::remove_file(&verified_path);
                 bail!(
-                    "refusing extracted wintun.dll: SHA256SUMS.txt does not contain a SHA-256 entry for wintun.dll"
+                    "refusing extracted wintun.dll: SHA256SUMS.txt is absent and no explicit pinned WINTUN_DLL_SHA256 was provided"
                 );
-            };
-            let expected_pinned_sha = match pinned_wintun_sha {
-                Some(sha) => sha,
-                None => match crate::platform::windows_tun::expected_wintun_dll_sha256() {
-                    Ok(sha) => sha,
-                    Err(err) => {
-                        let _ = fs::remove_file(&verified_path);
-                        return Err(err).context(
-                            "refusing extracted wintun.dll: unable to resolve pinned WINTUN_DLL_SHA256",
-                        );
-                    }
-                },
-            };
+            }
             let actual_sha = match sha256_file(&verified_path) {
                 Ok(sha) => sha,
                 Err(err) => {
@@ -1260,17 +1256,31 @@ fn verify_extracted_windows_companions_against(
                     return Err(err);
                 }
             };
-            if !actual_sha.eq_ignore_ascii_case(expected_sums_sha) {
-                let _ = fs::remove_file(&verified_path);
-                bail!(
-                    "extracted wintun.dll SHA-256 mismatch against SHA256SUMS.txt: expected {expected_sums_sha}, got {actual_sha}"
+            if let Some(expected_sums_sha) = expected_wintun_sha.as_deref() {
+                if !actual_sha.eq_ignore_ascii_case(expected_sums_sha) {
+                    let _ = fs::remove_file(&verified_path);
+                    bail!(
+                        "extracted wintun.dll SHA-256 mismatch against SHA256SUMS.txt: expected {expected_sums_sha}, got {actual_sha}"
+                    );
+                }
+            } else if sums_text.is_some() {
+                // The parent release zip was already SHA-256 verified against SHA256SUMS.txt.
+                // Do not fail-closed against the OLD running binary's compile-time Wintun hash
+                // when SHA256SUMS.txt has no separate wintun.dll entry; let the new binary's
+                // `install --upgrade` / runtime loader validate its own Wintun pin.
+                debug!(
+                    path = %verified_path.display(),
+                    sha256 = %actual_sha,
+                    "extracted wintun.dll accepted via verified archive SHA-256 (no separate SHA256SUMS.txt entry)"
                 );
             }
-            if !actual_sha.eq_ignore_ascii_case(expected_pinned_sha) {
-                let _ = fs::remove_file(&verified_path);
-                bail!(
-                    "extracted wintun.dll SHA-256 mismatch against pinned WINTUN_DLL_SHA256: expected {expected_pinned_sha}, got {actual_sha}"
-                );
+            if let Some(expected_pinned_sha) = pinned_wintun_sha {
+                if !actual_sha.eq_ignore_ascii_case(expected_pinned_sha) {
+                    let _ = fs::remove_file(&verified_path);
+                    bail!(
+                        "extracted wintun.dll SHA-256 mismatch against pinned WINTUN_DLL_SHA256: expected {expected_pinned_sha}, got {actual_sha}"
+                    );
+                }
             }
         }
     }
@@ -1670,23 +1680,95 @@ fn error_is_permission_denied(err: &anyhow::Error) -> bool {
     })
 }
 
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_SEE_MASK_NOCLOSEPROCESS: u32 = 0x0000_0040;
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_SEE_MASK_NOASYNC: u32 = 0x0000_0100;
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_SEE_MASK_FLAG_NO_UI: u32 = 0x0000_0400;
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_ELEVATED_SHELL_EXECUTE_MASK: u32 =
+    WINDOWS_SEE_MASK_NOCLOSEPROCESS | WINDOWS_SEE_MASK_NOASYNC | WINDOWS_SEE_MASK_FLAG_NO_UI;
+
+#[cfg(any(target_os = "windows", test))]
+fn env_flag_is_truthy(val: &str) -> bool {
+    let trimmed = val.trim();
+    !trimmed.is_empty()
+        && !matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+}
+
+/// Returns `Some(reason)` when Windows UAC elevation must be refused (headless CI, SSH,
+/// explicit `VDPI_NONINTERACTIVE`, or Session 0 Windows service). Intentionally does NOT
+/// check `stdin().is_terminal()` / `stdout().is_terminal()` so Git Bash / MSYS2 Mintty
+/// PTYs (whose pipes report `!is_terminal()` on Windows) still trigger UAC cleanly.
+#[cfg(any(target_os = "windows", test))]
+fn windows_elevation_blocked_reason_with<F>(
+    is_service: bool,
+    mut env_var: F,
+) -> Option<&'static str>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    if is_service {
+        return Some("running inside a non-interactive Windows service session");
+    }
+    if env_var("VDPI_NONINTERACTIVE")
+        .as_deref()
+        .is_some_and(env_flag_is_truthy)
+    {
+        return Some("VDPI_NONINTERACTIVE is set");
+    }
+    for key in [
+        "CI",
+        "GITHUB_ACTIONS",
+        "GITLAB_CI",
+        "TF_BUILD",
+        "JENKINS_URL",
+        "BUILDKITE",
+        "CIRCLECI",
+        "APPVEYOR",
+        "TEAMCITY_VERSION",
+    ] {
+        if env_var(key).as_deref().is_some_and(env_flag_is_truthy) {
+            return Some("running in a CI/headless environment");
+        }
+    }
+    for key in ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"] {
+        if env_var(key)
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty())
+        {
+            return Some("running inside an SSH session");
+        }
+    }
+    None
+}
+
 #[cfg(target_os = "windows")]
 fn run_windows_elevated_binary(bin: &Path, args: &[&str]) -> Result<()> {
     use std::ffi::c_void;
-    use std::io::IsTerminal;
     use std::os::windows::ffi::OsStrExt;
     use std::ptr;
 
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+    if let Some(reason) = windows_elevation_blocked_reason_with(
+        crate::platform::windows::is_running_as_service(),
+        |key| std::env::var(key).ok(),
+    ) {
         bail!(
-            "Administrator privileges are required to update the vdpi Windows service in non-interactive mode. Re-run 'vdpi update' from an elevated Administrator terminal."
+            "Administrator privileges are required to update the vdpi Windows service ({reason}). Re-run 'vdpi update' from an elevated Administrator terminal."
         );
     }
 
     type Bool = i32;
     type Dword = u32;
 
-    const SEE_MASK_NOCLOSEPROCESS: Dword = 0x0000_0040;
+    const COINIT_APARTMENTTHREADED: Dword = 0x0000_0002;
+    const COINIT_DISABLE_OLE1DDE: Dword = 0x0000_0004;
+    const S_OK: i32 = 0;
+    const S_FALSE: i32 = 1;
     const SW_HIDE: i32 = 0;
     const INFINITE: Dword = 0xFFFF_FFFF;
     const WAIT_OBJECT_0: Dword = 0;
@@ -1723,6 +1805,43 @@ fn run_windows_elevated_binary(bin: &Path, args: &[&str]) -> Result<()> {
     #[link(name = "shell32")]
     extern "system" {
         fn ShellExecuteExW(p_exec_info: *mut ShellExecuteInfoW) -> Bool;
+    }
+
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoInitializeEx(pv_reserved: *mut c_void, dw_co_init: Dword) -> i32;
+        fn CoUninitialize();
+    }
+
+    struct ComStaGuard {
+        should_uninitialize: bool,
+    }
+
+    impl ComStaGuard {
+        fn init() -> Self {
+            // SAFETY: Initializes COM STA (without OLE1 DDE) on the current thread for
+            // `ShellExecuteExW`. Only `S_OK` / `S_FALSE` must be balanced by `CoUninitialize`.
+            let hr = unsafe {
+                CoInitializeEx(
+                    ptr::null_mut(),
+                    COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
+                )
+            };
+            Self {
+                should_uninitialize: hr == S_OK || hr == S_FALSE,
+            }
+        }
+    }
+
+    impl Drop for ComStaGuard {
+        fn drop(&mut self) {
+            if self.should_uninitialize {
+                // SAFETY: Balances the matching `S_OK` / `S_FALSE` `CoInitializeEx` on this thread.
+                unsafe {
+                    CoUninitialize();
+                }
+            }
+        }
     }
 
     fn to_wide_null(value: &OsStr) -> Vec<u16> {
@@ -1771,7 +1890,7 @@ fn run_windows_elevated_binary(bin: &Path, args: &[&str]) -> Result<()> {
 
     let mut info = ShellExecuteInfoW {
         cb_size: std::mem::size_of::<ShellExecuteInfoW>() as Dword,
-        f_mask: SEE_MASK_NOCLOSEPROCESS,
+        f_mask: WINDOWS_ELEVATED_SHELL_EXECUTE_MASK,
         hwnd: ptr::null_mut(),
         lp_verb: verb_wide.as_ptr(),
         lp_file: file_wide.as_ptr(),
@@ -1791,6 +1910,7 @@ fn run_windows_elevated_binary(bin: &Path, args: &[&str]) -> Result<()> {
         h_process: ptr::null_mut(),
     };
 
+    let _com_guard = ComStaGuard::init();
     // SAFETY: `info` and all wide-string buffers live across the `ShellExecuteExW` call.
     let ok = unsafe { ShellExecuteExW(&mut info) };
     if ok == 0 {
@@ -2011,10 +2131,61 @@ fn unique_windows_backup_path(dir: &Path, prefix: &str, suffix: &str) -> Result<
     )
 }
 
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_RENAME_RETRY_DELAYS_MS: &[u64] = &[25, 50, 100, 200, 300, 500];
+
+#[cfg(any(target_os = "windows", test))]
+fn is_transient_windows_rename_error(err: &io::Error) -> bool {
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+    const ERROR_USER_MAPPED_FILE: i32 = 1224;
+
+    err.kind() == io::ErrorKind::PermissionDenied
+        || matches!(
+            err.raw_os_error(),
+            Some(
+                ERROR_ACCESS_DENIED
+                    | ERROR_SHARING_VIOLATION
+                    | ERROR_LOCK_VIOLATION
+                    | ERROR_USER_MAPPED_FILE
+            )
+        )
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn retry_windows_rename_with<F, S>(mut op: F, mut sleep_fn: S) -> io::Result<()>
+where
+    F: FnMut() -> io::Result<()>,
+    S: FnMut(Duration),
+{
+    let mut attempt = 0usize;
+    loop {
+        match op() {
+            Ok(()) => return Ok(()),
+            Err(err)
+                if is_transient_windows_rename_error(&err)
+                    && attempt < WINDOWS_RENAME_RETRY_DELAYS_MS.len() =>
+            {
+                sleep_fn(Duration::from_millis(
+                    WINDOWS_RENAME_RETRY_DELAYS_MS[attempt],
+                ));
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn rename_windows_with_retry(from: &Path, to: &Path) -> io::Result<()> {
+    retry_windows_rename_with(|| fs::rename(from, to), std::thread::sleep)
+}
+
 #[cfg(target_os = "windows")]
 fn rollback_windows_file(backup: Option<&Path>, target: &Path) -> Result<()> {
     if let Some(backup_path) = backup {
-        fs::rename(backup_path, target).with_context(|| {
+        rename_windows_with_retry(backup_path, target).with_context(|| {
             format!(
                 "failed to restore backup {} to {}",
                 backup_path.display(),
@@ -2040,6 +2211,7 @@ fn swap_staged_windows_wintun(staged_new: &Path, exe_dir: &Path) -> Result<Optio
         Ok(_) => true,
         Err(e) if e.kind() == io::ErrorKind::NotFound => false,
         Err(e) => {
+            let _ = fs::remove_file(staged_new);
             return Err(e).with_context(|| {
                 format!(
                     "failed to inspect existing wintun.dll {}",
@@ -2050,8 +2222,15 @@ fn swap_staged_windows_wintun(staged_new: &Path, exe_dir: &Path) -> Result<Optio
     };
 
     let backup_path = if target_exists {
-        let backup = unique_windows_backup_path(exe_dir, "wintun.old", ".dll")?;
-        if let Err(err) = fs::rename(&target_wintun, &backup) {
+        let backup = match unique_windows_backup_path(exe_dir, "wintun.old", ".dll") {
+            Ok(path) => path,
+            Err(err) => {
+                let _ = fs::remove_file(staged_new);
+                return Err(err);
+            }
+        };
+        if let Err(err) = rename_windows_with_retry(&target_wintun, &backup) {
+            let _ = fs::remove_file(staged_new);
             return Err(err).with_context(|| {
                 format!(
                     "failed to move current wintun.dll {} to {}",
@@ -2065,15 +2244,24 @@ fn swap_staged_windows_wintun(staged_new: &Path, exe_dir: &Path) -> Result<Optio
         None
     };
 
-    if let Err(err) = fs::rename(staged_new, &target_wintun) {
-        let _ = fs::remove_file(staged_new);
+    if let Err(err) = rename_windows_with_retry(staged_new, &target_wintun) {
+        let mut rollback_ok = true;
         let rollback_note = match &backup_path {
             Some(backup) => match rollback_windows_file(Some(backup), &target_wintun) {
                 Ok(()) => "restored previous wintun.dll".to_string(),
-                Err(rb_err) => format!("rollback of previous wintun.dll FAILED: {rb_err:#}"),
+                Err(rb_err) => {
+                    rollback_ok = false;
+                    format!(
+                        "rollback of previous wintun.dll FAILED: {rb_err:#}; preserved staged DLL at {}",
+                        staged_new.display()
+                    )
+                }
             },
             None => "no previous wintun.dll to restore".to_string(),
         };
+        if rollback_ok {
+            let _ = fs::remove_file(staged_new);
+        }
         return Err(err).with_context(|| {
             format!(
                 "failed to place new wintun.dll at {} ({rollback_note})",
@@ -2088,13 +2276,7 @@ fn swap_staged_windows_wintun(staged_new: &Path, exe_dir: &Path) -> Result<Optio
 #[cfg(all(target_os = "windows", test))]
 fn atomic_swap_windows_wintun(src_wintun: &Path, exe_dir: &Path) -> Result<()> {
     let staged_new = stage_windows_file_unique(src_wintun, exe_dir, "wintun.new", ".dll")?;
-    let backup = match swap_staged_windows_wintun(&staged_new, exe_dir) {
-        Ok(backup) => backup,
-        Err(err) => {
-            let _ = fs::remove_file(&staged_new);
-            return Err(err);
-        }
-    };
+    let backup = swap_staged_windows_wintun(&staged_new, exe_dir)?;
     if let Some(backup_path) = backup {
         let _ = fs::remove_file(backup_path);
     }
@@ -2119,7 +2301,7 @@ fn replace_portable_binary_in_dir(
         Some(src_wintun) => {
             let Some(expected_sha) = expected_wintun_sha256 else {
                 let _ = fs::remove_file(&staged_new_exe);
-                bail!("refusing to stage wintun.dll without a pinned expected SHA-256 digest");
+                bail!("refusing to stage wintun.dll without a verified expected SHA-256 digest");
             };
             let staged_path =
                 match stage_windows_file_unique(src_wintun, exe_dir, "wintun.new", ".dll") {
@@ -2136,7 +2318,7 @@ fn replace_portable_binary_in_dir(
                 let _ = fs::remove_file(&staged_new_exe);
                 return Err(err).with_context(|| {
                     format!(
-                        "staged wintun.dll failed pinned SHA-256 re-verification: {}",
+                        "staged wintun.dll failed SHA-256 re-verification: {}",
                         staged_path.display()
                     )
                 });
@@ -2154,7 +2336,6 @@ fn replace_portable_binary_in_dir(
         match swap_staged_windows_wintun(staged_wintun, exe_dir) {
             Ok(backup) => (true, backup),
             Err(err) => {
-                let _ = fs::remove_file(staged_wintun);
                 let _ = fs::remove_file(&staged_new_exe);
                 return Err(err);
             }
@@ -2179,7 +2360,7 @@ fn replace_portable_binary_in_dir(
         }
     };
 
-    if let Err(err) = fs::rename(current_exe, &exe_backup) {
+    if let Err(err) = rename_windows_with_retry(current_exe, &exe_backup) {
         let _ = fs::remove_file(&staged_new_exe);
         let rollback_note = if wintun_swapped {
             match rollback_windows_file(wintun_backup.as_deref(), &target_wintun) {
@@ -2198,14 +2379,25 @@ fn replace_portable_binary_in_dir(
         });
     }
 
-    if let Err(err) = fs::rename(&staged_new_exe, current_exe) {
-        let _ = fs::remove_file(&staged_new_exe);
+    if let Err(err) = rename_windows_with_retry(&staged_new_exe, current_exe) {
         let mut rollback_notes = Vec::new();
-        match rollback_windows_file(Some(&exe_backup), current_exe) {
-            Ok(()) => rollback_notes.push("restored previous binary".to_string()),
+        let exe_rollback_ok = match rollback_windows_file(Some(&exe_backup), current_exe) {
+            Ok(()) => {
+                rollback_notes.push("restored previous binary".to_string());
+                true
+            }
             Err(rb_err) => {
                 rollback_notes.push(format!("previous binary rollback FAILED: {rb_err:#}"));
+                false
             }
+        };
+        if exe_rollback_ok {
+            let _ = fs::remove_file(&staged_new_exe);
+        } else {
+            rollback_notes.push(format!(
+                "preserved staged binary at {} for manual recovery",
+                staged_new_exe.display()
+            ));
         }
         if wintun_swapped {
             match rollback_windows_file(wintun_backup.as_deref(), &target_wintun) {
@@ -2346,7 +2538,10 @@ fn replace_portable_binary_with_sudo(
 }
 
 #[cfg(target_os = "windows")]
-fn verify_portable_wintun_if_present(extracted_bin: &Path) -> Result<Option<&'static str>> {
+fn verify_portable_wintun_if_present(
+    extracted_bin: &Path,
+    sums_text: Option<&str>,
+) -> Result<Option<String>> {
     let Some(staged_wintun) = extracted_bin
         .parent()
         .map(|dir| dir.join("wintun.dll"))
@@ -2354,6 +2549,39 @@ fn verify_portable_wintun_if_present(extracted_bin: &Path) -> Result<Option<&'st
     else {
         return Ok(None);
     };
+    let meta = fs::symlink_metadata(&staged_wintun).with_context(|| {
+        format!(
+            "failed to inspect extracted wintun.dll {}",
+            staged_wintun.display()
+        )
+    })?;
+    if meta.len() == 0 {
+        bail!("extracted wintun.dll is empty: {}", staged_wintun.display());
+    }
+
+    if let Some(sums) = sums_text {
+        let actual_sha = sha256_file(&staged_wintun)?;
+        if let Some(expected_sums_sha) = parse_sha256sum_for_asset(sums, "wintun.dll") {
+            if !actual_sha.eq_ignore_ascii_case(&expected_sums_sha) {
+                bail!(
+                    "refusing to install wintun.dll with SHA-256 mismatch against SHA256SUMS.txt: expected {expected_sums_sha}, got {actual_sha}"
+                );
+            }
+            return Ok(Some(expected_sums_sha));
+        }
+        // The release zip itself was already SHA-256 verified against SHA256SUMS.txt and has
+        // no separate wintun.dll entry. Do not fail-closed against the OLD running binary's
+        // compile-time Wintun hash; return the extracted file's SHA-256 so the staged copy
+        // in `exe_dir` is still integrity-checked before swapping, and the new binary validates
+        // its own Wintun pin at load time.
+        debug!(
+            path = %staged_wintun.display(),
+            sha256 = %actual_sha,
+            "portable wintun.dll accepted via verified archive SHA-256 (no separate SHA256SUMS.txt entry)"
+        );
+        return Ok(Some(actual_sha));
+    }
+
     let expected_sha256 = crate::platform::windows_tun::expected_wintun_dll_sha256()?;
     crate::platform::windows_tun::verify_wintun_dll_sha256(&staged_wintun, expected_sha256)
         .with_context(|| {
@@ -2362,10 +2590,14 @@ fn verify_portable_wintun_if_present(extracted_bin: &Path) -> Result<Option<&'st
                 staged_wintun.display()
             )
         })?;
-    Ok(Some(expected_sha256))
+    Ok(Some(expected_sha256.to_string()))
 }
 
-fn replace_portable_binary(extracted_bin: &Path, staging_root: &Path) -> Result<PathBuf> {
+fn replace_portable_binary(
+    extracted_bin: &Path,
+    staging_root: &Path,
+    sums_text: Option<&str>,
+) -> Result<PathBuf> {
     let current_exe_raw =
         std::env::current_exe().context("failed to determine current executable path")?;
     #[cfg(unix)]
@@ -2398,18 +2630,19 @@ fn replace_portable_binary(extracted_bin: &Path, staging_root: &Path) -> Result<
     #[cfg(target_os = "windows")]
     {
         let _ = staging_root;
-        let expected_wintun_sha = verify_portable_wintun_if_present(extracted_bin)?;
+        let expected_wintun_sha = verify_portable_wintun_if_present(extracted_bin, sums_text)?;
         replace_portable_binary_in_dir(
             extracted_bin,
             &current_exe,
             exe_dir,
-            expected_wintun_sha,
+            expected_wintun_sha.as_deref(),
         )?;
         Ok(current_exe)
     }
 
     #[cfg(unix)]
     {
+        let _ = sums_text;
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let _ = staging_root;
 
@@ -2461,7 +2694,7 @@ fn replace_portable_binary(extracted_bin: &Path, staging_root: &Path) -> Result<
 
     #[cfg(not(any(target_os = "windows", unix)))]
     {
-        let _ = (extracted_bin, staging_root, exe_dir);
+        let _ = (extracted_bin, staging_root, sums_text, exe_dir);
         bail!(
             "portable self-update is not supported on {}",
             std::env::consts::OS
@@ -2469,18 +2702,142 @@ fn replace_portable_binary(extracted_bin: &Path, staging_root: &Path) -> Result<
     }
 }
 
-fn build_updater_client(target: RedirectTargetPolicy) -> Result<Client> {
+fn build_updater_client_with_proxy(
+    target: RedirectTargetPolicy,
+    use_system_proxy: bool,
+) -> Result<Client> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let user_agent = format!("vdpi/{}", env!("CARGO_PKG_VERSION"));
-    Client::builder()
+    let mut builder = Client::builder()
         .user_agent(&user_agent)
         .https_only(true)
         .redirect(build_redirect_policy(target))
         .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(API_TIMEOUT)
+        .timeout(API_TIMEOUT);
+    if !use_system_proxy {
+        builder = builder.no_proxy();
+    }
+    builder
         .build()
         .context("failed to build HTTP client for updater")
+}
+
+fn build_updater_client(target: RedirectTargetPolicy) -> Result<Client> {
+    build_updater_client_with_proxy(target, true)
+}
+
+fn build_direct_updater_client(target: RedirectTargetPolicy) -> Result<Client> {
+    build_updater_client_with_proxy(target, false)
+}
+
+fn should_retry_direct_without_proxy(err: &reqwest::Error) -> bool {
+    if err.is_redirect() {
+        return false;
+    }
+    if err.is_connect() || err.is_timeout() {
+        return true;
+    }
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(cause) = source {
+        let msg = cause.to_string().to_ascii_lowercase();
+        if msg.contains("proxy") || msg.contains("tunnel") || msg.contains("socks") {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
+}
+
+async fn send_get_with_no_proxy_fallback(
+    client: &mut Client,
+    target: RedirectTargetPolicy,
+    url: &str,
+    accept_header: Option<&str>,
+    timeout_override: Option<Duration>,
+) -> std::result::Result<reqwest::Response, reqwest::Error> {
+    let build_req = |c: &Client| {
+        let mut req = c.get(url);
+        if let Some(accept) = accept_header {
+            req = req.header(reqwest::header::ACCEPT, accept);
+        }
+        if let Some(timeout) = timeout_override {
+            req = req.timeout(timeout);
+        }
+        req
+    };
+
+    match build_req(client).send().await {
+        Ok(resp) => Ok(resp),
+        Err(first_err) if should_retry_direct_without_proxy(&first_err) => {
+            debug!(
+                url,
+                error = %first_err,
+                "updater request failed via default proxy settings; retrying directly without proxy"
+            );
+            match build_direct_updater_client(target) {
+                Ok(direct_client) => {
+                    let res = build_req(&direct_client).send().await;
+                    if res.is_ok() {
+                        *client = direct_client;
+                    }
+                    res
+                }
+                Err(_) => Err(first_err),
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn extract_windows_service_exe_path(raw_cmdline: Option<&str>) -> Option<PathBuf> {
+    let trimmed = raw_cmdline?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix('"') {
+        let end = rest.find('"')?;
+        let inner = rest[..end].trim();
+        return (!inner.is_empty()).then(|| PathBuf::from(inner));
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(idx) = lower.find(".exe") {
+        let end = idx + 4;
+        if trimmed
+            .as_bytes()
+            .get(end)
+            .is_none_or(u8::is_ascii_whitespace)
+        {
+            let exe = trimmed[..end].trim();
+            if !exe.is_empty() {
+                return Some(PathBuf::from(exe));
+            }
+        }
+    }
+    trimmed
+        .split_whitespace()
+        .next()
+        .filter(|token| !token.is_empty())
+        .map(PathBuf::from)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn resolve_windows_installed_service_path(
+    detected_path: Option<PathBuf>,
+    scm_installed: bool,
+    scm_binary_path: Option<&str>,
+    default_installed_path: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if detected_path.is_some() {
+        return detected_path;
+    }
+    if !scm_installed {
+        return None;
+    }
+    extract_windows_service_exe_path(scm_binary_path)
+        .or(default_installed_path)
+        .or_else(|| Some(PathBuf::from("vdpi.exe")))
 }
 
 fn extract_release_notes(body: Option<&str>) -> Vec<String> {
@@ -2507,18 +2864,21 @@ fn extract_release_notes(body: Option<&str>) -> Vec<String> {
 pub async fn check_latest_release_for_version(
     current_version: &str,
 ) -> Result<ReleaseCheckResult> {
-    let client = build_updater_client(RedirectTargetPolicy::GitHubApi)?;
+    let mut client = build_updater_client(RedirectTargetPolicy::GitHubApi)?;
 
     debug!(
         url = GITHUB_LATEST_RELEASE_URL,
         "checking latest vdpi release"
     );
-    let resp = client
-        .get(GITHUB_LATEST_RELEASE_URL)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .send()
-        .await
-        .context("failed to contact GitHub Releases API")?;
+    let resp = send_get_with_no_proxy_fallback(
+        &mut client,
+        RedirectTargetPolicy::GitHubApi,
+        GITHUB_LATEST_RELEASE_URL,
+        Some("application/vnd.github+json"),
+        None,
+    )
+    .await
+    .context("failed to contact GitHub Releases API")?;
 
     if !resp.status().is_success() {
         bail!(
@@ -2573,7 +2933,22 @@ pub async fn check_latest_release() -> Result<ReleaseCheckResult> {
         .and_then(|info| info.installed_version.as_deref())
         .unwrap_or(env!("CARGO_PKG_VERSION"));
     let mut result = check_latest_release_for_version(baseline_raw).await?;
-    result.installed_service_path = installed.map(|info| info.binary_path);
+    let detected_path = installed.map(|info| info.binary_path);
+    #[cfg(target_os = "windows")]
+    let service_path = if detected_path.is_some() {
+        detected_path
+    } else {
+        let scm = crate::platform::windows_service::query_windows_service_status();
+        resolve_windows_installed_service_path(
+            None,
+            scm.installed,
+            scm.binary_path.as_deref(),
+            crate::service::installed_binary_path().ok(),
+        )
+    };
+    #[cfg(not(target_os = "windows"))]
+    let service_path = detected_path;
+    result.installed_service_path = service_path;
     Ok(result)
 }
 
@@ -2632,16 +3007,20 @@ where
     validate_github_download_url(asset_url, asset_name)?;
     validate_github_download_url(sums_url, "SHA256SUMS.txt")?;
 
-    let client = build_updater_client(RedirectTargetPolicy::GitHubDownload)?;
+    let mut client = build_updater_client(RedirectTargetPolicy::GitHubDownload)?;
     let staging = StagingDir::new()?;
     debug!(dir = %staging.path().display(), "created update staging directory");
 
     on_progress("Downloading SHA256SUMS.txt...");
-    let sums_resp = client
-        .get(sums_url)
-        .send()
-        .await
-        .context("failed to download SHA256SUMS.txt")?;
+    let sums_resp = send_get_with_no_proxy_fallback(
+        &mut client,
+        RedirectTargetPolicy::GitHubDownload,
+        sums_url,
+        None,
+        None,
+    )
+    .await
+    .context("failed to download SHA256SUMS.txt")?;
     if !sums_resp.status().is_success() {
         bail!(
             "failed to download SHA256SUMS.txt (HTTP {})",
@@ -2654,7 +3033,7 @@ where
 
     on_progress(&format!("Downloading {asset_name}..."));
     let archive_path = staging.path().join(asset_name);
-    download_to_file(&client, asset_url, &archive_path, MAX_ARCHIVE_BYTES).await?;
+    download_to_file(&mut client, asset_url, &archive_path, MAX_ARCHIVE_BYTES).await?;
 
     on_progress("Verifying SHA-256 checksum...");
     verify_archive_sha256(&archive_path, &sums_text, asset_name)?;
@@ -2669,7 +3048,27 @@ where
 
     let extracted_bin = find_extracted_binary(&extract_dir, bin_name)?;
 
-    if let Some(service_path) = check.installed_service_path.as_deref() {
+    let effective_service_path: Option<PathBuf> =
+        if let Some(service_path) = check.installed_service_path.as_deref() {
+            Some(service_path.to_path_buf())
+        } else {
+            #[cfg(target_os = "windows")]
+            {
+                let scm = crate::platform::windows_service::query_windows_service_status();
+                resolve_windows_installed_service_path(
+                    None,
+                    scm.installed,
+                    scm.binary_path.as_deref(),
+                    crate::service::installed_binary_path().ok(),
+                )
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                None
+            }
+        };
+
+    if let Some(service_path) = effective_service_path.as_deref() {
         on_progress(&format!(
             "Updating installed vdpi service ({})...",
             service_path.display()
@@ -2681,7 +3080,8 @@ where
         ))
     } else {
         on_progress("Replacing vdpi binary...");
-        let updated_path = replace_portable_binary(&extracted_bin, staging.path())?;
+        let updated_path =
+            replace_portable_binary(&extracted_bin, staging.path(), Some(&sums_text))?;
         Ok(format!(
             "Successfully updated vdpi to {} at {}.",
             check.latest_version,
@@ -3163,25 +3563,22 @@ vdpi-windows-x86_64/WINTUN-LICENSE.txt
     }
 
     #[test]
-    fn windows_companion_verification_fails_closed_and_enforces_pinned_wintun_sha() {
+    fn windows_companion_verification_allows_verified_archive_future_wintun_and_rejects_tampering() {
         let staging = StagingDir::new().expect("staging dir");
         let extract_dir = staging.path().join("extract");
         fs::create_dir(&extract_dir).expect("create extract dir");
 
         let wintun_path = extract_dir.join("wintun.dll");
-        let payload = b"unpinned-wintun-payload";
+        let payload = b"future-wintun-payload";
         let payload_sha = sha256_hex(payload);
         let members = vec!["wintun.dll".to_string()];
 
-        // 1. Missing SHA256SUMS.txt altogether must fail closed and delete extracted wintun.dll.
+        // 1. Missing SHA256SUMS.txt altogether (with no explicit pin) must fail closed and delete wintun.dll.
         fs::write(&wintun_path, payload).expect("write wintun");
         let err = verify_extracted_windows_companions(&extract_dir, &members, None)
             .expect_err("wintun.dll without SHA256SUMS.txt must fail closed");
         assert!(
-            err.to_string().contains("no entry for wintun.dll")
-                || err
-                    .to_string()
-                    .contains("does not contain a SHA-256 entry for wintun.dll"),
+            err.to_string().contains("SHA256SUMS.txt is absent"),
             "unexpected error: {err}"
         );
         assert!(
@@ -3189,41 +3586,25 @@ vdpi-windows-x86_64/WINTUN-LICENSE.txt
             "wintun.dll must be removed when SHA256SUMS.txt is absent"
         );
 
-        // 2. SHA256SUMS.txt present without a wintun.dll entry must fail closed and delete file.
+        // 2. SHA256SUMS.txt present for verified zip without a separate wintun.dll entry must
+        //    succeed rather than failing closed against the old binary's compile-time Wintun hash.
         fs::write(&wintun_path, payload).expect("write wintun");
         let archive_only_sums = format!(
             "{}  vdpi-windows-x86_64.zip\n",
             sha256_hex(b"archive-bytes")
         );
-        let err =
-            verify_extracted_windows_companions(&extract_dir, &members, Some(&archive_only_sums))
-                .expect_err("wintun.dll missing from SHA256SUMS.txt must fail closed");
-        assert!(
-            err.to_string().contains("wintun.dll"),
-            "unexpected error: {err}"
-        );
-        assert!(
-            !wintun_path.exists(),
-            "wintun.dll must be removed when missing from SHA256SUMS.txt"
-        );
+        verify_extracted_windows_companions(&extract_dir, &members, Some(&archive_only_sums))
+            .expect("wintun.dll inside verified zip without separate SHA256SUMS entry must pass");
+        assert!(wintun_path.exists());
 
-        // 3. Even when SHA256SUMS.txt matches extracted bytes, mismatch against pinned
-        //    WINTUN_DLL_SHA256 must fail closed and delete extracted wintun.dll.
-        fs::write(&wintun_path, payload).expect("write wintun");
-        let forged_sums = format!("{payload_sha} *wintun.dll\n");
-        let err = verify_extracted_windows_companions(&extract_dir, &members, Some(&forged_sums))
-            .expect_err("wintun.dll not matching pinned WINTUN_DLL_SHA256 must fail closed");
-        assert!(
-            err.to_string().contains("pinned WINTUN_DLL_SHA256"),
-            "unexpected error: {err}"
-        );
-        assert!(
-            !wintun_path.exists(),
-            "unpinned wintun.dll must be removed on verification failure"
-        );
+        // 3. SHA256SUMS.txt with a matching future wintun.dll hash must succeed without failing
+        //    against the old binary's compile-time Wintun pin.
+        let future_sums = format!("{payload_sha} *wintun.dll\n");
+        verify_extracted_windows_companions(&extract_dir, &members, Some(&future_sums))
+            .expect("future wintun.dll matching SHA256SUMS.txt must pass");
+        assert!(wintun_path.exists());
 
         // 4. Mismatched SHA256SUMS.txt entry must fail and delete extracted wintun.dll.
-        fs::write(&wintun_path, payload).expect("write wintun");
         let bad_sums = format!("{} *wintun.dll\n", sha256_hex(b"different-wintun"));
         assert!(verify_extracted_windows_companions_against(
             &extract_dir,
@@ -3237,26 +3618,48 @@ vdpi-windows-x86_64/WINTUN-LICENSE.txt
             "mismatched wintun.dll must be removed on verification failure"
         );
 
-        // 5. Empty (0-byte) wintun.dll must fail and be removed.
+        // 5. Explicit pinned_wintun_sha mismatch must still fail closed and delete wintun.dll.
+        fs::write(&wintun_path, payload).expect("write wintun");
+        let wrong_pin = sha256_hex(b"wrong-pin");
+        let err = verify_extracted_windows_companions_against(
+            &extract_dir,
+            &members,
+            Some(&future_sums),
+            Some(&wrong_pin),
+        )
+        .expect_err("explicit pinned_wintun_sha mismatch must fail");
+        assert!(
+            err.to_string().contains("pinned WINTUN_DLL_SHA256"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !wintun_path.exists(),
+            "unpinned wintun.dll must be removed on explicit pin mismatch"
+        );
+
+        // 6. Empty (0-byte) wintun.dll must fail and be removed even when archive_only_sums is present.
         fs::write(&wintun_path, b"").expect("write empty wintun");
-        assert!(verify_extracted_windows_companions(&extract_dir, &members, None).is_err());
+        assert!(
+            verify_extracted_windows_companions(&extract_dir, &members, Some(&archive_only_sums))
+                .is_err()
+        );
         assert!(
             !wintun_path.exists(),
             "empty wintun.dll must be removed on verification failure"
         );
 
-        // 6. Matching BOTH SHA256SUMS.txt and pinned WINTUN_DLL_SHA256 succeeds.
+        // 7. Matching BOTH SHA256SUMS.txt and explicit pinned hash succeeds.
         fs::write(&wintun_path, payload).expect("write valid wintun");
         verify_extracted_windows_companions_against(
             &extract_dir,
             &members,
-            Some(&forged_sums),
+            Some(&future_sums),
             Some(&payload_sha),
         )
-        .expect("wintun.dll matching both SHA256SUMS.txt and pinned hash must pass");
+        .expect("wintun.dll matching both SHA256SUMS.txt and explicit pin must pass");
         assert!(wintun_path.exists());
 
-        // 7. Non-wintun companion (e.g. WINTUN-LICENSE.txt only) succeeds without wintun entry.
+        // 8. Non-wintun companion (e.g. WINTUN-LICENSE.txt only) succeeds without wintun entry.
         let license_path = extract_dir.join("WINTUN-LICENSE.txt");
         fs::write(&license_path, b"GPL-2.0").expect("write license");
         verify_extracted_windows_companions(
@@ -4002,21 +4405,222 @@ Plain paragraph ignored
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn portable_wintun_verification_rejects_tampered_dll() {
+    fn portable_wintun_verification_handles_verified_archive_and_rejects_tampered_dll() {
         let staging = StagingDir::new().expect("staging dir");
         let exe = staging.path().join("vdpi.exe");
         fs::write(&exe, b"fake-exe").expect("write fake exe");
         assert_eq!(
-            verify_portable_wintun_if_present(&exe)
+            verify_portable_wintun_if_present(&exe, None)
                 .expect("missing wintun.dll next to portable exe should pass"),
             None
         );
 
+        let payload = b"future-wintun-bytes";
+        let payload_sha = sha256_hex(payload);
         let wintun = staging.path().join("wintun.dll");
-        fs::write(&wintun, b"tampered-wintun-bytes").expect("write tampered wintun");
+        fs::write(&wintun, payload).expect("write wintun");
+
+        // Without SHA256SUMS.txt context, an unpinned DLL is still rejected against expected_wintun_dll_sha256.
         assert!(
-            verify_portable_wintun_if_present(&exe).is_err(),
-            "tampered wintun.dll must be rejected against expected_wintun_dll_sha256"
+            verify_portable_wintun_if_present(&exe, None).is_err(),
+            "tampered wintun.dll without SHA256SUMS.txt must be rejected against expected_wintun_dll_sha256"
+        );
+
+        // Mismatched SHA256SUMS.txt wintun.dll entry must fail.
+        let bad_sums = format!("{}  wintun.dll\n", sha256_hex(b"other-wintun"));
+        assert!(verify_portable_wintun_if_present(&exe, Some(&bad_sums)).is_err());
+
+        // Matching future SHA256SUMS.txt wintun.dll entry succeeds.
+        let future_sums = format!("{payload_sha}  wintun.dll\n");
+        assert_eq!(
+            verify_portable_wintun_if_present(&exe, Some(&future_sums))
+                .expect("matching future wintun.dll in SHA256SUMS.txt must pass"),
+            Some(payload_sha.clone())
+        );
+
+        // Verified zip with archive-only SHA256SUMS.txt (no separate wintun.dll entry) succeeds
+        // and returns the extracted file's SHA-256 for staging re-verification.
+        let archive_only_sums = format!(
+            "{}  vdpi-windows-x86_64.zip\n",
+            sha256_hex(b"archive-bytes")
+        );
+        assert_eq!(
+            verify_portable_wintun_if_present(&exe, Some(&archive_only_sums))
+                .expect("verified zip without separate wintun.dll entry must pass"),
+            Some(payload_sha)
+        );
+
+        // Empty (0-byte) wintun.dll is always rejected.
+        fs::write(&wintun, b"").expect("write empty wintun");
+        assert!(verify_portable_wintun_if_present(&exe, Some(&archive_only_sums)).is_err());
+    }
+
+    #[test]
+    fn windows_rename_retry_uses_defender_backoff_and_skips_non_transient_errors() {
+        // Recovers after transient PermissionDenied failures with exact backoff prefix.
+        let mut sleeps = Vec::new();
+        let mut attempts = 0usize;
+        retry_windows_rename_with(
+            || {
+                attempts += 1;
+                if attempts <= 3 {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "defender scan lock",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+            |d| sleeps.push(d.as_millis() as u64),
+        )
+        .expect("transient rename errors should succeed on retry");
+        assert_eq!(attempts, 4);
+        assert_eq!(sleeps, vec![25, 50, 100]);
+
+        // Exhausts the full backoff schedule on persistent Win32 sharing violation (error 32).
+        let mut full_sleeps = Vec::new();
+        let mut full_attempts = 0usize;
+        let err = retry_windows_rename_with(
+            || {
+                full_attempts += 1;
+                Err(io::Error::from_raw_os_error(32))
+            },
+            |d| full_sleeps.push(d.as_millis() as u64),
+        )
+        .expect_err("persistent sharing violation must eventually fail");
+        assert_eq!(err.raw_os_error(), Some(32));
+        assert_eq!(full_attempts, WINDOWS_RENAME_RETRY_DELAYS_MS.len() + 1);
+        assert_eq!(full_sleeps, WINDOWS_RENAME_RETRY_DELAYS_MS);
+
+        // Non-transient NotFound fails immediately without sleeping.
+        let mut no_sleeps = Vec::new();
+        let err = retry_windows_rename_with(
+            || Err(io::Error::new(io::ErrorKind::NotFound, "missing")),
+            |d| no_sleeps.push(d.as_millis() as u64),
+        )
+        .expect_err("NotFound must fail immediately");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(no_sleeps.is_empty());
+    }
+
+    #[test]
+    fn windows_elevation_policy_allows_mintty_blocks_headless_and_sets_safe_shell_mask() {
+        assert_eq!(
+            WINDOWS_ELEVATED_SHELL_EXECUTE_MASK,
+            WINDOWS_SEE_MASK_NOCLOSEPROCESS
+                | WINDOWS_SEE_MASK_NOASYNC
+                | WINDOWS_SEE_MASK_FLAG_NO_UI
+        );
+
+        // Interactive desktop / Git Bash Mintty session (no CI/SSH/service flags) is allowed.
+        let mintty = |key: &str| match key {
+            "MSYSTEM" => Some("MINGW64".to_string()),
+            "TERM_PROGRAM" => Some("mintty".to_string()),
+            "CI" => Some("false".to_string()),
+            "VDPI_NONINTERACTIVE" => Some("0".to_string()),
+            _ => None,
+        };
+        assert_eq!(windows_elevation_blocked_reason_with(false, mintty), None);
+
+        // Session 0 Windows service is blocked.
+        assert!(windows_elevation_blocked_reason_with(true, |_| None).is_some());
+
+        // CI, SSH, and explicit VDPI_NONINTERACTIVE are blocked.
+        assert!(windows_elevation_blocked_reason_with(false, |k| {
+            (k == "CI").then(|| "true".to_string())
+        })
+        .is_some());
+        assert!(windows_elevation_blocked_reason_with(false, |k| {
+            (k == "GITHUB_ACTIONS").then(|| "true".to_string())
+        })
+        .is_some());
+        assert!(windows_elevation_blocked_reason_with(false, |k| {
+            (k == "SSH_CONNECTION").then(|| "10.0.0.1 5555 10.0.0.2 22".to_string())
+        })
+        .is_some());
+        assert!(windows_elevation_blocked_reason_with(false, |k| {
+            (k == "VDPI_NONINTERACTIVE").then(|| "1".to_string())
+        })
+        .is_some());
+    }
+
+    #[test]
+    fn windows_scm_service_path_resolution_handles_quarantined_service_binary() {
+        let detected = PathBuf::from(r"C:\ProgramData\vdpi\bin\vdpi.exe");
+        assert_eq!(
+            resolve_windows_installed_service_path(Some(detected.clone()), false, None, None),
+            Some(detected)
+        );
+
+        // Not installed on disk and not registered in SCM -> portable path (None).
+        assert_eq!(
+            resolve_windows_installed_service_path(None, false, None, None),
+            None
+        );
+
+        // Binary quarantined on disk (detected = None), but SCM reports installed with quoted path.
+        assert_eq!(
+            resolve_windows_installed_service_path(
+                None,
+                true,
+                Some("\"C:\\Program Files\\vdpi\\bin\\vdpi.exe\" --service"),
+                Some(PathBuf::from(r"C:\fallback\vdpi.exe")),
+            ),
+            Some(PathBuf::from(r"C:\Program Files\vdpi\bin\vdpi.exe"))
+        );
+
+        // Unquoted SCM binary path with spaces before `.exe`.
+        assert_eq!(
+            resolve_windows_installed_service_path(
+                None,
+                true,
+                Some(r"C:\Program Files\vdpi\bin\vdpi.exe --service"),
+                None,
+            ),
+            Some(PathBuf::from(r"C:\Program Files\vdpi\bin\vdpi.exe"))
+        );
+
+        // SCM reports installed=true with ACCESS_DENIED on config query (binary_path=None) -> fallback path.
+        let fallback = PathBuf::from(r"C:\ProgramData\vdpi\bin\vdpi.exe");
+        assert_eq!(
+            resolve_windows_installed_service_path(None, true, None, Some(fallback.clone())),
+            Some(fallback)
+        );
+        assert_eq!(
+            resolve_windows_installed_service_path(None, true, None, None),
+            Some(PathBuf::from("vdpi.exe"))
+        );
+    }
+
+    #[tokio::test]
+    async fn updater_direct_no_proxy_client_builds_and_detects_dead_proxy_errors() {
+        build_direct_updater_client(RedirectTargetPolicy::GitHubApi)
+            .expect("direct API client with no_proxy must build");
+        build_direct_updater_client(RedirectTargetPolicy::GitHubDownload)
+            .expect("direct download client with no_proxy must build");
+
+        // Bind and immediately drop a loopback listener to obtain a guaranteed-dead local proxy port.
+        let dead_port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            listener.local_addr().expect("local addr").port()
+        };
+        let proxy_url = format!("http://127.0.0.1:{dead_port}");
+        let dead_proxy_client = Client::builder()
+            .proxy(reqwest::Proxy::all(&proxy_url).expect("build dead proxy"))
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("build client with dead proxy");
+
+        let err = dead_proxy_client
+            .get("https://127.0.0.1:1/")
+            .send()
+            .await
+            .expect_err("dead local proxy must error");
+        assert!(
+            should_retry_direct_without_proxy(&err),
+            "expected dead local proxy error to trigger direct no_proxy fallback, got: {err:#}"
         );
     }
 }

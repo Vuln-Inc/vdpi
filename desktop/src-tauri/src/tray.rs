@@ -5,9 +5,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread::ThreadId;
-use std::time::Duration;
-#[cfg(target_os = "linux")]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
@@ -39,6 +37,8 @@ const ICON_PAUSED_BYTES: &[u8] = include_bytes!("../icons/tray-paused.png");
 
 const RESTORE_GUARD_WINDOW: Duration = Duration::from_millis(350);
 const TRAY_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
+const TRAY_RETRY_BASE_BACKOFF: Duration = Duration::from_secs(2);
+const TRAY_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 static ICON_PROTECTED: OnceLock<Option<Image<'static>>> = OnceLock::new();
 static ICON_WARNING: OnceLock<Option<Image<'static>>> = OnceLock::new();
@@ -223,13 +223,14 @@ impl TrayVisualState {
                 .and_then(|live| live.vpn_conflict.as_deref())
                 .is_some_and(|msg| !msg.trim().is_empty());
 
-        let has_wintun_issue = status.wintun.required && !status.wintun.ready;
-
         if is_running {
             if has_vpn_conflict {
+                if !is_live_running && status.service_state == ServiceStateDto::Running {
+                    return Self::PausedVpnActive;
+                }
                 return Self::VpnConflict(active_engine);
             }
-            if has_wintun_issue && active_engine == EngineModeDto::Tun {
+            if !status.wintun.ready && active_engine == EngineModeDto::Tun {
                 return Self::WintunRequiredTun;
             }
             if !is_live_running {
@@ -576,6 +577,17 @@ impl AppliedTrayVisual {
     }
 }
 
+fn failure_backoff_duration(consecutive_failures: u32) -> Duration {
+    if consecutive_failures == 0 {
+        return Duration::ZERO;
+    }
+    let shift = consecutive_failures.saturating_sub(1).min(6);
+    let factor = 1u32 << shift;
+    TRAY_RETRY_BASE_BACKOFF
+        .saturating_mul(factor)
+        .min(TRAY_RETRY_MAX_BACKOFF)
+}
+
 struct TrayRuntimeState {
     show_item: Option<MenuItem<Wry>>,
     status_item: Option<MenuItem<Wry>>,
@@ -587,6 +599,8 @@ struct TrayRuntimeState {
     last_snapshot_seq: u64,
     tray_generation: u64,
     toggle_busy: bool,
+    consecutive_failures: u32,
+    retry_after: Option<Instant>,
 }
 
 impl TrayRuntimeState {
@@ -602,6 +616,8 @@ impl TrayRuntimeState {
             last_snapshot_seq: 0,
             tray_generation: 0,
             toggle_busy: false,
+            consecutive_failures: 0,
+            retry_after: None,
         }
     }
 
@@ -622,16 +638,71 @@ impl TrayRuntimeState {
             .with_toggle_busy(self.toggle_busy, self.language)
     }
 
-    fn should_dispatch_snapshot(&mut self, snapshot_seq: u64, base_state: TrayVisualState) -> bool {
+    fn resolve_sync_spec(
+        &mut self,
+        language: EffectiveLanguage,
+        incoming: Option<(u64, TrayVisualState)>,
+    ) -> TrayVisualSpec {
+        self.language = language;
+        let state = match incoming {
+            Some((seq, incoming_state)) => {
+                if self.accept_snapshot(seq, incoming_state) {
+                    incoming_state
+                } else {
+                    *self.base_state.get_or_insert(incoming_state)
+                }
+            }
+            None => self.base_state.unwrap_or(TrayVisualState::Checking),
+        };
+        TrayVisualSpec::from_state(state, language).with_toggle_busy(self.toggle_busy, language)
+    }
+
+    fn is_in_failure_backoff(&self, now: Instant) -> bool {
+        self.retry_after.is_some_and(|until| now < until)
+    }
+
+    fn record_sync_outcome(&mut self, succeeded: bool, now: Instant) {
+        if succeeded {
+            self.consecutive_failures = 0;
+            self.retry_after = None;
+        } else {
+            self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+            let delay = failure_backoff_duration(self.consecutive_failures);
+            self.retry_after = now.checked_add(delay).or(Some(now));
+        }
+    }
+
+    fn reset_failure_backoff(&mut self) {
+        self.consecutive_failures = 0;
+        self.retry_after = None;
+    }
+
+    fn should_dispatch_snapshot_at(
+        &mut self,
+        snapshot_seq: u64,
+        base_state: TrayVisualState,
+        now: Instant,
+    ) -> bool {
         if !self.accept_snapshot(snapshot_seq, base_state) {
             return false;
         }
-        !self.last_visual.matches(self.effective_spec())
+        if self.last_visual.matches(self.effective_spec()) {
+            return false;
+        }
+        !self.is_in_failure_backoff(now)
+    }
+
+    fn should_dispatch_snapshot(&mut self, snapshot_seq: u64, base_state: TrayVisualState) -> bool {
+        self.should_dispatch_snapshot_at(snapshot_seq, base_state, Instant::now())
     }
 
     fn set_language(&mut self, language: EffectiveLanguage) -> bool {
         self.language = language;
-        !self.last_visual.matches(self.effective_spec())
+        let dirty = !self.last_visual.matches(self.effective_spec());
+        if dirty {
+            self.reset_failure_backoff();
+        }
+        dirty
     }
 
     fn try_claim_toggle_busy(&mut self) -> bool {
@@ -755,42 +826,70 @@ fn sync_visual_fields<S: TrayVisualSink>(
     committed: &mut AppliedTrayVisual,
     spec: TrayVisualSpec,
     sink: &mut S,
-) {
+) -> bool {
     if committed.matches(spec) {
-        return;
+        return true;
     }
 
-    if committed.icon != Some(spec.icon) && sink.set_icon(spec.icon) {
-        committed.icon = Some(spec.icon);
+    let mut all_ok = true;
+
+    if committed.icon != Some(spec.icon) {
+        if sink.set_icon(spec.icon) {
+            committed.icon = Some(spec.icon);
+        } else {
+            all_ok = false;
+        }
     }
 
-    if committed.tooltip != Some(spec.tooltip) && sink.set_tooltip(spec.tooltip) {
-        committed.tooltip = Some(spec.tooltip);
+    if committed.tooltip != Some(spec.tooltip) {
+        if sink.set_tooltip(spec.tooltip) {
+            committed.tooltip = Some(spec.tooltip);
+        } else {
+            all_ok = false;
+        }
     }
 
-    if committed.show_label != Some(spec.show_label) && sink.set_show_label(spec.show_label) {
-        committed.show_label = Some(spec.show_label);
+    if committed.show_label != Some(spec.show_label) {
+        if sink.set_show_label(spec.show_label) {
+            committed.show_label = Some(spec.show_label);
+        } else {
+            all_ok = false;
+        }
     }
 
-    if committed.status_label != Some(spec.status_label) && sink.set_status_label(spec.status_label)
-    {
-        committed.status_label = Some(spec.status_label);
+    if committed.status_label != Some(spec.status_label) {
+        if sink.set_status_label(spec.status_label) {
+            committed.status_label = Some(spec.status_label);
+        } else {
+            all_ok = false;
+        }
     }
 
-    if committed.toggle_label != Some(spec.toggle_label) && sink.set_toggle_label(spec.toggle_label)
-    {
-        committed.toggle_label = Some(spec.toggle_label);
+    if committed.toggle_label != Some(spec.toggle_label) {
+        if sink.set_toggle_label(spec.toggle_label) {
+            committed.toggle_label = Some(spec.toggle_label);
+        } else {
+            all_ok = false;
+        }
     }
 
-    if committed.toggle_enabled != Some(spec.toggle_enabled)
-        && sink.set_toggle_enabled(spec.toggle_enabled)
-    {
-        committed.toggle_enabled = Some(spec.toggle_enabled);
+    if committed.toggle_enabled != Some(spec.toggle_enabled) {
+        if sink.set_toggle_enabled(spec.toggle_enabled) {
+            committed.toggle_enabled = Some(spec.toggle_enabled);
+        } else {
+            all_ok = false;
+        }
     }
 
-    if committed.quit_label != Some(spec.quit_label) && sink.set_quit_label(spec.quit_label) {
-        committed.quit_label = Some(spec.quit_label);
+    if committed.quit_label != Some(spec.quit_label) {
+        if sink.set_quit_label(spec.quit_label) {
+            committed.quit_label = Some(spec.quit_label);
+        } else {
+            all_ok = false;
+        }
     }
+
+    all_ok
 }
 
 fn cached_tray_icon(kind: TrayIconKind) -> Option<Image<'static>> {
@@ -1128,18 +1227,8 @@ fn setup_or_sync_tray_on_main_thread(
         let mut guard = TRAY_STATE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.language = language;
-        let state = match incoming {
-            Some((seq, incoming_state)) => {
-                if guard.accept_snapshot(seq, incoming_state) {
-                    incoming_state
-                } else {
-                    *guard.base_state.get_or_insert(incoming_state)
-                }
-            }
-            None => *guard.base_state.get_or_insert(TrayVisualState::Checking),
-        };
-        TrayVisualSpec::from_state(state, language).with_toggle_busy(guard.toggle_busy, language)
+        guard.reset_failure_backoff();
+        guard.resolve_sync_spec(language, incoming)
     };
 
     if let Some(existing) = app.tray_by_id(TRAY_ID) {
@@ -1227,6 +1316,7 @@ fn setup_or_sync_tray_on_main_thread(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.tray_generation = guard.tray_generation.wrapping_add(1);
+        guard.reset_failure_backoff();
         let prev_show = guard.show_item.replace(show_item);
         let prev_status = guard.status_item.replace(status_item);
         let prev_toggle = guard.toggle_item.replace(toggle_item);
@@ -1343,6 +1433,7 @@ fn apply_current_tray_visuals_on_main_thread(app: &AppHandle) {
         return;
     };
 
+    let now = Instant::now();
     let (
         base_state,
         language,
@@ -1353,6 +1444,7 @@ fn apply_current_tray_visuals_on_main_thread(app: &AppHandle) {
         toggle_item,
         quit_item,
         generation,
+        in_backoff,
     ) = {
         let guard = TRAY_STATE
             .lock()
@@ -1367,8 +1459,17 @@ fn apply_current_tray_visuals_on_main_thread(app: &AppHandle) {
             guard.toggle_item.clone(),
             guard.quit_item.clone(),
             guard.tray_generation,
+            guard.is_in_failure_backoff(now),
         )
     };
+
+    if in_backoff {
+        drop(show_item);
+        drop(status_item);
+        drop(toggle_item);
+        drop(quit_item);
+        return;
+    }
 
     let state = base_state.unwrap_or_else(|| {
         app.try_state::<DesktopAppState>()
@@ -1394,7 +1495,7 @@ fn apply_current_tray_visuals_on_main_thread(app: &AppHandle) {
         toggle_item: toggle_item.as_ref(),
         quit_item: quit_item.as_ref(),
     };
-    sync_visual_fields(&mut committed, spec, &mut sink);
+    let all_ok = sync_visual_fields(&mut committed, spec, &mut sink);
 
     {
         let mut guard = TRAY_STATE
@@ -1402,6 +1503,7 @@ fn apply_current_tray_visuals_on_main_thread(app: &AppHandle) {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if guard.tray_generation == generation {
             guard.last_visual = committed;
+            guard.record_sync_outcome(all_ok, Instant::now());
         }
     }
 
@@ -1426,6 +1528,7 @@ fn remove_tray_cleanly_on_main_thread(app: &AppHandle) {
         guard.tray_generation = guard.tray_generation.wrapping_add(1);
         guard.base_state = None;
         guard.last_visual = AppliedTrayVisual::empty();
+        guard.reset_failure_backoff();
         (
             guard.show_item.take(),
             guard.status_item.take(),
@@ -1569,6 +1672,8 @@ pub fn hide_main_window_to_tray(app: &AppHandle, skip_taskbar: bool) {
     if skip_taskbar {
         if let Err(err) = window.hide() {
             warn!(error = %err, "failed to hide main window to tray");
+        } else {
+            crate::mark_main_window_hidden(app);
         }
         #[cfg(target_os = "macos")]
         {
@@ -1576,6 +1681,8 @@ pub fn hide_main_window_to_tray(app: &AppHandle, skip_taskbar: bool) {
         }
     } else if let Err(err) = window.minimize() {
         warn!(error = %err, "failed to minimize main window");
+    } else {
+        crate::mark_main_window_hidden(app);
     }
 }
 
@@ -1970,6 +2077,48 @@ mod tests {
         assert_eq!(not_installed.status_label, "Status: Not Installed");
         assert_eq!(not_installed.toggle_label, "Resume Protection");
         assert!(!not_installed.toggle_enabled);
+
+        // Running service yielded to VPN (live = None or live.running = false) maps to
+        // PausedVpnActive ("VPN Active - Yielded") instead of VpnConflict.
+        let mut running_yielded_none = sample_snapshot(ServiceStateDto::Running, EngineModeDto::Tun, None);
+        running_yielded_none.vpn_conflict = Some("Mullvad".to_string());
+        assert_eq!(
+            TrayVisualState::from_snapshot(&running_yielded_none),
+            TrayVisualState::PausedVpnActive
+        );
+        let running_yielded_spec =
+            TrayVisualSpec::from_snapshot(&running_yielded_none, EffectiveLanguage::En);
+        assert_eq!(
+            running_yielded_spec.status_label,
+            "Status: VPN Active - Yielded"
+        );
+        assert_eq!(
+            running_yielded_spec.toggle_action,
+            ProtectionToggleAction::Resume
+        );
+
+        let mut inactive_live = sample_live(EngineModeDto::Tun, Some("WireGuard"));
+        inactive_live.running = false;
+        let running_yielded_inactive =
+            sample_snapshot(ServiceStateDto::Running, EngineModeDto::Tun, Some(inactive_live));
+        assert_eq!(
+            TrayVisualState::from_snapshot(&running_yielded_inactive),
+            TrayVisualState::PausedVpnActive
+        );
+
+        // Wintun issue checks `!wintun.ready && active_engine == Tun` even if `wintun.required`
+        // is false (e.g. configured_engine switched to Proxy while live engine is still TUN).
+        let mut live_tun_missing_wintun = sample_snapshot(
+            ServiceStateDto::Running,
+            EngineModeDto::Proxy,
+            Some(sample_live(EngineModeDto::Tun, None)),
+        );
+        live_tun_missing_wintun.wintun.required = false;
+        live_tun_missing_wintun.wintun.ready = false;
+        assert_eq!(
+            TrayVisualState::from_snapshot(&live_tun_missing_wintun),
+            TrayVisualState::WintunRequiredTun
+        );
     }
 
     #[test]
@@ -2122,7 +2271,7 @@ mod tests {
             ..MockTrayVisualSink::default()
         };
 
-        sync_visual_fields(&mut committed, spec, &mut sink);
+        assert!(!sync_visual_fields(&mut committed, spec, &mut sink));
         assert_eq!(committed.icon, None);
         assert_eq!(committed.tooltip, Some(spec.tooltip));
         assert_eq!(committed.show_label, Some(spec.show_label));
@@ -2142,7 +2291,7 @@ mod tests {
         // Retry after transient OS failure resolves: only previously failed fields run.
         sink.fail_icon = false;
         sink.fail_toggle_enabled = false;
-        sync_visual_fields(&mut committed, spec, &mut sink);
+        assert!(sync_visual_fields(&mut committed, spec, &mut sink));
         assert!(committed.matches(spec));
         assert_eq!(sink.icon_calls, 2);
         assert_eq!(sink.tooltip_calls, 1);
@@ -2332,6 +2481,86 @@ mod tests {
         // Underlying state change during toggle_busy still dispatches.
         assert!(state.should_dispatch_snapshot(5, paused_state));
         assert_eq!(state.last_snapshot_seq, 5);
+    }
+
+    #[test]
+    fn runtime_state_backs_off_after_consecutive_os_failures_and_resets_on_success() {
+        assert_eq!(failure_backoff_duration(0), Duration::ZERO);
+        assert_eq!(failure_backoff_duration(1), Duration::from_secs(2));
+        assert_eq!(failure_backoff_duration(2), Duration::from_secs(4));
+        assert_eq!(failure_backoff_duration(3), Duration::from_secs(8));
+        assert_eq!(failure_backoff_duration(4), Duration::from_secs(16));
+        assert_eq!(failure_backoff_duration(5), Duration::from_secs(32));
+        assert_eq!(failure_backoff_duration(6), TRAY_RETRY_MAX_BACKOFF);
+        assert_eq!(failure_backoff_duration(20), TRAY_RETRY_MAX_BACKOFF);
+
+        let mut state = TrayRuntimeState::new();
+        let protected = TrayVisualState::from_snapshot(&sample_snapshot(
+            ServiceStateDto::Running,
+            EngineModeDto::Tun,
+            Some(sample_live(EngineModeDto::Tun, None)),
+        ));
+        let t0 = Instant::now();
+
+        // First attempt dispatches immediately.
+        assert!(state.should_dispatch_snapshot_at(1, protected, t0));
+
+        // 1st OS failure arms 2s backoff: 1.5s tick is suppressed; +2s retry dispatches.
+        state.record_sync_outcome(false, t0);
+        assert_eq!(state.consecutive_failures, 1);
+        assert!(state.is_in_failure_backoff(t0 + Duration::from_millis(1500)));
+        assert!(!state.should_dispatch_snapshot_at(
+            2,
+            protected,
+            t0 + Duration::from_millis(1500)
+        ));
+        assert!(state.should_dispatch_snapshot_at(3, protected, t0 + Duration::from_secs(2)));
+
+        // 2nd consecutive failure arms 4s backoff.
+        let t1 = t0 + Duration::from_secs(2);
+        state.record_sync_outcome(false, t1);
+        assert_eq!(state.consecutive_failures, 2);
+        assert!(!state.should_dispatch_snapshot_at(4, protected, t1 + Duration::from_secs(3)));
+        assert!(state.should_dispatch_snapshot_at(5, protected, t1 + Duration::from_secs(4)));
+
+        // Success resets consecutive_failures and retry_after immediately.
+        let t2 = t1 + Duration::from_secs(4);
+        state.record_sync_outcome(true, t2);
+        assert_eq!(state.consecutive_failures, 0);
+        assert!(state.retry_after.is_none());
+        assert!(!state.is_in_failure_backoff(t2));
+    }
+
+    #[test]
+    fn resolve_sync_spec_leaves_base_state_none_when_incoming_is_none() {
+        let mut state = TrayRuntimeState::new();
+        assert_eq!(state.base_state, None);
+
+        let initial_spec = state.resolve_sync_spec(EffectiveLanguage::En, None);
+        assert_eq!(
+            initial_spec,
+            TrayVisualSpec::from_state(TrayVisualState::Checking, EffectiveLanguage::En)
+        );
+        assert_eq!(
+            state.base_state, None,
+            "incoming=None must not lock base_state to Some(Checking)"
+        );
+
+        // Once a real snapshot arrives, base_state is recorded and preserved on subsequent None syncs.
+        let protected = TrayVisualState::Protected(EngineModeDto::Tun);
+        let protected_spec = state.resolve_sync_spec(EffectiveLanguage::En, Some((1, protected)));
+        assert_eq!(
+            protected_spec,
+            TrayVisualSpec::from_state(protected, EffectiveLanguage::En)
+        );
+        assert_eq!(state.base_state, Some(protected));
+
+        let synced_tr = state.resolve_sync_spec(EffectiveLanguage::Tr, None);
+        assert_eq!(
+            synced_tr,
+            TrayVisualSpec::from_state(protected, EffectiveLanguage::Tr)
+        );
+        assert_eq!(state.base_state, Some(protected));
     }
 
     #[test]

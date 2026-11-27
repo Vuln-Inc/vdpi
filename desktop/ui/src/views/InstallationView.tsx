@@ -62,6 +62,7 @@ export interface InstallationViewProps {
   onRefreshStatus: () => void | Promise<void>;
   onClearInstallError: () => void;
   onNavigate: (tab: NavTab) => void;
+  onModalOpenChange?: (open: boolean) => void;
 }
 
 type WintunRecheckFeedbackKind =
@@ -833,7 +834,8 @@ function areInstallationPropsEqual(
     prev.onOpenAppFolder !== next.onOpenAppFolder ||
     prev.onRefreshStatus !== next.onRefreshStatus ||
     prev.onClearInstallError !== next.onClearInstallError ||
-    prev.onNavigate !== next.onNavigate
+    prev.onNavigate !== next.onNavigate ||
+    prev.onModalOpenChange !== next.onModalOpenChange
   ) {
     return false;
   }
@@ -923,6 +925,7 @@ function InstallationViewComponent({
   onRefreshStatus,
   onClearInstallError,
   onNavigate,
+  onModalOpenChange,
 }: InstallationViewProps) {
   const { lang } = useLang();
   const idPrefix = useId();
@@ -971,19 +974,14 @@ function InstallationViewComponent({
     };
   }, []);
 
-  useEffect(() => {
-    if (userSelectedEngineRef.current) return;
-    const preferred = status?.configuredEngine ?? settings?.engine;
-    if (preferred) {
-      setSelectedEngine(preferred);
-    }
-  }, [status?.configuredEngine, settings?.engine]);
-
   const platform = status?.platform ?? "windows";
   const serviceState = status?.serviceState;
   const isNotInstalled = serviceState === "not_installed";
   const isInstalled = serviceState === "running" || serviceState === "stopped";
   const isProtectionRunning = Boolean(status?.live?.running);
+  const isServiceActive = Boolean(
+    status?.live?.running || serviceState === "running",
+  );
 
   useEffect(() => {
     const prev = prevServiceStateRef.current;
@@ -994,9 +992,20 @@ function InstallationViewComponent({
       setShowPostInstallCallout(true);
     } else if (serviceState === "not_installed") {
       setShowPostInstallCallout(false);
+      if (prev !== undefined && prev !== "not_installed") {
+        userSelectedEngineRef.current = false;
+      }
     }
     prevServiceStateRef.current = serviceState;
   }, [serviceState]);
+
+  useEffect(() => {
+    if (userSelectedEngineRef.current) return;
+    const preferred = status?.configuredEngine ?? settings?.engine;
+    if (preferred) {
+      setSelectedEngine(preferred);
+    }
+  }, [isNotInstalled, status?.configuredEngine, settings?.engine]);
 
   useEffect(() => {
     if (serviceState === "not_installed") {
@@ -1005,6 +1014,25 @@ function InstallationViewComponent({
       setPendingSwitchEngine(null);
     }
   }, [serviceState]);
+
+  const modalOpenRef = useRef(false);
+  const hasOpenModal =
+    pendingSwitchEngine !== null || confirmRepairOpen || confirmUninstallOpen;
+  useEffect(() => {
+    if (modalOpenRef.current !== hasOpenModal) {
+      modalOpenRef.current = hasOpenModal;
+      onModalOpenChange?.(hasOpenModal);
+    }
+  }, [hasOpenModal, onModalOpenChange]);
+
+  useEffect(() => {
+    return () => {
+      if (modalOpenRef.current) {
+        modalOpenRef.current = false;
+        onModalOpenChange?.(false);
+      }
+    };
+  }, [onModalOpenChange]);
 
   const bundledRaw = status?.bundledEngineVersion?.trim() || null;
   const installedRaw =
@@ -1039,18 +1067,25 @@ function InstallationViewComponent({
 
   const activeEngine: EngineMode =
     status?.live?.engine ??
-    settings?.engine ??
     status?.configuredEngine ??
-    "proxy";
+    settings?.engine ??
+    "tun";
+  const configuredEngine = status?.configuredEngine ?? settings?.engine;
+  const engineSwitchValue: EngineMode = configuredEngine ?? activeEngine;
+  const isEngineEffective = (engine: EngineMode): boolean =>
+    (!status?.live || status.live.engine === engine) &&
+    configuredEngine === engine;
 
   useEffect(() => {
     if (
       pendingSwitchEngine !== null &&
-      (pendingSwitchEngine === activeEngine || !isProtectionRunning)
+      (((!status?.live || status.live.engine === pendingSwitchEngine) &&
+        configuredEngine === pendingSwitchEngine) ||
+        !isServiceActive)
     ) {
       setPendingSwitchEngine(null);
     }
-  }, [activeEngine, isProtectionRunning, pendingSwitchEngine]);
+  }, [configuredEngine, isServiceActive, pendingSwitchEngine, status?.live]);
 
   const normalizedBusy = busyAction?.trim().toLowerCase() ?? null;
   const pendingOp = status?.pendingOperation ?? null;
@@ -1149,11 +1184,22 @@ function InstallationViewComponent({
         ? tInstallation(lang, "repairDisabledUnknownHint")
         : undefined;
 
-  const retryDisabled = isNotInstalled
-    ? installDisabled
-    : isUpgradeAvailable
-      ? isAnyServiceBusy || bundledMissing
-      : repairDisabled;
+  const retryOperation: "install" | "upgrade" | "repair" = isNotInstalled
+    ? "install"
+    : installError?.operation === "repair"
+      ? "repair"
+      : installError?.operation === "upgrade"
+        ? "upgrade"
+        : isUpgradeAvailable
+          ? "upgrade"
+          : "repair";
+
+  const retryDisabled =
+    retryOperation === "install"
+      ? installDisabled
+      : retryOperation === "upgrade"
+        ? isAnyServiceBusy || bundledMissing
+        : repairDisabled;
 
   const safeReleaseUrl = sanitizeExternalUrl(updateInfo?.releaseUrl);
   const showReleaseCard = Boolean(updateInfo?.hasUpdate);
@@ -1287,13 +1333,17 @@ function InstallationViewComponent({
   };
 
   const handleRequestSwitchEngine = (nextEngine: EngineMode) => {
-    if (!onSwitchEngine || isAnyServiceBusy || nextEngine === activeEngine) {
+    if (
+      !onSwitchEngine ||
+      isAnyServiceBusy ||
+      isEngineEffective(nextEngine)
+    ) {
       return;
     }
     if (nextEngine === "tun" && wintunNotReady) {
       return;
     }
-    if (isProtectionRunning) {
+    if (isServiceActive) {
       setPendingSwitchEngine(nextEngine);
       return;
     }
@@ -1400,9 +1450,9 @@ function InstallationViewComponent({
 
   const handleRetryFromError = () => {
     if (retryDisabled) return;
-    if (isNotInstalled) {
+    if (retryOperation === "install") {
       handleStartInstall(selectedEngine);
-    } else if (isUpgradeAvailable) {
+    } else if (retryOperation === "upgrade") {
       onClearInstallError();
       void onUpgradeService();
     } else if (!repairDisabled) {
@@ -2327,7 +2377,7 @@ function InstallationViewComponent({
                         size="sm"
                         className="install-meta-segmented"
                         options={engineSwitchOptions}
-                        value={activeEngine}
+                        value={engineSwitchValue}
                         disabled={isAnyServiceBusy}
                         ariaLabelledBy={installedEngineLabelId}
                         ariaDescribedBy={

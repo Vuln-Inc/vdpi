@@ -37,7 +37,7 @@ export const STATUS_EVENT = "vdpi://status";
 
 export type AppFolderTarget = "config" | "logs" | "app";
 
-const APP_VERSION = "0.6.2";
+const APP_VERSION = "0.6.3";
 const READ_IPC_TIMEOUT_MS = 15_000;
 const APP_ICONS_TIMEOUT_MS = 10_000;
 const UPDATE_IPC_TIMEOUT_MS = 25_000;

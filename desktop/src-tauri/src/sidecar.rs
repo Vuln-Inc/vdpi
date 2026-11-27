@@ -6,17 +6,21 @@ use std::io::{ErrorKind, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
-use std::thread::{self, JoinHandle};
+use std::sync::{mpsc, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use vdpi::config_file::{render_config_toml, user_config_path, FileConfig};
+#[cfg(not(target_os = "windows"))]
+use vdpi::config_file::user_config_path;
+use vdpi::config_file::{render_config_toml, FileConfig};
 use vdpi::service::installed_binary_path;
 use vdpi::update::strip_windows_verbatim_prefix;
 use vdpi_core::dns::redact_urls_in_text;
 
 const MAX_CAPTURE_BYTES: usize = 256 * 1024;
+#[cfg(not(target_os = "windows"))]
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const KILL_WAIT_GRACE: Duration = Duration::from_millis(250);
 const APPLY_CONFIG_TIMEOUT_SECS: u64 = 90;
 const APPLY_FILE_SAVED_NEEDS_RESTART_EXIT_CODE: i32 = 2;
@@ -451,6 +455,12 @@ fn user_home_and_config_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     #[cfg(windows)]
     {
+        if let Some(local_appdata) = cached_windows_local_app_data_dir() {
+            let candidate = strip_windows_verbatim_prefix(&local_appdata);
+            if candidate.is_absolute() && !roots.contains(&candidate) {
+                roots.push(candidate);
+            }
+        }
         push_abs_env_dir(&mut roots, "USERPROFILE");
         push_abs_env_dir(&mut roots, "LOCALAPPDATA");
         push_abs_env_dir(&mut roots, "APPDATA");
@@ -843,10 +853,10 @@ fn push_windows_program_files_cli_candidate(candidates: &mut Vec<PathBuf>, dir: 
 }
 
 #[cfg(target_os = "windows")]
-fn query_windows_program_files_dir() -> Option<PathBuf> {
+fn query_windows_known_folder(folder_id: &windows_sys::core::GUID) -> Option<PathBuf> {
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStringExt;
-    use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath};
+    use windows_sys::Win32::UI::Shell::SHGetKnownFolderPath;
 
     #[link(name = "ole32")]
     extern "system" {
@@ -867,8 +877,8 @@ fn query_windows_program_files_dir() -> Option<PathBuf> {
     }
 
     let mut raw_ptr: *mut u16 = std::ptr::null_mut();
-    // SAFETY: `&FOLDERID_ProgramFiles` is a valid GUID pointer; `raw_ptr` is a valid out-pointer.
-    let hr = unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, 0, 0, &mut raw_ptr) };
+    // SAFETY: `folder_id` is a valid GUID pointer; `raw_ptr` is a valid out-pointer.
+    let hr = unsafe { SHGetKnownFolderPath(folder_id, 0, 0, &mut raw_ptr) };
     let _guard = CoTaskMemGuard(raw_ptr);
     if hr < 0 || raw_ptr.is_null() {
         return None;
@@ -886,6 +896,28 @@ fn query_windows_program_files_dir() -> Option<PathBuf> {
         }
         Some(PathBuf::from(OsString::from_wide(slice)))
     }
+}
+
+#[cfg(target_os = "windows")]
+fn cached_windows_program_files_dir() -> Option<PathBuf> {
+    static CACHED: OnceLock<Option<PathBuf>> = OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            use windows_sys::Win32::UI::Shell::FOLDERID_ProgramFiles;
+            query_windows_known_folder(&FOLDERID_ProgramFiles)
+        })
+        .clone()
+}
+
+#[cfg(target_os = "windows")]
+fn cached_windows_local_app_data_dir() -> Option<PathBuf> {
+    static CACHED: OnceLock<Option<PathBuf>> = OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            use windows_sys::Win32::UI::Shell::FOLDERID_LocalAppData;
+            query_windows_known_folder(&FOLDERID_LocalAppData)
+        })
+        .clone()
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -923,7 +955,8 @@ fn build_system_cli_candidates() -> Vec<PathBuf> {
 
     #[cfg(target_os = "windows")]
     {
-        for candidate in build_windows_system_cli_candidates_from(query_windows_program_files_dir())
+        for candidate in
+            build_windows_system_cli_candidates_from(cached_windows_program_files_dir())
         {
             push_unique_candidate(&mut candidates, candidate);
         }
@@ -1310,51 +1343,123 @@ fn scrub_linux_appimage_env(cmd: &mut Command) {
     }
 }
 
-fn spawn_pipe_reader<R: Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<Vec<u8>> {
-    thread::spawn(move || {
-        let Some(mut reader) = pipe else {
-            return Vec::new();
-        };
-        let mut retained = Vec::new();
-        let mut scratch = [0u8; 4096];
-        loop {
-            match reader.read(&mut scratch) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if retained.len() < MAX_CAPTURE_BYTES {
-                        let keep = (MAX_CAPTURE_BYTES - retained.len()).min(n);
-                        retained.extend_from_slice(&scratch[..keep]);
+fn spawn_pipe_reader<R: Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    let Some(mut reader) = pipe else {
+        let _ = tx.send(Vec::new());
+        return rx;
+    };
+    let tx_thread = tx.clone();
+    let spawn_res = thread::Builder::new()
+        .name("vdpi-sidecar-pipe-reader".to_string())
+        .spawn(move || {
+            let mut retained = Vec::new();
+            let mut scratch = [0u8; 4096];
+            loop {
+                match reader.read(&mut scratch) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if retained.len() < MAX_CAPTURE_BYTES {
+                            let keep = (MAX_CAPTURE_BYTES - retained.len()).min(n);
+                            retained.extend_from_slice(&scratch[..keep]);
+                        }
                     }
+                    Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => break,
                 }
-                Err(err) if err.kind() == ErrorKind::Interrupted => continue,
-                Err(_) => break,
             }
-        }
-        retained
-    })
+            let _ = tx_thread.send(retained);
+        });
+    if spawn_res.is_err() {
+        let _ = tx.send(Vec::new());
+    }
+    rx
 }
 
-fn detach_child_reaper(
-    mut child: Child,
-    stdout_handle: JoinHandle<Vec<u8>>,
-    stderr_handle: JoinHandle<Vec<u8>>,
-) {
+fn drain_pipe_with_timeout(rx: &mpsc::Receiver<Vec<u8>>, timeout: Duration) -> Vec<u8> {
+    rx.recv_timeout(timeout).unwrap_or_default()
+}
+
+fn detach_child_reaper(mut child: Child) {
     let _ = thread::Builder::new()
         .name("vdpi-sidecar-reaper".to_string())
         .spawn(move || {
             let _ = child.wait();
-            let _ = stdout_handle.join();
-            let _ = stderr_handle.join();
         });
 }
 
-fn detach_pipe_reaper(stdout_handle: JoinHandle<Vec<u8>>, stderr_handle: JoinHandle<Vec<u8>>) {
-    let _ = thread::Builder::new()
-        .name("vdpi-sidecar-pipe-reaper".to_string())
-        .spawn(move || {
-            let _ = stdout_handle.join();
-            let _ = stderr_handle.join();
-        });
+#[cfg(any(target_os = "windows", test))]
+fn duration_to_wait_ms(dur: Duration) -> u32 {
+    if dur.is_zero() {
+        return 0;
+    }
+    dur.as_millis()
+        .max(1)
+        .min(MAX_NON_INFINITE_WAIT_MS as u128) as u32
+}
+
+#[cfg(target_os = "windows")]
+fn wait_child_with_timeout(
+    child: &mut Child,
+    timeout: Duration,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{
+        GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        let wait_ms = duration_to_wait_ms(remaining);
+        let handle = child.as_raw_handle() as HANDLE;
+        if handle == 0 || handle == INVALID_HANDLE_VALUE {
+            return child.try_wait();
+        }
+        // SAFETY: `child` is owned and live; `handle` is its valid Win32 process handle,
+        // and `wait_ms` is strictly bounded (< INFINITE).
+        let wait_res = unsafe { WaitForSingleObject(handle, wait_ms) };
+        match wait_res {
+            WAIT_OBJECT_0 => return child.wait().map(Some),
+            WAIT_TIMEOUT => {
+                if Instant::now() >= deadline {
+                    return Ok(None);
+                }
+            }
+            _ => {
+                let err = unsafe { GetLastError() };
+                return Err(std::io::Error::from_raw_os_error(err as i32));
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn wait_child_with_timeout(
+    child: &mut Child,
+    timeout: Duration,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let start = Instant::now();
+    loop {
+        match child.try_wait()? {
+            Some(status) => return Ok(Some(status)),
+            None => {
+                let elapsed = start.elapsed();
+                if elapsed >= timeout {
+                    return Ok(None);
+                }
+                let remaining = timeout.saturating_sub(elapsed);
+                thread::sleep(CHILD_POLL_INTERVAL.min(remaining));
+            }
+        }
+    }
 }
 
 fn run_command_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<CapturedOutput, String> {
@@ -1380,68 +1485,53 @@ fn run_command_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Capt
         redact_urls_in_text(&format!("Failed to launch vdpi CLI process: {err}"))
     })?;
 
-    let stdout_handle = spawn_pipe_reader(child.stdout.take());
-    let stderr_handle = spawn_pipe_reader(child.stderr.take());
+    let stdout_rx = spawn_pipe_reader(child.stdout.take());
+    let stderr_rx = spawn_pipe_reader(child.stderr.take());
 
-    let start = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                let elapsed = start.elapsed();
-                if elapsed >= timeout {
-                    match child.kill() {
-                        Ok(()) => {
-                            let kill_deadline = Instant::now() + KILL_WAIT_GRACE;
-                            let mut reaped = false;
-                            loop {
-                                match child.try_wait() {
-                                    Ok(Some(_)) => {
-                                        reaped = true;
-                                        break;
-                                    }
-                                    Ok(None) if Instant::now() < kill_deadline => {
-                                        thread::sleep(Duration::from_millis(10));
-                                    }
-                                    _ => break,
-                                }
-                            }
-                            if reaped {
-                                // Detach pipe joins so an orphaned grandchild keeping
-                                // stdout/stderr open can never wedge the caller's lock.
-                                detach_pipe_reaper(stdout_handle, stderr_handle);
-                            } else {
-                                detach_child_reaper(child, stdout_handle, stderr_handle);
-                            }
-                        }
-                        Err(_) => {
-                            // E.g. `PermissionDenied` when attempting to signal setuid `pkexec`
-                            // on Linux. Hand `child` and pipe readers to a detached background
-                            // reaper thread and return timeout immediately so `action_lock` is
-                            // never wedged.
-                            detach_child_reaper(child, stdout_handle, stderr_handle);
-                        }
+    let status = match wait_child_with_timeout(&mut child, timeout) {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            match child.kill() {
+                Ok(()) => {
+                    let reaped = wait_child_with_timeout(&mut child, KILL_WAIT_GRACE)
+                        .ok()
+                        .flatten()
+                        .is_some();
+                    if !reaped {
+                        detach_child_reaper(child);
                     }
-                    return Err(format!(
-                        "vdpi command timed out after {}s.",
-                        timeout.as_secs().max(1)
-                    ));
                 }
-                let remaining = timeout.saturating_sub(elapsed);
-                thread::sleep(CHILD_POLL_INTERVAL.min(remaining));
+                Err(_) => {
+                    // E.g. `PermissionDenied` when attempting to signal setuid `pkexec`
+                    // on Linux. Hand `child` to a detached background reaper thread and
+                    // return timeout immediately so `action_lock` is never wedged.
+                    detach_child_reaper(child);
+                }
             }
-            Err(err) => {
-                let _ = child.kill();
-                detach_child_reaper(child, stdout_handle, stderr_handle);
-                return Err(redact_urls_in_text(&format!(
-                    "Failed while waiting for vdpi process: {err}"
-                )));
-            }
+            return Err(format!(
+                "vdpi command timed out after {}s.",
+                timeout.as_secs().max(1)
+            ));
+        }
+        Err(err) => {
+            let _ = child.kill();
+            detach_child_reaper(child);
+            return Err(redact_urls_in_text(&format!(
+                "Failed while waiting for vdpi process: {err}"
+            )));
         }
     };
 
-    let stdout_bytes = stdout_handle.join().unwrap_or_default();
-    let stderr_bytes = stderr_handle.join().unwrap_or_default();
+    // Bounded pipe drain prevents inherited grandchild handles from wedging `action_lock` forever.
+    let drain_deadline = Instant::now() + PIPE_DRAIN_TIMEOUT;
+    let stdout_bytes = drain_pipe_with_timeout(
+        &stdout_rx,
+        drain_deadline.saturating_duration_since(Instant::now()),
+    );
+    let stderr_bytes = drain_pipe_with_timeout(
+        &stderr_rx,
+        drain_deadline.saturating_duration_since(Instant::now()),
+    );
 
     Ok(CapturedOutput {
         exit_code: status.code(),
@@ -1814,35 +1904,34 @@ mod win_elevate {
     }
 
     pub(super) fn windows_system32_dir() -> PathBuf {
-        resolve_windows_system32_dir_from(
-            query_windows_system32_dir(),
-            std::env::var_os("SystemRoot").as_deref(),
-            std::env::var_os("WINDIR").as_deref(),
-        )
+        static CACHED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        CACHED
+            .get_or_init(|| {
+                resolve_windows_system32_dir_from(
+                    query_windows_system32_dir(),
+                    std::env::var_os("SystemRoot").as_deref(),
+                    std::env::var_os("WINDIR").as_deref(),
+                )
+            })
+            .clone()
     }
 
-    pub(super) fn run_elevated(
-        bin: &Path,
-        args: &[&str],
+    fn run_elevated_on_sta_thread(
+        clean_bin: &Path,
+        params: &str,
         timeout_secs: u64,
         allow_saved_needs_restart: bool,
     ) -> SidecarOutcome {
-        let params = match build_windows_parameters(args) {
-            Ok(p) => p,
-            Err(err) => return SidecarOutcome::Err(err),
-        };
-
         // Initialize COM STA as documented by Microsoft for `ShellExecuteExW`.
         let _com_guard = ComStaGuard::init();
 
-        let clean_bin = strip_windows_verbatim_prefix(bin);
         // Always set elevated working directory to `%SystemRoot%\System32` (never a
         // user-writable application or temp directory) to prevent DLL search-order hijacking.
         let work_dir = windows_system32_dir();
 
         let verb_wide = encode_wide_nul(OsStr::new("runas"));
         let file_wide = encode_wide_nul(clean_bin.as_os_str());
-        let params_wide = encode_wide_nul(OsStr::new(&params));
+        let params_wide = encode_wide_nul(OsStr::new(params));
         let dir_wide = encode_wide_nul(work_dir.as_os_str());
 
         let mut info = ShellExecuteInfoW {
@@ -1914,6 +2003,47 @@ mod win_elevate {
                     "Waiting for elevated vdpi command failed (result {other}, Win32 error {err})."
                 ))
             }
+        }
+    }
+
+    pub(super) fn run_elevated(
+        bin: &Path,
+        args: &[&str],
+        timeout_secs: u64,
+        allow_saved_needs_restart: bool,
+    ) -> SidecarOutcome {
+        let params = match build_windows_parameters(args) {
+            Ok(p) => p,
+            Err(err) => return SidecarOutcome::Err(err),
+        };
+        let clean_bin = strip_windows_verbatim_prefix(bin);
+
+        // Run COM STA initialization + `ShellExecuteExW` on a dedicated short-lived OS
+        // thread instead of a reused Tokio blocking worker thread that may already be
+        // initialized as COM MTA (`RPC_E_CHANGED_MODE`).
+        let handle = match std::thread::Builder::new()
+            .name("vdpi-win-elevate".to_string())
+            .spawn(move || {
+                run_elevated_on_sta_thread(
+                    &clean_bin,
+                    &params,
+                    timeout_secs,
+                    allow_saved_needs_restart,
+                )
+            }) {
+            Ok(h) => h,
+            Err(err) => {
+                return SidecarOutcome::Err(format!(
+                    "Failed to spawn elevation helper thread: {err}"
+                ));
+            }
+        };
+
+        match handle.join() {
+            Ok(outcome) => outcome,
+            Err(_) => SidecarOutcome::Err(
+                "Elevated vdpi helper thread panicked before completing.".to_string(),
+            ),
         }
     }
 }
@@ -2564,6 +2694,7 @@ impl Drop for TempFileGuard {
     }
 }
 
+#[cfg(any(not(target_os = "windows"), test))]
 fn resolve_user_config_dir_from(
     cfg_path: &Path,
     system_temp_dir: &Path,
@@ -2605,10 +2736,79 @@ fn resolve_user_config_dir_from(
     Ok(clean_parent)
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn resolve_windows_user_config_dir_from(
+    known_local_appdata: Option<PathBuf>,
+    local_appdata_env: Option<&OsStr>,
+    user_profile_env: Option<&OsStr>,
+    system_temp_dir: &Path,
+) -> Result<PathBuf, String> {
+    let clean_temp = strip_windows_verbatim_prefix(system_temp_dir);
+    let validate_base = |raw: PathBuf| -> Option<PathBuf> {
+        let clean = strip_windows_verbatim_prefix(&raw);
+        if clean.as_os_str().is_empty()
+            || !is_local_drive_absolute(&clean)
+            || has_windows_parent_traversal(&clean)
+        {
+            return None;
+        }
+        if matches!(split_under_root(&clean, &clean_temp), Some((_, rest)) if rest.is_empty()) {
+            return None;
+        }
+        let vdpi_dir = clean.join("vdpi");
+        if matches!(split_under_root(&vdpi_dir, &clean_temp), Some((_, rest)) if rest.is_empty()) {
+            return None;
+        }
+        Some(vdpi_dir)
+    };
+
+    // 1. Prefer OS Known Folder API (`SHGetKnownFolderPath(FOLDERID_LocalAppData)`),
+    //    immune to stripped `%LOCALAPPDATA%` env vars and never falling back to
+    //    admin-only / read-only `ProgramData`.
+    if let Some(dir) = known_local_appdata.and_then(validate_base) {
+        return Ok(dir);
+    }
+
+    // 2. Fallback to `%LOCALAPPDATA%\vdpi`.
+    if let Some(dir) = local_appdata_env
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .and_then(validate_base)
+    {
+        return Ok(dir);
+    }
+
+    // 3. Fallback to `%USERPROFILE%\AppData\Local\vdpi`.
+    if let Some(dir) = user_profile_env
+        .filter(|v| !v.is_empty())
+        .map(|profile| PathBuf::from(profile).join("AppData").join("Local"))
+        .and_then(validate_base)
+    {
+        return Ok(dir);
+    }
+
+    Err(
+        "Could not determine a writable per-user LocalAppData directory; refusing to fall back to read-only ProgramData or a shared temp directory."
+            .to_string(),
+    )
+}
+
 fn user_config_dir() -> Result<PathBuf, String> {
-    let cfg_path = user_config_path();
     let temp_dir = std::env::temp_dir();
-    resolve_user_config_dir_from(&cfg_path, &temp_dir)
+    #[cfg(target_os = "windows")]
+    {
+        resolve_windows_user_config_dir_from(
+            cached_windows_local_app_data_dir(),
+            std::env::var_os("LOCALAPPDATA").as_deref(),
+            std::env::var_os("USERPROFILE").as_deref(),
+            &temp_dir,
+        )
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let cfg_path = user_config_path();
+        resolve_user_config_dir_from(&cfg_path, &temp_dir)
+    }
 }
 
 fn is_stale_apply_temp_filename(name: &str) -> bool {
@@ -5272,5 +5472,88 @@ mod tests {
             symlink(&fake_exe, &link_exe).expect("create symlink exe");
             assert!(validate_self_exe_for_elevation(&link_exe).is_err());
         }
+    }
+
+    #[test]
+    fn bounded_pipe_drain_and_wait_ms_prevent_grandchild_deadlock_and_infinite_wait() {
+        // Normal EOF delivers captured bytes promptly.
+        let (tx_ok, rx_ok) = mpsc::channel();
+        tx_ok.send(b"vdpi 0.6.3\n".to_vec()).expect("send bytes");
+        assert_eq!(
+            drain_pipe_with_timeout(&rx_ok, Duration::from_millis(200)),
+            b"vdpi 0.6.3\n"
+        );
+
+        // Open sender (simulating an inherited grandchild handle keeping stdout/stderr open)
+        // returns promptly after the bounded timeout instead of deadlocking forever.
+        let (_held_tx, rx_stuck) = mpsc::channel::<Vec<u8>>();
+        let start = Instant::now();
+        let drained = drain_pipe_with_timeout(&rx_stuck, Duration::from_millis(60));
+        assert!(drained.is_empty());
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "bounded pipe drain must not block indefinitely when a grandchild holds the pipe open"
+        );
+
+        // Windows WaitForSingleObject millisecond conversion rounds sub-ms up to 1ms
+        // and never returns INFINITE (u32::MAX).
+        assert_eq!(duration_to_wait_ms(Duration::ZERO), 0);
+        assert_eq!(duration_to_wait_ms(Duration::from_micros(250)), 1);
+        assert_eq!(duration_to_wait_ms(Duration::from_millis(120)), 120);
+        assert_eq!(
+            duration_to_wait_ms(Duration::from_secs(u64::MAX)),
+            u32::MAX - 1
+        );
+        assert_ne!(duration_to_wait_ms(Duration::from_secs(u64::MAX)), u32::MAX);
+    }
+
+    #[test]
+    fn windows_user_config_dir_prefers_known_local_appdata_and_never_falls_back_to_programdata() {
+        let temp_dir = Path::new(r"C:\Windows\Temp");
+
+        // 1. Prefers SHGetKnownFolderPath(FOLDERID_LocalAppData) over env vars and strips verbatim prefix.
+        assert_eq!(
+            resolve_windows_user_config_dir_from(
+                Some(PathBuf::from(r"\\?\C:\Users\Alice\AppData\Local")),
+                Some(OsStr::new(r"D:\EnvLocal")),
+                Some(OsStr::new(r"E:\EnvProfile")),
+                temp_dir,
+            )
+            .expect("known LocalAppData should win"),
+            PathBuf::from(r"C:\Users\Alice\AppData\Local").join("vdpi")
+        );
+
+        // 2. Rejects UNC/traversal/temp-dir KnownFolder values and falls back to env vars.
+        assert_eq!(
+            resolve_windows_user_config_dir_from(
+                Some(PathBuf::from(r"\\attacker\share\Local")),
+                Some(OsStr::new(r"C:\Users\Bob\AppData\Local")),
+                None,
+                temp_dir,
+            )
+            .expect("valid LOCALAPPDATA fallback"),
+            PathBuf::from(r"C:\Users\Bob\AppData\Local").join("vdpi")
+        );
+        assert_eq!(
+            resolve_windows_user_config_dir_from(
+                Some(PathBuf::from(r"C:\Users\Alice\..\Evil")),
+                Some(OsStr::new(r"C:\Windows\Temp")),
+                Some(OsStr::new(r"C:\Users\Carol")),
+                temp_dir,
+            )
+            .expect("valid USERPROFILE fallback"),
+            PathBuf::from(r"C:\Users\Carol")
+                .join("AppData")
+                .join("Local")
+                .join("vdpi")
+        );
+
+        // 3. When all per-user sources are missing or invalid, refuses to fall back to read-only ProgramData.
+        let err = resolve_windows_user_config_dir_from(None, None, None, temp_dir)
+            .expect_err("must fail instead of falling back to read-only ProgramData");
+        assert!(
+            err.contains("ProgramData"),
+            "error should explain refusal to fall back to ProgramData: {err}"
+        );
     }
 }

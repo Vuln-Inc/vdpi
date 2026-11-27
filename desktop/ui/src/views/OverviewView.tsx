@@ -53,6 +53,7 @@ export interface OverviewViewProps {
   onNavigate: (tab: NavTab) => void;
   onClearActivity: () => void;
   onCopyActivity: () => boolean | void | Promise<boolean | void>;
+  onModalOpenChange?: (open: boolean) => void;
 }
 
 type StatusTone = "active" | "idle" | "warn" | "muted";
@@ -119,6 +120,7 @@ export function OverviewView({
   onNavigate,
   onClearActivity,
   onCopyActivity,
+  onModalOpenChange,
 }: OverviewViewProps) {
   const { lang } = useLang();
   const engineLabelId = useId();
@@ -162,7 +164,11 @@ export function OverviewView({
       status.cliVersionRelation === "repair_needed",
   );
   const activeEngine: EngineMode =
-    live?.engine ?? settings?.engine ?? status?.configuredEngine ?? "tun";
+    live?.engine ?? status?.configuredEngine ?? settings?.engine ?? "tun";
+  const configuredEngine = status?.configuredEngine ?? settings?.engine;
+  const engineSwitchValue: EngineMode = configuredEngine ?? activeEngine;
+  const isEngineEffective = (engine: EngineMode): boolean =>
+    (!live || live.engine === engine) && configuredEngine === engine;
   const vpnConflict =
     (live?.vpnConflict ?? status?.vpnConflict)?.trim() || null;
 
@@ -177,6 +183,8 @@ export function OverviewView({
     status !== null && serviceState === "running" && !live && !isYielded,
   );
   const isRunning = Boolean(live?.running);
+  const isServiceActive = Boolean(live?.running || serviceState === "running");
+  const canPause = isRunning || isStarting || isYielded;
 
   const normalizedBusy = busyAction?.trim().toLowerCase() ?? null;
   const pendingOp = status?.pendingOperation ?? null;
@@ -218,11 +226,31 @@ export function OverviewView({
   useEffect(() => {
     if (
       pendingEngine !== null &&
-      (pendingEngine === activeEngine || !isRunning)
+      (((!live || live.engine === pendingEngine) &&
+        configuredEngine === pendingEngine) ||
+        !isServiceActive)
     ) {
       setPendingEngine(null);
     }
-  }, [activeEngine, isRunning, pendingEngine]);
+  }, [configuredEngine, isServiceActive, live, pendingEngine]);
+
+  const modalOpenRef = useRef(false);
+  useEffect(() => {
+    const isOpen = pendingEngine !== null;
+    if (modalOpenRef.current !== isOpen) {
+      modalOpenRef.current = isOpen;
+      onModalOpenChange?.(isOpen);
+    }
+  }, [onModalOpenChange, pendingEngine]);
+
+  useEffect(() => {
+    return () => {
+      if (modalOpenRef.current) {
+        modalOpenRef.current = false;
+        onModalOpenChange?.(false);
+      }
+    };
+  }, [onModalOpenChange]);
 
   const wintunNotReady = Boolean(
     status?.platform === "windows" && !status.wintun.ready,
@@ -423,10 +451,11 @@ export function OverviewView({
     if (isNotInstalled) {
       return tOverview(lang, "btnSetUpAndConnect");
     }
-    return (isRunning || isStarting) && !isYielded
+    return canPause
       ? tOverview(lang, "btnPause")
       : tOverview(lang, "btnConnect");
   }, [
+    canPause,
     isConnecting,
     isInstallingService,
     isLoadingStatus,
@@ -434,10 +463,7 @@ export function OverviewView({
     isPausing,
     isPrimaryBusy,
     isRepairingService,
-    isRunning,
-    isStarting,
     isUninstallingService,
-    isYielded,
     lang,
   ]);
 
@@ -450,23 +476,19 @@ export function OverviewView({
     if (isPrimaryBusy && pendingToggleIntentRef.current === "connecting") {
       return "btn-primary";
     }
-    return (isRunning || isStarting) && !isYielded
-      ? "btn-secondary"
-      : "btn-primary";
+    return canPause ? "btn-secondary" : "btn-primary";
   }, [
+    canPause,
     isConnecting,
     isInstallingService,
     isPausing,
     isPrimaryBusy,
-    isRunning,
-    isStarting,
-    isYielded,
   ]);
 
   const primaryDisabled =
     !status ||
     isAnyBusy ||
-    (wintunMissing && !isRunning) ||
+    (wintunMissing && !canPause) ||
     (isNotInstalled && bundleMissing);
 
   const rxRateBps = live?.rxRateBps ?? 0;
@@ -522,7 +544,7 @@ export function OverviewView({
       }
       return;
     }
-    const shouldConnect = !(isRunning || isStarting) || isYielded;
+    const shouldConnect = !canPause;
     pendingToggleIntentRef.current = shouldConnect ? "connecting" : "pausing";
     void onToggleProtection(shouldConnect);
   };
@@ -537,9 +559,9 @@ export function OverviewView({
   };
 
   const handleEngineChange = (next: EngineMode) => {
-    if (next === activeEngine || isAnyBusy) return;
+    if (isEngineEffective(next) || isAnyBusy) return;
     if (next === "tun" && tunSwitchBlockedByWintun) return;
-    if (isRunning) {
+    if (isServiceActive) {
       setPendingEngine(next);
       return;
     }
@@ -619,8 +641,8 @@ export function OverviewView({
       if (refreshed && typeof refreshed === "object" && "wintun" in refreshed) {
         const refreshedEngine =
           refreshed.live?.engine ??
-          settings?.engine ??
           refreshed.configuredEngine ??
+          settings?.engine ??
           "tun";
         const stillMissing = Boolean(
           refreshed.platform === "windows" &&
@@ -786,7 +808,7 @@ export function OverviewView({
             </span>
             <SegmentedControl<EngineMode>
               options={engineOptions}
-              value={activeEngine}
+              value={engineSwitchValue}
               disabled={!status || isAnyBusy}
               ariaLabelledBy={engineLabelId}
               onChange={handleEngineChange}

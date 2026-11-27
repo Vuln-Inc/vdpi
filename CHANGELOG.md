@@ -6,6 +6,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-11-27
+
+### Fixed
+- **Windows TUN multicast self-loop, memory/handle leak, and Roblox Error Code 277**:
+  - Dropped multicast (`224.0.0.0/4`, `ff00::/8`), link-local, Class E, `0.0.0.0/8`, and `vdpi0` `/30` non-DNS UDP packets at TUN ingress and bound `IP_MULTICAST_IF` / `IPV6_MULTICAST_IF` with multicast loopback disabled on Windows UDP sockets, eliminating the 55,000 pps self-loop that pegged UDP flows at 512, leaked RAM/handles, and disconnected games.
+  - Added two-tier UDP NAT idle timeouts (`25s` unreplied / `120s` established) with `has_rx`-protected LRU eviction, raised desktop UDP flow capacity to `1024`, released the NAT read lock before `try_send_to`, deduplicated concurrent in-flight UDP binds, disabled false-positive Windows `SystemTime` NTP sleep-jump drains, and exempted RakNet offline handshakes and DTLS 1.3 ACKs from UDP/443 QUIC blocking.
+- **Windows audio/PC stutter and DPC latency under TUN**:
+  - Lowered `DESKTOP_MTU` / `VDPI_TUN_MTU` to `4096` (inside the Windows NT LFH `16368`-byte ceiling), reduced Wintun ring allocation to `4 MiB`, capped TX batches to `32` packets, added TCP socket/control buffer pooling (`SocketBufferPool`) and `256 KiB` desktop smoltcp buffers, fixed `TIME_WAIT` reaping without unsolicited `RST`, filtered IPv6 RFC 4941 temporary privacy addresses and NDIS route/unicast callbacks, cached `DnsFlushResolverCache` and split-tunnel process/table snapshots, and removed synchronous UI-thread Win32 roundtrips and `document.body` `MutationObserver` churn from the Desktop GUI.
+- **Windows Proxy Mode and TUN <-> Proxy switching**:
+  - Switched Windows service registration (`BINARY_PATH_NAME`) to config-driven `"vdpi.exe" --service` so `C:\ProgramData\vdpi\config.toml` is the single source of truth instead of legacy baked `--tun` flags overriding Proxy mode.
+  - Synthesized valid `0x46` `DefaultConnectionSettings` / `SavedLegacySettings` blobs when missing or malformed, cleared the WPAD `0x08` bit while `vdpi` PAC is active (restoring original auto-detect state on stop), added Session-0 -> Session-1 interactive WinINET notification (`--internal-wininet-notify`) plus Desktop GUI session refresh, started the HTTP/PAC listener before activating system proxy, raised `MAX_CLIENT_SESSIONS` from `256` to `2048` with clean `503` overload responses, switched `/vdpi.pac` to `Cache-Control: no-cache, max-age=0, private` with per-session `?v=<nonce>` cache-busting, and registered `SERVICE_ACCEPT_PRESHUTDOWN` with unloaded-hive backup preservation.
+- **Windows IPv6 DNS leak (`DNS-Client 8048`), Radmin VPN, adaptive cache poisoning, and service logs**:
+  - Installed a managed Windows NRPT DNS policy rule while TUN is active (cleaned up on every stop, crash recovery, and `reset-network`), kept IPv4 DoH and non-port-53 UDP servers ahead of IPv6, suppressed `HTTPS`/`SVCB`/`ANY` leaks in IPv4-only mode, and restored DoH failover on `SERVFAIL`/`REFUSED`.
+  - Classified Radmin VPN and Hamachi as LAN-overlay adapters so they are never ranked as physical NICs or false-yielded, prevented `FineFragment` and alternate-IP failovers from poisoning `global_isp_stage` (bumping adaptive cache schema to `v2` so stale `v0.6.2` caches auto-reset), added Microsoft OS update/telemetry domains to default bypasses while removing ISP-blocked Proton/consumer-VPN web domains, and enabled non-blocking rotating service logs in `C:\Program Files\vdpi\logs\vdpi.log`.
+- **Desktop GUI, CLI, macOS, and Linux reliability**:
+  - Fixed Desktop UI `activeEngine` precedence, mismatched-engine revert clicks, `ReadinessWait::LiveEngine` verification, portable `Proxy -> TUN` Wintun fallback, yielded-to-VPN pause button, Installation retry routing, DNS/Split Tunnel/Settings/Diagnostics state races, and `DiagnosticsView` / `SettingsView` layout alignment.
+  - Fixed macOS offline TUN teardown ordering and non-root proxy reset, Linux manual-proxy preservation and IPv6 routing guards, SOCKS5 `UDP ASSOCIATE` bind ordering, foreground running-service conflict guards, and updater Defender rename retries with direct `.no_proxy()` fallback.
+
 ## [0.6.2] - 2026-11-27
 
 ### Added
@@ -248,7 +266,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Configured `CODE_SIGN_ENTITLEMENTS` in iOS `project.yml` so XcodeGen preserves `.entitlements` files.
 - Fixed release workflow entitlement verification and restricted automatic release runs to version tags and manual dispatch.
 
-[Unreleased]: https://github.com/Vuln-Inc/vdpi/compare/v0.6.2...HEAD
+[Unreleased]: https://github.com/Vuln-Inc/vdpi/compare/v0.6.3...HEAD
+[0.6.3]: https://github.com/Vuln-Inc/vdpi/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/Vuln-Inc/vdpi/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/Vuln-Inc/vdpi/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/Vuln-Inc/vdpi/compare/v0.5.8...v0.6.0

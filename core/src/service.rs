@@ -1273,11 +1273,111 @@ pub fn clear_runtime_state(expected_pid: u32) {
     }
 }
 
-pub fn read_runtime_states() -> Vec<RuntimeState> {
+#[cfg(target_os = "windows")]
+fn is_windows_pid_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    const ERROR_ACCESS_DENIED: i32 = 5;
+
+    if pid == 0 {
+        return false;
+    }
+    if pid == std::process::id() {
+        return true;
+    }
+
+    // SAFETY: Requesting query-only rights on a single PID and immediately closing the handle.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        // `ACCESS_DENIED` means a privileged/protected process with this PID is still alive.
+        return std::io::Error::last_os_error().raw_os_error() == Some(ERROR_ACCESS_DENIED);
+    }
+
+    let mut exit_code: u32 = 0;
+    // SAFETY: `handle` is a valid process handle opened with `PROCESS_QUERY_LIMITED_INFORMATION`.
+    let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+    // SAFETY: `handle` is owned exclusively by this function and closed once.
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    ok != 0 && exit_code == (STILL_ACTIVE as u32)
+}
+
+fn is_runtime_state_pid_alive(pid: u32) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        is_windows_pid_alive(pid)
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        if pid == 0 {
+            return false;
+        }
+        if pid == std::process::id() {
+            return true;
+        }
+        let Ok(raw_pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        if raw_pid <= 0 {
+            return false;
+        }
+        // SAFETY: `kill(pid, 0)` probes process existence without delivering a signal.
+        let rc = unsafe { libc::kill(raw_pid, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        pid != 0
+    }
+}
+
+fn remove_runtime_state_file_safely(path: &Path) {
+    #[cfg(target_os = "windows")]
+    {
+        if path
+            .parent()
+            .is_some_and(win_fs_hardening::is_reparse_point)
+            || win_fs_hardening::is_reparse_point(path)
+        {
+            return;
+        }
+        let _ = win_fs_hardening::safe_remove_file(path);
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        if ensure_no_symlink_under_user_home(path).is_err() {
+            return;
+        }
+        let _ = fs::remove_file(path);
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn read_runtime_states_from_paths<F>(
+    paths: &[PathBuf],
+    is_alive: F,
+    prune_dead: bool,
+) -> Vec<RuntimeState>
+where
+    F: Fn(u32) -> bool,
+{
     let mut states = Vec::new();
-    for path in runtime_state_read_paths() {
-        if let Ok(raw) = fs::read_to_string(&path) {
+    for path in paths {
+        if let Ok(raw) = fs::read_to_string(path) {
             if let Ok(state) = serde_json::from_str::<RuntimeState>(&raw) {
+                if !is_alive(state.pid) {
+                    if prune_dead {
+                        remove_runtime_state_file_safely(path);
+                    }
+                    continue;
+                }
                 if !states.contains(&state) {
                     states.push(state);
                 }
@@ -1287,33 +1387,47 @@ pub fn read_runtime_states() -> Vec<RuntimeState> {
     states
 }
 
-/// Removes all accessible stale `state.json` runtime state files across system and user
-/// locations. Used by the network reset orchestrator after stopping daemons.
-pub fn clear_all_stale_runtime_states() {
-    for path in runtime_state_read_paths() {
+pub fn read_runtime_states() -> Vec<RuntimeState> {
+    read_runtime_states_from_paths(
+        &runtime_state_read_paths(),
+        is_runtime_state_pid_alive,
+        cfg!(target_os = "windows"),
+    )
+}
+
+fn clear_stale_runtime_states_at_paths<F>(paths: &[PathBuf], is_alive: F)
+where
+    F: Fn(u32) -> bool,
+{
+    for path in paths {
         #[cfg(target_os = "windows")]
+        if path
+            .parent()
+            .is_some_and(win_fs_hardening::is_reparse_point)
+            || win_fs_hardening::is_reparse_point(path)
         {
-            if path
-                .parent()
-                .is_some_and(win_fs_hardening::is_reparse_point)
-                || win_fs_hardening::is_reparse_point(&path)
-            {
-                continue;
-            }
-            let _ = win_fs_hardening::safe_remove_file(&path);
+            continue;
         }
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        {
-            if ensure_no_symlink_under_user_home(&path).is_err() {
-                continue;
+        if ensure_no_symlink_under_user_home(path).is_err() {
+            continue;
+        }
+        if let Ok(raw) = fs::read_to_string(path) {
+            if let Ok(state) = serde_json::from_str::<RuntimeState>(&raw) {
+                if is_alive(state.pid) {
+                    continue;
+                }
             }
-            let _ = fs::remove_file(&path);
         }
-        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-        {
-            let _ = fs::remove_file(&path);
-        }
+        remove_runtime_state_file_safely(path);
     }
+}
+
+/// Removes all accessible stale `state.json` runtime state files across system and user
+/// locations whose recorded PID is no longer alive. Used by the network reset orchestrator
+/// and foreground daemon cleanup.
+pub fn clear_all_stale_runtime_states() {
+    clear_stale_runtime_states_at_paths(&runtime_state_read_paths(), is_runtime_state_pid_alive);
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
@@ -2107,53 +2221,46 @@ fn extract_split_tunnel_from_file_config(
     })
 }
 
-/// Loads the currently configured per-application split-tunnel settings from
-/// the active `config.toml` (system config when a system service is installed,
-/// otherwise user config with fallback to system config and
-/// [`vdpi_core::config::SplitTunnelConfig::default`]).
-pub fn load_configured_split_tunnel() -> vdpi_core::config::SplitTunnelConfig {
-    #[cfg(target_os = "macos")]
-    if launch_daemon_plist_path().exists() {
-        let sys_path = config_file::system_config_path();
-        return config_file::load_file_config(Some(&sys_path), true)
+fn resolve_configured_split_tunnel_from_paths(
+    system_service_installed: bool,
+    sys_path: &Path,
+    user_path: &Path,
+) -> vdpi_core::config::SplitTunnelConfig {
+    if system_service_installed {
+        return config_file::load_file_config(Some(sys_path), true)
             .ok()
             .and_then(|(_, file_cfg)| extract_split_tunnel_from_file_config(&file_cfg))
             .unwrap_or_default();
     }
 
-    #[cfg(target_os = "linux")]
-    if systemd_system_unit_path().exists() {
-        let sys_path = config_file::system_config_path();
-        return config_file::load_file_config(Some(&sys_path), true)
-            .ok()
-            .and_then(|(_, file_cfg)| extract_split_tunnel_from_file_config(&file_cfg))
-            .unwrap_or_default();
+    if let Ok((Some(_), file_cfg)) = config_file::load_file_config(Some(user_path), false) {
+        return extract_split_tunnel_from_file_config(&file_cfg).unwrap_or_default();
     }
-
-    #[cfg(target_os = "windows")]
-    if crate::platform::windows_service::query_windows_service_status().installed {
-        let sys_path = config_file::system_config_path();
-        return config_file::load_file_config(Some(&sys_path), true)
-            .ok()
-            .and_then(|(_, file_cfg)| extract_split_tunnel_from_file_config(&file_cfg))
-            .unwrap_or_default();
-    }
-
-    let user_path = resolved_user_config_path();
-    if let Some(split_tunnel) = config_file::load_file_config(Some(&user_path), false)
-        .ok()
-        .and_then(|(_, file_cfg)| extract_split_tunnel_from_file_config(&file_cfg))
-    {
-        return split_tunnel;
-    }
-    let sys_path = config_file::system_config_path();
-    if let Some(split_tunnel) = config_file::load_file_config(Some(&sys_path), true)
-        .ok()
-        .and_then(|(_, file_cfg)| extract_split_tunnel_from_file_config(&file_cfg))
-    {
-        return split_tunnel;
+    if let Ok((Some(_), file_cfg)) = config_file::load_file_config(Some(sys_path), true) {
+        return extract_split_tunnel_from_file_config(&file_cfg).unwrap_or_default();
     }
     vdpi_core::config::SplitTunnelConfig::default()
+}
+
+/// Loads the currently configured per-application split-tunnel settings from
+/// the active `config.toml` (system config when a system service is installed,
+/// otherwise user config — returning default `All` when user config exists
+/// without split-tunnel keys — with fallback to system config only when user
+/// config does not exist).
+pub fn load_configured_split_tunnel() -> vdpi_core::config::SplitTunnelConfig {
+    #[cfg(target_os = "macos")]
+    let system_service_installed = launch_daemon_plist_path().exists();
+    #[cfg(target_os = "linux")]
+    let system_service_installed = systemd_system_unit_path().exists();
+    #[cfg(target_os = "windows")]
+    let system_service_installed =
+        crate::platform::windows_service::query_windows_service_status().installed;
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    let system_service_installed = false;
+
+    let sys_path = config_file::system_config_path();
+    let user_path = resolved_user_config_path();
+    resolve_configured_split_tunnel_from_paths(system_service_installed, &sys_path, &user_path)
 }
 
 fn format_vpn_scope_conflict(scope: &VpnScope) -> Option<String> {
@@ -2351,21 +2458,15 @@ fn probe_connect_ip(addr: IpAddr) -> Option<IpAddr> {
 }
 
 fn build_probe_candidates(cfg: &RuntimeConfig, states: &[RuntimeState]) -> Vec<ProbeCandidate> {
-    let cfg_connect_ip = probe_connect_ip(cfg.addr);
-    let primary_socks = states
-        .iter()
-        .find(|s| {
-            s.port == cfg.port
-                && (s.addr == cfg.addr
-                    || cfg_connect_ip.is_some_and(|ip| probe_connect_ip(s.addr) == Some(ip)))
-        })
-        .map_or(cfg.socks_port, |s| s.socks_port);
-
     let mut seen: Vec<(IpAddr, u16)> = Vec::new();
     let mut out = Vec::new();
 
-    for (addr, port, socks_port) in std::iter::once((cfg.addr, cfg.port, primary_socks))
-        .chain(states.iter().map(|s| (s.addr, s.port, s.socks_port)))
+    // Probe live `state.json` listeners BEFORE fallback `cfg.port` (`8080`) so an
+    // unrelated local service on port 8080 cannot starve rotated/TUN health ports.
+    for (addr, port, socks_port) in states
+        .iter()
+        .map(|s| (s.addr, s.port, s.socks_port))
+        .chain(std::iter::once((cfg.addr, cfg.port, cfg.socks_port)))
         .chain(std::iter::once((
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             DEFAULT_TUN_HEALTH_PORT,
@@ -2700,11 +2801,11 @@ pub fn systemd_system_unit_path() -> PathBuf {
 }
 
 pub fn build_windows_service_bin_path(bin_path: &Path, cfg: &RuntimeConfig) -> String {
-    let mut args = vec!["--service".to_string()];
-    args.extend(build_service_cli_args(cfg));
-    args.push("--quiet".to_string());
-    let quoted_args: Vec<String> = args.into_iter().map(|a| quote_windows_arg(&a)).collect();
-    format!("\"{}\" {}", bin_path.display(), quoted_args.join(" "))
+    if cfg.debug {
+        format!("\"{}\" --service --debug", bin_path.display())
+    } else {
+        format!("\"{}\" --service", bin_path.display())
+    }
 }
 
 pub(crate) fn quote_windows_arg(arg: &str) -> String {
@@ -3414,7 +3515,17 @@ pub fn install_service(cfg: &RuntimeConfig) -> Result<()> {
 /// Quiet variant of [`install_service`] for interactive TUI callers that must not write
 /// status lines to stdout.
 pub fn install_service_quiet(cfg: &RuntimeConfig) -> Result<()> {
-    install_service_with_options_impl(cfg, false, None, false)
+    install_service_with_options_quiet(cfg, false, None)
+}
+
+/// Quiet variant of [`install_service_with_engine_override`] for interactive TUI callers
+/// that perform upgrades or explicit engine overrides without writing to stdout.
+pub fn install_service_with_options_quiet(
+    cfg: &RuntimeConfig,
+    upgrade: bool,
+    explicit_engine: Option<EngineMode>,
+) -> Result<()> {
+    install_service_with_options_impl(cfg, upgrade, explicit_engine, false)
 }
 
 pub fn install_service_with_options(cfg: &RuntimeConfig, upgrade: bool) -> Result<()> {
@@ -3795,27 +3906,30 @@ fn preflight_windows_tun_wintun_with_exe(
         win_fs_hardening::reject_reparse_point(&target_wintun)
             .with_context(|| format!("cannot {action}"))?;
         if target_wintun.is_file() {
-            if let Err(err) = verify_wintun_dll_sha256(&target_wintun, expected_sha256) {
-                if let Some(exe) = current_exe {
-                    let canonical = fs::canonicalize(exe).ok();
-                    if let Some(sibling) = resolve_wintun_dll_candidates(exe, canonical.as_deref())
-                        .into_iter()
-                        .find(|cand| {
-                            !win_fs_hardening::is_reparse_point(cand)
-                                && cand.is_file()
-                                && verify_wintun_dll_sha256(cand, expected_sha256).is_ok()
-                        })
-                    {
-                        return Ok(sibling);
+            match verify_wintun_dll_sha256(&target_wintun, expected_sha256) {
+                Ok(()) => return Ok(target_wintun),
+                Err(err) => {
+                    if let Some(exe) = current_exe {
+                        let canonical = fs::canonicalize(exe).ok();
+                        if let Some(sibling) = resolve_wintun_dll_candidates(exe, canonical.as_deref())
+                            .into_iter()
+                            .find(|cand| {
+                                !win_fs_hardening::is_reparse_point(cand)
+                                    && cand.is_file()
+                                    && verify_wintun_dll_sha256(cand, expected_sha256).is_ok()
+                            })
+                        {
+                            return Ok(sibling);
+                        }
                     }
+                    return Err(err).with_context(|| {
+                        format!(
+                            "cannot {action}: {} (v{WINTUN_VERSION}) is corrupted or mismatched - \
+                             extract all files from the zip (keep wintun.dll beside vdpi.exe)",
+                            target_wintun.display()
+                        )
+                    });
                 }
-                return Err(err).with_context(|| {
-                    format!(
-                        "cannot {action}: {} (v{WINTUN_VERSION}) is corrupted or mismatched - \
-                         extract all files from the zip (keep wintun.dll beside vdpi.exe)",
-                        target_wintun.display()
-                    )
-                });
             }
         }
     }
@@ -4242,7 +4356,6 @@ fn install_service_with_options_impl(
 ) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
-        use crate::platform::windows::{broadcast_environment_change, notify_wininet_refresh};
         use crate::platform::windows_service::{
             is_elevated, query_windows_service_status, relaunch_elevated_and_wait,
         };
@@ -4254,7 +4367,17 @@ fn install_service_with_options_impl(
         let preflight_tun = if let Some(engine) = explicit_engine {
             engine == EngineMode::Tun
         } else if upgrade {
-            load_configured_engine(cfg.engine) == EngineMode::Tun
+            let sys_cfg_path = config_file::system_config_path();
+            let fallback_engine = if sys_cfg_path.is_file() {
+                cfg.engine
+            } else {
+                prev_svc
+                    .binary_path
+                    .as_deref()
+                    .and_then(|cmd| migrate_legacy_service_cmdline_to_file_config(cmd).engine)
+                    .unwrap_or(cfg.engine)
+            };
+            load_configured_engine(fallback_engine) == EngineMode::Tun
         } else {
             cfg.engine == EngineMode::Tun
         };
@@ -4277,8 +4400,10 @@ fn install_service_with_options_impl(
             }
             let args = build_windows_install_elevated_args(cfg, upgrade, explicit_engine);
             relaunch_elevated_and_wait(&args)?;
-            notify_wininet_refresh();
-            broadcast_environment_change();
+            if preflight_tun || load_configured_engine(EngineMode::Proxy) == EngineMode::Tun {
+                clear_all_system_proxies()?;
+            }
+            refresh_windows_network_caches_unconditionally();
             if verbose {
                 let prev_was_running =
                     prev_svc.installed && matches!(prev_svc.state, "RUNNING" | "START_PENDING");
@@ -4355,7 +4480,7 @@ fn install_service_with_options_impl(
             prev_svc.installed,
             prev_was_running,
         );
-        if upgrade {
+        if upgrade && effective_cfg.engine != EngineMode::Tun {
             let _ = crate::platform::windows_service::stop_windows_service_for_upgrade()?;
         } else {
             let _ = crate::platform::windows_service::stop_windows_service_if_running()?;
@@ -4369,6 +4494,9 @@ fn install_service_with_options_impl(
             cleanup_legacy_windows_startup();
             stop_windows_foreground_daemons();
             let _ = crate::platform::windows_tun::cleanup_orphan_wintun_adapter();
+            if effective_cfg.engine == EngineMode::Tun {
+                clear_all_system_proxies()?;
+            }
 
             if upgrade {
                 if !config_path.is_file() {
@@ -4446,6 +4574,31 @@ fn install_service_with_options_impl(
                 };
             wintun_backup = next_wintun_backup;
 
+            if effective_cfg.engine == EngineMode::Tun {
+                let target_wintun = bin_dir.join("wintun.dll");
+                let expected_sha256 =
+                    crate::platform::windows_tun::expected_wintun_dll_sha256()?;
+                win_fs_hardening::reject_reparse_point(&target_wintun)
+                    .context("cannot install the vdpi Windows service in TUN mode")?;
+                if !target_wintun.is_file() {
+                    bail!(
+                        "cannot install the vdpi Windows service in TUN mode: {} is missing (LocalSystem requires wintun.dll in the service binary directory)",
+                        target_wintun.display()
+                    );
+                }
+                crate::platform::windows_tun::verify_wintun_dll_sha256(
+                    &target_wintun,
+                    expected_sha256,
+                )
+                .with_context(|| {
+                    format!(
+                        "cannot install the vdpi Windows service in TUN mode: {} (v{}) is corrupted or mismatched",
+                        target_wintun.display(),
+                        crate::platform::windows_tun::WINTUN_VERSION
+                    )
+                })?;
+            }
+
             service_touched = true;
             install_windows_native_service(&target_bin, &effective_cfg, start_service, verbose)?;
             Ok(wintun_copied)
@@ -4486,19 +4639,35 @@ fn install_service_with_options_impl(
                         );
                     }
                 }
+                let mut restarted = false;
                 if upgrade && prev_was_running && rollback_ok {
-                    if let Err(restart_err) =
-                        crate::platform::windows_service::start_windows_service()
-                    {
-                        tracing::error!(
-                            error = %restart_err,
-                            "failed to restart prior Windows service after upgrade failure"
-                        );
+                    match crate::platform::windows_service::start_windows_service() {
+                        Ok(true) => restarted = true,
+                        Ok(false) => {
+                            tracing::error!(
+                                "prior Windows service was not present to restart after upgrade failure"
+                            );
+                        }
+                        Err(restart_err) => {
+                            tracing::error!(
+                                error = %restart_err,
+                                "failed to restart prior Windows service after upgrade failure"
+                            );
+                        }
                     }
                 } else if upgrade && prev_was_running {
                     tracing::error!(
                         "skipping Windows service restart after upgrade failure because file rollback was incomplete"
                     );
+                }
+                if !restarted {
+                    if let Err(clear_err) = crate::platform::windows::clear_all_windows_proxies() {
+                        tracing::warn!(
+                            error = %clear_err,
+                            "failed to clear Windows system proxies after install/upgrade failure"
+                        );
+                    }
+                    refresh_windows_network_caches_unconditionally();
                 }
                 return Err(err);
             }
@@ -5758,8 +5927,8 @@ fn terminate_windows_vdpi_pid(pid: u32) -> TerminatePidOutcome {
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
-        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+        OpenProcess, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
     };
 
     const ERROR_ACCESS_DENIED: i32 = 5;
@@ -5781,28 +5950,26 @@ fn terminate_windows_vdpi_pid(pid: u32) -> TerminatePidOutcome {
         return TerminatePidOutcome::NotRunningOrMismatch;
     }
 
-    // SAFETY: Requesting query + terminate rights on a single PID; closed via RAII guard.
-    let handle = unsafe {
-        OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
-            0,
-            pid,
-        )
-    };
-    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+    // Step 1: Open with `PROCESS_QUERY_LIMITED_INFORMATION` only to verify image basename
+    // `vdpi.exe` before requesting `PROCESS_TERMINATE` (avoids false `ACCESS_DENIED` on
+    // reused privileged non-vdpi PIDs).
+    // SAFETY: Requesting query-only rights on a single PID; closed via RAII guard.
+    let query_handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if query_handle.is_null() || query_handle == INVALID_HANDLE_VALUE {
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(ERROR_ACCESS_DENIED) {
             return TerminatePidOutcome::AccessDenied;
         }
         return TerminatePidOutcome::NotRunningOrMismatch;
     }
-    let _guard = ProcessHandleGuard(handle);
+    let query_guard = ProcessHandleGuard(query_handle);
 
     let mut buf = vec![0u16; 1024];
     let image_path = loop {
         let mut len = buf.len() as u32;
         // SAFETY: `buf` is writable with capacity `len` UTF-16 code units.
-        let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len) };
+        let ok =
+            unsafe { QueryFullProcessImageNameW(query_handle, 0, buf.as_mut_ptr(), &mut len) };
         if ok != 0 && len > 0 {
             break PathBuf::from(OsString::from_wide(&buf[..len as usize]));
         }
@@ -5818,12 +5985,30 @@ fn terminate_windows_vdpi_pid(pid: u32) -> TerminatePidOutcome {
         .file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|name| name.eq_ignore_ascii_case("vdpi.exe"));
+    drop(query_guard);
     if !is_vdpi {
         return TerminatePidOutcome::NotRunningOrMismatch;
     }
 
+    // Step 2: Reopen with `PROCESS_TERMINATE | PROCESS_SYNCHRONIZE`, terminate, and wait
+    // up to 2000ms for the process to actually exit and release sockets/handles.
     // SAFETY: Verified target PID image basename is `vdpi.exe` and not `current_pid`.
-    if unsafe { TerminateProcess(handle, 1) } != 0 {
+    let term_handle = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid) };
+    if term_handle.is_null() || term_handle == INVALID_HANDLE_VALUE {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(ERROR_ACCESS_DENIED) {
+            return TerminatePidOutcome::AccessDenied;
+        }
+        return TerminatePidOutcome::NotRunningOrMismatch;
+    }
+    let _term_guard = ProcessHandleGuard(term_handle);
+
+    // SAFETY: `term_handle` was opened with `PROCESS_TERMINATE | PROCESS_SYNCHRONIZE`.
+    if unsafe { TerminateProcess(term_handle, 1) } != 0 {
+        // SAFETY: Waiting up to 2000ms for process exit on a handle with `PROCESS_SYNCHRONIZE`.
+        unsafe {
+            let _ = WaitForSingleObject(term_handle, 2000);
+        }
         TerminatePidOutcome::Terminated
     } else if std::io::Error::last_os_error().raw_os_error() == Some(ERROR_ACCESS_DENIED) {
         TerminatePidOutcome::AccessDenied
@@ -5847,6 +6032,7 @@ fn stop_windows_foreground_daemons_detailed() -> (bool, bool) {
             }
         }
     }
+    clear_all_stale_runtime_states();
     (stopped_any, access_denied)
 }
 
@@ -5985,6 +6171,8 @@ fn cleanup_windows_install_files(purge: bool) {
                 // uninstall runs without `--purge`; remove only bin/, logs/, runtime/, and state files.
                 let _ = win_fs_hardening::safe_remove_dir_all(&legacy.join("logs"));
                 let _ = win_fs_hardening::safe_remove_file(&legacy.join("state.json"));
+                let _ = win_fs_hardening::safe_remove_file(&legacy.join("proxy-lease.lock"));
+                let _ = win_fs_hardening::safe_remove_file(&legacy.join("run-directly"));
                 let _ = win_fs_hardening::safe_remove_file(
                     &legacy.join(WINDOWS_PROXY_STATE_FILENAME),
                 );
@@ -6092,7 +6280,6 @@ fn switch_service_engine_impl(
 ) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
-        use crate::platform::windows::{broadcast_environment_change, notify_wininet_refresh};
         use crate::platform::windows_service::{
             install_or_update_windows_service_with_start, is_elevated,
             query_windows_service_status, relaunch_elevated_and_wait,
@@ -6125,8 +6312,10 @@ fn switch_service_engine_impl(
                 );
             }
             relaunch_elevated_and_wait(&["engine".to_string(), target.as_str().to_string()])?;
-            notify_wininet_refresh();
-            broadcast_environment_change();
+            if target == EngineMode::Tun {
+                clear_all_system_proxies()?;
+            }
+            refresh_windows_network_caches_unconditionally();
             if verbose {
                 println!(
                     "Switched vdpi Windows service engine to {}.",
@@ -6145,7 +6334,16 @@ fn switch_service_engine_impl(
         let mut file_cfg = config_file::load_file_config(Some(&config_path), svc.installed)
             .ok()
             .and_then(|(found, fc)| found.map(|_| fc))
-            .unwrap_or_else(|| file_config_from_runtime(cfg));
+            .unwrap_or_else(|| {
+                if svc.installed {
+                    svc.binary_path
+                        .as_deref()
+                        .map(migrate_legacy_service_cmdline_to_file_config)
+                        .unwrap_or_else(|| file_config_from_runtime(&RuntimeConfig::default()))
+                } else {
+                    file_config_from_runtime(cfg)
+                }
+            });
         file_cfg.schema_version = Some(CONFIG_SCHEMA_VERSION);
         file_cfg.engine = Some(target);
 
@@ -6196,26 +6394,53 @@ fn switch_service_engine_impl(
                 }
                 win_fs_hardening::reject_reparse_point(&target_wintun)
                     .context("cannot switch Windows service to TUN mode")?;
-                if target_wintun.is_file() {
-                    verify_wintun_dll_sha256(&target_wintun, expected_sha256).with_context(
-                        || {
-                            format!(
-                                "cannot switch Windows service to TUN mode: {} (v{WINTUN_VERSION}) is corrupted or mismatched - \
-                                 extract all files from the zip (keep wintun.dll beside vdpi.exe)",
-                                target_wintun.display()
-                            )
-                        },
-                    )?;
+                if !target_wintun.is_file() {
+                    bail!(
+                        "cannot switch Windows service to TUN mode: {} is missing (LocalSystem requires wintun.dll in the service binary directory)",
+                        target_wintun.display()
+                    );
                 }
+                verify_wintun_dll_sha256(&target_wintun, expected_sha256).with_context(|| {
+                    format!(
+                        "cannot switch Windows service to TUN mode: {} (v{WINTUN_VERSION}) is corrupted or mismatched - \
+                         extract all files from the zip (keep wintun.dll beside vdpi.exe)",
+                        target_wintun.display()
+                    )
+                })?;
                 clear_all_system_proxies()?;
             }
 
+            let prior_config_bytes = if config_path.is_file()
+                && !win_fs_hardening::is_reparse_point(&config_path)
+            {
+                fs::read(&config_path).ok()
+            } else {
+                None
+            };
             config_file::save_file_config_atomic(&config_path, &file_cfg)?;
-            let target_cfg = apply_file_config_to_runtime(cfg, &file_cfg);
+            let target_cfg = apply_file_config_to_runtime(&RuntimeConfig::default(), &file_cfg);
             let bin_path_cmd = build_windows_service_bin_path(&target_bin, &target_cfg);
-            install_or_update_windows_service_with_start(&bin_path_cmd, was_running)?;
-            notify_wininet_refresh();
-            broadcast_environment_change();
+            if let Err(err) = install_or_update_windows_service_with_start(&bin_path_cmd, was_running)
+            {
+                match prior_config_bytes {
+                    Some(ref bytes) => {
+                        if let Err(restore_err) =
+                            win_fs_hardening::write_state_file_atomically(&config_path, bytes, true)
+                        {
+                            tracing::error!(
+                                error = %restore_err,
+                                path = %config_path.display(),
+                                "failed to restore prior config.toml after engine switch failure"
+                            );
+                        }
+                    }
+                    None => {
+                        let _ = win_fs_hardening::safe_remove_file(&config_path);
+                    }
+                }
+                return Err(err);
+            }
+            refresh_windows_network_caches_unconditionally();
         } else {
             config_file::save_file_config_atomic(&config_path, &file_cfg)?;
         }
@@ -6535,6 +6760,7 @@ fn set_service_dns_impl(dns_addr: &str, cfg: &RuntimeConfig, verbose: bool) -> R
                 );
             }
             relaunch_elevated_and_wait(&["dns".to_string(), validated.clone()])?;
+            refresh_windows_network_caches_unconditionally();
             if verbose {
                 println!("Updated vdpi Windows service DNS server to {redacted}.");
             }
@@ -6550,7 +6776,16 @@ fn set_service_dns_impl(dns_addr: &str, cfg: &RuntimeConfig, verbose: bool) -> R
         let mut file_cfg = config_file::load_file_config(Some(&config_path), use_system)
             .ok()
             .and_then(|(found, fc)| found.map(|_| fc))
-            .unwrap_or_else(|| file_config_from_runtime(cfg));
+            .unwrap_or_else(|| {
+                if svc.installed {
+                    svc.binary_path
+                        .as_deref()
+                        .map(migrate_legacy_service_cmdline_to_file_config)
+                        .unwrap_or_else(|| file_config_from_runtime(&RuntimeConfig::default()))
+                } else {
+                    file_config_from_runtime(cfg)
+                }
+            });
         file_cfg.schema_version = Some(CONFIG_SCHEMA_VERSION);
         file_cfg.dns_addr = Some(validated.clone());
         if validated
@@ -6568,10 +6803,11 @@ fn set_service_dns_impl(dns_addr: &str, cfg: &RuntimeConfig, verbose: bool) -> R
                 .filter(|p| p.is_file())
                 .or_else(|| std::env::current_exe().ok())
                 .context("failed to determine vdpi binary path for DNS update")?;
-            let target_cfg = apply_file_config_to_runtime(cfg, &file_cfg);
+            let target_cfg = apply_file_config_to_runtime(&RuntimeConfig::default(), &file_cfg);
             let bin_path_cmd = build_windows_service_bin_path(&target_bin, &target_cfg);
             install_or_update_windows_service_with_start(&bin_path_cmd, was_running)?;
         }
+        refresh_windows_network_caches_unconditionally();
 
         if verbose {
             println!(
@@ -7223,6 +7459,31 @@ pub fn build_split_apply_args(cfg: &vdpi_core::config::SplitTunnelConfig) -> Vec
     args
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn save_windows_service_split_tunnel_config(
+    config_path: &Path,
+    use_system: bool,
+    service_binary_path: Option<&str>,
+    cfg: &vdpi_core::config::SplitTunnelConfig,
+) -> Result<FileConfig> {
+    let mut file_cfg = if !config_path.is_file() {
+        service_binary_path
+            .map(migrate_legacy_service_cmdline_to_file_config)
+            .unwrap_or_default()
+    } else {
+        config_file::load_file_config_or_default(Some(config_path), use_system)?.1
+    };
+    if file_cfg.engine.is_none() {
+        file_cfg.engine = service_binary_path
+            .and_then(|cmd| migrate_legacy_service_cmdline_to_file_config(cmd).engine);
+    }
+    file_cfg.schema_version = Some(CONFIG_SCHEMA_VERSION);
+    file_cfg.split_tunnel_mode = Some(cfg.mode);
+    file_cfg.split_tunnel_apps = Some(cfg.apps.clone());
+    config_file::save_file_config_atomic(config_path, &file_cfg)?;
+    Ok(file_cfg)
+}
+
 /// Validates and saves per-application split-tunnel settings into the active
 /// `config.toml` (preserving all other keys) and restarts the background `vdpi`
 /// service when it is currently running.
@@ -7262,8 +7523,16 @@ pub fn set_service_split_tunnel(
             return Ok(format_split_tunnel_saved_message(&summary, was_running));
         }
 
-        let file_cfg =
-            save_split_tunnel_to_config_path_with_result(&config_path, use_system, &normalized)?;
+        let file_cfg = if svc.installed {
+            save_windows_service_split_tunnel_config(
+                &config_path,
+                use_system,
+                svc.binary_path.as_deref(),
+                &normalized,
+            )?
+        } else {
+            save_split_tunnel_to_config_path_with_result(&config_path, use_system, &normalized)?
+        };
 
         if svc.installed {
             let target_bin = installed_binary_path()
@@ -8468,7 +8737,6 @@ fn linux_resume_systemctl_action(unit_changed: bool) -> &'static str {
 fn resume_service_impl(verbose: bool) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
-        use crate::platform::windows::{broadcast_environment_change, notify_wininet_refresh};
         use crate::platform::windows_service::{
             install_or_update_windows_service_with_start, is_elevated,
             query_windows_service_status, relaunch_elevated_and_wait, start_windows_service,
@@ -8484,11 +8752,15 @@ fn resume_service_impl(verbose: bool) -> Result<()> {
             .filter(|p| p.is_file())
             .or_else(|| std::env::current_exe().ok());
         let target_bin_dir = target_bin.as_deref().and_then(Path::parent);
-        let fallback_engine = svc
-            .binary_path
-            .as_deref()
-            .and_then(|cmd| migrate_legacy_service_cmdline_to_file_config(cmd).engine)
-            .unwrap_or_default();
+        let sys_cfg_path = config_file::system_config_path();
+        let fallback_engine = if sys_cfg_path.is_file() {
+            RuntimeConfig::default().engine
+        } else {
+            svc.binary_path
+                .as_deref()
+                .and_then(|cmd| migrate_legacy_service_cmdline_to_file_config(cmd).engine)
+                .unwrap_or_default()
+        };
         let configured_engine = load_configured_engine(fallback_engine);
 
         // Preflight verified wintun.dll BEFORE triggering UAC so TUN resumes fail fast
@@ -8507,19 +8779,26 @@ fn resume_service_impl(verbose: bool) -> Result<()> {
                 );
             }
             relaunch_elevated_and_wait(&["resume".to_string()])?;
-            notify_wininet_refresh();
-            broadcast_environment_change();
+            if configured_engine == EngineMode::Tun {
+                clear_all_system_proxies()?;
+            }
+            refresh_windows_network_caches_unconditionally();
             return Ok(());
         }
 
-        let sys_cfg_path = config_file::system_config_path();
+        let was_running = matches!(svc.state, "RUNNING" | "START_PENDING");
         let mut updated_and_started = false;
         if let Some(file_cfg) = load_resume_file_config(&sys_cfg_path, true)? {
-            let base_cfg = RuntimeConfig {
-                engine: fallback_engine,
-                ..RuntimeConfig::default()
-            };
+            let base_cfg = RuntimeConfig::default();
             let desired_cfg = apply_file_config_to_runtime(&base_cfg, &file_cfg);
+            let desired_cmd = target_bin
+                .as_deref()
+                .map(|bin| build_windows_service_bin_path(bin, &desired_cfg));
+            let current_cmd = svc.binary_path.as_deref().map(str::trim).unwrap_or("");
+            let needs_cmd_update = desired_cmd
+                .as_deref()
+                .is_some_and(|cmd| current_cmd != cmd);
+
             if desired_cfg.engine == EngineMode::Tun {
                 let src_wintun = preflight_windows_tun_wintun(
                     target_bin_dir,
@@ -8527,15 +8806,14 @@ fn resume_service_impl(verbose: bool) -> Result<()> {
                 )?;
                 if let Some(bin_dir) = target_bin_dir {
                     let target_wintun = bin_dir.join("wintun.dll");
+                    let expected_sha256 =
+                        crate::platform::windows_tun::expected_wintun_dll_sha256()?;
                     let needs_repair = !target_wintun.is_file()
-                        || crate::platform::windows_tun::expected_wintun_dll_sha256()
-                            .and_then(|sha| {
-                                crate::platform::windows_tun::verify_wintun_dll_sha256(
-                                    &target_wintun,
-                                    sha,
-                                )
-                            })
-                            .is_err();
+                        || crate::platform::windows_tun::verify_wintun_dll_sha256(
+                            &target_wintun,
+                            expected_sha256,
+                        )
+                        .is_err();
                     if needs_repair {
                         let _ = copy_verified_wintun_to_bin_dir_with_backup(
                             &src_wintun,
@@ -8543,23 +8821,51 @@ fn resume_service_impl(verbose: bool) -> Result<()> {
                             false,
                         )?;
                     }
+                    win_fs_hardening::reject_reparse_point(&target_wintun)
+                        .context("cannot resume the vdpi Windows service in TUN mode")?;
+                    if !target_wintun.is_file() {
+                        bail!(
+                            "cannot resume the vdpi Windows service in TUN mode: {} is missing (LocalSystem requires wintun.dll in the service binary directory)",
+                            target_wintun.display()
+                        );
+                    }
+                    crate::platform::windows_tun::verify_wintun_dll_sha256(
+                        &target_wintun,
+                        expected_sha256,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "cannot resume the vdpi Windows service in TUN mode: {} (v{}) is corrupted or mismatched",
+                            target_wintun.display(),
+                            crate::platform::windows_tun::WINTUN_VERSION
+                        )
+                    })?;
+                }
+                if needs_cmd_update && was_running {
+                    let _ = crate::platform::windows_service::stop_windows_service_if_running()?;
+                }
+                if !was_running || needs_cmd_update {
+                    stop_windows_foreground_daemons();
+                    let _ = crate::platform::windows_tun::cleanup_orphan_wintun_adapter();
+                    let _ = clear_all_system_proxies();
                 }
             }
-            if let Some(bin) = target_bin.as_deref() {
-                let desired_cmd = build_windows_service_bin_path(bin, &desired_cfg);
-                let current_cmd = svc.binary_path.as_deref().map(str::trim).unwrap_or("");
-                if current_cmd != desired_cmd {
+            if needs_cmd_update {
+                if let Some(desired_cmd) = desired_cmd {
                     install_or_update_windows_service_with_start(&desired_cmd, true)?;
                     updated_and_started = true;
                 }
             }
+        } else if fallback_engine == EngineMode::Tun && !was_running {
+            stop_windows_foreground_daemons();
+            let _ = crate::platform::windows_tun::cleanup_orphan_wintun_adapter();
+            let _ = clear_all_system_proxies();
         }
 
         if !updated_and_started && !start_windows_service()? {
             bail!("vdpi Windows service is not installed. Run 'vdpi install' first.");
         }
-        notify_wininet_refresh();
-        broadcast_environment_change();
+        refresh_windows_network_caches_unconditionally();
         if verbose {
             println!(
                 "Resumed Windows service '{WINDOWS_SERVICE_NAME}' (anti-DPI protection active)."
@@ -9515,6 +9821,12 @@ fn evaluate_windows_proxy_drift_full(
         ));
     }
 
+    if auto_config_trimmed.is_none() {
+        return Some(format!(
+            "WinINET AutoConfigURL is missing or empty while system proxy is enabled (expected fail-open PAC '{expected_pac_url}'; restart vdpi or run 'vdpi reset-network' then 'vdpi resume')"
+        ));
+    }
+
     for (var_name, val) in [
         ("HTTP_PROXY", env_http_proxy),
         ("HTTPS_PROXY", env_https_proxy),
@@ -9524,7 +9836,7 @@ fn evaluate_windows_proxy_drift_full(
             let trimmed = raw.trim();
             if is_loopback_proxy_env_val(trimmed) {
                 return Some(format!(
-                    "stale HKCU\\Environment {var_name}='{trimmed}' left from legacy proxy mode (cannot fail open; restart vdpi or run 'vdpi pause' to clear)"
+                    "stale HKCU\\Environment {var_name}='{trimmed}' left from legacy proxy mode (cannot fail open; restart vdpi or run 'vdpi reset-network' / 'vdpi pause' to clear)"
                 ));
             }
         }
@@ -9629,7 +9941,7 @@ fn evaluate_windows_stale_proxy_when_stopped_full(
     if let Some(pac) = auto_config_url.map(str::trim).filter(|s| !s.is_empty()) {
         if is_vdpi_pac_url_generic(pac) {
             return Some(format!(
-                "stale WinINET AutoConfigURL '{pac}' remains active while no vdpi daemon is running (run 'vdpi pause' to clear)"
+                "stale WinINET AutoConfigURL '{pac}' remains active while no vdpi Proxy daemon is running (run 'vdpi reset-network' or 'vdpi pause' to clear)"
             ));
         }
     }
@@ -9637,7 +9949,7 @@ fn evaluate_windows_stale_proxy_when_stopped_full(
     let server_trimmed = proxy_server.trim();
     if proxy_enable && !server_trimmed.is_empty() && is_loopback_proxy_env_val(server_trimmed) {
         return Some(format!(
-            "stale WinINET ProxyEnable=1 points to loopback '{server_trimmed}' while no vdpi daemon is running (run 'vdpi pause' to clear)"
+            "stale WinINET ProxyEnable=1 points to loopback '{server_trimmed}' while no vdpi Proxy daemon is running (run 'vdpi reset-network' or 'vdpi pause' to clear)"
         ));
     }
 
@@ -9650,7 +9962,7 @@ fn evaluate_windows_stale_proxy_when_stopped_full(
             let trimmed = raw.trim();
             if is_loopback_proxy_env_val(trimmed) {
                 return Some(format!(
-                    "stale HKCU\\Environment {var_name}='{trimmed}' points to loopback while no vdpi daemon is running (run 'vdpi pause' to clear)"
+                    "stale HKCU\\Environment {var_name}='{trimmed}' points to loopback while no vdpi Proxy daemon is running (run 'vdpi reset-network' or 'vdpi pause' to clear)"
                 ));
             }
         }
@@ -9659,7 +9971,7 @@ fn evaluate_windows_stale_proxy_when_stopped_full(
     if let Some(wh) = winhttp_proxy.map(str::trim).filter(|s| !s.is_empty()) {
         if is_loopback_winhttp_proxy(wh) {
             return Some(format!(
-                "stale WinHTTP proxy '{wh}' points to loopback while no vdpi daemon is running (run 'vdpi pause' to clear)"
+                "stale WinHTTP proxy '{wh}' points to loopback while no vdpi Proxy daemon is running (run 'vdpi reset-network' or 'vdpi pause' to clear)"
             ));
         }
     }
@@ -9732,7 +10044,7 @@ fn evaluate_macos_proxy_drift_snapshot(
             let trimmed = raw.trim();
             if is_loopback_proxy_env_val(trimmed) {
                 return Some(format!(
-                    "stale launchd {var_name}='{trimmed}' left from legacy proxy mode (cannot fail open; restart vdpi or run 'vdpi pause' to clear)"
+                    "stale launchd {var_name}='{trimmed}' left from legacy proxy mode (cannot fail open; restart vdpi or run 'vdpi reset-network' / 'vdpi pause' to clear)"
                 ));
             }
         }
@@ -9756,25 +10068,25 @@ fn evaluate_macos_stale_proxy_when_stopped(
         let pac_trimmed = st.auto_proxy_url.trim();
         if st.auto_proxy_enabled && is_vdpi_pac_url_generic(pac_trimmed) {
             return Some(format!(
-                "stale macOS service '{}' AutoProxyURL '{}' remains enabled while no vdpi daemon is running (run 'vdpi pause' to clear)",
+                "stale macOS service '{}' AutoProxyURL '{}' remains enabled while no vdpi Proxy daemon is running (run 'vdpi reset-network' or 'vdpi pause' to clear)",
                 st.service, pac_trimmed
             ));
         }
         if st.web_enabled && is_loopback_host_str(&st.web_server) {
             return Some(format!(
-                "stale macOS service '{}' HTTP proxy {}:{} remains enabled while no vdpi daemon is running",
+                "stale macOS service '{}' HTTP proxy {}:{} remains enabled while no vdpi Proxy daemon is running (run 'vdpi reset-network' to clear)",
                 st.service, st.web_server, st.web_port
             ));
         }
         if st.secure_enabled && is_loopback_host_str(&st.secure_server) {
             return Some(format!(
-                "stale macOS service '{}' HTTPS proxy {}:{} remains enabled while no vdpi daemon is running",
+                "stale macOS service '{}' HTTPS proxy {}:{} remains enabled while no vdpi Proxy daemon is running (run 'vdpi reset-network' to clear)",
                 st.service, st.secure_server, st.secure_port
             ));
         }
         if st.socks_enabled && is_loopback_host_str(&st.socks_server) {
             return Some(format!(
-                "stale macOS service '{}' SOCKS proxy {}:{} remains enabled while no vdpi daemon is running",
+                "stale macOS service '{}' SOCKS proxy {}:{} remains enabled while no vdpi Proxy daemon is running (run 'vdpi reset-network' to clear)",
                 st.service, st.socks_server, st.socks_port
             ));
         }
@@ -9785,7 +10097,7 @@ fn evaluate_macos_stale_proxy_when_stopped(
             let trimmed = raw.trim();
             if is_loopback_proxy_env_val(trimmed) {
                 return Some(format!(
-                    "stale launchd {var_name}='{trimmed}' remains set while no vdpi daemon is running (run 'vdpi pause' to clear)"
+                    "stale launchd {var_name}='{trimmed}' remains set while no vdpi Proxy daemon is running (run 'vdpi reset-network' or 'vdpi pause' to clear)"
                 ));
             }
         }
@@ -10023,7 +10335,7 @@ fn evaluate_linux_stale_proxy_when_stopped(snapshot: &LinuxProxySnapshot) -> Opt
             .unwrap_or("");
         if mode == "auto" && is_vdpi_pac_url_generic(pac) {
             return Some(format!(
-                "stale GNOME autoconfig-url '{pac}' remains active while no vdpi daemon is running (run 'vdpi pause' to clear)"
+                "stale GNOME autoconfig-url '{pac}' remains active while no vdpi Proxy daemon is running (run 'vdpi reset-network' or 'vdpi pause' to clear)"
             ));
         }
         if mode == "manual" {
@@ -10031,7 +10343,7 @@ fn evaluate_linux_stale_proxy_when_stopped(snapshot: &LinuxProxySnapshot) -> Opt
                 let clean_host = host.trim().trim_matches('\'').trim();
                 if !clean_host.is_empty() && is_loopback_host_str(clean_host) {
                     return Some(format!(
-                        "stale GNOME manual {proto} proxy '{clean_host}' remains active while no vdpi daemon is running"
+                        "stale GNOME manual {proto} proxy '{clean_host}' remains active while no vdpi Proxy daemon is running (run 'vdpi reset-network' to clear)"
                     ));
                 }
             }
@@ -10043,7 +10355,7 @@ fn evaluate_linux_stale_proxy_when_stopped(snapshot: &LinuxProxySnapshot) -> Opt
         let pac = snapshot.kde_pac_url.as_deref().map(str::trim).unwrap_or("");
         if proxy_type == "2" && is_vdpi_pac_url_generic(pac) {
             return Some(format!(
-                "stale KDE kioslaverc 'Proxy Config Script' '{pac}' remains active while no vdpi daemon is running (run 'vdpi pause' to clear)"
+                "stale KDE kioslaverc 'Proxy Config Script' '{pac}' remains active while no vdpi Proxy daemon is running (run 'vdpi reset-network' or 'vdpi pause' to clear)"
             ));
         }
         if proxy_type == "1" {
@@ -10051,7 +10363,7 @@ fn evaluate_linux_stale_proxy_when_stopped(snapshot: &LinuxProxySnapshot) -> Opt
                 let trimmed = val.trim();
                 if !trimmed.is_empty() && is_loopback_proxy_env_val(trimmed) {
                     return Some(format!(
-                        "stale KDE kioslaverc manual {key}='{trimmed}' remains active while no vdpi daemon is running"
+                        "stale KDE kioslaverc manual {key}='{trimmed}' remains active while no vdpi Proxy daemon is running (run 'vdpi reset-network' to clear)"
                     ));
                 }
             }
@@ -10066,7 +10378,7 @@ fn evaluate_linux_stale_proxy_when_stopped(snapshot: &LinuxProxySnapshot) -> Opt
         ) && is_loopback_proxy_env_val(trimmed)
         {
             return Some(format!(
-                "stale systemd user {key}='{trimmed}' remains set while no vdpi daemon is running (run 'vdpi pause' to clear)"
+                "stale systemd user {key}='{trimmed}' remains set while no vdpi Proxy daemon is running (run 'vdpi reset-network' or 'vdpi pause' to clear)"
             ));
         }
     }
@@ -10567,6 +10879,16 @@ pub async fn run_doctor(cfg: RuntimeConfig) -> Result<()> {
             }
         }
 
+        println!("\n=== System Proxy Hygiene Checks ===");
+        if let Some(drift) = check_stale_proxy_when_no_daemon() {
+            println!("  [WARN] {:24} -> {drift}", "Stale System Proxy");
+        } else {
+            println!(
+                "  [PASS] {:24} -> clean (no stale vdpi proxy active in TUN mode)",
+                "Stale System Proxy"
+            );
+        }
+
         if passed != tun_targets.len() || !dns_ok {
             bail!(
                 "doctor detected TUN failures ({}/{} HTTPS passed, udp_dns_ok={})",
@@ -10597,7 +10919,7 @@ pub async fn run_doctor(cfg: RuntimeConfig) -> Result<()> {
         }
         if let Some(orphan) = detect_orphan_tun_adapter() {
             println!(
-                "  [WARN] {:24} -> orphaned interface '{orphan}' still present while no vdpi daemon is running (run 'vdpi pause' to clean up)",
+                "  [WARN] {:24} -> orphaned interface '{orphan}' still present while no vdpi daemon is running (run 'vdpi reset-network' or 'vdpi pause' to clean up)",
                 "Orphaned TUN Adapter"
             );
         } else {
@@ -10772,7 +11094,7 @@ pub async fn run_doctor(cfg: RuntimeConfig) -> Result<()> {
 
         if let Some(orphan) = detect_orphan_tun_adapter() {
             println!(
-                "  [WARN] {:24} -> orphaned interface '{orphan}' still present while Proxy daemon is running (run 'vdpi pause' to clean up)",
+                "  [WARN] {:24} -> orphaned interface '{orphan}' still present while Proxy daemon is running (run 'vdpi reset-network' or 'vdpi pause' to clean up)",
                 "Orphaned TUN Adapter"
             );
         } else {
@@ -11065,12 +11387,16 @@ mod tests {
 
         let win_bin =
             build_windows_service_bin_path(Path::new(r"C:\Program Files\vdpi\bin\vdpi.exe"), &cfg);
-        assert!(win_bin.starts_with(r#""C:\Program Files\vdpi\bin\vdpi.exe" --service --proxy "#));
-        assert!(win_bin.contains("--bind 127.0.0.1"));
-        assert!(win_bin.contains("--port 8080"));
-        assert!(win_bin.contains("--chunk-size 10"));
-        assert!(win_bin.contains("--socks-port 1080"));
-        assert!(win_bin.contains("--quiet"));
+        assert_eq!(
+            win_bin,
+            r#""C:\Program Files\vdpi\bin\vdpi.exe" --service"#
+        );
+        assert!(!win_bin.contains("--proxy"));
+        assert!(!win_bin.contains("--tun"));
+        assert!(!win_bin.contains("--bind"));
+        assert!(!win_bin.contains("--port"));
+        assert!(!win_bin.contains("--dns"));
+        assert!(!win_bin.contains("--quiet"));
 
         // Passing a TUN config to proxy-only generators must still force --proxy.
         let mut tun_cfg = cfg;
@@ -11086,26 +11412,43 @@ mod tests {
     }
 
     #[test]
-    fn preserves_custom_flags_in_windows_service_bin_path() {
+    fn windows_service_bin_path_is_minimal_and_config_driven() {
         let cli = CliArgs::parse_from_iter([
             "vdpi",
+            "--tun",
             "--mode",
             "tls-record",
             "--dns",
-            "8.8.8.8",
+            "https://dns.nextdns.io/secret123",
             "--bypass",
             "*.example.com",
             "--no-env-proxy",
         ])
         .unwrap();
-        let cfg = cli.into_runtime_config();
+        let mut cfg = cli.into_runtime_config();
         let win_bin =
             build_windows_service_bin_path(Path::new(r"C:\Program Files\vdpi\bin\vdpi.exe"), &cfg);
-        assert!(win_bin.contains("--service"));
-        assert!(win_bin.contains("--mode tls-record"));
-        assert!(win_bin.contains("--dns 8.8.8.8"));
-        assert!(win_bin.contains("--bypass *.example.com"));
-        assert!(win_bin.contains("--no-env-proxy"));
+        assert_eq!(
+            win_bin,
+            r#""C:\Program Files\vdpi\bin\vdpi.exe" --service"#
+        );
+        assert!(!win_bin.contains("--tun"));
+        assert!(!win_bin.contains("--proxy"));
+        assert!(!win_bin.contains("--mode"));
+        assert!(!win_bin.contains("--dns"));
+        assert!(!win_bin.contains("secret123"));
+        assert!(!win_bin.contains("--bypass"));
+        assert!(!win_bin.contains("--no-env-proxy"));
+        assert!(!win_bin.contains("--quiet"));
+        assert!(!win_bin.contains("--debug"));
+
+        cfg.debug = true;
+        let debug_win_bin =
+            build_windows_service_bin_path(Path::new(r"C:\Program Files\vdpi\bin\vdpi.exe"), &cfg);
+        assert_eq!(
+            debug_win_bin,
+            r#""C:\Program Files\vdpi\bin\vdpi.exe" --service --debug"#
+        );
     }
 
     #[test]
@@ -12120,16 +12463,26 @@ mod tests {
                 .expect("--dns flag missing");
             assert_eq!(cli_args.get(dns_idx + 1).map(String::as_str), Some(*dns));
 
-            // Windows service binPath round-trip (TUN mode + custom DoH URL never parses as Ipv4Addr).
+            // Windows service binPath must remain minimal (never leaking secret DoH URLs into SCM).
             let win_bin = build_windows_service_bin_path(
                 Path::new(r"C:\Program Files\vdpi\bin\vdpi.exe"),
                 &cfg,
             );
-            assert!(
-                win_bin.contains(&format!("--dns {dns}")),
-                "Windows binPath missing custom DNS '{dns}': {win_bin}"
+            assert_eq!(
+                win_bin,
+                r#""C:\Program Files\vdpi\bin\vdpi.exe" --service"#
             );
-            let migrated = migrate_legacy_service_cmdline_to_file_config(&win_bin);
+            assert!(
+                !win_bin.contains("--dns") && !win_bin.contains(dns),
+                "Windows binPath must not embed custom DNS '{dns}': {win_bin}"
+            );
+
+            // Legacy Windows binPath migration still round-trips TUN mode + custom DoH URLs.
+            let legacy_win_bin = format!(
+                r#""C:\Program Files\vdpi\bin\vdpi.exe" --service --tun --dns {} --quiet"#,
+                quote_windows_arg(dns)
+            );
+            let migrated = migrate_legacy_service_cmdline_to_file_config(&legacy_win_bin);
             assert_eq!(migrated.engine, Some(EngineMode::Tun));
             assert_eq!(migrated.dns_addr.as_deref(), Some(*dns));
 
@@ -12346,19 +12699,32 @@ mod tests {
         .expect("stale HKCU\\Environment HTTP_PROXY must be flagged");
         assert!(stale_http_env.contains("HTTP_PROXY"));
 
-        // Unrelated external env proxy and --no-system-proxy mode are left alone.
+        // Unrelated external env proxy with aligned PAC is left alone.
         assert_eq!(
             evaluate_windows_proxy_drift(
                 lo4,
                 8080,
                 false,
                 "",
-                None,
+                Some("http://127.0.0.1:8080/vdpi.pac"),
                 Some("http://proxy.corp.local:3128"),
                 Some("http://proxy.corp.local:3128"),
             ),
             None
         );
+
+        // Missing or empty AutoConfigURL when system proxy is enabled must be flagged as drift.
+        let missing_pac =
+            evaluate_windows_proxy_drift(lo4, 8080, false, "", None, None, None)
+                .expect("missing AutoConfigURL must be flagged as drift");
+        assert!(missing_pac.contains("AutoConfigURL"));
+        assert!(missing_pac.contains("http://127.0.0.1:8080/vdpi.pac"));
+
+        let empty_pac =
+            evaluate_windows_proxy_drift(lo4, 8080, false, "", Some("   "), None, None)
+                .expect("empty AutoConfigURL must be flagged as drift");
+        assert!(empty_pac.contains("AutoConfigURL"));
+        assert!(empty_pac.contains("http://127.0.0.1:8080/vdpi.pac"));
     }
 
     #[test]
@@ -12705,15 +13071,16 @@ mod tests {
             ),
             None
         );
-        assert!(evaluate_windows_stale_proxy_when_stopped(
+        let stale_pac = evaluate_windows_stale_proxy_when_stopped(
             false,
             "",
             Some("http://127.0.0.1:8080/vdpi.pac"),
             None,
             None,
         )
-        .expect("stale vdpi PAC must be flagged when stopped")
-        .contains("AutoConfigURL"));
+        .expect("stale vdpi PAC must be flagged when stopped");
+        assert!(stale_pac.contains("AutoConfigURL"));
+        assert!(stale_pac.contains("vdpi reset-network"));
         assert!(evaluate_windows_stale_proxy_when_stopped(
             true,
             "127.0.0.1:8080",
@@ -14019,6 +14386,238 @@ mod tests {
             "<plist/>"
         )
         .is_err());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn build_probe_candidates_orders_live_state_before_default_port() {
+        let cfg = RuntimeConfig::default();
+        assert_eq!(cfg.port, 8080);
+
+        let tun_states = vec![RuntimeState {
+            pid: 42,
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: DEFAULT_TUN_HEALTH_PORT,
+            socks_port: None,
+            engine: EngineMode::Tun,
+            tun_interface: Some("vdpi0".to_string()),
+            env_activated_at: None,
+        }];
+        let tun_candidates = build_probe_candidates(&cfg, &tun_states);
+        assert_eq!(tun_candidates.len(), 2);
+        assert_eq!(tun_candidates[0].port, DEFAULT_TUN_HEALTH_PORT);
+        assert_eq!(tun_candidates[1].port, 8080);
+
+        let proxy_states = vec![RuntimeState {
+            pid: 43,
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 8081,
+            socks_port: Some(1081),
+            engine: EngineMode::Proxy,
+            tun_interface: None,
+            env_activated_at: None,
+        }];
+        let proxy_candidates = build_probe_candidates(&cfg, &proxy_states);
+        assert_eq!(proxy_candidates.len(), 3);
+        assert_eq!(proxy_candidates[0].port, 8081);
+        assert_eq!(proxy_candidates[0].socks_port, Some(1081));
+        assert_eq!(proxy_candidates[1].port, 8080);
+        assert_eq!(proxy_candidates[2].port, DEFAULT_TUN_HEALTH_PORT);
+    }
+
+    #[test]
+    fn runtime_state_pid_liveness_filters_prunes_dead_and_preserves_live() {
+        let base = std::env::temp_dir().join(format!(
+            "vdpi-state-pid-liveness-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("create temp dir");
+
+        let dead_path = base.join("dead-state.json");
+        let live_path = base.join("live-state.json");
+        let dead_state = RuntimeState {
+            pid: 11_111,
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 8081,
+            socks_port: Some(1081),
+            engine: EngineMode::Proxy,
+            tun_interface: None,
+            env_activated_at: None,
+        };
+        let live_state = RuntimeState {
+            pid: 22_222,
+            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: DEFAULT_TUN_HEALTH_PORT,
+            socks_port: None,
+            engine: EngineMode::Tun,
+            tun_interface: Some("vdpi0".to_string()),
+            env_activated_at: None,
+        };
+        let dead_json = serde_json::to_string(&dead_state).expect("serialize dead state");
+        let live_json = serde_json::to_string(&live_state).expect("serialize live state");
+        fs::write(&dead_path, &dead_json).expect("write dead state");
+        fs::write(&live_path, &live_json).expect("write live state");
+
+        let paths = vec![dead_path.clone(), live_path.clone()];
+        let loaded = read_runtime_states_from_paths(&paths, |pid| pid == 22_222, true);
+        assert_eq!(loaded, vec![live_state]);
+        assert!(!dead_path.exists(), "dead state.json should be pruned");
+        assert!(live_path.exists(), "live state.json must be preserved");
+
+        // Re-create dead state and verify clear_stale_runtime_states_at_paths only deletes dead.
+        fs::write(&dead_path, &dead_json).expect("rewrite dead state");
+        clear_stale_runtime_states_at_paths(&paths, |pid| pid == 22_222);
+        assert!(!dead_path.exists(), "stale dead state.json must be removed");
+        assert!(
+            live_path.exists(),
+            "clear_all_stale_runtime_states must never delete a state.json whose PID is alive"
+        );
+
+        #[cfg(target_os = "windows")]
+        {
+            assert!(is_windows_pid_alive(std::process::id()));
+            assert!(!is_windows_pid_alive(0));
+        }
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_configured_split_tunnel_does_not_fall_through_when_user_config_exists() {
+        let base = std::env::temp_dir().join(format!(
+            "vdpi-split-tunnel-no-fallthrough-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("create temp dir");
+
+        let user_path = base.join("user-config.toml");
+        let sys_path = base.join("sys-config.toml");
+
+        let user_cfg = FileConfig {
+            schema_version: Some(CONFIG_SCHEMA_VERSION),
+            engine: Some(EngineMode::Proxy),
+            ..Default::default()
+        };
+        let sys_cfg = FileConfig {
+            schema_version: Some(CONFIG_SCHEMA_VERSION),
+            engine: Some(EngineMode::Tun),
+            split_tunnel_mode: Some(vdpi_core::config::SplitTunnelMode::Exclude),
+            split_tunnel_apps: Some(vec!["discord".to_string()]),
+            ..Default::default()
+        };
+        config_file::save_file_config_atomic(&user_path, &user_cfg).expect("save user config");
+        config_file::save_file_config_atomic(&sys_path, &sys_cfg).expect("save sys config");
+
+        let resolved = resolve_configured_split_tunnel_from_paths(false, &sys_path, &user_path);
+        assert_eq!(resolved.mode, vdpi_core::config::SplitTunnelMode::All);
+        assert!(resolved.apps.is_empty());
+
+        // When user config is absent, falling back to system config still works.
+        fs::remove_file(&user_path).expect("remove user config");
+        let fallback = resolve_configured_split_tunnel_from_paths(false, &sys_path, &user_path);
+        assert_eq!(fallback.mode, vdpi_core::config::SplitTunnelMode::Exclude);
+        assert_eq!(fallback.apps, vec!["discord".to_string()]);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn save_windows_service_split_tunnel_config_preserves_engine_from_legacy_bin_path() {
+        let base = std::env::temp_dir().join(format!(
+            "vdpi-win-split-preserve-engine-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("create temp dir");
+
+        let split = vdpi_core::config::SplitTunnelConfig {
+            mode: vdpi_core::config::SplitTunnelMode::Exclude,
+            apps: vec!["discord".to_string()],
+        };
+
+        // Case 1: config.toml missing -> migrate legacy binPath including --tun and --dns.
+        let cfg_missing = base.join("missing-config.toml");
+        let saved_missing = save_windows_service_split_tunnel_config(
+            &cfg_missing,
+            false,
+            Some(r#""C:\Program Files\vdpi\bin\vdpi.exe" --service --tun --dns 8.8.8.8 --quiet"#),
+            &split,
+        )
+        .expect("save migrated split-tunnel config");
+        assert_eq!(saved_missing.engine, Some(EngineMode::Tun));
+        assert_eq!(saved_missing.dns_addr.as_deref(), Some("8.8.8.8"));
+        assert_eq!(
+            saved_missing.split_tunnel_mode,
+            Some(vdpi_core::config::SplitTunnelMode::Exclude)
+        );
+
+        // Case 2: config.toml exists without engine -> preserve TUN from legacy binPath.
+        let cfg_no_engine = base.join("no-engine-config.toml");
+        let initial_no_engine = FileConfig {
+            schema_version: Some(CONFIG_SCHEMA_VERSION),
+            dns_addr: Some("9.9.9.9".to_string()),
+            ..Default::default()
+        };
+        config_file::save_file_config_atomic(&cfg_no_engine, &initial_no_engine)
+            .expect("save initial config without engine");
+        let saved_no_engine = save_windows_service_split_tunnel_config(
+            &cfg_no_engine,
+            false,
+            Some(r#""C:\Program Files\vdpi\bin\vdpi.exe" --service --tun"#),
+            &split,
+        )
+        .expect("save split-tunnel config preserving engine");
+        assert_eq!(saved_no_engine.engine, Some(EngineMode::Tun));
+        assert_eq!(saved_no_engine.dns_addr.as_deref(), Some("9.9.9.9"));
+
+        // Case 3: config.toml specifies engine=tun with minimal config-driven binPath -> stays Tun.
+        let cfg_with_engine = base.join("with-engine-config.toml");
+        let initial_with_engine = FileConfig {
+            schema_version: Some(CONFIG_SCHEMA_VERSION),
+            engine: Some(EngineMode::Tun),
+            ..Default::default()
+        };
+        config_file::save_file_config_atomic(&cfg_with_engine, &initial_with_engine)
+            .expect("save initial config with engine");
+        let saved_with_engine = save_windows_service_split_tunnel_config(
+            &cfg_with_engine,
+            false,
+            Some(r#""C:\Program Files\vdpi\bin\vdpi.exe" --service"#),
+            &split,
+        )
+        .expect("save split-tunnel config with explicit engine");
+        assert_eq!(saved_with_engine.engine, Some(EngineMode::Tun));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn preflight_windows_tun_wintun_returns_verified_installed_dll_directly() {
+        let base = std::env::temp_dir().join(format!(
+            "vdpi-wintun-preflight-installed-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let installed_bin = base.join("bin");
+        fs::create_dir_all(&installed_bin).expect("create installed bin dir");
+
+        const ABC_SHA256: &str =
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let installed_wintun = installed_bin.join("wintun.dll");
+        fs::write(&installed_wintun, b"abc").expect("write valid installed wintun");
+
+        let resolved = preflight_windows_tun_wintun_with_exe(
+            Some(&installed_bin),
+            None,
+            ABC_SHA256,
+            "install the vdpi Windows service in TUN mode",
+        )
+        .expect("valid installed wintun.dll must be returned directly");
+        assert_eq!(resolved, installed_wintun);
 
         let _ = fs::remove_dir_all(&base);
     }

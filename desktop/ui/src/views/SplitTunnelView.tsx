@@ -1053,6 +1053,9 @@ export const SplitTunnelView = memo(function SplitTunnelView({
   savedSelectedRef.current = savedSelected;
   const savingRef = useRef(saving);
   savingRef.current = saving;
+  const loadingRef = useRef(loading);
+  loadingRef.current = loading;
+  const loadSeqRef = useRef(0);
   const onDirtyChangeRef = useRef(onDirtyChange);
   onDirtyChangeRef.current = onDirtyChange;
   const onPushToastRef = useRef(onPushToast);
@@ -1126,6 +1129,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
   const loadSplitTunnel = useCallback(
     async (options: { preserveDraft: boolean; silentToast?: boolean }) => {
       const { preserveDraft, silentToast = true } = options;
+      const seq = ++loadSeqRef.current;
       if (preserveDraft) {
         setRefreshing(true);
       } else {
@@ -1135,7 +1139,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
 
       try {
         const payload: SplitTunnelPayload = await getSplitTunnel();
-        if (!mountedRef.current) return;
+        if (!mountedRef.current || seq !== loadSeqRef.current) return;
         applyPayload(payload, preserveDraft);
         if (preserveDraft && !silentToast) {
           const runningCount = payload.discoveredApps.filter(
@@ -1147,7 +1151,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
           );
         }
       } catch (error) {
-        if (!mountedRef.current) return;
+        if (!mountedRef.current || seq !== loadSeqRef.current) return;
         const message = getErrorMessage(
           error,
           tSplit(langRef.current, "loadFailed"),
@@ -1157,7 +1161,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
           onPushToast?.("error", message);
         }
       } finally {
-        if (mountedRef.current) {
+        if (mountedRef.current && seq === loadSeqRef.current) {
           setLoading(false);
           setRefreshing(false);
         }
@@ -1631,7 +1635,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
 
   const handleToggleApp = useCallback(
     (normalizedKey: string) => {
-      if (savingRef.current) return;
+      if (savingRef.current || loadingRef.current) return;
       const key = normalizeAppKey(normalizedKey);
       if (!key) return;
 
@@ -1685,7 +1689,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
 
   const handleTogglePreset = useCallback(
     (preset: SplitTunnelPreset, nextSelected?: boolean) => {
-      if (savingRef.current) return;
+      if (savingRef.current || loadingRef.current) return;
 
       const entries = preset.apps
         .map((raw) => ({ raw, key: normalizeAppKey(raw) }))
@@ -1801,6 +1805,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
 
   const addCustomExecutable = useCallback(
     (rawInput: string) => {
+      if (savingRef.current || loadingRef.current) return false;
       const extracted = extractExecutableName(rawInput);
       const key = normalizeAppKey(extracted || rawInput);
       if (!extracted || !key) {
@@ -1903,12 +1908,12 @@ export const SplitTunnelView = memo(function SplitTunnelView({
 
   const handleCustomSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (saving) return;
+    if (saving || loading) return;
     addCustomExecutable(customInput);
   };
 
   const handleBrowseFile = async () => {
-    if (saving || browsing) return;
+    if (saving || loading || browsing) return;
     setBrowsing(true);
     setCustomError(null);
 
@@ -1932,7 +1937,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
   };
 
   const handleDiscard = () => {
-    if (saving) return;
+    if (saving || loading) return;
     draftModeRef.current = savedMode;
     const restored = new Map(savedSelected);
     draftSelectedRef.current = restored;
@@ -1947,7 +1952,12 @@ export const SplitTunnelView = memo(function SplitTunnelView({
   };
 
   const handleSave = useCallback(async () => {
-    if (savingRef.current || isAnyBusyRef.current || !diffHasChangesRef.current)
+    if (
+      savingRef.current ||
+      loadingRef.current ||
+      isAnyBusyRef.current ||
+      !diffHasChangesRef.current
+    )
       return;
 
     const currentMode = draftModeRef.current;
@@ -2040,6 +2050,9 @@ export const SplitTunnelView = memo(function SplitTunnelView({
         return;
       }
 
+      const saveLoadSeq = ++loadSeqRef.current;
+      setLoading(false);
+      setRefreshing(false);
       const savedCopy = new Map(currentSelected);
       setSavedMode(currentMode);
       setSavedSelected(savedCopy);
@@ -2068,11 +2081,11 @@ export const SplitTunnelView = memo(function SplitTunnelView({
 
       try {
         const freshPayload = await getSplitTunnel();
-        if (mountedRef.current) {
+        if (mountedRef.current && saveLoadSeq === loadSeqRef.current) {
           applyPayload(freshPayload, false);
         }
       } catch {
-        if (mountedRef.current) {
+        if (mountedRef.current && saveLoadSeq === loadSeqRef.current) {
           resetSortSnapshot(savedCopy.keys());
         }
       }
@@ -2126,6 +2139,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
         if (
           !diffHasChangesRef.current ||
           savingRef.current ||
+          loadingRef.current ||
           isAnyBusyRef.current
         ) {
           return;
@@ -2141,12 +2155,13 @@ export const SplitTunnelView = memo(function SplitTunnelView({
   }, []);
 
   const modeOptions = useMemo(() => getModeOptions(lang), [lang]);
+  const editsDisabled = saving || loading;
 
   const handleModeKeyDown = (
     event: KeyboardEvent<HTMLButtonElement>,
     index: number,
   ) => {
-    if (saving) return;
+    if (editsDisabled) return;
     let nextIndex: number | null = null;
     if (event.key === "ArrowRight" || event.key === "ArrowDown") {
       nextIndex = (index + 1) % MODE_VALUES.length;
@@ -2315,8 +2330,9 @@ export const SplitTunnelView = memo(function SplitTunnelView({
                 data-mode={option.value}
                 data-active={active ? "true" : "false"}
                 className="split-mode-card"
-                disabled={saving}
+                disabled={editsDisabled}
                 onClick={() => {
+                  if (editsDisabled) return;
                   draftModeRef.current = option.value;
                   setDraftMode(option.value);
                 }}
@@ -2362,7 +2378,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
           presets={effectivePresets}
           selectedKeys={draftSelectedKeys}
           mode={draftMode}
-          disabled={saving}
+          disabled={editsDisabled}
           onTogglePreset={handleTogglePreset}
         />
       </div>
@@ -2415,7 +2431,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
               className="split-btn"
               aria-expanded={showCustomForm}
               aria-controls={showCustomForm ? "split-custom-app-form" : undefined}
-              disabled={saving}
+              disabled={editsDisabled}
               onClick={() => {
                 setShowCustomForm((prev) => {
                   const next = !prev;
@@ -2471,7 +2487,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
                   }
                   placeholder={customPlaceholder}
                   value={customInput}
-                  disabled={saving}
+                  disabled={editsDisabled}
                   onChange={(event) => {
                     setCustomInput(event.target.value);
                     if (customError) setCustomError(null);
@@ -2480,14 +2496,14 @@ export const SplitTunnelView = memo(function SplitTunnelView({
                 <button
                   type="submit"
                   className="split-btn"
-                  disabled={saving || !customInput.trim()}
+                  disabled={editsDisabled || !customInput.trim()}
                 >
                   {tSplit(lang, "add")}
                 </button>
                 <button
                   type="button"
                   className="split-btn"
-                  disabled={saving || browsing}
+                  disabled={editsDisabled || browsing}
                   onClick={() => void handleBrowseFile()}
                 >
                   {tSplit(lang, browsing ? "browsing" : "browse")}
@@ -2529,8 +2545,9 @@ export const SplitTunnelView = memo(function SplitTunnelView({
               <button
                 type="button"
                 className="split-btn split-btn--ghost"
-                disabled={saving}
+                disabled={editsDisabled}
                 onClick={() => {
+                  if (editsDisabled) return;
                   const empty = new Map<string, string>();
                   draftSelectedRef.current = empty;
                   setDraftSelected(empty);
@@ -2625,7 +2642,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
                   selected={draftSelectedKeys.has(app.normalizedKey)}
                   mode={draftMode}
                   iconSrc={iconsByKey[app.normalizedKey]}
-                  disabled={saving}
+                  disabled={editsDisabled}
                   onToggle={handleToggleApp}
                   onIconError={handleIconError}
                 />
@@ -2675,7 +2692,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
             <button
               type="button"
               className="split-btn"
-              disabled={saving}
+              disabled={editsDisabled}
               onClick={handleDiscard}
             >
               {tSplit(lang, "discard")}
@@ -2683,7 +2700,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
             <button
               type="button"
               className="split-btn split-btn--primary"
-              disabled={saving || isAnyBusy}
+              disabled={editsDisabled || isAnyBusy}
               aria-busy={saving || undefined}
               onClick={() => void handleSave()}
             >
