@@ -4386,7 +4386,14 @@ mod desktop_tun {
                             }
                         } => {
                             if power_changed {
-                                LoopEvent::PowerResume
+                                #[cfg(target_os = "windows")]
+                                {
+                                    LoopEvent::PowerResume
+                                }
+                                #[cfg(not(target_os = "windows"))]
+                                {
+                                    LoopEvent::None
+                                }
                             } else {
                                 #[cfg(target_os = "windows")]
                                 {

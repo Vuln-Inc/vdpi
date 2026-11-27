@@ -1235,19 +1235,16 @@ fn paths_match_allowlist(a: &Path, b: &Path) -> bool {
     na == nb
 }
 
+#[cfg(target_os = "windows")]
 fn is_symlink_or_reparse(meta: &fs::Metadata) -> bool {
-    if meta.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::fs::MetadataExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-            return true;
-        }
-    }
-    false
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    meta.file_type().is_symlink() || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_symlink_or_reparse(meta: &fs::Metadata) -> bool {
+    meta.file_type().is_symlink()
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]

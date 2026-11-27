@@ -322,19 +322,16 @@ mod platform_fs {
     }
 }
 
+#[cfg(windows)]
 fn is_symlink_or_reparse(meta: &fs::Metadata) -> bool {
-    if meta.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-            return true;
-        }
-    }
-    false
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    meta.file_type().is_symlink() || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+}
+
+#[cfg(not(windows))]
+fn is_symlink_or_reparse(meta: &fs::Metadata) -> bool {
+    meta.file_type().is_symlink()
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
