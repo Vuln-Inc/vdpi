@@ -3048,26 +3048,25 @@ where
 
     let extracted_bin = find_extracted_binary(&extract_dir, bin_name)?;
 
+    #[cfg(target_os = "windows")]
     let effective_service_path: Option<PathBuf> = check
         .installed_service_path
         .as_deref()
         .map(Path::to_path_buf)
         .or_else(|| {
-            #[cfg(target_os = "windows")]
-            {
-                let scm = crate::platform::windows_service::query_windows_service_status();
-                resolve_windows_installed_service_path(
-                    None,
-                    scm.installed,
-                    scm.binary_path.as_deref(),
-                    crate::service::installed_binary_path().ok(),
-                )
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                None
-            }
+            let scm = crate::platform::windows_service::query_windows_service_status();
+            resolve_windows_installed_service_path(
+                None,
+                scm.installed,
+                scm.binary_path.as_deref(),
+                crate::service::installed_binary_path().ok(),
+            )
         });
+    #[cfg(not(target_os = "windows"))]
+    let effective_service_path: Option<PathBuf> = check
+        .installed_service_path
+        .as_deref()
+        .map(Path::to_path_buf);
 
     if let Some(service_path) = effective_service_path.as_deref() {
         on_progress(&format!(
