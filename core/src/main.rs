@@ -970,7 +970,7 @@ where
 {
     let fallback_home = home_env
         .map(str::trim)
-        .filter(|h| !h.is_empty() && *h != "/root")
+        .filter(|h| !h.is_empty() && *h != "/root" && *h != "/var/root")
         .map(PathBuf::from);
 
     if let Some(uid) = parse_nonzero_unix_id(sudo_uid) {
@@ -1096,7 +1096,7 @@ fn resolve_elevated_invoking_user() -> Option<ElevatedUserInfo> {
     let pkexec_uid = std::env::var("PKEXEC_UID").ok();
     let doas_user = std::env::var("DOAS_USER").ok();
     let home_env = std::env::var("HOME").ok();
-    resolve_elevated_invoking_user_with(
+    if let Some(user) = resolve_elevated_invoking_user_with(
         sudo_uid.as_deref(),
         sudo_gid.as_deref(),
         sudo_user.as_deref(),
@@ -1105,7 +1105,36 @@ fn resolve_elevated_invoking_user() -> Option<ElevatedUserInfo> {
         home_env.as_deref(),
         lookup_unix_passwd_by_uid,
         lookup_unix_passwd_by_name,
-    )
+    ) {
+        return Some(user);
+    }
+
+    // Fallback for macOS `osascript ... with administrator privileges` (and setuid
+    // elevation paths) where euid == 0 and SUDO_*/PKEXEC_*/DOAS_* are absent while
+    // `getuid()` still identifies the invoking non-root user.
+    // SAFETY: `getuid(2)` is always safe to call and never fails.
+    let ruid = unsafe { libc::getuid() };
+    if ruid != 0 {
+        if let Some(user) = lookup_unix_passwd_by_uid(ruid).filter(|u| u.uid != 0) {
+            return Some(user);
+        }
+        if let Some(home_dir) = home_env
+            .as_deref()
+            .map(str::trim)
+            .filter(|h| !h.is_empty() && *h != "/root" && *h != "/var/root")
+            .map(PathBuf::from)
+        {
+            // SAFETY: `getgid(2)` is always safe to call and never fails.
+            let rgid = unsafe { libc::getgid() };
+            let gid = if rgid != 0 { rgid } else { ruid };
+            return Some(ElevatedUserInfo {
+                uid: ruid,
+                gid,
+                home_dir,
+            });
+        }
+    }
+    None
 }
 
 /// Refuses to create directories, write files, or `lchown` through any symlink

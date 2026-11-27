@@ -10,6 +10,7 @@ export interface SplitTunnelAppRowProps {
   app: DiscoveredAppItem;
   selected: boolean;
   mode: SplitTunnelMode;
+  iconSrc?: string;
   disabled?: boolean;
   onToggle: (normalizedKey: string) => void;
   className?: string;
@@ -118,6 +119,28 @@ const FALLBACK_STYLES = `
   gap: 10px;
   min-width: 0;
   flex: 1 1 auto;
+}
+
+:where(.split-app-row__icon-wrap) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+:where(.split-app-row__icon) {
+  display: block;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  object-fit: contain;
+  user-select: none;
+  pointer-events: none;
 }
 
 :where(.split-app-row__monogram) {
@@ -392,19 +415,26 @@ export const SplitTunnelAppRow = memo(function SplitTunnelAppRow({
   app,
   selected,
   mode,
+  iconSrc,
   disabled = false,
   onToggle,
   className,
 }: SplitTunnelAppRowProps) {
   const { lang } = useLang();
   const [companionsOpen, setCompanionsOpen] = useState(false);
+  const [failedIconSrc, setFailedIconSrc] = useState<string | null>(null);
   const companionsPanelId = useId();
 
   useEffect(() => {
     ensureStyles();
   }, []);
 
+  useEffect(() => {
+    setFailedIconSrc(null);
+  }, [iconSrc]);
+
   const isDisabled = disabled;
+  const showIcon = Boolean(iconSrc && failedIconSrc !== iconSrc);
   const monogram = getAppMonogram(app.displayName, app.exeName);
   const toneIndex = getMonogramToneIndex(
     app.normalizedKey || app.exeName || app.displayName,
@@ -468,13 +498,29 @@ export const SplitTunnelAppRow = memo(function SplitTunnelAppRow({
     >
       <div className="split-app-row__main">
         <div className="split-app-row__identity">
-          <span
-            className="split-app-row__monogram"
-            data-tone={toneIndex}
-            aria-hidden="true"
-          >
-            {monogram}
-          </span>
+          {showIcon ? (
+            <span className="split-app-row__icon-wrap" aria-hidden="true">
+              <img
+                className="split-app-row__icon"
+                src={iconSrc}
+                alt=""
+                width={28}
+                height={28}
+                loading="lazy"
+                decoding="async"
+                draggable={false}
+                onError={() => setFailedIconSrc(iconSrc ?? null)}
+              />
+            </span>
+          ) : (
+            <span
+              className="split-app-row__monogram"
+              data-tone={toneIndex}
+              aria-hidden="true"
+            >
+              {monogram}
+            </span>
+          )}
 
           <div className="split-app-row__names">
             <span

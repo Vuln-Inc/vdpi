@@ -26,15 +26,18 @@ import type {
   DiagStatus,
   EngineMode,
   NavTab,
+  ServiceState,
 } from "../types";
 
 export interface DiagnosticsViewProps {
   status: DesktopStatusSnapshot | null;
+  serviceState?: ServiceState;
   busyAction?: string | null;
   onPushToast?: (tone: ToastTone, message: string) => void;
   onNavigate?: (tab: NavTab) => void;
   onSwitchEngine?: (engine: EngineMode) => void | Promise<void>;
   onStartProtection?: () => void | Promise<void>;
+  onInstallService?: (engine?: EngineMode) => void | Promise<void>;
   onOpenAppFolder?: (kind: AppFolderTarget) => void | Promise<void>;
 }
 
@@ -863,10 +866,13 @@ function getErrorMessage(error: unknown, lang: ResolvedLanguage): string {
 function formatContextSubtitle(
   status: DesktopStatusSnapshot | null,
   lang: ResolvedLanguage,
+  serviceStateOverride?: ServiceState,
 ): string {
   if (!status) {
     return tDiagnostics(lang, "subtitleFallback");
   }
+
+  const resolvedState = serviceStateOverride ?? status.serviceState;
 
   const engineLabel =
     (status.live?.engine ?? status.configuredEngine) === "tun"
@@ -874,9 +880,9 @@ function formatContextSubtitle(
       : tDiagnostics(lang, "engineProxy");
 
   const stateLabel =
-    status.serviceState === "not_installed"
+    resolvedState === "not_installed"
       ? tDiagnostics(lang, "stateNotInstalled")
-      : status.live?.running || status.serviceState === "running"
+      : status.live?.running || resolvedState === "running"
         ? tDiagnostics(lang, "stateRunning")
         : tDiagnostics(lang, "stateStopped");
 
@@ -1012,11 +1018,13 @@ interface RecoveryAction {
 
 function DiagnosticsViewComponent({
   status,
+  serviceState,
   busyAction = null,
   onPushToast,
   onNavigate,
   onSwitchEngine,
   onStartProtection,
+  onInstallService,
   onOpenAppFolder,
 }: DiagnosticsViewProps) {
   const { lang } = useLang();
@@ -1062,9 +1070,12 @@ function DiagnosticsViewComponent({
     [isWindows],
   );
 
+  const effectiveServiceState = serviceState ?? status?.serviceState ?? null;
+  const isNotInstalled = effectiveServiceState === "not_installed";
+
   const subtitle = useMemo(
-    () => formatContextSubtitle(status, lang),
-    [status, lang],
+    () => formatContextSubtitle(status, lang, serviceState),
+    [status, lang, serviceState],
   );
 
   const summary = useMemo(
@@ -1078,6 +1089,9 @@ function DiagnosticsViewComponent({
   const isBusy = busyAction !== null;
   const isSwitchingProxy = busyAction === "switch-engine:proxy";
   const isStartingProtection = busyAction === "connecting";
+  const isInstallingService =
+    busyAction === "install-service" ||
+    status?.pendingOperation === "installing";
 
   const recoveryActions = useMemo<RecoveryAction[]>(() => {
     if (!report || !summary || summary.allPassed) {
@@ -1118,8 +1132,8 @@ function DiagnosticsViewComponent({
     const actions: RecoveryAction[] = [];
 
     if (
-      status?.serviceState === "stopped" &&
-      !status.live?.running &&
+      effectiveServiceState === "stopped" &&
+      !status?.live?.running &&
       !wintunBlocked
     ) {
       if (onStartProtection) {
@@ -1146,15 +1160,38 @@ function DiagnosticsViewComponent({
           },
         });
       }
-    } else if (status?.serviceState === "not_installed" && onNavigate) {
-      actions.push({
-        id: "go-overview",
-        label: tDiagnostics(lang, "actionGoOverview"),
-        icon: "overview",
-        onClick: () => {
-          onNavigate("overview");
-        },
-      });
+    } else if (isNotInstalled) {
+      if (
+        onInstallService &&
+        !wintunBlocked &&
+        status?.canInstallFromBundle !== false
+      ) {
+        actions.push({
+          id: "install-service",
+          label: tDiagnostics(
+            lang,
+            isInstallingService
+              ? "actionInstallingService"
+              : "actionInstallService",
+          ),
+          icon: "shield",
+          busy: isInstallingService,
+          disabled: running || isBusy,
+          onClick: () => {
+            void onInstallService(activeEngine);
+          },
+        });
+      }
+      if (onNavigate) {
+        actions.push({
+          id: "open-installation",
+          label: tDiagnostics(lang, "actionOpenInstallation"),
+          icon: "overview",
+          onClick: () => {
+            onNavigate("installation");
+          },
+        });
+      }
     }
 
     if (
@@ -1179,9 +1216,8 @@ function DiagnosticsViewComponent({
 
     if (
       onNavigate &&
-      (hasServiceIssue ||
-        status?.serviceState === "not_installed" ||
-        hasNetworkIssue)
+      !isNotInstalled &&
+      (hasServiceIssue || hasNetworkIssue)
     ) {
       actions.push({
         id: "open-settings",
@@ -1218,19 +1254,23 @@ function DiagnosticsViewComponent({
     return actions;
   }, [
     activeEngine,
+    effectiveServiceState,
     isBusy,
+    isInstallingService,
+    isNotInstalled,
     isStartingProtection,
     isSwitchingProxy,
     lang,
+    onInstallService,
     onNavigate,
     onOpenAppFolder,
     onStartProtection,
     onSwitchEngine,
     report,
     running,
+    status?.canInstallFromBundle,
     status?.live?.running,
     status?.platform,
-    status?.serviceState,
     status?.wintun.ready,
     status?.wintun.required,
     summary,
@@ -1361,6 +1401,18 @@ function DiagnosticsViewComponent({
           </button>
         </div>
       </header>
+
+      {isNotInstalled ? (
+        <InlineBanner
+          tone="info"
+          title={tDiagnostics(lang, "notInstalledBannerTitle")}
+          description={tDiagnostics(lang, "notInstalledBannerDesc")}
+          actionLabel={
+            onNavigate ? tDiagnostics(lang, "notInstalledBannerAction") : undefined
+          }
+          onAction={onNavigate ? () => onNavigate("installation") : undefined}
+        />
+      ) : null}
 
       {runError ? (
         <InlineBanner
@@ -1633,11 +1685,13 @@ function areDiagnosticsPropsEqual(
   next: DiagnosticsViewProps,
 ): boolean {
   if (
+    prev.serviceState !== next.serviceState ||
     prev.busyAction !== next.busyAction ||
     prev.onPushToast !== next.onPushToast ||
     prev.onNavigate !== next.onNavigate ||
     prev.onSwitchEngine !== next.onSwitchEngine ||
     prev.onStartProtection !== next.onStartProtection ||
+    prev.onInstallService !== next.onInstallService ||
     prev.onOpenAppFolder !== next.onOpenAppFolder
   ) {
     return false;
@@ -1659,6 +1713,8 @@ function areDiagnosticsPropsEqual(
     prevStatus.serviceState === nextStatus.serviceState &&
     prevStatus.configuredEngine === nextStatus.configuredEngine &&
     prevStatus.vpnConflict === nextStatus.vpnConflict &&
+    prevStatus.canInstallFromBundle === nextStatus.canInstallFromBundle &&
+    prevStatus.pendingOperation === nextStatus.pendingOperation &&
     prevStatus.wintun.required === nextStatus.wintun.required &&
     prevStatus.wintun.ready === nextStatus.wintun.ready &&
     (prevLive?.running ?? false) === (nextLive?.running ?? false) &&

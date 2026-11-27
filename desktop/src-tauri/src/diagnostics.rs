@@ -992,10 +992,11 @@ fn evaluate_service_hygiene_check(status: &DesktopStatusSnapshotDto) -> Diagnost
         .map(|v| sanitize_single_line(&redact_urls_in_text(v)))
         .filter(|s| !s.is_empty());
 
-    let (summary, base_detail) = match status.service_state {
+    let (check_status, summary, base_detail) = match status.service_state {
         ServiceStateDto::Running if status.live.is_none() && vpn_conflict.is_some() => {
             let vpn = vpn_conflict.unwrap();
             (
+                DiagStatusDto::Warn,
                 format!(
                     "{} service running (protection paused — VPN conflict: {vpn})",
                     engine_label(status.configured_engine)
@@ -1006,6 +1007,7 @@ fn evaluate_service_hygiene_check(status: &DesktopStatusSnapshotDto) -> Diagnost
             )
         }
         ServiceStateDto::Running => (
+            DiagStatusDto::Warn,
             format!(
                 "{} service running (live telemetry unavailable)",
                 engine_label(status.configured_engine)
@@ -1014,13 +1016,21 @@ fn evaluate_service_hygiene_check(status: &DesktopStatusSnapshotDto) -> Diagnost
                 .to_string(),
         ),
         ServiceStateDto::Stopped => (
+            DiagStatusDto::Warn,
             "Service stopped (standby)".to_string(),
             format!(
                 "Configured engine: {}. Start vdpi to enable protection.",
                 engine_label(status.configured_engine)
             ),
         ),
+        ServiceStateDto::NotInstalled if !status.can_install_from_bundle => (
+            DiagStatusDto::Fail,
+            "Service not installed · Bundled vdpi CLI missing".to_string(),
+            "The bundled vdpi CLI engine binary was not found in the application directory. Reinstall vdpi Desktop, extract all files from the archive, or check antivirus quarantine before installing the service."
+                .to_string(),
+        ),
         ServiceStateDto::NotInstalled => (
+            DiagStatusDto::Warn,
             "Service not installed (standby)".to_string(),
             "Checks ran over your direct connection until the vdpi service is installed and active."
                 .to_string(),
@@ -1036,7 +1046,7 @@ fn evaluate_service_hygiene_check(status: &DesktopStatusSnapshotDto) -> Diagnost
         id: "service_hygiene".to_string(),
         name: "Service & Runtime Hygiene".to_string(),
         target,
-        status: DiagStatusDto::Warn,
+        status: check_status,
         latency_ms: None,
         summary,
         detail: Some(detail),
@@ -1695,6 +1705,12 @@ mod tests {
             logs_dir: String::new(),
             tray_supported: true,
             config_warning: None,
+            bundled_engine_version: Some("0.6.0".to_string()),
+            cli_version_relation: crate::models::CliVersionRelationDto::UpToDate,
+            can_install_from_bundle: true,
+            live_version_stale: false,
+            pending_operation: None,
+            running_from_readonly_dmg: false,
         }
     }
 
@@ -2123,6 +2139,16 @@ mod tests {
         let no_live_check = evaluate_service_hygiene_check(&running_no_live);
         assert_eq!(no_live_check.status, DiagStatusDto::Warn);
         assert!(no_live_check.summary.contains("live telemetry unavailable"));
+
+        // NotInstalled with missing bundled sidecar flags a Fail check.
+        let mut missing_bundle = sample_status(EngineModeDto::Tun, None);
+        missing_bundle.service_state = ServiceStateDto::NotInstalled;
+        missing_bundle.can_install_from_bundle = false;
+        missing_bundle.bundled_engine_version = None;
+        missing_bundle.cli_version_relation = crate::models::CliVersionRelationDto::BundledMissing;
+        let missing_bundle_check = evaluate_service_hygiene_check(&missing_bundle);
+        assert_eq!(missing_bundle_check.status, DiagStatusDto::Fail);
+        assert!(missing_bundle_check.summary.contains("Bundled vdpi CLI missing"));
     }
 
     #[test]

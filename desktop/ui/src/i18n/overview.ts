@@ -77,6 +77,16 @@ const en = {
   setupRequiredDesc:
     "Click Set Up & Connect above to install the background service and start protection. An administrator prompt may appear to approve the setup.",
   btnOpenSettings: "Open Settings",
+  btnOpenInstallation: "Open Installation",
+
+  // Engine upgrade banner
+  upgradeAvailableTitle: "Engine update available",
+  upgradeAvailableDescVersions:
+    "Bundled vdpi {bundled} is newer than your installed service ({installed}). Update now to keep background protection in sync.",
+  upgradeAvailableDesc:
+    "A newer bundled vdpi engine is included with this app. Update now to keep background protection in sync.",
+  btnUpdateEngine: "Update Engine",
+  btnLater: "Later",
 
   // Telemetry metrics
   metricsAria: "Live telemetry",
@@ -143,7 +153,8 @@ const en = {
   cancel: "Cancel",
 } as const;
 
-type OverviewDict = Record<keyof typeof en, string>;
+export type OverviewStringKey = keyof typeof en;
+type OverviewDict = Record<OverviewStringKey, string>;
 
 const tr: OverviewDict = {
   // Engine
@@ -222,6 +233,16 @@ const tr: OverviewDict = {
   setupRequiredDesc:
     "Arka plan servisini kurmak ve korumayı başlatmak için yukarıdaki Kur ve Bağlan düğmesine tıklayın. Kurulumu onaylamak için yönetici istemi görünebilir.",
   btnOpenSettings: "Ayarları Aç",
+  btnOpenInstallation: "Kuruluma Git",
+
+  // Engine upgrade banner
+  upgradeAvailableTitle: "Motor güncellemesi mevcut",
+  upgradeAvailableDescVersions:
+    "Paket içindeki vdpi {bundled}, kurulu servisinizden ({installed}) daha yeni. Arka plan korumasını güncel tutmak için şimdi güncelleyin.",
+  upgradeAvailableDesc:
+    "Bu uygulamayla daha yeni bir vdpi motoru birlikte gelir. Arka plan korumasını güncel tutmak için şimdi güncelleyin.",
+  btnUpdateEngine: "Motoru Güncelle",
+  btnLater: "Sonra",
 
   // Telemetry metrics
   metricsAria: "Canlı telemetri",
@@ -288,7 +309,12 @@ const tr: OverviewDict = {
   cancel: "İptal",
 };
 
-export const tOverview = createTranslator<OverviewDict>({ en, tr });
+export const OVERVIEW_STRINGS: {
+  en: OverviewDict;
+  tr: OverviewDict;
+} = { en, tr };
+
+export const tOverview = createTranslator<OverviewDict>(OVERVIEW_STRINGS);
 
 export function formatStageLabelLocalized(
   lang: ResolvedLanguage,

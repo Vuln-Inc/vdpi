@@ -11,6 +11,12 @@ const en = {
   navDns: "DNS & Rules",
   navDiagnostics: "Diagnostics",
   navSettings: "Settings",
+  navInstallation: "Installation",
+  updateBadgeAppAvailable: "Update available ({version})",
+  updateBadgeEngineUpgrade: "Engine update available ({version})",
+  updateBadgeAvailable: "Update available",
+  updateBadgeSetupNeeded: "Setup needed",
+  updateBadgeRepairNeeded: "Repair recommended",
   splitIncludeEmpty: "0 included apps (no apps protected)",
   splitIncludeOne: "1 included app",
   splitIncludeMany: "{count} included apps",
@@ -97,6 +103,34 @@ const en = {
   installFailed: "Failed to install background service.",
   installNeedsRestart: "Background service installed. Restart to apply.",
   installSuccess: "Background service installed.",
+  installWintunMissing:
+    "wintun.dll is missing. Restore the Wintun driver before starting TUN mode.",
+  upgradeCancelled: "Engine update cancelled.",
+  upgradeFailed: "Failed to update background service.",
+  upgradeNeedsRestart:
+    "Background service updated. Restart service to apply.",
+  upgradeSuccess: "Background service updated.",
+  upgradeAlreadyUpToDate: "Background service is already up to date.",
+  upgradeDowngradeBlocked:
+    "A newer vdpi engine is already installed. Automatic downgrade is blocked.",
+  upgradeVersionUnknown:
+    "Could not verify the installed vdpi version. Use Repair in Installation if needed.",
+  upgradeBundledMissing:
+    "Bundled vdpi engine binary is missing from this installation.",
+  repairCancelled: "Service repair cancelled.",
+  repairFailed: "Failed to repair background service.",
+  repairNeedsRestart:
+    "Background service repaired. Restart service to apply.",
+  repairSuccess: "Background service repaired.",
+  uninstallCancelled: "Service uninstall cancelled.",
+  uninstallFailed: "Failed to uninstall background service.",
+  uninstallSuccess: "Background service uninstalled.",
+  actionBusy: "Another service operation is already in progress.",
+  actionShuttingDown: "The desktop app is shutting down.",
+  checkUpdatesFailed: "Could not check for updates.",
+  checkUpdatesUpToDate: "vdpi is up to date ({version}).",
+  checkUpdatesAvailable: "Update available: {version}.",
+  openReleaseFailed: "Failed to open release page.",
   folderKindConfig: "config",
   folderKindLogs: "logs",
   folderKindApp: "app",
@@ -106,6 +140,22 @@ const en = {
   activityCopyFailed: "Failed to copy activity log.",
   clipboardUnavailable: "Clipboard API unavailable.",
   copyCommandFailed: "Copy command failed.",
+
+  // Launch update prompt dialog
+  updatePromptTitleApp: "Update available",
+  updatePromptTitleEngine: "Engine update ready",
+  updatePromptDescApp:
+    "A newer vdpi release is available on GitHub. Open the release page or review details in Installation.",
+  updatePromptDescEngine:
+    "This desktop app includes a newer vdpi background engine ready to install.",
+  updatePromptEngineSummary:
+    "Updates the installed vdpi service binary to match this app without resetting your configuration.",
+  updatePromptNotesHeading: "Release highlights",
+  updatePromptUpdateNow: "Update Now",
+  updatePromptUpdating: "Updating...",
+  updatePromptViewInstallation: "View in Installation",
+  updatePromptNotNow: "Not Now",
+  updatePromptVersionAria: "Version update from {from} to {to}",
 
   // App confirm dialogs
   discardDnsTitle: "Discard unsaved DNS & Rules changes?",
@@ -126,7 +176,8 @@ const en = {
   switchToTunConfirm: "Switch to Full-PC (TUN)",
 } as const;
 
-type ShellDict = Record<keyof typeof en, string>;
+export type ShellStringKey = keyof typeof en;
+type ShellDict = Record<ShellStringKey, string>;
 
 const tr: ShellDict = {
   // Sidebar
@@ -137,6 +188,12 @@ const tr: ShellDict = {
   navDns: "DNS ve Kurallar",
   navDiagnostics: "Tanılama",
   navSettings: "Ayarlar",
+  navInstallation: "Kurulum",
+  updateBadgeAppAvailable: "Güncelleme mevcut ({version})",
+  updateBadgeEngineUpgrade: "Motor güncellemesi mevcut ({version})",
+  updateBadgeAvailable: "Güncelleme mevcut",
+  updateBadgeSetupNeeded: "Kurulum gerekli",
+  updateBadgeRepairNeeded: "Onarım önerilir",
   splitIncludeEmpty: "0 dahil edilen uygulama (hiçbir uygulama korunmuyor)",
   splitIncludeOne: "1 dahil edilen uygulama",
   splitIncludeMany: "{count} dahil edilen uygulama",
@@ -224,6 +281,34 @@ const tr: ShellDict = {
   installFailed: "Arka plan servisi kurulamadı.",
   installNeedsRestart: "Arka plan servisi kuruldu. Uygulamak için yeniden başlatın.",
   installSuccess: "Arka plan servisi kuruldu.",
+  installWintunMissing:
+    "wintun.dll eksik. TUN modunu başlatmadan önce Wintun sürücüsünü geri yükleyin.",
+  upgradeCancelled: "Motor güncellemesi iptal edildi.",
+  upgradeFailed: "Arka plan servisi güncellenemedi.",
+  upgradeNeedsRestart:
+    "Arka plan servisi güncellendi. Uygulamak için servisi yeniden başlatın.",
+  upgradeSuccess: "Arka plan servisi güncellendi.",
+  upgradeAlreadyUpToDate: "Arka plan servisi zaten güncel.",
+  upgradeDowngradeBlocked:
+    "Daha yeni bir vdpi motoru zaten kurulu. Otomatik sürüm düşürme engellendi.",
+  upgradeVersionUnknown:
+    "Kurulu vdpi sürümü doğrulanamadı. Gerekirse Kurulum sekmesinden Onar seçeneğini kullanın.",
+  upgradeBundledMissing:
+    "Paketli vdpi motor ikili dosyası bu kurulumda bulunamadı.",
+  repairCancelled: "Servis onarımı iptal edildi.",
+  repairFailed: "Arka plan servisi onarılamadı.",
+  repairNeedsRestart:
+    "Arka plan servisi onarıldı. Uygulamak için servisi yeniden başlatın.",
+  repairSuccess: "Arka plan servisi onarıldı.",
+  uninstallCancelled: "Servis kaldırma işlemi iptal edildi.",
+  uninstallFailed: "Arka plan servisi kaldırılamadı.",
+  uninstallSuccess: "Arka plan servisi kaldırıldı.",
+  actionBusy: "Başka bir servis işlemi zaten devam ediyor.",
+  actionShuttingDown: "Masaüstü uygulaması kapatılıyor.",
+  checkUpdatesFailed: "Güncellemeler denetlenemedi.",
+  checkUpdatesUpToDate: "vdpi güncel ({version}).",
+  checkUpdatesAvailable: "Güncelleme mevcut: {version}.",
+  openReleaseFailed: "Sürüm sayfası açılamadı.",
   folderKindConfig: "yapılandırma",
   folderKindLogs: "günlük",
   folderKindApp: "uygulama",
@@ -233,6 +318,22 @@ const tr: ShellDict = {
   activityCopyFailed: "Etkinlik günlüğü kopyalanamadı.",
   clipboardUnavailable: "Pano API'si kullanılamıyor.",
   copyCommandFailed: "Kopyalama komutu başarısız oldu.",
+
+  // Launch update prompt dialog
+  updatePromptTitleApp: "Güncelleme mevcut",
+  updatePromptTitleEngine: "Motor güncellemesi hazır",
+  updatePromptDescApp:
+    "GitHub üzerinde daha yeni bir vdpi sürümü mevcut. Sürüm sayfasını açabilir veya ayrıntıları Kurulum sekmesinde inceleyebilirsiniz.",
+  updatePromptDescEngine:
+    "Bu masaüstü uygulaması, kuruluma hazır daha yeni bir vdpi arka plan motoru içeriyor.",
+  updatePromptEngineSummary:
+    "Yapılandırmanızı sıfırlamadan kurulu vdpi servis ikili dosyasını bu uygulamayla eşleşecek şekilde günceller.",
+  updatePromptNotesHeading: "Sürüm öne çıkanları",
+  updatePromptUpdateNow: "Şimdi Güncelle",
+  updatePromptUpdating: "Güncelleniyor...",
+  updatePromptViewInstallation: "Kurulumda Gör",
+  updatePromptNotNow: "Şimdi Değil",
+  updatePromptVersionAria: "{from} sürümünden {to} sürümüne güncelleme",
 
   // App confirm dialogs
   discardDnsTitle: "Kaydedilmemiş DNS ve Kurallar değişiklikleri silinsin mi?",
@@ -253,7 +354,12 @@ const tr: ShellDict = {
   switchToTunConfirm: "Tam PC (TUN) Moduna Geç",
 };
 
-export const tShell = createTranslator<ShellDict>({ en, tr });
+export const SHELL_STRINGS: {
+  en: Record<ShellStringKey, string>;
+  tr: Record<ShellStringKey, string>;
+} = { en, tr };
+
+export const tShell = createTranslator<ShellDict>(SHELL_STRINGS);
 
 const KNOWN_ACTION_MESSAGES_TR: Record<string, string> = {
   "GUI preferences saved.": "Arayüz tercihleri kaydedildi.",
@@ -268,11 +374,23 @@ const KNOWN_ACTION_MESSAGES_TR: Record<string, string> = {
   "Switched engine to TUN.": "Motor TUN olarak değiştirildi.",
   "Switched engine to Proxy.": "Motor Proxy olarak değiştirildi.",
   "Background service is not installed. Install the service from Settings first.":
-    "Arka plan servisi kurulu değil. Önce Ayarlar'dan servisi kurun.",
+    "Arka plan servisi kurulu değil. Önce Kurulum sekmesinden servisi kurun.",
+  "Background service is not installed. Install the service from Installation first.":
+    "Arka plan servisi kurulu değil. Önce Kurulum sekmesinden servisi kurun.",
   "Background service is already installed.": "Arka plan servisi zaten kurulu.",
   "Background service installed and started.":
     "Arka plan servisi kuruldu ve başlatıldı.",
   "Background service installed.": "Arka plan servisi kuruldu.",
+  "Background service is already up to date.":
+    "Arka plan servisi zaten güncel.",
+  "Background service updated and started.":
+    "Arka plan servisi güncellendi ve başlatıldı.",
+  "Background service updated.": "Arka plan servisi güncellendi.",
+  "Background service repaired and started.":
+    "Arka plan servisi onarıldı ve başlatıldı.",
+  "Background service repaired.": "Arka plan servisi onarıldı.",
+  "A newer vdpi engine is already installed. Automatic downgrade is blocked.":
+    "Daha yeni bir vdpi motoru zaten kurulu. Otomatik sürüm düşürme engellendi.",
   "Background service is already uninstalled.":
     "Arka plan servisi zaten kaldırılmış.",
   "Background service uninstalled.": "Arka plan servisi kaldırıldı.",
@@ -293,5 +411,9 @@ export function localizeActionMessage(
   if (previewOpen) {
     return `Önizleme modu: şu klasör açılacaktı: ${previewOpen[1]}`;
   }
-  return message;
+  const previewExternal = /^Preview mode: opened (.+)$/.exec(message);
+  if (previewExternal) {
+    return `Önizleme modu: ${previewExternal[1]} açıldı`;
+  }
+  return message.replace(/vdpi'ı/g, "vdpi'yi");
 }

@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod app_icons;
 pub mod commands;
 pub mod diagnostics;
 pub mod models;
@@ -275,6 +276,21 @@ fn spawn_status_poller(app: AppHandle, wake: StatusPollerWake) {
                 continue;
             }
 
+            // Skip disk/binary/service probes while an install, upgrade, repair, or
+            // uninstall operation is actively mutating the service binaries.
+            if state.is_mutating_install_operation_active() {
+                let interval = if visible {
+                    VISIBLE_POLL_INTERVAL
+                } else {
+                    HIDDEN_TRAY_POLL_INTERVAL
+                };
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {}
+                    _ = wake.notify.notified() => {}
+                }
+                continue;
+            }
+
             let app_clone = app.clone();
             let snapshot_result = tokio::task::spawn_blocking(move || {
                 app_clone
@@ -502,8 +518,11 @@ pub fn run() {
             commands::save_dns_rules,
             commands::get_split_tunnel,
             commands::save_split_tunnel,
+            commands::get_app_icons,
             commands::run_diagnostics,
             commands::install_service,
+            commands::upgrade_service,
+            commands::repair_service,
             commands::uninstall_service,
             commands::check_updates,
             commands::open_app_folder,

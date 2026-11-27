@@ -7,6 +7,7 @@ export const NAV_TAB_ORDER: readonly NavTab[] = [
   "dns",
   "diagnostics",
   "settings",
+  "installation",
 ] as const;
 
 const TAB_BY_DIGIT: Record<string, NavTab> = {
@@ -15,6 +16,7 @@ const TAB_BY_DIGIT: Record<string, NavTab> = {
   "3": "dns",
   "4": "diagnostics",
   "5": "settings",
+  "6": "installation",
 };
 
 const TAB_BY_CODE: Record<string, NavTab> = {
@@ -23,6 +25,7 @@ const TAB_BY_CODE: Record<string, NavTab> = {
   Digit3: "dns",
   Digit4: "diagnostics",
   Digit5: "settings",
+  Digit6: "installation",
   Comma: "settings",
 };
 

@@ -37,6 +37,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const INTERNET_SETTINGS_SUBKEY: &str =
     r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 const USER_ENV_SUBKEY: &str = "Environment";
+const SYSTEM_ENV_SUBKEY: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
 const SYSTEM_ENV_KEY: &str = r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
 
 const INTERNET_OPTION_SETTINGS_CHANGED: u32 = 39;
@@ -1913,13 +1914,166 @@ pub fn broadcast_environment_change() {
     }
 }
 
-/// Adds `dir` to the Windows System `Path` (`REG_EXPAND_SZ`) and removes any legacy directory
-/// from the current user's `Path` so `vdpi` resolves cleanly from any terminal.
-pub fn add_dir_to_windows_system_path(dir: &Path, legacy_dir: Option<&Path>) -> Result<bool> {
-    let target = dir.display().to_string();
-    let target_norm = target.trim_end_matches('\\');
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RegQueryOutcome {
+    Value(String),
+    NotFound,
+}
 
-    let current = query_reg_sz(SYSTEM_ENV_KEY, "Path").unwrap_or_default();
+fn decode_reg_utf16_bytes(bytes: &[u8]) -> Result<String> {
+    let chunks = bytes.chunks_exact(2);
+    if !chunks.remainder().is_empty() {
+        anyhow::bail!("registry string value has odd byte length ({})", bytes.len());
+    }
+    let mut wide: Vec<u16> = chunks
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect();
+    while wide.last() == Some(&0) {
+        wide.pop();
+    }
+    Ok(String::from_utf16_lossy(&wide))
+}
+
+/// Queries a `REG_SZ` / `REG_EXPAND_SZ` value under `HKLM\<subkey>` using Win32 Advapi32,
+/// distinguishing an absent value (`RegQueryOutcome::NotFound`) from real query errors
+/// (such as access denied, key open failure, or unexpected value type).
+fn query_hklm_reg_sz_checked(subkey: &str, value_name: &str) -> Result<RegQueryOutcome> {
+    use windows_sys::Win32::Foundation::{
+        ERROR_FILE_NOT_FOUND as WIN32_ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA,
+        ERROR_SUCCESS as WIN32_ERROR_SUCCESS,
+    };
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE,
+        REG_EXPAND_SZ, REG_SZ, REG_VALUE_TYPE,
+    };
+
+    struct RegKeyGuard(HKEY);
+    impl Drop for RegKeyGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` was opened by `RegOpenKeyExW` and is closed once on drop.
+                unsafe {
+                    let _ = RegCloseKey(self.0);
+                }
+            }
+        }
+    }
+
+    let wide_subkey: Vec<u16> = OsStr::new(subkey)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut raw_hkey: HKEY = std::ptr::null_mut();
+    // SAFETY: `wide_subkey` is NUL-terminated UTF-16 and `raw_hkey` is a valid out-pointer.
+    let open_rc = unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            wide_subkey.as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &mut raw_hkey,
+        )
+    };
+    if open_rc != WIN32_ERROR_SUCCESS {
+        anyhow::bail!("RegOpenKeyExW(HKLM\\{subkey}) failed with Win32 error {open_rc}");
+    }
+    let key = RegKeyGuard(raw_hkey);
+
+    let wide_name: Vec<u16> = OsStr::new(value_name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut reg_type: REG_VALUE_TYPE = 0;
+    let mut cb_data: u32 = 0;
+
+    for _ in 0..8 {
+        // SAFETY: `key.0` is a valid open registry handle and `wide_name` is NUL-terminated.
+        let size_rc = unsafe {
+            RegQueryValueExW(
+                key.0,
+                wide_name.as_ptr(),
+                std::ptr::null(),
+                &mut reg_type,
+                std::ptr::null_mut(),
+                &mut cb_data,
+            )
+        };
+        if size_rc == WIN32_ERROR_FILE_NOT_FOUND {
+            return Ok(RegQueryOutcome::NotFound);
+        }
+        if size_rc != WIN32_ERROR_SUCCESS {
+            anyhow::bail!(
+                "RegQueryValueExW(HKLM\\{subkey}\\{value_name}) size query failed with Win32 error {size_rc}"
+            );
+        }
+        if cb_data == 0 {
+            if reg_type != REG_SZ && reg_type != REG_EXPAND_SZ {
+                anyhow::bail!(
+                    "unexpected registry type {reg_type} for HKLM\\{subkey}\\{value_name}"
+                );
+            }
+            return Ok(RegQueryOutcome::Value(String::new()));
+        }
+
+        let mut data = vec![0u8; cb_data as usize];
+        // SAFETY: `data` has capacity/length `cb_data` bytes.
+        let read_rc = unsafe {
+            RegQueryValueExW(
+                key.0,
+                wide_name.as_ptr(),
+                std::ptr::null(),
+                &mut reg_type,
+                data.as_mut_ptr(),
+                &mut cb_data,
+            )
+        };
+        match read_rc {
+            WIN32_ERROR_FILE_NOT_FOUND => return Ok(RegQueryOutcome::NotFound),
+            ERROR_MORE_DATA => continue,
+            WIN32_ERROR_SUCCESS => {
+                if reg_type != REG_SZ && reg_type != REG_EXPAND_SZ {
+                    anyhow::bail!(
+                        "unexpected registry type {reg_type} for HKLM\\{subkey}\\{value_name}"
+                    );
+                }
+                data.truncate(cb_data as usize);
+                return decode_reg_utf16_bytes(&data).map(RegQueryOutcome::Value);
+            }
+            other => {
+                anyhow::bail!(
+                    "RegQueryValueExW(HKLM\\{subkey}\\{value_name}) read failed with Win32 error {other}"
+                );
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "RegQueryValueExW(HKLM\\{subkey}\\{value_name}) kept returning ERROR_MORE_DATA"
+    )
+}
+
+fn add_dir_to_windows_system_path_with<FQuery, FWrite>(
+    dir: &Path,
+    query_path: FQuery,
+    mut write_path: FWrite,
+) -> Result<bool>
+where
+    FQuery: FnOnce() -> Result<RegQueryOutcome>,
+    FWrite: FnMut(&str) -> Result<()>,
+{
+    let target = dir.display().to_string();
+    let target_norm = target.trim().trim_end_matches('\\');
+    if target_norm.is_empty() {
+        anyhow::bail!("refusing to add an empty directory to Windows System Path");
+    }
+
+    let current = match query_path()
+        .context("refusing to modify Windows System Path because querying existing Path failed")?
+    {
+        RegQueryOutcome::Value(val) => val,
+        RegQueryOutcome::NotFound => String::new(),
+    };
+
     let mut parts: Vec<String> = current
         .split(';')
         .map(str::trim)
@@ -1931,24 +2085,46 @@ pub fn add_dir_to_windows_system_path(dir: &Path, legacy_dir: Option<&Path>) -> 
         .iter()
         .any(|p| p.trim_end_matches('\\').eq_ignore_ascii_case(target_norm));
 
-    let mut changed = false;
     if !already_present {
         parts.push(target_norm.to_string());
         let new_path = parts.join(";");
-        run_reg(&[
-            "add",
-            SYSTEM_ENV_KEY,
-            "/v",
-            "Path",
-            "/t",
-            "REG_EXPAND_SZ",
-            "/d",
-            &new_path,
-            "/f",
-        ])?;
-        changed = true;
+        // Defensive sanity guard: never allow a write that would shorten an existing non-empty Path.
+        if !current.is_empty() && new_path.len() < current.len() {
+            anyhow::bail!(
+                "refusing to overwrite Windows System Path: computed Path ({} bytes) is shorter than existing Path ({} bytes)",
+                new_path.len(),
+                current.len()
+            );
+        }
+        write_path(&new_path)?;
     }
 
+    Ok(!already_present)
+}
+
+/// Adds `dir` to the Windows System `Path` (`REG_EXPAND_SZ`) and removes any legacy directory
+/// from the current user's `Path` so `vdpi` resolves cleanly from any terminal.
+pub fn add_dir_to_windows_system_path(dir: &Path, legacy_dir: Option<&Path>) -> Result<bool> {
+    let added = add_dir_to_windows_system_path_with(
+        dir,
+        || query_hklm_reg_sz_checked(SYSTEM_ENV_SUBKEY, "Path"),
+        |new_path| {
+            run_reg(&[
+                "add",
+                SYSTEM_ENV_KEY,
+                "/v",
+                "Path",
+                "/t",
+                "REG_EXPAND_SZ",
+                "/d",
+                new_path,
+                "/f",
+            ])
+            .map(|_| ())
+        },
+    )?;
+
+    let mut changed = added;
     if let Some(legacy) = legacy_dir {
         if remove_from_env_path_key(&user_env_key("HKCU"), &[legacy]) {
             changed = true;
@@ -1958,7 +2134,7 @@ pub fn add_dir_to_windows_system_path(dir: &Path, legacy_dir: Option<&Path>) -> 
     if changed {
         broadcast_environment_change();
     }
-    Ok(!already_present)
+    Ok(added)
 }
 
 /// Removes `dir` (and optional `legacy_dir`) from System `Path` and interactive User `Path` entries.
@@ -2899,5 +3075,94 @@ mod tests {
                 .and_then(|s| s.auto_config_url),
             Some("http://pac.corp.local/user.pac".into())
         );
+    }
+
+    #[test]
+    fn add_dir_to_windows_system_path_aborts_on_query_error_without_overwriting() {
+        let mut wrote = false;
+        let res = add_dir_to_windows_system_path_with(
+            Path::new(r"C:\Program Files\vdpi\bin"),
+            || Err(anyhow::anyhow!("simulated Win32 ERROR_ACCESS_DENIED (5)")),
+            |_| {
+                wrote = true;
+                Ok(())
+            },
+        );
+        assert!(
+            res.is_err(),
+            "query failure must abort System Path update rather than wiping Path"
+        );
+        assert!(
+            !wrote,
+            "write callback must never be invoked when querying System Path fails"
+        );
+    }
+
+    #[test]
+    fn add_dir_to_windows_system_path_appends_handles_not_found_and_guards_truncation() {
+        // Existing Path: appends cleanly and never drops existing entries.
+        let mut written = None;
+        let added = add_dir_to_windows_system_path_with(
+            Path::new(r"C:\Program Files\vdpi\bin\"),
+            || Ok(RegQueryOutcome::Value(r"C:\Windows\System32;C:\Windows".into())),
+            |new_path| {
+                written = Some(new_path.to_string());
+                Ok(())
+            },
+        )
+        .expect("append to existing Path");
+        assert!(added);
+        assert_eq!(
+            written.as_deref(),
+            Some(r"C:\Windows\System32;C:\Windows;C:\Program Files\vdpi\bin")
+        );
+
+        // Already present (case-insensitive): no-op without writing.
+        let mut wrote_duplicate = false;
+        let added_dup = add_dir_to_windows_system_path_with(
+            Path::new(r"c:\program files\vdpi\bin"),
+            || {
+                Ok(RegQueryOutcome::Value(
+                    r"C:\Windows\System32;C:\Program Files\vdpi\bin".into(),
+                ))
+            },
+            |_| {
+                wrote_duplicate = true;
+                Ok(())
+            },
+        )
+        .expect("duplicate Path check");
+        assert!(!added_dup);
+        assert!(!wrote_duplicate);
+
+        // Genuinely absent Path value (NotFound): initializes with target directory.
+        let mut written_new = None;
+        let added_new = add_dir_to_windows_system_path_with(
+            Path::new(r"C:\Program Files\vdpi\bin"),
+            || Ok(RegQueryOutcome::NotFound),
+            |new_path| {
+                written_new = Some(new_path.to_string());
+                Ok(())
+            },
+        )
+        .expect("initialize absent Path");
+        assert!(added_new);
+        assert_eq!(written_new.as_deref(), Some(r"C:\Program Files\vdpi\bin"));
+
+        // Defensive sanity guard: refuse to write if computed Path is shorter than existing Path.
+        let mut wrote_short = false;
+        let short_res = add_dir_to_windows_system_path_with(
+            Path::new(r"C:\a"),
+            || Ok(RegQueryOutcome::Value(r"C:\Windows;;;;;;;;;;;;;;;;;;;;".into())),
+            |_| {
+                wrote_short = true;
+                Ok(())
+            },
+        );
+        assert!(
+            short_res.is_err(),
+            "sanity guard must refuse to write a Path shorter than existing Path"
+        );
+        assert!(!wrote_short);
     }
 }

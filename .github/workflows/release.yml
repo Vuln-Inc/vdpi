@@ -607,6 +607,41 @@ jobs:
             throw "WINTUN_LICENSE_PATH is missing or invalid: '$($env:WINTUN_LICENSE_PATH)'"
           }
 
+          $tauriConf = Get-Content -LiteralPath 'desktop/src-tauri/tauri.conf.json' -Raw | ConvertFrom-Json
+          $expectedVersion = [string]$tauriConf.version
+          if ([string]::IsNullOrWhiteSpace($expectedVersion)) {
+            throw "Missing version in desktop/src-tauri/tauri.conf.json"
+          }
+
+          $rootCargoRaw = Get-Content -LiteralPath 'Cargo.toml' -Raw
+          $rootCargoMatch = [regex]::Match($rootCargoRaw, '(?ms)^\[workspace\.package\]\s*(?:(?!^\[).)*?^version\s*=\s*"([^"]+)"')
+          if (-not $rootCargoMatch.Success) {
+            throw "Could not read [workspace.package] version from Cargo.toml"
+          }
+          $workspaceCargoVersion = $rootCargoMatch.Groups[1].Value
+          if ($expectedVersion -ne $workspaceCargoVersion) {
+            throw "Version mismatch: desktop/src-tauri/tauri.conf.json ($expectedVersion) != Cargo.toml ($workspaceCargoVersion)"
+          }
+
+          $desktopCargoRaw = Get-Content -LiteralPath 'desktop/src-tauri/Cargo.toml' -Raw
+          $desktopCargoMatch = [regex]::Match($desktopCargoRaw, '(?ms)^\[package\]\s*(?:(?!^\[).)*?^version\s*=\s*"([^"]+)"')
+          if (-not $desktopCargoMatch.Success) {
+            throw "Could not read [package] version from desktop/src-tauri/Cargo.toml"
+          }
+          $desktopCargoVersion = $desktopCargoMatch.Groups[1].Value
+          if ($expectedVersion -ne $desktopCargoVersion) {
+            throw "Version mismatch: desktop/src-tauri/tauri.conf.json ($expectedVersion) != desktop/src-tauri/Cargo.toml ($desktopCargoVersion)"
+          }
+
+          $cliVersionOut = (& $cliBin --version 2>&1 | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) {
+            throw "$cliBin --version failed with exit code $LASTEXITCODE`: $cliVersionOut"
+          }
+          if ($cliVersionOut -notmatch "(?:^|\s)$([regex]::Escape($expectedVersion))(?:\s|$)") {
+            throw "CLI version mismatch: '$cliVersionOut' does not contain expected version '$expectedVersion'"
+          }
+          Write-Host "Verified vdpi.exe --version ('$cliVersionOut') matches tauri.conf.json ($expectedVersion), Cargo.toml ($workspaceCargoVersion), and desktop/src-tauri/Cargo.toml ($desktopCargoVersion)"
+
           $resourcesDir = 'desktop/src-tauri/resources'
           Remove-Item -LiteralPath $resourcesDir -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path $resourcesDir | Out-Null
@@ -620,7 +655,7 @@ jobs:
             throw "Staged wintun.dll SHA-256 mismatch: expected $expectedDllSha256, got $stagedDllSha256"
           }
           Write-Host "Staged vdpi.exe, SHA-256-verified wintun.dll, and WINTUN-LICENSE.txt into $resourcesDir"
-      - name: Build Tauri Desktop App & NSIS Installer
+      - name: Build Tauri Desktop App (Windows Portable)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -632,28 +667,22 @@ jobs:
             throw "Desktop UI build failed with exit code $LASTEXITCODE"
           }
 
-          $bundleConfig = Join-Path $env:RUNNER_TEMP 'tauri-windows-resources.json'
+          $bundleConfig = Join-Path $env:RUNNER_TEMP 'tauri-windows-portable.json'
           @{
             build = @{
               beforeBuildCommand = ''
             }
-            bundle = @{
-              resources = @{
-                'resources/vdpi.exe' = 'vdpi.exe'
-                'resources/wintun.dll' = 'wintun.dll'
-                'resources/WINTUN-LICENSE.txt' = 'WINTUN-LICENSE.txt'
-              }
-            }
           } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $bundleConfig -Encoding utf8NoBOM
 
-          npx --prefix desktop/ui tauri build --config $bundleConfig --target x86_64-pc-windows-msvc --bundles nsis -- --locked
+          npx --prefix desktop/ui tauri build --config $bundleConfig --no-bundle --target x86_64-pc-windows-msvc -- --locked
           if ($LASTEXITCODE -ne 0) {
             throw "tauri build failed with exit code $LASTEXITCODE"
           }
-      - name: Package Windows Desktop NSIS Installer & Portable Zip
+      - name: Package Windows Desktop Portable Zip
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $expectedDllSha256 = 'e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce'
           if (-not $env:WINTUN_DLL_PATH -or -not (Test-Path -LiteralPath $env:WINTUN_DLL_PATH)) {
             throw "WINTUN_DLL_PATH is missing or invalid: '$($env:WINTUN_DLL_PATH)'"
           }
@@ -663,7 +692,6 @@ jobs:
 
           $desktopBin = 'desktop/src-tauri/target/x86_64-pc-windows-msvc/release/vdpi-desktop.exe'
           $cliBin = 'target/x86_64-pc-windows-msvc/release/vdpi.exe'
-          $nsisDir = 'desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis'
 
           if (-not (Test-Path -LiteralPath $desktopBin)) {
             throw "Missing built desktop binary at $desktopBin"
@@ -672,38 +700,9 @@ jobs:
             throw "Missing built CLI binary at $cliBin"
           }
 
-          $nsisSetup = Get-ChildItem -LiteralPath $nsisDir -Filter '*-setup.exe' -File | Select-Object -First 1
-          if (-not $nsisSetup) {
-            throw "Missing NSIS setup installer in $nsisDir"
-          }
-
-          $sevenZipCmd = Get-Command 7z -ErrorAction SilentlyContinue
-          $sevenZip = if ($sevenZipCmd) {
-            $sevenZipCmd.Source
-          } elseif (Test-Path -LiteralPath 'C:\Program Files\7-Zip\7z.exe') {
-            'C:\Program Files\7-Zip\7z.exe'
-          } else {
-            $null
-          }
-          if (-not $sevenZip) {
-            throw "7z executable not found on PATH or at C:\Program Files\7-Zip\7z.exe"
-          }
-          $nsisListing = (& $sevenZip l $nsisSetup.FullName 2>&1) | Out-String
-          if ($LASTEXITCODE -ne 0) {
-            throw "7z l failed inspecting $($nsisSetup.FullName) (exit code $LASTEXITCODE):`n$nsisListing"
-          }
-          foreach ($requiredFile in @('vdpi.exe', 'wintun.dll', 'WINTUN-LICENSE.txt')) {
-            $escaped = [regex]::Escape($requiredFile)
-            if ($nsisListing -notmatch "(?m)(?:^|[\s\\/])$escaped\s*`$") {
-              throw "Expected NSIS installer $($nsisSetup.Name) to contain $requiredFile; 7z l output:`n$nsisListing"
-            }
-          }
-          Write-Host "Verified NSIS installer contents via 7z l ($($nsisSetup.Name): vdpi.exe, wintun.dll, WINTUN-LICENSE.txt)"
-
           Remove-Item -LiteralPath dist/desktop-win, dist/desktop-win-portable -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path dist/desktop-win, dist/desktop-win-portable | Out-Null
 
-          Copy-Item -LiteralPath $nsisSetup.FullName -Destination dist/desktop-win/vdpi-desktop-windows-x86_64-setup.exe
           Copy-Item -LiteralPath $desktopBin -Destination dist/desktop-win-portable/vdpi-desktop.exe
           Copy-Item -LiteralPath $cliBin -Destination dist/desktop-win-portable/vdpi.exe
           Copy-Item -LiteralPath $env:WINTUN_DLL_PATH -Destination dist/desktop-win-portable/wintun.dll
@@ -720,15 +719,31 @@ jobs:
             if ($entries.Count -ne $expected.Count -or $diff.Count -ne 0) {
               throw "Expected vdpi-desktop-windows-x86_64-portable.zip to contain $($expected -join ', '), got: $($entries -join ', ')"
             }
+
+            $wintunEntry = $zip.GetEntry('wintun.dll')
+            if (-not $wintunEntry) {
+              throw "Missing wintun.dll entry in vdpi-desktop-windows-x86_64-portable.zip"
+            }
+            $sha256 = [System.Security.Cryptography.SHA256]::Create()
+            $entryStream = $wintunEntry.Open()
+            try {
+              $hashBytes = $sha256.ComputeHash($entryStream)
+              $actualPortableDllSha256 = ([System.BitConverter]::ToString($hashBytes) -replace '-', '').ToLowerInvariant()
+            } finally {
+              $entryStream.Dispose()
+              $sha256.Dispose()
+            }
+            if ($actualPortableDllSha256 -ne $expectedDllSha256) {
+              throw "Portable zip wintun.dll SHA-256 mismatch: expected $expectedDllSha256, got $actualPortableDllSha256"
+            }
           } finally {
             $zip.Dispose()
           }
-          Write-Host "Verified Windows desktop NSIS setup and portable archive (vdpi-desktop.exe + vdpi.exe + loose wintun.dll + WINTUN-LICENSE.txt)"
+          Write-Host "Verified Windows desktop portable archive (vdpi-desktop.exe + vdpi.exe + SHA-256-verified wintun.dll [$actualPortableDllSha256] + WINTUN-LICENSE.txt)"
       - uses: actions/upload-artifact@v4
         with:
           name: release-desktop-windows
           path: |
-            dist/desktop-win/vdpi-desktop-windows-x86_64-setup.exe
             dist/desktop-win/vdpi-desktop-windows-x86_64-portable.zip
 
   build-desktop-macos:
@@ -870,6 +885,17 @@ jobs:
           printf '%s\n' "$DMG_CLI_ARCHS" | grep -q "arm64"
           printf '%s\n' "$DMG_CLI_ARCHS" | grep -q "x86_64"
 
+          EXPECTED_VERSION="$(node -e "const v = require('./desktop/src-tauri/tauri.conf.json').version; if (typeof v !== 'string' || !v.trim()) process.exit(1); process.stdout.write(v.trim());")"
+          DMG_CLI_VERSION="$("$DMG_CLI" --version)"
+          echo "DMG-mounted vdpi CLI --version: $DMG_CLI_VERSION"
+          case " $DMG_CLI_VERSION " in
+            *" ${EXPECTED_VERSION} "*) ;;
+            *)
+              echo "ERROR: DMG-mounted vdpi CLI version '$DMG_CLI_VERSION' does not contain expected version '$EXPECTED_VERSION'" >&2
+              exit 1
+              ;;
+          esac
+
           hdiutil detach "$MOUNT_DIR" -force
           MOUNTED=0
 
@@ -969,12 +995,12 @@ jobs:
           fi
 
           DEB_CONTENTS="$(dpkg-deb -c "$DEB_FILE")"
-          if ! printf '%s\n' "$DEB_CONTENTS" | grep -E '[[:space:]](\./)?usr/lib/vdpi Desktop/vdpi$' >/dev/null; then
-            echo "ERROR: Linux .deb bundle is missing exact 'usr/lib/vdpi Desktop/vdpi'" >&2
+          if ! printf '%s\n' "$DEB_CONTENTS" | grep -E '^-rwx.*[[:space:]](\./)?usr/lib/vdpi Desktop/vdpi$' >/dev/null; then
+            echo "ERROR: Linux .deb bundle is missing executable 'usr/lib/vdpi Desktop/vdpi' (expected ^-rwx mode)" >&2
             printf '%s\n' "$DEB_CONTENTS" >&2
             exit 1
           fi
-          echo "Verified exact 'usr/lib/vdpi Desktop/vdpi' in $DEB_FILE"
+          echo "Verified executable 'usr/lib/vdpi Desktop/vdpi' in $DEB_FILE"
 
           DEB_DEPENDS="$(dpkg-deb -f "$DEB_FILE" Depends)"
           echo "Linux .deb Depends: $DEB_DEPENDS"
@@ -1006,7 +1032,17 @@ jobs:
             find "${APPIMAGE_INSPECT_DIR}/squashfs-root/usr/lib" -maxdepth 3 2>/dev/null >&2 || true
             exit 1
           fi
-          echo "Verified executable 'squashfs-root/usr/lib/vdpi Desktop/vdpi' in $APPIMAGE_FILE"
+          EXPECTED_VERSION="$(node -e "const v = require('./desktop/src-tauri/tauri.conf.json').version; if (typeof v !== 'string' || !v.trim()) process.exit(1); process.stdout.write(v.trim());")"
+          APPIMAGE_CLI_VERSION="$("$APPIMAGE_CLI" --version)"
+          echo "AppImage-extracted vdpi CLI --version: $APPIMAGE_CLI_VERSION"
+          case " $APPIMAGE_CLI_VERSION " in
+            *" ${EXPECTED_VERSION} "*) ;;
+            *)
+              echo "ERROR: AppImage-extracted vdpi CLI version '$APPIMAGE_CLI_VERSION' does not contain expected version '$EXPECTED_VERSION'" >&2
+              exit 1
+              ;;
+          esac
+          echo "Verified executable 'squashfs-root/usr/lib/vdpi Desktop/vdpi' (version $EXPECTED_VERSION) in $APPIMAGE_FILE"
 
           mkdir -p dist/desktop-linux
           cp "$DEB_FILE" dist/desktop-linux/vdpi-desktop-linux-x86_64.deb
@@ -1092,7 +1128,7 @@ jobs:
           ### Downloads
 
           **Desktop App (GUI)**
-          - **Windows (`x86_64`):** [Installer (.exe)](__BASE_URL__/vdpi-desktop-windows-x86_64-setup.exe) · [Portable (.zip)](__BASE_URL__/vdpi-desktop-windows-x86_64-portable.zip)
+          - **Windows (`x86_64`):** [Portable (.zip)](__BASE_URL__/vdpi-desktop-windows-x86_64-portable.zip)
           - **macOS (Universal):** [DMG (.dmg)](__BASE_URL__/vdpi-desktop-macos-universal.dmg)
           - **Linux (`x86_64`):** [Debian/Ubuntu (.deb)](__BASE_URL__/vdpi-desktop-linux-x86_64.deb) · [AppImage](__BASE_URL__/vdpi-desktop-linux-x86_64.AppImage)
 
@@ -1117,7 +1153,6 @@ jobs:
             vdpi-linux-arm64.tar.gz
             vdpi-android-universal.apk
             vdpi-ios-unsigned.ipa
-            vdpi-desktop-windows-x86_64-setup.exe
             vdpi-desktop-windows-x86_64-portable.zip
             vdpi-desktop-macos-universal.dmg
             vdpi-desktop-linux-x86_64.deb

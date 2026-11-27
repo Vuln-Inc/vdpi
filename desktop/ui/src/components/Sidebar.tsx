@@ -11,16 +11,20 @@ import {
   BrandMark,
   IconDiagnostics,
   IconDns,
+  IconInstall,
   IconOverview,
   IconSettings,
   IconSplitTunnel,
   IconTray,
+  IconUpdateBadge,
 } from "./Icons";
 
 export interface SidebarProps {
   activeTab: NavTab;
   onSelectTab: (tab: NavTab) => void;
   status: DesktopStatusSnapshot | null;
+  hasAppUpdate?: boolean;
+  latestReleaseVersion?: string | null;
   keepInTrayOnClose?: boolean;
   trayActive?: boolean;
   vpnCoexistence?: VpnCoexistence;
@@ -184,11 +188,59 @@ const FALLBACK_STYLES = `
 :where(.sidebar-nav) {
   display: flex;
   flex-direction: column;
+  gap: 0;
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 0;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+:where(.sidebar-nav-primary) {
+  display: flex;
+  flex-direction: column;
   gap: 2px;
   flex: 1 1 auto;
-  padding: 4px 10px 12px;
+  min-height: 0;
+  padding: 4px 10px 10px;
   overflow-y: auto;
   box-sizing: border-box;
+}
+
+:where(.sidebar-nav-bottom) {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex-shrink: 0;
+  padding: 8px 10px;
+  border-top: 1px solid var(--_sb-border);
+  box-sizing: border-box;
+}
+
+:where(.sidebar-nav-update-badge) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-left: auto;
+  width: 16px;
+  height: 16px;
+  box-shadow: none;
+  filter: none;
+}
+
+:where(.sidebar-nav-update-badge--update) {
+  color: var(--accent-fg, var(--_sb-focus));
+}
+
+:where(.sidebar-nav-update-badge--setup) {
+  color: var(--_sb-warn-fg);
+}
+
+:where(.sidebar-nav-update-icon) {
+  width: 15px;
+  height: 15px;
+  display: block;
 }
 
 :where(.sidebar-nav-item) {
@@ -501,6 +553,8 @@ function SidebarComponent({
   activeTab,
   onSelectTab,
   status,
+  hasAppUpdate = false,
+  latestReleaseVersion = null,
   keepInTrayOnClose = false,
   trayActive,
   vpnCoexistence,
@@ -527,6 +581,44 @@ function SidebarComponent({
       : splitCount === 1
         ? tShell(lang, "splitExcludeOne")
         : tShell(lang, "splitExcludeMany", { count: splitCount });
+
+  const hasEngineUpgrade =
+    status?.cliVersionRelation === "upgrade_available";
+  const hasUpdateAvailable = Boolean(hasAppUpdate || hasEngineUpgrade);
+  const needsSetup = status?.serviceState === "not_installed";
+  const needsRepair = status?.cliVersionRelation === "repair_needed";
+  const showInstallBadge = hasUpdateAvailable || needsSetup || needsRepair;
+  const installBadgeTone: "update" | "setup" | null = hasUpdateAvailable
+    ? "update"
+    : needsSetup || needsRepair
+      ? "setup"
+      : null;
+  const installBadgeTitle = hasAppUpdate
+    ? latestReleaseVersion?.trim()
+      ? tShell(lang, "updateBadgeAppAvailable", {
+          version: formatVersionPill(latestReleaseVersion),
+        })
+      : tShell(lang, "updateBadgeAvailable")
+    : hasEngineUpgrade
+      ? status?.bundledEngineVersion?.trim()
+        ? tShell(lang, "updateBadgeEngineUpgrade", {
+            version: formatVersionPill(status.bundledEngineVersion),
+          })
+        : tShell(lang, "updateBadgeAvailable")
+      : needsSetup
+        ? tShell(lang, "updateBadgeSetupNeeded")
+        : needsRepair
+          ? tShell(lang, "updateBadgeRepairNeeded")
+          : null;
+
+  const isInstallActive = activeTab === "installation";
+  const installLabel = tShell(lang, "navInstallation");
+  const installItemClasses = [
+    "sidebar-nav-item",
+    isInstallActive ? "is-active" : null,
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   const footerStatus = deriveFooterStatus(status, vpnCoexistence, lang);
   const wantsTray = Boolean(trayActive ?? keepInTrayOnClose);
@@ -575,47 +667,81 @@ function SidebarComponent({
         role="navigation"
         aria-label={tShell(lang, "navPrimaryAria")}
       >
-        {NAV_ITEMS.map(({ id, labelKey, Icon }) => {
-          const isActive = activeTab === id;
-          const isSplit = id === "split";
-          const label = tShell(lang, labelKey);
-          const itemClasses = [
-            "sidebar-nav-item",
-            isActive ? "is-active" : null,
-          ]
-            .filter(Boolean)
-            .join(" ");
+        <div className="sidebar-nav-primary">
+          {NAV_ITEMS.map(({ id, labelKey, Icon }) => {
+            const isActive = activeTab === id;
+            const isSplit = id === "split";
+            const label = tShell(lang, labelKey);
+            const itemClasses = [
+              "sidebar-nav-item",
+              isActive ? "is-active" : null,
+            ]
+              .filter(Boolean)
+              .join(" ");
 
-          return (
-            <button
-              key={id}
-              type="button"
-              className={itemClasses}
-              aria-current={isActive ? "page" : undefined}
-              data-tab={id}
-              data-active={isActive ? "true" : undefined}
-              onClick={() => onSelectTab(id)}
-            >
-              <span className="sidebar-nav-icon-wrap" aria-hidden="true">
-                <Icon size={16} className="sidebar-nav-icon" />
+            return (
+              <button
+                key={id}
+                type="button"
+                className={itemClasses}
+                aria-current={isActive ? "page" : undefined}
+                data-tab={id}
+                data-active={isActive ? "true" : undefined}
+                onClick={() => onSelectTab(id)}
+              >
+                <span className="sidebar-nav-icon-wrap" aria-hidden="true">
+                  <Icon size={16} className="sidebar-nav-icon" />
+                </span>
+                <span className="sidebar-nav-label">{label}</span>
+                {isSplit && showSplitCount ? (
+                  <>
+                    <span
+                      className={splitPillClasses}
+                      data-tone={isSplitIncludeEmpty ? "warn" : undefined}
+                      title={splitCountTitle}
+                      aria-hidden="true"
+                    >
+                      {splitCount}
+                    </span>
+                    <span className="sr-only"> ({splitCountTitle})</span>
+                  </>
+                ) : null}
+              </button>
+            );
+          })}
+        </div>
+
+        <div className="sidebar-nav-bottom">
+          <button
+            type="button"
+            className={installItemClasses}
+            aria-current={isInstallActive ? "page" : undefined}
+            data-tab="installation"
+            data-active={isInstallActive ? "true" : undefined}
+            title={installBadgeTitle ?? undefined}
+            onClick={() => onSelectTab("installation")}
+          >
+            <span className="sidebar-nav-icon-wrap" aria-hidden="true">
+              <IconInstall size={16} className="sidebar-nav-icon" />
+            </span>
+            <span className="sidebar-nav-label">{installLabel}</span>
+            {showInstallBadge && installBadgeTone && installBadgeTitle ? (
+              <span
+                className={`sidebar-nav-update-badge sidebar-nav-update-badge--${installBadgeTone}`}
+                role="img"
+                aria-label={installBadgeTitle}
+                title={installBadgeTitle}
+                data-testid="sidebar-install-badge"
+                data-tone={installBadgeTone}
+              >
+                <IconUpdateBadge
+                  size={15}
+                  className="sidebar-nav-update-icon"
+                />
               </span>
-              <span className="sidebar-nav-label">{label}</span>
-              {isSplit && showSplitCount ? (
-                <>
-                  <span
-                    className={splitPillClasses}
-                    data-tone={isSplitIncludeEmpty ? "warn" : undefined}
-                    title={splitCountTitle}
-                    aria-hidden="true"
-                  >
-                    {splitCount}
-                  </span>
-                  <span className="sr-only"> ({splitCountTitle})</span>
-                </>
-              ) : null}
-            </button>
-          );
-        })}
+            ) : null}
+          </button>
+        </div>
       </nav>
 
       <footer className="sidebar-footer">
@@ -658,6 +784,8 @@ function areSidebarPropsEqual(
     prev.activeTab !== next.activeTab ||
     prev.onSelectTab !== next.onSelectTab ||
     prev.className !== next.className ||
+    prev.hasAppUpdate !== next.hasAppUpdate ||
+    prev.latestReleaseVersion !== next.latestReleaseVersion ||
     prev.trayActive !== next.trayActive ||
     prev.keepInTrayOnClose !== next.keepInTrayOnClose ||
     prev.vpnCoexistence !== next.vpnCoexistence
@@ -690,7 +818,10 @@ function areSidebarPropsEqual(
     prevStatus.splitTunnelMode === nextStatus.splitTunnelMode &&
     prevStatus.splitTunnelCount === nextStatus.splitTunnelCount &&
     prevStatus.appVersion === nextStatus.appVersion &&
-    prevStatus.traySupported === nextStatus.traySupported
+    prevStatus.traySupported === nextStatus.traySupported &&
+    prevStatus.cliVersionRelation === nextStatus.cliVersionRelation &&
+    prevStatus.bundledEngineVersion === nextStatus.bundledEngineVersion &&
+    prevStatus.pendingOperation === nextStatus.pendingOperation
   );
 }
 

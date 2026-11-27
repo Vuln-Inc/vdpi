@@ -8,12 +8,13 @@ use vdpi::config_file::{self, FileConfig};
 use vdpi::health::DEFAULT_TUN_HEALTH_PORT;
 use vdpi::platform::vpn::{detect_active_vpn, VpnScope};
 use vdpi::service::{self, LiveEngineStatus, RuntimeState, ServiceState};
+use vdpi::update::{compare_versions, VersionRelation};
 use vdpi_core::config::{EngineMode, RuntimeConfig, VpnCoexistence};
 use vdpi_core::dns;
 
 use crate::models::{
-    DesktopSettingsPayloadDto, DesktopStatusSnapshotDto, GuiPreferencesDto, LiveTelemetryDto,
-    WintunStatusDto,
+    CliVersionRelationDto, DesktopSettingsPayloadDto, DesktopStatusSnapshotDto, GuiPreferencesDto,
+    LiveTelemetryDto, ServiceStateDto, WintunStatusDto,
 };
 use crate::state::{
     engine_mode_to_dto, service_state_to_dto, split_tunnel_mode_to_dto, vpn_coexistence_to_dto,
@@ -84,10 +85,11 @@ pub fn probe_wintun_status(configured_engine: EngineMode) -> WintunStatusDto {
 fn probe_wintun_status_cached(
     state: &DesktopAppState,
     configured_engine: EngineMode,
+    service_state: ServiceState,
 ) -> WintunStatusDto {
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (state, configured_engine);
+        let _ = (state, configured_engine, service_state);
         WintunStatusDto {
             required: false,
             ready: true,
@@ -97,17 +99,39 @@ fn probe_wintun_status_cached(
 
     #[cfg(target_os = "windows")]
     {
-        let candidates = collect_windows_wintun_candidates();
         match vdpi::platform::windows_tun::expected_wintun_dll_sha256() {
-            Ok(expected_sha256) => evaluate_wintun_candidates_cached_with(
-                state,
-                configured_engine,
-                &candidates,
-                |path| {
-                    vdpi::platform::windows_tun::verify_wintun_dll_sha256(path, expected_sha256)
-                        .is_ok()
-                },
-            ),
+            Ok(expected_sha256) => {
+                if service_state != ServiceState::NotInstalled {
+                    let (primary_installed, candidates) = collect_windows_service_wintun_candidates();
+                    evaluate_service_wintun_candidates_cached_with(
+                        state,
+                        configured_engine,
+                        primary_installed.as_deref(),
+                        &candidates,
+                        |path| {
+                            vdpi::platform::windows_tun::verify_wintun_dll_sha256(
+                                path,
+                                expected_sha256,
+                            )
+                            .is_ok()
+                        },
+                    )
+                } else {
+                    let candidates = collect_windows_wintun_candidates();
+                    evaluate_wintun_candidates_cached_with(
+                        state,
+                        configured_engine,
+                        &candidates,
+                        |path| {
+                            vdpi::platform::windows_tun::verify_wintun_dll_sha256(
+                                path,
+                                expected_sha256,
+                            )
+                            .is_ok()
+                        },
+                    )
+                }
+            }
             Err(_) => WintunStatusDto {
                 required: configured_engine == EngineMode::Tun,
                 ready: false,
@@ -164,6 +188,17 @@ fn collect_windows_wintun_candidates() -> Vec<PathBuf> {
     let mut candidates =
         collect_wintun_candidates(installed_bin.as_deref(), current_exe.as_deref());
 
+    if let Ok(bundled_cli) = crate::sidecar::resolve_bundled_vdpi_cli_binary() {
+        collect_wintun_candidates_for_exe(&mut candidates, &bundled_cli);
+    }
+
+    if let Some(res_dir) =
+        crate::sidecar::registered_resource_dir().filter(|dir| !is_unc_or_device_path(dir))
+    {
+        push_unique_candidate(&mut candidates, res_dir.join("wintun.dll"));
+        push_unique_candidate(&mut candidates, res_dir.join("resources").join("wintun.dll"));
+    }
+
     if let Some(pf) = env_non_empty_local_path("ProgramFiles") {
         push_unique_candidate(&mut candidates, pf.join("vdpi").join("bin").join("wintun.dll"));
     }
@@ -184,6 +219,62 @@ fn collect_windows_wintun_candidates() -> Vec<PathBuf> {
     }
 
     candidates
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn collect_service_wintun_candidates(
+    installed_bin: Option<&Path>,
+    program_files: Option<&Path>,
+    program_data: Option<&Path>,
+    runtime_dll_name: &str,
+) -> (Option<PathBuf>, Vec<PathBuf>) {
+    let mut candidates = Vec::new();
+    let mut primary_installed = None;
+
+    if let Some(installed) = installed_bin {
+        let canonical = std::fs::canonicalize(installed).ok();
+        for candidate in vdpi::platform::windows_tun::resolve_wintun_dll_candidates(
+            installed,
+            canonical.as_deref(),
+        ) {
+            if primary_installed.is_none() {
+                primary_installed = Some(candidate.clone());
+            }
+            push_unique_candidate(&mut candidates, candidate);
+        }
+    }
+
+    if let Some(pf) = program_files.filter(|p| !p.as_os_str().is_empty()) {
+        let pf_dll = pf.join("vdpi").join("bin").join("wintun.dll");
+        if primary_installed.is_none() {
+            primary_installed = Some(pf_dll.clone());
+        }
+        push_unique_candidate(&mut candidates, pf_dll);
+    }
+
+    if let Some(pd) = program_data.filter(|p| !p.as_os_str().is_empty()) {
+        push_unique_candidate(
+            &mut candidates,
+            pd.join("vdpi").join("runtime").join(runtime_dll_name),
+        );
+    }
+
+    (primary_installed, candidates)
+}
+
+#[cfg(target_os = "windows")]
+fn collect_windows_service_wintun_candidates() -> (Option<PathBuf>, Vec<PathBuf>) {
+    let installed_bin = service::installed_binary_path().ok();
+    let program_files = env_non_empty_local_path("ProgramFiles")
+        .or_else(|| Some(PathBuf::from(r"C:\Program Files")));
+    let program_data = env_non_empty_local_path("ProgramData");
+    let runtime_dll = format!("wintun-{}.dll", vdpi::platform::windows_tun::WINTUN_VERSION);
+    collect_service_wintun_candidates(
+        installed_bin.as_deref(),
+        program_files.as_deref(),
+        program_data.as_deref(),
+        &runtime_dll,
+    )
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -290,6 +381,75 @@ where
 
     let result = evaluate_wintun_metadata_with(required, &existing_files, verify_sha256);
     state.set_cached_wintun_status(existing_files, result.clone());
+    result
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn evaluate_service_wintun_metadata_with<FVerify>(
+    required: bool,
+    primary_installed_path: Option<&Path>,
+    existing_files: &[BinaryFileMetadata],
+    verify_sha256: FVerify,
+) -> WintunStatusDto
+where
+    FVerify: Fn(&Path) -> bool,
+{
+    if existing_files.is_empty() {
+        return WintunStatusDto {
+            required,
+            ready: false,
+            message: Some(WINTUN_MISSING_MESSAGE.to_string()),
+        };
+    }
+
+    // If the primary installed `wintun.dll` beside the service binary exists on disk
+    // but fails SHA-256 verification, fail immediately rather than falling through to
+    // secondary locations because the Windows service loads its sibling DLL first.
+    if let Some(primary_meta) = primary_installed_path
+        .and_then(|primary_path| existing_files.iter().find(|f| f.path == primary_path))
+    {
+        if primary_meta.len == 0 || !verify_sha256(&primary_meta.path) {
+            return WintunStatusDto {
+                required,
+                ready: false,
+                message: Some(WINTUN_HASH_MISMATCH_MESSAGE.to_string()),
+            };
+        }
+        return WintunStatusDto {
+            required,
+            ready: true,
+            message: None,
+        };
+    }
+
+    evaluate_wintun_metadata_with(required, existing_files, verify_sha256)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn evaluate_service_wintun_candidates_cached_with<FVerify>(
+    state: &DesktopAppState,
+    configured_engine: EngineMode,
+    primary_installed_path: Option<&Path>,
+    candidates: &[PathBuf],
+    verify_sha256: FVerify,
+) -> WintunStatusDto
+where
+    FVerify: Fn(&Path) -> bool,
+{
+    let required = configured_engine == EngineMode::Tun;
+    let existing_files = snapshot_existing_wintun_metadata(candidates);
+
+    if let Some(cached) = state.cached_wintun_status_with_mode(&existing_files, required, true) {
+        return cached;
+    }
+
+    let result = evaluate_service_wintun_metadata_with(
+        required,
+        primary_installed_path,
+        &existing_files,
+        verify_sha256,
+    );
+    state.set_cached_wintun_status_with_mode(existing_files, result.clone(), true);
     result
 }
 
@@ -712,6 +872,124 @@ fn resolve_installed_version_cached(state: &DesktopAppState) -> Option<String> {
     })
 }
 
+/// Probes the semantic version of a resolved bundled `vdpi` CLI binary by
+/// invoking `<bin> --version` directly and parsing stdout via
+/// [`vdpi::service::parse_version_from_cli_output`].
+pub(crate) fn probe_bundled_cli_version(path: &Path) -> Option<String> {
+    match crate::sidecar::run_resolved_vdpi_cli(path, &["--version"], 3, false) {
+        crate::sidecar::SidecarOutcome::Ok(stdout) => {
+            service::parse_version_from_cli_output(&stdout)
+        }
+        _ => None,
+    }
+}
+
+fn resolve_bundled_engine_with<FLocate, FProbe>(
+    state: &DesktopAppState,
+    locate_bundled: FLocate,
+    probe_version: FProbe,
+) -> (bool, Option<String>)
+where
+    FLocate: FnOnce() -> Option<PathBuf>,
+    FProbe: FnOnce(&Path) -> Option<String>,
+{
+    let Some(binary_path) = locate_bundled() else {
+        state.clear_cached_bundled_version();
+        return (false, None);
+    };
+
+    let Some(metadata) = BinaryFileMetadata::from_path(&binary_path) else {
+        state.clear_cached_bundled_version();
+        return (false, None);
+    };
+
+    if let Some(cached) = state.cached_bundled_version(&metadata) {
+        return (true, cached);
+    }
+
+    let version = probe_version(&binary_path);
+    if version.is_some() {
+        state.set_cached_bundled_version(metadata, version.clone());
+    } else {
+        state.clear_cached_bundled_version();
+    }
+    (true, version)
+}
+
+fn resolve_bundled_engine_cached(state: &DesktopAppState) -> (bool, Option<String>) {
+    resolve_bundled_engine_with(
+        state,
+        || crate::sidecar::resolve_bundled_vdpi_cli_binary().ok(),
+        probe_bundled_cli_version,
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn is_macos_readonly_dmg_path(path: &Path) -> bool {
+    let Some(raw) = path.to_str() else {
+        return false;
+    };
+    raw.starts_with("/Volumes/") || raw.contains("/AppTranslocation/")
+}
+
+fn detect_running_from_readonly_dmg() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        std::env::current_exe()
+            .ok()
+            .is_some_and(|exe| is_macos_readonly_dmg_path(&exe))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+fn compute_cli_version_relation(
+    service_state: ServiceStateDto,
+    installed_version: Option<&str>,
+    bundled_engine_version: Option<&str>,
+    can_install_from_bundle: bool,
+) -> CliVersionRelationDto {
+    if !can_install_from_bundle {
+        return CliVersionRelationDto::BundledMissing;
+    }
+    if service_state == ServiceStateDto::NotInstalled {
+        return CliVersionRelationDto::NotInstalled;
+    }
+    let Some(installed) = installed_version else {
+        return CliVersionRelationDto::RepairNeeded;
+    };
+    let Some(bundled) = bundled_engine_version else {
+        return CliVersionRelationDto::Unknown;
+    };
+    match compare_versions(bundled, installed) {
+        VersionRelation::Newer => CliVersionRelationDto::UpgradeAvailable,
+        VersionRelation::Same => CliVersionRelationDto::UpToDate,
+        VersionRelation::Older => CliVersionRelationDto::NewerInstalled,
+        VersionRelation::Unknown => CliVersionRelationDto::Unknown,
+    }
+}
+
+fn compute_live_version_stale(
+    installed_version: Option<&str>,
+    live_version: Option<&str>,
+) -> bool {
+    let (Some(installed), Some(live)) = (installed_version, live_version) else {
+        return false;
+    };
+    let inst = installed.trim().trim_start_matches(['v', 'V']);
+    let running = live.trim().trim_start_matches(['v', 'V']);
+    if inst.is_empty() || running.is_empty() {
+        return false;
+    }
+    match compare_versions(inst, running) {
+        VersionRelation::Same => false,
+        VersionRelation::Newer | VersionRelation::Older => true,
+        VersionRelation::Unknown => inst != running,
+    }
+}
+
 fn collect_static_probe_entry(
     state: &DesktopAppState,
     default_cfg: &RuntimeConfig,
@@ -735,7 +1013,9 @@ fn collect_static_probe_entry(
     let configured_engine = runtime.engine;
     let fallback_dns = compute_fallback_dns(&loaded.config, &default_cfg.dns_addr);
     let installed_version = resolve_installed_version_cached(state);
-    let wintun = probe_wintun_status_cached(state, configured_engine);
+    let (can_install_from_bundle, bundled_engine_version) = resolve_bundled_engine_cached(state);
+    let running_from_readonly_dmg = detect_running_from_readonly_dmg();
+    let wintun = probe_wintun_status_cached(state, configured_engine, service_state);
     let tray_supported = crate::tray::is_tray_host_available();
     let logs_dir = default_logs_dir_for_service_mode(system_service_installed)
         .display()
@@ -755,6 +1035,9 @@ fn collect_static_probe_entry(
 
     StaticProbeEntry {
         installed_version,
+        bundled_engine_version,
+        can_install_from_bundle,
+        running_from_readonly_dmg,
         wintun,
         config_path: loaded.path.display().to_string(),
         logs_dir,
@@ -840,12 +1123,25 @@ where
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
+    let pending_operation = state.active_operation();
+    let mutating_install = state.is_mutating_install_operation_active();
+    if !force_full_refresh && mutating_install {
+        if let Some(last) = state.last_snapshot() {
+            let mut held = (*last).clone();
+            held.snapshot_seq = state.next_snapshot_seq();
+            held.pending_operation = pending_operation;
+            let snapshot = Arc::new(held);
+            state.set_last_snapshot(Arc::clone(&snapshot));
+            return snapshot;
+        }
+    }
+
     let default_cfg = RuntimeConfig::default();
     let live_status = probe_live(&default_cfg);
     let sampled_at = now_fn();
 
     let prev_live_present = state.last_snapshot().map(|s| s.live.is_some());
-    if prev_live_present.is_some_and(|was_live| was_live != live_status.is_some()) {
+    if !mutating_install && prev_live_present.is_some_and(|was_live| was_live != live_status.is_some()) {
         force_full_refresh = true;
     }
 
@@ -886,6 +1182,17 @@ where
         .and_then(|l| l.vpn_conflict.clone())
         .or_else(|| static_entry.vpn_conflict.clone());
 
+    let cli_version_relation = compute_cli_version_relation(
+        static_entry.service_state,
+        static_entry.installed_version.as_deref(),
+        static_entry.bundled_engine_version.as_deref(),
+        static_entry.can_install_from_bundle,
+    );
+    let live_version_stale = compute_live_version_stale(
+        static_entry.installed_version.as_deref(),
+        live.as_ref().and_then(|l| l.version.as_deref()),
+    );
+
     let snapshot = Arc::new(DesktopStatusSnapshotDto {
         snapshot_seq: state.next_snapshot_seq(),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -902,6 +1209,12 @@ where
         logs_dir: static_entry.logs_dir,
         tray_supported: static_entry.tray_supported,
         config_warning: static_entry.config_warning,
+        bundled_engine_version: static_entry.bundled_engine_version,
+        cli_version_relation,
+        can_install_from_bundle: static_entry.can_install_from_bundle,
+        live_version_stale,
+        pending_operation,
+        running_from_readonly_dmg: static_entry.running_from_readonly_dmg,
     });
 
     state.set_last_snapshot(Arc::clone(&snapshot));
@@ -1065,6 +1378,9 @@ mod tests {
     ) -> StaticProbeEntry {
         StaticProbeEntry {
             installed_version: Some("0.6.0".to_string()),
+            bundled_engine_version: Some("0.6.0".to_string()),
+            can_install_from_bundle: true,
+            running_from_readonly_dmg: false,
             wintun: WintunStatusDto {
                 required: true,
                 ready: true,
@@ -2059,5 +2375,185 @@ mod tests {
             state.last_snapshot().expect("cached snapshot").snapshot_seq,
             threads as u64
         );
+    }
+
+    #[test]
+    fn cli_version_relation_live_staleness_and_macos_dmg_detection() {
+        assert_eq!(
+            compute_cli_version_relation(ServiceStateDto::NotInstalled, None, None, false),
+            CliVersionRelationDto::BundledMissing
+        );
+        assert_eq!(
+            compute_cli_version_relation(
+                ServiceStateDto::Running,
+                Some("0.6.0"),
+                None,
+                false
+            ),
+            CliVersionRelationDto::BundledMissing
+        );
+        assert_eq!(
+            compute_cli_version_relation(
+                ServiceStateDto::NotInstalled,
+                None,
+                Some("0.6.1"),
+                true
+            ),
+            CliVersionRelationDto::NotInstalled
+        );
+        assert_eq!(
+            compute_cli_version_relation(ServiceStateDto::Stopped, None, Some("0.6.1"), true),
+            CliVersionRelationDto::RepairNeeded
+        );
+        assert_eq!(
+            compute_cli_version_relation(
+                ServiceStateDto::Running,
+                Some("0.6.0"),
+                Some("0.6.1"),
+                true
+            ),
+            CliVersionRelationDto::UpgradeAvailable
+        );
+        assert_eq!(
+            compute_cli_version_relation(
+                ServiceStateDto::Running,
+                Some("0.6.1"),
+                Some("0.6.1"),
+                true
+            ),
+            CliVersionRelationDto::UpToDate
+        );
+        assert_eq!(
+            compute_cli_version_relation(
+                ServiceStateDto::Running,
+                Some("0.7.0"),
+                Some("0.6.1"),
+                true
+            ),
+            CliVersionRelationDto::NewerInstalled
+        );
+        assert_eq!(
+            compute_cli_version_relation(
+                ServiceStateDto::Running,
+                Some("0.6.1"),
+                None,
+                true
+            ),
+            CliVersionRelationDto::Unknown
+        );
+
+        assert!(!compute_live_version_stale(Some("0.6.1"), Some("v0.6.1")));
+        assert!(compute_live_version_stale(Some("0.6.1"), Some("0.6.0")));
+        assert!(!compute_live_version_stale(Some("0.6.1"), None));
+        assert!(!compute_live_version_stale(None, Some("0.6.1")));
+
+        assert!(is_macos_readonly_dmg_path(Path::new(
+            "/Volumes/vdpi Desktop/vdpi Desktop.app/Contents/MacOS/vdpi-desktop"
+        )));
+        assert!(is_macos_readonly_dmg_path(Path::new(
+            "/private/var/folders/ab/cd/T/AppTranslocation/1234/d/vdpi Desktop.app/Contents/MacOS/vdpi-desktop"
+        )));
+        assert!(!is_macos_readonly_dmg_path(Path::new(
+            "/Applications/vdpi Desktop.app/Contents/MacOS/vdpi-desktop"
+        )));
+    }
+
+    #[test]
+    fn service_wintun_probe_fails_if_primary_installed_dll_has_bad_sha256() {
+        let dir = TestDir::new("service-wintun-strict");
+        let installed_dir = dir.path().join("ProgramFiles").join("vdpi").join("bin");
+        let pd_dir = dir.path().join("ProgramData").join("vdpi").join("runtime");
+        fs::create_dir_all(&installed_dir).expect("create installed dir");
+        fs::create_dir_all(&pd_dir).expect("create ProgramData dir");
+
+        let installed_bin = installed_dir.join("vdpi.exe");
+        let primary_dll = installed_dir.join("wintun.dll");
+        let fallback_dll = pd_dir.join("wintun-0.14.1.dll");
+        let valid_bytes = b"MZ-valid-service-wintun";
+        let expected_sha256 = vdpi::update::sha256_hex(valid_bytes);
+
+        fs::write(&installed_bin, b"fake-exe").expect("write exe");
+        fs::write(&primary_dll, b"corrupted-primary-wintun").expect("write bad primary dll");
+        fs::write(&fallback_dll, valid_bytes).expect("write valid fallback dll");
+
+        let pf_root = dir.path().join("ProgramFiles");
+        let pd_root = dir.path().join("ProgramData");
+        let (primary_path, candidates) = collect_service_wintun_candidates(
+            Some(&installed_bin),
+            Some(pf_root.as_path()),
+            Some(pd_root.as_path()),
+            "wintun-0.14.1.dll",
+        );
+        assert_eq!(primary_path.as_deref(), Some(primary_dll.as_path()));
+
+        let state = DesktopAppState::default();
+        let failed = evaluate_service_wintun_candidates_cached_with(
+            &state,
+            EngineMode::Tun,
+            primary_path.as_deref(),
+            &candidates,
+            |p| vdpi::platform::windows_tun::verify_wintun_dll_sha256(p, &expected_sha256).is_ok(),
+        );
+        assert!(!failed.ready, "bad primary installed wintun.dll must fail immediately");
+        assert_eq!(failed.message.as_deref(), Some(WINTUN_HASH_MISMATCH_MESSAGE));
+
+        // Replacing primary installed DLL with valid bytes succeeds after cache invalidation.
+        fs::write(&primary_dll, valid_bytes).expect("write valid primary dll");
+        state.invalidate_static_cache();
+        let passed = evaluate_service_wintun_candidates_cached_with(
+            &state,
+            EngineMode::Tun,
+            primary_path.as_deref(),
+            &candidates,
+            |p| vdpi::platform::windows_tun::verify_wintun_dll_sha256(p, &expected_sha256).is_ok(),
+        );
+        assert!(passed.ready);
+        assert!(passed.message.is_none());
+    }
+
+    #[test]
+    fn collect_status_snapshot_skips_probes_during_mutating_install_operation() {
+        let state = DesktopAppState::default();
+        let static_calls = AtomicUsize::new(0);
+        let live_calls = AtomicUsize::new(0);
+
+        let initial = collect_status_snapshot_with(
+            &state,
+            true,
+            Instant::now,
+            |_| {
+                live_calls.fetch_add(1, Ordering::SeqCst);
+                None
+            },
+            |_, _, now| {
+                static_calls.fetch_add(1, Ordering::SeqCst);
+                sample_static_entry(now, true, None)
+            },
+        );
+        assert_eq!(initial.pending_operation, None);
+        assert_eq!(static_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(live_calls.load(Ordering::SeqCst), 1);
+
+        state.set_active_operation(Some(crate::models::ServiceOperationDto::Upgrading));
+        let held = collect_status_snapshot_with(
+            &state,
+            false,
+            Instant::now,
+            |_| {
+                live_calls.fetch_add(1, Ordering::SeqCst);
+                None
+            },
+            |_, _, now| {
+                static_calls.fetch_add(1, Ordering::SeqCst);
+                sample_static_entry(now, true, None)
+            },
+        );
+        assert_eq!(
+            held.pending_operation,
+            Some(crate::models::ServiceOperationDto::Upgrading)
+        );
+        assert_eq!(static_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(live_calls.load(Ordering::SeqCst), 1);
+        assert!(held.snapshot_seq > initial.snapshot_seq);
     }
 }

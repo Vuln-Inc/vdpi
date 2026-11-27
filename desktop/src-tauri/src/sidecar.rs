@@ -87,6 +87,11 @@ pub fn set_resource_dir(dir: PathBuf) {
     }
 }
 
+#[cfg(target_os = "windows")]
+pub(crate) fn registered_resource_dir() -> Option<PathBuf> {
+    RESOURCE_DIR.get().cloned()
+}
+
 #[cfg(windows)]
 mod platform_fs {
     use std::fs::{File, OpenOptions};
@@ -650,21 +655,38 @@ fn is_valid_vdpi_cli_candidate(path: &Path) -> bool {
         return false;
     }
 
-    if let Ok(canon) = fs::canonicalize(path) {
-        let Some(canon_name) = canon.file_name().and_then(OsStr::to_str) else {
+    let Ok(canon) = fs::canonicalize(path) else {
+        return false;
+    };
+    let Some(canon_name) = canon.file_name().and_then(OsStr::to_str) else {
+        return false;
+    };
+    if !is_allowed_vdpi_cli_filename(canon_name, cfg!(windows)) {
+        return false;
+    }
+    if let Ok(current_exe) = std::env::current_exe().and_then(fs::canonicalize) {
+        if canon == current_exe {
             return false;
-        };
-        if !is_allowed_vdpi_cli_filename(canon_name, cfg!(windows)) {
-            return false;
-        }
-        if let Ok(current_exe) = std::env::current_exe().and_then(fs::canonicalize) {
-            if canon == current_exe {
-                return false;
-            }
         }
     }
 
     true
+}
+
+#[cfg(any(unix, test))]
+fn is_verified_unix_system_cli_metadata_for(
+    file_uid: u32,
+    file_mode: u32,
+    parent_uid: u32,
+    parent_mode: u32,
+    allow_debian_staff_parent: bool,
+) -> bool {
+    let file_ok = file_uid == 0 && (file_mode & 0o022) == 0 && (file_mode & 0o111) != 0;
+    let parent_perms = parent_mode & 0o7777;
+    let parent_ok = parent_uid == 0
+        && ((parent_mode & 0o022) == 0
+            || (allow_debian_staff_parent && parent_perms == 0o2775));
+    file_ok && parent_ok
 }
 
 #[cfg(any(unix, test))]
@@ -674,9 +696,13 @@ fn is_verified_unix_system_cli_metadata(
     parent_uid: u32,
     parent_mode: u32,
 ) -> bool {
-    let file_ok = file_uid == 0 && (file_mode & 0o022) == 0 && (file_mode & 0o111) != 0;
-    let parent_ok = parent_uid == 0 && (parent_mode & 0o022) == 0;
-    file_ok && parent_ok
+    is_verified_unix_system_cli_metadata_for(
+        file_uid,
+        file_mode,
+        parent_uid,
+        parent_mode,
+        cfg!(target_os = "linux"),
+    )
 }
 
 fn is_verified_system_cli_candidate(path: &Path) -> bool {
@@ -969,11 +995,10 @@ fn push_linux_packaged_candidates(
     }
 }
 
-fn build_cli_candidates_with(
+fn build_bundled_cli_candidates_with(
     current_exe: Option<&Path>,
     resource_dir: Option<&Path>,
     appdir: Option<&Path>,
-    installed_bin: Option<PathBuf>,
 ) -> Vec<PathBuf> {
     let bin_name = expected_cli_binary_name();
     let mut candidates = Vec::new();
@@ -1017,6 +1042,17 @@ fn build_cli_candidates_with(
     #[cfg(not(target_os = "linux"))]
     let _ = appdir;
 
+    candidates
+}
+
+fn build_cli_candidates_with(
+    current_exe: Option<&Path>,
+    resource_dir: Option<&Path>,
+    appdir: Option<&Path>,
+    installed_bin: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut candidates = build_bundled_cli_candidates_with(current_exe, resource_dir, appdir);
+
     // 6. Standard installed CLI binary path (`vdpi::service::installed_binary_path()`).
     if let Some(installed) = installed_bin {
         push_unique_candidate(&mut candidates, installed);
@@ -1052,6 +1088,40 @@ fn resolve_vdpi_cli_from_candidates(candidates: &[PathBuf]) -> Result<PathBuf, S
         "Could not locate the real `{}` CLI engine binary in the application directory, `resources/`, or the installed vdpi binary location.",
         expected_cli_binary_name()
     ))
+}
+
+fn resolve_bundled_vdpi_cli_from_candidates(candidates: &[PathBuf]) -> Result<PathBuf, String> {
+    for candidate in candidates {
+        if is_valid_vdpi_cli_candidate(candidate) {
+            return Ok(strip_windows_verbatim_prefix(candidate));
+        }
+    }
+    Err(format!(
+        "Bundled `{}` CLI engine binary is missing from the vdpi Desktop package. Reinstall vdpi Desktop, extract all files from the archive, or check antivirus quarantine.",
+        expected_cli_binary_name()
+    ))
+}
+
+/// Resolves ONLY the bundled `vdpi` CLI engine binary shipped inside the vdpi Desktop
+/// application package (`vdpi.exe` on Windows, `vdpi` on Unix).
+///
+/// Unlike [`resolve_vdpi_cli_binary`], this NEVER falls back to user-writable
+/// `~/.vdpi/bin/vdpi` or pre-existing system binaries so install, upgrade, and repair
+/// operations always execute the exact engine bundled with this desktop build.
+pub fn resolve_bundled_vdpi_cli_binary() -> Result<PathBuf, String> {
+    let current_exe = std::env::current_exe().ok();
+    let resource_dir = RESOURCE_DIR.get().map(PathBuf::as_path);
+    let appdir = std::env::var_os("APPDIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let candidates =
+        build_bundled_cli_candidates_with(current_exe.as_deref(), resource_dir, appdir.as_deref());
+    resolve_bundled_vdpi_cli_from_candidates(&candidates)
+}
+
+/// Returns `true` if a valid bundled `vdpi` CLI sidecar exists inside the application package.
+pub fn has_bundled_sidecar() -> bool {
+    resolve_bundled_vdpi_cli_binary().is_ok()
 }
 
 fn resolve_vdpi_cli_for_elevation_with<FSystem>(
@@ -1101,24 +1171,18 @@ pub fn resolve_vdpi_cli_binary() -> Result<PathBuf, String> {
 /// When `prefer_system_binary` is `true` (all non-`install` operations targeting an
 /// already-installed system service), verified system-owned binary paths
 /// (`/usr/local/bin/vdpi` on Unix, `%ProgramFiles%\vdpi\bin\vdpi.exe` on Windows) are
-/// checked FIRST before falling back to bundled application paths. When `false`
-/// (e.g. `install`), bundled application paths are preferred so the packaged CLI
-/// installs or upgrades the system service. Every candidate undergoes a full ancestor
-/// symlink/reparse-point walk.
+/// checked FIRST before falling back to bundled application paths (never user-writable
+/// `~/.vdpi/bin/vdpi`). When `false` (e.g. `install`), bundled-only application paths
+/// are used exclusively. Every candidate undergoes a full ancestor symlink/reparse-point walk.
 pub fn resolve_vdpi_cli_binary_for_elevation(prefer_system_binary: bool) -> Result<PathBuf, String> {
     let current_exe = std::env::current_exe().ok();
     let resource_dir = RESOURCE_DIR.get().map(PathBuf::as_path);
     let appdir = std::env::var_os("APPDIR")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from);
-    let installed = installed_binary_path().ok();
     let system_candidates = build_system_cli_candidates();
-    let bundled_candidates = build_cli_candidates_with(
-        current_exe.as_deref(),
-        resource_dir,
-        appdir.as_deref(),
-        installed,
-    );
+    let bundled_candidates =
+        build_bundled_cli_candidates_with(current_exe.as_deref(), resource_dir, appdir.as_deref());
     resolve_vdpi_cli_for_elevation_with(
         prefer_system_binary,
         &system_candidates,
@@ -1200,9 +1264,17 @@ fn run_command_with_timeout(cmd: &mut Command, timeout: Duration) -> Result<Capt
         cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     }
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|err| redact_urls_in_text(&format!("Failed to launch vdpi CLI process: {err}")))?;
+    let mut child = cmd.spawn().map_err(|err| {
+        #[cfg(target_os = "windows")]
+        if let Some(msg) = err
+            .raw_os_error()
+            .and_then(|c| u32::try_from(c).ok())
+            .and_then(classify_windows_os_error_message)
+        {
+            return msg.to_string();
+        }
+        redact_urls_in_text(&format!("Failed to launch vdpi CLI process: {err}"))
+    })?;
 
     let stdout_handle = spawn_pipe_reader(child.stdout.take());
     let stderr_handle = spawn_pipe_reader(child.stderr.take());
@@ -1324,7 +1396,7 @@ fn build_resolved_vdpi_cli_command(bin: &Path, args: &[&str]) -> Command {
     cmd
 }
 
-fn run_resolved_vdpi_cli(
+pub(crate) fn run_resolved_vdpi_cli(
     bin: &Path,
     args: &[&str],
     timeout_secs: u64,
@@ -1416,6 +1488,44 @@ fn bounded_timeout_ms(timeout_secs: u64) -> u32 {
 }
 
 #[cfg(any(target_os = "windows", test))]
+fn classify_windows_os_error_message(code: u32) -> Option<&'static str> {
+    match code {
+        225 => Some(
+            "Windows Defender or antivirus blocked launching vdpi.exe (Win32 error 225). Check Windows Security protection history, allow or restore vdpi.exe, or reinstall vdpi Desktop.",
+        ),
+        226 => Some(
+            "Windows Defender or antivirus quarantined or deleted vdpi.exe (Win32 error 226). Restore vdpi.exe from Windows Security quarantine or reinstall vdpi Desktop.",
+        ),
+        1260 => Some(
+            "Windows Group Policy, AppLocker, or SmartScreen blocked launching vdpi.exe (Win32 error 1260). Allow vdpi Desktop in Windows Security or contact your system administrator.",
+        ),
+        786 => Some(
+            "Windows could not elevate vdpi.exe because administrator elevation is blocked or unavailable (Win32 error 786). Sign in with an administrator account or check UAC/policy settings.",
+        ),
+        5 => Some(
+            "Access denied when launching vdpi.exe (Win32 error 5). Check antivirus exclusions, file permissions, or administrator rights.",
+        ),
+        2 => Some(
+            "Bundled vdpi.exe could not be found (Win32 error 2). Reinstall vdpi Desktop, extract all files from the zip, or check Windows Security quarantine.",
+        ),
+        _ => None,
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn classify_windows_launch_error(code: u32) -> SidecarOutcome {
+    if code == WIN32_ERROR_CANCELLED {
+        return SidecarOutcome::Cancelled;
+    }
+    if let Some(msg) = classify_windows_os_error_message(code) {
+        return SidecarOutcome::Err(msg.to_string());
+    }
+    SidecarOutcome::Err(format!(
+        "Failed to launch elevated vdpi command (Win32 error {code})."
+    ))
+}
+
+#[cfg(any(target_os = "windows", test))]
 fn classify_windows_exit_code(exit_code: u32, allow_saved_needs_restart: bool) -> SidecarOutcome {
     match exit_code {
         0 => SidecarOutcome::Ok(String::new()),
@@ -1460,7 +1570,7 @@ mod win_elevate {
     use std::ptr;
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, BOOL, ERROR_CANCELLED, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        CloseHandle, GetLastError, BOOL, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
     use windows_sys::Win32::System::Threading::{
@@ -1473,7 +1583,7 @@ mod win_elevate {
 
     use super::{
         bounded_timeout_ms, build_windows_parameters, classify_windows_exit_code,
-        resolve_windows_system32_dir_from, SidecarOutcome,
+        classify_windows_launch_error, resolve_windows_system32_dir_from, SidecarOutcome,
     };
 
     #[cfg_attr(target_arch = "x86", repr(C, packed(1)))]
@@ -1594,12 +1704,7 @@ mod win_elevate {
         let ok = unsafe { ShellExecuteExW(&mut info) };
         if ok == 0 {
             let err = unsafe { GetLastError() };
-            if err == ERROR_CANCELLED {
-                return SidecarOutcome::Cancelled;
-            }
-            return SidecarOutcome::Err(format!(
-                "Failed to launch elevated vdpi command (Win32 error {err})."
-            ));
+            return classify_windows_launch_error(err);
         }
 
         if info.h_process == 0 {
@@ -2035,6 +2140,12 @@ fn classify_pkexec_outcome(
         return SidecarOutcome::Cancelled;
     }
 
+    if output.exit_code == Some(127) && lower_err.contains("no authentication agent") {
+        return SidecarOutcome::Err(
+            "No Polkit authentication agent is running in this desktop session (pkexec exit 127). Start a Polkit agent (such as polkit-gnome or lxqt-policykit) or run `sudo vdpi install` from a terminal.".to_string(),
+        );
+    }
+
     if allow_saved_needs_restart
         && output.exit_code == Some(APPLY_FILE_SAVED_NEEDS_RESTART_EXIT_CODE)
     {
@@ -2048,6 +2159,110 @@ fn classify_pkexec_outcome(
         &stdout,
         &stderr,
     ))
+}
+
+fn run_resolved_vdpi_cli_elevated(
+    bin: &Path,
+    args: &[&str],
+    timeout_secs: u64,
+    allow_saved_needs_restart: bool,
+) -> SidecarOutcome {
+    #[cfg(target_os = "windows")]
+    {
+        if vdpi::platform::windows_service::is_elevated() {
+            return run_resolved_vdpi_cli(bin, args, timeout_secs, allow_saved_needs_restart);
+        }
+        win_elevate::run_elevated(bin, args, timeout_secs, allow_saved_needs_restart)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if vdpi::service::is_unix_root() {
+            return run_resolved_vdpi_cli(bin, args, timeout_secs, allow_saved_needs_restart);
+        }
+        let script = match build_osascript_elevation_script(bin, args) {
+            Ok(s) => s,
+            Err(err) => return SidecarOutcome::Err(err),
+        };
+        let mut cmd = Command::new("/usr/bin/osascript");
+        cmd.arg("-e").arg(&script);
+        let timeout = Duration::from_secs(timeout_secs.max(1));
+        match run_command_with_timeout(&mut cmd, timeout) {
+            Ok(output) => classify_osascript_outcome(&output, allow_saved_needs_restart),
+            Err(err) => SidecarOutcome::Err(redact_urls_in_text(&err)),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if vdpi::service::is_unix_root() {
+            return run_resolved_vdpi_cli(bin, args, timeout_secs, allow_saved_needs_restart);
+        }
+
+        let current_exe = std::env::current_exe().ok();
+        let appdir = std::env::var_os("APPDIR")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .filter(|dir| {
+                current_exe_is_inside_appdir(current_exe.as_deref(), Some(dir.as_path()))
+            });
+        let _staged_guard;
+        let exec_bin = if !is_verified_system_cli_candidate(bin)
+            && is_appimage_fuse_path(bin, appdir.as_deref())
+        {
+            let guard = match stage_appimage_binary_for_pkexec(bin, appdir.as_deref()) {
+                Ok(g) => g,
+                Err(err) => return SidecarOutcome::Err(redact_urls_in_text(&err)),
+            };
+            let staged_path = guard.path().to_path_buf();
+            _staged_guard = Some(guard);
+            staged_path
+        } else {
+            _staged_guard = None;
+            bin.to_path_buf()
+        };
+
+        let pkexec_candidates: Vec<PathBuf> =
+            PKEXEC_CANDIDATES.iter().map(PathBuf::from).collect();
+        let pkexec = match resolve_pkexec_from_candidates(&pkexec_candidates) {
+            Ok(path) => path,
+            Err(err) => return SidecarOutcome::Err(err),
+        };
+        let mut cmd = Command::new(&pkexec);
+        scrub_linux_appimage_env(&mut cmd);
+        cmd.arg(&exec_bin).args(args);
+        let timeout = Duration::from_secs(timeout_secs.max(1));
+        match run_command_with_timeout(&mut cmd, timeout) {
+            Ok(output) => classify_pkexec_outcome(&output, allow_saved_needs_restart),
+            Err(err) => SidecarOutcome::Err(redact_urls_in_text(&err)),
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        run_resolved_vdpi_cli(bin, args, timeout_secs, allow_saved_needs_restart)
+    }
+}
+
+/// Runs ONLY the bundled `vdpi` CLI binary shipped inside the vdpi Desktop package
+/// (never falling back to `~/.vdpi/bin/vdpi` or pre-existing system binaries), either
+/// directly or with OS elevation.
+pub fn run_bundled_vdpi_cli(args: &[&str], elevated: bool, timeout_secs: u64) -> SidecarOutcome {
+    if args.iter().any(|arg| arg.contains('\0')) {
+        return SidecarOutcome::Err("vdpi arguments cannot contain NUL characters.".to_string());
+    }
+
+    let bin = match resolve_bundled_vdpi_cli_binary() {
+        Ok(path) => path,
+        Err(err) => return SidecarOutcome::Err(err),
+    };
+
+    let allow_saved_needs_restart = is_config_apply_file_args(args);
+    if elevated {
+        run_resolved_vdpi_cli_elevated(&bin, args, timeout_secs, allow_saved_needs_restart)
+    } else {
+        run_resolved_vdpi_cli(&bin, args, timeout_secs, allow_saved_needs_restart)
+    }
 }
 
 /// Runs the resolved `vdpi` CLI binary with OS administrator/root privileges and a bounded timeout.
@@ -2073,95 +2288,11 @@ pub fn run_vdpi_cli_elevated(args: &[&str], timeout_secs: u64) -> SidecarOutcome
 
     let allow_saved_needs_restart = is_config_apply_file_args(args);
     let prefer_system_binary = should_prefer_system_binary_for_elevation(args);
-
-    #[cfg(target_os = "windows")]
-    {
-        let bin = match resolve_vdpi_cli_binary_for_elevation(prefer_system_binary) {
-            Ok(path) => path,
-            Err(err) => return SidecarOutcome::Err(err),
-        };
-        if vdpi::platform::windows_service::is_elevated() {
-            return run_resolved_vdpi_cli(&bin, args, timeout_secs, allow_saved_needs_restart);
-        }
-        win_elevate::run_elevated(&bin, args, timeout_secs, allow_saved_needs_restart)
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let bin = match resolve_vdpi_cli_binary_for_elevation(prefer_system_binary) {
-            Ok(path) => path,
-            Err(err) => return SidecarOutcome::Err(err),
-        };
-        if vdpi::service::is_unix_root() {
-            return run_resolved_vdpi_cli(&bin, args, timeout_secs, allow_saved_needs_restart);
-        }
-        let script = match build_osascript_elevation_script(&bin, args) {
-            Ok(s) => s,
-            Err(err) => return SidecarOutcome::Err(err),
-        };
-        let mut cmd = Command::new("/usr/bin/osascript");
-        cmd.arg("-e").arg(&script);
-        let timeout = Duration::from_secs(timeout_secs.max(1));
-        match run_command_with_timeout(&mut cmd, timeout) {
-            Ok(output) => classify_osascript_outcome(&output, allow_saved_needs_restart),
-            Err(err) => SidecarOutcome::Err(redact_urls_in_text(&err)),
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let bin = match resolve_vdpi_cli_binary_for_elevation(prefer_system_binary) {
-            Ok(path) => path,
-            Err(err) => return SidecarOutcome::Err(err),
-        };
-        if vdpi::service::is_unix_root() {
-            return run_resolved_vdpi_cli(&bin, args, timeout_secs, allow_saved_needs_restart);
-        }
-
-        let current_exe = std::env::current_exe().ok();
-        let appdir = std::env::var_os("APPDIR")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .filter(|dir| {
-                current_exe_is_inside_appdir(current_exe.as_deref(), Some(dir.as_path()))
-            });
-        let _staged_guard;
-        let exec_bin = if !is_verified_system_cli_candidate(&bin)
-            && is_appimage_fuse_path(&bin, appdir.as_deref())
-        {
-            let guard = match stage_appimage_binary_for_pkexec(&bin, appdir.as_deref()) {
-                Ok(g) => g,
-                Err(err) => return SidecarOutcome::Err(redact_urls_in_text(&err)),
-            };
-            let staged_path = guard.path().to_path_buf();
-            _staged_guard = Some(guard);
-            staged_path
-        } else {
-            _staged_guard = None;
-            bin
-        };
-
-        let pkexec_candidates: Vec<PathBuf> =
-            PKEXEC_CANDIDATES.iter().map(PathBuf::from).collect();
-        let pkexec = match resolve_pkexec_from_candidates(&pkexec_candidates) {
-            Ok(path) => path,
-            Err(err) => return SidecarOutcome::Err(err),
-        };
-        let mut cmd = Command::new(&pkexec);
-        scrub_linux_appimage_env(&mut cmd);
-        cmd.arg(&exec_bin).args(args);
-        let timeout = Duration::from_secs(timeout_secs.max(1));
-        match run_command_with_timeout(&mut cmd, timeout) {
-            Ok(output) => classify_pkexec_outcome(&output, allow_saved_needs_restart),
-            Err(err) => SidecarOutcome::Err(redact_urls_in_text(&err)),
-        }
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    {
-        let _ = (allow_saved_needs_restart, prefer_system_binary);
-        run_vdpi_cli(args, timeout_secs)
-    }
+    let bin = match resolve_vdpi_cli_binary_for_elevation(prefer_system_binary) {
+        Ok(path) => path,
+        Err(err) => return SidecarOutcome::Err(err),
+    };
+    run_resolved_vdpi_cli_elevated(&bin, args, timeout_secs, allow_saved_needs_restart)
 }
 
 struct TempFileGuard {
@@ -4040,5 +4171,105 @@ mod tests {
             leftover.is_empty(),
             "expected zero leftover temp files, found: {leftover:?}"
         );
+    }
+
+    #[test]
+    fn bundled_cli_candidates_exclude_installed_and_system_paths() {
+        let dir = TestDir::new("bundled-only-candidates");
+        let fake_exe = dir.path().join("app").join("vdpi-desktop.exe");
+        let res_dir = dir.path().join("res");
+        let installed = dir.path().join("home").join(".vdpi").join("bin").join(expected_cli_binary_name());
+
+        let bundled = build_bundled_cli_candidates_with(
+            Some(&fake_exe),
+            Some(&res_dir),
+            None,
+        );
+        assert!(bundled.contains(&dir.path().join("app").join(expected_cli_binary_name())));
+        assert!(bundled.contains(&dir.path().join("app").join("resources").join(expected_cli_binary_name())));
+        assert!(bundled.contains(&res_dir.join(expected_cli_binary_name())));
+        assert!(!bundled.contains(&installed));
+        assert!(!bundled.contains(&PathBuf::from("/usr/local/bin/vdpi")));
+    }
+
+    #[test]
+    fn unix_system_cli_metadata_allows_debian_staff_parent_only_on_linux() {
+        // Debian `/usr/local/bin` (`02775` root:staff) is allowed on Linux when the binary itself
+        // is root-owned and not group/world-writable.
+        assert!(is_verified_unix_system_cli_metadata_for(
+            0, 0o100755, 0, 0o042775, true
+        ));
+        // Non-Linux (macOS) still rejects setgid group-writable parent dirs.
+        assert!(!is_verified_unix_system_cli_metadata_for(
+            0, 0o100755, 0, 0o042775, false
+        ));
+        // Plain 0775 (without setgid) and world-writable 02777 are rejected even on Linux.
+        assert!(!is_verified_unix_system_cli_metadata_for(
+            0, 0o100755, 0, 0o040775, true
+        ));
+        assert!(!is_verified_unix_system_cli_metadata_for(
+            0, 0o100755, 0, 0o042777, true
+        ));
+        // Binary itself must ALWAYS remain root-owned and not group/world-writable.
+        assert!(!is_verified_unix_system_cli_metadata_for(
+            0, 0o100775, 0, 0o042775, true
+        ));
+        assert!(!is_verified_unix_system_cli_metadata_for(
+            1000, 0o100755, 0, 0o042775, true
+        ));
+    }
+
+    #[test]
+    fn windows_launch_error_and_pkexec_no_agent_return_actionable_messages() {
+        assert_eq!(
+            classify_windows_launch_error(WIN32_ERROR_CANCELLED),
+            SidecarOutcome::Cancelled
+        );
+
+        for (code, expected_substr) in [
+            (225, "Defender"),
+            (226, "quarantined"),
+            (1260, "SmartScreen"),
+            (786, "elevation"),
+            (5, "Access denied"),
+            (2, "could not be found"),
+        ] {
+            match classify_windows_launch_error(code) {
+                SidecarOutcome::Err(msg) => {
+                    assert!(
+                        msg.contains(expected_substr),
+                        "Win32 error {code} message should mention {expected_substr:?}, got: {msg}"
+                    );
+                    assert!(
+                        msg.contains(&code.to_string()),
+                        "Win32 error {code} message should include numeric code, got: {msg}"
+                    );
+                }
+                other => panic!("expected Err for Win32 error {code}, got {other:?}"),
+            }
+        }
+
+        match classify_windows_launch_error(9999) {
+            SidecarOutcome::Err(msg) => assert!(msg.contains("9999")),
+            other => panic!("expected Err for fallback Win32 error, got {other:?}"),
+        }
+
+        let no_agent = classify_pkexec_outcome(
+            &CapturedOutput {
+                exit_code: Some(127),
+                success: false,
+                stdout: String::new(),
+                stderr: "Error executing command as another user: No authentication agent found."
+                    .to_string(),
+            },
+            false,
+        );
+        match no_agent {
+            SidecarOutcome::Err(msg) => {
+                assert!(msg.contains("Polkit authentication agent"));
+                assert!(msg.contains("sudo vdpi install"));
+            }
+            other => panic!("expected actionable Err for pkexec no auth agent, got {other:?}"),
+        }
     }
 }

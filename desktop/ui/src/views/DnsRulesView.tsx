@@ -29,6 +29,8 @@ import type {
   DesktopSettingsPayload,
   DesktopStatusSnapshot,
   DnsConfigUpdate,
+  NavTab,
+  ServiceState,
   VpnCoexistence,
 } from "../types";
 import { DomainListEditor } from "./DomainListEditor";
@@ -36,10 +38,12 @@ import { DomainListEditor } from "./DomainListEditor";
 export interface DnsRulesViewProps {
   settings: DesktopSettingsPayload | null;
   status: DesktopStatusSnapshot | null;
+  serviceState?: ServiceState;
   busyAction?: string | null;
   onSaved?: () => void | Promise<void>;
   onPushToast?: (tone: ToastTone, message: string) => void;
   onDirtyChange?: (dirty: boolean) => void;
+  onNavigate?: (tab: NavTab) => void;
 }
 
 type ResolverPresetId =
@@ -1060,9 +1064,11 @@ function getErrorMessage(error: unknown, fallback: string): string {
 function DnsRulesViewComponent({
   settings,
   status,
+  serviceState,
   onSaved,
   onPushToast,
   onDirtyChange,
+  onNavigate,
 }: DnsRulesViewProps) {
   const { lang } = useLang();
   const langRef = useRef(lang);
@@ -1296,6 +1302,8 @@ function DnsRulesViewComponent({
     onDirtyChange?.(isDirty);
   }, [isDirty, onDirtyChange]);
 
+  const effectiveServiceState = serviceState ?? status?.serviceState;
+  const isNotInstalled = effectiveServiceState === "not_installed";
   const isLiveRunning = Boolean(status?.live?.running);
   const livePillLabel = tDns(
     lang,
@@ -1564,6 +1572,18 @@ function DnsRulesViewComponent({
         ) : null}
       </header>
 
+      {isNotInstalled ? (
+        <InlineBanner
+          tone="info"
+          title={tDns(lang, "notInstalledBannerTitle")}
+          description={tDns(lang, "notInstalledBannerDesc")}
+          actionLabel={
+            onNavigate ? tDns(lang, "notInstalledBannerAction") : undefined
+          }
+          onAction={onNavigate ? () => onNavigate("installation") : undefined}
+        />
+      ) : null}
+
       {errorBanner ? (
         <InlineBanner
           tone="error"
@@ -1572,7 +1592,7 @@ function DnsRulesViewComponent({
         />
       ) : null}
 
-      {activeVpnConflict ? (
+      {activeVpnConflict && !isNotInstalled ? (
         <InlineBanner
           tone="warn"
           title={tDns(lang, "vpnConflictTitle")}
@@ -2115,7 +2135,12 @@ function DnsRulesViewComponent({
               {saving ? (
                 <span className="dns-spinner" aria-hidden="true" />
               ) : null}
-              <span>{tDns(lang, saving ? "saving" : "saveApply")}</span>
+              <span>
+                {tDns(
+                  lang,
+                  saving ? "saving" : isNotInstalled ? "saveConfig" : "saveApply",
+                )}
+              </span>
             </button>
           </div>
         </div>
@@ -2130,10 +2155,12 @@ function areDnsRulesPropsEqual(
 ): boolean {
   if (
     prev.settings !== next.settings ||
+    prev.serviceState !== next.serviceState ||
     prev.busyAction !== next.busyAction ||
     prev.onSaved !== next.onSaved ||
     prev.onPushToast !== next.onPushToast ||
-    prev.onDirtyChange !== next.onDirtyChange
+    prev.onDirtyChange !== next.onDirtyChange ||
+    prev.onNavigate !== next.onNavigate
   ) {
     return false;
   }

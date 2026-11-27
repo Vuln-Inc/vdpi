@@ -68,6 +68,44 @@ pub enum AppCategoryDto {
     Custom,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CliVersionRelationDto {
+    NotInstalled,
+    UpToDate,
+    UpgradeAvailable,
+    NewerInstalled,
+    RepairNeeded,
+    BundledMissing,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceOperationDto {
+    Installing,
+    Upgrading,
+    Repairing,
+    Uninstalling,
+    Resuming,
+    Pausing,
+    SwitchingEngine,
+    SavingConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionErrorCodeDto {
+    Busy,
+    ShuttingDown,
+    DowngradeBlocked,
+    VersionUnknown,
+    BundledCliMissing,
+    WintunMissing,
+    AlreadyUpToDate,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveTelemetryDto {
@@ -127,6 +165,13 @@ pub struct DesktopStatusSnapshotDto {
     pub tray_supported: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_warning: Option<String>,
+    pub bundled_engine_version: Option<String>,
+    pub cli_version_relation: CliVersionRelationDto,
+    pub can_install_from_bundle: bool,
+    pub live_version_stale: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_operation: Option<ServiceOperationDto>,
+    pub running_from_readonly_dmg: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -214,6 +259,14 @@ pub struct SplitTunnelSaveRequestDto {
     pub apply_live: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppIconRequestDto {
+    pub key: String,
+    pub path: Option<String>,
+    pub exe_name: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiagnosticCheckItemDto {
@@ -256,4 +309,8 @@ pub struct ActionResultDto {
     pub needs_restart: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cancelled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<ActionErrorCodeDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<Box<DesktopStatusSnapshotDto>>,
 }

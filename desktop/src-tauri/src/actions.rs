@@ -9,9 +9,12 @@ use vdpi::config_file::{
     load_file_config_or_default, save_file_config_atomic, system_config_path, user_config_path,
     FileConfig, CONFIG_SCHEMA_VERSION,
 };
-use vdpi::service::{detect_service_state, installed_binary_path, vdpi_root_dir, ServiceState};
+use vdpi::service::{
+    detect_installed_info, detect_service_state, installed_binary_path, vdpi_root_dir, ServiceState,
+};
 use vdpi::update::{
-    check_latest_release, strip_windows_verbatim_prefix, ReleaseCheckResult, VersionRelation,
+    check_latest_release, compare_versions, strip_windows_verbatim_prefix, ReleaseCheckResult,
+    VersionRelation,
 };
 use vdpi_core::bypass::{BypassPolicy, IpNet};
 use vdpi_core::config::{EngineMode, RuntimeConfig, VpnCoexistence};
@@ -20,7 +23,8 @@ use vdpi_core::dns::{
 };
 
 use crate::models::{
-    ActionResultDto, DnsConfigUpdateDto, EngineModeDto, UpdateCheckPayloadDto, VpnCoexistenceDto,
+    ActionErrorCodeDto, ActionResultDto, DnsConfigUpdateDto, EngineModeDto, UpdateCheckPayloadDto,
+    VpnCoexistenceDto,
 };
 use crate::sidecar::{self, SidecarOutcome};
 
@@ -70,6 +74,23 @@ fn action_ok(message: impl Into<String>, needs_restart: Option<bool>) -> ActionR
         message: message.into(),
         needs_restart,
         cancelled: None,
+        code: None,
+        snapshot: None,
+    }
+}
+
+fn action_ok_with_code(
+    message: impl Into<String>,
+    needs_restart: Option<bool>,
+    code: ActionErrorCodeDto,
+) -> ActionResultDto {
+    ActionResultDto {
+        ok: true,
+        message: message.into(),
+        needs_restart,
+        cancelled: None,
+        code: Some(code),
+        snapshot: None,
     }
 }
 
@@ -79,6 +100,19 @@ fn action_err(message: impl Into<String>, needs_restart: Option<bool>) -> Action
         message: message.into(),
         needs_restart,
         cancelled: None,
+        code: None,
+        snapshot: None,
+    }
+}
+
+fn action_err_with_code(message: impl Into<String>, code: ActionErrorCodeDto) -> ActionResultDto {
+    ActionResultDto {
+        ok: false,
+        message: message.into(),
+        needs_restart: None,
+        cancelled: None,
+        code: Some(code),
+        snapshot: None,
     }
 }
 
@@ -88,6 +122,8 @@ fn action_cancelled() -> ActionResultDto {
         message: "Elevation was cancelled.".to_string(),
         needs_restart: None,
         cancelled: Some(true),
+        code: None,
+        snapshot: None,
     }
 }
 
@@ -233,21 +269,49 @@ fn engine_switch_needs_elevation(target: EngineMode) -> bool {
     }
 }
 
+fn install_needs_elevation_for_os(
+    os: &str,
+    target: EngineMode,
+    system_service_installed: bool,
+) -> bool {
+    match os {
+        "windows" => true,
+        "macos" | "linux" => target == EngineMode::Tun || system_service_installed,
+        _ => false,
+    }
+}
+
 fn install_needs_elevation(target: EngineMode, system_service_installed: bool) -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        let _ = (target, system_service_installed);
-        true
+    install_needs_elevation_for_os(std::env::consts::OS, target, system_service_installed)
+}
+
+fn upgrade_needs_elevation_for_os(
+    os: &str,
+    engine: EngineMode,
+    system_service_installed: bool,
+    unix_system_bin_exists: bool,
+) -> bool {
+    match os {
+        "windows" => true,
+        "macos" | "linux" => {
+            system_service_installed || engine == EngineMode::Tun || unix_system_bin_exists
+        }
+        _ => false,
     }
+}
+
+fn upgrade_needs_elevation(engine: EngineMode, system_service_installed: bool) -> bool {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        target == EngineMode::Tun || system_service_installed
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    {
-        let _ = (target, system_service_installed);
-        false
-    }
+    let unix_system_bin_exists = path_entry_exists(Path::new(vdpi::service::UNIX_SYSTEM_BIN_PATH));
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let unix_system_bin_exists = false;
+
+    upgrade_needs_elevation_for_os(
+        std::env::consts::OS,
+        engine,
+        system_service_installed,
+        unix_system_bin_exists,
+    )
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
@@ -690,12 +754,7 @@ where
                         "Saved DNS ({redacted_dns}) and routing rules, but failed to restart the background service: {detail}"
                     )
                 };
-                ActionResultDto {
-                    ok: true,
-                    message,
-                    needs_restart: Some(true),
-                    cancelled: None,
-                }
+                action_ok(message, Some(true))
             }
             SidecarOutcome::Cancelled => action_cancelled(),
             SidecarOutcome::Err(err) => action_err(
@@ -752,6 +811,151 @@ pub fn save_dns_and_rules(update: DnsConfigUpdateDto) -> ActionResultDto {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VersionGuardMode {
+    Install,
+    Upgrade,
+    Repair,
+}
+
+fn check_version_guard(
+    mode: VersionGuardMode,
+    service_installed: bool,
+    installed_binary_present: bool,
+    installed_version: Option<&str>,
+    bundled_version: Option<&str>,
+) -> Option<ActionResultDto> {
+    match mode {
+        VersionGuardMode::Install => {
+            if !service_installed && !installed_binary_present && installed_version.is_none() {
+                return None;
+            }
+            if let Some(inst) = installed_version {
+                let Some(bundled) = bundled_version else {
+                    return Some(action_err_with_code(
+                        format!(
+                            "Could not determine the bundled vdpi CLI version to compare against installed v{inst}."
+                        ),
+                        ActionErrorCodeDto::VersionUnknown,
+                    ));
+                };
+                match compare_versions(bundled, inst) {
+                    VersionRelation::Older => Some(action_err_with_code(
+                        format!(
+                            "Refusing to downgrade installed vdpi v{inst} to older bundled v{bundled}. Download the latest vdpi Desktop release or uninstall the newer CLI first."
+                        ),
+                        ActionErrorCodeDto::DowngradeBlocked,
+                    )),
+                    VersionRelation::Unknown => Some(action_err_with_code(
+                        format!(
+                            "Cannot safely compare installed vdpi version ({inst}) with bundled version ({bundled})."
+                        ),
+                        ActionErrorCodeDto::VersionUnknown,
+                    )),
+                    VersionRelation::Newer | VersionRelation::Same => None,
+                }
+            } else if installed_binary_present {
+                Some(action_err_with_code(
+                    "Could not determine the currently installed vdpi CLI version. Use Repair to overwrite the existing installation.",
+                    ActionErrorCodeDto::VersionUnknown,
+                ))
+            } else {
+                None
+            }
+        }
+        VersionGuardMode::Upgrade => {
+            if !service_installed && !installed_binary_present && installed_version.is_none() {
+                return Some(action_err(
+                    "Background service is not installed. Install the service first.",
+                    None,
+                ));
+            }
+            let (Some(inst), Some(bundled)) = (installed_version, bundled_version) else {
+                return Some(action_err_with_code(
+                    "Could not determine installed or bundled vdpi CLI version to perform a safe upgrade. Use Repair if the installed binary is missing or damaged.",
+                    ActionErrorCodeDto::VersionUnknown,
+                ));
+            };
+            match compare_versions(bundled, inst) {
+                VersionRelation::Newer => None,
+                VersionRelation::Same => Some(action_ok_with_code(
+                    format!("Background service is already up to date (v{inst})."),
+                    Some(false),
+                    ActionErrorCodeDto::AlreadyUpToDate,
+                )),
+                VersionRelation::Older => Some(action_err_with_code(
+                    format!(
+                        "Refusing to downgrade installed vdpi v{inst} to older bundled v{bundled}. Download the latest vdpi Desktop release instead."
+                    ),
+                    ActionErrorCodeDto::DowngradeBlocked,
+                )),
+                VersionRelation::Unknown => Some(action_err_with_code(
+                    format!(
+                        "Cannot safely compare installed vdpi version ({inst}) with bundled version ({bundled})."
+                    ),
+                    ActionErrorCodeDto::VersionUnknown,
+                )),
+            }
+        }
+        VersionGuardMode::Repair => {
+            let Some(inst) = installed_version else {
+                // Missing or unreadable installed binary is explicitly allowed to be repaired.
+                return None;
+            };
+            let Some(bundled) = bundled_version else {
+                return Some(action_err_with_code(
+                    format!(
+                        "Could not determine the bundled vdpi CLI version to compare against installed v{inst}."
+                    ),
+                    ActionErrorCodeDto::VersionUnknown,
+                ));
+            };
+            match compare_versions(bundled, inst) {
+                VersionRelation::Older => Some(action_err_with_code(
+                    format!(
+                        "Refusing to downgrade installed vdpi v{inst} to older bundled v{bundled} during repair. Download the latest vdpi Desktop release instead."
+                    ),
+                    ActionErrorCodeDto::DowngradeBlocked,
+                )),
+                VersionRelation::Unknown => Some(action_err_with_code(
+                    format!(
+                        "Cannot safely compare installed vdpi version ({inst}) with bundled version ({bundled})."
+                    ),
+                    ActionErrorCodeDto::VersionUnknown,
+                )),
+                VersionRelation::Newer | VersionRelation::Same => None,
+            }
+        }
+    }
+}
+
+fn installed_binary_exists_on_disk() -> bool {
+    let user_or_win = installed_binary_path().ok().is_some_and(|p| p.is_file());
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        user_or_win || Path::new(vdpi::service::UNIX_SYSTEM_BIN_PATH).is_file()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        user_or_win
+    }
+}
+
+fn check_windows_tun_wintun_preflight(engine: EngineMode) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    if engine == EngineMode::Tun {
+        let status = crate::status::probe_wintun_status(EngineMode::Tun);
+        if !status.ready {
+            return Err(status.message.unwrap_or_else(|| {
+                "wintun.dll is missing — reinstall vdpi Desktop, extract all files from the zip, or check Windows Defender quarantine.".to_string()
+            }));
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = engine;
+    Ok(())
+}
+
 fn install_background_service_with<FRun>(
     engine: EngineMode,
     needs_elevation: bool,
@@ -795,16 +999,282 @@ where
     }
 }
 
-/// Installs and starts the OS background `vdpi` service via the real `vdpi` CLI
-/// sidecar (`install --tun` or `install --proxy`) so SCM/launchd/systemd always
-/// registers the `vdpi` engine binary rather than `vdpi-desktop`.
-pub fn install_background_service() -> ActionResultDto {
+#[allow(clippy::too_many_arguments)]
+fn install_background_service_checked_with<FRun>(
+    engine: EngineMode,
+    needs_elevation: bool,
+    bundled_cli_result: Result<(), String>,
+    wintun_preflight: Result<(), String>,
+    service_installed: bool,
+    installed_binary_present: bool,
+    installed_version: Option<&str>,
+    bundled_version: Option<&str>,
+    run_cli: FRun,
+) -> ActionResultDto
+where
+    FRun: FnOnce(&[&str], bool) -> SidecarOutcome,
+{
+    if let Err(err) = bundled_cli_result {
+        return action_err_with_code(redact_message(&err), ActionErrorCodeDto::BundledCliMissing);
+    }
+    if let Err(err) = wintun_preflight {
+        return action_err_with_code(redact_message(&err), ActionErrorCodeDto::WintunMissing);
+    }
+    if let Some(blocked) = check_version_guard(
+        VersionGuardMode::Install,
+        service_installed,
+        installed_binary_present,
+        installed_version,
+        bundled_version,
+    ) {
+        return blocked;
+    }
+    install_background_service_with(engine, needs_elevation, run_cli)
+}
+
+/// Installs and starts the OS background `vdpi` service via ONLY the bundled
+/// `vdpi` CLI sidecar (`install --tun` or `install --proxy`) so SCM/launchd/systemd
+/// always registers the `vdpi` engine binary rather than `vdpi-desktop`.
+///
+/// Pre-checks bundled sidecar presence, Wintun availability on Windows for TUN
+/// mode, and strict semver downgrade prevention before requesting elevation.
+pub fn install_background_service(engine: Option<EngineModeDto>) -> ActionResultDto {
+    let bundled_bin = sidecar::resolve_bundled_vdpi_cli_binary();
+    let bundled_version = bundled_bin
+        .as_ref()
+        .ok()
+        .and_then(|path| crate::status::probe_bundled_cli_version(path));
+    let bundled_cli_result = bundled_bin.map(|_| ());
+
+    let service_state = detect_service_state();
+    let service_installed = service_state != ServiceState::NotInstalled;
     let use_system = is_system_service_installed();
     let cfg = load_effective_runtime_config(use_system);
-    let elevated = install_needs_elevation(cfg.engine, use_system);
-    install_background_service_with(cfg.engine, elevated, |args, need_elev| {
-        run_sidecar_cli(args, need_elev, SIDECAR_INSTALL_TIMEOUT_SECS)
-    })
+    let target_engine = engine.map(engine_mode_from_dto).unwrap_or(cfg.engine);
+    let wintun_preflight = check_windows_tun_wintun_preflight(target_engine);
+    let installed_binary_present = installed_binary_exists_on_disk();
+    let installed_version = detect_installed_info().and_then(|info| info.installed_version);
+    let elevated = install_needs_elevation(target_engine, use_system);
+
+    install_background_service_checked_with(
+        target_engine,
+        elevated,
+        bundled_cli_result,
+        wintun_preflight,
+        service_installed,
+        installed_binary_present,
+        installed_version.as_deref(),
+        bundled_version.as_deref(),
+        |args, need_elev| {
+            sidecar::run_bundled_vdpi_cli(args, need_elev, SIDECAR_INSTALL_TIMEOUT_SECS)
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upgrade_background_service_with<FRun>(
+    needs_elevation: bool,
+    bundled_cli_result: Result<(), String>,
+    service_installed: bool,
+    installed_binary_present: bool,
+    installed_version: Option<&str>,
+    bundled_version: Option<&str>,
+    run_cli: FRun,
+) -> ActionResultDto
+where
+    FRun: FnOnce(&[&str], bool) -> SidecarOutcome,
+{
+    if let Err(err) = bundled_cli_result {
+        return action_err_with_code(redact_message(&err), ActionErrorCodeDto::BundledCliMissing);
+    }
+    if let Some(blocked) = check_version_guard(
+        VersionGuardMode::Upgrade,
+        service_installed,
+        installed_binary_present,
+        installed_version,
+        bundled_version,
+    ) {
+        return blocked;
+    }
+
+    let target_ver_suffix = bundled_version
+        .map(|v| format!(" to v{}", v.trim_start_matches(['v', 'V'])))
+        .unwrap_or_default();
+
+    match run_cli(&["install", "--upgrade"], needs_elevation) {
+        SidecarOutcome::Ok(_) => action_ok(
+            format!("Upgraded vdpi background service{target_ver_suffix}."),
+            Some(false),
+        ),
+        SidecarOutcome::SavedNeedsRestart(msg) => {
+            let detail = redact_message(&msg);
+            let message = if detail.is_empty() {
+                format!(
+                    "Upgraded vdpi background service{target_ver_suffix}, but failed to restart the background service. Restart protection to apply changes."
+                )
+            } else {
+                format!(
+                    "Upgraded vdpi background service{target_ver_suffix}, but failed to restart the background service: {detail}"
+                )
+            };
+            action_ok(message, Some(true))
+        }
+        SidecarOutcome::Cancelled => action_cancelled(),
+        SidecarOutcome::Err(err) => action_err(
+            format!(
+                "Failed to upgrade background service: {}",
+                redact_message(&err)
+            ),
+            None,
+        ),
+    }
+}
+
+/// Upgrades an already-installed `vdpi` background service in-place using ONLY
+/// the bundled `vdpi` CLI (`install --upgrade`), preserving existing `config.toml`.
+///
+/// Refuses downgrades when the installed version is newer than the bundled version
+/// (`DowngradeBlocked`) and no-ops (`AlreadyUpToDate`) when versions match.
+pub fn upgrade_background_service() -> ActionResultDto {
+    let bundled_bin = sidecar::resolve_bundled_vdpi_cli_binary();
+    let bundled_version = bundled_bin
+        .as_ref()
+        .ok()
+        .and_then(|path| crate::status::probe_bundled_cli_version(path));
+    let bundled_cli_result = bundled_bin.map(|_| ());
+
+    let service_state = detect_service_state();
+    let service_installed = service_state != ServiceState::NotInstalled;
+    let use_system = is_system_service_installed();
+    let cfg = load_effective_runtime_config(use_system);
+    let installed_binary_present = installed_binary_exists_on_disk();
+    let installed_version = detect_installed_info().and_then(|info| info.installed_version);
+    let elevated = upgrade_needs_elevation(cfg.engine, use_system);
+
+    upgrade_background_service_with(
+        elevated,
+        bundled_cli_result,
+        service_installed,
+        installed_binary_present,
+        installed_version.as_deref(),
+        bundled_version.as_deref(),
+        |args, need_elev| {
+            sidecar::run_bundled_vdpi_cli(args, need_elev, SIDECAR_INSTALL_TIMEOUT_SECS)
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn repair_background_service_with<FRun>(
+    service_state: ServiceState,
+    explicit_engine: Option<EngineMode>,
+    effective_engine: EngineMode,
+    needs_elevation: bool,
+    bundled_cli_result: Result<(), String>,
+    wintun_preflight: Result<(), String>,
+    installed_binary_present: bool,
+    installed_version: Option<&str>,
+    bundled_version: Option<&str>,
+    run_cli: FRun,
+) -> ActionResultDto
+where
+    FRun: FnOnce(&[&str], bool) -> SidecarOutcome,
+{
+    if let Err(err) = bundled_cli_result {
+        return action_err_with_code(redact_message(&err), ActionErrorCodeDto::BundledCliMissing);
+    }
+    if let Err(err) = wintun_preflight {
+        return action_err_with_code(redact_message(&err), ActionErrorCodeDto::WintunMissing);
+    }
+    let service_installed = service_state != ServiceState::NotInstalled;
+    if let Some(blocked) = check_version_guard(
+        VersionGuardMode::Repair,
+        service_installed,
+        installed_binary_present,
+        installed_version,
+        bundled_version,
+    ) {
+        return blocked;
+    }
+
+    let flag = engine_install_flag(effective_engine);
+    let outcome = if !service_installed {
+        run_cli(&["install", flag], needs_elevation)
+    } else if explicit_engine.is_some() {
+        run_cli(&["install", "--upgrade", flag], needs_elevation)
+    } else {
+        run_cli(&["install", "--upgrade"], needs_elevation)
+    };
+
+    match outcome {
+        SidecarOutcome::Ok(_) => action_ok(
+            format!(
+                "Repaired and restarted vdpi background service ({} mode).",
+                engine_display_name(effective_engine)
+            ),
+            Some(false),
+        ),
+        SidecarOutcome::SavedNeedsRestart(msg) => {
+            let detail = redact_message(&msg);
+            let message = if detail.is_empty() {
+                format!(
+                    "Repaired vdpi background service ({} mode), but failed to restart the background service. Restart protection to apply changes.",
+                    engine_display_name(effective_engine)
+                )
+            } else {
+                format!(
+                    "Repaired vdpi background service ({} mode), but failed to restart the background service: {detail}",
+                    engine_display_name(effective_engine)
+                )
+            };
+            action_ok(message, Some(true))
+        }
+        SidecarOutcome::Cancelled => action_cancelled(),
+        SidecarOutcome::Err(err) => action_err(
+            format!(
+                "Failed to repair background service: {}",
+                redact_message(&err)
+            ),
+            None,
+        ),
+    }
+}
+
+/// Repairs or reinstalls the `vdpi` background service using ONLY the bundled
+/// `vdpi` CLI (`install --upgrade`, or fresh `install --tun|--proxy` if not yet
+/// installed), refusing downgrades when the installed version is newer than bundled.
+pub fn repair_background_service(engine: Option<EngineModeDto>) -> ActionResultDto {
+    let bundled_bin = sidecar::resolve_bundled_vdpi_cli_binary();
+    let bundled_version = bundled_bin
+        .as_ref()
+        .ok()
+        .and_then(|path| crate::status::probe_bundled_cli_version(path));
+    let bundled_cli_result = bundled_bin.map(|_| ());
+
+    let service_state = detect_service_state();
+    let use_system = is_system_service_installed();
+    let cfg = load_effective_runtime_config(use_system);
+    let explicit_engine = engine.map(engine_mode_from_dto);
+    let effective_engine = explicit_engine.unwrap_or(cfg.engine);
+    let wintun_preflight = check_windows_tun_wintun_preflight(effective_engine);
+    let installed_binary_present = installed_binary_exists_on_disk();
+    let installed_version = detect_installed_info().and_then(|info| info.installed_version);
+    let elevated = upgrade_needs_elevation(effective_engine, use_system);
+
+    repair_background_service_with(
+        service_state,
+        explicit_engine,
+        effective_engine,
+        elevated,
+        bundled_cli_result,
+        wintun_preflight,
+        installed_binary_present,
+        installed_version.as_deref(),
+        bundled_version.as_deref(),
+        |args, need_elev| {
+            sidecar::run_bundled_vdpi_cli(args, need_elev, SIDECAR_INSTALL_TIMEOUT_SECS)
+        },
+    )
 }
 
 fn uninstall_background_service_with<FRun>(needs_elevation: bool, run_cli: FRun) -> ActionResultDto
@@ -2774,5 +3244,263 @@ mod tests {
                 broken_link.as_path()
             ]));
         }
+    }
+
+    #[test]
+    fn cross_os_install_and_upgrade_elevation_rules() {
+        // Windows always elevates install and upgrade regardless of engine or service mode.
+        assert!(install_needs_elevation_for_os("windows", EngineMode::Proxy, false));
+        assert!(install_needs_elevation_for_os("windows", EngineMode::Tun, false));
+        assert!(upgrade_needs_elevation_for_os(
+            "windows",
+            EngineMode::Proxy,
+            false,
+            false
+        ));
+
+        // macOS and Linux: Proxy user-scoped install does not elevate; TUN or system service does.
+        for os in ["macos", "linux"] {
+            assert!(!install_needs_elevation_for_os(os, EngineMode::Proxy, false));
+            assert!(install_needs_elevation_for_os(os, EngineMode::Tun, false));
+            assert!(install_needs_elevation_for_os(os, EngineMode::Proxy, true));
+
+            assert!(!upgrade_needs_elevation_for_os(
+                os,
+                EngineMode::Proxy,
+                false,
+                false
+            ));
+            assert!(upgrade_needs_elevation_for_os(
+                os,
+                EngineMode::Tun,
+                false,
+                false
+            ));
+            assert!(upgrade_needs_elevation_for_os(
+                os,
+                EngineMode::Proxy,
+                true,
+                false
+            ));
+            assert!(upgrade_needs_elevation_for_os(
+                os,
+                EngineMode::Proxy,
+                false,
+                true
+            ));
+        }
+    }
+
+    #[test]
+    fn install_preflight_blocks_missing_bundle_wintun_and_downgrade_before_elevation() {
+        let missing_bundle = install_background_service_checked_with(
+            EngineMode::Tun,
+            true,
+            Err("Bundled vdpi missing".to_string()),
+            Ok(()),
+            false,
+            false,
+            None,
+            None,
+            |_, _| unreachable!("must not elevate when bundled CLI is missing"),
+        );
+        assert!(!missing_bundle.ok);
+        assert_eq!(missing_bundle.code, Some(ActionErrorCodeDto::BundledCliMissing));
+
+        let missing_wintun = install_background_service_checked_with(
+            EngineMode::Tun,
+            true,
+            Ok(()),
+            Err("wintun.dll is missing".to_string()),
+            false,
+            false,
+            None,
+            Some("0.6.1"),
+            |_, _| unreachable!("must not elevate when Wintun is missing for TUN"),
+        );
+        assert!(!missing_wintun.ok);
+        assert_eq!(missing_wintun.code, Some(ActionErrorCodeDto::WintunMissing));
+
+        let downgrade = install_background_service_checked_with(
+            EngineMode::Tun,
+            true,
+            Ok(()),
+            Ok(()),
+            true,
+            true,
+            Some("0.7.0"),
+            Some("0.6.1"),
+            |_, _| unreachable!("must not elevate on semver downgrade"),
+        );
+        assert!(!downgrade.ok);
+        assert_eq!(downgrade.code, Some(ActionErrorCodeDto::DowngradeBlocked));
+
+        let unknown = install_background_service_checked_with(
+            EngineMode::Tun,
+            true,
+            Ok(()),
+            Ok(()),
+            true,
+            true,
+            Some("0.6.0"),
+            None,
+            |_, _| unreachable!("must not elevate when bundled version is unknown"),
+        );
+        assert!(!unknown.ok);
+        assert_eq!(unknown.code, Some(ActionErrorCodeDto::VersionUnknown));
+
+        let fresh_proxy = install_background_service_checked_with(
+            EngineMode::Proxy,
+            false,
+            Ok(()),
+            Ok(()),
+            false,
+            false,
+            None,
+            Some("0.6.1"),
+            |args, elev| {
+                assert_eq!(args, &["install", "--proxy"]);
+                assert!(!elev);
+                SidecarOutcome::Ok(String::new())
+            },
+        );
+        assert!(fresh_proxy.ok);
+        assert_eq!(fresh_proxy.code, None);
+    }
+
+    #[test]
+    fn upgrade_and_repair_enforce_semver_guards_and_cli_arguments() {
+        // Upgrade succeeds when bundled > installed and passes `install --upgrade`.
+        let upgraded = upgrade_background_service_with(
+            true,
+            Ok(()),
+            true,
+            true,
+            Some("0.6.0"),
+            Some("0.6.1"),
+            |args, elev| {
+                assert_eq!(args, &["install", "--upgrade"]);
+                assert!(elev);
+                SidecarOutcome::Ok(String::new())
+            },
+        );
+        assert!(upgraded.ok);
+        assert_eq!(upgraded.code, None);
+        assert!(upgraded.message.contains("v0.6.1"));
+
+        // Upgrade no-ops with AlreadyUpToDate when versions match.
+        let same = upgrade_background_service_with(
+            true,
+            Ok(()),
+            true,
+            true,
+            Some("0.6.1"),
+            Some("0.6.1"),
+            |_, _| unreachable!("must not invoke sidecar when already up to date"),
+        );
+        assert!(same.ok);
+        assert_eq!(same.code, Some(ActionErrorCodeDto::AlreadyUpToDate));
+
+        // Upgrade blocks downgrade when installed > bundled.
+        let downgrade = upgrade_background_service_with(
+            true,
+            Ok(()),
+            true,
+            true,
+            Some("0.7.0"),
+            Some("0.6.1"),
+            |_, _| unreachable!("must not downgrade during upgrade"),
+        );
+        assert!(!downgrade.ok);
+        assert_eq!(downgrade.code, Some(ActionErrorCodeDto::DowngradeBlocked));
+
+        // Upgrade returns VersionUnknown when installed version is unavailable.
+        let unknown = upgrade_background_service_with(
+            true,
+            Ok(()),
+            true,
+            true,
+            None,
+            Some("0.6.1"),
+            |_, _| unreachable!("must not upgrade with unknown installed version"),
+        );
+        assert!(!unknown.ok);
+        assert_eq!(unknown.code, Some(ActionErrorCodeDto::VersionUnknown));
+
+        // Repair when NotInstalled runs fresh install with explicit engine flag.
+        let repair_fresh = repair_background_service_with(
+            ServiceState::NotInstalled,
+            Some(EngineMode::Proxy),
+            EngineMode::Proxy,
+            false,
+            Ok(()),
+            Ok(()),
+            false,
+            None,
+            Some("0.6.1"),
+            |args, elev| {
+                assert_eq!(args, &["install", "--proxy"]);
+                assert!(!elev);
+                SidecarOutcome::Ok(String::new())
+            },
+        );
+        assert!(repair_fresh.ok);
+
+        // Repair when installed binary is missing/corrupted (`installed_version == None`) is allowed.
+        let repair_corrupt = repair_background_service_with(
+            ServiceState::Stopped,
+            None,
+            EngineMode::Tun,
+            true,
+            Ok(()),
+            Ok(()),
+            false,
+            None,
+            Some("0.6.1"),
+            |args, elev| {
+                assert_eq!(args, &["install", "--upgrade"]);
+                assert!(elev);
+                SidecarOutcome::Ok(String::new())
+            },
+        );
+        assert!(repair_corrupt.ok);
+
+        // Repair with explicit engine passes `install --upgrade --proxy`.
+        let repair_explicit = repair_background_service_with(
+            ServiceState::Running,
+            Some(EngineMode::Proxy),
+            EngineMode::Proxy,
+            true,
+            Ok(()),
+            Ok(()),
+            true,
+            Some("0.6.1"),
+            Some("0.6.1"),
+            |args, elev| {
+                assert_eq!(args, &["install", "--upgrade", "--proxy"]);
+                assert!(elev);
+                SidecarOutcome::Ok(String::new())
+            },
+        );
+        assert!(repair_explicit.ok);
+
+        // Repair blocks downgrade when installed > bundled.
+        let repair_downgrade = repair_background_service_with(
+            ServiceState::Running,
+            None,
+            EngineMode::Tun,
+            true,
+            Ok(()),
+            Ok(()),
+            true,
+            Some("0.7.0"),
+            Some("0.6.1"),
+            |_, _| unreachable!("must not downgrade during repair"),
+        );
+        assert!(!repair_downgrade.ok);
+        assert_eq!(
+            repair_downgrade.code,
+            Some(ActionErrorCodeDto::DowngradeBlocked)
+        );
     }
 }

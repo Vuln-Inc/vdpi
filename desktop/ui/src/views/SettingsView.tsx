@@ -35,8 +35,10 @@ import type {
   ActionResult,
   DesktopSettingsPayload,
   DesktopStatusSnapshot,
+  EngineMode,
   GuiPreferences,
   LanguagePreference,
+  NavTab,
   ServiceState,
   ThemePreference,
   UpdateCheckPayload,
@@ -45,10 +47,15 @@ import type {
 export interface SettingsViewProps {
   status: DesktopStatusSnapshot | null;
   settings: DesktopSettingsPayload | null;
+  busyAction?: string | null;
   onPreferencesPreview?: (prefs: GuiPreferences) => void;
   onPreferencesChanged: (prefs: GuiPreferences) => void | Promise<void>;
   onRefreshSettings?: () => void | Promise<unknown>;
   onServiceChanged: () => void | Promise<void>;
+  onInstallService?: (engine?: EngineMode) => void | Promise<void>;
+  onUpgradeService?: () => void | Promise<void>;
+  onUninstallService?: () => void | Promise<void>;
+  onNavigate?: (tab: NavTab) => void;
   onPushToast: (tone: ToastTone, message: string) => void;
 }
 
@@ -511,10 +518,15 @@ function formatServiceState(
 function SettingsViewComponent({
   status,
   settings,
+  busyAction = null,
   onPreferencesPreview,
   onPreferencesChanged,
   onRefreshSettings,
   onServiceChanged,
+  onInstallService,
+  onUpgradeService,
+  onUninstallService,
+  onNavigate,
   onPushToast,
 }: SettingsViewProps) {
   const { lang } = useLang();
@@ -564,7 +576,7 @@ function SettingsViewComponent({
   const [savingPrefs, setSavingPrefs] = useState(false);
 
   const [serviceBusy, setServiceBusy] = useState<
-    "install" | "uninstall" | null
+    "install" | "upgrade" | "uninstall" | null
   >(null);
   const [confirmUninstallOpen, setConfirmUninstallOpen] = useState(false);
 
@@ -611,6 +623,40 @@ function SettingsViewComponent({
 
   const serviceState = status?.serviceState;
   const serviceInfo = formatServiceState(serviceState, lang);
+  const configuredEngine: EngineMode =
+    status?.configuredEngine ?? settings?.engine ?? "tun";
+  const wintunMissing = Boolean(
+    status?.platform === "windows" &&
+      status.wintun.required &&
+      !status.wintun.ready,
+  );
+  const installBlockedByWintun = wintunMissing && configuredEngine === "tun";
+  const normalizedBusy = busyAction?.trim().toLowerCase() ?? null;
+  const isCentralBusy = normalizedBusy !== null;
+  const isInstalling =
+    serviceBusy === "install" ||
+    normalizedBusy === "install-service" ||
+    status?.pendingOperation === "installing";
+  const isUpgrading =
+    serviceBusy === "upgrade" ||
+    normalizedBusy === "upgrade-service" ||
+    status?.pendingOperation === "upgrading";
+  const isUninstalling =
+    serviceBusy === "uninstall" ||
+    normalizedBusy === "uninstall-service" ||
+    status?.pendingOperation === "uninstalling";
+  const anyServiceBusy =
+    serviceBusy !== null ||
+    isCentralBusy ||
+    isInstalling ||
+    isUpgrading ||
+    isUninstalling;
+  const showUpgradeAction = Boolean(
+    onUpgradeService &&
+      status &&
+      serviceState !== "not_installed" &&
+      status.cliVersionRelation === "upgrade_available",
+  );
   const isUnixSystemServiceConfig =
     (isMac || isLinux) &&
     (serviceState === "running" ||
@@ -712,9 +758,22 @@ function SettingsViewComponent({
   };
 
   const handleInstallService = async () => {
-    if (serviceBusyRef.current) return;
+    if (serviceBusyRef.current || anyServiceBusy || installBlockedByWintun) {
+      return;
+    }
     serviceBusyRef.current = true;
     setServiceBusy("install");
+    if (onInstallService) {
+      try {
+        await onInstallService(configuredEngine);
+      } finally {
+        serviceBusyRef.current = false;
+        if (mountedRef.current) {
+          setServiceBusy(null);
+        }
+      }
+      return;
+    }
     try {
       const response: unknown = await installService();
       if (!mountedRef.current) return;
@@ -759,10 +818,38 @@ function SettingsViewComponent({
     }
   };
 
+  const handleUpgradeService = async () => {
+    if (serviceBusyRef.current || anyServiceBusy || !onUpgradeService) return;
+    serviceBusyRef.current = true;
+    setServiceBusy("upgrade");
+    try {
+      await onUpgradeService();
+    } finally {
+      serviceBusyRef.current = false;
+      if (mountedRef.current) {
+        setServiceBusy(null);
+      }
+    }
+  };
+
   const handleConfirmUninstall = async () => {
-    if (serviceBusyRef.current) return;
+    if (serviceBusyRef.current || anyServiceBusy) return;
     serviceBusyRef.current = true;
     setServiceBusy("uninstall");
+    if (onUninstallService) {
+      try {
+        await onUninstallService();
+        if (mountedRef.current) {
+          setConfirmUninstallOpen(false);
+        }
+      } finally {
+        serviceBusyRef.current = false;
+        if (mountedRef.current) {
+          setServiceBusy(null);
+        }
+      }
+      return;
+    }
     try {
       const response: unknown = await uninstallService();
       if (!mountedRef.current) return;
@@ -1159,22 +1246,61 @@ function SettingsViewComponent({
               </p>
             </div>
 
-            <div className="settings-row__control">
+            <div className="settings-row__control settings-actions-group">
+              {onNavigate ? (
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  disabled={anyServiceBusy}
+                  onClick={() => onNavigate("installation")}
+                >
+                  <span>{tSettings(lang, "btnOpenInstallation")}</span>
+                </button>
+              ) : null}
+              {showUpgradeAction ? (
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  disabled={
+                    !status ||
+                    anyServiceBusy ||
+                    status.canInstallFromBundle === false
+                  }
+                  aria-busy={isUpgrading}
+                  onClick={() => {
+                    void handleUpgradeService();
+                  }}
+                >
+                  {isUpgrading ? (
+                    <span className="settings-spinner" aria-hidden="true" />
+                  ) : null}
+                  <span>
+                    {isUpgrading
+                      ? tSettings(lang, "btnUpdatingEngine")
+                      : tSettings(lang, "btnUpdateEngine")}
+                  </span>
+                </button>
+              ) : null}
               {serviceState === "not_installed" ? (
                 <button
                   type="button"
                   className="btn btn-primary"
-                  disabled={!status || serviceBusy !== null}
-                  aria-busy={serviceBusy === "install"}
+                  disabled={
+                    !status ||
+                    anyServiceBusy ||
+                    installBlockedByWintun ||
+                    status.canInstallFromBundle === false
+                  }
+                  aria-busy={isInstalling}
                   onClick={() => {
                     void handleInstallService();
                   }}
                 >
-                  {serviceBusy === "install" ? (
+                  {isInstalling ? (
                     <span className="settings-spinner" aria-hidden="true" />
                   ) : null}
                   <span>
-                    {serviceBusy === "install"
+                    {isInstalling
                       ? tSettings(lang, "btnInstalling")
                       : tSettings(lang, "btnInstallService")}
                   </span>
@@ -1183,15 +1309,15 @@ function SettingsViewComponent({
                 <button
                   type="button"
                   className="btn btn-danger"
-                  disabled={!status || serviceBusy !== null}
-                  aria-busy={serviceBusy === "uninstall"}
+                  disabled={!status || anyServiceBusy}
+                  aria-busy={isUninstalling}
                   onClick={() => setConfirmUninstallOpen(true)}
                 >
-                  {serviceBusy === "uninstall" ? (
+                  {isUninstalling ? (
                     <span className="settings-spinner" aria-hidden="true" />
                   ) : null}
                   <span>
-                    {serviceBusy === "uninstall"
+                    {isUninstalling
                       ? tSettings(lang, "btnUninstalling")
                       : tSettings(lang, "btnUninstallService")}
                   </span>
@@ -1200,6 +1326,11 @@ function SettingsViewComponent({
             </div>
           </div>
         </div>
+        {serviceState === "not_installed" && installBlockedByWintun ? (
+          <p className="settings-note">
+            {tSettings(lang, "serviceWintunMissingNote")}
+          </p>
+        ) : null}
       </section>
 
       {/* 3. Appearance */}
@@ -1532,18 +1663,18 @@ function SettingsViewComponent({
         title={tSettings(lang, "uninstallTitle")}
         description={tSettings(lang, "uninstallDesc")}
         confirmLabel={
-          serviceBusy === "uninstall"
+          isUninstalling
             ? tSettings(lang, "btnUninstalling")
             : tSettings(lang, "btnUninstallService")
         }
         cancelLabel={tSettings(lang, "cancel")}
         danger
-        busy={serviceBusy === "uninstall"}
+        busy={isUninstalling}
         onConfirm={() => {
           void handleConfirmUninstall();
         }}
         onCancel={() => {
-          if (serviceBusy !== "uninstall") {
+          if (!isUninstalling) {
             setConfirmUninstallOpen(false);
           }
         }}
@@ -1558,10 +1689,15 @@ function areSettingsPropsEqual(
 ): boolean {
   if (
     prev.settings !== next.settings ||
+    prev.busyAction !== next.busyAction ||
     prev.onPreferencesPreview !== next.onPreferencesPreview ||
     prev.onPreferencesChanged !== next.onPreferencesChanged ||
     prev.onRefreshSettings !== next.onRefreshSettings ||
     prev.onServiceChanged !== next.onServiceChanged ||
+    prev.onInstallService !== next.onInstallService ||
+    prev.onUpgradeService !== next.onUpgradeService ||
+    prev.onUninstallService !== next.onUninstallService ||
+    prev.onNavigate !== next.onNavigate ||
     prev.onPushToast !== next.onPushToast
   ) {
     return false;
@@ -1580,8 +1716,15 @@ function areSettingsPropsEqual(
     prevStatus.platform === nextStatus.platform &&
     prevStatus.traySupported === nextStatus.traySupported &&
     prevStatus.serviceState === nextStatus.serviceState &&
+    prevStatus.configuredEngine === nextStatus.configuredEngine &&
     prevStatus.appVersion === nextStatus.appVersion &&
     prevStatus.installedVersion === nextStatus.installedVersion &&
+    prevStatus.bundledEngineVersion === nextStatus.bundledEngineVersion &&
+    prevStatus.cliVersionRelation === nextStatus.cliVersionRelation &&
+    prevStatus.canInstallFromBundle === nextStatus.canInstallFromBundle &&
+    prevStatus.pendingOperation === nextStatus.pendingOperation &&
+    prevStatus.wintun.required === nextStatus.wintun.required &&
+    prevStatus.wintun.ready === nextStatus.wintun.ready &&
     prevStatus.live?.version === nextStatus.live?.version &&
     prevStatus.configPath === nextStatus.configPath &&
     prevStatus.logsDir === nextStatus.logsDir

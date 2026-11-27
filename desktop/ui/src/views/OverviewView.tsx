@@ -35,7 +35,8 @@ export interface OverviewViewProps {
   busyAction: string | null;
   onToggleProtection: (connect?: boolean) => void | Promise<void>;
   onSwitchEngine: (engine: EngineMode) => void | Promise<void>;
-  onInstallService?: () => void | Promise<void>;
+  onInstallService?: (engine?: EngineMode) => void | Promise<void>;
+  onUpgradeService?: () => void | Promise<void>;
   onOpenAppFolder?: () => void | Promise<void>;
   onRefreshStatus?: () =>
     | DesktopStatusSnapshot
@@ -103,6 +104,7 @@ export function OverviewView({
   onToggleProtection,
   onSwitchEngine,
   onInstallService,
+  onUpgradeService,
   onOpenAppFolder,
   onRefreshStatus,
   onPushToast,
@@ -129,6 +131,9 @@ export function OverviewView({
     string | null
   >(null);
   const [wintunRecheckDoneSeq, setWintunRecheckDoneSeq] = useState(0);
+  const [dismissedUpgradeKey, setDismissedUpgradeKey] = useState<string | null>(
+    null,
+  );
   const copyTimerRef = useRef<number | null>(null);
   const wintunFeedbackTimerRef = useRef<number | null>(null);
   const mountedRef = useRef(true);
@@ -181,7 +186,12 @@ export function OverviewView({
     (normalizedBusy !== null && normalizedBusy.startsWith("switch-engine"));
   const isConnecting = normalizedBusy === "connecting";
   const isPausing = normalizedBusy === "pausing";
-  const isInstallingService = normalizedBusy === "install-service";
+  const isInstallingService =
+    normalizedBusy === "install-service" ||
+    status?.pendingOperation === "installing";
+  const isUpgradingService =
+    normalizedBusy === "upgrade-service" ||
+    status?.pendingOperation === "upgrading";
   const isPrimaryBusy = isAnyBusy && !isSwitchingEngine;
 
   useEffect(() => {
@@ -443,15 +453,24 @@ export function OverviewView({
     if (primaryDisabled) return;
     if (isNotInstalled) {
       if (onInstallService) {
-        void onInstallService();
+        void onInstallService(activeEngine);
       } else {
-        onNavigate("settings");
+        onNavigate("installation");
       }
       return;
     }
     const shouldConnect = !(isRunning || isStarting) || isYielded;
     pendingToggleIntentRef.current = shouldConnect ? "connecting" : "pausing";
     void onToggleProtection(shouldConnect);
+  };
+
+  const handleUpgradeService = () => {
+    if (isAnyBusy || isUpgradingService) return;
+    if (onUpgradeService) {
+      void onUpgradeService();
+    } else {
+      onNavigate("installation");
+    }
   };
 
   const handleEngineChange = (next: EngineMode) => {
@@ -616,6 +635,25 @@ export function OverviewView({
       })
     : tOverview(lang, "wintunDefaultDesc");
 
+  const installedVersionTag = formatVersion(
+    status?.installedVersion ?? live?.version,
+  );
+  const bundledVersionTag = formatVersion(status?.bundledEngineVersion);
+  const upgradeVersionKey = `${status?.installedVersion ?? ""}=>${status?.bundledEngineVersion ?? ""}`;
+  const showUpgradeBanner = Boolean(
+    status !== null &&
+      !isNotInstalled &&
+      status.cliVersionRelation === "upgrade_available" &&
+      dismissedUpgradeKey !== upgradeVersionKey,
+  );
+  const upgradeBannerDesc =
+    bundledVersionTag && installedVersionTag
+      ? tOverview(lang, "upgradeAvailableDescVersions", {
+          bundled: bundledVersionTag,
+          installed: installedVersionTag,
+        })
+      : tOverview(lang, "upgradeAvailableDesc");
+
   const engineHintText = isSwitchingEngine
     ? switchTargetEngine
       ? tOverview(lang, "engineSwitchingTo", {
@@ -757,8 +795,43 @@ export function OverviewView({
           tone="info"
           title={tOverview(lang, "setupRequiredTitle")}
           description={tOverview(lang, "setupRequiredDesc")}
-          actionLabel={tOverview(lang, "btnOpenSettings")}
-          onAction={() => onNavigate("settings")}
+          actionLabel={tOverview(lang, "btnOpenInstallation")}
+          onAction={() => onNavigate("installation")}
+        />
+      )}
+
+      {showUpgradeBanner && (
+        <InlineBanner
+          tone="info"
+          title={tOverview(lang, "upgradeAvailableTitle")}
+          description={upgradeBannerDesc}
+          action={
+            <div className="banner-actions">
+              <button
+                type="button"
+                className="inline-banner__action"
+                disabled={
+                  isAnyBusy ||
+                  isUpgradingService ||
+                  status?.canInstallFromBundle === false
+                }
+                aria-busy={isUpgradingService || undefined}
+                onClick={handleUpgradeService}
+              >
+                {isUpgradingService
+                  ? tOverview(lang, "btnUpdating")
+                  : tOverview(lang, "btnUpdateEngine")}
+              </button>
+              <button
+                type="button"
+                className="inline-banner__action"
+                disabled={isUpgradingService}
+                onClick={() => setDismissedUpgradeKey(upgradeVersionKey)}
+              >
+                {tOverview(lang, "btnLater")}
+              </button>
+            </div>
+          }
         />
       )}
 

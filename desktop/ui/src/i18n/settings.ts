@@ -59,10 +59,15 @@ const en = {
   serviceBinaryPrefix: "Binary:",
   serviceVersionNotInstalled: "Not installed",
   serviceVersionUnknown: "Unknown",
+  btnOpenInstallation: "Open Installation",
+  btnUpdateEngine: "Update Engine",
+  btnUpdatingEngine: "Updating...",
   btnInstalling: "Installing...",
   btnInstallService: "Install Background Service",
   btnUninstalling: "Uninstalling...",
   btnUninstallService: "Uninstall Service",
+  serviceWintunMissingNote:
+    "wintun.dll is required for Full-PC (TUN) mode on Windows. Add wintun.dll or switch to Proxy mode in Installation.",
 
   // Appearance card
   appearanceHeading: "Appearance",
@@ -131,7 +136,8 @@ const en = {
   quitGuiFailed: "Failed to quit GUI.",
 } as const;
 
-type SettingsDict = Record<keyof typeof en, string>;
+export type SettingsStringKey = keyof typeof en;
+type SettingsDict = Record<SettingsStringKey, string>;
 
 const tr: SettingsDict = {
   // Header
@@ -192,10 +198,15 @@ const tr: SettingsDict = {
   serviceBinaryPrefix: "İkili dosya:",
   serviceVersionNotInstalled: "Kurulu değil",
   serviceVersionUnknown: "Bilinmiyor",
+  btnOpenInstallation: "Kuruluma Git",
+  btnUpdateEngine: "Motoru Güncelle",
+  btnUpdatingEngine: "Güncelleniyor...",
   btnInstalling: "Kuruluyor...",
   btnInstallService: "Arka Plan Servisini Kur",
   btnUninstalling: "Kaldırılıyor...",
   btnUninstallService: "Servisi Kaldır",
+  serviceWintunMissingNote:
+    "Windows'ta Tam PC (TUN) modu için wintun.dll gerekir. Kurulum sekmesinden wintun.dll ekleyin veya Proxy moduna geçin.",
 
   // Appearance card
   appearanceHeading: "Görünüm",
@@ -264,4 +275,9 @@ const tr: SettingsDict = {
   quitGuiFailed: "Arayüzden çıkılamadı.",
 };
 
-export const tSettings = createTranslator<SettingsDict>({ en, tr });
+export const SETTINGS_STRINGS: {
+  en: SettingsDict;
+  tr: SettingsDict;
+} = { en, tr };
+
+export const tSettings = createTranslator<SettingsDict>(SETTINGS_STRINGS);

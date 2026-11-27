@@ -82,7 +82,7 @@ Ships as a native Desktop GUI, an interactive Control Center TUI, and zero-root 
 
 ### Desktop App (GUI) - Windows, macOS & Linux
 
-- **Windows (`x86_64`, Windows 10 & 11):** [Installer (`.exe`)](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-windows-x86_64-setup.exe) · [Portable (`.zip`)](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-windows-x86_64-portable.zip)
+- **Windows (`x86_64`, Windows 10 & 11):** [Portable (`.zip`)](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-windows-x86_64-portable.zip)
 - **macOS (Universal, Apple Silicon & Intel):** [DMG (`.dmg`)](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-macos-universal.dmg)
 - **Linux (`x86_64`):** [Debian/Ubuntu (`.deb`)](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.deb) · [AppImage (`.AppImage`)](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.AppImage)
 

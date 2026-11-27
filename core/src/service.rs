@@ -1405,16 +1405,21 @@ fn lookup_unix_user_by_name(name: &str) -> Option<UnixTargetUser> {
 }
 
 /// Resolves the invoking non-root user when running as root under `sudo`, `pkexec`,
-/// or `doas` (`geteuid() == 0`), querying `libc::getpwuid_r` / `libc::getpwnam_r` so
-/// service management and uninstall target the real user's session, home directory,
-/// and `config.toml` instead of `/root` / `gui/0`.
+/// `doas`, or macOS `osascript ... with administrator privileges` (`geteuid() == 0`),
+/// querying `libc::getpwuid_r` / `libc::getpwnam_r` so service management and uninstall
+/// target the real user's session, home directory, and `config.toml` instead of
+/// `/root` / `/var/root` / `gui/0`.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn resolve_sudo_invoking_user() -> Option<UnixTargetUser> {
     if !is_unix_root() {
         return None;
     }
     let fallback_home = std::env::var_os("HOME")
-        .filter(|v| !v.is_empty() && Path::new(v) != Path::new("/root"))
+        .filter(|v| {
+            !v.is_empty()
+                && Path::new(v) != Path::new("/root")
+                && Path::new(v) != Path::new("/var/root")
+        })
         .map(PathBuf::from);
     if let Some(sudo_uid) = parse_nonzero_sudo_uid(std::env::var_os("SUDO_UID").as_deref()) {
         if let Some(user) = lookup_unix_user_by_uid(sudo_uid) {
@@ -1453,7 +1458,7 @@ fn resolve_sudo_invoking_user() -> Option<UnixTargetUser> {
         if let Some(user) = lookup_unix_user_by_uid(pkexec_uid) {
             return Some(user);
         }
-        if let Some(home) = fallback_home {
+        if let Some(home) = fallback_home.clone() {
             return Some(UnixTargetUser {
                 uid: pkexec_uid,
                 gid: pkexec_uid,
@@ -1473,6 +1478,28 @@ fn resolve_sudo_invoking_user() -> Option<UnixTargetUser> {
             if let Some(user) = lookup_unix_user_by_name(trimmed).filter(|u| u.uid != 0) {
                 return Some(user);
             }
+        }
+    }
+    // Fallback for macOS `osascript ... with administrator privileges` (and setuid
+    // elevation paths) where euid == 0 and SUDO_*/PKEXEC_*/DOAS_* are absent while
+    // `getuid()` still identifies the invoking non-root user.
+    // SAFETY: `getuid(2)` is always safe to call and never fails.
+    let ruid = unsafe { libc::getuid() };
+    if ruid != 0 {
+        if let Some(user) = lookup_unix_user_by_uid(ruid) {
+            return Some(user);
+        }
+        if let Some(home) = fallback_home {
+            // SAFETY: `getgid(2)` is always safe to call and never fails.
+            let rgid = unsafe { libc::getgid() };
+            let gid = if rgid != 0 { rgid } else { ruid };
+            return Some(UnixTargetUser {
+                uid: ruid,
+                gid,
+                #[cfg(target_os = "linux")]
+                username: None,
+                home_dir: home,
+            });
         }
     }
     None
@@ -2476,7 +2503,9 @@ pub fn parse_version_from_cli_output(stdout: &str) -> Option<String> {
     })
 }
 
-fn probe_binary_version(path: &Path) -> Option<String> {
+/// Probes a `vdpi` binary at `path` by running `path --version` with a bounded timeout
+/// and stdout cap, returning the normalized semantic version (`X.Y.Z`) if successful.
+pub fn probe_binary_version(path: &Path) -> Option<String> {
     const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
     const POLL_INTERVAL: Duration = Duration::from_millis(25);
     const MAX_PROBE_STDOUT_BYTES: usize = 4 * 1024;
@@ -2868,8 +2897,6 @@ pub fn generate_systemd_unit(bin_path: &Path, cfg: &RuntimeConfig) -> String {
     format!(
         "[Unit]\n\
 Description=vdpi Anti-DPI Local Proxy Engine\n\
-After=network-online.target\n\
-Wants=network-online.target\n\
 \n\
 [Service]\n\
 Type=simple\n\
@@ -3445,6 +3472,37 @@ fn copy_binary_atomically(current_exe: &Path, target_bin: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
+fn is_retryable_windows_rename_error(err: &std::io::Error) -> bool {
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+
+    err.kind() == std::io::ErrorKind::PermissionDenied
+        || matches!(
+            err.raw_os_error(),
+            Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+        )
+}
+
+#[cfg(target_os = "windows")]
+fn rename_with_windows_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    // Up to 8 attempts with short exponential backoff (25ms..200ms) so transient
+    // Windows Defender / antivirus real-time scans never fail install/upgrade.
+    const BACKOFF_MS: [u64; 7] = [25, 40, 60, 90, 120, 160, 200];
+
+    for delay_ms in BACKOFF_MS.into_iter().chain(std::iter::once(0)) {
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(err) if delay_ms > 0 && is_retryable_windows_rename_error(&err) => {
+                std::thread::sleep(Duration::from_millis(delay_ms));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    unreachable!("retry loop always returns on final attempt")
+}
+
+#[cfg(target_os = "windows")]
 struct ReplacedFileBackup {
     target: PathBuf,
     backup: PathBuf,
@@ -3453,7 +3511,7 @@ struct ReplacedFileBackup {
 #[cfg(target_os = "windows")]
 impl ReplacedFileBackup {
     fn commit(self) {
-        let _ = fs::remove_file(&self.backup);
+        let _ = fs::remove_file(self.backup);
     }
 
     fn rollback(self) {
@@ -3461,10 +3519,10 @@ impl ReplacedFileBackup {
             let displaced = self
                 .target
                 .with_extension(format!("failed.{}", std::process::id()));
-            let _ = fs::rename(&self.target, &displaced);
-            let _ = fs::remove_file(&displaced);
+            let _ = rename_with_windows_retry(&self.target, &displaced);
+            let _ = fs::remove_file(displaced);
         }
-        let _ = fs::rename(&self.backup, &self.target);
+        let _ = rename_with_windows_retry(&self.backup, &self.target);
     }
 }
 
@@ -3493,7 +3551,7 @@ fn copy_binary_atomically_with_backup(
     if let Err(err) = fs::copy(current_exe, &tmp_bin)
         .with_context(|| format!("failed to copy {:?} to {:?}", current_exe, tmp_bin))
     {
-        let _ = fs::remove_file(&tmp_bin);
+        let _ = fs::remove_file(tmp_bin);
         return Err(err);
     }
 
@@ -3504,8 +3562,8 @@ fn copy_binary_atomically_with_backup(
         } else {
             preferred
         };
-        if let Err(err) = fs::rename(target_bin, &backup) {
-            let _ = fs::remove_file(&tmp_bin);
+        if let Err(err) = rename_with_windows_retry(target_bin, &backup) {
+            let _ = fs::remove_file(tmp_bin);
             return Err(err).with_context(|| {
                 format!(
                     "failed to move existing binary {} aside to {}",
@@ -3519,10 +3577,10 @@ fn copy_binary_atomically_with_backup(
         None
     };
 
-    if let Err(err) = fs::rename(&tmp_bin, target_bin) {
+    if let Err(err) = rename_with_windows_retry(&tmp_bin, target_bin) {
         let _ = fs::remove_file(tmp_bin);
         if let Some(backup) = backup_path {
-            let _ = fs::rename(backup, target_bin);
+            let _ = rename_with_windows_retry(&backup, target_bin);
         }
         return Err(err)
             .with_context(|| format!("failed to install new binary to {}", target_bin.display()));
@@ -3629,6 +3687,7 @@ fn copy_verified_wintun_to_bin_dir_with_backup(
     crate::platform::windows_tun::verify_wintun_dll_sha256(src_wintun, expected_sha256)?;
 
     let target_wintun = bin_dir.join("wintun.dll");
+    win_fs_hardening::reject_reparse_point(&target_wintun)?;
     let same_file = match (
         fs::canonicalize(src_wintun),
         fs::canonicalize(&target_wintun),
@@ -3636,8 +3695,13 @@ fn copy_verified_wintun_to_bin_dir_with_backup(
         (Ok(a), Ok(b)) => a == b,
         _ => src_wintun == target_wintun,
     };
+    let already_verified = !same_file
+        && target_wintun.is_file()
+        && crate::platform::windows_tun::verify_wintun_dll_sha256(&target_wintun, expected_sha256)
+            .is_ok();
+    let skip_copy = same_file || already_verified;
 
-    let retained_backup = if !same_file {
+    let retained_backup = if !skip_copy {
         let pid = std::process::id();
         let staged = bin_dir.join(format!("wintun.tmp.{pid}.dll"));
         if let Err(err) = fs::copy(src_wintun, &staged).with_context(|| {
@@ -3647,7 +3711,7 @@ fn copy_verified_wintun_to_bin_dir_with_backup(
                 staged.display()
             )
         }) {
-            let _ = fs::remove_file(&staged);
+            let _ = fs::remove_file(staged);
             return Err(err);
         }
 
@@ -3658,8 +3722,8 @@ fn copy_verified_wintun_to_bin_dir_with_backup(
             } else {
                 preferred
             };
-            if let Err(err) = fs::rename(&target_wintun, &backup) {
-                let _ = fs::remove_file(&staged);
+            if let Err(err) = rename_with_windows_retry(&target_wintun, &backup) {
+                let _ = fs::remove_file(staged);
                 return Err(err).with_context(|| {
                     format!(
                         "failed to move existing {} aside to {}",
@@ -3673,10 +3737,10 @@ fn copy_verified_wintun_to_bin_dir_with_backup(
             None
         };
 
-        if let Err(err) = fs::rename(&staged, &target_wintun) {
+        if let Err(err) = rename_with_windows_retry(&staged, &target_wintun) {
             let _ = fs::remove_file(staged);
             if let Some(backup) = backup_path {
-                let _ = fs::rename(backup, &target_wintun);
+                let _ = rename_with_windows_retry(&backup, &target_wintun);
             }
             return Err(err).with_context(|| {
                 format!(
@@ -3704,17 +3768,19 @@ fn copy_verified_wintun_to_bin_dir_with_backup(
     if let Some(src_dir) = src_wintun.parent() {
         let license_src = src_dir.join("WINTUN-LICENSE.txt");
         let license_dst = bin_dir.join("WINTUN-LICENSE.txt");
-        if win_fs_hardening::reject_reparse_point(&license_src).is_ok()
+        let need_license = !skip_copy || !license_dst.is_file();
+        if need_license
+            && win_fs_hardening::reject_reparse_point(&license_src).is_ok()
             && license_src.is_file()
             && win_fs_hardening::reject_reparse_point(&license_dst).is_ok()
             && !same_file
             && license_src != license_dst
         {
-            let _ = fs::copy(&license_src, &license_dst);
+            let _ = fs::copy(license_src, license_dst);
         }
     }
 
-    Ok((!same_file, retained_backup))
+    Ok((!skip_copy, retained_backup))
 }
 
 #[cfg(target_os = "windows")]
@@ -3862,6 +3928,8 @@ fn install_service_with_options_impl(
         };
 
         // Stop existing Windows service and any legacy vdpi.exe processes before replacing the binary.
+        let prev_was_running =
+            prev_svc.installed && matches!(prev_svc.state, "RUNNING" | "START_PENDING");
         if upgrade {
             let _ = crate::platform::windows_service::stop_windows_service_for_upgrade()?;
         } else {
@@ -3900,23 +3968,46 @@ fn install_service_with_options_impl(
         let bin_backup = copy_binary_atomically_with_backup(&current_exe, &target_bin, upgrade)?;
         let (wintun_copied, wintun_backup) =
             match copy_verified_sibling_wintun_with_backup(&bin_dir, upgrade) {
-                Ok((false, None)) if verified_tun_wintun.is_some() => {
-                    let src_wintun = verified_tun_wintun.as_deref().unwrap();
-                    match copy_verified_wintun_to_bin_dir_with_backup(src_wintun, &bin_dir, upgrade)
-                    {
-                        Ok(res) => res,
-                        Err(err) => {
-                            if let Some(backup) = bin_backup {
-                                backup.rollback();
+                Ok((false, None)) => {
+                    if let Some(src_wintun) = verified_tun_wintun.as_deref() {
+                        match copy_verified_wintun_to_bin_dir_with_backup(
+                            src_wintun, &bin_dir, upgrade,
+                        ) {
+                            Ok(res) => res,
+                            Err(err) => {
+                                if let Some(backup) = bin_backup {
+                                    backup.rollback();
+                                }
+                                if upgrade && prev_was_running {
+                                    let _ =
+                                        crate::platform::windows_service::start_windows_service();
+                                }
+                                return Err(err);
                             }
-                            return Err(err);
                         }
+                    } else {
+                        (false, None)
                     }
                 }
                 Ok(res) => res,
+                Err(err) if effective_cfg.engine == EngineMode::Proxy => {
+                    tracing::warn!(
+                        error = %err,
+                        "skipping sibling wintun.dll copy during Windows Proxy service install"
+                    );
+                    if verbose {
+                        eprintln!(
+                            "Warning: could not copy sibling wintun.dll ({err}); continuing Proxy service install."
+                        );
+                    }
+                    (false, None)
+                }
                 Err(err) => {
                     if let Some(backup) = bin_backup {
                         backup.rollback();
+                    }
+                    if upgrade && prev_was_running {
+                        let _ = crate::platform::windows_service::start_windows_service();
                     }
                     return Err(err);
                 }
@@ -3928,6 +4019,9 @@ fn install_service_with_options_impl(
             }
             if let Some(backup) = bin_backup {
                 backup.rollback();
+            }
+            if upgrade && prev_was_running {
+                let _ = crate::platform::windows_service::start_windows_service();
             }
             return Err(err);
         }
@@ -4495,6 +4589,112 @@ fn remove_linux_system_unit_if_present() -> Result<bool> {
 }
 
 #[cfg(target_os = "linux")]
+fn write_linux_system_unit_atomically(unit_path: &Path, contents: &str) -> Result<()> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::sync::atomic::Ordering;
+
+    let parent = unit_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .context("failed to determine parent directory for systemd system unit")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+
+    let file_name = unit_path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(SYSTEMD_UNIT_NAME);
+    let pid = std::process::id();
+
+    let mut created = None;
+    for _ in 0..16 {
+        let seq = UNIX_SAFE_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".{file_name}.tmp.{pid}.{seq}"));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .mode(0o644)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                created = Some((candidate, file));
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to create temporary unit file {}", candidate.display())
+                });
+            }
+        }
+    }
+
+    let (tmp_path, mut file) = created.ok_or_else(|| {
+        anyhow::anyhow!(
+            "failed to allocate unique temporary unit file in {}",
+            parent.display()
+        )
+    })?;
+
+    if let Err(err) = file
+        .write_all(contents.as_bytes())
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("failed to write temporary unit file {}", tmp_path.display()))
+    {
+        drop(file);
+        let _ = fs::remove_file(tmp_path);
+        return Err(err);
+    }
+    drop(file);
+
+    let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o644));
+    if let Err(err) = fs::rename(&tmp_path, unit_path) {
+        let _ = fs::remove_file(tmp_path);
+        return Err(err).with_context(|| {
+            format!(
+                "failed to atomically write systemd system unit {}",
+                unit_path.display()
+            )
+        });
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn format_systemctl_error(out: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !stdout.is_empty() {
+        return stdout;
+    }
+    format!("exit status {}", out.status)
+}
+
+#[cfg(target_os = "linux")]
+fn run_systemctl_step(cmd: &mut Command, action_desc: &str, unit_path: &Path) -> Result<()> {
+    let out = cmd.stdin(Stdio::null()).output().with_context(|| {
+        format!(
+            "wrote systemd unit to {}, but failed to execute '{action_desc}'",
+            unit_path.display()
+        )
+    })?;
+    if !out.status.success() {
+        let detail = format_systemctl_error(&out);
+        bail!(
+            "wrote systemd unit to {}, but '{action_desc}' failed: {detail}",
+            unit_path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn install_linux_systemd_system_service(
     target_bin: &Path,
     cfg: &RuntimeConfig,
@@ -4505,50 +4705,26 @@ fn install_linux_systemd_system_service(
     let _ = clear_all_system_proxies();
 
     let unit_path = systemd_system_unit_path();
-    if let Some(parent) = unit_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
     let unit_text = generate_systemd_system_unit(target_bin, cfg);
-    fs::write(&unit_path, unit_text)
-        .with_context(|| format!("failed to write {}", unit_path.display()))?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&unit_path, fs::Permissions::from_mode(0o644));
-    }
+    write_linux_system_unit_atomically(&unit_path, &unit_text)?;
 
-    let _ = Command::new(resolve_systemctl_bin())
-        .args(["daemon-reload"])
-        .stdin(Stdio::null())
-        .output();
-    let enable = Command::new(resolve_systemctl_bin())
-        .args(["enable", SYSTEMD_UNIT_NAME])
-        .stdin(Stdio::null())
-        .output();
-
-    let mut systemd_note = enable
-        .ok()
-        .filter(|out| !out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stderr).trim().to_string());
-
-    if systemd_note.is_none() {
-        let restart = Command::new(resolve_systemctl_bin())
-            .args(["restart", SYSTEMD_UNIT_NAME])
-            .stdin(Stdio::null())
-            .output();
-        if let Some(out) = restart.ok().filter(|out| !out.status.success()) {
-            systemd_note = Some(String::from_utf8_lossy(&out.stderr).trim().to_string());
-        }
-    }
+    run_systemctl_step(
+        Command::new(resolve_systemctl_bin()).args(["daemon-reload"]),
+        "systemctl daemon-reload",
+        &unit_path,
+    )?;
+    run_systemctl_step(
+        Command::new(resolve_systemctl_bin()).args(["enable", SYSTEMD_UNIT_NAME]),
+        &format!("systemctl enable {SYSTEMD_UNIT_NAME}"),
+        &unit_path,
+    )?;
+    run_systemctl_step(
+        Command::new(resolve_systemctl_bin()).args(["restart", SYSTEMD_UNIT_NAME]),
+        &format!("systemctl restart {SYSTEMD_UNIT_NAME}"),
+        &unit_path,
+    )?;
 
     if verbose {
-        if let Some(reason) = systemd_note {
-            println!(
-                "Note: systemd system daemon not active ({reason}). Wrote unit file to {}",
-                unit_path.display()
-            );
-        }
-
         println!("Installed binary : {}", target_bin.display());
         println!("Systemd unit     : {} (TUN)", unit_path.display());
     }
@@ -4589,37 +4765,25 @@ fn install_linux_systemd_service(
     let unit_text = generate_systemd_unit(target_bin, cfg);
     write_unix_user_file_safely(&unit_path, unit_text.as_bytes())?;
 
-    let _ = linux_user_systemctl_command()
-        .args(["daemon-reload"])
-        .output();
-    let enable = linux_user_systemctl_command()
-        .args(["enable", SYSTEMD_UNIT_NAME])
-        .output();
-
-    let mut systemd_note = enable
-        .ok()
-        .filter(|out| !out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stderr).trim().to_string());
-
-    if systemd_note.is_none() {
-        let restart = linux_user_systemctl_command()
-            .args(["restart", SYSTEMD_UNIT_NAME])
-            .output();
-        if let Some(out) = restart.ok().filter(|out| !out.status.success()) {
-            systemd_note = Some(String::from_utf8_lossy(&out.stderr).trim().to_string());
-        }
-    }
+    run_systemctl_step(
+        linux_user_systemctl_command().args(["daemon-reload"]),
+        "systemctl --user daemon-reload",
+        &unit_path,
+    )?;
+    run_systemctl_step(
+        linux_user_systemctl_command().args(["enable", SYSTEMD_UNIT_NAME]),
+        &format!("systemctl --user enable {SYSTEMD_UNIT_NAME}"),
+        &unit_path,
+    )?;
+    run_systemctl_step(
+        linux_user_systemctl_command().args(["restart", SYSTEMD_UNIT_NAME]),
+        &format!("systemctl --user restart {SYSTEMD_UNIT_NAME}"),
+        &unit_path,
+    )?;
 
     let path_updated = ensure_unix_shell_path();
 
     if verbose {
-        if let Some(reason) = systemd_note {
-            println!(
-                "Note: systemd user session not active ({reason}). Wrote unit file to {}",
-                unit_path.display()
-            );
-        }
-
         println!("Installed binary : {}", target_bin.display());
         println!("Systemd unit     : {}", unit_path.display());
         if path_updated {
@@ -5424,17 +5588,8 @@ fn switch_service_engine_impl(
                     let target_bin = PathBuf::from(UNIX_SYSTEM_BIN_PATH);
                     copy_binary_atomically(&current_exe, &target_bin)?;
                     let unit_path = systemd_system_unit_path();
-                    if let Some(parent) = unit_path.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    fs::write(
-                        &unit_path,
-                        generate_systemd_system_unit(&target_bin, &target_cfg),
-                    )?;
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = fs::set_permissions(&unit_path, fs::Permissions::from_mode(0o644));
-                    }
+                    let unit_text = generate_systemd_system_unit(&target_bin, &target_cfg);
+                    write_linux_system_unit_atomically(&unit_path, &unit_text)?;
                     let _ = Command::new(resolve_systemctl_bin())
                         .args(["daemon-reload"])
                         .stdin(Stdio::null())
@@ -5466,14 +5621,12 @@ fn switch_service_engine_impl(
                 EngineMode::Proxy => {
                     let _ = remove_linux_system_unit_if_present()?;
                     let target_bin = installed_binary_path()?;
-                    if !target_bin.is_file() {
-                        copy_binary_atomically(&current_exe, &target_bin)?;
-                        chown_to_sudo_user(&target_bin);
-                        if let Some(bin_dir) = target_bin.parent() {
-                            chown_to_sudo_user(bin_dir);
-                            if let Some(root) = bin_dir.parent() {
-                                chown_to_sudo_user(root);
-                            }
+                    copy_binary_atomically(&current_exe, &target_bin)?;
+                    chown_to_sudo_user(&target_bin);
+                    if let Some(bin_dir) = target_bin.parent() {
+                        chown_to_sudo_user(bin_dir);
+                        if let Some(root) = bin_dir.parent() {
+                            chown_to_sudo_user(root);
                         }
                     }
                     let log_dir = vdpi_root_dir()?.join("logs");
@@ -5764,10 +5917,8 @@ fn set_service_dns_impl(dns_addr: &str, cfg: &RuntimeConfig, verbose: bool) -> R
         if system_exists {
             let target_bin = PathBuf::from(UNIX_SYSTEM_BIN_PATH);
             let unit_path = systemd_system_unit_path();
-            fs::write(
-                &unit_path,
-                generate_systemd_system_unit(&target_bin, &target_cfg),
-            )?;
+            let unit_text = generate_systemd_system_unit(&target_bin, &target_cfg);
+            write_linux_system_unit_atomically(&unit_path, &unit_text)?;
             let _ = Command::new(resolve_systemctl_bin())
                 .args(["daemon-reload"])
                 .stdin(Stdio::null())
@@ -6221,10 +6372,8 @@ pub fn set_service_split_tunnel(
         if system_exists {
             let target_bin = PathBuf::from(UNIX_SYSTEM_BIN_PATH);
             let unit_path = systemd_system_unit_path();
-            fs::write(
-                &unit_path,
-                generate_systemd_system_unit(&target_bin, &target_cfg),
-            )?;
+            let unit_text = generate_systemd_system_unit(&target_bin, &target_cfg);
+            write_linux_system_unit_atomically(&unit_path, &unit_text)?;
             let _ = Command::new(resolve_systemctl_bin())
                 .args(["daemon-reload"])
                 .stdin(Stdio::null())
@@ -7217,9 +7366,7 @@ fn resume_service_impl(verbose: bool) -> Result<()> {
                     generate_systemd_system_unit(Path::new(UNIX_SYSTEM_BIN_PATH), &desired_cfg);
                 if fs::read_to_string(&system_unit).ok().as_deref() != Some(desired_unit.as_str())
                 {
-                    fs::write(&system_unit, &desired_unit)?;
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = fs::set_permissions(&system_unit, fs::Permissions::from_mode(0o644));
+                    write_linux_system_unit_atomically(&system_unit, &desired_unit)?;
                     unit_changed = true;
                 }
             }
@@ -9649,6 +9796,7 @@ mod tests {
         let unit = generate_systemd_unit(Path::new("/home/test/.vdpi/bin/vdpi"), &cfg);
         assert!(unit.contains("ExecStart=\"/home/test/.vdpi/bin/vdpi\" \"--proxy\""));
         assert!(!unit.contains("\"--tun\""));
+        assert!(!unit.contains("network-online.target"));
         assert!(unit.contains("LimitNOFILE=65536"));
 
         let win_bin =
@@ -10794,6 +10942,28 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn retryable_windows_rename_errors_cover_defender_sharing_and_access_locks() {
+        assert!(is_retryable_windows_rename_error(&std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied",
+        )));
+        assert!(is_retryable_windows_rename_error(
+            &std::io::Error::from_raw_os_error(5)
+        ));
+        assert!(is_retryable_windows_rename_error(
+            &std::io::Error::from_raw_os_error(32)
+        ));
+        assert!(is_retryable_windows_rename_error(
+            &std::io::Error::from_raw_os_error(33)
+        ));
+        assert!(!is_retryable_windows_rename_error(&std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "not found",
+        )));
     }
 
     #[cfg(target_os = "windows")]

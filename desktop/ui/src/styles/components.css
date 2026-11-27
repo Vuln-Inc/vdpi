@@ -2089,7 +2089,146 @@
 }
 
 /* --------------------------------------------------------------------------
-   20. Reduced Motion
+   20. Sidebar Bottom-Docked Installation Tab & Update Prompt Dialog
+   -------------------------------------------------------------------------- */
+
+.sidebar-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+.sidebar-nav-primary {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 4px 10px 10px;
+  overflow-y: auto;
+}
+
+.sidebar-nav-bottom {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex-shrink: 0;
+  padding: 8px 10px;
+  border-top: 1px solid var(--border-hairline);
+}
+
+.sidebar-nav-update-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-left: auto;
+  width: 16px;
+  height: 16px;
+  box-shadow: none;
+  filter: none;
+}
+
+.sidebar-nav-update-badge--update {
+  color: var(--accent-fg, var(--accent));
+}
+
+.sidebar-nav-update-badge--setup {
+  color: var(--status-warning-fg, var(--status-amber));
+}
+
+.sidebar-nav-update-icon {
+  width: 15px;
+  height: 15px;
+  display: block;
+}
+
+.update-prompt-dialog {
+  max-width: 460px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3, 12px);
+}
+
+.update-prompt-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2, 8px);
+  flex-wrap: wrap;
+}
+
+.update-prompt-version-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs, 11px);
+  font-variant-numeric: tabular-nums;
+}
+
+.update-prompt-version-arrow {
+  opacity: 0.7;
+}
+
+.update-prompt-desc {
+  margin: 0;
+  font-size: var(--text-base, 13px);
+  line-height: 1.5;
+  color: var(--ink-secondary);
+}
+
+.update-prompt-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md, 8px);
+  border: 1px solid var(--border-hairline);
+  background: var(--bg-surface-subtle);
+}
+
+.update-prompt-notes-title {
+  font-size: var(--text-xs, 11px);
+  font-weight: var(--weight-semibold, 600);
+  letter-spacing: var(--tracking-wide, 0.04em);
+  text-transform: uppercase;
+  color: var(--ink-tertiary);
+}
+
+.update-prompt-notes-list {
+  margin: 0;
+  padding-left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: var(--text-sm, 12px);
+  line-height: 1.45;
+  color: var(--ink-secondary);
+}
+
+.update-prompt-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2, 8px);
+  margin-top: 4px;
+  flex-wrap: wrap;
+}
+
+.update-prompt-actions-right {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2, 8px);
+  margin-left: auto;
+}
+
+/* --------------------------------------------------------------------------
+   21. Reduced Motion
    -------------------------------------------------------------------------- */
 
 @media (prefers-reduced-motion: reduce) {

@@ -10,6 +10,7 @@ import type {
   DesktopSettingsPayload,
   DesktopStatusSnapshot,
   EngineMode,
+  ServiceOperation,
   ServiceState,
   ThroughputPoint,
   VpnCoexistence,
@@ -35,6 +36,7 @@ export interface UseDesktopStatusResult {
   toasts: ToastMessage[];
   refreshStatus: (force?: boolean) => Promise<DesktopStatusSnapshot | null>;
   refreshSettings: () => Promise<DesktopSettingsPayload | null>;
+  applySnapshot: (snapshot: DesktopStatusSnapshot) => boolean;
   pushToast: (kind: ToastKind, text: string, durationMs?: number) => string;
   dismissToast: (id: string) => void;
   pauseToastTimer: (id: string) => void;
@@ -181,19 +183,33 @@ function observeSnapshot(
   };
 }
 
+function isLifecyclePendingOperation(
+  pendingOperation: ServiceOperation | null | undefined,
+): boolean {
+  return (
+    pendingOperation === "installing" ||
+    pendingOperation === "upgrading" ||
+    pendingOperation === "repairing" ||
+    pendingOperation === "uninstalling"
+  );
+}
+
 function deriveActivityDrafts(
   prev: ObservedSnapshotState | null,
   next: ObservedSnapshotState,
+  suppressTransientStates: boolean,
 ): ActivityDraft[] {
   const drafts: ActivityDraft[] = [];
 
   if (prev === null) {
     if (next.connectionState === "not_installed") {
-      drafts.push({
-        level: "warn",
-        category: "system",
-        message: "Service not installed",
-      });
+      if (!suppressTransientStates) {
+        drafts.push({
+          level: "warn",
+          category: "system",
+          message: "Service not installed",
+        });
+      }
     } else if (next.connectionState === "yielded") {
       drafts.push({
         level: "warn",
@@ -207,11 +223,13 @@ function deriveActivityDrafts(
         message: `Protection active (${formatEngineLabel(next.engine)})`,
       });
     } else if (next.connectionState === "stopped") {
-      drafts.push({
-        level: "info",
-        category: "engine",
-        message: "Protection paused",
-      });
+      if (!suppressTransientStates) {
+        drafts.push({
+          level: "info",
+          category: "engine",
+          message: "Protection paused",
+        });
+      }
     }
 
     if (next.vpnConflict) {
@@ -255,17 +273,21 @@ function deriveActivityDrafts(
         message: `Protection active (${formatEngineLabel(next.engine)})`,
       });
     } else if (next.connectionState === "not_installed") {
-      drafts.push({
-        level: "warn",
-        category: "system",
-        message: "Service not installed",
-      });
+      if (!suppressTransientStates) {
+        drafts.push({
+          level: "warn",
+          category: "system",
+          message: "Service not installed",
+        });
+      }
     } else if (next.connectionState === "stopped") {
-      drafts.push({
-        level: "info",
-        category: "engine",
-        message: "Protection paused",
-      });
+      if (!suppressTransientStates) {
+        drafts.push({
+          level: "info",
+          category: "engine",
+          message: "Protection paused",
+        });
+      }
     }
   }
 
@@ -472,8 +494,21 @@ export function useDesktopStatus(): UseDesktopStatusResult {
         });
       }
 
-      const drafts = deriveActivityDrafts(prevObserved, observed);
-      prevObservedRef.current = observed;
+      const suppressTransientStates = isLifecyclePendingOperation(
+        snapshot.pendingOperation,
+      );
+      const drafts = deriveActivityDrafts(
+        prevObserved,
+        observed,
+        suppressTransientStates,
+      );
+      prevObservedRef.current =
+        suppressTransientStates &&
+        prevObserved !== null &&
+        (observed.connectionState === "stopped" ||
+          observed.connectionState === "not_installed")
+          ? { ...observed, connectionState: prevObserved.connectionState }
+          : observed;
 
       if (drafts.length > 0) {
         setActivity((prev) => {
@@ -853,6 +888,7 @@ export function useDesktopStatus(): UseDesktopStatusResult {
     toasts,
     refreshStatus,
     refreshSettings,
+    applySnapshot,
     pushToast,
     dismissToast,
     pauseToastTimer,

@@ -15,6 +15,7 @@ import { useLang, type ResolvedLanguage } from "../i18n/context";
 import { localizePresetLabel, tSplit } from "../i18n/split";
 import { extractExecutableName, foldTurkish } from "../lib/format";
 import {
+  getAppIcons,
   getSplitTunnel,
   pickExecutableFile,
   saveSplitTunnel,
@@ -22,8 +23,11 @@ import {
 import type {
   ActionResult,
   AppCategory,
+  AppIconRequest,
   DiscoveredAppItem,
   EngineMode,
+  NavTab,
+  ServiceState,
   SplitTunnelMode,
   SplitTunnelPayload,
   SplitTunnelPreset,
@@ -34,11 +38,13 @@ import { SplitTunnelPresets } from "./SplitTunnelPresets";
 export interface SplitTunnelViewProps {
   activeEngine?: EngineMode;
   platform?: "windows" | "macos" | "linux";
+  serviceState?: ServiceState;
   busyAction?: string | null;
   onSaved?: () => void | Promise<void>;
   onPushToast?: (tone: ToastTone, message: string) => void;
   onDirtyChange?: (dirty: boolean) => void;
   onSwitchToTun?: () => void | Promise<void>;
+  onNavigate?: (tab: NavTab) => void;
 }
 
 type FilterPillId =
@@ -57,6 +63,14 @@ interface ModeOption {
 }
 
 const MAX_SPLIT_TUNNEL_APPS = 256;
+
+const appIconCache = new Map<string, string>();
+const appIconAttempted = new Map<string, string>();
+
+export function clearAppIconCache(): void {
+  appIconCache.clear();
+  appIconAttempted.clear();
+}
 
 const APP_NAME_COLLATOR = new Intl.Collator(undefined, {
   sensitivity: "base",
@@ -951,11 +965,13 @@ function getErrorMessage(error: unknown, fallback: string): string {
 export const SplitTunnelView = memo(function SplitTunnelView({
   activeEngine,
   platform,
+  serviceState,
   busyAction = null,
   onSaved,
   onPushToast,
   onDirtyChange,
   onSwitchToTun,
+  onNavigate,
 }: SplitTunnelViewProps) {
   const { lang } = useLang();
   const langRef = useRef(lang);
@@ -992,6 +1008,9 @@ export const SplitTunnelView = memo(function SplitTunnelView({
   const [customInput, setCustomInput] = useState("");
   const [customError, setCustomError] = useState<string | null>(null);
   const [sortVersion, setSortVersion] = useState(0);
+  const [iconsByKey, setIconsByKey] = useState<Record<string, string>>(() =>
+    Object.fromEntries(appIconCache.entries()),
+  );
 
   const mountedRef = useRef(true);
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -1015,6 +1034,9 @@ export const SplitTunnelView = memo(function SplitTunnelView({
   const sortOrderVersionRef = useRef<number>(-1);
 
   const isWindows = platform === undefined || platform === "windows";
+  const isNotInstalled = serviceState === "not_installed";
+  const isNotInstalledRef = useRef(isNotInstalled);
+  isNotInstalledRef.current = isNotInstalled;
 
   useEffect(() => {
     ensureStyles();
@@ -1198,6 +1220,91 @@ export const SplitTunnelView = memo(function SplitTunnelView({
     allIndexedApps.byKey,
   );
   appByKeyRef.current = allIndexedApps.byKey;
+
+  useEffect(() => {
+    if (allIndexedApps.items.length === 0) return;
+
+    const missingRequests: AppIconRequest[] = [];
+    const requestSignatures = new Map<string, string>();
+    const cachedAdditions: Record<string, string> = {};
+    let hasCachedAdditions = false;
+
+    for (const { app } of allIndexedApps.items) {
+      const key = app.normalizedKey;
+      if (!key) continue;
+      const cached = appIconCache.get(key);
+      if (cached) {
+        cachedAdditions[key] = cached;
+        hasCachedAdditions = true;
+        continue;
+      }
+      const signature = `${app.path ?? ""}\0${app.exeName}`;
+      if (appIconAttempted.get(key) === signature) {
+        continue;
+      }
+      requestSignatures.set(key, signature);
+      missingRequests.push({
+        key,
+        path: app.path,
+        exeName: app.exeName,
+      });
+    }
+
+    if (hasCachedAdditions) {
+      setIconsByKey((prev) => {
+        let changed = false;
+        for (const [k, v] of Object.entries(cachedAdditions)) {
+          if (prev[k] !== v) {
+            changed = true;
+            break;
+          }
+        }
+        return changed ? { ...prev, ...cachedAdditions } : prev;
+      });
+    }
+
+    if (missingRequests.length === 0 || typeof getAppIcons !== "function") {
+      return;
+    }
+
+    let cancelled = false;
+    void getAppIcons(missingRequests)
+      .then((fetched) => {
+        if (!fetched || typeof fetched !== "object") return;
+        for (const [key, signature] of requestSignatures.entries()) {
+          appIconAttempted.set(key, signature);
+        }
+        const updates: Record<string, string> = {};
+        let hasUpdates = false;
+        for (const [key, uri] of Object.entries(fetched)) {
+          if (typeof uri === "string" && uri.length > 0) {
+            appIconCache.set(key, uri);
+            updates[key] = uri;
+            hasUpdates = true;
+          }
+        }
+        if (cancelled || !mountedRef.current || !hasUpdates) {
+          return;
+        }
+        setIconsByKey((prev) => {
+          let changed = false;
+          for (const [k, v] of Object.entries(updates)) {
+            if (prev[k] !== v) {
+              changed = true;
+              break;
+            }
+          }
+          return changed ? { ...prev, ...updates } : prev;
+        });
+      })
+      .catch(() => {
+        // Icons are progressive enhancement; fall back silently to monograms.
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [allIndexedApps.items]);
 
   const draftSelectedKeys = useMemo(
     () => new Set<string>(draftSelected.keys()),
@@ -1745,7 +1852,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
       const result: ActionResult = await saveSplitTunnel({
         mode: currentMode,
         apps: appsToSave,
-        applyLive: true,
+        applyLive: !isNotInstalledRef.current,
       });
       if (!mountedRef.current) return;
 
@@ -1948,6 +2055,18 @@ export const SplitTunnelView = memo(function SplitTunnelView({
         <h1 className="split-view__title">{tSplit(lang, "title")}</h1>
         <p className="split-view__subtitle">{subtitle}</p>
       </header>
+
+      {isNotInstalled ? (
+        <InlineBanner
+          tone="info"
+          title={tSplit(lang, "notInstalledBannerTitle")}
+          description={tSplit(lang, "notInstalledBannerDesc")}
+          actionLabel={
+            onNavigate ? tSplit(lang, "notInstalledBannerAction") : undefined
+          }
+          onAction={onNavigate ? () => onNavigate("installation") : undefined}
+        />
+      ) : null}
 
       {activeEngine === "proxy" ? (
         <InlineBanner
@@ -2318,6 +2437,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
                   app={app}
                   selected={draftSelectedKeys.has(app.normalizedKey)}
                   mode={draftMode}
+                  iconSrc={iconsByKey[app.normalizedKey]}
                   disabled={saving}
                   onToggle={handleToggleApp}
                 />
@@ -2381,7 +2501,12 @@ export const SplitTunnelView = memo(function SplitTunnelView({
               {saving ? (
                 <span className="split-spinner" aria-hidden="true" />
               ) : null}
-              <span>{tSplit(lang, saving ? "saving" : "saveApply")}</span>
+              <span>
+                {tSplit(
+                  lang,
+                  saving ? "saving" : isNotInstalled ? "saveConfig" : "saveApply",
+                )}
+              </span>
             </button>
           </div>
         </div>

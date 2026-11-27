@@ -271,6 +271,7 @@ struct ElevationEnv {
     sudo_user: Option<String>,
     pkexec_uid: Option<String>,
     doas_user: Option<String>,
+    real_uid: Option<libc::uid_t>,
     home: Option<PathBuf>,
 }
 
@@ -447,21 +448,32 @@ fn resolve_elevated_user_from(
         }
     }
 
+    // 5. Real UID fallback (e.g. macOS `osascript ... with administrator privileges`
+    // where `geteuid() == 0` and SUDO_*/PKEXEC_*/DOAS_* are absent, while `getuid() != 0`).
+    if let Some(uid) = env.real_uid.filter(|&uid| uid != 0) {
+        let entry = lookup_uid(uid);
+        let gid = entry.as_ref().map(|e| e.gid).unwrap_or(libc::gid_t::MAX);
+        let home_dir = entry.map(|e| e.home_dir).or(fallback_home);
+        return Some(ElevatedUser { uid, gid, home_dir });
+    }
+
     None
 }
 
 #[cfg(unix)]
 fn resolve_elevated_user() -> Option<ElevatedUser> {
-    // SAFETY: `geteuid(2)` is always safe to call and never fails.
+    // SAFETY: `geteuid(2)` and `getuid(2)` are always safe to call and never fail.
     if unsafe { libc::geteuid() } != 0 {
         return None;
     }
+    let ruid = unsafe { libc::getuid() };
     let env = ElevationEnv {
         sudo_uid: std::env::var("SUDO_UID").ok(),
         sudo_gid: std::env::var("SUDO_GID").ok(),
         sudo_user: std::env::var("SUDO_USER").ok(),
         pkexec_uid: std::env::var("PKEXEC_UID").ok(),
         doas_user: std::env::var("DOAS_USER").ok(),
+        real_uid: (ruid != 0).then_some(ruid),
         home: std::env::var_os("HOME").map(PathBuf::from),
     };
     resolve_elevated_user_from(&env, lookup_passwd_by_uid, lookup_passwd_by_name)
@@ -2707,11 +2719,26 @@ ProtonVPN
             })
         );
 
+        // Real UID fallback (osascript with administrator privileges)
+        let osascript_env = ElevationEnv {
+            real_uid: Some(501),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_elevated_user_from(&osascript_env, lookup_uid, lookup_name),
+            Some(ElevatedUser {
+                uid: 501,
+                gid: 20,
+                home_dir: Some(PathBuf::from("/Users/alice")),
+            })
+        );
+
         // Reject root / invalid elevation vars
         let root_env = ElevationEnv {
             sudo_uid: Some("0".to_string()),
             pkexec_uid: Some("0".to_string()),
             doas_user: Some("root".to_string()),
+            real_uid: Some(0),
             ..Default::default()
         };
         assert_eq!(

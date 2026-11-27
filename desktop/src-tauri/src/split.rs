@@ -920,6 +920,8 @@ where
                 message: redact_anyhow_error(&err),
                 needs_restart: None,
                 cancelled: None,
+                code: None,
+                snapshot: None,
             };
         }
     };
@@ -956,6 +958,8 @@ where
                     ),
                     needs_restart: None,
                     cancelled: None,
+                    code: None,
+                    snapshot: None,
                 };
             }
         };
@@ -984,6 +988,8 @@ where
                     ),
                     needs_restart: Some(service_running && !restart_service),
                     cancelled: None,
+                    code: None,
+                    snapshot: None,
                 }
             }
             SidecarOutcome::SavedNeedsRestart(msg) => {
@@ -1004,6 +1010,8 @@ where
                     ),
                     needs_restart: Some(true),
                     cancelled: None,
+                    code: None,
+                    snapshot: None,
                 }
             }
             SidecarOutcome::Cancelled => ActionResultDto {
@@ -1011,6 +1019,8 @@ where
                 message: "Administrator authorization was cancelled. Split tunneling settings were not changed.".to_string(),
                 needs_restart: None,
                 cancelled: Some(true),
+                code: None,
+                snapshot: None,
             },
             SidecarOutcome::Err(err) => ActionResultDto {
                 ok: false,
@@ -1020,6 +1030,8 @@ where
                 ),
                 needs_restart: None,
                 cancelled: None,
+                code: None,
+                snapshot: None,
             },
         };
     }
@@ -1030,6 +1042,8 @@ where
             message: append_truncation_notice(message, truncated_count),
             needs_restart: if service_running { Some(true) } else { None },
             cancelled: None,
+            code: None,
+            snapshot: None,
         },
         Err(err) => ActionResultDto {
             ok: false,
@@ -1039,6 +1053,8 @@ where
             ),
             needs_restart: None,
             cancelled: None,
+            code: None,
+            snapshot: None,
         },
     }
 }

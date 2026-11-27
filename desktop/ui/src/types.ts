@@ -3,6 +3,7 @@ export type NavTab =
   | "split"
   | "dns"
   | "diagnostics"
+  | "installation"
   | "settings";
 
 export type EngineMode = "tun" | "proxy";
@@ -13,6 +14,31 @@ export type ThemePreference = "system" | "dark" | "light";
 export type LanguagePreference = "system" | "en" | "tr";
 export type DiagStatus = "idle" | "running" | "pass" | "warn" | "fail";
 export type AppCategory = "popular" | "running" | "installed" | "custom";
+export type CliVersionRelation =
+  | "not_installed"
+  | "up_to_date"
+  | "upgrade_available"
+  | "newer_installed"
+  | "repair_needed"
+  | "bundled_missing"
+  | "unknown";
+export type ServiceOperation =
+  | "installing"
+  | "upgrading"
+  | "repairing"
+  | "uninstalling"
+  | "resuming"
+  | "pausing"
+  | "switching_engine"
+  | "saving_config";
+export type ActionErrorCode =
+  | "busy"
+  | "shutting_down"
+  | "downgrade_blocked"
+  | "version_unknown"
+  | "bundled_cli_missing"
+  | "wintun_missing"
+  | "already_up_to_date";
 
 export interface LiveTelemetry {
   running: boolean;
@@ -66,6 +92,12 @@ export interface DesktopStatusSnapshot {
   logsDir: string;
   traySupported?: boolean;
   configWarning?: string | null;
+  bundledEngineVersion?: string | null;
+  cliVersionRelation?: CliVersionRelation;
+  canInstallFromBundle?: boolean;
+  liveVersionStale?: boolean;
+  pendingOperation?: ServiceOperation | null;
+  runningFromReadonlyDmg?: boolean;
 }
 
 export interface ThroughputPoint {
@@ -152,6 +184,12 @@ export interface SplitTunnelSaveRequest {
   applyLive: boolean;
 }
 
+export interface AppIconRequest {
+  key: string;
+  path: string | null;
+  exeName: string;
+}
+
 export interface DiagnosticCheckItem {
   id: string;
   name: string;
@@ -184,4 +222,6 @@ export interface ActionResult {
   message: string;
   needsRestart?: boolean;
   cancelled?: boolean;
+  code?: ActionErrorCode;
+  snapshot?: DesktopStatusSnapshot;
 }

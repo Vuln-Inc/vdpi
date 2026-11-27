@@ -524,4 +524,74 @@ describe("App", () => {
     expect(within(sidebar).getByText("Menu bar")).toBeInTheDocument();
     expect(within(sidebar).queryByText("Tray on")).not.toBeInTheDocument();
   });
+
+  it("manages Proxy/TUN switching, uninstall, and reinstall from the Installation tab", async () => {
+    render(<App />);
+    await screen.findByRole("heading", { name: "Protected" });
+
+    fireEvent.click(getNavButton("Installation"));
+    expect(
+      await screen.findByRole("heading", { name: "Installation" }),
+    ).toBeInTheDocument();
+
+    const engineGroup = screen.getByRole("group", { name: "Switch engine mode" });
+    const proxyBtn = within(engineGroup).getByRole("button", { name: "Proxy" });
+    const tunBtn = within(engineGroup).getByRole("button", { name: "TUN" });
+    expect(tunBtn).toHaveAttribute("aria-pressed", "true");
+
+    fireEvent.click(proxyBtn);
+    await waitFor(() => {
+      expect(proxyBtn).toHaveAttribute("aria-pressed", "true");
+    });
+
+    // Uninstall -> transitions to first-run setup UI
+    fireEvent.click(screen.getByRole("button", { name: "Uninstall Service" }));
+    const uninstallDialog = await screen.findByRole("alertdialog", {
+      name: "Uninstall vdpi service?",
+    });
+    fireEvent.click(
+      within(uninstallDialog).getByRole("button", { name: "Uninstall Service" }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "Set Up Protection Engine" }),
+    ).toBeInTheDocument();
+
+    // Install Proxy Mode from first-run setup
+    fireEvent.click(screen.getByRole("button", { name: "Install & Protect" }));
+    expect(
+      await screen.findByRole("heading", { name: "Engine & Background Service" }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows the in-app launch update prompt when an older engine is installed and lets user dismiss into the app", async () => {
+    statusSnapshotOverride = {
+      installedVersion: "0.5.6",
+      bundledEngineVersion: "0.6.1",
+      cliVersionRelation: "upgrade_available",
+    };
+
+    render(<App />);
+    const prompt = await screen.findByRole("dialog", {
+      name: /Engine update ready/i,
+    });
+    expect(prompt).toBeInTheDocument();
+
+    fireEvent.click(within(prompt).getByRole("button", { name: "Not Now" }));
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("dialog", { name: /Engine update ready/i }),
+      ).not.toBeInTheDocument();
+    });
+
+    expect(
+      screen.getByRole("heading", { name: "Protected" }),
+    ).toBeInTheDocument();
+    const sidebar = screen.getByRole("complementary", {
+      name: "Application navigation",
+    });
+    expect(
+      within(sidebar).getByRole("button", { name: /Installation/i }),
+    ).toBeInTheDocument();
+  });
 });

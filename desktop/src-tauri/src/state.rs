@@ -7,8 +7,8 @@ use vdpi::service::ServiceState;
 use vdpi_core::config::{EngineMode, SplitTunnelMode, VpnCoexistence};
 
 use crate::models::{
-    DesktopStatusSnapshotDto, EngineModeDto, GuiPreferencesDto, ServiceStateDto,
-    SplitTunnelModeDto, VpnCoexistenceDto, WintunStatusDto,
+    DesktopStatusSnapshotDto, EngineModeDto, GuiPreferencesDto, ServiceOperationDto,
+    ServiceStateDto, SplitTunnelModeDto, VpnCoexistenceDto, WintunStatusDto,
 };
 
 const NANOS_PER_SEC: u128 = 1_000_000_000;
@@ -126,6 +126,9 @@ impl RateTracker {
 #[derive(Debug, Clone)]
 pub struct StaticProbeEntry {
     pub installed_version: Option<String>,
+    pub bundled_engine_version: Option<String>,
+    pub can_install_from_bundle: bool,
+    pub running_from_readonly_dmg: bool,
     pub wintun: WintunStatusDto,
     pub config_path: String,
     pub logs_dir: String,
@@ -247,11 +250,13 @@ struct CachedInstalledVersion {
 #[derive(Debug, Clone)]
 struct CachedWintunVerification {
     metadata: Vec<BinaryFileMetadata>,
+    strict_primary: bool,
     wintun: WintunStatusDto,
 }
 
 /// File-metadata-keyed cache for expensive binary probes (`installed_version`
-/// subprocess spawn and `wintun.dll` SHA-256 verification).
+/// subprocess spawn, bundled sidecar `--version` spawn, and `wintun.dll` SHA-256
+/// verification).
 ///
 /// Entries persist across [`STATIC_PROBE_CACHE_TTL`] expirations while the
 /// inspected file `(path, len, mtime)` metadata stays identical, and are
@@ -259,6 +264,7 @@ struct CachedWintunVerification {
 #[derive(Debug, Default, Clone)]
 pub struct BinaryMetadataCache {
     installed_version: Option<CachedInstalledVersion>,
+    bundled_version: Option<CachedInstalledVersion>,
     wintun: Option<CachedWintunVerification>,
 }
 
@@ -287,17 +293,40 @@ impl BinaryMetadataCache {
         self.installed_version = None;
     }
 
+    /// Returns the cached `bundled_engine_version` result when `metadata` matches
+    /// the stored `(path, len, mtime)` key.
+    pub fn get_bundled_version(&self, metadata: &BinaryFileMetadata) -> Option<Option<String>> {
+        self.bundled_version
+            .as_ref()
+            .filter(|entry| &entry.metadata == metadata)
+            .map(|entry| entry.version.clone())
+    }
+
+    /// Stores a probed `bundled_engine_version` keyed by its binary file metadata.
+    pub fn set_bundled_version(&mut self, metadata: BinaryFileMetadata, version: Option<String>) {
+        self.bundled_version = Some(CachedInstalledVersion { metadata, version });
+    }
+
+    /// Clears the cached `bundled_engine_version` (for example when the bundled
+    /// sidecar is absent).
+    pub fn clear_bundled_version(&mut self) {
+        self.bundled_version = None;
+    }
+
     /// Returns the cached `WintunStatusDto` when the set of existing candidate
-    /// file `(path, len, mtime)` keys matches, updating `required` to reflect
-    /// the currently configured engine mode.
-    pub fn get_wintun(
+    /// file `(path, len, mtime)` keys and `strict_primary` mode match, updating
+    /// `required` to reflect the currently configured engine mode.
+    pub fn get_wintun_with_mode(
         &self,
         metadata: &[BinaryFileMetadata],
         required: bool,
+        strict_primary: bool,
     ) -> Option<WintunStatusDto> {
         self.wintun
             .as_ref()
-            .filter(|entry| entry.metadata.as_slice() == metadata)
+            .filter(|entry| {
+                entry.strict_primary == strict_primary && entry.metadata.as_slice() == metadata
+            })
             .map(|entry| WintunStatusDto {
                 required,
                 ready: entry.wintun.ready,
@@ -305,16 +334,40 @@ impl BinaryMetadataCache {
             })
     }
 
+    /// Returns the cached `WintunStatusDto` for non-strict candidate probing.
+    pub fn get_wintun(
+        &self,
+        metadata: &[BinaryFileMetadata],
+        required: bool,
+    ) -> Option<WintunStatusDto> {
+        self.get_wintun_with_mode(metadata, required, false)
+    }
+
     /// Stores a verified `WintunStatusDto` keyed by the inspected candidate
-    /// files' `(path, len, mtime)` metadata.
+    /// files' `(path, len, mtime)` metadata and `strict_primary` mode.
+    pub fn set_wintun_with_mode(
+        &mut self,
+        metadata: Vec<BinaryFileMetadata>,
+        wintun: WintunStatusDto,
+        strict_primary: bool,
+    ) {
+        self.wintun = Some(CachedWintunVerification {
+            metadata,
+            strict_primary,
+            wintun,
+        });
+    }
+
+    /// Stores a verified `WintunStatusDto` for non-strict candidate probing.
     pub fn set_wintun(&mut self, metadata: Vec<BinaryFileMetadata>, wintun: WintunStatusDto) {
-        self.wintun = Some(CachedWintunVerification { metadata, wintun });
+        self.set_wintun_with_mode(metadata, wintun, false);
     }
 
     /// Clears all cached binary metadata entries so the next probe re-runs
     /// version detection and `wintun.dll` SHA-256 verification.
     pub fn invalidate(&mut self) {
         self.installed_version = None;
+        self.bundled_version = None;
         self.wintun = None;
     }
 }
@@ -341,6 +394,10 @@ pub struct DesktopAppState {
     /// so transient `WindowEvent::Resized` events do not bounce it back into
     /// the tray.
     pub restoring_until: Mutex<Option<Instant>>,
+    /// Tracks the currently executing mutating service operation (if any) so
+    /// the status poller can skip disruptive disk/binary probes during
+    /// install/upgrade/repair/uninstall and surface pending state to the UI.
+    pub active_operation: Mutex<Option<ServiceOperationDto>>,
     pub last_snapshot: RwLock<Option<Arc<DesktopStatusSnapshotDto>>>,
     pub static_probe_cache: Mutex<StaticProbeCache>,
     pub binary_metadata_cache: Mutex<BinaryMetadataCache>,
@@ -363,6 +420,7 @@ impl DesktopAppState {
             preferences: RwLock::new(preferences),
             is_quitting: AtomicBool::new(false),
             restoring_until: Mutex::new(None),
+            active_operation: Mutex::new(None),
             last_snapshot: RwLock::new(None),
             static_probe_cache: Mutex::new(StaticProbeCache::new()),
             binary_metadata_cache: Mutex::new(BinaryMetadataCache::new()),
@@ -395,6 +453,36 @@ impl DesktopAppState {
 
     pub fn set_quitting(&self, quitting: bool) {
         self.is_quitting.store(quitting, Ordering::SeqCst);
+    }
+
+    pub fn active_operation(&self) -> Option<ServiceOperationDto> {
+        *self
+            .active_operation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn set_active_operation(&self, operation: Option<ServiceOperationDto>) {
+        let mut guard = self
+            .active_operation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = operation;
+    }
+
+    /// Returns `true` while an install, upgrade, repair, or uninstall operation
+    /// is actively modifying the installed service binaries so the background
+    /// poller avoids probing or locking binaries mid-swap.
+    pub fn is_mutating_install_operation_active(&self) -> bool {
+        matches!(
+            self.active_operation(),
+            Some(
+                ServiceOperationDto::Installing
+                    | ServiceOperationDto::Upgrading
+                    | ServiceOperationDto::Repairing
+                    | ServiceOperationDto::Uninstalling
+            )
+        )
     }
 
     /// Marks the main window as restoring for `duration` so transient resize
@@ -535,6 +623,36 @@ impl DesktopAppState {
         cache.clear_installed_version();
     }
 
+    pub fn cached_bundled_version(
+        &self,
+        metadata: &BinaryFileMetadata,
+    ) -> Option<Option<String>> {
+        self.binary_metadata_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_bundled_version(metadata)
+    }
+
+    pub fn set_cached_bundled_version(
+        &self,
+        metadata: BinaryFileMetadata,
+        version: Option<String>,
+    ) {
+        let mut cache = self
+            .binary_metadata_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.set_bundled_version(metadata, version);
+    }
+
+    pub fn clear_cached_bundled_version(&self) {
+        let mut cache = self
+            .binary_metadata_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.clear_bundled_version();
+    }
+
     pub fn cached_wintun_status(
         &self,
         metadata: &[BinaryFileMetadata],
@@ -544,6 +662,18 @@ impl DesktopAppState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get_wintun(metadata, required)
+    }
+
+    pub fn cached_wintun_status_with_mode(
+        &self,
+        metadata: &[BinaryFileMetadata],
+        required: bool,
+        strict_primary: bool,
+    ) -> Option<WintunStatusDto> {
+        self.binary_metadata_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_wintun_with_mode(metadata, required, strict_primary)
     }
 
     pub fn set_cached_wintun_status(
@@ -556,6 +686,19 @@ impl DesktopAppState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         cache.set_wintun(metadata, wintun);
+    }
+
+    pub fn set_cached_wintun_status_with_mode(
+        &self,
+        metadata: Vec<BinaryFileMetadata>,
+        wintun: WintunStatusDto,
+        strict_primary: bool,
+    ) {
+        let mut cache = self
+            .binary_metadata_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cache.set_wintun_with_mode(metadata, wintun, strict_primary);
     }
 
     /// Invalidates cached slow probes and binary metadata caches so the next
@@ -709,12 +852,21 @@ mod tests {
             logs_dir: "C:/vdpi/logs".to_string(),
             tray_supported: true,
             config_warning: None,
+            bundled_engine_version: Some("0.6.0".to_string()),
+            cli_version_relation: crate::models::CliVersionRelationDto::UpToDate,
+            can_install_from_bundle: true,
+            live_version_stale: false,
+            pending_operation: None,
+            running_from_readonly_dmg: false,
         }
     }
 
     fn sample_static_probe(cached_at: Instant) -> StaticProbeEntry {
         StaticProbeEntry {
             installed_version: Some("0.6.0".to_string()),
+            bundled_engine_version: Some("0.6.0".to_string()),
+            can_install_from_bundle: true,
+            running_from_readonly_dmg: false,
             wintun: WintunStatusDto {
                 required: true,
                 ready: true,
@@ -1244,5 +1396,51 @@ mod tests {
         assert!(state
             .cached_wintun_status(std::slice::from_ref(&dll_key), true)
             .is_none());
+    }
+
+    #[test]
+    fn active_operation_tracks_mutating_install_lifecycle_and_bundled_version_cache() {
+        let state = DesktopAppState::default();
+        assert_eq!(state.active_operation(), None);
+        assert!(!state.is_mutating_install_operation_active());
+
+        for op in [
+            ServiceOperationDto::Installing,
+            ServiceOperationDto::Upgrading,
+            ServiceOperationDto::Repairing,
+            ServiceOperationDto::Uninstalling,
+        ] {
+            state.set_active_operation(Some(op));
+            assert_eq!(state.active_operation(), Some(op));
+            assert!(state.is_mutating_install_operation_active());
+        }
+
+        for op in [
+            ServiceOperationDto::Resuming,
+            ServiceOperationDto::Pausing,
+            ServiceOperationDto::SwitchingEngine,
+            ServiceOperationDto::SavingConfig,
+        ] {
+            state.set_active_operation(Some(op));
+            assert_eq!(state.active_operation(), Some(op));
+            assert!(!state.is_mutating_install_operation_active());
+        }
+
+        state.set_active_operation(None);
+        assert!(!state.is_mutating_install_operation_active());
+
+        let bundled_key = BinaryFileMetadata {
+            path: PathBuf::from("C:/app/resources/vdpi.exe"),
+            len: 2_048_000,
+            mtime: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+        };
+        assert!(state.cached_bundled_version(&bundled_key).is_none());
+        state.set_cached_bundled_version(bundled_key.clone(), Some("0.6.1".to_string()));
+        assert_eq!(
+            state.cached_bundled_version(&bundled_key),
+            Some(Some("0.6.1".to_string()))
+        );
+        state.invalidate_static_cache();
+        assert!(state.cached_bundled_version(&bundled_key).is_none());
     }
 }

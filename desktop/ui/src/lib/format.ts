@@ -1383,6 +1383,71 @@ export function extractExecutableName(raw: string): string {
   return extractExecutableNameInternal(raw, 0);
 }
 
+const STRICT_SEMVER_RE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+
+/**
+ * Parses a strict 3-part numeric SemVer string (`major.minor.patch`) after
+ * trimming whitespace and stripping an optional leading `vdpi ` and/or `v`/`V`.
+ * Rejects prereleases, build metadata, leading zeros, or non-3-part inputs.
+ */
+export function parseSemverTuple(
+  raw: string | null | undefined,
+): [number, number, number] | null {
+  if (typeof raw !== "string") {
+    return null;
+  }
+  const stripped = raw
+    .trim()
+    .replace(/^vdpi\s+/i, "")
+    .replace(/^[vV]/, "");
+  const match = STRICT_SEMVER_RE.exec(stripped);
+  if (!match) {
+    return null;
+  }
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  const patch = Number(match[3]);
+  if (
+    !Number.isSafeInteger(major) ||
+    !Number.isSafeInteger(minor) ||
+    !Number.isSafeInteger(patch)
+  ) {
+    return null;
+  }
+  return [major, minor, patch];
+}
+
+/**
+ * Compares two strict SemVer strings numerically.
+ * Returns -1 when `a < b`, 0 when `a === b`, 1 when `a > b`, or null if either is invalid.
+ */
+export function compareSemver(
+  a: string | null | undefined,
+  b: string | null | undefined,
+): -1 | 0 | 1 | null {
+  const pa = parseSemverTuple(a);
+  const pb = parseSemverTuple(b);
+  if (!pa || !pb) {
+    return null;
+  }
+  for (let i = 0; i < 3; i += 1) {
+    if (pa[i] < pb[i]) return -1;
+    if (pa[i] > pb[i]) return 1;
+  }
+  return 0;
+}
+
+/**
+ * Returns true strictly when both `installed` and `target` parse as valid
+ * 3-part SemVer versions and `installed < target`.
+ */
+export function isVersionOlder(
+  installed: string | null | undefined,
+  target: string | null | undefined,
+): boolean {
+  return compareSemver(installed, target) === -1;
+}
+
 /**
  * Validates a domain or wildcard domain rule (e.g. "example.com" or "*.example.com").
  * Rejects bare public TLD wildcards (e.g. "*.com", "*.tr") while allowing standard

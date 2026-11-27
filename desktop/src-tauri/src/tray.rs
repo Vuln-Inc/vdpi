@@ -245,7 +245,7 @@ impl TrayVisualState {
 const fn open_label(language: EffectiveLanguage) -> &'static str {
     match language {
         EffectiveLanguage::En => "Open vdpi",
-        EffectiveLanguage::Tr => "vdpi'ı Aç",
+        EffectiveLanguage::Tr => "vdpi'yi Aç",
     }
 }
 
@@ -1676,6 +1676,12 @@ mod tests {
             logs_dir: "C:/vdpi/logs".to_string(),
             tray_supported: true,
             config_warning: None,
+            bundled_engine_version: Some("0.6.0".to_string()),
+            cli_version_relation: crate::models::CliVersionRelationDto::UpToDate,
+            can_install_from_bundle: true,
+            live_version_stale: false,
+            pending_operation: None,
+            running_from_readonly_dmg: false,
         }
     }
 
@@ -1875,7 +1881,7 @@ mod tests {
     #[test]
     fn visual_spec_localizes_turkish_and_english_labels_cleanly() {
         let checking_tr = TrayVisualSpec::from_option(None, EffectiveLanguage::Tr);
-        assert_eq!(checking_tr.show_label, "vdpi'ı Aç");
+        assert_eq!(checking_tr.show_label, "vdpi'yi Aç");
         assert_eq!(checking_tr.status_label, "Durum: Kontrol ediliyor...");
         assert_eq!(checking_tr.toggle_label, "Korumayı Duraklat");
         assert_eq!(checking_tr.quit_label, "vdpi Masaüstünden Çık");
@@ -2111,7 +2117,7 @@ mod tests {
         assert_eq!(sink.status_label_calls, 1);
         assert_eq!(sink.toggle_label_calls, 1);
         assert_eq!(sink.quit_label_calls, 1);
-        assert_eq!(state.last_visual.show_label, Some("vdpi'ı Aç"));
+        assert_eq!(state.last_visual.show_label, Some("vdpi'yi Aç"));
         assert_eq!(
             state.last_visual.status_label,
             Some("Durum: Korunuyor (TUN)")

@@ -14,6 +14,10 @@ import {
   translateCustomDnsError,
   translateDomainRuleError,
 } from "./dns";
+import { INSTALLATION_STRINGS, tInstallation } from "./installation";
+import { OVERVIEW_STRINGS } from "./overview";
+import { SETTINGS_STRINGS } from "./settings";
+import { SHELL_STRINGS } from "./shell";
 import { SPLIT_STRINGS, tSplit } from "./split";
 
 function extractPlaceholders(template: string): string[] {
@@ -151,6 +155,10 @@ describe("i18n dictionary completeness", () => {
     { name: "split", dict: SPLIT_STRINGS },
     { name: "dns", dict: DNS_STRINGS },
     { name: "diagnostics", dict: DIAGNOSTICS_STRINGS },
+    { name: "overview", dict: OVERVIEW_STRINGS },
+    { name: "settings", dict: SETTINGS_STRINGS },
+    { name: "shell", dict: SHELL_STRINGS },
+    { name: "installation", dict: INSTALLATION_STRINGS },
   ] as const;
 
   for (const { name, dict } of dictionaries) {
@@ -161,14 +169,17 @@ describe("i18n dictionary completeness", () => {
       expect(enKeys.length).toBeGreaterThan(0);
 
       for (const key of enKeys) {
-        const enVal = dict.en[key as keyof typeof dict.en];
-        const trVal = dict.tr[key as keyof typeof dict.tr];
+        const enMap = dict.en as Record<string, string>;
+        const trMap = dict.tr as Record<string, string>;
+        const enVal = enMap[key];
+        const trVal = trMap[key];
         expect(typeof enVal).toBe("string");
         expect(typeof trVal).toBe("string");
         expect(enVal.trim().length).toBeGreaterThan(0);
         expect(trVal.trim().length).toBeGreaterThan(0);
         expect(enVal).not.toContain("\u2014");
         expect(trVal).not.toContain("\u2014");
+        expect(trVal).not.toContain("vdpi'ı");
         expect(extractPlaceholders(trVal)).toEqual(extractPlaceholders(enVal));
       }
     });
@@ -186,6 +197,7 @@ describe("i18n dictionary completeness", () => {
     expect(tSplit("tr", "title")).toBe("Bölünmüş Tünel");
     expect(tDns("tr", "title")).toBe("DNS ve Kurallar");
     expect(tDiagnostics("tr", "title")).toBe("Tanılama");
+    expect(tInstallation("tr", "title")).toBe("Kurulum");
   });
 });
 

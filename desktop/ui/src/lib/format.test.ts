@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  compareSemver,
   extractExecutableName,
   foldTurkish,
   formatBytes,
@@ -8,6 +9,8 @@ import {
   formatLatency,
   formatRate,
   isKnownPublicDohIp,
+  isVersionOlder,
+  parseSemverTuple,
   redactDnsPreview,
   scrubUrlsInText,
   validateCustomDnsClient,
@@ -863,5 +866,70 @@ describe("validateDomainRule", () => {
         `${"a".repeat(60)}.${"b".repeat(60)}.${"c".repeat(60)}.${"d".repeat(60)}.example.com`,
       ),
     ).not.toBeNull();
+  });
+});
+
+describe("parseSemverTuple, compareSemver, and isVersionOlder", () => {
+  it("parses strict 3-part versions with optional leading v/V or vdpi prefix", () => {
+    expect(parseSemverTuple("0.6.1")).toEqual([0, 6, 1]);
+    expect(parseSemverTuple("v0.6.1")).toEqual([0, 6, 1]);
+    expect(parseSemverTuple("V0.6.1")).toEqual([0, 6, 1]);
+    expect(parseSemverTuple("vdpi 0.6.1")).toEqual([0, 6, 1]);
+    expect(parseSemverTuple("VDPI v0.10.0")).toEqual([0, 10, 0]);
+    expect(parseSemverTuple("  vdpi   0.5.6  ")).toEqual([0, 5, 6]);
+    expect(parseSemverTuple("0.0.0")).toEqual([0, 0, 0]);
+    expect(parseSemverTuple("12.34.56")).toEqual([12, 34, 56]);
+  });
+
+  it("rejects prereleases, build metadata, leading zeros, and malformed strings", () => {
+    const invalid = [
+      null,
+      undefined,
+      "",
+      "   ",
+      "0.6",
+      "0.6.1.0",
+      "0.6.1-rc.1",
+      "v0.6.1-beta.2",
+      "0.6.1+build.123",
+      "vv0.6.1",
+      "01.2.3",
+      "0.06.1",
+      "0.6.01",
+      "v0.6.x",
+      "unknown",
+      "0.6.1 extra",
+      "-1.0.0",
+    ];
+    for (const raw of invalid) {
+      expect(parseSemverTuple(raw), `expected null for ${String(raw)}`).toBeNull();
+    }
+  });
+
+  it("compares semantic versions numerically across major, minor, and patch", () => {
+    expect(compareSemver("0.10.0", "0.9.9")).toBe(1);
+    expect(compareSemver("0.9.9", "0.10.0")).toBe(-1);
+    expect(compareSemver("0.5.6", "0.6.1")).toBe(-1);
+    expect(compareSemver("0.7.0", "0.6.1")).toBe(1);
+    expect(compareSemver("v0.6.1", "0.6.1")).toBe(0);
+    expect(compareSemver("vdpi 0.6.1", "V0.6.1")).toBe(0);
+    expect(compareSemver("1.0.0", "0.99.99")).toBe(1);
+    expect(compareSemver("0.6.1", "0.6.2")).toBe(-1);
+    expect(compareSemver("0.6.1-rc.1", "0.6.1")).toBeNull();
+    expect(compareSemver("0.6.1", "invalid")).toBeNull();
+    expect(compareSemver(null, "0.6.1")).toBeNull();
+  });
+
+  it("identifies strictly older installed versions safely via isVersionOlder", () => {
+    expect(isVersionOlder("0.5.6", "0.6.1")).toBe(true);
+    expect(isVersionOlder("0.9.9", "0.10.0")).toBe(true);
+    expect(isVersionOlder("v0.5.6", "vdpi 0.6.1")).toBe(true);
+    expect(isVersionOlder("0.6.1", "0.6.1")).toBe(false);
+    expect(isVersionOlder("v0.6.1", "0.6.1")).toBe(false);
+    expect(isVersionOlder("0.7.0", "0.6.1")).toBe(false);
+    expect(isVersionOlder("0.10.0", "0.9.9")).toBe(false);
+    expect(isVersionOlder("0.6.1-rc.1", "0.6.1")).toBe(false);
+    expect(isVersionOlder(null, "0.6.1")).toBe(false);
+    expect(isVersionOlder("0.5.6", undefined)).toBe(false);
   });
 });

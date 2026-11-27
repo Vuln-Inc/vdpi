@@ -1,14 +1,18 @@
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { SplitTunnelView } from "../views/SplitTunnelView";
+import { clearAppIconCache, SplitTunnelView } from "../views/SplitTunnelView";
 import type {
   ActionResult,
+  AppIconRequest,
   DiscoveredAppItem,
   SplitTunnelPayload,
   SplitTunnelPreset,
 } from "../types";
 
 const mockGetSplitTunnel = vi.fn<() => Promise<SplitTunnelPayload>>();
+const mockGetAppIcons = vi.fn<
+  (apps: AppIconRequest[]) => Promise<Record<string, string>>
+>();
 const mockSaveSplitTunnel = vi.fn<
   (req: { mode: string; apps: string[]; applyLive: boolean }) => Promise<ActionResult>
 >();
@@ -16,6 +20,7 @@ const mockPickExecutableFile = vi.fn<() => Promise<string | null>>();
 
 vi.mock("../lib/ipc", () => ({
   getSplitTunnel: () => mockGetSplitTunnel(),
+  getAppIcons: (apps: AppIconRequest[]) => mockGetAppIcons(apps),
   saveSplitTunnel: (req: { mode: string; apps: string[]; applyLive: boolean }) =>
     mockSaveSplitTunnel(req),
   pickExecutableFile: () => mockPickExecutableFile(),
@@ -108,7 +113,9 @@ function makePayload(overrides: Partial<SplitTunnelPayload> = {}): SplitTunnelPa
 describe("SplitTunnelView", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    clearAppIconCache();
     mockGetSplitTunnel.mockResolvedValue(makePayload());
+    mockGetAppIcons.mockResolvedValue({});
     mockSaveSplitTunnel.mockResolvedValue({
       ok: true,
       message: "Split tunneling saved and applied.",
@@ -658,5 +665,68 @@ describe("SplitTunnelView", () => {
     expect(screen.getByRole("alert")).toHaveTextContent(
       /Maximum 256 apps allowed/i,
     );
+  });
+
+  it("renders native app icons when provided and falls back to monograms when omitted or errored", async () => {
+    const discordIcon =
+      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    const brokenChromeIcon = "data:image/png;base64,broken-icon-payload";
+
+    mockGetAppIcons.mockResolvedValue({
+      discord: discordIcon,
+      chrome: brokenChromeIcon,
+    });
+
+    const { unmount } = render(<SplitTunnelView />);
+    await screen.findByText("Discord");
+
+    const getRow = (key: string) =>
+      within(
+        screen.getByRole("list", { name: "Split tunneling applications" }),
+      )
+        .getAllByRole("listitem")
+        .find((row) => row.getAttribute("data-app-key") === key);
+
+    await waitFor(() => {
+      const discordImg = getRow("discord")?.querySelector<HTMLImageElement>(
+        "img.split-app-row__icon",
+      );
+      expect(discordImg).not.toBeNull();
+      expect(discordImg?.getAttribute("src")).toBe(discordIcon);
+    });
+
+    // Apps omitted from getAppIcons response keep their monogram fallback
+    const turkishRow = getRow("sarki-calar");
+    expect(turkishRow?.querySelector("img.split-app-row__icon")).toBeNull();
+    expect(
+      turkishRow?.querySelector(".split-app-row__monogram"),
+    ).toHaveTextContent("İŞ");
+
+    // Broken icon gracefully falls back to the 2-letter monogram on img error
+    const chromeImg = getRow("chrome")?.querySelector<HTMLImageElement>(
+      "img.split-app-row__icon",
+    );
+    expect(chromeImg).not.toBeNull();
+    expect(chromeImg?.getAttribute("src")).toBe(brokenChromeIcon);
+
+    fireEvent.error(chromeImg!);
+    expect(getRow("chrome")?.querySelector("img.split-app-row__icon")).toBeNull();
+    expect(
+      getRow("chrome")?.querySelector(".split-app-row__monogram"),
+    ).toHaveTextContent("GC");
+
+    // Remounting uses the module-level cache without re-fetching icons
+    expect(mockGetAppIcons).toHaveBeenCalledTimes(1);
+    unmount();
+
+    render(<SplitTunnelView />);
+    await screen.findByText("Discord");
+
+    const remountedDiscordImg = getRow("discord")?.querySelector<HTMLImageElement>(
+      "img.split-app-row__icon",
+    );
+    expect(remountedDiscordImg).not.toBeNull();
+    expect(remountedDiscordImg?.getAttribute("src")).toBe(discordIcon);
+    expect(mockGetAppIcons).toHaveBeenCalledTimes(1);
   });
 });

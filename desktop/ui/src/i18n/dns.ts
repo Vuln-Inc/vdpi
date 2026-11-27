@@ -8,6 +8,10 @@ const en = {
     liveActive: "Active",
     liveConfigured: "Configured",
     errorBannerTitle: "Could not save DNS & rule settings",
+    notInstalledBannerTitle: "Service not installed yet",
+    notInstalledBannerDesc:
+      "DNS and domain rules save to config.toml now and take effect once vdpi is installed.",
+    notInstalledBannerAction: "Open Installation",
     vpnConflictTitle: "Full-tunnel VPN detected",
     vpnConflictDesc:
       "Active VPN interface ({iface}) detected. Adjust VPN Coexistence below to choose whether vdpi auto-yields or warns.",
@@ -138,6 +142,7 @@ const en = {
     discard: "Discard",
     saving: "Saving...",
     saveApply: "Save & Apply",
+    saveConfig: "Save to Config",
     editorDefaultPlaceholder: "example.com, *.example.com",
     editorDefaultEmpty: "No domains configured.",
     editorMaxReached:
@@ -164,6 +169,10 @@ const tr: Record<DnsStringKey, string> = {
     liveActive: "Aktif",
     liveConfigured: "Yapılandırıldı",
     errorBannerTitle: "DNS ve kural ayarları kaydedilemedi",
+    notInstalledBannerTitle: "Servis henüz kurulmadı",
+    notInstalledBannerDesc:
+      "DNS ve alan adı kurallarınız şimdi config.toml dosyasına kaydedilir ve vdpi kurulduğunda etkinleşir.",
+    notInstalledBannerAction: "Kuruluma Git",
     vpnConflictTitle: "Tam tünelli VPN algılandı",
     vpnConflictDesc:
       "Etkin VPN arayüzü ({iface}) algılandı. vdpi'nin otomatik duraklatılmasını veya uyarmasını seçmek için aşağıdaki VPN Uyumluluğu ayarını değiştirin.",
@@ -294,6 +303,7 @@ const tr: Record<DnsStringKey, string> = {
     discard: "Vazgeç",
     saving: "Kaydediliyor...",
     saveApply: "Kaydet ve Uygula",
+    saveConfig: "Yapılandırmaya Kaydet",
     editorDefaultPlaceholder: "ornek.com, *.ornek.com",
     editorDefaultEmpty: "Yapılandırılmış alan adı yok.",
     editorMaxReached:

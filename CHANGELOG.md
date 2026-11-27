@@ -9,6 +9,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ## [0.6.1] - 2026-11-27
 
 ### Added
+- **Dedicated `Installation` (`Kurulum`) tab & automatic launch update check in Desktop GUI**:
+  - Bottom-docked `Installation` tab right above the sidebar engine status pill with a right-aligned update indicator icon whenever a newer release or bundled engine upgrade is available.
+  - Non-blocking automatic update check on GUI launch with a clean, dismissible in-app GUI update prompt (no OS messageboxes).
+  - Full installation lifecycle management from the GUI: first-time Proxy vs TUN mode setup, 1-click Proxy/TUN mode switching, in-place bundled engine upgrade with strict semver downgrade protection, Repair / Reinstall, and Uninstall.
+- **Native OS Split Tunnel app icons**:
+  - Extracts and caches native application icons (`.exe` / `.app` / `.desktop`) for installed apps in Split Tunneling with clean monogram fallback.
 - **Full Turkish (`Türkçe`) and English language support across every platform**:
   - **Desktop GUI & System Tray / Menu Bar**: added `System / English / Türkçe` language preference in Settings (`gui-prefs.json`), auto-detecting OS locale and updating all views, dialogs, toasts, and native system tray / menu bar labels live without restarting.
   - **Core Control Center TUI, Live Dashboard & Split Tunnel TUI**: added `language = "auto" | "en" | "tr"` in `config.toml`, `VDPI_LANG` / OS locale auto-detection, and instant `g` hotkey language toggle in the Control Center TUI.
@@ -17,6 +23,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   - **Documentation**: added full Turkish `README.tr.md`, language switchers, and Desktop GUI screenshots/install guides in `README.md`.
 
 ### Changed
+- Hardened Windows, macOS, and Linux service installation and upgrades (fail-closed Windows System `Path` updates, Defender rename retries, non-fatal Proxy-mode `wintun.dll` handling, macOS `osascript` invoking-user resolution, atomic Linux systemd unit writes with real `systemctl` error propagation, and single-flight GUI operation locking).
+- Shipped Windows Desktop GUI exclusively as a clean portable archive (`vdpi-desktop-windows-x86_64-portable.zip`) with `vdpi-desktop.exe`, `vdpi.exe`, and SHA-256-verified `wintun.dll` (removed Windows setup `.exe` installer).
 - Redesigned GitHub Release notes layout into clean `### Changes` bullets and grouped `### Downloads` links (Desktop App GUI, CLI, Mobile, and `SHA256SUMS.txt`).
 
 ## [0.6.0] - 2026-11-27

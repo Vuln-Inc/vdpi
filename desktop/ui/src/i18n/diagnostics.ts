@@ -45,6 +45,10 @@ const en = {
     toastCopied: "Redacted diagnostics report copied to clipboard.",
     toastCopyFailed: "Failed to copy report: {message}",
     runErrorTitle: "Diagnostics failed to run",
+    notInstalledBannerTitle: "Service not installed yet",
+    notInstalledBannerDesc:
+      "Probes test your direct connection until vdpi is installed. Open Installation to set up the background service.",
+    notInstalledBannerAction: "Open Installation",
     retry: "Retry",
     allPassedTitle: "All checks passed ({passed}/{total})",
     allPassedDescWin:
@@ -63,6 +67,9 @@ const en = {
     suggestedActions: "Suggested actions",
     actionStarting: "Starting...",
     actionStartProtection: "Start Protection",
+    actionInstallingService: "Installing...",
+    actionInstallService: "Install Service",
+    actionOpenInstallation: "Open Installation",
     actionGoOverview: "Go to Overview",
     actionSwitchingProxy: "Switching to Proxy...",
     actionSwitchProxy: "Switch to Proxy",
@@ -144,6 +151,10 @@ const tr: Record<DiagnosticsStringKey, string> = {
     toastCopied: "Maskelenmiş tanılama raporu panoya kopyalandı.",
     toastCopyFailed: "Rapor kopyalanamadı: {message}",
     runErrorTitle: "Tanılama çalıştırılamadı",
+    notInstalledBannerTitle: "Servis henüz kurulmadı",
+    notInstalledBannerDesc:
+      "vdpi kurulana kadar denetimler doğrudan bağlantınızı test eder. Arka plan servisini kurmak için Kurulum sekmesini açın.",
+    notInstalledBannerAction: "Kuruluma Git",
     retry: "Tekrar Dene",
     allPassedTitle: "Tüm denetimler geçti ({passed}/{total})",
     allPassedDescWin:
@@ -162,6 +173,9 @@ const tr: Record<DiagnosticsStringKey, string> = {
     suggestedActions: "Önerilen eylemler",
     actionStarting: "Başlatılıyor...",
     actionStartProtection: "Korumayı Başlat",
+    actionInstallingService: "Kuruluyor...",
+    actionInstallService: "Servisi Kur",
+    actionOpenInstallation: "Kuruluma Git",
     actionGoOverview: "Genel Bakışa Git",
     actionSwitchingProxy: "Proxy'ye Geçiliyor...",
     actionSwitchProxy: "Proxy'ye Geç",

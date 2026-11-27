@@ -82,7 +82,7 @@ Yerel Masaüstü Arayüzü (GUI), etkileşimli Kontrol Merkezi TUI ve root gerek
 
 ### Masaüstü Uygulaması (GUI) - Windows, macOS ve Linux
 
-- **Windows (`x86_64`, Windows 10 ve 11):** [Yükleyici (`.exe`)](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-windows-x86_64-setup.exe) · [Taşınabilir (`.zip`)](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-windows-x86_64-portable.zip)
+- **Windows (`x86_64`, Windows 10 ve 11):** [Taşınabilir (`.zip`)](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-windows-x86_64-portable.zip)
 - **macOS (Evrensel, Apple Silicon ve Intel):** [DMG (`.dmg`)](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-macos-universal.dmg)
 - **Linux (`x86_64`):** [Debian/Ubuntu (`.deb`)](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.deb) · [AppImage (`.AppImage`)](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.AppImage)
 

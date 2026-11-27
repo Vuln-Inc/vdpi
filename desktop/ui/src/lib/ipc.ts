@@ -3,6 +3,8 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import type {
   ActionResult,
+  AppIconRequest,
+  CliVersionRelation,
   DesktopSettingsPayload,
   DesktopStatusSnapshot,
   DiagnosticCheckItem,
@@ -12,6 +14,7 @@ import type {
   EngineMode,
   GuiPreferences,
   LiveTelemetry,
+  ServiceOperation,
   ServiceState,
   SplitTunnelMode,
   SplitTunnelPayload,
@@ -21,6 +24,7 @@ import type {
   WintunStatus,
 } from "../types";
 import {
+  compareSemver,
   extractExecutableName,
   isKnownPublicDohIp,
   redactDnsPreview,
@@ -33,8 +37,9 @@ export const STATUS_EVENT = "vdpi://status";
 
 export type AppFolderTarget = "config" | "logs" | "app";
 
-const APP_VERSION = "0.6.0";
+const APP_VERSION = "0.6.1";
 const READ_IPC_TIMEOUT_MS = 15_000;
+const APP_ICONS_TIMEOUT_MS = 10_000;
 const SERVICE_ACTION_TIMEOUT_MS = 180_000;
 const MAX_DOMAIN_ENTRIES = 512;
 const MAX_SPLIT_TUNNEL_APPS = 256;
@@ -430,6 +435,11 @@ interface MockStore {
   snapshotSeq: number;
   serviceState: ServiceState;
   installedVersion: string | null;
+  bundledEngineVersion: string | null;
+  canInstallFromBundle: boolean;
+  liveVersionStale: boolean;
+  pendingOperation: ServiceOperation | null;
+  runningFromReadonlyDmg: boolean;
   vpnConflict: string | null;
   wintun: WintunStatus;
   traySupported: boolean;
@@ -446,6 +456,7 @@ function buildLiveTelemetry(
   settings: DesktopSettingsPayload,
   vpnConflict: string | null,
   previous?: LiveTelemetry | null,
+  version?: string | null,
 ): LiveTelemetry {
   const step = DETERMINISTIC_TELEMETRY_STEPS[0];
   const isTun = settings.engine === "tun";
@@ -458,7 +469,7 @@ function buildLiveTelemetry(
     tunInterface: isTun ? "vdpi-tun0" : null,
     physicalNic: isTun ? "Ethernet" : null,
     vpnConflict,
-    version: APP_VERSION,
+    version: version ?? previous?.version ?? APP_VERSION,
     mode: isTun ? "tun-adaptive" : "proxy-adaptive",
     dohEnabled: settings.effectiveDoh,
     dnsDisplay: settings.dnsDisplay,
@@ -513,6 +524,11 @@ function createInitialMockStore(): MockStore {
     snapshotSeq: 0,
     serviceState: "running",
     installedVersion: APP_VERSION,
+    bundledEngineVersion: APP_VERSION,
+    canInstallFromBundle: true,
+    liveVersionStale: false,
+    pendingOperation: null,
+    runningFromReadonlyDmg: false,
     vpnConflict: null,
     wintun: {
       required: true,
@@ -524,7 +540,7 @@ function createInitialMockStore(): MockStore {
     settings,
     discoveredApps: createDefaultDiscoveredApps(),
     presets: createDefaultPresets(),
-    live: buildLiveTelemetry(settings, null),
+    live: buildLiveTelemetry(settings, null, null, APP_VERSION),
     tickIndex: 0,
     pickerIndex: 0,
   };
@@ -537,6 +553,29 @@ let mockVisibilityListening = false;
 
 function isDocumentHidden(): boolean {
   return typeof document !== "undefined" && Boolean(document.hidden);
+}
+
+function computeMockCliVersionRelation(store: MockStore): CliVersionRelation {
+  if (!store.canInstallFromBundle || !store.bundledEngineVersion) {
+    return "bundled_missing";
+  }
+  if (store.serviceState === "not_installed") {
+    return "not_installed";
+  }
+  if (!store.installedVersion) {
+    return "unknown";
+  }
+  const cmp = compareSemver(store.installedVersion, store.bundledEngineVersion);
+  if (cmp === null) {
+    return "unknown";
+  }
+  if (cmp < 0) {
+    return "upgrade_available";
+  }
+  if (cmp > 0) {
+    return "newer_installed";
+  }
+  return "up_to_date";
 }
 
 function cloneSnapshot(store: MockStore): DesktopStatusSnapshot {
@@ -561,6 +600,12 @@ function cloneSnapshot(store: MockStore): DesktopStatusSnapshot {
     logsDir: MOCK_LOGS_DIR,
     traySupported: store.traySupported,
     configWarning: store.configWarning,
+    bundledEngineVersion: store.bundledEngineVersion,
+    cliVersionRelation: computeMockCliVersionRelation(store),
+    canInstallFromBundle: store.canInstallFromBundle,
+    liveVersionStale: store.liveVersionStale,
+    pendingOperation: store.pendingOperation,
+    runningFromReadonlyDmg: store.runningFromReadonlyDmg,
   };
 }
 
@@ -1064,7 +1109,12 @@ export async function toggleProtection(
   }
 
   mockStore.serviceState = "running";
-  mockStore.live = buildLiveTelemetry(mockStore.settings, mockStore.vpnConflict);
+  mockStore.live = buildLiveTelemetry(
+    mockStore.settings,
+    mockStore.vpnConflict,
+    null,
+    mockStore.installedVersion,
+  );
   emitMockStatus();
   return {
     ok: true,
@@ -1104,6 +1154,7 @@ export async function switchEngine(engine: EngineMode): Promise<ActionResult> {
       mockStore.settings,
       mockStore.vpnConflict,
       mockStore.live,
+      mockStore.installedVersion,
     );
   }
 
@@ -1194,6 +1245,144 @@ export async function getSplitTunnel(): Promise<SplitTunnelPayload> {
     );
   }
   return cloneSplitTunnelPayload(mockStore);
+}
+
+function svgToDataUri(svg: string): string {
+  const compact = svg.trim();
+  if (typeof btoa === "function") {
+    return `data:image/svg+xml;base64,${btoa(compact)}`;
+  }
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(compact)}`;
+}
+
+const MOCK_ICON_SVGS = {
+  discord: svgToDataUri(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28"><rect width="28" height="28" rx="6" fill="#5865F2"/><path d="M20.3 9.2a13 13 0 0 0-3.2-1c-.1.2-.3.6-.4.8a12 12 0 0 0-3.4 0c-.1-.2-.3-.6-.4-.8a13 13 0 0 0-3.2 1C7.7 12.2 7.1 15.1 7.4 18a13 13 0 0 0 3.9 2c.3-.4.6-.9.8-1.4-.5-.2-.9-.4-1.3-.7.1-.1.2-.2.3-.3 2.5 1.1 5.3 1.1 7.8 0 .1.1.2.2.3.3-.4.3-.8.5-1.3.7.2.5.5 1 .8 1.4a13 13 0 0 0 3.9-2c.3-3.3-.5-6.2-2.3-8.8z" fill="#FFFFFF"/><circle cx="11.5" cy="14.7" r="1.45" fill="#5865F2"/><circle cx="16.5" cy="14.7" r="1.45" fill="#5865F2"/></svg>',
+  ),
+  chrome: svgToDataUri(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28"><defs><clipPath id="c"><circle cx="14" cy="14" r="13"/></clipPath></defs><g clip-path="url(#c)"><path d="M0 0h28v8.4H14L9.15 16.8 2.15 4.7 0 0z" fill="#EA4335"/><path d="M14 8.4H28V28H11.85l7-11.2L14 8.4z" fill="#FBBC05"/><path d="M0 0l2.15 4.7 7 12.1h9.7l-7 11.2H0V0z" fill="#34A853"/></g><circle cx="14" cy="14" r="6.2" fill="#FFFFFF"/><circle cx="14" cy="14" r="4.8" fill="#4285F4"/></svg>',
+  ),
+  firefox: svgToDataUri(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28"><circle cx="14" cy="14" r="13" fill="#FF7139"/><path d="M14 1a13 13 0 0 1 11.4 6.7c-2.3-2.1-5.4-2.8-8.1-1.9 2.2 1.2 3.7 3.6 3.7 6.4 0 4-3.2 7.2-7.2 7.2-3.5 0-6.5-2.5-7.1-5.9-.5-2.6.5-5.3 2.5-6.9-1.5.5-2.8 1.5-3.6 2.8A13 13 0 0 1 14 1z" fill="#FFAD00"/><circle cx="14.2" cy="14.6" r="5.6" fill="#4338CA"/></svg>',
+  ),
+  msedge: svgToDataUri(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28"><circle cx="14" cy="14" r="13" fill="#0078D4"/><path d="M26 17.5a13 13 0 0 1-22.4 4.2 9.5 9.5 0 0 0 7.9 2.6c4.2 0 7.7-2.2 9.9-4.5 1.8-1.8 3.2-2.3 4.6-2.3z" fill="#30C5B0"/><path d="M14.2 2.2c5.9 0 10.8 4.1 12 9.6-1.4-2.1-4.1-3.3-7.1-3.3-4.6 0-8.1 3.2-8.1 7.3 0 2.6 1.5 4.9 3.9 6.1-5.4-.2-9.8-4.4-9.8-9.8 0-5.5 4.1-9.9 9.1-9.9z" fill="#38BDF8"/><circle cx="15.2" cy="15.4" r="4" fill="#FFFFFF"/></svg>',
+  ),
+  brave: svgToDataUri(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28"><rect width="28" height="28" rx="6" fill="#FB542B"/><path d="M14 5.2l7 2.8-1.4 9.5L14 22.8l-5.6-5.3L7 8l7-2.8z" fill="#FFFFFF"/><path d="M14 7.8l4.4 1.8-.9 6.6L14 19.6l-3.5-3.4-.9-6.6L14 7.8z" fill="#FB542B"/><path d="M11.6 11.4h4.8l-1.1 2.2h-2.6l-1.1-2.2zm1.3 3.4h2.2l-1.1 2-1.1-2z" fill="#FFFFFF"/></svg>',
+  ),
+  steam: svgToDataUri(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28"><circle cx="14" cy="14" r="13" fill="#1B2838"/><circle cx="18.2" cy="10.8" r="3.9" fill="none" stroke="#FFFFFF" stroke-width="2"/><circle cx="18.2" cy="10.8" r="1.5" fill="#FFFFFF"/><circle cx="10.6" cy="17.8" r="2.7" fill="none" stroke="#FFFFFF" stroke-width="1.8"/><path d="M12.7 16.1l3.6-3.1M1.8 14.3l7.3 3" stroke="#FFFFFF" stroke-width="2.4" stroke-linecap="round"/></svg>',
+  ),
+  spotify: svgToDataUri(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28"><circle cx="14" cy="14" r="13" fill="#1DB954"/><path d="M8 11.2c3.8-1.1 8.6-.9 12.1 1.1M8.8 14.9c3.1-.9 7-.7 9.9.9M9.6 18.4c2.4-.7 5.4-.5 7.7.8" fill="none" stroke="#121212" stroke-width="2.1" stroke-linecap="round"/></svg>',
+  ),
+  valorant: svgToDataUri(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28"><rect width="28" height="28" rx="6" fill="#FF4655"/><path d="M6.5 8.5v5.1l5.6 7h4.2l-9.8-12.1zm15 0l-6.1 7.6h4.2l1.9-2.4V8.5z" fill="#FFFFFF"/></svg>',
+  ),
+  league: svgToDataUri(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28"><rect width="28" height="28" rx="6" fill="#091428"/><rect x="2" y="2" width="24" height="24" rx="4.5" fill="none" stroke="#C89B3C" stroke-width="1.4"/><path d="M10.2 7.2h3.4v10.6h5.6v3H10.2V7.2z" fill="#C89B3C"/></svg>',
+  ),
+  roblox: svgToDataUri(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28"><rect width="28" height="28" rx="6" fill="#1F2227"/><g transform="rotate(16 14 14)"><rect x="7" y="7" width="14" height="14" rx="2" fill="#FFFFFF"/><rect x="12" y="12" width="4" height="4" rx="0.5" fill="#1F2227"/></g></svg>',
+  ),
+  telegram: svgToDataUri(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28"><circle cx="14" cy="14" r="13" fill="#229ED9"/><path d="M20.8 8.8L18.4 20c-.2.8-.7 1-1.3.6l-3.7-2.7-1.8 1.7c-.2.2-.4.4-.8.4l.3-3.8 6.9-6.2c.3-.3-.1-.4-.5-.2l-8.5 5.4-3.7-1.1c-.8-.3-.8-.8.2-1.2l14.4-5.5c.7-.2 1.2.2 1 1.4z" fill="#FFFFFF"/></svg>',
+  ),
+  obs: svgToDataUri(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28"><circle cx="14" cy="14" r="13" fill="#1E222A"/><circle cx="14" cy="10.4" r="3.6" fill="none" stroke="#FFFFFF" stroke-width="2.2"/><circle cx="17.2" cy="15.9" r="3.6" fill="none" stroke="#FFFFFF" stroke-width="2.2"/><circle cx="10.8" cy="15.9" r="3.6" fill="none" stroke="#FFFFFF" stroke-width="2.2"/><circle cx="14" cy="14" r="2.2" fill="#1E222A"/></svg>',
+  ),
+  vscode: svgToDataUri(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28"><rect width="28" height="28" rx="6" fill="#007ACC"/><path d="M18.6 6.2l3.4 1.6v12.4l-3.4 1.6-7.8-6.4-3.3 2.5-1.5-.8v-6.2l1.5-.8 3.3 2.5 7.8-6.4zm0 4.2L13.7 14l4.9 3.6v-7.2z" fill="#FFFFFF"/></svg>',
+  ),
+  vlc: svgToDataUri(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28"><rect width="28" height="28" rx="6" fill="#25282E"/><path d="M12.4 6h3.2l4.4 14.5H8L12.4 6z" fill="#FF8800"/><path d="M11.1 10.4h5.8l.8 2.6h-7.4l.8-2.6zm-1.6 5.2h9l.8 2.6H8.7l.8-2.6z" fill="#FFFFFF"/><rect x="6.5" y="20" width="15" height="2.4" rx="1" fill="#FF8800"/></svg>',
+  ),
+  epic: svgToDataUri(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28"><rect width="28" height="28" rx="6" fill="#202226"/><path d="M8.2 5.8h11.6v12.8L14 22.4l-5.8-3.8V5.8z" fill="none" stroke="#FFFFFF" stroke-width="1.6"/><path d="M11 9.5h6v1.8h-4v1.8h3.4v1.8H13v1.9h4v1.8h-6V9.5z" fill="#FFFFFF"/></svg>',
+  ),
+  qbittorrent: svgToDataUri(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28"><circle cx="14" cy="14" r="13" fill="#2F67BA"/><circle cx="10.8" cy="14.5" r="2.9" fill="none" stroke="#FFFFFF" stroke-width="1.9"/><path d="M13.7 11.6v8.2" stroke="#FFFFFF" stroke-width="1.9" stroke-linecap="round"/><circle cx="18.3" cy="14.5" r="2.9" fill="none" stroke="#FFFFFF" stroke-width="1.9"/><path d="M15.4 8.2v9.2" stroke="#FFFFFF" stroke-width="1.9" stroke-linecap="round"/></svg>',
+  ),
+} as const;
+
+const MOCK_APP_ICON_BY_KEY: Record<string, string> = {
+  discord: MOCK_ICON_SVGS.discord,
+  discordptb: MOCK_ICON_SVGS.discord,
+  discordcanary: MOCK_ICON_SVGS.discord,
+  chrome: MOCK_ICON_SVGS.chrome,
+  chrome_proxy: MOCK_ICON_SVGS.chrome,
+  firefox: MOCK_ICON_SVGS.firefox,
+  msedge: MOCK_ICON_SVGS.msedge,
+  brave: MOCK_ICON_SVGS.brave,
+  steam: MOCK_ICON_SVGS.steam,
+  steamwebhelper: MOCK_ICON_SVGS.steam,
+  gameoverlayui: MOCK_ICON_SVGS.steam,
+  spotify: MOCK_ICON_SVGS.spotify,
+  valorant: MOCK_ICON_SVGS.valorant,
+  "valorant-win64-shipping": MOCK_ICON_SVGS.valorant,
+  riotclientservices: MOCK_ICON_SVGS.valorant,
+  riotclientux: MOCK_ICON_SVGS.valorant,
+  vgc: MOCK_ICON_SVGS.valorant,
+  vgtray: MOCK_ICON_SVGS.valorant,
+  leagueclient: MOCK_ICON_SVGS.league,
+  leagueclientux: MOCK_ICON_SVGS.league,
+  "league of legends": MOCK_ICON_SVGS.league,
+  robloxplayerbeta: MOCK_ICON_SVGS.roblox,
+  robloxplayerlauncher: MOCK_ICON_SVGS.roblox,
+  bloxstrap: MOCK_ICON_SVGS.roblox,
+  telegram: MOCK_ICON_SVGS.telegram,
+  obs64: MOCK_ICON_SVGS.obs,
+  obs32: MOCK_ICON_SVGS.obs,
+  code: MOCK_ICON_SVGS.vscode,
+  vlc: MOCK_ICON_SVGS.vlc,
+  epicgameslauncher: MOCK_ICON_SVGS.epic,
+  qbittorrent: MOCK_ICON_SVGS.qbittorrent,
+};
+
+export async function getAppIcons(
+  apps: AppIconRequest[],
+): Promise<Record<string, string>> {
+  if (!Array.isArray(apps) || apps.length === 0) {
+    return {};
+  }
+
+  if (isTauriRuntime()) {
+    try {
+      const raw = await invokeWithTimeout<Record<string, string>>(
+        "get_app_icons",
+        APP_ICONS_TIMEOUT_MS,
+        { apps },
+      );
+      if (!raw || typeof raw !== "object") {
+        return {};
+      }
+      const sanitized: Record<string, string> = {};
+      for (const [key, value] of Object.entries(raw)) {
+        if (typeof value === "string" && value.length > 0) {
+          sanitized[key] = value;
+        }
+      }
+      return sanitized;
+    } catch {
+      return {};
+    }
+  }
+
+  const icons: Record<string, string> = {};
+  for (const app of apps) {
+    if (!app || typeof app.key !== "string" || !app.key) {
+      continue;
+    }
+    const normalizedKey = normalizeExeKey(app.key);
+    const exeKey = normalizeExeKey(app.exeName || "");
+    const uri =
+      MOCK_APP_ICON_BY_KEY[normalizedKey] ?? MOCK_APP_ICON_BY_KEY[exeKey];
+    if (uri) {
+      icons[app.key] = uri;
+    }
+  }
+  return icons;
 }
 
 export async function saveSplitTunnel(
@@ -1313,29 +1502,224 @@ export async function runDiagnostics(): Promise<DiagnosticsReport> {
   return buildMockDiagnosticsReport(mockStore);
 }
 
-export async function installService(): Promise<ActionResult> {
+export async function installService(
+  engine?: EngineMode,
+): Promise<ActionResult> {
   if (isTauriRuntime()) {
     return invokeWithTimeout<ActionResult>(
       "install_service",
       SERVICE_ACTION_TIMEOUT_MS,
+      engine !== undefined ? { engine } : undefined,
     );
+  }
+
+  if (!mockStore.canInstallFromBundle || !mockStore.bundledEngineVersion) {
+    return {
+      ok: false,
+      code: "bundled_cli_missing",
+      message:
+        "Bundled vdpi engine binary was not found in the application folder.",
+      snapshot: cloneSnapshot(mockStore),
+    };
   }
 
   if (mockStore.serviceState !== "not_installed") {
     return {
       ok: true,
       message: "Background service is already installed.",
+      snapshot: cloneSnapshot(mockStore),
     };
   }
 
+  const targetEngine = engine ?? mockStore.settings.engine;
+  if (targetEngine === "tun" && !mockStore.wintun.ready) {
+    return {
+      ok: false,
+      code: "wintun_missing",
+      message:
+        mockStore.wintun.message ??
+        "wintun.dll is missing beside vdpi.exe. Extract all files or use Proxy mode.",
+      snapshot: cloneSnapshot(mockStore),
+    };
+  }
+
+  mockStore.settings = {
+    ...mockStore.settings,
+    engine: targetEngine,
+  };
+  mockStore.wintun = {
+    ...mockStore.wintun,
+    required: targetEngine === "tun",
+  };
   mockStore.serviceState = "running";
-  mockStore.installedVersion = APP_VERSION;
-  mockStore.live = buildLiveTelemetry(mockStore.settings, mockStore.vpnConflict);
+  mockStore.installedVersion = mockStore.bundledEngineVersion;
+  mockStore.liveVersionStale = false;
+  mockStore.live = buildLiveTelemetry(
+    mockStore.settings,
+    mockStore.vpnConflict,
+    null,
+    mockStore.installedVersion,
+  );
   emitMockStatus();
 
   return {
     ok: true,
     message: "Background service installed and started.",
+    snapshot: cloneSnapshot(mockStore),
+  };
+}
+
+export async function upgradeService(): Promise<ActionResult> {
+  if (isTauriRuntime()) {
+    return invokeWithTimeout<ActionResult>(
+      "upgrade_service",
+      SERVICE_ACTION_TIMEOUT_MS,
+    );
+  }
+
+  if (!mockStore.canInstallFromBundle || !mockStore.bundledEngineVersion) {
+    return {
+      ok: false,
+      code: "bundled_cli_missing",
+      message:
+        "Bundled vdpi engine binary was not found in the application folder.",
+      snapshot: cloneSnapshot(mockStore),
+    };
+  }
+
+  if (mockStore.serviceState === "not_installed") {
+    return {
+      ok: false,
+      message: "Background service is not installed. Install the service first.",
+      snapshot: cloneSnapshot(mockStore),
+    };
+  }
+
+  const cmp = compareSemver(
+    mockStore.installedVersion,
+    mockStore.bundledEngineVersion,
+  );
+  if (cmp === null) {
+    return {
+      ok: false,
+      code: "version_unknown",
+      message:
+        "Installed engine version could not be determined. Use Repair / Reinstall instead.",
+      snapshot: cloneSnapshot(mockStore),
+    };
+  }
+
+  if (cmp > 0) {
+    return {
+      ok: false,
+      code: "downgrade_blocked",
+      message: `Installed engine v${mockStore.installedVersion} is newer than bundled v${mockStore.bundledEngineVersion}. Downgrade blocked.`,
+      snapshot: cloneSnapshot(mockStore),
+    };
+  }
+
+  if (cmp === 0) {
+    return {
+      ok: true,
+      code: "already_up_to_date",
+      message: `Engine is already up to date (v${mockStore.installedVersion}).`,
+      snapshot: cloneSnapshot(mockStore),
+    };
+  }
+
+  mockStore.installedVersion = mockStore.bundledEngineVersion;
+  mockStore.liveVersionStale = false;
+  if (mockStore.serviceState === "running") {
+    mockStore.live = buildLiveTelemetry(
+      mockStore.settings,
+      mockStore.vpnConflict,
+      mockStore.live,
+      mockStore.installedVersion,
+    );
+  }
+  emitMockStatus();
+
+  return {
+    ok: true,
+    message: `Engine updated to v${mockStore.bundledEngineVersion}.`,
+    snapshot: cloneSnapshot(mockStore),
+  };
+}
+
+export async function repairService(
+  engine?: EngineMode,
+): Promise<ActionResult> {
+  if (isTauriRuntime()) {
+    return invokeWithTimeout<ActionResult>(
+      "repair_service",
+      SERVICE_ACTION_TIMEOUT_MS,
+      engine !== undefined ? { engine } : undefined,
+    );
+  }
+
+  if (!mockStore.canInstallFromBundle || !mockStore.bundledEngineVersion) {
+    return {
+      ok: false,
+      code: "bundled_cli_missing",
+      message:
+        "Bundled vdpi engine binary was not found in the application folder.",
+      snapshot: cloneSnapshot(mockStore),
+    };
+  }
+
+  if (
+    mockStore.serviceState !== "not_installed" &&
+    mockStore.installedVersion !== null
+  ) {
+    const cmp = compareSemver(
+      mockStore.installedVersion,
+      mockStore.bundledEngineVersion,
+    );
+    if (cmp !== null && cmp > 0) {
+      return {
+        ok: false,
+        code: "downgrade_blocked",
+        message: `Installed engine v${mockStore.installedVersion} is newer than bundled v${mockStore.bundledEngineVersion}. Downgrade blocked.`,
+        snapshot: cloneSnapshot(mockStore),
+      };
+    }
+  }
+
+  const targetEngine = engine ?? mockStore.settings.engine;
+  if (targetEngine === "tun" && !mockStore.wintun.ready) {
+    return {
+      ok: false,
+      code: "wintun_missing",
+      message:
+        mockStore.wintun.message ??
+        "wintun.dll is missing beside vdpi.exe. Extract all files or use Proxy mode.",
+      snapshot: cloneSnapshot(mockStore),
+    };
+  }
+
+  mockStore.settings = {
+    ...mockStore.settings,
+    engine: targetEngine,
+  };
+  mockStore.wintun = {
+    ...mockStore.wintun,
+    required: targetEngine === "tun",
+  };
+  mockStore.serviceState = "running";
+  mockStore.installedVersion = mockStore.bundledEngineVersion;
+  mockStore.liveVersionStale = false;
+  mockStore.live = buildLiveTelemetry(
+    mockStore.settings,
+    mockStore.vpnConflict,
+    mockStore.live,
+    mockStore.installedVersion,
+  );
+  emitMockStatus();
+
+  return {
+    ok: true,
+    message: `Background service repaired (v${mockStore.bundledEngineVersion}).`,
+    snapshot: cloneSnapshot(mockStore),
   };
 }
 
@@ -1351,17 +1735,20 @@ export async function uninstallService(): Promise<ActionResult> {
     return {
       ok: true,
       message: "Background service is already uninstalled.",
+      snapshot: cloneSnapshot(mockStore),
     };
   }
 
   mockStore.serviceState = "not_installed";
   mockStore.installedVersion = null;
+  mockStore.liveVersionStale = false;
   mockStore.live = null;
   emitMockStatus();
 
   return {
     ok: true,
     message: "Background service uninstalled.",
+    snapshot: cloneSnapshot(mockStore),
   };
 }
 
