@@ -7104,8 +7104,10 @@ fn resume_service_impl(verbose: bool) -> Result<()> {
             let sys_cfg_path = config_file::system_config_path();
             let mut plist_changed = false;
             if let Some(file_cfg) = load_resume_file_config(&sys_cfg_path, true)? {
-                let mut base_cfg = RuntimeConfig::default();
-                base_cfg.engine = EngineMode::Tun;
+                let base_cfg = RuntimeConfig {
+                    engine: EngineMode::Tun,
+                    ..RuntimeConfig::default()
+                };
                 let mut desired_cfg = apply_file_config_to_runtime(&base_cfg, &file_cfg);
                 desired_cfg.engine = EngineMode::Tun;
                 let desired_plist =
@@ -7153,8 +7155,10 @@ fn resume_service_impl(verbose: bool) -> Result<()> {
         let mut plist_changed = false;
         if let Some(file_cfg) = load_resume_file_config(&user_cfg_path, false)? {
             if let Ok(target_bin) = installed_binary_path() {
-                let mut base_cfg = RuntimeConfig::default();
-                base_cfg.engine = EngineMode::Proxy;
+                let base_cfg = RuntimeConfig {
+                    engine: EngineMode::Proxy,
+                    ..RuntimeConfig::default()
+                };
                 let mut desired_cfg = apply_file_config_to_runtime(&base_cfg, &file_cfg);
                 desired_cfg.engine = EngineMode::Proxy;
                 let desired_plist = generate_launch_agent_plist(&target_bin, &desired_cfg);
@@ -7202,8 +7206,10 @@ fn resume_service_impl(verbose: bool) -> Result<()> {
             let sys_cfg_path = config_file::system_config_path();
             let mut unit_changed = false;
             if let Some(file_cfg) = load_resume_file_config(&sys_cfg_path, true)? {
-                let mut base_cfg = RuntimeConfig::default();
-                base_cfg.engine = EngineMode::Tun;
+                let base_cfg = RuntimeConfig {
+                    engine: EngineMode::Tun,
+                    ..RuntimeConfig::default()
+                };
                 let mut desired_cfg = apply_file_config_to_runtime(&base_cfg, &file_cfg);
                 desired_cfg.engine = EngineMode::Tun;
                 let desired_unit =
@@ -7256,8 +7262,10 @@ fn resume_service_impl(verbose: bool) -> Result<()> {
         let mut unit_changed = false;
         if let Some(file_cfg) = load_resume_file_config(&user_cfg_path, false)? {
             if let Ok(target_bin) = installed_binary_path() {
-                let mut base_cfg = RuntimeConfig::default();
-                base_cfg.engine = EngineMode::Proxy;
+                let base_cfg = RuntimeConfig {
+                    engine: EngineMode::Proxy,
+                    ..RuntimeConfig::default()
+                };
                 let mut desired_cfg = apply_file_config_to_runtime(&base_cfg, &file_cfg);
                 desired_cfg.engine = EngineMode::Proxy;
                 let desired_unit = generate_systemd_unit(&target_bin, &desired_cfg);

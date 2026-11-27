@@ -2126,9 +2126,7 @@ pub fn run_vdpi_cli_elevated(args: &[&str], timeout_secs: u64) -> SidecarOutcome
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
             .filter(|dir| {
-                current_exe
-                    .as_deref()
-                    .is_some_and(|exe| current_exe_is_inside_appdir(exe, dir))
+                current_exe_is_inside_appdir(current_exe.as_deref(), Some(dir.as_path()))
             });
         let _staged_guard;
         let exec_bin = if !is_verified_system_cli_candidate(&bin)

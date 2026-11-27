@@ -2997,7 +2997,7 @@ mod tests {
             ..Default::default()
         };
         let sudo_ctx =
-            resolve_sudo_user_context_from(&sudo_user_env, &lookup_uid, &lookup_name).unwrap();
+            resolve_sudo_user_context_from(&sudo_user_env, lookup_uid, lookup_name).unwrap();
         assert_eq!(sudo_ctx.uid, 1000);
         assert_eq!(sudo_ctx.gid, 1000);
         assert_eq!(sudo_ctx.username.as_deref(), Some("alice"));
@@ -3013,7 +3013,7 @@ mod tests {
             ..Default::default()
         };
         let pkexec_ctx =
-            resolve_sudo_user_context_from(&pkexec_env, &lookup_uid, &lookup_name).unwrap();
+            resolve_sudo_user_context_from(&pkexec_env, lookup_uid, lookup_name).unwrap();
         assert_eq!(pkexec_ctx.uid, 1001);
         assert_eq!(pkexec_ctx.gid, 1002);
         assert_eq!(pkexec_ctx.username.as_deref(), Some("bob"));
@@ -3028,7 +3028,7 @@ mod tests {
             ..Default::default()
         };
         let doas_ctx =
-            resolve_sudo_user_context_from(&doas_env, &lookup_uid, &lookup_name).unwrap();
+            resolve_sudo_user_context_from(&doas_env, lookup_uid, lookup_name).unwrap();
         assert_eq!(doas_ctx.uid, 1001);
         assert_eq!(doas_ctx.gid, 1002);
         assert_eq!(doas_ctx.username.as_deref(), Some("bob"));
@@ -3038,7 +3038,7 @@ mod tests {
             doas_user: Some("root".to_string()),
             ..Default::default()
         };
-        assert!(resolve_sudo_user_context_from(&root_doas, &lookup_uid, &lookup_name).is_none());
+        assert!(resolve_sudo_user_context_from(&root_doas, lookup_uid, lookup_name).is_none());
 
         // build_user_command uses absolute path and sets USER, LOGNAME, sanitized PATH, XDG, DBUS
         let cmd = build_user_command(Path::new("/usr/bin/gsettings"), Some(&sudo_ctx));
