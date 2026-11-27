@@ -2,6 +2,7 @@ import {
   memo,
   useEffect,
   useId,
+  useMemo,
   useRef,
   useState,
   type KeyboardEvent,
@@ -20,6 +21,10 @@ import {
   IconTrash,
 } from "../components/Icons";
 import { InlineBanner } from "../components/InlineBanner";
+import {
+  SegmentedControl,
+  type SegmentedOption,
+} from "../components/SegmentedControl";
 import { useLang } from "../i18n/context";
 import { tInstallation } from "../i18n/installation";
 import { compareSemver, scrubUrlsInText } from "../lib/format";
@@ -29,6 +34,7 @@ import type {
   DesktopStatusSnapshot,
   EngineMode,
   NavTab,
+  ServiceState,
   UpdateCheckPayload,
 } from "../types";
 
@@ -42,6 +48,7 @@ export interface InstallationViewProps {
     message: string;
     kind: "cancelled" | "wintun" | "antivirus" | "generic";
     attemptedEngine?: EngineMode;
+    operation?: "install" | "upgrade" | "repair";
   } | null;
   onInstallService: (engine: EngineMode) => void | Promise<void>;
   onSwitchEngine?: (engine: EngineMode) => void | Promise<void>;
@@ -56,7 +63,16 @@ export interface InstallationViewProps {
   onNavigate: (tab: NavTab) => void;
 }
 
+type WintunRecheckFeedbackKind =
+  | "still_missing"
+  | "still_invalid"
+  | "ready"
+  | "error";
+
 const STYLE_ID = "vdpi-installation-view-styles";
+
+const WINTUN_HASH_PATTERN =
+  /(?:sha-?256|\bhash\b|\bmismatch\b|\bcorrupt(?:ed)?\b|\binvalid\b|\bintegrity\b|\btamper(?:ed)?\b|wintun_invalid)/i;
 
 const SCOPED_STYLES = `
 @keyframes vdpi-install-indeterminate {
@@ -133,6 +149,10 @@ const SCOPED_STYLES = `
   color: var(--ink-primary, #F3F4F6);
 }
 
+:where(.install-card__title:focus:not(:focus-visible)) {
+  outline: none;
+}
+
 :where(.install-card__body) {
   display: flex;
   flex-direction: column;
@@ -152,17 +172,40 @@ const SCOPED_STYLES = `
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  column-gap: 16px;
+  row-gap: 8px;
   flex-wrap: wrap;
   padding: 12px 16px;
   border-top: 1px solid var(--border-hairline, rgba(255, 255, 255, 0.07));
   background: var(--bg-surface-subtle, rgba(255, 255, 255, 0.02));
 }
 
+:where(.install-footer-danger) {
+  margin-left: auto;
+}
+
+@media (max-width: 840px) {
+  :where(.install-card__footer) {
+    padding: 10px 12px;
+    column-gap: 12px;
+  }
+
+  :where(.install-card__footer .btn) {
+    padding: 0 10px;
+  }
+}
+
 :where(.install-actions-group) {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
+:where(.install-setup-cta) {
+  display: flex;
+  flex-direction: column;
   gap: 8px;
   min-width: 0;
 }
@@ -197,6 +240,12 @@ const SCOPED_STYLES = `
   gap: 10px;
   width: 100%;
   min-width: 0;
+}
+
+@media (max-width: 820px) {
+  :where(.install-mode-grid) {
+    grid-template-columns: 1fr;
+  }
 }
 
 :where(.install-mode-card) {
@@ -246,6 +295,7 @@ const SCOPED_STYLES = `
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 6px;
   width: 100%;
   min-width: 0;
@@ -254,7 +304,7 @@ const SCOPED_STYLES = `
 :where(.install-mode-card__title-wrap) {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
+  gap: 8px;
   min-width: 0;
 }
 
@@ -262,24 +312,25 @@ const SCOPED_STYLES = `
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 14px;
-  height: 14px;
+  width: 16px;
+  height: 16px;
   border-radius: 9999px;
   border: 1.5px solid var(--border-control, #5E687B);
   flex-shrink: 0;
   box-sizing: border-box;
+  transition: border-color 120ms ease;
 }
 
 :where(.install-mode-card[aria-checked="true"] .install-mode-card__radio) {
-  border-color: var(--accent, #2563EB);
+  border-color: var(--accent-fg, #60A5FA);
 }
 
-:where(.install-mode-card[aria-checked="true"] .install-mode-card__radio::after) {
+:where(.install-mode-card[aria-checked="true"] .install-mode-card__radio)::after {
   content: "";
-  width: 6px;
-  height: 6px;
+  width: 8px;
+  height: 8px;
   border-radius: 9999px;
-  background: var(--accent, #2563EB);
+  background: var(--accent-fg, #60A5FA);
 }
 
 :where(.install-mode-card__title) {
@@ -328,6 +379,12 @@ const SCOPED_STYLES = `
   background: var(--status-warning-bg, rgba(255, 159, 10, 0.12));
 }
 
+:where(.install-callout--success) {
+  border-color: var(--status-success-border, rgba(48, 209, 88, 0.28));
+  border-left: 3px solid var(--status-green, #30D158);
+  background: var(--status-success-bg, rgba(48, 209, 88, 0.12));
+}
+
 :where(.install-callout--info) {
   border-color: var(--border-default, rgba(255, 255, 255, 0.14));
   border-left: 3px solid var(--accent, #2563EB);
@@ -363,6 +420,22 @@ const SCOPED_STYLES = `
   font-size: var(--text-sm, 12px);
   line-height: 1.45;
   color: var(--ink-secondary, #A1A6B0);
+}
+
+:where(.install-callout__feedback) {
+  margin: 2px 0 0;
+  font-size: var(--text-xs, 11px);
+  font-weight: var(--weight-medium, 500);
+  line-height: 1.4;
+  color: var(--status-warning-fg, #FF9F0A);
+}
+
+:where(.install-callout__feedback--error) {
+  color: var(--status-danger-fg, #FF6961);
+}
+
+:where(.install-callout__feedback--success) {
+  color: var(--status-success-fg, #30D158);
 }
 
 /* Indeterminate progress track */
@@ -415,6 +488,12 @@ const SCOPED_STYLES = `
   box-sizing: border-box;
 }
 
+:where(.install-error--cancelled) {
+  border-color: var(--status-warning-border, rgba(255, 159, 10, 0.28));
+  border-left: 3px solid var(--status-amber, #FF9F0A);
+  background: var(--status-warning-bg, rgba(255, 159, 10, 0.12));
+}
+
 :where(.install-error__top) {
   display: flex;
   align-items: flex-start;
@@ -437,6 +516,10 @@ const SCOPED_STYLES = `
   color: var(--status-danger-fg, #FF6961);
   margin-top: 2px;
   flex-shrink: 0;
+}
+
+:where(.install-error--cancelled .install-error__icon) {
+  color: var(--status-warning-fg, #FF9F0A);
 }
 
 :where(.install-error__copy) {
@@ -545,10 +628,6 @@ const SCOPED_STYLES = `
   min-width: 0;
 }
 
-:where(.install-meta-item--full) {
-  grid-column: 1 / -1;
-}
-
 :where(.install-meta-label) {
   font-size: var(--text-xs, 11px);
   font-weight: var(--weight-medium, 500);
@@ -564,6 +643,18 @@ const SCOPED_STYLES = `
   font-weight: var(--weight-medium, 500);
   color: var(--ink-primary, #F3F4F6);
   min-width: 0;
+}
+
+:where(.install-meta-segmented) {
+  align-self: flex-start;
+  margin-top: 2px;
+}
+
+:where(.install-meta-hint) {
+  margin: 4px 0 0;
+  font-size: var(--text-xs, 11px);
+  line-height: 1.4;
+  color: var(--status-warning-fg, #FF9F0A);
 }
 
 :where(.install-meta-path) {
@@ -629,6 +720,10 @@ const SCOPED_STYLES = `
   border-color: var(--accent-border, rgba(0, 102, 204, 0.28));
 }
 
+[data-theme="light"] .install-mode-card[aria-checked="true"] .pill-accent {
+  background: var(--bg-surface, #FFFFFF);
+}
+
 @media (prefers-color-scheme: light) {
   :where(:root:not([data-theme="dark"]) .install-mode-card) {
     background: var(--bg-surface, #FFFFFF);
@@ -636,6 +731,9 @@ const SCOPED_STYLES = `
   :where(:root:not([data-theme="dark"]) .install-mode-card[aria-checked="true"]) {
     background: var(--accent-subtle, rgba(0, 102, 204, 0.1));
     border-color: var(--accent-border, rgba(0, 102, 204, 0.28));
+  }
+  :root:not([data-theme="dark"]) .install-mode-card[aria-checked="true"] .pill-accent {
+    background: var(--bg-surface, #FFFFFF);
   }
 }
 
@@ -677,6 +775,11 @@ function sanitizeExternalUrl(raw: string | null | undefined): string | null {
   }
 }
 
+function isWintunHashMismatch(message: string | null | undefined): boolean {
+  if (!message) return false;
+  return WINTUN_HASH_PATTERN.test(message.trim());
+}
+
 function resolveCliVersionRelation(
   status: DesktopStatusSnapshot | null,
   installedVersion: string | null,
@@ -697,6 +800,106 @@ function resolveCliVersionRelation(
   if (cmp < 0) return "upgrade_available";
   if (cmp > 0) return "newer_installed";
   return "up_to_date";
+}
+
+function stringArraysEqual(
+  a: readonly string[] | undefined,
+  b: readonly string[] | undefined,
+): boolean {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+function areInstallationPropsEqual(
+  prev: Readonly<InstallationViewProps>,
+  next: Readonly<InstallationViewProps>,
+): boolean {
+  if (
+    prev.checkingUpdates !== next.checkingUpdates ||
+    prev.busyAction !== next.busyAction ||
+    prev.onInstallService !== next.onInstallService ||
+    prev.onSwitchEngine !== next.onSwitchEngine ||
+    prev.onUpgradeService !== next.onUpgradeService ||
+    prev.onRepairService !== next.onRepairService ||
+    prev.onUninstallService !== next.onUninstallService ||
+    prev.onCheckUpdates !== next.onCheckUpdates ||
+    prev.onOpenReleaseUrl !== next.onOpenReleaseUrl ||
+    prev.onOpenAppFolder !== next.onOpenAppFolder ||
+    prev.onRefreshStatus !== next.onRefreshStatus ||
+    prev.onClearInstallError !== next.onClearInstallError ||
+    prev.onNavigate !== next.onNavigate
+  ) {
+    return false;
+  }
+
+  if (prev.settings?.engine !== next.settings?.engine) {
+    return false;
+  }
+
+  const prevErr = prev.installError;
+  const nextErr = next.installError;
+  if (prevErr !== nextErr) {
+    if (
+      !prevErr ||
+      !nextErr ||
+      prevErr.kind !== nextErr.kind ||
+      prevErr.message !== nextErr.message ||
+      prevErr.attemptedEngine !== nextErr.attemptedEngine ||
+      prevErr.operation !== nextErr.operation
+    ) {
+      return false;
+    }
+  }
+
+  const prevUpd = prev.updateInfo;
+  const nextUpd = next.updateInfo;
+  if (prevUpd !== nextUpd) {
+    if (
+      !prevUpd ||
+      !nextUpd ||
+      prevUpd.hasUpdate !== nextUpd.hasUpdate ||
+      prevUpd.currentVersion !== nextUpd.currentVersion ||
+      prevUpd.latestVersion !== nextUpd.latestVersion ||
+      prevUpd.releaseUrl !== nextUpd.releaseUrl ||
+      !stringArraysEqual(prevUpd.releaseNotes, nextUpd.releaseNotes)
+    ) {
+      return false;
+    }
+  }
+
+  const prevStatus = prev.status;
+  const nextStatus = next.status;
+  if (prevStatus === nextStatus) {
+    return true;
+  }
+  if (!prevStatus || !nextStatus) {
+    return false;
+  }
+
+  return (
+    prevStatus.platform === nextStatus.platform &&
+    prevStatus.serviceState === nextStatus.serviceState &&
+    prevStatus.installedVersion === nextStatus.installedVersion &&
+    prevStatus.bundledEngineVersion === nextStatus.bundledEngineVersion &&
+    prevStatus.configuredEngine === nextStatus.configuredEngine &&
+    prevStatus.cliVersionRelation === nextStatus.cliVersionRelation &&
+    prevStatus.canInstallFromBundle === nextStatus.canInstallFromBundle &&
+    prevStatus.liveVersionStale === nextStatus.liveVersionStale &&
+    prevStatus.pendingOperation === nextStatus.pendingOperation &&
+    prevStatus.runningFromReadonlyDmg === nextStatus.runningFromReadonlyDmg &&
+    prevStatus.configPath === nextStatus.configPath &&
+    prevStatus.logsDir === nextStatus.logsDir &&
+    prevStatus.live?.running === nextStatus.live?.running &&
+    prevStatus.live?.engine === nextStatus.live?.engine &&
+    prevStatus.live?.version === nextStatus.live?.version &&
+    prevStatus.wintun.required === nextStatus.wintun.required &&
+    prevStatus.wintun.ready === nextStatus.wintun.ready &&
+    prevStatus.wintun.message === nextStatus.wintun.message
+  );
 }
 
 function InstallationViewComponent({
@@ -723,25 +926,82 @@ function InstallationViewComponent({
   const mountedRef = useRef(true);
   const proxyRadioRef = useRef<HTMLButtonElement>(null);
   const tunRadioRef = useRef<HTMLButtonElement>(null);
+  const primaryInstallBtnRef = useRef<HTMLButtonElement>(null);
+  const engineHeadingRef = useRef<HTMLHeadingElement>(null);
+  const userSelectedEngineRef = useRef(false);
+  const confirmInFlightRef = useRef(false);
+  const openingReleaseRef = useRef(false);
+  const recheckingWintunRef = useRef(false);
+  const wintunFeedbackTimerRef = useRef<number | null>(null);
+  const prevServiceStateRef = useRef<ServiceState | undefined>(
+    status?.serviceState,
+  );
 
-  const [selectedEngine, setSelectedEngine] = useState<EngineMode>("proxy");
+  const [selectedEngine, setSelectedEngine] = useState<EngineMode>(
+    () => status?.configuredEngine ?? settings?.engine ?? "proxy",
+  );
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [confirmRepairOpen, setConfirmRepairOpen] = useState(false);
   const [confirmUninstallOpen, setConfirmUninstallOpen] = useState(false);
+  const [pendingSwitchEngine, setPendingSwitchEngine] =
+    useState<EngineMode | null>(null);
   const [recheckingWintun, setRecheckingWintun] = useState(false);
+  const [wintunRecheckFeedback, setWintunRecheckFeedback] =
+    useState<WintunRecheckFeedbackKind | null>(null);
+  const [wintunRecheckDoneSeq, setWintunRecheckDoneSeq] = useState(0);
+  const [recheckingBundle, setRecheckingBundle] = useState(false);
+  const [openingRelease, setOpeningRelease] = useState(false);
+  const [showPostInstallCallout, setShowPostInstallCallout] = useState(false);
 
   useEffect(() => {
     ensureStyles();
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      if (
+        wintunFeedbackTimerRef.current !== null &&
+        typeof window !== "undefined"
+      ) {
+        window.clearTimeout(wintunFeedbackTimerRef.current);
+        wintunFeedbackTimerRef.current = null;
+      }
     };
   }, []);
+
+  useEffect(() => {
+    if (userSelectedEngineRef.current) return;
+    const preferred = status?.configuredEngine ?? settings?.engine;
+    if (preferred) {
+      setSelectedEngine(preferred);
+    }
+  }, [status?.configuredEngine, settings?.engine]);
 
   const platform = status?.platform ?? "windows";
   const serviceState = status?.serviceState;
   const isNotInstalled = serviceState === "not_installed";
   const isInstalled = serviceState === "running" || serviceState === "stopped";
+  const isProtectionRunning = Boolean(status?.live?.running);
+
+  useEffect(() => {
+    const prev = prevServiceStateRef.current;
+    if (
+      prev === "not_installed" &&
+      (serviceState === "running" || serviceState === "stopped")
+    ) {
+      setShowPostInstallCallout(true);
+    } else if (serviceState === "not_installed") {
+      setShowPostInstallCallout(false);
+    }
+    prevServiceStateRef.current = serviceState;
+  }, [serviceState]);
+
+  useEffect(() => {
+    if (serviceState === "not_installed") {
+      setConfirmRepairOpen(false);
+      setConfirmUninstallOpen(false);
+      setPendingSwitchEngine(null);
+    }
+  }, [serviceState]);
 
   const bundledRaw = status?.bundledEngineVersion?.trim() || null;
   const installedRaw =
@@ -768,6 +1028,7 @@ function InstallationViewComponent({
     isInstalled && relation === "upgrade_available" && !bundledMissing;
   const isNewerInstalled = isInstalled && relation === "newer_installed";
   const isRepairNeeded = isInstalled && relation === "repair_needed";
+  const isUnknownRelation = isInstalled && relation === "unknown";
   const liveVersionStale = Boolean(
     isInstalled && status?.liveVersionStale && installedDisplay && liveDisplay,
   );
@@ -778,6 +1039,15 @@ function InstallationViewComponent({
     settings?.engine ??
     status?.configuredEngine ??
     "proxy";
+
+  useEffect(() => {
+    if (
+      pendingSwitchEngine !== null &&
+      (pendingSwitchEngine === activeEngine || !isProtectionRunning)
+    ) {
+      setPendingSwitchEngine(null);
+    }
+  }, [activeEngine, isProtectionRunning, pendingSwitchEngine]);
 
   const normalizedBusy = busyAction?.trim().toLowerCase() ?? null;
   const pendingOp = status?.pendingOperation ?? null;
@@ -802,31 +1072,91 @@ function InstallationViewComponent({
     normalizedBusy === "uninstall" ||
     normalizedBusy === "uninstall-service" ||
     normalizedBusy === "uninstalling";
+  const isSwitchingEngine =
+    pendingOp === "switching_engine" ||
+    (normalizedBusy !== null && normalizedBusy.startsWith("switch-engine"));
 
   const isAnyServiceBusy = Boolean(normalizedBusy || pendingOp);
 
-  const showWintunMissing = Boolean(
-    isNotInstalled &&
-      platform === "windows" &&
-      selectedEngine === "tun" &&
-      status &&
-      !status.wintun.ready,
+  const wintunNotReady = Boolean(
+    platform === "windows" && status && !status.wintun.ready,
+  );
+  const wintunInvalid = Boolean(
+    wintunNotReady && isWintunHashMismatch(status?.wintun.message),
   );
 
+  const showSetupWintunWarning = Boolean(
+    isNotInstalled && selectedEngine === "tun" && wintunNotReady,
+  );
+  const showInstalledWintunWarning = Boolean(
+    isInstalled && activeEngine === "tun" && wintunNotReady,
+  );
+  const tunSwitchBlocked = Boolean(
+    wintunNotReady && activeEngine !== "tun",
+  );
+
+  const scheduleClearWintunFeedback = () => {
+    if (typeof window === "undefined") return;
+    if (wintunFeedbackTimerRef.current !== null) {
+      window.clearTimeout(wintunFeedbackTimerRef.current);
+    }
+    wintunFeedbackTimerRef.current = window.setTimeout(() => {
+      if (mountedRef.current) {
+        setWintunRecheckFeedback(null);
+      }
+      wintunFeedbackTimerRef.current = null;
+    }, 6000);
+  };
+
+  useEffect(() => {
+    if (wintunRecheckDoneSeq === 0) return;
+    if (status?.wintun.ready) {
+      setWintunRecheckFeedback("ready");
+    } else if (wintunInvalid) {
+      setWintunRecheckFeedback("still_invalid");
+    } else {
+      setWintunRecheckFeedback("still_missing");
+    }
+    scheduleClearWintunFeedback();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wintunRecheckDoneSeq]);
+
   const installDisabled =
-    !status || isAnyServiceBusy || bundledMissing || showWintunMissing;
+    !status || isAnyServiceBusy || bundledMissing || showSetupWintunWarning;
 
   const repairDisabled =
-    !status || isAnyServiceBusy || isNewerInstalled || bundledMissing;
+    !status ||
+    isAnyServiceBusy ||
+    isNewerInstalled ||
+    bundledMissing ||
+    isUnknownRelation;
 
   const repairDisabledTitle = isNewerInstalled
     ? tInstallation(lang, "repairDisabledNewerHint")
     : bundledMissing
       ? tInstallation(lang, "repairDisabledBundleHint")
-      : undefined;
+      : isUnknownRelation
+        ? tInstallation(lang, "repairDisabledUnknownHint")
+        : undefined;
+
+  const retryDisabled = isNotInstalled
+    ? installDisabled
+    : isUpgradeAvailable
+      ? isAnyServiceBusy || bundledMissing
+      : repairDisabled;
 
   const safeReleaseUrl = sanitizeExternalUrl(updateInfo?.releaseUrl);
   const showReleaseCard = Boolean(updateInfo?.hasUpdate);
+
+  const cleanedReleaseNotes = useMemo(
+    () =>
+      (updateInfo?.releaseNotes ?? [])
+        .map((note) =>
+          scrubUrlsInText(note.trim().replace(/^[-*•]\s+/, "").trim()),
+        )
+        .filter((note) => note.length > 0),
+    [updateInfo?.releaseNotes],
+  );
 
   const elevationNote =
     platform === "windows"
@@ -837,15 +1167,58 @@ function InstallationViewComponent({
           ? tInstallation(lang, "elevationMacTun")
           : tInstallation(lang, "elevationLinuxTun");
 
+  const installingProgressText =
+    platform === "windows"
+      ? tInstallation(lang, "progressInstallingWindows")
+      : selectedEngine === "tun"
+        ? platform === "macos"
+          ? tInstallation(lang, "progressInstallingMacTun")
+          : tInstallation(lang, "progressInstallingLinuxTun")
+        : tInstallation(lang, "progressInstalling");
+
   const activeProgressText = isInstalling
-    ? tInstallation(lang, "progressInstalling")
+    ? installingProgressText
     : isUpgrading
       ? tInstallation(lang, "progressUpgrading")
       : isRepairing
         ? tInstallation(lang, "progressRepairing")
         : isUninstalling
           ? tInstallation(lang, "progressUninstalling")
-          : null;
+          : isSwitchingEngine
+            ? tInstallation(lang, "progressSwitchingEngine")
+            : null;
+
+  const engineSwitchOptions = useMemo<readonly SegmentedOption<EngineMode>[]>(
+    () => [
+      {
+        value: "proxy",
+        label: tInstallation(lang, "switchEngineProxy"),
+      },
+      {
+        value: "tun",
+        label: tInstallation(lang, "switchEngineTun"),
+        disabled: tunSwitchBlocked,
+      },
+    ],
+    [lang, tunSwitchBlocked],
+  );
+
+  const switchEngineAdminNote =
+    platform === "windows"
+      ? tInstallation(lang, "switchEngineAdminWindows")
+      : platform === "macos"
+        ? tInstallation(lang, "switchEngineAdminMac")
+        : pendingSwitchEngine === "tun"
+          ? tInstallation(lang, "switchEngineAdminLinux")
+          : "";
+
+  const selectEngineChoice = (next: EngineMode) => {
+    userSelectedEngineRef.current = true;
+    setSelectedEngine(next);
+    if (next === "proxy") {
+      setWintunRecheckFeedback(null);
+    }
+  };
 
   const handleStartInstall = (engineToUse: EngineMode = selectedEngine) => {
     if (isAnyServiceBusy || bundledMissing) return;
@@ -857,6 +1230,7 @@ function InstallationViewComponent({
     ) {
       return;
     }
+    setWintunRecheckFeedback(null);
     onClearInstallError();
     void onInstallService(engineToUse);
   };
@@ -873,7 +1247,7 @@ function InstallationViewComponent({
     ) {
       event.preventDefault();
       const next: EngineMode = current === "proxy" ? "tun" : "proxy";
-      setSelectedEngine(next);
+      selectEngineChoice(next);
       if (next === "proxy") {
         proxyRadioRef.current?.focus();
       } else {
@@ -882,31 +1256,119 @@ function InstallationViewComponent({
       return;
     }
 
-    if (event.key === "Enter") {
+    if (event.key === "Home") {
       event.preventDefault();
-      if (!installDisabled) {
-        handleStartInstall(current);
-      }
+      selectEngineChoice("proxy");
+      proxyRadioRef.current?.focus();
+      return;
+    }
+
+    if (event.key === "End") {
+      event.preventDefault();
+      selectEngineChoice("tun");
+      tunRadioRef.current?.focus();
+      return;
+    }
+
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      selectEngineChoice(current);
+    }
+  };
+
+  const handleRequestSwitchEngine = (nextEngine: EngineMode) => {
+    if (!onSwitchEngine || isAnyServiceBusy || nextEngine === activeEngine) {
+      return;
+    }
+    if (nextEngine === "tun" && wintunNotReady) {
+      return;
+    }
+    if (isProtectionRunning) {
+      setPendingSwitchEngine(nextEngine);
+      return;
+    }
+    onClearInstallError();
+    void onSwitchEngine(nextEngine);
+  };
+
+  const handleConfirmSwitchEngine = async () => {
+    const target = pendingSwitchEngine;
+    if (
+      !target ||
+      !onSwitchEngine ||
+      isAnyServiceBusy ||
+      confirmInFlightRef.current
+    ) {
+      return;
+    }
+    confirmInFlightRef.current = true;
+    setPendingSwitchEngine(null);
+    onClearInstallError();
+    try {
+      await onSwitchEngine(target);
+    } finally {
+      confirmInFlightRef.current = false;
     }
   };
 
   const handleRecheckWintun = async () => {
-    if (recheckingWintun) return;
+    if (recheckingWintunRef.current || isAnyServiceBusy) return;
+    recheckingWintunRef.current = true;
     setRecheckingWintun(true);
+    setWintunRecheckFeedback(null);
     try {
       await onRefreshStatus();
+      if (mountedRef.current) {
+        setWintunRecheckDoneSeq((prev) => prev + 1);
+      }
+    } catch {
+      if (mountedRef.current) {
+        setWintunRecheckFeedback("error");
+        scheduleClearWintunFeedback();
+      }
     } finally {
+      recheckingWintunRef.current = false;
       if (mountedRef.current) {
         setRecheckingWintun(false);
       }
     }
   };
 
+  const handleRecheckBundle = async () => {
+    if (recheckingBundle || isAnyServiceBusy) return;
+    setRecheckingBundle(true);
+    try {
+      await onRefreshStatus();
+    } catch {
+      // Refresh errors surface through AppShell's status banner.
+    } finally {
+      if (mountedRef.current) {
+        setRecheckingBundle(false);
+      }
+    }
+  };
+
+  const handleOpenRelease = async (url: string) => {
+    if (openingReleaseRef.current) return;
+    openingReleaseRef.current = true;
+    setOpeningRelease(true);
+    try {
+      await onOpenReleaseUrl(url);
+    } finally {
+      openingReleaseRef.current = false;
+      if (mountedRef.current) {
+        setOpeningRelease(false);
+      }
+    }
+  };
+
   const handleConfirmRepair = async () => {
-    if (isAnyServiceBusy) return;
+    if (isAnyServiceBusy || confirmInFlightRef.current) return;
+    confirmInFlightRef.current = true;
     try {
       await onRepairService();
     } finally {
+      confirmInFlightRef.current = false;
       if (mountedRef.current) {
         setConfirmRepairOpen(false);
       }
@@ -914,10 +1376,12 @@ function InstallationViewComponent({
   };
 
   const handleConfirmUninstall = async () => {
-    if (isAnyServiceBusy) return;
+    if (isAnyServiceBusy || confirmInFlightRef.current) return;
+    confirmInFlightRef.current = true;
     try {
       await onUninstallService();
     } finally {
+      confirmInFlightRef.current = false;
       if (mountedRef.current) {
         setConfirmUninstallOpen(false);
       }
@@ -925,45 +1389,154 @@ function InstallationViewComponent({
   };
 
   const handleRetryFromError = () => {
-    if (isAnyServiceBusy) return;
-    const attempted = installError?.attemptedEngine ?? selectedEngine;
-    onClearInstallError();
+    if (retryDisabled) return;
     if (isNotInstalled) {
-      void onInstallService(attempted);
+      handleStartInstall(selectedEngine);
     } else if (isUpgradeAvailable) {
+      onClearInstallError();
       void onUpgradeService();
-    } else if (!isNewerInstalled && !bundledMissing) {
+    } else if (!repairDisabled) {
+      onClearInstallError();
       void onRepairService();
     }
   };
 
   const handleTryProxyInstead = () => {
     if (isAnyServiceBusy || bundledMissing) return;
-    setSelectedEngine("proxy");
+    selectEngineChoice("proxy");
     onClearInstallError();
     void onInstallService("proxy");
   };
 
+  const handleDismissError = () => {
+    onClearInstallError();
+    const primaryBtn = primaryInstallBtnRef.current;
+    if (isNotInstalled && primaryBtn && !primaryBtn.disabled) {
+      primaryBtn.focus();
+      return;
+    }
+    engineHeadingRef.current?.focus();
+  };
+
+  const wintunFeedbackText =
+    wintunRecheckFeedback === "still_invalid"
+      ? tInstallation(lang, "wintunStillInvalid")
+      : wintunRecheckFeedback === "still_missing"
+        ? tInstallation(lang, "wintunStillMissing")
+        : wintunRecheckFeedback === "ready"
+          ? tInstallation(lang, "wintunRecheckReady")
+          : wintunRecheckFeedback === "error"
+            ? tInstallation(lang, "wintunRecheckError")
+            : null;
+
+  const renderWintunCallout = (allowSwitchToProxy: boolean) => (
+    <div className="install-callout install-callout--warn" role="status">
+      <div className="install-callout__head">
+        <div className="install-callout__copy">
+          <p className="install-callout__title">
+            {wintunInvalid
+              ? tInstallation(lang, "wintunInvalidTitle")
+              : tInstallation(lang, "wintunMissingTitle")}
+          </p>
+          <p className="install-callout__desc">
+            {wintunInvalid
+              ? tInstallation(lang, "wintunInvalidDesc")
+              : tInstallation(lang, "wintunMissingDesc")}
+          </p>
+          {wintunFeedbackText ? (
+            <p
+              className={
+                wintunRecheckFeedback === "error"
+                  ? "install-callout__feedback install-callout__feedback--error"
+                  : wintunRecheckFeedback === "ready"
+                    ? "install-callout__feedback install-callout__feedback--success"
+                    : "install-callout__feedback"
+              }
+              aria-live="polite"
+            >
+              {wintunFeedbackText}
+            </p>
+          ) : null}
+        </div>
+      </div>
+      <div className="install-actions-group">
+        <button
+          type="button"
+          className="btn btn-secondary btn-sm"
+          onClick={() => {
+            void onOpenAppFolder("app");
+          }}
+        >
+          <IconFolder size={13} />
+          <span>{tInstallation(lang, "btnOpenAppFolder")}</span>
+        </button>
+        <button
+          type="button"
+          className="btn btn-secondary btn-sm"
+          disabled={recheckingWintun || isAnyServiceBusy}
+          aria-busy={recheckingWintun}
+          onClick={() => {
+            void handleRecheckWintun();
+          }}
+        >
+          {recheckingWintun ? (
+            <span className="spinner" aria-hidden="true" />
+          ) : (
+            <IconRefresh size={13} />
+          )}
+          <span>
+            {recheckingWintun
+              ? tInstallation(lang, "btnRechecking")
+              : tInstallation(lang, "btnRecheckWintun")}
+          </span>
+        </button>
+        {allowSwitchToProxy && onSwitchEngine ? (
+          <button
+            type="button"
+            className="btn btn-secondary btn-sm"
+            disabled={isAnyServiceBusy}
+            onClick={() => handleRequestSwitchEngine("proxy")}
+          >
+            <span>{tInstallation(lang, "btnSwitchToProxy")}</span>
+          </button>
+        ) : null}
+      </div>
+    </div>
+  );
+
   const renderErrorBanner = () => {
     if (!installError) return null;
 
-    const errorTitle =
-      installError.kind === "cancelled"
-        ? tInstallation(lang, "errorTitleCancelled")
-        : installError.kind === "wintun"
-          ? tInstallation(lang, "errorTitleWintun")
-          : installError.kind === "antivirus"
-            ? tInstallation(lang, "errorTitleAntivirus")
-            : tInstallation(lang, "errorTitleGeneric");
+    const isCancelled = installError.kind === "cancelled";
+    const isWintunHashErr =
+      installError.kind === "wintun" &&
+      (wintunInvalid || isWintunHashMismatch(installError.message));
 
-    const errorHint =
-      installError.kind === "cancelled"
-        ? tInstallation(lang, "errorHintCancelled")
-        : installError.kind === "wintun"
-          ? tInstallation(lang, "errorHintWintun")
-          : installError.kind === "antivirus"
-            ? tInstallation(lang, "errorHintAntivirus")
-            : null;
+    const errorTitle = isCancelled
+      ? installError.operation === "upgrade"
+        ? tInstallation(lang, "errorTitleCancelledUpgrade")
+        : installError.operation === "repair"
+          ? tInstallation(lang, "errorTitleCancelledRepair")
+          : tInstallation(lang, "errorTitleCancelled")
+      : installError.kind === "wintun"
+        ? tInstallation(lang, "errorTitleWintun")
+        : installError.kind === "antivirus"
+          ? tInstallation(lang, "errorTitleAntivirus")
+          : tInstallation(lang, "errorTitleGeneric");
+
+    const errorHint = isCancelled
+      ? installError.operation === "upgrade"
+        ? tInstallation(lang, "errorHintCancelledUpgrade")
+        : installError.operation === "repair"
+          ? tInstallation(lang, "errorHintCancelledRepair")
+          : tInstallation(lang, "errorHintCancelled")
+      : installError.kind === "wintun"
+        ? isWintunHashErr
+          ? tInstallation(lang, "errorHintWintunInvalid")
+          : tInstallation(lang, "errorHintWintun")
+        : installError.kind === "antivirus"
+          ? tInstallation(lang, "errorHintAntivirus")
+          : null;
 
     const scrubbedMessage = scrubUrlsInText(installError.message.trim());
     const showTryProxy =
@@ -974,7 +1547,12 @@ function InstallationViewComponent({
         selectedEngine === "tun");
 
     return (
-      <div className="install-error" role="alert">
+      <div
+        className={
+          isCancelled ? "install-error install-error--cancelled" : "install-error"
+        }
+        role={isCancelled ? "status" : "alert"}
+      >
         <div className="install-error__top">
           <div className="install-error__head">
             <span className="install-error__icon" aria-hidden="true">
@@ -995,7 +1573,7 @@ function InstallationViewComponent({
             type="button"
             className="install-error__dismiss"
             aria-label={tInstallation(lang, "btnDismissError")}
-            onClick={onClearInstallError}
+            onClick={handleDismissError}
           >
             <IconClose size={14} />
           </button>
@@ -1016,7 +1594,7 @@ function InstallationViewComponent({
           <button
             type="button"
             className="btn btn-secondary btn-sm"
-            disabled={isAnyServiceBusy || bundledMissing}
+            disabled={retryDisabled}
             onClick={handleRetryFromError}
           >
             <IconRefresh size={13} />
@@ -1063,24 +1641,47 @@ function InstallationViewComponent({
     ? {
         className: "pill pill-accent",
         label: tInstallation(lang, "badgeUpgradeAvailable"),
+        showCheck: false,
       }
     : isRepairNeeded
       ? {
           className: "pill pill-warn",
           label: tInstallation(lang, "badgeRepairNeeded"),
+          showCheck: false,
         }
-      : isNewerInstalled
+      : bundledMissing
         ? {
-            className: "pill pill-neutral",
-            label: tInstallation(lang, "badgeNewerInstalled"),
+            className: "pill pill-warn",
+            label: tInstallation(lang, "badgeBundleMissing"),
+            showCheck: false,
           }
-        : {
-            className: "pill pill-success",
-            label: tInstallation(lang, "badgeUpToDate"),
-          };
+        : isNewerInstalled
+          ? {
+              className: "pill pill-neutral",
+              label: tInstallation(lang, "badgeNewerInstalled"),
+              showCheck: false,
+            }
+          : relation === "up_to_date"
+            ? {
+                className: "pill pill-success",
+                label: tInstallation(lang, "badgeUpToDate"),
+                showCheck: true,
+              }
+            : {
+                className: "pill pill-neutral",
+                label: tInstallation(lang, "badgeVersionUnknown"),
+                showCheck: false,
+              };
 
+  const engineHeadingId = `${idPrefix}-engine-heading`;
   const detailsPanelId = `${idPrefix}-what-gets-installed`;
   const engineGroupLabelId = `${idPrefix}-engine-group-label`;
+  const proxyTitleId = `${idPrefix}-mode-proxy-title`;
+  const proxyDescId = `${idPrefix}-mode-proxy-desc`;
+  const tunTitleId = `${idPrefix}-mode-tun-title`;
+  const tunDescId = `${idPrefix}-mode-tun-desc`;
+  const installedEngineLabelId = `${idPrefix}-installed-engine-mode-label`;
+  const installedEngineHintId = `${idPrefix}-installed-engine-mode-hint`;
 
   const whatGetsInstalledItems = [
     platform === "windows"
@@ -1141,9 +1742,9 @@ function InstallationViewComponent({
               </span>
             </div>
 
-            {updateInfo.releaseNotes.length > 0 ? (
+            {cleanedReleaseNotes.length > 0 ? (
               <ul className="install-release-notes">
-                {updateInfo.releaseNotes.map((note, idx) => (
+                {cleanedReleaseNotes.map((note, idx) => (
                   <li key={`${idx}-${note}`}>{note}</li>
                 ))}
               </ul>
@@ -1156,12 +1757,17 @@ function InstallationViewComponent({
                 <button
                   type="button"
                   className="btn btn-primary"
+                  disabled={openingRelease}
+                  aria-busy={openingRelease}
                   onClick={() => {
-                    void onOpenReleaseUrl(safeReleaseUrl);
+                    void handleOpenRelease(safeReleaseUrl);
                   }}
                 >
+                  {openingRelease ? (
+                    <span className="spinner" aria-hidden="true" />
+                  ) : null}
                   <span>{tInstallation(lang, "btnDownloadRelease")}</span>
-                  <IconExternal size={13} />
+                  {!openingRelease ? <IconExternal size={13} /> : null}
                 </button>
               ) : null}
 
@@ -1205,17 +1811,47 @@ function InstallationViewComponent({
           tone="warn"
           title={tInstallation(lang, "bundledMissingTitle")}
           description={tInstallation(lang, "bundledMissingDesc")}
-          actionLabel={tInstallation(lang, "btnOpenAppFolder")}
-          onAction={() => {
-            void onOpenAppFolder("app");
-          }}
+          action={
+            <>
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm"
+                onClick={() => {
+                  void onOpenAppFolder("app");
+                }}
+              >
+                <IconFolder size={13} />
+                <span>{tInstallation(lang, "btnOpenAppFolder")}</span>
+              </button>
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm"
+                disabled={recheckingBundle || isAnyServiceBusy}
+                aria-busy={recheckingBundle}
+                onClick={() => {
+                  void handleRecheckBundle();
+                }}
+              >
+                {recheckingBundle ? (
+                  <span className="spinner" aria-hidden="true" />
+                ) : (
+                  <IconRefresh size={13} />
+                )}
+                <span>
+                  {recheckingBundle
+                    ? tInstallation(lang, "btnRechecking")
+                    : tInstallation(lang, "btnRecheckWintun")}
+                </span>
+              </button>
+            </>
+          }
         />
       ) : null}
 
       {/* 4. Engine Installation & Management Card */}
       <section
         className="install-card"
-        aria-labelledby={`${idPrefix}-engine-heading`}
+        aria-labelledby={status !== null ? engineHeadingId : undefined}
       >
         {status === null ? (
           <div className="install-loading" role="status" aria-live="polite">
@@ -1230,7 +1866,9 @@ function InstallationViewComponent({
                   <IconShield size={16} />
                 </span>
                 <h2
-                  id={`${idPrefix}-engine-heading`}
+                  ref={engineHeadingRef}
+                  id={engineHeadingId}
+                  tabIndex={-1}
                   className="install-card__title"
                 >
                   {tInstallation(lang, "setupCardTitle")}
@@ -1257,10 +1895,12 @@ function InstallationViewComponent({
                   type="button"
                   role="radio"
                   aria-checked={selectedEngine === "proxy"}
+                  aria-labelledby={proxyTitleId}
+                  aria-describedby={proxyDescId}
                   tabIndex={selectedEngine === "proxy" ? 0 : -1}
                   className="install-mode-card"
                   disabled={isAnyServiceBusy}
-                  onClick={() => setSelectedEngine("proxy")}
+                  onClick={() => selectEngineChoice("proxy")}
                   onKeyDown={(e) => handleRadioKeyDown(e, "proxy")}
                 >
                   <div className="install-mode-card__top">
@@ -1269,7 +1909,10 @@ function InstallationViewComponent({
                         className="install-mode-card__radio"
                         aria-hidden="true"
                       />
-                      <span className="install-mode-card__title">
+                      <span
+                        id={proxyTitleId}
+                        className="install-mode-card__title"
+                      >
                         {tInstallation(lang, "engineProxyTitle")}
                       </span>
                     </span>
@@ -1277,7 +1920,7 @@ function InstallationViewComponent({
                       {tInstallation(lang, "engineProxyBadge")}
                     </span>
                   </div>
-                  <p className="install-mode-card__desc">
+                  <p id={proxyDescId} className="install-mode-card__desc">
                     {tInstallation(lang, "engineProxyDesc")}
                   </p>
                 </button>
@@ -1287,10 +1930,12 @@ function InstallationViewComponent({
                   type="button"
                   role="radio"
                   aria-checked={selectedEngine === "tun"}
+                  aria-labelledby={tunTitleId}
+                  aria-describedby={tunDescId}
                   tabIndex={selectedEngine === "tun" ? 0 : -1}
                   className="install-mode-card"
                   disabled={isAnyServiceBusy}
-                  onClick={() => setSelectedEngine("tun")}
+                  onClick={() => selectEngineChoice("tun")}
                   onKeyDown={(e) => handleRadioKeyDown(e, "tun")}
                 >
                   <div className="install-mode-card__top">
@@ -1299,7 +1944,10 @@ function InstallationViewComponent({
                         className="install-mode-card__radio"
                         aria-hidden="true"
                       />
-                      <span className="install-mode-card__title">
+                      <span
+                        id={tunTitleId}
+                        className="install-mode-card__title"
+                      >
                         {tInstallation(lang, "engineTunTitle")}
                       </span>
                     </span>
@@ -1307,108 +1955,48 @@ function InstallationViewComponent({
                       {tInstallation(lang, "engineTunBadge")}
                     </span>
                   </div>
-                  <p className="install-mode-card__desc">
+                  <p id={tunDescId} className="install-mode-card__desc">
                     {tInstallation(lang, "engineTunDesc")}
                   </p>
                 </button>
               </div>
 
-              {showWintunMissing ? (
+              {showSetupWintunWarning ? (
+                renderWintunCallout(false)
+              ) : wintunRecheckFeedback === "ready" && wintunFeedbackText ? (
                 <div
-                  className="install-callout install-callout--warn"
+                  className="install-callout install-callout--success"
                   role="status"
+                  aria-live="polite"
                 >
-                  <div className="install-callout__head">
-                    <div className="install-callout__copy">
-                      <p className="install-callout__title">
-                        {tInstallation(lang, "wintunMissingTitle")}
-                      </p>
-                      <p className="install-callout__desc">
-                        {status.wintun.message?.trim()
-                          ? scrubUrlsInText(status.wintun.message.trim())
-                          : tInstallation(lang, "wintunMissingDesc")}
-                      </p>
-                    </div>
-                  </div>
-                  <div className="install-actions-group">
-                    <button
-                      type="button"
-                      className="btn btn-secondary btn-sm"
-                      onClick={() => {
-                        void onOpenAppFolder("app");
-                      }}
-                    >
-                      <IconFolder size={13} />
-                      <span>{tInstallation(lang, "btnOpenAppFolder")}</span>
-                    </button>
-                    <button
-                      type="button"
-                      className="btn btn-secondary btn-sm"
-                      disabled={recheckingWintun}
-                      aria-busy={recheckingWintun}
-                      onClick={() => {
-                        void handleRecheckWintun();
-                      }}
-                    >
-                      {recheckingWintun ? (
-                        <span className="spinner" aria-hidden="true" />
-                      ) : (
-                        <IconRefresh size={13} />
-                      )}
-                      <span>
-                        {recheckingWintun
-                          ? tInstallation(lang, "btnRechecking")
-                          : tInstallation(lang, "btnRecheckWintun")}
-                      </span>
-                    </button>
-                  </div>
+                  <p className="install-callout__desc">{wintunFeedbackText}</p>
                 </div>
               ) : null}
 
-              <p className="install-elevation-note">{elevationNote}</p>
+              <div className="install-setup-cta">
+                <p className="install-elevation-note">{elevationNote}</p>
 
-              <div className="install-actions-group">
-                <button
-                  type="button"
-                  className="btn btn-primary"
-                  disabled={installDisabled}
-                  aria-busy={isInstalling}
-                  onClick={() => handleStartInstall(selectedEngine)}
-                >
-                  {isInstalling ? (
-                    <span className="spinner" aria-hidden="true" />
-                  ) : (
-                    <IconShield size={14} />
-                  )}
-                  <span>
-                    {isInstalling
-                      ? tInstallation(lang, "btnInstalling")
-                      : tInstallation(lang, "btnInstallAndProtect")}
-                  </span>
-                </button>
-
-                {!showReleaseCard ? (
+                <div className="install-actions-group">
                   <button
+                    ref={primaryInstallBtnRef}
                     type="button"
-                    className="btn btn-secondary"
-                    disabled={checkingUpdates || isAnyServiceBusy}
-                    aria-busy={checkingUpdates}
-                    onClick={() => {
-                      void onCheckUpdates(true);
-                    }}
+                    className="btn btn-primary"
+                    disabled={installDisabled}
+                    aria-busy={isInstalling}
+                    onClick={() => handleStartInstall(selectedEngine)}
                   >
-                    {checkingUpdates ? (
+                    {isInstalling ? (
                       <span className="spinner" aria-hidden="true" />
                     ) : (
-                      <IconRefresh size={14} />
+                      <IconShield size={14} />
                     )}
                     <span>
-                      {checkingUpdates
-                        ? tInstallation(lang, "btnChecking")
-                        : tInstallation(lang, "btnCheckUpdates")}
+                      {isInstalling
+                        ? tInstallation(lang, "btnInstalling")
+                        : tInstallation(lang, "btnInstallAndProtect")}
                     </span>
                   </button>
-                ) : null}
+                </div>
               </div>
 
               {renderProgressTrack()}
@@ -1420,7 +2008,7 @@ function InstallationViewComponent({
                 type="button"
                 className="install-details__trigger"
                 aria-expanded={detailsOpen}
-                aria-controls={detailsPanelId}
+                aria-controls={detailsOpen ? detailsPanelId : undefined}
                 onClick={() => setDetailsOpen((prev) => !prev)}
               >
                 <span>{tInstallation(lang, "detailsToggleLabel")}</span>
@@ -1446,21 +2034,77 @@ function InstallationViewComponent({
                   <IconShield size={16} />
                 </span>
                 <h2
-                  id={`${idPrefix}-engine-heading`}
+                  ref={engineHeadingRef}
+                  id={engineHeadingId}
+                  tabIndex={-1}
                   className="install-card__title"
                 >
                   {tInstallation(lang, "engineCardTitle")}
                 </h2>
               </div>
               <span className={installedBadge.className}>
-                {relation === "up_to_date" ? (
-                  <IconCheck size={11} />
-                ) : null}
+                {installedBadge.showCheck ? <IconCheck size={11} /> : null}
                 <span>{installedBadge.label}</span>
               </span>
             </div>
 
             <div className="install-card__body">
+              {/* Post-install success callout */}
+              {showPostInstallCallout ? (
+                <div
+                  className="install-callout install-callout--success"
+                  role="status"
+                  aria-live="polite"
+                >
+                  <div className="install-callout__head">
+                    <div className="install-callout__copy">
+                      <p className="install-callout__title">
+                        {serviceState === "running" || isProtectionRunning
+                          ? tInstallation(lang, "postInstallActiveTitle")
+                          : tInstallation(lang, "postInstallReadyTitle")}
+                      </p>
+                      <p className="install-callout__desc">
+                        {serviceState === "running" || isProtectionRunning
+                          ? tInstallation(lang, "postInstallActiveDesc")
+                          : tInstallation(lang, "postInstallReadyDesc")}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      className="install-error__dismiss"
+                      aria-label={tInstallation(lang, "btnDismissNotice")}
+                      onClick={() => {
+                        setShowPostInstallCallout(false);
+                        engineHeadingRef.current?.focus();
+                      }}
+                    >
+                      <IconClose size={14} />
+                    </button>
+                  </div>
+                  <div className="install-actions-group">
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-sm"
+                      onClick={() => onNavigate("overview")}
+                    >
+                      <span>{tInstallation(lang, "btnGoToOverview")}</span>
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+
+              {/* Installed TUN mode Wintun warning */}
+              {showInstalledWintunWarning ? (
+                renderWintunCallout(true)
+              ) : wintunRecheckFeedback === "ready" && wintunFeedbackText ? (
+                <div
+                  className="install-callout install-callout--success"
+                  role="status"
+                  aria-live="polite"
+                >
+                  <p className="install-callout__desc">{wintunFeedbackText}</p>
+                </div>
+              ) : null}
               {/* Bundled Engine Upgrade Callout */}
               {isUpgradeAvailable && bundledDisplay ? (
                 <div className="install-callout install-callout--accent">
@@ -1522,6 +2166,26 @@ function InstallationViewComponent({
                     <p className="install-callout__desc">
                       {tInstallation(lang, "repairNeededDesc")}
                     </p>
+                  </div>
+                  <div className="install-actions-group">
+                    <button
+                      type="button"
+                      className="btn btn-primary btn-sm"
+                      disabled={repairDisabled}
+                      aria-busy={isRepairing}
+                      onClick={() => setConfirmRepairOpen(true)}
+                    >
+                      {isRepairing ? (
+                        <span className="spinner" aria-hidden="true" />
+                      ) : (
+                        <IconRefresh size={13} />
+                      )}
+                      <span>
+                        {isRepairing
+                          ? tInstallation(lang, "btnRepairing")
+                          : tInstallation(lang, "btnRepairReinstall")}
+                      </span>
+                    </button>
                   </div>
                 </div>
               ) : null}
@@ -1594,61 +2258,37 @@ function InstallationViewComponent({
                 </div>
 
                 <div className="install-meta-item">
-                  <span className="install-meta-label">
+                  <span
+                    id={installedEngineLabelId}
+                    className="install-meta-label"
+                  >
                     {tInstallation(lang, "metaEngineMode")}
                   </span>
                   {onSwitchEngine ? (
-                    <div
-                      className="segmented"
-                      role="group"
-                      aria-label={tInstallation(lang, "switchEngineGroupAria")}
-                      style={{ alignSelf: "flex-start", marginTop: 2 }}
-                    >
-                      <button
-                        type="button"
-                        className={
-                          activeEngine === "proxy"
-                            ? "segmented-item active"
-                            : "segmented-item"
-                        }
-                        aria-pressed={activeEngine === "proxy"}
+                    <>
+                      <SegmentedControl<EngineMode>
+                        size="sm"
+                        className="install-meta-segmented"
+                        options={engineSwitchOptions}
+                        value={activeEngine}
                         disabled={isAnyServiceBusy}
-                        onClick={() => {
-                          if (activeEngine !== "proxy") {
-                            onClearInstallError();
-                            void onSwitchEngine("proxy");
-                          }
-                        }}
-                      >
-                        {tInstallation(lang, "switchEngineProxy")}
-                      </button>
-                      <button
-                        type="button"
-                        className={
-                          activeEngine === "tun"
-                            ? "segmented-item active"
-                            : "segmented-item"
+                        ariaLabelledBy={installedEngineLabelId}
+                        ariaDescribedBy={
+                          tunSwitchBlocked ? installedEngineHintId : undefined
                         }
-                        aria-pressed={activeEngine === "tun"}
-                        disabled={
-                          isAnyServiceBusy ||
-                          (platform === "windows" && !status.wintun.ready && activeEngine !== "tun")
-                        }
-                        title={
-                          platform === "windows" && !status.wintun.ready && activeEngine !== "tun"
-                            ? tInstallation(lang, "switchEngineWintunMissing")
-                            : undefined
-                        }
-                        onClick={() => {
-                          if (activeEngine !== "tun") {
-                            onClearInstallError();
-                            void onSwitchEngine("tun");
-                          }
-                        }}
-                      >
-                        {tInstallation(lang, "switchEngineTun")}
-                      </button>
-                    </div>
+                        onChange={handleRequestSwitchEngine}
+                      />
+                      {tunSwitchBlocked ? (
+                        <p
+                          id={installedEngineHintId}
+                          className="install-meta-hint"
+                        >
+                          {wintunInvalid
+                            ? tInstallation(lang, "switchEngineWintunInvalid")
+                            : tInstallation(lang, "switchEngineWintunMissing")}
+                        </p>
+                      ) : null}
+                    </>
                   ) : (
                     <span className="install-meta-value">
                       {activeEngine === "tun"
@@ -1678,20 +2318,6 @@ function InstallationViewComponent({
                     </span>
                   </span>
                 </div>
-
-                {status.configPath ? (
-                  <div className="install-meta-item install-meta-item--full">
-                    <span className="install-meta-label">
-                      {tInstallation(lang, "metaConfigPath")}
-                    </span>
-                    <span
-                      className="install-meta-path"
-                      title={status.configPath}
-                    >
-                      {status.configPath}
-                    </span>
-                  </div>
-                ) : null}
               </div>
             </div>
 
@@ -1741,7 +2367,7 @@ function InstallationViewComponent({
 
               <button
                 type="button"
-                className="btn btn-danger"
+                className="btn btn-danger install-footer-danger"
                 disabled={isAnyServiceBusy}
                 aria-busy={isUninstalling}
                 onClick={() => setConfirmUninstallOpen(true)}
@@ -1808,6 +2434,7 @@ function InstallationViewComponent({
             <button
               type="button"
               className="btn btn-secondary btn-sm"
+              aria-label={tInstallation(lang, "btnOpenConfigFolderAria")}
               onClick={() => {
                 void onOpenAppFolder("config");
               }}
@@ -1832,6 +2459,7 @@ function InstallationViewComponent({
             <button
               type="button"
               className="btn btn-secondary btn-sm"
+              aria-label={tInstallation(lang, "btnOpenLogsFolderAria")}
               onClick={() => {
                 void onOpenAppFolder("logs");
               }}
@@ -1842,6 +2470,35 @@ function InstallationViewComponent({
           </div>
         </div>
       </section>
+
+      {/* Engine Switch Confirm Dialog (active protection) */}
+      <ConfirmDialog
+        open={pendingSwitchEngine !== null}
+        title={
+          pendingSwitchEngine === "proxy"
+            ? tInstallation(lang, "switchEngineProxyTitle")
+            : tInstallation(lang, "switchEngineTunTitle")
+        }
+        description={
+          pendingSwitchEngine === "proxy"
+            ? tInstallation(lang, "switchEngineProxyDesc", {
+                adminNote: switchEngineAdminNote,
+              })
+            : tInstallation(lang, "switchEngineTunDesc", {
+                adminNote: switchEngineAdminNote,
+              })
+        }
+        confirmLabel={
+          pendingSwitchEngine === "proxy"
+            ? tInstallation(lang, "switchEngineProxyConfirm")
+            : tInstallation(lang, "switchEngineTunConfirm")
+        }
+        cancelLabel={tInstallation(lang, "cancel")}
+        onConfirm={() => {
+          void handleConfirmSwitchEngine();
+        }}
+        onCancel={() => setPendingSwitchEngine(null)}
+      />
 
       {/* Repair / Reinstall Confirm Dialog */}
       <ConfirmDialog
@@ -1897,7 +2554,10 @@ function InstallationViewComponent({
   );
 }
 
-export const InstallationView = memo(InstallationViewComponent);
+export const InstallationView = memo(
+  InstallationViewComponent,
+  areInstallationPropsEqual,
+);
 InstallationView.displayName = "InstallationView";
 
 export default InstallationView;

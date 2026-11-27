@@ -230,11 +230,19 @@ impl BinaryFileMetadata {
     }
 
     /// Captures `(path, len, mtime)` via `symlink_metadata` without following
-    /// symlinks; returns `None` when missing, a symlink/reparse point, or not
-    /// a regular file.
+    /// symlinks or Windows reparse points; returns `None` when missing, a
+    /// symlink/reparse point, or not a regular file.
     pub fn from_regular_file(path: &Path) -> Option<Self> {
         let meta = std::fs::symlink_metadata(path).ok()?;
-        if !meta.is_file() {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+            if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                return None;
+            }
+        }
+        if meta.file_type().is_symlink() || !meta.is_file() {
             return None;
         }
         Some(Self::from_metadata(path.to_path_buf(), &meta))
@@ -372,12 +380,26 @@ impl BinaryMetadataCache {
     }
 }
 
+/// Returns `true` when `op` is a mutating install/upgrade/repair/uninstall
+/// service operation that modifies service binaries on disk.
+pub const fn is_mutating_install_operation(op: Option<ServiceOperationDto>) -> bool {
+    matches!(
+        op,
+        Some(
+            ServiceOperationDto::Installing
+                | ServiceOperationDto::Upgrading
+                | ServiceOperationDto::Repairing
+                | ServiceOperationDto::Uninstalling
+        )
+    )
+}
+
 /// Shared runtime state managed by Tauri for the desktop application.
 #[derive(Debug)]
 pub struct DesktopAppState {
     /// Serializes all service and configuration mutations across Tauri
     /// commands and tray actions.
-    pub action_lock: tokio::sync::Mutex<()>,
+    pub action_lock: Arc<tokio::sync::Mutex<()>>,
     /// Serializes GUI preference writes independently of `action_lock` so
     /// saving local preferences never blocks behind long-running elevated
     /// service actions.
@@ -412,7 +434,7 @@ impl Default for DesktopAppState {
 impl DesktopAppState {
     pub fn new(preferences: GuiPreferencesDto) -> Self {
         Self {
-            action_lock: tokio::sync::Mutex::new(()),
+            action_lock: Arc::new(tokio::sync::Mutex::new(())),
             prefs_lock: tokio::sync::Mutex::new(()),
             snapshot_lock: Mutex::new(()),
             snapshot_seq: AtomicU64::new(0),
@@ -474,15 +496,7 @@ impl DesktopAppState {
     /// is actively modifying the installed service binaries so the background
     /// poller avoids probing or locking binaries mid-swap.
     pub fn is_mutating_install_operation_active(&self) -> bool {
-        matches!(
-            self.active_operation(),
-            Some(
-                ServiceOperationDto::Installing
-                    | ServiceOperationDto::Upgrading
-                    | ServiceOperationDto::Repairing
-                    | ServiceOperationDto::Uninstalling
-            )
-        )
+        is_mutating_install_operation(self.active_operation())
     }
 
     /// Marks the main window as restoring for `duration` so transient resize

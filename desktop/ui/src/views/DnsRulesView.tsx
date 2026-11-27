@@ -17,6 +17,7 @@ import {
   translateCustomDnsError,
   type DnsStringKey,
 } from "../i18n/dns";
+import { localizeActionMessage, tShell } from "../i18n/shell";
 import {
   isKnownPublicDohIp,
   redactDnsPreview,
@@ -40,7 +41,7 @@ export interface DnsRulesViewProps {
   status: DesktopStatusSnapshot | null;
   serviceState?: ServiceState;
   busyAction?: string | null;
-  onSaved?: () => void | Promise<void>;
+  onSaved?: (snapshot?: DesktopStatusSnapshot) => void | Promise<void>;
   onPushToast?: (tone: ToastTone, message: string) => void;
   onDirtyChange?: (dirty: boolean) => void;
   onNavigate?: (tab: NavTab) => void;
@@ -1065,6 +1066,7 @@ function DnsRulesViewComponent({
   settings,
   status,
   serviceState,
+  busyAction = null,
   onSaved,
   onPushToast,
   onDirtyChange,
@@ -1296,7 +1298,11 @@ function DnsRulesViewComponent({
   ]);
 
   const isDirty = dirtyChanges.length > 0;
-  const canSave = isDirty && activeDnsAnalysis.valid && !saving;
+  const normalizedBusy = busyAction?.trim().toLowerCase() ?? null;
+  const isExternalBusy =
+    normalizedBusy !== null || Boolean(status?.pendingOperation);
+  const canSave =
+    isDirty && activeDnsAnalysis.valid && !saving && !isExternalBusy;
 
   useEffect(() => {
     onDirtyChange?.(isDirty);
@@ -1395,19 +1401,50 @@ function DnsRulesViewComponent({
       const result = await saveDnsRules(payload);
       if (!mountedRef.current) return;
 
+      const localizedResultMessage = result.message?.trim()
+        ? localizeActionMessage(
+            langRef.current,
+            scrubUrlsInText(result.message.trim()),
+          )
+        : null;
+
       if (result.cancelled) {
         setRevealCustom(false);
-        const cancelMessage = scrubUrlsInText(
-          result.message?.trim() || tDns(langRef.current, "saveCancelled"),
-        );
+        const cancelMessage =
+          localizedResultMessage || tDns(langRef.current, "saveCancelled");
         setErrorBanner(null);
         onPushToast?.("info", cancelMessage);
         if (
+          result.snapshot ||
           typeof result.needsRestart === "boolean" ||
           /\bsaved\b/i.test(result.message ?? "")
         ) {
           try {
-            await onSaved?.();
+            await onSaved?.(result.snapshot);
+          } catch {
+            // Parent refresh errors are handled upstream.
+          }
+        }
+        return;
+      }
+
+      if (
+        !result.ok &&
+        (result.code === "busy" || result.code === "shutting_down")
+      ) {
+        setErrorBanner(null);
+        onPushToast?.(
+          "info",
+          tShell(
+            langRef.current,
+            result.code === "shutting_down"
+              ? "actionShuttingDown"
+              : "actionBusy",
+          ),
+        );
+        if (result.snapshot) {
+          try {
+            await onSaved?.(result.snapshot);
           } catch {
             // Parent refresh errors are handled upstream.
           }
@@ -1416,19 +1453,19 @@ function DnsRulesViewComponent({
       }
 
       if (!result.ok) {
-        const message = scrubUrlsInText(
-          result.message?.trim() || tDns(langRef.current, "saveFailed"),
-        );
+        const message =
+          localizedResultMessage || tDns(langRef.current, "saveFailed");
         setErrorBanner(message);
         onPushToast?.("error", message);
 
         const partialConfigPersisted =
+          Boolean(result.snapshot) ||
           typeof result.needsRestart === "boolean" ||
           /\bsaved\b/i.test(result.message ?? "");
         if (partialConfigPersisted) {
           keepErrorBannerOnNextSyncRef.current = true;
           try {
-            await onSaved?.();
+            await onSaved?.(result.snapshot);
           } catch {
             // Parent refresh errors are handled upstream.
           } finally {
@@ -1455,24 +1492,26 @@ function DnsRulesViewComponent({
       setRevealCustom(false);
       setResetNonce((prev) => prev + 1);
 
-      const successMessage = scrubUrlsInText(
-        result.message?.trim() ||
-          tDns(
-            langRef.current,
-            result.needsRestart ? "saveSuccessRestart" : "saveSuccess",
-          ),
-      );
+      const successMessage =
+        localizedResultMessage ||
+        tDns(
+          langRef.current,
+          result.needsRestart ? "saveSuccessRestart" : "saveSuccess",
+        );
       onPushToast?.(result.needsRestart ? "warn" : "success", successMessage);
 
       try {
-        await onSaved?.();
+        await onSaved?.(result.snapshot);
       } catch {
         // Parent refresh errors are handled upstream; keep saved baseline intact.
       }
     } catch (error) {
       if (!mountedRef.current) return;
-      const message = scrubUrlsInText(
-        getErrorMessage(error, tDns(langRef.current, "saveFailed")),
+      const message = localizeActionMessage(
+        langRef.current,
+        scrubUrlsInText(
+          getErrorMessage(error, tDns(langRef.current, "saveFailed")),
+        ),
       );
       setErrorBanner(message);
       onPushToast?.("error", message);
@@ -2181,6 +2220,7 @@ function areDnsRulesPropsEqual(
     prevStatus.serviceState === nextStatus.serviceState &&
     prevStatus.configuredEngine === nextStatus.configuredEngine &&
     prevStatus.vpnConflict === nextStatus.vpnConflict &&
+    prevStatus.pendingOperation === nextStatus.pendingOperation &&
     (prevLive?.running ?? false) === (nextLive?.running ?? false) &&
     prevLive?.engine === nextLive?.engine &&
     prevLive?.dnsDisplay === nextLive?.dnsDisplay &&

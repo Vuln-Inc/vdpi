@@ -176,7 +176,7 @@ For anti-DPI framing modes (`--mode combo` default with 7-stage self-healing aut
 `vdpi` supports **English** and **Turkish (`Türkçe`)** across the Desktop GUI, Control Center TUI, Android, and iOS.
 
 - **Automatic detection:** By default, `vdpi` follows your OS locale and launches in Turkish when your system language is set to Turkish, or English otherwise.
-- **Manual override:** Switch languages anytime in **Settings** (Desktop GUI, Android, and iOS), inside the Control Center TUI, or by setting `language` in `config.toml` (`"system"`, `"en"`, or `"tr"`).
+- **Manual override:** Switch languages anytime in **Settings** (Desktop GUI, Android, and iOS), inside the Control Center TUI, or by setting `language` in `config.toml` (`"auto"`, `"en"`, or `"tr"`).
 
 ---
 

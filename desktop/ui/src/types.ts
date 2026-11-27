@@ -38,6 +38,7 @@ export type ActionErrorCode =
   | "version_unknown"
   | "bundled_cli_missing"
   | "wintun_missing"
+  | "wintun_invalid"
   | "already_up_to_date";
 
 export interface LiveTelemetry {

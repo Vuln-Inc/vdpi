@@ -19,7 +19,11 @@ import { Switch } from "../components/Switch";
 import type { ToastTone } from "../components/ToastStack";
 import { useLang, type ResolvedLanguage } from "../i18n/context";
 import { tSettings } from "../i18n/settings";
-import { LANGUAGE_STORAGE_KEY, localizeActionMessage } from "../i18n/shell";
+import {
+  LANGUAGE_STORAGE_KEY,
+  localizeActionMessage,
+  tShell,
+} from "../i18n/shell";
 import { scrubUrlsInText } from "../lib/format";
 import {
   checkUpdates,
@@ -48,6 +52,10 @@ export interface SettingsViewProps {
   status: DesktopStatusSnapshot | null;
   settings: DesktopSettingsPayload | null;
   busyAction?: string | null;
+  updateInfo?: UpdateCheckPayload | null;
+  checkingUpdates?: boolean;
+  onCheckUpdates?: (manual?: boolean) => void | Promise<void>;
+  onOpenReleaseUrl?: (url: string) => void | Promise<void>;
   onPreferencesPreview?: (prefs: GuiPreferences) => void;
   onPreferencesChanged: (prefs: GuiPreferences) => void | Promise<void>;
   onRefreshSettings?: () => void | Promise<unknown>;
@@ -255,6 +263,12 @@ const FALLBACK_STYLES = `
   color: var(--accent-fg, #60A5FA);
 }
 
+:where(.settings-badge--warn) {
+  border-color: var(--status-amber-border, rgba(255, 159, 10, 0.28));
+  background: var(--status-amber-bg, rgba(255, 159, 10, 0.12));
+  color: var(--status-amber-fg, #FF9F0A);
+}
+
 :where(.settings-badge__dot) {
   width: 6px;
   height: 6px;
@@ -417,7 +431,8 @@ function formatVersion(version: string | null | undefined): string {
   if (!version) return "-";
   const trimmed = version.trim();
   if (!trimmed) return "-";
-  return trimmed.startsWith("v") ? trimmed : `v${trimmed}`;
+  const bare = trimmed.replace(/^[vV]/, "");
+  return bare ? `v${bare}` : "-";
 }
 
 function getErrorMessage(err: unknown, fallback: string): string {
@@ -519,6 +534,10 @@ function SettingsViewComponent({
   status,
   settings,
   busyAction = null,
+  updateInfo,
+  checkingUpdates: checkingUpdatesProp,
+  onCheckUpdates,
+  onOpenReleaseUrl,
   onPreferencesPreview,
   onPreferencesChanged,
   onRefreshSettings,
@@ -580,10 +599,9 @@ function SettingsViewComponent({
   >(null);
   const [confirmUninstallOpen, setConfirmUninstallOpen] = useState(false);
 
-  const [checkingUpdates, setCheckingUpdates] = useState(false);
-  const [updateResult, setUpdateResult] = useState<UpdateCheckPayload | null>(
-    null,
-  );
+  const [localCheckingUpdates, setLocalCheckingUpdates] = useState(false);
+  const [localUpdateResult, setLocalUpdateResult] =
+    useState<UpdateCheckPayload | null>(null);
   const [updateError, setUpdateError] = useState<string | null>(null);
 
   const [openingFolder, setOpeningFolder] = useState<"config" | "logs" | null>(
@@ -591,6 +609,13 @@ function SettingsViewComponent({
   );
   const [openingExternal, setOpeningExternal] = useState(false);
   const [quitting, setQuitting] = useState(false);
+
+  const checkingUpdates =
+    checkingUpdatesProp !== undefined
+      ? checkingUpdatesProp
+      : localCheckingUpdates;
+  const updateResult =
+    updateInfo !== undefined ? updateInfo : localUpdateResult;
 
   useEffect(() => {
     if (settings?.gui) {
@@ -623,6 +648,13 @@ function SettingsViewComponent({
 
   const serviceState = status?.serviceState;
   const serviceInfo = formatServiceState(serviceState, lang);
+
+  useEffect(() => {
+    if (serviceState === "not_installed" && confirmUninstallOpen) {
+      setConfirmUninstallOpen(false);
+    }
+  }, [confirmUninstallOpen, serviceState]);
+
   const configuredEngine: EngineMode =
     status?.configuredEngine ?? settings?.engine ?? "tun";
   const wintunMissing = Boolean(
@@ -631,6 +663,12 @@ function SettingsViewComponent({
       !status.wintun.ready,
   );
   const installBlockedByWintun = wintunMissing && configuredEngine === "tun";
+  const bundleMissing = status?.canInstallFromBundle === false;
+  const isRepairNeeded = Boolean(
+    status &&
+      serviceState !== "not_installed" &&
+      status.cliVersionRelation === "repair_needed",
+  );
   const normalizedBusy = busyAction?.trim().toLowerCase() ?? null;
   const isCentralBusy = normalizedBusy !== null;
   const isInstalling =
@@ -648,9 +686,7 @@ function SettingsViewComponent({
   const anyServiceBusy =
     serviceBusy !== null ||
     isCentralBusy ||
-    isInstalling ||
-    isUpgrading ||
-    isUninstalling;
+    Boolean(status?.pendingOperation);
   const showUpgradeAction = Boolean(
     onUpgradeService &&
       status &&
@@ -693,7 +729,6 @@ function SettingsViewComponent({
     setSavingPrefs(true);
     try {
       const response: unknown = await saveGuiPreferences(next);
-      if (!mountedRef.current) return;
       const action = asActionResult(response);
       if (action && !action.ok) {
         let refreshed: unknown = null;
@@ -704,7 +739,6 @@ function SettingsViewComponent({
             refreshed = null;
           }
         }
-        if (!mountedRef.current) return;
         if (
           refreshed &&
           typeof refreshed === "object" &&
@@ -717,38 +751,59 @@ function SettingsViewComponent({
             language: persistedGui.language ?? previous.language ?? "system",
           };
           confirmedPrefsRef.current = mergedPersisted;
-          setPrefs(mergedPersisted);
+          if (mountedRef.current) {
+            setPrefs(mergedPersisted);
+          }
           onPreferencesPreview?.(mergedPersisted);
         } else if (!refreshed) {
-          setPrefs(previous);
+          if (mountedRef.current) {
+            setPrefs(previous);
+          }
           onPreferencesPreview?.(previous);
         }
-        onPushToast(
-          "error",
-          localizeActionMessage(
-            lang,
-            scrubUrlsInText(
-              action.message?.trim() || tSettings(lang, "savePrefsFailed"),
+        if (action.code === "shutting_down" || action.code === "busy") {
+          onPushToast(
+            "info",
+            tShell(
+              lang,
+              action.code === "shutting_down"
+                ? "actionShuttingDown"
+                : "actionBusy",
             ),
-          ),
-        );
+          );
+        } else {
+          onPushToast(
+            "error",
+            localizeActionMessage(
+              lang,
+              scrubUrlsInText(
+                action.message?.trim() || tSettings(lang, "savePrefsFailed"),
+              ),
+            ),
+          );
+        }
         return;
       }
       const resolved: GuiPreferences = isGuiPreferences(response)
         ? { ...response, language: response.language ?? next.language }
         : next;
       confirmedPrefsRef.current = resolved;
-      setPrefs(resolved);
+      if (mountedRef.current) {
+        setPrefs(resolved);
+      }
       await onPreferencesChanged(resolved);
     } catch (err) {
       if (mountedRef.current) {
         setPrefs(previous);
-        onPreferencesPreview?.(previous);
-        onPushToast(
-          "error",
-          getErrorMessage(err, tSettings(lang, "savePrefsFailed")),
-        );
       }
+      onPreferencesPreview?.(previous);
+      onPushToast(
+        "error",
+        localizeActionMessage(
+          lang,
+          getErrorMessage(err, tSettings(lang, "savePrefsFailed")),
+        ),
+      );
     } finally {
       savingPrefsRef.current = false;
       if (mountedRef.current) {
@@ -897,27 +952,50 @@ function SettingsViewComponent({
   };
 
   const handleCheckUpdates = async () => {
-    if (checkingUpdatesRef.current) return;
+    if (checkingUpdatesRef.current || checkingUpdates) return;
     checkingUpdatesRef.current = true;
-    setCheckingUpdates(true);
     setUpdateError(null);
+    if (onCheckUpdates) {
+      if (checkingUpdatesProp === undefined) {
+        setLocalCheckingUpdates(true);
+      }
+      try {
+        await onCheckUpdates(true);
+      } catch (err) {
+        if (!mountedRef.current) return;
+        const message = getErrorMessage(
+          err,
+          tSettings(lang, "checkUpdatesFailed"),
+        );
+        setUpdateError(message);
+        onPushToast("error", message);
+      } finally {
+        checkingUpdatesRef.current = false;
+        if (mountedRef.current && checkingUpdatesProp === undefined) {
+          setLocalCheckingUpdates(false);
+        }
+      }
+      return;
+    }
+
+    setLocalCheckingUpdates(true);
     try {
-      const result = await checkUpdates();
+      const result = await checkUpdates(true);
       if (!mountedRef.current) return;
-      setUpdateResult(result);
+      setLocalUpdateResult(result);
     } catch (err) {
       if (!mountedRef.current) return;
       const message = getErrorMessage(
         err,
         tSettings(lang, "checkUpdatesFailed"),
       );
-      setUpdateResult(null);
+      setLocalUpdateResult(null);
       setUpdateError(message);
       onPushToast("error", message);
     } finally {
       checkingUpdatesRef.current = false;
       if (mountedRef.current) {
-        setCheckingUpdates(false);
+        setLocalCheckingUpdates(false);
       }
     }
   };
@@ -926,6 +1004,28 @@ function SettingsViewComponent({
     if (openingExternalRef.current) return;
     openingExternalRef.current = true;
     setOpeningExternal(true);
+    if (onOpenReleaseUrl) {
+      try {
+        await onOpenReleaseUrl(url);
+      } catch (err) {
+        if (mountedRef.current) {
+          onPushToast(
+            "error",
+            localizeActionMessage(
+              lang,
+              getErrorMessage(err, tSettings(lang, "openReleaseFailed")),
+            ),
+          );
+        }
+      } finally {
+        openingExternalRef.current = false;
+        if (mountedRef.current) {
+          setOpeningExternal(false);
+        }
+      }
+      return;
+    }
+
     try {
       const response: unknown = await openExternalUrl(url);
       if (!mountedRef.current) return;
@@ -937,7 +1037,10 @@ function SettingsViewComponent({
       if (mountedRef.current) {
         onPushToast(
           "error",
-          getErrorMessage(err, tSettings(lang, "openReleaseFailed")),
+          localizeActionMessage(
+            lang,
+            getErrorMessage(err, tSettings(lang, "openReleaseFailed")),
+          ),
         );
       }
     } finally {
@@ -965,7 +1068,10 @@ function SettingsViewComponent({
       }
     } catch (err) {
       if (mountedRef.current) {
-        onPushToast("error", getErrorMessage(err, folderFailMsg));
+        onPushToast(
+          "error",
+          localizeActionMessage(lang, getErrorMessage(err, folderFailMsg)),
+        );
       }
     } finally {
       openingFolderRef.current = false;
@@ -1009,7 +1115,10 @@ function SettingsViewComponent({
       if (mountedRef.current) {
         onPushToast(
           "error",
-          getErrorMessage(err, tSettings(lang, "quitGuiFailed")),
+          localizeActionMessage(
+            lang,
+            getErrorMessage(err, tSettings(lang, "quitGuiFailed")),
+          ),
         );
         setQuitting(false);
       }
@@ -1018,6 +1127,15 @@ function SettingsViewComponent({
   };
 
   const safeReleaseUrl = sanitizeExternalUrl(updateResult?.releaseUrl);
+  const cleanedReleaseNotes = useMemo(
+    () =>
+      (updateResult?.releaseNotes ?? [])
+        .map((note) =>
+          scrubUrlsInText(note.trim().replace(/^[-*•]\s+/, "").trim()),
+        )
+        .filter((note) => note.length > 0),
+    [updateResult?.releaseNotes],
+  );
 
   const keepInTrayLabelId = `${idPrefix}-keep-in-tray-label`;
   const keepInTrayDescId = `${idPrefix}-keep-in-tray-desc`;
@@ -1223,13 +1341,24 @@ function SettingsViewComponent({
               {tSettings(lang, "serviceHeading")}
             </h2>
           </div>
-          <span
-            className={serviceInfo.badgeClass}
-            data-service-state={serviceState ?? "loading"}
-          >
-            <span className="settings-badge__dot" aria-hidden="true" />
-            {serviceInfo.label}
-          </span>
+          <div className="settings-actions-group">
+            {isRepairNeeded ? (
+              <span
+                className="settings-badge settings-badge--warn"
+                data-cli-relation="repair_needed"
+              >
+                <span className="settings-badge__dot" aria-hidden="true" />
+                {tSettings(lang, "badgeRepairNeeded")}
+              </span>
+            ) : null}
+            <span
+              className={serviceInfo.badgeClass}
+              data-service-state={serviceState ?? "loading"}
+            >
+              <span className="settings-badge__dot" aria-hidden="true" />
+              {serviceInfo.label}
+            </span>
+          </div>
         </div>
 
         <div className="settings-list">
@@ -1250,11 +1379,18 @@ function SettingsViewComponent({
               {onNavigate ? (
                 <button
                   type="button"
-                  className="btn btn-secondary"
+                  className={isRepairNeeded ? "btn btn-primary" : "btn btn-secondary"}
                   disabled={anyServiceBusy}
                   onClick={() => onNavigate("installation")}
                 >
-                  <span>{tSettings(lang, "btnOpenInstallation")}</span>
+                  <span>
+                    {tSettings(
+                      lang,
+                      isRepairNeeded
+                        ? "btnRepairInInstallation"
+                        : "btnOpenInstallation",
+                    )}
+                  </span>
                 </button>
               ) : null}
               {showUpgradeAction ? (
@@ -1264,7 +1400,7 @@ function SettingsViewComponent({
                   disabled={
                     !status ||
                     anyServiceBusy ||
-                    status.canInstallFromBundle === false
+                    bundleMissing
                   }
                   aria-busy={isUpgrading}
                   onClick={() => {
@@ -1289,7 +1425,7 @@ function SettingsViewComponent({
                     !status ||
                     anyServiceBusy ||
                     installBlockedByWintun ||
-                    status.canInstallFromBundle === false
+                    bundleMissing
                   }
                   aria-busy={isInstalling}
                   onClick={() => {
@@ -1326,6 +1462,16 @@ function SettingsViewComponent({
             </div>
           </div>
         </div>
+        {isRepairNeeded ? (
+          <p className="settings-note">
+            {tSettings(lang, "serviceRepairNeededNote")}
+          </p>
+        ) : null}
+        {bundleMissing ? (
+          <p className="settings-note">
+            {tSettings(lang, "serviceBundleMissingNote")}
+          </p>
+        ) : null}
         {serviceState === "not_installed" && installBlockedByWintun ? (
           <p className="settings-note">
             {tSettings(lang, "serviceWintunMissingNote")}
@@ -1531,9 +1677,9 @@ function SettingsViewComponent({
                 )}
               </p>
 
-              {updateResult.hasUpdate && updateResult.releaseNotes.length > 0 ? (
+              {updateResult.hasUpdate && cleanedReleaseNotes.length > 0 ? (
                 <ul className="settings-update-notes">
-                  {updateResult.releaseNotes.map((note, idx) => (
+                  {cleanedReleaseNotes.map((note, idx) => (
                     <li key={`${idx}-${note}`}>{note}</li>
                   ))}
                 </ul>
@@ -1690,6 +1836,10 @@ function areSettingsPropsEqual(
   if (
     prev.settings !== next.settings ||
     prev.busyAction !== next.busyAction ||
+    prev.updateInfo !== next.updateInfo ||
+    prev.checkingUpdates !== next.checkingUpdates ||
+    prev.onCheckUpdates !== next.onCheckUpdates ||
+    prev.onOpenReleaseUrl !== next.onOpenReleaseUrl ||
     prev.onPreferencesPreview !== next.onPreferencesPreview ||
     prev.onPreferencesChanged !== next.onPreferencesChanged ||
     prev.onRefreshSettings !== next.onRefreshSettings ||

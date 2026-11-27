@@ -523,17 +523,30 @@ fn is_filesystem_or_known_root(dir: &Path, roots: &[PathBuf]) -> bool {
         .any(|root| matches!(split_under_root(dir, root), Some((_, rest)) if rest.is_empty()))
 }
 
+fn reject_ancestor_symlink_or_reparse(path: &Path) -> Result<(), String> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink()
+            && is_allowed_os_system_symlink(path, &meta)
+            && fs::metadata(path).is_ok_and(|target| target.is_dir())
+        {
+            return Ok(());
+        }
+    }
+    platform_fs::reject_symlink_or_reparse(path)
+}
+
 fn check_ancestors_under_roots(parent: &Path, roots: &[PathBuf]) -> Result<(), String> {
     let mut checked_any_root = false;
     for root in roots {
         if let Some((mut cur, rest)) = split_under_root(parent, root) {
             checked_any_root = true;
             if cur.parent().is_some() {
-                platform_fs::reject_symlink_or_reparse(&cur)?;
+                reject_ancestor_symlink_or_reparse(&cur)?;
             }
             for seg in rest {
                 cur.push(seg);
-                platform_fs::reject_symlink_or_reparse(&cur)?;
+                reject_ancestor_symlink_or_reparse(&cur)?;
             }
         }
     }
@@ -553,7 +566,7 @@ fn check_ancestors_under_roots(parent: &Path, roots: &[PathBuf]) -> Result<(), S
                 }
                 Component::Normal(seg) => {
                     cur.push(seg);
-                    platform_fs::reject_symlink_or_reparse(&cur)?;
+                    reject_ancestor_symlink_or_reparse(&cur)?;
                 }
             }
         }
@@ -673,36 +686,63 @@ fn is_valid_vdpi_cli_candidate(path: &Path) -> bool {
     true
 }
 
+#[cfg(target_os = "linux")]
+fn lookup_linux_staff_gid() -> Option<u32> {
+    use std::ffi::CString;
+    use std::mem::MaybeUninit;
+
+    let name = CString::new("staff").ok()?;
+    let mut buf_len = 1024usize;
+    for _ in 0..4 {
+        let mut grp = MaybeUninit::<libc::group>::zeroed();
+        let mut buf = vec![0u8; buf_len];
+        let mut result: *mut libc::group = std::ptr::null_mut();
+        // SAFETY: `name` is NUL-terminated; `grp`, `buf`, and `result` are valid writable pointers.
+        let rc = unsafe {
+            libc::getgrnam_r(
+                name.as_ptr(),
+                grp.as_mut_ptr(),
+                buf.as_mut_ptr().cast::<libc::c_char>(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        if rc == 0 {
+            if result.is_null() {
+                return None;
+            }
+            // SAFETY: `getgrnam_r` returned 0 with non-null `result` pointing to initialized `grp`.
+            let grp = unsafe { grp.assume_init() };
+            return Some(grp.gr_gid);
+        }
+        if rc == libc::ERANGE {
+            buf_len = buf_len.saturating_mul(2);
+            continue;
+        }
+        return None;
+    }
+    None
+}
+
 #[cfg(any(unix, test))]
 fn is_verified_unix_system_cli_metadata_for(
     file_uid: u32,
     file_mode: u32,
+    parent_path: &Path,
     parent_uid: u32,
+    parent_gid: u32,
     parent_mode: u32,
-    allow_debian_staff_parent: bool,
+    allowed_staff_gids: &[u32],
 ) -> bool {
     let file_ok = file_uid == 0 && (file_mode & 0o022) == 0 && (file_mode & 0o111) != 0;
     let parent_perms = parent_mode & 0o7777;
-    let parent_ok = parent_uid == 0
-        && ((parent_mode & 0o022) == 0
-            || (allow_debian_staff_parent && parent_perms == 0o2775));
+    let is_debian_staff_usr_local_bin = !allowed_staff_gids.is_empty()
+        && parent_path == Path::new("/usr/local/bin")
+        && parent_perms == 0o2775
+        && allowed_staff_gids.contains(&parent_gid);
+    let parent_ok =
+        parent_uid == 0 && ((parent_mode & 0o022) == 0 || is_debian_staff_usr_local_bin);
     file_ok && parent_ok
-}
-
-#[cfg(any(unix, test))]
-fn is_verified_unix_system_cli_metadata(
-    file_uid: u32,
-    file_mode: u32,
-    parent_uid: u32,
-    parent_mode: u32,
-) -> bool {
-    is_verified_unix_system_cli_metadata_for(
-        file_uid,
-        file_mode,
-        parent_uid,
-        parent_mode,
-        cfg!(target_os = "linux"),
-    )
 }
 
 fn is_verified_system_cli_candidate(path: &Path) -> bool {
@@ -722,13 +762,29 @@ fn is_verified_system_cli_candidate(path: &Path) -> bool {
         let Ok(parent_meta) = fs::symlink_metadata(parent) else {
             return false;
         };
+        #[cfg(target_os = "linux")]
+        let allowed_staff_gids_buf: [u32; 2];
+        #[cfg(target_os = "linux")]
+        let allowed_staff_gids: &[u32] = match lookup_linux_staff_gid() {
+            Some(gid) => {
+                allowed_staff_gids_buf = [0, gid];
+                &allowed_staff_gids_buf
+            }
+            None => &[0],
+        };
+        #[cfg(not(target_os = "linux"))]
+        let allowed_staff_gids: &[u32] = &[];
         // Both binary and parent directory must be owned by root (uid 0) and not
-        // group- or world-writable; binary must also be executable.
-        if !is_verified_unix_system_cli_metadata(
+        // group- or world-writable (except Debian's `02775 root:staff` `/usr/local/bin`
+        // on Linux); binary must also be executable.
+        if !is_verified_unix_system_cli_metadata_for(
             meta.uid(),
             meta.mode(),
+            parent,
             parent_meta.uid(),
+            parent_meta.gid(),
             parent_meta.mode(),
+            allowed_staff_gids,
         ) {
             return false;
         }
@@ -761,22 +817,6 @@ fn has_windows_parent_traversal(path: &Path) -> bool {
         || path
             .to_str()
             .is_some_and(|raw| raw.split(['\\', '/']).any(|seg| seg == ".."))
-}
-
-#[cfg(any(target_os = "windows", test))]
-fn program_files_dir_from_system_drive(system_drive: &OsStr) -> Option<PathBuf> {
-    let text = system_drive.to_str()?.trim();
-    let bytes = text.as_bytes();
-    let valid = (bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
-        || (bytes.len() == 3
-            && bytes[0].is_ascii_alphabetic()
-            && bytes[1] == b':'
-            && matches!(bytes[2], b'\\' | b'/'));
-    if !valid {
-        return None;
-    }
-    let drive = (bytes[0] as char).to_ascii_uppercase();
-    Some(PathBuf::from(format!(r"{drive}:\Program Files")))
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -834,11 +874,7 @@ fn query_windows_program_files_dir() -> Option<PathBuf> {
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn build_windows_system_cli_candidates_from(
-    known_program_files: Option<PathBuf>,
-    system_drive: Option<&OsStr>,
-    program_files_env: Option<&OsStr>,
-) -> Vec<PathBuf> {
+fn build_windows_system_cli_candidates_from(known_program_files: Option<PathBuf>) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
     // 1. OS Known Folder API (`SHGetKnownFolderPath(FOLDERID_ProgramFiles)`):
@@ -847,23 +883,13 @@ fn build_windows_system_cli_candidates_from(
         push_windows_program_files_cli_candidate(&mut candidates, pf);
     }
 
-    // 2. `%SystemDrive%\Program Files\vdpi\bin\vdpi.exe` (strictly validated drive letter).
-    if let Some(pf) = system_drive.and_then(program_files_dir_from_system_drive) {
-        push_windows_program_files_cli_candidate(&mut candidates, pf);
-    }
-
-    // 3. Standard `C:\Program Files\vdpi\bin\vdpi.exe` ahead of mutable `%ProgramFiles%`.
-    push_unique_candidate(
-        &mut candidates,
-        PathBuf::from(r"C:\Program Files")
-            .join("vdpi")
-            .join("bin")
-            .join("vdpi.exe"),
-    );
-
-    // 4. Last-resort fallback to mutable `%ProgramFiles%` environment variable.
-    if let Some(program_files) = program_files_env.filter(|v| !v.is_empty()) {
-        push_windows_program_files_cli_candidate(&mut candidates, PathBuf::from(program_files));
+    // 2. Fallback to validated `C:\Program Files\vdpi\bin\vdpi.exe` only if the
+    //    Known Folder API failed or yielded an invalid path (never mutable env vars).
+    if candidates.is_empty() {
+        push_windows_program_files_cli_candidate(
+            &mut candidates,
+            PathBuf::from(r"C:\Program Files"),
+        );
     }
 
     candidates
@@ -882,11 +908,8 @@ fn build_system_cli_candidates() -> Vec<PathBuf> {
 
     #[cfg(target_os = "windows")]
     {
-        for candidate in build_windows_system_cli_candidates_from(
-            query_windows_program_files_dir(),
-            std::env::var_os("SystemDrive").as_deref(),
-            std::env::var_os("ProgramFiles").as_deref(),
-        ) {
+        for candidate in build_windows_system_cli_candidates_from(query_windows_program_files_dir())
+        {
             push_unique_candidate(&mut candidates, candidate);
         }
     }
@@ -909,7 +932,31 @@ fn current_exe_is_inside_appdir(current_exe: Option<&Path>, appdir: Option<&Path
     {
         return false;
     }
+    if let Ok(app_meta) = fs::symlink_metadata(app_dir) {
+        if is_symlink_or_reparse(&app_meta) || !app_meta.is_dir() {
+            return false;
+        }
+        let Ok(canon_app_dir) = fs::canonicalize(app_dir) else {
+            return false;
+        };
+        if !canon_app_dir
+            .components()
+            .any(|c| matches!(c, Component::Normal(_)))
+        {
+            return false;
+        }
+        let canon_exe = fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+        return canon_exe.starts_with(&canon_app_dir);
+    }
     exe.starts_with(app_dir)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn is_linux_shared_fhs_bin_dir(dir: &Path) -> bool {
+    matches!(
+        dir.to_str(),
+        Some("/usr/bin" | "/bin" | "/usr/local/bin" | "/usr/sbin" | "/sbin" | "/usr/local/sbin")
+    )
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -922,8 +969,14 @@ fn push_linux_packaged_candidates(
     let exe_dir = current_exe
         .and_then(Path::parent)
         .filter(|p| !p.as_os_str().is_empty());
-    if let Some(prefix_dir) = exe_dir.and_then(Path::parent) {
-        if !prefix_dir.as_os_str().is_empty() {
+    if let Some(raw_prefix_dir) = exe_dir.and_then(Path::parent) {
+        if !raw_prefix_dir.as_os_str().is_empty() {
+            // On merged-`/usr` distros, `/bin/vdpi-desktop` has parent `/`; map to `/usr`.
+            let prefix_dir = if raw_prefix_dir == Path::new("/") {
+                Path::new("/usr")
+            } else {
+                raw_prefix_dir
+            };
             // Tauri v2 Linux packages install resources under `/usr/lib/<productName>/`
             // (`vdpi Desktop`) and legacy/custom layouts under `/usr/lib/vdpi-desktop/`.
             push_unique_candidate(
@@ -995,54 +1048,90 @@ fn push_linux_packaged_candidates(
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn build_linux_bundled_cli_candidates(
+    current_exe: Option<&Path>,
+    resource_dir: Option<&Path>,
+    appdir: Option<&Path>,
+    bin_name: &str,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let exe_dir = current_exe
+        .and_then(Path::parent)
+        .filter(|p| !p.as_os_str().is_empty());
+
+    // 1. Tauri runtime `resource_dir` registered via `set_resource_dir()` from `lib.rs::setup()`.
+    if let Some(res_dir) = resource_dir.filter(|p| !p.as_os_str().is_empty()) {
+        push_unique_candidate(&mut candidates, res_dir.join(bin_name));
+        push_unique_candidate(&mut candidates, res_dir.join("resources").join(bin_name));
+    }
+
+    // 2. Linux packaged resource directories (`/usr/lib/vdpi Desktop/`, `$APPDIR/usr/lib/vdpi Desktop/`,
+    //    `/usr/lib/vdpi-desktop/`) prioritized ahead of sibling executables so `.deb`/`.rpm`
+    //    installs are never shadowed by unrelated binaries in shared FHS bin directories.
+    push_linux_packaged_candidates(&mut candidates, current_exe, appdir, bin_name);
+
+    // 3. Direct sibling next to `vdpi-desktop` executable (dev / portable / AppImage layouts),
+    //    strictly excluding shared FHS bin dirs (`/usr/bin`, `/bin`, `/usr/local/bin`, etc.).
+    if let Some(exe_dir) = exe_dir.filter(|dir| !is_linux_shared_fhs_bin_dir(dir)) {
+        push_unique_candidate(&mut candidates, exe_dir.join(bin_name));
+        push_unique_candidate(&mut candidates, exe_dir.join("resources").join(bin_name));
+    }
+
+    candidates
+}
+
 fn build_bundled_cli_candidates_with(
     current_exe: Option<&Path>,
     resource_dir: Option<&Path>,
     appdir: Option<&Path>,
 ) -> Vec<PathBuf> {
     let bin_name = expected_cli_binary_name();
-    let mut candidates = Vec::new();
-    let exe_dir = current_exe
-        .and_then(Path::parent)
-        .filter(|p| !p.as_os_str().is_empty());
 
-    if let Some(exe_dir) = exe_dir {
-        // 1. Direct sibling next to `vdpi-desktop` executable.
-        push_unique_candidate(&mut candidates, exe_dir.join(bin_name));
-        // 2. Tauri `resources/` subdirectory (NSIS, portable, Linux, dev layouts).
-        push_unique_candidate(&mut candidates, exe_dir.join("resources").join(bin_name));
-    }
-
-    // 3. Tauri runtime `resource_dir` registered via `set_resource_dir()` from `lib.rs::setup()`.
-    if let Some(res_dir) = resource_dir.filter(|p| !p.as_os_str().is_empty()) {
-        push_unique_candidate(&mut candidates, res_dir.join(bin_name));
-        push_unique_candidate(&mut candidates, res_dir.join("resources").join(bin_name));
-    }
-
-    // 4. macOS `.app/Contents/MacOS/../Resources/` bundle layouts.
-    #[cfg(target_os = "macos")]
-    if let Some(contents_dir) = exe_dir.and_then(Path::parent) {
-        push_unique_candidate(
-            &mut candidates,
-            contents_dir.join("Resources").join(bin_name),
-        );
-        push_unique_candidate(
-            &mut candidates,
-            contents_dir
-                .join("Resources")
-                .join("resources")
-                .join(bin_name),
-        );
-    }
-
-    // 5. Linux packaged resource directories (`/usr/lib/vdpi Desktop/`, `$APPDIR/usr/lib/vdpi Desktop/`
-    //    when `current_exe` resides inside `$APPDIR`, `/usr/lib/vdpi-desktop/`).
     #[cfg(target_os = "linux")]
-    push_linux_packaged_candidates(&mut candidates, current_exe, appdir, bin_name);
-    #[cfg(not(target_os = "linux"))]
-    let _ = appdir;
+    {
+        build_linux_bundled_cli_candidates(current_exe, resource_dir, appdir, bin_name)
+    }
 
-    candidates
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = appdir;
+        let mut candidates = Vec::new();
+        let exe_dir = current_exe
+            .and_then(Path::parent)
+            .filter(|p| !p.as_os_str().is_empty());
+
+        if let Some(exe_dir) = exe_dir {
+            // 1. Direct sibling next to `vdpi-desktop` executable.
+            push_unique_candidate(&mut candidates, exe_dir.join(bin_name));
+            // 2. Tauri `resources/` subdirectory (NSIS, portable, dev layouts).
+            push_unique_candidate(&mut candidates, exe_dir.join("resources").join(bin_name));
+        }
+
+        // 3. Tauri runtime `resource_dir` registered via `set_resource_dir()` from `lib.rs::setup()`.
+        if let Some(res_dir) = resource_dir.filter(|p| !p.as_os_str().is_empty()) {
+            push_unique_candidate(&mut candidates, res_dir.join(bin_name));
+            push_unique_candidate(&mut candidates, res_dir.join("resources").join(bin_name));
+        }
+
+        // 4. macOS `.app/Contents/MacOS/../Resources/` bundle layouts.
+        #[cfg(target_os = "macos")]
+        if let Some(contents_dir) = exe_dir.and_then(Path::parent) {
+            push_unique_candidate(
+                &mut candidates,
+                contents_dir.join("Resources").join(bin_name),
+            );
+            push_unique_candidate(
+                &mut candidates,
+                contents_dir
+                    .join("Resources")
+                    .join("resources")
+                    .join(bin_name),
+            );
+        }
+
+        candidates
+    }
 }
 
 fn build_cli_candidates_with(
@@ -1353,7 +1442,12 @@ fn format_non_zero_detail(label: &str, exit_code: Option<i32>, stdout: &str, std
     } else if !stdout.is_empty() {
         stdout.to_string()
     } else if let Some(code) = exit_code {
-        format!("{label} exited with status code {code}.")
+        let raw = code as u32;
+        if code < 0 || raw >= 0x10000 {
+            format!("{label} exited with status code 0x{raw:08X}.")
+        } else {
+            format!("{label} exited with status code {code}.")
+        }
     } else {
         format!("{label} was terminated before completing.")
     }
@@ -1496,17 +1590,26 @@ fn classify_windows_os_error_message(code: u32) -> Option<&'static str> {
         226 => Some(
             "Windows Defender or antivirus quarantined or deleted vdpi.exe (Win32 error 226). Restore vdpi.exe from Windows Security quarantine or reinstall vdpi Desktop.",
         ),
-        1260 => Some(
-            "Windows Group Policy, AppLocker, or SmartScreen blocked launching vdpi.exe (Win32 error 1260). Allow vdpi Desktop in Windows Security or contact your system administrator.",
+        740 => Some(
+            "Windows could not elevate vdpi.exe because administrator elevation is blocked or unavailable (Win32 error 740). Sign in with an administrator account or check UAC/policy settings.",
         ),
         786 => Some(
-            "Windows could not elevate vdpi.exe because administrator elevation is blocked or unavailable (Win32 error 786). Sign in with an administrator account or check UAC/policy settings.",
+            "Windows security policy blocked elevating vdpi.exe (Win32 error 786). Check Windows Security policy, UAC settings, or contact your system administrator.",
+        ),
+        1260 => Some(
+            "Windows Group Policy, AppLocker, or SmartScreen policy blocked launching vdpi.exe (Win32 error 1260). Allow vdpi Desktop in Windows Security or contact your system administrator.",
+        ),
+        4551 => Some(
+            "Windows Smart App Control or Application Control (WDAC) policy blocked launching vdpi.exe (Win32 error 4551). Allow vdpi Desktop in Windows Security or contact your system administrator.",
         ),
         5 => Some(
             "Access denied when launching vdpi.exe (Win32 error 5). Check antivirus exclusions, file permissions, or administrator rights.",
         ),
         2 => Some(
             "Bundled vdpi.exe could not be found (Win32 error 2). Reinstall vdpi Desktop, extract all files from the zip, or check Windows Security quarantine.",
+        ),
+        3 => Some(
+            "Bundled vdpi.exe path could not be found (Win32 error 3). Reinstall vdpi Desktop, extract all files from the zip, or check Windows Security quarantine.",
         ),
         _ => None,
     }
@@ -1535,6 +1638,9 @@ fn classify_windows_exit_code(exit_code: u32, allow_saved_needs_restart: bool) -
             SidecarOutcome::SavedNeedsRestart(String::new())
         }
         WIN32_ERROR_CANCELLED => SidecarOutcome::Cancelled,
+        code if code >= 0x10000 => SidecarOutcome::Err(format!(
+            "Elevated vdpi command failed with exit code 0x{code:08X}."
+        )),
         code => SidecarOutcome::Err(format!(
             "Elevated vdpi command failed with exit code {code}."
         )),
@@ -1586,6 +1692,12 @@ mod win_elevate {
         classify_windows_launch_error, resolve_windows_system32_dir_from, SidecarOutcome,
     };
 
+    const SEE_MASK_FLAG_NO_UI: u32 = 0x0000_0400;
+    const COINIT_APARTMENTTHREADED: u32 = 0x2;
+    const COINIT_DISABLE_OLE1DDE: u32 = 0x4;
+    const S_OK: i32 = 0;
+    const S_FALSE: i32 = 1;
+
     #[cfg_attr(target_arch = "x86", repr(C, packed(1)))]
     #[cfg_attr(not(target_arch = "x86"), repr(C))]
     struct ShellExecuteInfoW {
@@ -1609,6 +1721,43 @@ mod win_elevate {
     #[link(name = "shell32")]
     extern "system" {
         fn ShellExecuteExW(p_exec_info: *mut ShellExecuteInfoW) -> BOOL;
+    }
+
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoInitializeEx(pv_reserved: *const c_void, dw_co_init: u32) -> i32;
+        fn CoUninitialize();
+    }
+
+    struct ComStaGuard {
+        should_uninit: bool,
+    }
+
+    impl ComStaGuard {
+        fn init() -> Self {
+            // SAFETY: `CoInitializeEx` with NULL reserved pointer and STA flags is safe to call
+            // on any thread; `CoUninitialize` is invoked on Drop iff it returns S_OK or S_FALSE.
+            let hr = unsafe {
+                CoInitializeEx(
+                    ptr::null(),
+                    COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
+                )
+            };
+            Self {
+                should_uninit: hr == S_OK || hr == S_FALSE,
+            }
+        }
+    }
+
+    impl Drop for ComStaGuard {
+        fn drop(&mut self) {
+            if self.should_uninit {
+                // SAFETY: Matches a preceding successful `CoInitializeEx` (S_OK or S_FALSE) on this thread.
+                unsafe {
+                    CoUninitialize();
+                }
+            }
+        }
     }
 
     struct ProcessHandleGuard(HANDLE);
@@ -1668,6 +1817,9 @@ mod win_elevate {
             Err(err) => return SidecarOutcome::Err(err),
         };
 
+        // Initialize COM STA as documented by Microsoft for `ShellExecuteExW`.
+        let _com_guard = ComStaGuard::init();
+
         let clean_bin = strip_windows_verbatim_prefix(bin);
         // Always set elevated working directory to `%SystemRoot%\System32` (never a
         // user-writable application or temp directory) to prevent DLL search-order hijacking.
@@ -1680,7 +1832,7 @@ mod win_elevate {
 
         let mut info = ShellExecuteInfoW {
             cb_size: std::mem::size_of::<ShellExecuteInfoW>() as u32,
-            f_mask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
+            f_mask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
             hwnd: 0,
             lp_verb: verb_wide.as_ptr(),
             lp_file: file_wide.as_ptr(),
@@ -1770,11 +1922,24 @@ fn shell_escape_posix_single_quote(arg: &str) -> Result<String, String> {
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn build_posix_shell_command(bin: &Path, args: &[&str]) -> Result<String, String> {
+fn build_posix_shell_command_with_caller_ids(
+    bin: &Path,
+    args: &[&str],
+    caller_ids: Option<(u32, u32)>,
+) -> Result<String, String> {
     let bin_str = bin
         .to_str()
         .ok_or_else(|| "vdpi binary path is not valid UTF-8.".to_string())?;
-    let mut parts = Vec::with_capacity(args.len() + 1);
+    let mut parts = Vec::with_capacity(args.len() + 4);
+    if let Some((uid, gid)) = caller_ids {
+        if uid != 0 {
+            parts.push("/usr/bin/env".to_string());
+            parts.push(format!("SUDO_UID={uid}"));
+            if gid != 0 {
+                parts.push(format!("SUDO_GID={gid}"));
+            }
+        }
+    }
     parts.push(shell_escape_posix_single_quote(bin_str)?);
     for arg in args {
         parts.push(shell_escape_posix_single_quote(arg)?);
@@ -1802,12 +1967,31 @@ fn escape_applescript_string(input: &str) -> Result<String, String> {
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn build_osascript_elevation_script(bin: &Path, args: &[&str]) -> Result<String, String> {
-    let shell_cmd = build_posix_shell_command(bin, args)?;
+fn build_osascript_elevation_script_with_caller_ids(
+    bin: &Path,
+    args: &[&str],
+    caller_ids: Option<(u32, u32)>,
+) -> Result<String, String> {
+    let shell_cmd = build_posix_shell_command_with_caller_ids(bin, args, caller_ids)?;
     let escaped = escape_applescript_string(&shell_cmd)?;
     Ok(format!(
         "do shell script \"{escaped}\" with prompt \"{MACOS_ELEVATION_PROMPT}\" with administrator privileges"
     ))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn build_osascript_elevation_script(bin: &Path, args: &[&str]) -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    let caller_ids = {
+        // SAFETY: POSIX `getuid(2)` and `getgid(2)` are always safe to call and never fail.
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        (uid != 0).then_some((uid, gid))
+    };
+    #[cfg(not(target_os = "macos"))]
+    let caller_ids: Option<(u32, u32)> = None;
+
+    build_osascript_elevation_script_with_caller_ids(bin, args, caller_ids)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1880,13 +2064,19 @@ fn is_appimage_fuse_path(path: &Path, appdir: Option<&Path>) -> bool {
         if path.starts_with(app_dir) {
             return true;
         }
-    }
-    if let Some(raw) = path.to_str() {
-        if raw.starts_with("/tmp/.mount_") {
-            return true;
+        if let (Ok(canon_path), Ok(canon_app)) = (fs::canonicalize(path), fs::canonicalize(app_dir))
+        {
+            if canon_path.starts_with(&canon_app) {
+                return true;
+            }
         }
     }
-    false
+    path.components().any(|comp| {
+        matches!(
+            comp,
+            Component::Normal(seg) if seg.to_str().is_some_and(|s| s.starts_with(".mount_"))
+        )
+    })
 }
 
 #[cfg(any(target_os = "linux", all(unix, test)))]
@@ -2142,7 +2332,7 @@ fn classify_pkexec_outcome(
 
     if output.exit_code == Some(127) && lower_err.contains("no authentication agent") {
         return SidecarOutcome::Err(
-            "No Polkit authentication agent is running in this desktop session (pkexec exit 127). Start a Polkit agent (such as polkit-gnome or lxqt-policykit) or run `sudo vdpi install` from a terminal.".to_string(),
+            "No Polkit authentication agent is running in this desktop session (pkexec exit 127). Start a Polkit agent (such as polkit-gnome or lxqt-policykit) or run `sudo vdpi ...` from a terminal.".to_string(),
         );
     }
 
@@ -2159,6 +2349,21 @@ fn classify_pkexec_outcome(
         &stdout,
         &stderr,
     ))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn build_pkexec_command(pkexec: &Path, exec_bin: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new(pkexec);
+    scrub_linux_appimage_env(&mut cmd);
+    // Force untranslated English diagnostics from `pkexec` so exit-127 reason matching
+    // ("dismissed", "no authentication agent") works reliably in non-English locales.
+    // Remove `LC_ALL` and `LANGUAGE` because GNU gettext gives them precedence over
+    // `LC_MESSAGES`.
+    cmd.env_remove("LC_ALL")
+        .env_remove("LANGUAGE")
+        .env("LC_MESSAGES", "C");
+    cmd.arg(exec_bin).args(args);
+    cmd
 }
 
 fn run_resolved_vdpi_cli_elevated(
@@ -2228,9 +2433,7 @@ fn run_resolved_vdpi_cli_elevated(
             Ok(path) => path,
             Err(err) => return SidecarOutcome::Err(err),
         };
-        let mut cmd = Command::new(&pkexec);
-        scrub_linux_appimage_env(&mut cmd);
-        cmd.arg(&exec_bin).args(args);
+        let mut cmd = build_pkexec_command(&pkexec, &exec_bin, args);
         let timeout = Duration::from_secs(timeout_secs.max(1));
         match run_command_with_timeout(&mut cmd, timeout) {
             Ok(output) => classify_pkexec_outcome(&output, allow_saved_needs_restart),
@@ -2244,41 +2447,64 @@ fn run_resolved_vdpi_cli_elevated(
     }
 }
 
-/// Runs ONLY the bundled `vdpi` CLI binary shipped inside the vdpi Desktop package
-/// (never falling back to `~/.vdpi/bin/vdpi` or pre-existing system binaries), either
-/// directly or with OS elevation.
-pub fn run_bundled_vdpi_cli(args: &[&str], elevated: bool, timeout_secs: u64) -> SidecarOutcome {
+fn run_bundled_vdpi_cli_with<FResolve, FExec>(
+    args: &[&str],
+    elevated: bool,
+    timeout_secs: u64,
+    resolve_bundled: FResolve,
+    exec_resolved: FExec,
+) -> SidecarOutcome
+where
+    FResolve: FnOnce() -> Result<PathBuf, String>,
+    FExec: FnOnce(&Path, &[&str], bool, u64, bool) -> SidecarOutcome,
+{
     if args.iter().any(|arg| arg.contains('\0')) {
         return SidecarOutcome::Err("vdpi arguments cannot contain NUL characters.".to_string());
     }
 
-    let bin = match resolve_bundled_vdpi_cli_binary() {
+    let bin = match resolve_bundled() {
         Ok(path) => path,
         Err(err) => return SidecarOutcome::Err(err),
     };
 
     let allow_saved_needs_restart = is_config_apply_file_args(args);
-    if elevated {
-        run_resolved_vdpi_cli_elevated(&bin, args, timeout_secs, allow_saved_needs_restart)
-    } else {
-        run_resolved_vdpi_cli(&bin, args, timeout_secs, allow_saved_needs_restart)
-    }
+    exec_resolved(&bin, args, elevated, timeout_secs, allow_saved_needs_restart)
+}
+
+/// Runs ONLY the bundled `vdpi` CLI binary shipped inside the vdpi Desktop package
+/// (never falling back to `~/.vdpi/bin/vdpi` or pre-existing system binaries), either
+/// directly or with OS elevation.
+pub fn run_bundled_vdpi_cli(args: &[&str], elevated: bool, timeout_secs: u64) -> SidecarOutcome {
+    run_bundled_vdpi_cli_with(
+        args,
+        elevated,
+        timeout_secs,
+        resolve_bundled_vdpi_cli_binary,
+        |bin, cli_args, need_elev, timeout, allow_saved_needs_restart| {
+            if need_elev {
+                run_resolved_vdpi_cli_elevated(bin, cli_args, timeout, allow_saved_needs_restart)
+            } else {
+                run_resolved_vdpi_cli(bin, cli_args, timeout, allow_saved_needs_restart)
+            }
+        },
+    )
 }
 
 /// Runs the resolved `vdpi` CLI binary with OS administrator/root privileges and a bounded timeout.
 ///
 /// For non-`install` commands targeting an already-installed system service, verified system-owned
-/// binaries (`/usr/local/bin/vdpi`, `%ProgramFiles%\vdpi\bin\vdpi.exe`) are resolved FIRST before
+/// binaries (`/usr/local/bin/vdpi`, `Program Files\vdpi\bin\vdpi.exe`) are resolved FIRST before
 /// bundled paths.
 ///
-/// - Windows: runs directly when already elevated; otherwise uses `ShellExecuteExW` (`runas`,
-///   `SW_HIDE`, `SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC`, `lp_directory = %SystemRoot%\System32`)
-///   and bounded `WaitForSingleObject`.
+/// - Windows: runs directly when already elevated; otherwise initializes COM STA and uses
+///   `ShellExecuteExW` (`runas`, `SW_HIDE`, `SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC |
+///   SEE_MASK_FLAG_NO_UI`, `lp_directory = %SystemRoot%\System32`) and bounded `WaitForSingleObject`.
 /// - macOS: runs directly when already root; otherwise prompts via `/usr/bin/osascript` with
-///   a descriptive prompt and single-quoted POSIX shell escaping.
+///   a descriptive prompt, `/usr/bin/env SUDO_UID=... SUDO_GID=...` propagation, and single-quoted
+///   POSIX shell escaping.
 /// - Linux: runs directly when already root; otherwise elevates via `/usr/bin/pkexec` (or
-///   `/bin/pkexec`), staging a verified `0o700` copy outside FUSE when running from an AppImage
-///   and scrubbing AppImage loader/GTK environment variables.
+///   `/bin/pkexec`) with `LC_MESSAGES=C`, staging a verified `0o700` copy outside FUSE when
+///   running from an AppImage and scrubbing AppImage loader/GTK environment variables.
 pub fn run_vdpi_cli_elevated(args: &[&str], timeout_secs: u64) -> SidecarOutcome {
     if args.iter().any(|arg| arg.contains('\0')) {
         return SidecarOutcome::Err(
@@ -2948,11 +3174,19 @@ mod tests {
         let res_dir = dir.path().join("tauri-resources");
 
         let candidates = build_cli_candidates(Some(&fake_exe), Some(installed.clone()));
-        assert_eq!(candidates[0], dir.path().join(expected_cli_binary_name()));
-        assert_eq!(
-            candidates[1],
-            dir.path().join("resources").join(expected_cli_binary_name())
-        );
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(candidates[0], dir.path().join(expected_cli_binary_name()));
+            assert_eq!(
+                candidates[1],
+                dir.path().join("resources").join(expected_cli_binary_name())
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert!(candidates.contains(&dir.path().join(expected_cli_binary_name())));
+            assert!(candidates.contains(&dir.path().join("resources").join(expected_cli_binary_name())));
+        }
         assert!(candidates.contains(&installed));
         assert!(
             candidates.iter().all(|c| {
@@ -2970,6 +3204,61 @@ mod tests {
             Some(installed.clone()),
         );
         assert!(with_res.contains(&res_dir.join(expected_cli_binary_name())));
+
+        // Verify Linux bundled candidate ordering & FHS bin exclusion (LIN-R1-05):
+        // `.deb` installs in `/usr/bin/vdpi-desktop` must prioritize `resource_dir` and
+        // `/usr/lib/vdpi Desktop/vdpi` and NEVER look up sibling `/usr/bin/vdpi`.
+        let deb_candidates = build_linux_bundled_cli_candidates(
+            Some(Path::new("/usr/bin/vdpi-desktop")),
+            Some(Path::new("/usr/lib/vdpi Desktop")),
+            None,
+            "vdpi",
+        );
+        assert_eq!(deb_candidates[0], PathBuf::from("/usr/lib/vdpi Desktop/vdpi"));
+        assert!(!deb_candidates.contains(&PathBuf::from("/usr/bin/vdpi")));
+        assert!(!deb_candidates.contains(&PathBuf::from("/usr/bin/resources/vdpi")));
+
+        let deb_no_res = build_linux_bundled_cli_candidates(
+            Some(Path::new("/usr/bin/vdpi-desktop")),
+            None,
+            None,
+            "vdpi",
+        );
+        assert_eq!(deb_no_res[0], PathBuf::from("/usr/lib/vdpi Desktop/vdpi"));
+        assert!(!deb_no_res.contains(&PathBuf::from("/usr/bin/vdpi")));
+
+        let usrmerge_bin = build_linux_bundled_cli_candidates(
+            Some(Path::new("/bin/vdpi-desktop")),
+            None,
+            None,
+            "vdpi",
+        );
+        assert_eq!(usrmerge_bin[0], PathBuf::from("/usr/lib/vdpi Desktop/vdpi"));
+        assert!(!usrmerge_bin.contains(&PathBuf::from("/bin/vdpi")));
+
+        let usr_local_bin = build_linux_bundled_cli_candidates(
+            Some(Path::new("/usr/local/bin/vdpi-desktop")),
+            None,
+            None,
+            "vdpi",
+        );
+        assert!(!usr_local_bin.contains(&PathBuf::from("/usr/local/bin/vdpi")));
+
+        let portable_linux = build_linux_bundled_cli_candidates(
+            Some(Path::new("/opt/vdpi/vdpi-desktop")),
+            Some(Path::new("/opt/vdpi/res")),
+            None,
+            "vdpi",
+        );
+        let res_pos = portable_linux
+            .iter()
+            .position(|p| p == Path::new("/opt/vdpi/res/vdpi"))
+            .expect("resource_dir candidate present");
+        let sib_pos = portable_linux
+            .iter()
+            .position(|p| p == Path::new("/opt/vdpi/vdpi"))
+            .expect("non-FHS sibling candidate present");
+        assert!(res_pos < sib_pos, "resource_dir must precede sibling dir on Linux");
 
         // Verify all required Linux packaged candidate layouts (LIN-01) and that `$APPDIR`
         // is ignored unless `current_exe` actually resides inside `$APPDIR`.
@@ -3033,112 +3322,100 @@ mod tests {
             None,
             Some(Path::new("/tmp/.mount_vdpiXYZ")),
         ));
+
+        #[cfg(unix)]
+        {
+            let real_appdir = dir.path().join("real-appdir");
+            let real_exe = real_appdir.join("usr").join("bin").join("vdpi-desktop");
+            fs::create_dir_all(real_exe.parent().unwrap()).expect("create real appdir");
+            fs::write(&real_exe, b"bin").expect("write real exe");
+            assert!(current_exe_is_inside_appdir(
+                Some(&real_exe),
+                Some(&real_appdir)
+            ));
+
+            let sym_appdir = dir.path().join("sym-appdir");
+            std::os::unix::fs::symlink(&real_appdir, &sym_appdir).expect("create sym appdir");
+            assert!(
+                !current_exe_is_inside_appdir(Some(&real_exe), Some(&sym_appdir)),
+                "symlinked app_dir must be rejected"
+            );
+        }
     }
 
     #[test]
-    fn windows_system_cli_candidates_prefer_known_folder_and_system_drive_over_program_files_env() {
-        let spoofed = OsStr::new(r"C:\Users\attacker\fake-pf");
-
-        // SHGetKnownFolderPath + SystemDrive + C:\Program Files all precede mutable %ProgramFiles%.
-        let candidates = build_windows_system_cli_candidates_from(
-            Some(PathBuf::from(r"D:\Program Files")),
-            Some(OsStr::new("E:")),
-            Some(spoofed),
-        );
+    fn windows_system_cli_candidates_use_known_folder_or_validated_c_program_files_only() {
+        // SHGetKnownFolderPath alone is trusted when valid (no mutable env var fallback).
+        let candidates =
+            build_windows_system_cli_candidates_from(Some(PathBuf::from(r"D:\Program Files")));
         assert_eq!(
             candidates,
-            vec![
-                PathBuf::from(r"D:\Program Files")
-                    .join("vdpi")
-                    .join("bin")
-                    .join("vdpi.exe"),
-                PathBuf::from(r"E:\Program Files")
-                    .join("vdpi")
-                    .join("bin")
-                    .join("vdpi.exe"),
-                PathBuf::from(r"C:\Program Files")
-                    .join("vdpi")
-                    .join("bin")
-                    .join("vdpi.exe"),
-                PathBuf::from(r"C:\Users\attacker\fake-pf")
-                    .join("vdpi")
-                    .join("bin")
-                    .join("vdpi.exe"),
-            ]
+            vec![PathBuf::from(r"D:\Program Files")
+                .join("vdpi")
+                .join("bin")
+                .join("vdpi.exe")]
         );
 
-        // Deduplicates when Known Folder, SystemDrive, and C:\Program Files agree,
-        // and still ranks C:\Program Files ahead of mutable %ProgramFiles%.
-        let deduped = build_windows_system_cli_candidates_from(
-            Some(PathBuf::from(r"C:\Program Files")),
-            Some(OsStr::new(r"c:\")),
-            Some(spoofed),
-        );
+        let default_known =
+            build_windows_system_cli_candidates_from(Some(PathBuf::from(r"C:\Program Files")));
         assert_eq!(
-            deduped,
-            vec![
-                PathBuf::from(r"C:\Program Files")
-                    .join("vdpi")
-                    .join("bin")
-                    .join("vdpi.exe"),
-                PathBuf::from(r"C:\Users\attacker\fake-pf")
-                    .join("vdpi")
-                    .join("bin")
-                    .join("vdpi.exe"),
-            ]
-        );
-
-        // Invalid SystemDrive and traversal/UNC ProgramFiles values are rejected.
-        let sanitized = build_windows_system_cli_candidates_from(
-            None,
-            Some(OsStr::new(r"C:\Users\attacker")),
-            Some(OsStr::new(r"C:\Program Files\..\Evil")),
-        );
-        assert_eq!(
-            sanitized,
+            default_known,
             vec![PathBuf::from(r"C:\Program Files")
                 .join("vdpi")
                 .join("bin")
                 .join("vdpi.exe")]
         );
-        assert_eq!(program_files_dir_from_system_drive(OsStr::new("")), None);
-        assert_eq!(program_files_dir_from_system_drive(OsStr::new("1:")), None);
-        assert_eq!(
-            program_files_dir_from_system_drive(OsStr::new(r"\\attacker\share")),
-            None
-        );
+
+        // Falls back to validated `C:\Program Files` when API returns None or invalid paths.
+        for invalid in [
+            None,
+            Some(PathBuf::from("")),
+            Some(PathBuf::from(r"\\attacker\share")),
+            Some(PathBuf::from(r"C:\Program Files\..\Evil")),
+            Some(PathBuf::from(r"relative\Program Files")),
+        ] {
+            let fallback = build_windows_system_cli_candidates_from(invalid);
+            assert_eq!(
+                fallback,
+                vec![PathBuf::from(r"C:\Program Files")
+                    .join("vdpi")
+                    .join("bin")
+                    .join("vdpi.exe")]
+            );
+        }
     }
 
     #[test]
     fn unix_system_cli_metadata_requires_root_owned_non_writable_file_and_parent() {
-        assert!(is_verified_unix_system_cli_metadata(
-            0, 0o100755, 0, 0o040755
+        let parent = Path::new("/usr/local/bin");
+        assert!(is_verified_unix_system_cli_metadata_for(
+            0, 0o100755, parent, 0, 0, 0o040755, &[]
         ));
-        assert!(is_verified_unix_system_cli_metadata(
-            0, 0o100500, 0, 0o040555
+        assert!(is_verified_unix_system_cli_metadata_for(
+            0, 0o100500, parent, 0, 0, 0o040555, &[]
         ));
         // Non-root or group/world-writable parent directory must be rejected.
-        assert!(!is_verified_unix_system_cli_metadata(
-            0, 0o100755, 501, 0o040755
+        assert!(!is_verified_unix_system_cli_metadata_for(
+            0, 0o100755, parent, 501, 0, 0o040755, &[]
         ));
-        assert!(!is_verified_unix_system_cli_metadata(
-            0, 0o100755, 0, 0o040775
+        assert!(!is_verified_unix_system_cli_metadata_for(
+            0, 0o100755, parent, 0, 0, 0o040775, &[]
         ));
-        assert!(!is_verified_unix_system_cli_metadata(
-            0, 0o100755, 0, 0o040777
+        assert!(!is_verified_unix_system_cli_metadata_for(
+            0, 0o100755, parent, 0, 0, 0o040777, &[]
         ));
         // Non-root, writable, or non-executable binary must be rejected.
-        assert!(!is_verified_unix_system_cli_metadata(
-            1000, 0o100755, 0, 0o040755
+        assert!(!is_verified_unix_system_cli_metadata_for(
+            1000, 0o100755, parent, 0, 0, 0o040755, &[]
         ));
-        assert!(!is_verified_unix_system_cli_metadata(
-            0, 0o100775, 0, 0o040755
+        assert!(!is_verified_unix_system_cli_metadata_for(
+            0, 0o100775, parent, 0, 0, 0o040755, &[]
         ));
-        assert!(!is_verified_unix_system_cli_metadata(
-            0, 0o100757, 0, 0o040755
+        assert!(!is_verified_unix_system_cli_metadata_for(
+            0, 0o100757, parent, 0, 0, 0o040755, &[]
         ));
-        assert!(!is_verified_unix_system_cli_metadata(
-            0, 0o100644, 0, 0o040755
+        assert!(!is_verified_unix_system_cli_metadata_for(
+            0, 0o100644, parent, 0, 0, 0o040755, &[]
         ));
     }
 
@@ -3367,6 +3644,38 @@ mod tests {
         // Dollar expansion remains inside single quotes so sh cannot expand it.
         assert!(script.contains("$HOME"));
 
+        // MAC-R1-01: Non-zero unprivileged GUI uid/gid must be propagated via `/usr/bin/env SUDO_UID=... SUDO_GID=...`.
+        let with_ids = build_osascript_elevation_script_with_caller_ids(
+            Path::new("/Applications/vdpi Desktop.app/Contents/Resources/vdpi"),
+            &["install", "--tun"],
+            Some((501, 20)),
+        )
+        .expect("build osascript with caller ids");
+        assert!(
+            with_ids.contains(
+                "do shell script \"/usr/bin/env SUDO_UID=501 SUDO_GID=20 '/Applications/vdpi Desktop.app/Contents/Resources/vdpi' 'install' '--tun'\""
+            ),
+            "expected SUDO_UID/SUDO_GID prefix in osascript: {with_ids}"
+        );
+
+        let uid_only = build_osascript_elevation_script_with_caller_ids(
+            Path::new("/usr/local/bin/vdpi"),
+            &["resume"],
+            Some((501, 0)),
+        )
+        .expect("build osascript with nonzero uid and zero gid");
+        assert!(uid_only.contains("/usr/bin/env SUDO_UID=501 '/usr/local/bin/vdpi' 'resume'"));
+        assert!(!uid_only.contains("SUDO_GID="));
+
+        let root_ids = build_osascript_elevation_script_with_caller_ids(
+            Path::new("/usr/local/bin/vdpi"),
+            &["resume"],
+            Some((0, 0)),
+        )
+        .expect("build osascript with root ids");
+        assert!(!root_ids.contains("SUDO_UID="));
+        assert!(!root_ids.contains("/usr/bin/env"));
+
         assert_eq!(
             escape_applescript_string("a\\b\"c\nd\re\tf").unwrap(),
             "a\\\\b\\\"c\\nd\\re\\tf"
@@ -3465,6 +3774,42 @@ mod tests {
     }
 
     #[test]
+    fn format_non_zero_detail_formats_large_and_ntstatus_exit_codes_as_hex() {
+        assert_eq!(
+            format_non_zero_detail("vdpi command", Some(42), "", ""),
+            "vdpi command exited with status code 42."
+        );
+        assert_eq!(
+            format_non_zero_detail("vdpi command", Some(0xFFFF), "", ""),
+            "vdpi command exited with status code 65535."
+        );
+        assert_eq!(
+            format_non_zero_detail("vdpi command", Some(0x0001_0000), "", ""),
+            "vdpi command exited with status code 0x00010000."
+        );
+        assert_eq!(
+            format_non_zero_detail("vdpi command", Some(-1_073_741_515), "", ""),
+            "vdpi command exited with status code 0xC0000135."
+        );
+        assert_eq!(
+            classify_direct_outcome(
+                &CapturedOutput {
+                    exit_code: Some(0xC000_0135_u32 as i32),
+                    success: false,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+                false,
+            ),
+            SidecarOutcome::Err("vdpi command exited with status code 0xC0000135.".to_string())
+        );
+        assert_eq!(
+            format_non_zero_detail("vdpi command", None, "", ""),
+            "vdpi command was terminated before completing."
+        );
+    }
+
+    #[test]
     fn windows_timeout_bound_and_exit_code_mapping() {
         assert_eq!(bounded_timeout_ms(0), 1_000);
         assert_eq!(bounded_timeout_ms(30), 30_000);
@@ -3494,6 +3839,22 @@ mod tests {
         assert_eq!(
             classify_windows_exit_code(5, true),
             SidecarOutcome::Err("Elevated vdpi command failed with exit code 5.".to_string())
+        );
+        assert_eq!(
+            classify_windows_exit_code(0xFFFF, true),
+            SidecarOutcome::Err("Elevated vdpi command failed with exit code 65535.".to_string())
+        );
+        assert_eq!(
+            classify_windows_exit_code(0x0001_0000, true),
+            SidecarOutcome::Err(
+                "Elevated vdpi command failed with exit code 0x00010000.".to_string()
+            )
+        );
+        assert_eq!(
+            classify_windows_exit_code(0xC000_0135, true),
+            SidecarOutcome::Err(
+                "Elevated vdpi command failed with exit code 0xC0000135.".to_string()
+            )
         );
     }
 
@@ -3723,9 +4084,17 @@ mod tests {
                 .expect("resolve valid pkexec");
         assert_eq!(resolved, real_pkexec);
 
-        // AppImage FUSE path detection (LIN-03)
+        // AppImage FUSE path detection (LIN-03 / LIN-R1-05): detect `.mount_*` in any parent dir.
         assert!(is_appimage_fuse_path(
             Path::new("/tmp/.mount_vdpiAbCd/usr/lib/vdpi Desktop/vdpi"),
+            None
+        ));
+        assert!(is_appimage_fuse_path(
+            Path::new("/run/user/1000/.mount_vdpiAbCd/usr/lib/vdpi Desktop/vdpi"),
+            None
+        ));
+        assert!(is_appimage_fuse_path(
+            Path::new("/var/tmp/.mount_vdpi999/vdpi"),
             None
         ));
         assert!(is_appimage_fuse_path(
@@ -3741,9 +4110,12 @@ mod tests {
             None
         ));
 
-        // Linux AppImage env scrubbing (LIN-07)
-        let mut cmd = Command::new("vdpi");
-        scrub_linux_appimage_env(&mut cmd);
+        // Linux AppImage env scrubbing (LIN-07) + LC_ALL/LANGUAGE removal & LC_MESSAGES=C on pkexec (LIN-R1-04 / LIN-R2-01)
+        let cmd = build_pkexec_command(
+            Path::new("/usr/bin/pkexec"),
+            Path::new("/usr/local/bin/vdpi"),
+            &["resume"],
+        );
         let removed: Vec<String> = cmd
             .get_envs()
             .filter(|(_, v)| v.is_none())
@@ -3755,8 +4127,21 @@ mod tests {
                 "expected env var {expected} to be scrubbed"
             );
         }
+        assert!(
+            removed.iter().any(|k| k == "LC_ALL"),
+            "pkexec command must remove LC_ALL so LC_MESSAGES=C wins"
+        );
+        assert!(
+            removed.iter().any(|k| k == "LANGUAGE"),
+            "pkexec command must remove LANGUAGE so LC_MESSAGES=C wins"
+        );
         assert!(!removed.iter().any(|k| k == "DISPLAY"));
         assert!(!removed.iter().any(|k| k == "DBUS_SESSION_BUS_ADDRESS"));
+        assert!(
+            cmd.get_envs()
+                .any(|(k, v)| k == OsStr::new("LC_MESSAGES") && v == Some(OsStr::new("C"))),
+            "pkexec command must pin LC_MESSAGES=C"
+        );
     }
 
     #[cfg(unix)]
@@ -4194,28 +4579,46 @@ mod tests {
 
     #[test]
     fn unix_system_cli_metadata_allows_debian_staff_parent_only_on_linux() {
-        // Debian `/usr/local/bin` (`02775` root:staff) is allowed on Linux when the binary itself
-        // is root-owned and not group/world-writable.
+        let usr_local_bin = Path::new("/usr/local/bin");
+        let other_dir = Path::new("/usr/bin");
+        let linux_gids: &[u32] = &[0, 50];
+
+        // Debian `/usr/local/bin` (`02775` root:staff or root:root) is allowed on Linux when
+        // the binary itself is root-owned and not group/world-writable.
         assert!(is_verified_unix_system_cli_metadata_for(
-            0, 0o100755, 0, 0o042775, true
+            0, 0o100755, usr_local_bin, 0, 50, 0o042775, linux_gids
         ));
-        // Non-Linux (macOS) still rejects setgid group-writable parent dirs.
+        assert!(is_verified_unix_system_cli_metadata_for(
+            0, 0o100755, usr_local_bin, 0, 0, 0o042775, &[0]
+        ));
+        // Untrusted group ID on `/usr/local/bin` must be rejected even with `02775`.
         assert!(!is_verified_unix_system_cli_metadata_for(
-            0, 0o100755, 0, 0o042775, false
+            0, 0o100755, usr_local_bin, 0, 1000, 0o042775, linux_gids
+        ));
+        // Any parent directory other than `/usr/local/bin` must reject `02775` even on Linux.
+        assert!(!is_verified_unix_system_cli_metadata_for(
+            0, 0o100755, other_dir, 0, 50, 0o042775, linux_gids
+        ));
+        assert!(!is_verified_unix_system_cli_metadata_for(
+            0, 0o100755, other_dir, 0, 0, 0o042775, &[0]
+        ));
+        // Non-Linux (macOS, empty allowed_staff_gids) still rejects setgid group-writable parent dirs.
+        assert!(!is_verified_unix_system_cli_metadata_for(
+            0, 0o100755, usr_local_bin, 0, 0, 0o042775, &[]
         ));
         // Plain 0775 (without setgid) and world-writable 02777 are rejected even on Linux.
         assert!(!is_verified_unix_system_cli_metadata_for(
-            0, 0o100755, 0, 0o040775, true
+            0, 0o100755, usr_local_bin, 0, 50, 0o040775, linux_gids
         ));
         assert!(!is_verified_unix_system_cli_metadata_for(
-            0, 0o100755, 0, 0o042777, true
+            0, 0o100755, usr_local_bin, 0, 50, 0o042777, linux_gids
         ));
         // Binary itself must ALWAYS remain root-owned and not group/world-writable.
         assert!(!is_verified_unix_system_cli_metadata_for(
-            0, 0o100775, 0, 0o042775, true
+            0, 0o100775, usr_local_bin, 0, 50, 0o042775, linux_gids
         ));
         assert!(!is_verified_unix_system_cli_metadata_for(
-            1000, 0o100755, 0, 0o042775, true
+            1000, 0o100755, usr_local_bin, 0, 50, 0o042775, linux_gids
         ));
     }
 
@@ -4229,10 +4632,13 @@ mod tests {
         for (code, expected_substr) in [
             (225, "Defender"),
             (226, "quarantined"),
+            (740, "elevation"),
+            (786, "policy"),
             (1260, "SmartScreen"),
-            (786, "elevation"),
+            (4551, "Smart App Control"),
             (5, "Access denied"),
             (2, "could not be found"),
+            (3, "could not be found"),
         ] {
             match classify_windows_launch_error(code) {
                 SidecarOutcome::Err(msg) => {
@@ -4267,9 +4673,103 @@ mod tests {
         match no_agent {
             SidecarOutcome::Err(msg) => {
                 assert!(msg.contains("Polkit authentication agent"));
-                assert!(msg.contains("sudo vdpi install"));
+                assert!(msg.contains("sudo vdpi ..."));
             }
             other => panic!("expected actionable Err for pkexec no auth agent, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_bundled_vdpi_cli_and_run_bundled_vdpi_cli_behavior() {
+        let dir = TestDir::new("bundled-resolve-run");
+        let bin_name = expected_cli_binary_name();
+        let desktop_name = if cfg!(windows) {
+            "vdpi-desktop.exe"
+        } else {
+            "vdpi-desktop"
+        };
+
+        let desktop_file = dir.path().join(desktop_name);
+        fs::write(&desktop_file, b"gui").expect("write fake desktop");
+        let fake_dir = dir.path().join("subdir").join(bin_name);
+        fs::create_dir_all(&fake_dir).expect("create fake bin dir");
+
+        // Missing/invalid candidates return actionable reinstall/quarantine message.
+        let missing_err = resolve_bundled_vdpi_cli_from_candidates(&[
+            desktop_file.clone(),
+            fake_dir.clone(),
+            dir.path().join("missing").join(bin_name),
+        ])
+        .expect_err("missing bundled cli must error");
+        assert!(missing_err.contains("Reinstall vdpi Desktop"));
+        assert!(missing_err.contains("quarantine"));
+
+        // Valid bundled binary is resolved cleanly.
+        let bundled_bin = dir.path().join("resources").join(bin_name);
+        fs::create_dir_all(bundled_bin.parent().unwrap()).expect("create resources dir");
+        fs::write(&bundled_bin, b"cli").expect("write fake bundled cli");
+
+        let resolved = resolve_bundled_vdpi_cli_from_candidates(&[
+            desktop_file,
+            fake_dir,
+            bundled_bin.clone(),
+        ])
+        .expect("should resolve valid bundled binary");
+        assert_eq!(resolved, strip_windows_verbatim_prefix(&bundled_bin));
+
+        // `run_bundled_vdpi_cli` strictly rejects NUL bytes for both direct and elevated modes.
+        for elevated in [false, true] {
+            match run_bundled_vdpi_cli(&["install", "bad\0arg"], elevated, 5) {
+                SidecarOutcome::Err(msg) => assert!(msg.contains("NUL")),
+                other => panic!("expected NUL error, got {other:?}"),
+            }
+        }
+
+        // `run_bundled_vdpi_cli_with` propagates resolver errors without executing.
+        let resolve_err = run_bundled_vdpi_cli_with(
+            &["install"],
+            true,
+            30,
+            || Err("bundled missing".to_string()),
+            |_, _, _, _, _| panic!("executor must not run when bundled resolution fails"),
+        );
+        assert_eq!(resolve_err, SidecarOutcome::Err("bundled missing".to_string()));
+
+        // `run_bundled_vdpi_cli_with` forwards resolved path, elevation flag, timeout, and
+        // `allow_saved_needs_restart` properly.
+        let install_res = run_bundled_vdpi_cli_with(
+            &["install", "--tun"],
+            true,
+            45,
+            || Ok(bundled_bin.clone()),
+            |bin, args, elevated, timeout, allow_restart| {
+                assert_eq!(bin, bundled_bin.as_path());
+                assert_eq!(args, &["install", "--tun"]);
+                assert!(elevated);
+                assert_eq!(timeout, 45);
+                assert!(!allow_restart);
+                SidecarOutcome::Ok("installed".to_string())
+            },
+        );
+        assert_eq!(install_res, SidecarOutcome::Ok("installed".to_string()));
+
+        let apply_res = run_bundled_vdpi_cli_with(
+            &["config", "apply-file", "/tmp/cfg.toml", "--restart"],
+            false,
+            90,
+            || Ok(bundled_bin.clone()),
+            |bin, args, elevated, timeout, allow_restart| {
+                assert_eq!(bin, bundled_bin.as_path());
+                assert_eq!(args[0], "config");
+                assert!(!elevated);
+                assert_eq!(timeout, 90);
+                assert!(allow_restart);
+                SidecarOutcome::SavedNeedsRestart("restart pending".to_string())
+            },
+        );
+        assert_eq!(
+            apply_res,
+            SidecarOutcome::SavedNeedsRestart("restart pending".to_string())
+        );
     }
 }

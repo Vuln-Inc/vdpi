@@ -25,10 +25,28 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 use vdpi::config::{EngineMode, VpnCoexistence};
+use vdpi::i18n::{self, Lang};
 use vdpi::service::{ControlCenterStatus, ServiceState};
 use vdpi::update::{compare_versions, VersionRelation};
 use vdpi_core::config::RuntimeConfig;
 use vdpi_core::dns::DnsResolver;
+
+#[cfg(test)]
+#[inline]
+fn active_lang() -> Lang {
+    i18n::active_lang_with_fallback(Lang::En)
+}
+
+#[cfg(not(test))]
+#[inline]
+fn active_lang() -> Lang {
+    i18n::active_lang()
+}
+
+#[inline]
+fn tr(en: &'static str, tr_text: &'static str) -> &'static str {
+    i18n::tr_for(active_lang(), en, tr_text)
+}
 
 const MAX_CARD_WIDTH: u16 = 76;
 const MAX_CARD_HEIGHT: u16 = 28;
@@ -1104,10 +1122,16 @@ fn build_update_note_lines(
         return Vec::new();
     }
     if notes.is_empty() {
-        return wrap_words("No release notes published for this release.", width)
-            .into_iter()
-            .map(|text| Line::from(Span::styled(text, palette.hint)))
-            .collect();
+        return wrap_words(
+            tr(
+                "No release notes published for this release.",
+                "Bu sürüm için sürüm notu yayınlanmadı.",
+            ),
+            width,
+        )
+        .into_iter()
+        .map(|text| Line::from(Span::styled(text, palette.hint)))
+        .collect();
     }
 
     let mut out: Vec<Line<'static>> = Vec::new();
@@ -1158,12 +1182,17 @@ fn render_update_minimal(
     state: &UpdateTuiState,
     palette: Palette,
 ) {
-    let text = match &state.phase {
-        UpdatePhase::Checking => format!("{} vdpi Update", state.spinner_glyph()),
-        UpdatePhase::UpToDate(_) => "vdpi Up to date".to_string(),
-        UpdatePhase::Available(info) => format!("vdpi Update {}", info.latest_tag),
-        UpdatePhase::Unknown(_) => "vdpi Update".to_string(),
-        UpdatePhase::Error(_) => "vdpi Update failed".to_string(),
+    let text = match (active_lang(), &state.phase) {
+        (Lang::En, UpdatePhase::Checking) => format!("{} vdpi Update", state.spinner_glyph()),
+        (Lang::Tr, UpdatePhase::Checking) => format!("{} vdpi Güncelle", state.spinner_glyph()),
+        (Lang::En, UpdatePhase::UpToDate(_)) => "vdpi Up to date".to_string(),
+        (Lang::Tr, UpdatePhase::UpToDate(_)) => "vdpi Güncel".to_string(),
+        (Lang::En, UpdatePhase::Available(info)) => format!("vdpi Update {}", info.latest_tag),
+        (Lang::Tr, UpdatePhase::Available(info)) => format!("vdpi Güncelle {}", info.latest_tag),
+        (Lang::En, UpdatePhase::Unknown(_)) => "vdpi Update".to_string(),
+        (Lang::Tr, UpdatePhase::Unknown(_)) => "vdpi Güncelle".to_string(),
+        (Lang::En, UpdatePhase::Error(_)) => "vdpi Update failed".to_string(),
+        (Lang::Tr, UpdatePhase::Error(_)) => "vdpi Güncelleme hatası".to_string(),
     };
     frame.render_widget(
         Line::from(Span::styled(
@@ -1290,14 +1319,25 @@ fn render_update_tui(frame: &mut Frame<'_>, state: &mut UpdateTuiState, color: b
     let row = |ry: u16| Rect::new(inner.x, ry, inner.width, 1);
 
     // 1. Header with semantic status pill
+    let is_tr = active_lang() == Lang::Tr;
     let (pill_text, pill_style) = match &state.phase {
         UpdatePhase::Checking => (
-            format!("{} Checking…", state.spinner_glyph()),
+            format!(
+                "{} {}",
+                state.spinner_glyph(),
+                tr("Checking…", "Denetleniyor…")
+            ),
             palette.ice_bold,
         ),
-        UpdatePhase::UpToDate(_) => ("● Up to date".to_string(), palette.emerald_bold),
+        UpdatePhase::UpToDate(_) => (tr("● Up to date", "● Güncel").to_string(), palette.emerald_bold),
         UpdatePhase::Available(_) => (
-            if width >= 46 {
+            if is_tr {
+                if width >= 48 {
+                    "▲ Güncelleme mevcut".to_string()
+                } else {
+                    "▲ Mevcut".to_string()
+                }
+            } else if width >= 46 {
                 "▲ Update available".to_string()
             } else {
                 "▲ Available".to_string()
@@ -1306,19 +1346,23 @@ fn render_update_tui(frame: &mut Frame<'_>, state: &mut UpdateTuiState, color: b
         ),
         UpdatePhase::Unknown(_) => (
             format!(
-                "{} Check complete",
-                if color { "●" } else { palette.warn_icon }
+                "{} {}",
+                if color { "●" } else { palette.warn_icon },
+                tr("Check complete", "Denetim tamam")
             ),
             palette.amber_bold,
         ),
-        UpdatePhase::Error(_) => ("✕ Check failed".to_string(), palette.red_bold),
+        UpdatePhase::Error(_) => (
+            tr("✕ Check failed", "✕ Denetim hatası").to_string(),
+            palette.red_bold,
+        ),
     };
 
     render_header_bar(
         frame,
         row(y),
-        " · Software Update",
-        " · Update",
+        tr(" · Software Update", " · Yazılım Güncelleme"),
+        tr(" · Update", " · Güncelle"),
         &pill_text,
         pill_style,
         palette,
@@ -1347,7 +1391,14 @@ fn render_update_tui(frame: &mut Frame<'_>, state: &mut UpdateTuiState, color: b
                 y = y.saturating_add(1);
             }
             if y < content_bottom {
-                let status_line = format!("{} Checking GitHub Releases…", state.spinner_glyph());
+                let status_line = format!(
+                    "{} {}",
+                    state.spinner_glyph(),
+                    tr(
+                        "Checking GitHub Releases…",
+                        "GitHub Sürümleri denetleniyor…"
+                    )
+                );
                 frame.render_widget(
                     Line::from(Span::styled(
                         truncate_text(&status_line, width),
@@ -1365,7 +1416,7 @@ fn render_update_tui(frame: &mut Frame<'_>, state: &mut UpdateTuiState, color: b
                 render_meta_row(
                     frame,
                     row(y),
-                    "Current",
+                    tr("Current", "Mevcut"),
                     vec![Span::styled(cur, palette.value)],
                     palette,
                 );
@@ -1375,7 +1426,7 @@ fn render_update_tui(frame: &mut Frame<'_>, state: &mut UpdateTuiState, color: b
                 render_meta_row(
                     frame,
                     row(y),
-                    "Source",
+                    tr("Source", "Kaynak"),
                     vec![Span::styled("GitHub Releases", palette.value_muted)],
                     palette,
                 );
@@ -1385,7 +1436,13 @@ fn render_update_tui(frame: &mut Frame<'_>, state: &mut UpdateTuiState, color: b
                 y = y.saturating_add(1);
             }
             if y < content_bottom {
-                for line in wrap_words("Press q or Esc to return to Control Center.", width) {
+                for line in wrap_words(
+                    tr(
+                        "Press q or Esc to return to Control Center.",
+                        "Kontrol Merkezi'ne dönmek için q veya Esc tuşuna basın.",
+                    ),
+                    width,
+                ) {
                     if y >= content_bottom {
                         break;
                     }
@@ -1399,7 +1456,7 @@ fn render_update_tui(frame: &mut Frame<'_>, state: &mut UpdateTuiState, color: b
                 render_meta_row(
                     frame,
                     row(y),
-                    "Current",
+                    tr("Current", "Mevcut"),
                     vec![Span::styled(
                         format_version_v(&info.current_version),
                         palette.value,
@@ -1412,7 +1469,7 @@ fn render_update_tui(frame: &mut Frame<'_>, state: &mut UpdateTuiState, color: b
                 render_meta_row(
                     frame,
                     row(y),
-                    "Latest",
+                    tr("Latest", "En yeni"),
                     vec![Span::styled(info.latest_tag.clone(), palette.emerald_bold)],
                     palette,
                 );
@@ -1422,7 +1479,7 @@ fn render_update_tui(frame: &mut Frame<'_>, state: &mut UpdateTuiState, color: b
                 render_meta_row(
                     frame,
                     row(y),
-                    "Source",
+                    tr("Source", "Kaynak"),
                     vec![Span::styled(info.source.clone(), palette.value_muted)],
                     palette,
                 );
@@ -1447,14 +1504,17 @@ fn render_update_tui(frame: &mut Frame<'_>, state: &mut UpdateTuiState, color: b
 
             if y < body_bottom {
                 let cur = format_version_v(&info.current_version);
-                let transition_full = format!("Current {cur} -> Latest {}", info.latest_tag);
+                let cur_label = tr("Current ", "Mevcut ");
+                let latest_label = tr("Latest ", "En yeni ");
+                let transition_full =
+                    format!("{cur_label}{cur} -> {latest_label}{}", info.latest_tag);
                 if width >= transition_full.chars().count() {
                     frame.render_widget(
                         Line::from(vec![
-                            Span::styled("Current ", palette.label),
+                            Span::styled(cur_label, palette.label),
                             Span::styled(cur, palette.value_muted),
                             Span::styled(" -> ", palette.hint),
-                            Span::styled("Latest ", palette.label),
+                            Span::styled(latest_label, palette.label),
                             Span::styled(info.latest_tag.clone(), palette.ice_bold),
                         ]),
                         row(y),
@@ -1463,7 +1523,7 @@ fn render_update_tui(frame: &mut Frame<'_>, state: &mut UpdateTuiState, color: b
                     render_meta_row(
                         frame,
                         row(y),
-                        "Version",
+                        tr("Version", "Sürüm"),
                         vec![
                             Span::styled(cur, palette.value_muted),
                             Span::styled(" -> ", palette.hint),
@@ -1478,7 +1538,7 @@ fn render_update_tui(frame: &mut Frame<'_>, state: &mut UpdateTuiState, color: b
                 render_meta_row(
                     frame,
                     row(y),
-                    "Source",
+                    tr("Source", "Kaynak"),
                     vec![Span::styled(info.source.clone(), palette.value_muted)],
                     palette,
                 );
@@ -1496,7 +1556,11 @@ fn render_update_tui(frame: &mut Frame<'_>, state: &mut UpdateTuiState, color: b
             if content_bottom > body_bottom {
                 let action_y = content_bottom.saturating_sub(1);
                 let action_rect = row(action_y);
-                let label = format!("Install {}", info.latest_tag);
+                let label = if is_tr {
+                    format!("{} sürümünü kur", info.latest_tag)
+                } else {
+                    format!("Install {}", info.latest_tag)
+                };
                 let prefix = " ▸ ";
                 let key = "[u] ";
                 let content_len = prefix.chars().count() + key.len() + label.chars().count();
@@ -1520,7 +1584,7 @@ fn render_update_tui(frame: &mut Frame<'_>, state: &mut UpdateTuiState, color: b
                 render_meta_row(
                     frame,
                     row(y),
-                    "Current",
+                    tr("Current", "Mevcut"),
                     vec![Span::styled(
                         format_version_v(&info.current_version),
                         palette.value,
@@ -1533,7 +1597,7 @@ fn render_update_tui(frame: &mut Frame<'_>, state: &mut UpdateTuiState, color: b
                 render_meta_row(
                     frame,
                     row(y),
-                    "Latest",
+                    tr("Latest", "En yeni"),
                     vec![Span::styled(info.latest_tag.clone(), palette.amber_bold)],
                     palette,
                 );
@@ -1543,7 +1607,7 @@ fn render_update_tui(frame: &mut Frame<'_>, state: &mut UpdateTuiState, color: b
                 render_meta_row(
                     frame,
                     row(y),
-                    "Source",
+                    tr("Source", "Kaynak"),
                     vec![Span::styled(info.source.clone(), palette.value_muted)],
                     palette,
                 );
@@ -1558,17 +1622,21 @@ fn render_update_tui(frame: &mut Frame<'_>, state: &mut UpdateTuiState, color: b
         }
         UpdatePhase::Error(err_msg) => {
             if y < content_bottom {
+                let err_heading = tr(
+                    "Unable to check for updates",
+                    "Güncellemeler denetlenemedi",
+                );
                 let heading_line = if width > 2 {
                     Line::from(vec![
                         Span::styled("✕ ", palette.red_bold),
                         Span::styled(
-                            truncate_text("Unable to check for updates", width - 2),
+                            truncate_text(err_heading, width - 2),
                             palette.red_bold,
                         ),
                     ])
                 } else {
                     Line::from(Span::styled(
-                        truncate_text("✕ Unable to check for updates", width),
+                        truncate_text(&format!("✕ {err_heading}"), width),
                         palette.red_bold,
                     ))
                 };
@@ -1635,7 +1703,13 @@ fn render_update_tui(frame: &mut Frame<'_>, state: &mut UpdateTuiState, color: b
                 let hint_y = content_bottom.saturating_sub(1);
                 frame.render_widget(
                     Line::from(Span::styled(
-                        truncate_text("Check your network connection and press r to retry.", width),
+                        truncate_text(
+                            tr(
+                                "Check your network connection and press r to retry.",
+                                "Ağ bağlantınızı kontrol edin ve yeniden denemek için r tuşuna basın.",
+                            ),
+                            width,
+                        ),
                         palette.hint,
                     )),
                     row(hint_y),
@@ -1649,16 +1723,46 @@ fn render_update_tui(frame: &mut Frame<'_>, state: &mut UpdateTuiState, color: b
     if show_footer && footer_y > y {
         footer_y = footer_y.saturating_sub(1);
         let hints: Vec<(&str, &str)> = match &state.phase {
-            UpdatePhase::Checking => vec![("q / esc", "cancel")],
+            UpdatePhase::Checking => vec![("q / esc", tr("cancel", "iptal"))],
             UpdatePhase::UpToDate(_) | UpdatePhase::Unknown(_) => {
-                if width >= 44 {
+                if is_tr {
+                    if width >= 46 {
+                        vec![
+                            ("r", "yeniden denetle"),
+                            ("↑↓", "kaydır"),
+                            ("enter / q", "geri"),
+                        ]
+                    } else if width >= 38 {
+                        vec![("r", "denetle"), ("↑↓", "kaydır"), ("enter / q", "geri")]
+                    } else {
+                        vec![("r", "denetle"), ("↑↓", "kaydır"), ("q", "geri")]
+                    }
+                } else if width >= 44 {
                     vec![("r", "re-check"), ("↑↓", "scroll"), ("enter / q", "back")]
                 } else {
                     vec![("r", "check"), ("↑↓", "scroll"), ("q", "back")]
                 }
             }
             UpdatePhase::Available(_) => {
-                if width >= 43 {
+                if is_tr {
+                    if width >= 46 {
+                        vec![
+                            ("u", "kur"),
+                            ("r", "yeniden denetle"),
+                            ("↑↓", "kaydır"),
+                            ("q", "geri"),
+                        ]
+                    } else if width >= 38 {
+                        vec![
+                            ("u", "kur"),
+                            ("r", "denetle"),
+                            ("↑↓", "kaydır"),
+                            ("q", "geri"),
+                        ]
+                    } else {
+                        vec![("u", "kur"), ("r", "denetle"), ("q", "geri")]
+                    }
+                } else if width >= 43 {
                     vec![
                         ("u", "install"),
                         ("r", "re-check"),
@@ -1678,9 +1782,16 @@ fn render_update_tui(frame: &mut Frame<'_>, state: &mut UpdateTuiState, color: b
             }
             UpdatePhase::Error(_) => {
                 if state.last_total_rows > state.last_viewport_rows {
-                    vec![("r", "retry"), ("↑↓", "scroll"), ("q", "back")]
+                    vec![
+                        ("r", tr("retry", "yeniden dene")),
+                        ("↑↓", tr("scroll", "kaydır")),
+                        ("q", tr("back", "geri")),
+                    ]
                 } else {
-                    vec![("r", "retry"), ("q", "back")]
+                    vec![
+                        ("r", tr("retry", "yeniden dene")),
+                        ("q", tr("back", "geri")),
+                    ]
                 }
             }
         };
@@ -1730,12 +1841,12 @@ fn render_whats_new_section(
     state.scroll = state.scroll.min(max_scroll);
 
     // Section title row: "What's New" + optional scroll range indicator
-    let title = "What's New";
+    let title = tr("What's New", "Yenilikler");
     if needs_scrollbar {
         let start = state.scroll + 1;
         let end = (state.scroll + body_rows_available).min(lines.len());
         let indicator = format!("{start}-{end}/{}", lines.len());
-        let gap = width.saturating_sub(title.len() + indicator.len());
+        let gap = width.saturating_sub(title.chars().count() + indicator.len());
         if gap >= 2 {
             frame.render_widget(
                 Line::from(vec![
@@ -1808,19 +1919,35 @@ fn render_whats_new_section(
 /// Returns `Ok(Some(notice))` when an install was attempted (success or failure),
 /// or `Ok(None)` when the user returns to the Control Center without installing.
 pub async fn run_update_tui(cfg: &RuntimeConfig) -> Result<Option<String>> {
+    i18n::init_from_config();
+
     if !is_interactive_tty() {
+        let is_tr = active_lang() == Lang::Tr;
         return match fetch_latest_release().await {
-            Ok(info) if info.relation == VersionRelation::Newer => Ok(Some(format!(
-                "Update available: {} -> {}. Run 'vdpi update' to install.",
-                format_version_v(&info.current_version),
-                info.latest_tag
-            ))),
-            Ok(info) => Ok(Some(format!(
-                "vdpi is up to date ({}).",
-                format_version_v(&info.current_version)
-            ))),
+            Ok(info) if info.relation == VersionRelation::Newer => Ok(Some(if is_tr {
+                format!(
+                    "Güncelleme mevcut: {} -> {}. Kurmak için 'vdpi update' çalıştırın.",
+                    format_version_v(&info.current_version),
+                    info.latest_tag
+                )
+            } else {
+                format!(
+                    "Update available: {} -> {}. Run 'vdpi update' to install.",
+                    format_version_v(&info.current_version),
+                    info.latest_tag
+                )
+            })),
+            Ok(info) => Ok(Some(if is_tr {
+                format!("vdpi güncel ({}).", format_version_v(&info.current_version))
+            } else {
+                format!(
+                    "vdpi is up to date ({}).",
+                    format_version_v(&info.current_version)
+                )
+            })),
             Err(err) => Ok(Some(format!(
-                "Update check failed: {}",
+                "{}: {}",
+                tr("Update check failed", "Güncelleme denetimi başarısız"),
                 sanitize_single_line(&format!("{err:#}"))
             ))),
         };
@@ -1908,13 +2035,22 @@ pub async fn run_update_tui(cfg: &RuntimeConfig) -> Result<Option<String>> {
         return Ok(None);
     };
 
-    println!("\nUpdating vdpi to {}...", info.latest_tag);
+    if active_lang() == Lang::Tr {
+        println!("\nvdpi {} sürümüne güncelleniyor...", info.latest_tag);
+    } else {
+        println!("\nUpdating vdpi to {}...", info.latest_tag);
+    }
     let _ = io::stdout().flush();
 
     match vdpi::update::run_update(false, false, cfg).await {
-        Ok(()) => Ok(Some(format!("Updated vdpi to {}.", info.latest_tag))),
+        Ok(()) => Ok(Some(if active_lang() == Lang::Tr {
+            format!("vdpi {} sürümüne güncellendi.", info.latest_tag)
+        } else {
+            format!("Updated vdpi to {}.", info.latest_tag)
+        })),
         Err(err) => Ok(Some(format!(
-            "Update failed: {}",
+            "{}: {}",
+            tr("Update failed", "Güncelleme başarısız"),
             sanitize_single_line(&format!("{err:#}"))
         ))),
     }
@@ -1958,24 +2094,24 @@ const DIAG_CHECK_COUNT: usize = 6;
 #[cfg(not(target_os = "windows"))]
 const DIAG_CHECK_COUNT: usize = 5;
 
-#[cfg(target_os = "windows")]
-const DIAG_CHECK_NAMES: [&str; DIAG_CHECK_COUNT] = [
-    "Service & Engine",
-    "VPN & Split Tunnel",
-    "Wintun Driver (wintun.dll)",
-    "Encrypted DNS (DoH)",
-    "TLS Handshake (discord.com)",
-    "TLS Handshake (roblox.com)",
-];
-
-#[cfg(not(target_os = "windows"))]
-const DIAG_CHECK_NAMES: [&str; DIAG_CHECK_COUNT] = [
-    "Service & Engine",
-    "VPN & Split Tunnel",
-    "Encrypted DNS (DoH)",
-    "TLS Handshake (discord.com)",
-    "TLS Handshake (roblox.com)",
-];
+fn diag_check_name(idx: usize, dns_name: &'static str) -> &'static str {
+    match idx {
+        DIAG_IDX_SERVICE => tr("Service & Engine", "Servis ve Motor"),
+        DIAG_IDX_VPN => tr("VPN & Split Tunnel", "VPN ve Bölünmüş Tünel"),
+        #[cfg(target_os = "windows")]
+        DIAG_IDX_WINTUN => tr("Wintun Driver (wintun.dll)", "Wintun Sürücüsü (wintun.dll)"),
+        DIAG_IDX_DOH => dns_name,
+        DIAG_IDX_DISCORD => tr(
+            "TLS Handshake (discord.com)",
+            "TLS El Sıkışması (discord.com)",
+        ),
+        DIAG_IDX_ROBLOX => tr(
+            "TLS Handshake (roblox.com)",
+            "TLS El Sıkışması (roblox.com)",
+        ),
+        _ => "",
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DiagStatus {
@@ -2041,9 +2177,9 @@ enum DiagKeyAction {
 fn diag_dns_check_name(cfg: &RuntimeConfig) -> &'static str {
     let (_, _, transport, _) = doh_check_target(cfg);
     if transport == "DoH" {
-        "Encrypted DNS (DoH)"
+        tr("Encrypted DNS (DoH)", "Şifreli DNS (DoH)")
     } else {
-        "DNS Resolution (UDP)"
+        tr("DNS Resolution (UDP)", "DNS Çözümleme (UDP)")
     }
 }
 
@@ -2052,11 +2188,7 @@ impl DiagnosticsTuiState {
         let dns_name = diag_dns_check_name(cfg);
         Self {
             items: std::array::from_fn(|idx| DiagCheckItem {
-                name: if idx == DIAG_IDX_DOH {
-                    dns_name
-                } else {
-                    DIAG_CHECK_NAMES[idx]
-                },
+                name: diag_check_name(idx, dns_name),
                 status: DiagStatus::Running,
             }),
             spinner_tick: 0,
@@ -2116,7 +2248,17 @@ impl DiagnosticsTuiState {
     fn summary_string(&self) -> String {
         let done = self.done_count();
         let passed = self.pass_count();
-        if done == DIAG_CHECK_COUNT && passed == DIAG_CHECK_COUNT {
+        if active_lang() == Lang::Tr {
+            if done == DIAG_CHECK_COUNT && passed == DIAG_CHECK_COUNT {
+                format!("Tanılama başarılı ({passed}/{DIAG_CHECK_COUNT})")
+            } else if done < DIAG_CHECK_COUNT {
+                format!(
+                    "Tanılama iptal edildi ({done}/{DIAG_CHECK_COUNT} tamamlandı, {passed} başarılı)"
+                )
+            } else {
+                format!("Tanılama sorunlarla tamamlandı ({passed}/{DIAG_CHECK_COUNT} başarılı)")
+            }
+        } else if done == DIAG_CHECK_COUNT && passed == DIAG_CHECK_COUNT {
             format!("Diagnostics passed ({passed}/{DIAG_CHECK_COUNT})")
         } else if done < DIAG_CHECK_COUNT {
             format!("Diagnostics cancelled ({done}/{DIAG_CHECK_COUNT} complete, {passed} passed)")
@@ -2245,20 +2387,29 @@ fn format_rss_mb(rss_kb: u64) -> String {
 }
 
 fn evaluate_service_engine_check(status: &ControlCenterStatus) -> DiagStatus {
+    let is_tr = active_lang() == Lang::Tr;
     if let Some(live) = status.live_engine.as_ref() {
         let mut parts: Vec<String> = Vec::new();
         let engine_label = match live.engine {
             EngineMode::Tun => {
                 if let Some(iface) = live.tun_interface.as_deref().filter(|s| !s.is_empty()) {
-                    format!("TUN active ({iface})")
+                    if is_tr {
+                        format!("TUN etkin ({iface})")
+                    } else {
+                        format!("TUN active ({iface})")
+                    }
                 } else {
-                    "TUN active".to_string()
+                    tr("TUN active", "TUN etkin").to_string()
                 }
             }
             EngineMode::Proxy => {
                 let ip = normalize_loopback_ip(live.addr).unwrap_or(live.addr);
                 let addr = SocketAddr::new(ip, live.port);
-                format!("Proxy active ({addr})")
+                if is_tr {
+                    format!("Proxy etkin ({addr})")
+                } else {
+                    format!("Proxy active ({addr})")
+                }
             }
         };
         if let Some(ver) = live.version.as_deref().filter(|s| !s.is_empty()) {
@@ -2289,22 +2440,44 @@ fn evaluate_service_engine_check(status: &ControlCenterStatus) -> DiagStatus {
                 EngineMode::Proxy => "Proxy",
             };
             DiagStatus::Pass {
-                summary: format!("{eng} service running"),
-                detail: Some("Background service active (health endpoint idle)".to_string()),
+                summary: if is_tr {
+                    format!("{eng} servisi çalışıyor")
+                } else {
+                    format!("{eng} service running")
+                },
+                detail: Some(
+                    tr(
+                        "Background service active (health endpoint idle)",
+                        "Arka plan servisi etkin (durum uç noktası boşta)",
+                    )
+                    .to_string(),
+                ),
                 latency_ms: None,
             }
         }
         ServiceState::Stopped => DiagStatus::Warn {
-            summary: "Service paused (standby)".to_string(),
+            summary: tr("Service paused (standby)", "Servis duraklatıldı (beklemede)").to_string(),
             detail: Some(
-                "Resume the service from Control Center to enable protection.".to_string(),
+                tr(
+                    "Resume the service from Control Center to enable protection.",
+                    "Korumayı etkinleştirmek için Kontrol Merkezi'nden servisi sürdürün.",
+                )
+                .to_string(),
             ),
             latency_ms: None,
         },
         ServiceState::NotInstalled => DiagStatus::Warn {
-            summary: "Service not installed (standby)".to_string(),
+            summary: tr(
+                "Service not installed (standby)",
+                "Servis kurulu değil (beklemede)",
+            )
+            .to_string(),
             detail: Some(
-                "Checks run over your direct connection until vdpi is active.".to_string(),
+                tr(
+                    "Checks run over your direct connection until vdpi is active.",
+                    "vdpi etkinleşene kadar denetimler doğrudan bağlantınız üzerinden çalışır.",
+                )
+                .to_string(),
             ),
             latency_ms: None,
         },
@@ -2312,6 +2485,7 @@ fn evaluate_service_engine_check(status: &ControlCenterStatus) -> DiagStatus {
 }
 
 fn evaluate_vpn_split_check(status: &ControlCenterStatus, cfg: &RuntimeConfig) -> DiagStatus {
+    let is_tr = active_lang() == Lang::Tr;
     let split = if cfg.split_tunnel.mode == vdpi_core::config::SplitTunnelMode::All
         && cfg.split_tunnel.apps.is_empty()
     {
@@ -2319,12 +2493,31 @@ fn evaluate_vpn_split_check(status: &ControlCenterStatus, cfg: &RuntimeConfig) -
     } else {
         cfg.split_tunnel.clone()
     };
-    let split_label = split.summary_label();
+    let split_label = if is_tr {
+        let count = split.apps.len();
+        match split.mode {
+            vdpi_core::config::SplitTunnelMode::All => "Tüm uygulamalar".to_string(),
+            vdpi_core::config::SplitTunnelMode::Include => format!("Dahil et ({count} uygulama)"),
+            vdpi_core::config::SplitTunnelMode::Exclude => format!("Hariç tut ({count} uygulama)"),
+        }
+    } else {
+        split.summary_label()
+    };
 
     if cfg.vpn_coexistence == VpnCoexistence::Off {
         return DiagStatus::Pass {
-            summary: format!("VPN check off · {split_label}"),
-            detail: Some("VPN coexistence detection is disabled in configuration.".to_string()),
+            summary: if is_tr {
+                format!("VPN denetimi kapalı · {split_label}")
+            } else {
+                format!("VPN check off · {split_label}")
+            },
+            detail: Some(
+                tr(
+                    "VPN coexistence detection is disabled in configuration.",
+                    "VPN uyumluluğu algılaması yapılandırmada devre dışı.",
+                )
+                .to_string(),
+            ),
             latency_ms: None,
         };
     }
@@ -2335,13 +2528,23 @@ fn evaluate_vpn_split_check(status: &ControlCenterStatus, cfg: &RuntimeConfig) -
         .filter(|s| !s.trim().is_empty())
     {
         DiagStatus::Warn {
-            summary: format!("VPN conflict: {}", sanitize_single_line(conflict)),
-            detail: Some(format!("Split tunnel: {split_label}")),
+            summary: format!(
+                "{}: {}",
+                tr("VPN conflict", "VPN çakışması"),
+                sanitize_single_line(conflict)
+            ),
+            detail: Some(format!(
+                "{}: {split_label}",
+                tr("Split tunnel", "Bölünmüş tünel")
+            )),
             latency_ms: None,
         }
     } else {
         DiagStatus::Pass {
-            summary: format!("No VPN conflict · {split_label}"),
+            summary: format!(
+                "{} · {split_label}",
+                tr("No VPN conflict", "VPN çakışması yok")
+            ),
             detail: None,
             latency_ms: None,
         }
@@ -2391,7 +2594,11 @@ fn format_doh_init_error(
     latency_ms: u128,
 ) -> DiagStatus {
     DiagStatus::Fail {
-        summary: format!("Resolver init failed ({dns_display})"),
+        summary: if active_lang() == Lang::Tr {
+            format!("Çözümleyici başlatılamadı ({dns_display})")
+        } else {
+            format!("Resolver init failed ({dns_display})")
+        },
         detail: Some(sanitize_doh_error_detail(raw_err, dns_addr, dns_display)),
         latency_ms: Some(latency_ms),
     }
@@ -2404,23 +2611,43 @@ fn evaluate_doh_outcome(
     outcome: std::result::Result<Result<Vec<IpAddr>>, ()>,
     latency_ms: u128,
 ) -> DiagStatus {
+    let is_tr = active_lang() == Lang::Tr;
     match outcome {
         Ok(Ok(ips)) if !ips.is_empty() => {
             let first = ips[0].to_string();
-            let noun = if ips.len() == 1 { "IP" } else { "IPs" };
+            let (summary, detail) = if is_tr {
+                (
+                    format!("discord.com çözümlendi ({} IP)", ips.len()),
+                    format!("{dns_display} üzerinden {transport} · {first}"),
+                )
+            } else {
+                let noun = if ips.len() == 1 { "IP" } else { "IPs" };
+                (
+                    format!("discord.com resolved ({} {noun})", ips.len()),
+                    format!("{transport} via {dns_display} · {first}"),
+                )
+            };
             DiagStatus::Pass {
-                summary: format!("discord.com resolved ({} {noun})", ips.len()),
-                detail: Some(format!("{transport} via {dns_display} · {first}")),
+                summary,
+                detail: Some(detail),
                 latency_ms: Some(latency_ms),
             }
         }
         Ok(Ok(_)) => DiagStatus::Fail {
-            summary: "No IP addresses returned".to_string(),
-            detail: Some(format!("{transport} via {dns_display}")),
+            summary: tr("No IP addresses returned", "IP adresi dönmedi").to_string(),
+            detail: Some(if is_tr {
+                format!("{dns_display} üzerinden {transport}")
+            } else {
+                format!("{transport} via {dns_display}")
+            }),
             latency_ms: Some(latency_ms),
         },
         Ok(Err(err)) => DiagStatus::Fail {
-            summary: format!("{transport} lookup failed"),
+            summary: if is_tr {
+                format!("{transport} sorgusu başarısız")
+            } else {
+                format!("{transport} lookup failed")
+            },
             detail: Some(sanitize_doh_error_detail(
                 &format!("{err:#}"),
                 dns_addr,
@@ -2429,11 +2656,22 @@ fn evaluate_doh_outcome(
             latency_ms: Some(latency_ms),
         },
         Err(()) => DiagStatus::Fail {
-            summary: format!("{transport} lookup timed out"),
-            detail: Some(format!(
-                "No reply from {dns_display} within {}s",
-                DIAG_DNS_TIMEOUT.as_secs()
-            )),
+            summary: if is_tr {
+                format!("{transport} sorgusu zaman aşımına uğradı")
+            } else {
+                format!("{transport} lookup timed out")
+            },
+            detail: Some(if is_tr {
+                format!(
+                    "{dns_display} sunucusundan {} sn içinde yanıt yok",
+                    DIAG_DNS_TIMEOUT.as_secs()
+                )
+            } else {
+                format!(
+                    "No reply from {dns_display} within {}s",
+                    DIAG_DNS_TIMEOUT.as_secs()
+                )
+            }),
             latency_ms: Some(latency_ms),
         },
     }
@@ -2474,6 +2712,7 @@ enum TlsProbePath {
 async fn run_tls_handshake_check(host: &str, path: TlsProbePath) -> DiagStatus {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let started = Instant::now();
+    let is_tr = active_lang() == Lang::Tr;
 
     let (client_res, path_desc) = match &path {
         TlsProbePath::Proxy(proxy_addr) => {
@@ -2489,7 +2728,12 @@ async fn run_tls_handshake_check(host: &str, path: TlsProbePath) -> DiagStatus {
                         .build()
                         .map_err(anyhow::Error::from)
                 });
-            (res, format!("Via local proxy {proxy_addr}"))
+            let desc = if is_tr {
+                format!("Yerel proxy üzerinden ({proxy_addr})")
+            } else {
+                format!("Via local proxy {proxy_addr}")
+            };
+            (res, desc)
         }
         TlsProbePath::Tun => {
             let res = reqwest::Client::builder()
@@ -2499,7 +2743,10 @@ async fn run_tls_handshake_check(host: &str, path: TlsProbePath) -> DiagStatus {
                 .timeout(DIAG_TLS_TIMEOUT)
                 .build()
                 .map_err(anyhow::Error::from);
-            (res, "Via active TUN engine".to_string())
+            (
+                res,
+                tr("Via active TUN engine", "Etkin TUN motoru üzerinden").to_string(),
+            )
         }
         TlsProbePath::Direct => {
             let res = reqwest::Client::builder()
@@ -2509,7 +2756,10 @@ async fn run_tls_handshake_check(host: &str, path: TlsProbePath) -> DiagStatus {
                 .timeout(DIAG_TLS_TIMEOUT)
                 .build()
                 .map_err(anyhow::Error::from);
-            (res, "Direct TLS connection".to_string())
+            (
+                res,
+                tr("Direct TLS connection", "Doğrudan TLS bağlantısı").to_string(),
+            )
         }
     };
 
@@ -2517,7 +2767,7 @@ async fn run_tls_handshake_check(host: &str, path: TlsProbePath) -> DiagStatus {
         Ok(c) => c,
         Err(err) => {
             return DiagStatus::Fail {
-                summary: "TLS client unavailable".to_string(),
+                summary: tr("TLS client unavailable", "TLS istemcisi kullanılamıyor").to_string(),
                 detail: Some(sanitize_single_line(&format!("{err:#}"))),
                 latency_ms: Some(started.elapsed().as_millis()),
             };
@@ -2530,21 +2780,36 @@ async fn run_tls_handshake_check(host: &str, path: TlsProbePath) -> DiagStatus {
 
     match outcome {
         Ok(Ok(resp)) => DiagStatus::Pass {
-            summary: format!("TLS verified (HTTP {})", resp.status().as_u16()),
+            summary: if is_tr {
+                format!("TLS doğrulandı (HTTP {})", resp.status().as_u16())
+            } else {
+                format!("TLS verified (HTTP {})", resp.status().as_u16())
+            },
             detail: Some(path_desc),
             latency_ms: Some(latency_ms),
         },
         Ok(Err(err)) => DiagStatus::Fail {
-            summary: "TLS handshake failed".to_string(),
+            summary: tr("TLS handshake failed", "TLS el sıkışması başarısız").to_string(),
             detail: Some(sanitize_single_line(&err.to_string())),
             latency_ms: Some(latency_ms),
         },
         Err(_) => DiagStatus::Fail {
-            summary: "TLS handshake timed out".to_string(),
-            detail: Some(format!(
-                "Timed out after {}s ({path_desc})",
-                DIAG_TLS_TIMEOUT.as_secs()
-            )),
+            summary: tr(
+                "TLS handshake timed out",
+                "TLS el sıkışması zaman aşımına uğradı",
+            )
+            .to_string(),
+            detail: Some(if is_tr {
+                format!(
+                    "{} sn sonra zaman aşımına uğradı ({path_desc})",
+                    DIAG_TLS_TIMEOUT.as_secs()
+                )
+            } else {
+                format!(
+                    "Timed out after {}s ({path_desc})",
+                    DIAG_TLS_TIMEOUT.as_secs()
+                )
+            }),
             latency_ms: Some(latency_ms),
         },
     }
@@ -2555,12 +2820,20 @@ fn evaluate_wintun_check(
     result: Result<std::path::PathBuf, String>,
     tun_configured: bool,
 ) -> DiagStatus {
+    let is_tr = active_lang() == Lang::Tr;
     match result {
         Ok(path) => DiagStatus::Pass {
-            summary: format!(
-                "wintun.dll v{} verified",
-                vdpi::platform::windows_tun::WINTUN_VERSION
-            ),
+            summary: if is_tr {
+                format!(
+                    "wintun.dll v{} doğrulandı",
+                    vdpi::platform::windows_tun::WINTUN_VERSION
+                )
+            } else {
+                format!(
+                    "wintun.dll v{} verified",
+                    vdpi::platform::windows_tun::WINTUN_VERSION
+                )
+            },
             detail: Some(sanitize_single_line(&path.display().to_string())),
             latency_ms: None,
         },
@@ -2568,14 +2841,25 @@ fn evaluate_wintun_check(
             let lower = sanitize_single_line(&err).to_ascii_lowercase();
             let hash_mismatch =
                 lower.contains("sha-256") || lower.contains("hash") || lower.contains("mismatch");
-            let detail =
-                "Extract all files from the zip (keep wintun.dll beside vdpi.exe).".to_string();
+            let detail = tr(
+                "Extract all files from the zip (keep wintun.dll beside vdpi.exe).",
+                "Zip içindeki tüm dosyaları çıkarın (wintun.dll, vdpi.exe yanında olmalıdır).",
+            )
+            .to_string();
             if tun_configured {
                 DiagStatus::Fail {
                     summary: if hash_mismatch {
-                        "wintun.dll corrupted or mismatched (required for TUN)".to_string()
+                        tr(
+                            "wintun.dll corrupted or mismatched (required for TUN)",
+                            "wintun.dll bozuk veya eşleşmiyor (TUN için gerekli)",
+                        )
+                        .to_string()
                     } else {
-                        "wintun.dll missing or invalid (required for TUN)".to_string()
+                        tr(
+                            "wintun.dll missing or invalid (required for TUN)",
+                            "wintun.dll eksik veya geçersiz (TUN için gerekli)",
+                        )
+                        .to_string()
                     },
                     detail: Some(detail),
                     latency_ms: None,
@@ -2583,9 +2867,17 @@ fn evaluate_wintun_check(
             } else {
                 DiagStatus::Warn {
                     summary: if hash_mismatch {
-                        "wintun.dll corrupted or mismatched (Proxy ok; needed for TUN)".to_string()
+                        tr(
+                            "wintun.dll corrupted or mismatched (Proxy ok; needed for TUN)",
+                            "wintun.dll bozuk veya eşleşmiyor (Proxy sorunsuz; TUN için gerekli)",
+                        )
+                        .to_string()
                     } else {
-                        "wintun.dll missing or invalid (Proxy ok; needed for TUN)".to_string()
+                        tr(
+                            "wintun.dll missing or invalid (Proxy ok; needed for TUN)",
+                            "wintun.dll eksik veya geçersiz (Proxy sorunsuz; TUN için gerekli)",
+                        )
+                        .to_string()
                     },
                     detail: Some(detail),
                     latency_ms: None,
@@ -2755,7 +3047,8 @@ fn build_diag_rows(
         // Summary + detail lines strictly word-wrapped on whitespace boundaries
         match &item.status {
             DiagStatus::Running => {
-                for (_, text) in wrap_bullet("Checking…", width, "  ", "  ") {
+                for (_, text) in wrap_bullet(tr("Checking…", "Denetleniyor…"), width, "  ", "  ")
+                {
                     lines.push(Line::from(vec![
                         Span::raw("  "),
                         Span::styled(text, palette.hint),
@@ -2828,14 +3121,15 @@ fn render_diag_minimal(
     state: &DiagnosticsTuiState,
     palette: Palette,
 ) {
+    let label = tr("vdpi Diag", "vdpi Tanı");
     let text = if state.is_running() {
         format!(
-            "{} vdpi Diag ({}/{DIAG_CHECK_COUNT})",
+            "{} {label} ({}/{DIAG_CHECK_COUNT})",
             state.spinner_glyph(),
             state.done_count()
         )
     } else {
-        format!("vdpi Diag ({}/{DIAG_CHECK_COUNT})", state.pass_count())
+        format!("{label} ({}/{DIAG_CHECK_COUNT})", state.pass_count())
     };
     frame.render_widget(
         Line::from(Span::styled(
@@ -2888,9 +3182,19 @@ fn render_diagnostics_tui(frame: &mut Frame<'_>, state: &mut DiagnosticsTuiState
     let row = |ry: u16| Rect::new(inner.x, ry, inner.width, 1);
 
     // 1. Header row with live progress / result summary pill
+    let is_tr = active_lang() == Lang::Tr;
     let (pill_text, pill_style) = if state.is_running() {
         let done = state.done_count();
-        let text = if width >= 54 {
+        let text = if is_tr {
+            if width >= 56 {
+                format!(
+                    "{} Denetimler çalışıyor ({done}/{DIAG_CHECK_COUNT})…",
+                    state.spinner_glyph()
+                )
+            } else {
+                format!("{} {done}/{DIAG_CHECK_COUNT}…", state.spinner_glyph())
+            }
+        } else if width >= 54 {
             format!(
                 "{} Running checks ({done}/{DIAG_CHECK_COUNT})…",
                 state.spinner_glyph()
@@ -2902,7 +3206,13 @@ fn render_diagnostics_tui(frame: &mut Frame<'_>, state: &mut DiagnosticsTuiState
     } else {
         let attention = state.attention_count();
         if attention == 0 {
-            let text = if width >= 46 {
+            let text = if is_tr {
+                if width >= 48 {
+                    "● Tüm denetimler geçti".to_string()
+                } else {
+                    "● Tümü geçti".to_string()
+                }
+            } else if width >= 46 {
                 "● All checks passed".to_string()
             } else {
                 "● All passed".to_string()
@@ -2914,15 +3224,23 @@ fn render_diagnostics_tui(frame: &mut Frame<'_>, state: &mut DiagnosticsTuiState
             } else {
                 (palette.warn_icon, palette.amber_bold)
             };
-            let noun = if attention == 1 {
-                "check needs"
+            let text = if is_tr {
+                if width >= 54 {
+                    format!("{icon} {attention} denetim dikkat gerektiriyor")
+                } else {
+                    format!("{icon} {attention} uyarı")
+                }
             } else {
-                "checks need"
-            };
-            let text = if width >= 56 {
-                format!("{icon} {attention} {noun} attention")
-            } else {
-                format!("{icon} {attention} attention")
+                let noun = if attention == 1 {
+                    "check needs"
+                } else {
+                    "checks need"
+                };
+                if width >= 56 {
+                    format!("{icon} {attention} {noun} attention")
+                } else {
+                    format!("{icon} {attention} attention")
+                }
             };
             (text, style)
         }
@@ -2931,8 +3249,8 @@ fn render_diagnostics_tui(frame: &mut Frame<'_>, state: &mut DiagnosticsTuiState
     render_header_bar(
         frame,
         row(y),
-        " · Network Diagnostics",
-        " · Diagnostics",
+        tr(" · Network Diagnostics", " · Ağ Tanılaması"),
+        tr(" · Diagnostics", " · Tanılama"),
         &pill_text,
         pill_style,
         palette,
@@ -3004,9 +3322,24 @@ fn render_diagnostics_tui(frame: &mut Frame<'_>, state: &mut DiagnosticsTuiState
         footer_y = footer_y.saturating_sub(1);
         let hints: Vec<(&str, &str)> = if state.is_running() {
             if width >= 26 {
-                vec![("↑↓", "scroll"), ("enter / q", "back")]
+                vec![
+                    ("↑↓", tr("scroll", "kaydır")),
+                    ("enter / q", tr("back", "geri")),
+                ]
             } else {
-                vec![("↑↓", "scroll"), ("q", "back")]
+                vec![("↑↓", tr("scroll", "kaydır")), ("q", tr("back", "geri"))]
+            }
+        } else if is_tr {
+            if width >= 47 {
+                vec![
+                    ("r", "yeniden çalıştır"),
+                    ("↑↓", "kaydır"),
+                    ("enter / q", "geri"),
+                ]
+            } else if width >= 38 {
+                vec![("r", "tekrar"), ("↑↓", "kaydır"), ("enter / q", "geri")]
+            } else {
+                vec![("r", "tekrar"), ("↑↓", "kaydır"), ("q", "geri")]
             }
         } else if width >= 46 {
             vec![("r", "re-run"), ("↑↓", "scroll"), ("enter / q", "back")]
@@ -3029,6 +3362,8 @@ fn render_diagnostics_tui(frame: &mut Frame<'_>, state: &mut DiagnosticsTuiState
 /// `r` to re-run, `↑`/`↓` scrolling, and `Enter`/`q`/`Esc`/`Ctrl-C` to return to
 /// Control Center with a concise summary string.
 pub async fn run_diagnostics_tui(cfg: RuntimeConfig) -> Result<String> {
+    i18n::init_from_config();
+
     if !is_interactive_tty() {
         let mut state = DiagnosticsTuiState::new_running(&cfg);
         let (tx, mut rx) = mpsc::channel::<(u64, usize, DiagStatus)>(16);
@@ -4260,5 +4595,61 @@ mod tests {
         }
 
         build_release_api_client().expect("release API client with custom redirect policy builds");
+    }
+
+    #[test]
+    fn renders_update_and_diagnostics_tuis_in_turkish() {
+        let _guard = i18n::push_thread_lang(Some(Lang::Tr));
+
+        // 1. Update TUI: Checking, UpToDate, Available, Error
+        let mut checking = UpdateTuiState::new_checking("0.5.6");
+        let check_text = buffer_text(&render_update_buf(&mut checking, 80, 24, true));
+        assert!(check_text.contains("Yazılım Güncelleme"));
+        assert!(check_text.contains("Denetleniyor…"));
+        assert!(check_text.contains("Mevcut"));
+        assert!(check_text.contains("Kaynak"));
+        assert!(check_text.contains("q / esc iptal"));
+
+        let mut available = UpdateTuiState::new_checking("0.5.5");
+        available.apply_check_result(Ok(sample_available_info()));
+        let avail_text = buffer_text(&render_update_buf(&mut available, 80, 24, true));
+        assert!(avail_text.contains("Güncelleme mevcut"));
+        assert!(avail_text.contains("Yenilikler"));
+        assert!(avail_text.contains("[u] v0.5.6 sürümünü kur"));
+        assert!(avail_text.contains("u kur"));
+
+        let mut errored = UpdateTuiState::new_checking("0.5.6");
+        errored.apply_check_result(Err("HTTP 503".to_string()));
+        let err_text = buffer_text(&render_update_buf(&mut errored, 80, 24, true));
+        assert!(err_text.contains("Denetim hatası"));
+        assert!(err_text.contains("Güncellemeler denetlenemedi"));
+        assert!(err_text.contains("r yeniden dene"));
+
+        // 2. Diagnostics TUI: Running, All Passed, Mixed, and summaries
+        let mut running = DiagnosticsTuiState::new_running(&RuntimeConfig::default());
+        assert!(running.summary_string().contains("Tanılama iptal edildi"));
+        let run_text = buffer_text(&render_diag_buf(&mut running, 80, 24, true));
+        assert!(run_text.contains("Ağ Tanılaması"));
+        assert!(run_text.contains("Servis ve Motor"));
+        assert!(run_text.contains("VPN ve Bölünmüş Tünel"));
+        assert!(run_text.contains("Şifreli DNS (DoH)"));
+        assert!(run_text.contains("Denetleniyor…"));
+        assert!(run_text.contains("↑↓ kaydır"));
+
+        let mut all_pass = sample_all_pass_diag();
+        assert_eq!(
+            all_pass.summary_string(),
+            format!("Tanılama başarılı ({DIAG_CHECK_COUNT}/{DIAG_CHECK_COUNT})")
+        );
+        let pass_text = buffer_text(&render_diag_buf(&mut all_pass, 80, 24, true));
+        assert!(pass_text.contains("Tüm denetimler geçti"));
+        assert!(pass_text.contains("r yeniden çalıştır"));
+
+        let mut mixed = sample_mixed_diag();
+        assert!(mixed
+            .summary_string()
+            .contains("Tanılama sorunlarla tamamlandı"));
+        let mixed_text = buffer_text(&render_diag_buf(&mut mixed, 80, 24, true));
+        assert!(mixed_text.contains("denetim dikkat gerektiriyor"));
     }
 }

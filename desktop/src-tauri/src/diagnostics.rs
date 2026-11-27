@@ -12,8 +12,8 @@ use vdpi_core::dns::{
 #[cfg(any(target_os = "windows", test))]
 use crate::models::{LiveTelemetryDto, WintunStatusDto};
 use crate::models::{
-    DesktopStatusSnapshotDto, DiagStatusDto, DiagnosticCheckItemDto, DiagnosticsReportDto,
-    EngineModeDto, ServiceStateDto, SplitTunnelModeDto,
+    CliVersionRelationDto, DesktopStatusSnapshotDto, DiagStatusDto, DiagnosticCheckItemDto,
+    DiagnosticsReportDto, EngineModeDto, ServiceStateDto, SplitTunnelModeDto,
 };
 
 const DIAG_TIMEOUT: Duration = Duration::from_secs(5);
@@ -43,7 +43,7 @@ impl HttpProbePath {
             Self::Proxy(addr) => format!("Via local proxy {addr}"),
             Self::Tun => "Via active TUN engine".to_string(),
             Self::Direct => {
-                "Direct (vdpi not running — anti-DPI bypass not tested)".to_string()
+                "Direct (vdpi not running - anti-DPI bypass not tested)".to_string()
             }
         }
     }
@@ -354,7 +354,7 @@ fn evaluate_vpn_scope(
                     latency_ms,
                     summary: format!("Full-tunnel VPN active while coexistence is off: {desc}"),
                     detail: Some(format!(
-                        "VPN coexistence detection is disabled in configuration — active full-tunnel VPN may conflict with vdpi · Split tunnel: {split_label}"
+                        "VPN coexistence detection is disabled in configuration - active full-tunnel VPN may conflict with vdpi · Split tunnel: {split_label}"
                     )),
                 };
             }
@@ -468,9 +468,9 @@ fn evaluate_wintun_check(
         let runtime_note = if tun_active {
             None
         } else if live.is_some_and(|l| l.running) {
-            Some("Proxy mode active — TUN adapter load not tested".to_string())
+            Some("Proxy mode active - TUN adapter load not tested".to_string())
         } else {
-            Some("Service not running — driver load and adapter creation not tested".to_string())
+            Some("Service not running - driver load and adapter creation not tested".to_string())
         };
 
         let summary = if tun_active {
@@ -739,7 +739,7 @@ fn evaluate_http_probe_outcome(
                     target: display_target.to_string(),
                     status: DiagStatusDto::Warn,
                     latency_ms,
-                    summary: format!("Reachable directly (HTTP {code}) — bypass not tested"),
+                    summary: format!("Reachable directly (HTTP {code}) - bypass not tested"),
                     detail: Some(path_desc),
                 }
             } else {
@@ -954,6 +954,28 @@ fn evaluate_service_hygiene_check(status: &DesktopStatusSnapshotDto) -> Diagnost
             parts.push(format!("Config warning: {warn}"));
         }
 
+        if status.cli_version_relation == CliVersionRelationDto::RepairNeeded {
+            if warnings.is_empty() {
+                return DiagnosticCheckItemDto {
+                    id: "service_hygiene".to_string(),
+                    name: "Service & Runtime Hygiene".to_string(),
+                    target,
+                    status: DiagStatusDto::Warn,
+                    latency_ms: None,
+                    summary: "Background service needs repair".to_string(),
+                    detail: Some(
+                        "Installed CLI binary could not be verified on disk while the service is registered. Open Installation and run Repair / Reinstall."
+                            .to_string(),
+                    ),
+                };
+            }
+            warnings.push("Background service needs repair".to_string());
+            parts.push(
+                "Installed CLI binary could not be verified on disk while the service is registered. Open Installation and run Repair / Reinstall."
+                    .to_string(),
+            );
+        }
+
         if !warnings.is_empty() {
             let summary = if warnings.len() == 1 && !engine_mismatch && !version_mismatch {
                 format!("{active_label} · {}", warnings[0])
@@ -993,12 +1015,22 @@ fn evaluate_service_hygiene_check(status: &DesktopStatusSnapshotDto) -> Diagnost
         .filter(|s| !s.is_empty());
 
     let (check_status, summary, base_detail) = match status.service_state {
+        ServiceStateDto::Running | ServiceStateDto::Stopped
+            if status.cli_version_relation == CliVersionRelationDto::RepairNeeded =>
+        {
+            (
+                DiagStatusDto::Warn,
+                "Background service needs repair".to_string(),
+                "Installed CLI binary could not be verified on disk while the service is registered. Open Installation and run Repair / Reinstall."
+                    .to_string(),
+            )
+        }
         ServiceStateDto::Running if status.live.is_none() && vpn_conflict.is_some() => {
             let vpn = vpn_conflict.unwrap();
             (
                 DiagStatusDto::Warn,
                 format!(
-                    "{} service running (protection paused — VPN conflict: {vpn})",
+                    "{} service running (protection paused - VPN conflict: {vpn})",
                     engine_label(status.configured_engine)
                 ),
                 format!(
@@ -1128,7 +1160,7 @@ fn is_username_hard_stop_char(ch: char) -> bool {
                 | '?'
                 | '*'
                 | '·'
-                | '—'
+                | '\u{2014}'
         )
 }
 
@@ -1874,7 +1906,7 @@ mod tests {
         );
         assert_eq!(
             HttpProbePath::Direct.description(),
-            "Direct (vdpi not running — anti-DPI bypass not tested)"
+            "Direct (vdpi not running - anti-DPI bypass not tested)"
         );
     }
 
@@ -1892,7 +1924,7 @@ mod tests {
         assert_eq!(direct_ok.status, DiagStatusDto::Warn);
         assert_eq!(
             direct_ok.detail.as_deref(),
-            Some("Direct (vdpi not running — anti-DPI bypass not tested)")
+            Some("Direct (vdpi not running - anti-DPI bypass not tested)")
         );
 
         // Active TUN and Proxy HTTP 2xx report Pass.
@@ -2145,10 +2177,52 @@ mod tests {
         missing_bundle.service_state = ServiceStateDto::NotInstalled;
         missing_bundle.can_install_from_bundle = false;
         missing_bundle.bundled_engine_version = None;
-        missing_bundle.cli_version_relation = crate::models::CliVersionRelationDto::BundledMissing;
+        missing_bundle.cli_version_relation = CliVersionRelationDto::BundledMissing;
         let missing_bundle_check = evaluate_service_hygiene_check(&missing_bundle);
         assert_eq!(missing_bundle_check.status, DiagStatusDto::Fail);
         assert!(missing_bundle_check.summary.contains("Bundled vdpi CLI missing"));
+
+        // Running service with live telemetry but RepairNeeded (unreadable/missing disk binary)
+        // must WARN instead of falsely reporting Pass.
+        let mut repair_running = sample_status(
+            EngineModeDto::Tun,
+            Some(sample_live_telemetry(EngineModeDto::Tun)),
+        );
+        repair_running.installed_version = None;
+        repair_running.cli_version_relation = CliVersionRelationDto::RepairNeeded;
+        let repair_running_check = evaluate_service_hygiene_check(&repair_running);
+        assert_eq!(repair_running_check.status, DiagStatusDto::Warn);
+        assert_eq!(
+            repair_running_check.summary,
+            "Background service needs repair"
+        );
+        assert_eq!(
+            repair_running_check.detail.as_deref(),
+            Some(
+                "Installed CLI binary could not be verified on disk while the service is registered. Open Installation and run Repair / Reinstall."
+            )
+        );
+
+        // Concurrent warning alongside RepairNeeded preserves both warnings.
+        let mut repair_with_cfg_warn = repair_running.clone();
+        repair_with_cfg_warn.config_warning = Some("Invalid TOML syntax".to_string());
+        let repair_cfg_check = evaluate_service_hygiene_check(&repair_with_cfg_warn);
+        assert_eq!(repair_cfg_check.status, DiagStatusDto::Warn);
+        assert!(repair_cfg_check
+            .summary
+            .contains("Background service needs repair"));
+        assert!(repair_cfg_check.summary.contains("config warning"));
+
+        // Stopped service with RepairNeeded also surfaces repair guidance.
+        let mut repair_stopped = sample_status(EngineModeDto::Tun, None);
+        repair_stopped.installed_version = None;
+        repair_stopped.cli_version_relation = CliVersionRelationDto::RepairNeeded;
+        let repair_stopped_check = evaluate_service_hygiene_check(&repair_stopped);
+        assert_eq!(repair_stopped_check.status, DiagStatusDto::Warn);
+        assert_eq!(
+            repair_stopped_check.summary,
+            "Background service needs repair"
+        );
     }
 
     #[test]

@@ -20,40 +20,96 @@ use crate::{
 const READINESS_WAIT_MAX: Duration = Duration::from_millis(2500);
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// RAII guard ensuring `DesktopAppState::active_operation` is always cleared on
-/// exit/panic and immediately emitting a lightweight pending-operation snapshot.
+/// RAII guard ensuring `DesktopAppState::active_operation` is acquired
+/// atomically after draining `snapshot_lock` and cleared on abnormal exit/panic
+/// (emitting a cleared snapshot and waking the poller) unless disarmed on clean
+/// handoff to [`refresh_and_broadcast_status_with_readiness`].
 struct ServiceOperationGuard {
     app: AppHandle,
+    armed: bool,
 }
 
 impl ServiceOperationGuard {
-    fn set(app: &AppHandle, op: ServiceOperationDto) -> Self {
-        if let Some(state) = app.try_state::<DesktopAppState>() {
+    async fn acquire(app: &AppHandle, op: ServiceOperationDto) -> Self {
+        let app_clone = app.clone();
+        let emitted_snapshot = tokio::task::spawn_blocking(move || {
+            let state = app_clone.try_state::<DesktopAppState>()?;
+            let _snapshot_guard = state
+                .snapshot_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             state.set_active_operation(Some(op));
-            if let Some(last) = state.last_snapshot() {
+            state.last_snapshot().map(|last| {
                 let mut pending = (*last).clone();
                 pending.snapshot_seq = state.next_snapshot_seq();
                 pending.pending_operation = Some(op);
                 let pending_arc = std::sync::Arc::new(pending);
                 state.set_last_snapshot(std::sync::Arc::clone(&pending_arc));
-                if crate::is_main_window_actively_visible(app) {
-                    if let Err(err) =
-                        app.emit_to(tray::MAIN_WINDOW_LABEL, STATUS_EVENT_NAME, &*pending_arc)
-                    {
-                        debug!(error = %err, "failed to emit pending vdpi://status event");
-                    }
+                pending_arc
+            })
+        })
+        .await
+        .ok()
+        .flatten();
+
+        if let Some(pending_arc) = emitted_snapshot {
+            if crate::is_main_window_actively_visible(app) {
+                if let Err(err) =
+                    app.emit_to(tray::MAIN_WINDOW_LABEL, STATUS_EVENT_NAME, &*pending_arc)
+                {
+                    debug!(error = %err, "failed to emit pending vdpi://status event");
                 }
             }
         }
-        Self { app: app.clone() }
+
+        Self {
+            app: app.clone(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
     }
 }
 
 impl Drop for ServiceOperationGuard {
     fn drop(&mut self) {
-        if let Some(state) = self.app.try_state::<DesktopAppState>() {
-            state.set_active_operation(None);
+        if !self.armed {
+            return;
         }
+        if let Some(state) = self.app.try_state::<DesktopAppState>() {
+            let cleared_snapshot = {
+                let _snapshot_guard = state
+                    .snapshot_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.set_active_operation(None);
+                state.last_snapshot().map(|last| {
+                    let mut cleared = (*last).clone();
+                    cleared.snapshot_seq = state.next_snapshot_seq();
+                    cleared.pending_operation = None;
+                    let cleared_arc = std::sync::Arc::new(cleared);
+                    state.set_last_snapshot(std::sync::Arc::clone(&cleared_arc));
+                    cleared_arc
+                })
+            };
+            if let Some(cleared_arc) = cleared_snapshot {
+                if crate::is_main_window_actively_visible(&self.app) {
+                    if let Err(err) = self.app.emit_to(
+                        tray::MAIN_WINDOW_LABEL,
+                        STATUS_EVENT_NAME,
+                        &*cleared_arc,
+                    ) {
+                        debug!(
+                            error = %err,
+                            "failed to emit cleared pending vdpi://status event on abnormal drop"
+                        );
+                    }
+                }
+            }
+        }
+        crate::wake_status_poller(&self.app);
     }
 }
 
@@ -68,7 +124,7 @@ fn shutting_down_result() -> ActionResultDto {
     }
 }
 
-fn busy_result(active_op: Option<ServiceOperationDto>) -> ActionResultDto {
+pub(crate) fn busy_result_for_operation(active_op: Option<ServiceOperationDto>) -> ActionResultDto {
     let message = match active_op {
         Some(ServiceOperationDto::Installing) => {
             "Service installation is already in progress.".to_string()
@@ -103,32 +159,57 @@ fn busy_result(active_op: Option<ServiceOperationDto>) -> ActionResultDto {
     }
 }
 
-/// RAII guard ensuring tray toggle busy state is always cleared even if the
-/// async task is cancelled or panics.
+/// RAII visual guard ensuring tray toggle busy indicator is always cleared even
+/// if the async task is cancelled or panics. Mutual exclusion between tray and
+/// UI actions is unified exclusively on `DesktopAppState::action_lock`.
 pub struct TrayToggleBusyGuard {
     app: AppHandle,
 }
 
 impl TrayToggleBusyGuard {
-    /// Adopts a `toggle_busy` claim already acquired via
-    /// [`tray::try_claim_tray_toggle_busy`] so the busy flag is cleared on drop
-    /// without re-triggering the busy setter.
-    pub(crate) fn adopt(app: &AppHandle) -> Self {
+    pub(crate) fn acquire(app: &AppHandle) -> Self {
+        tray::set_tray_toggle_busy(app, true);
         Self { app: app.clone() }
-    }
-
-    fn try_claim(app: &AppHandle) -> Option<Self> {
-        if tray::try_claim_tray_toggle_busy(app) {
-            Some(Self { app: app.clone() })
-        } else {
-            None
-        }
     }
 }
 
 impl Drop for TrayToggleBusyGuard {
     fn drop(&mut self) {
         tray::set_tray_toggle_busy(&self.app, false);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadinessWait {
+    None,
+    Live,
+    LiveFreshVersion,
+}
+
+fn is_readiness_snapshot_ready(
+    wait: ReadinessWait,
+    snap: &DesktopStatusSnapshotDto,
+    is_quitting: bool,
+) -> bool {
+    if is_quitting {
+        return true;
+    }
+    match wait {
+        ReadinessWait::None => true,
+        ReadinessWait::Live | ReadinessWait::LiveFreshVersion => {
+            if snap.service_state == ServiceStateDto::NotInstalled {
+                return true;
+            }
+            if snap.service_state == ServiceStateDto::Running && snap.vpn_conflict.is_some() {
+                return true;
+            }
+            let has_live = snap.live.is_some();
+            match wait {
+                ReadinessWait::Live => has_live,
+                ReadinessWait::LiveFreshVersion => has_live && !snap.live_version_stale,
+                ReadinessWait::None => true,
+            }
+        }
     }
 }
 
@@ -145,37 +226,37 @@ fn format_tray_sync_error(err: impl std::fmt::Display) -> String {
     format_tray_sync_error_for_surface(TRAY_SURFACE_NAME, err)
 }
 
-/// Invalidates cached static probes, optionally waits up to 2.5 seconds for the
-/// newly started daemon's health endpoint to become reachable, updates tray
-/// visuals, pushes a fresh `vdpi://status` snapshot to the main webview window
-/// while actively visible, and returns the fresh snapshot.
+/// Invalidates cached static probes on the first readiness attempt, optionally
+/// waits up to 2.5 seconds (polling fast live telemetry every 250ms) for the
+/// restarted daemon to become reachable (and non-stale on upgrade/repair), keeps
+/// `active_operation` suppression active until right before the final broadcast,
+/// updates tray visuals, pushes the final `vdpi://status` snapshot, wakes the
+/// background poller, and returns the final snapshot.
 async fn refresh_and_broadcast_status_with_readiness(
     app: &AppHandle,
-    wait_for_live: bool,
+    mut op_guard: Option<ServiceOperationGuard>,
+    wait: ReadinessWait,
 ) -> Result<Box<DesktopStatusSnapshotDto>, String> {
     let deadline = Instant::now() + READINESS_WAIT_MAX;
     let mut attempt = 0usize;
 
     let snapshot = loop {
         let app_clone = app.clone();
-        let invalidate = attempt == 0;
+        let force_full_refresh = attempt == 0;
         let snap = tokio::task::spawn_blocking(move || {
             let state = app_clone.state::<DesktopAppState>();
-            if invalidate {
+            if force_full_refresh {
                 state.invalidate_static_cache();
             }
-            status::collect_status_snapshot(&state, true)
+            status::collect_status_snapshot_for_readiness(&state, force_full_refresh)
         })
         .await
         .map_err(|err| format!("Failed to refresh status snapshot: {err}"))?;
 
-        let ready = !wait_for_live
-            || snap.live.is_some()
-            || (snap.service_state == ServiceStateDto::Running && snap.vpn_conflict.is_some())
-            || app
-                .try_state::<DesktopAppState>()
-                .is_some_and(|state| state.is_quitting());
-        if ready {
+        let is_quitting = app
+            .try_state::<DesktopAppState>()
+            .is_some_and(|state| state.is_quitting());
+        if is_readiness_snapshot_ready(wait, &snap, is_quitting) {
             break snap;
         }
 
@@ -190,14 +271,52 @@ async fn refresh_and_broadcast_status_with_readiness(
         tokio::time::sleep(READINESS_POLL_INTERVAL.min(remaining)).await;
     };
 
-    tray::update_tray_visuals(app, &snapshot);
+    let final_snapshot = if let Some(mut guard) = op_guard.take() {
+        let app_clone = app.clone();
+        let base_snap = std::sync::Arc::clone(&snapshot);
+        let cleared = tokio::task::spawn_blocking(move || {
+            let state = app_clone.state::<DesktopAppState>();
+            let _snapshot_guard = state
+                .snapshot_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.set_active_operation(None);
+            let mut final_dto = (*base_snap).clone();
+            final_dto.snapshot_seq = state.next_snapshot_seq();
+            final_dto.pending_operation = None;
+            let final_arc = std::sync::Arc::new(final_dto);
+            state.set_last_snapshot(std::sync::Arc::clone(&final_arc));
+            final_arc
+        })
+        .await
+        .map_err(|err| format!("Failed to finalize status snapshot: {err}"));
+
+        match cleared {
+            Ok(final_arc) => {
+                guard.disarm();
+                final_arc
+            }
+            Err(err) => {
+                // Keep `guard` armed so its Drop clears active_operation, emits, and wakes poller.
+                drop(guard);
+                return Err(err);
+            }
+        }
+    } else {
+        snapshot
+    };
+
+    tray::update_tray_visuals(app, &final_snapshot);
     if crate::is_main_window_actively_visible(app) {
-        if let Err(err) = app.emit_to(tray::MAIN_WINDOW_LABEL, STATUS_EVENT_NAME, &snapshot) {
+        if let Err(err) =
+            app.emit_to(tray::MAIN_WINDOW_LABEL, STATUS_EVENT_NAME, &final_snapshot)
+        {
             debug!(error = %err, "failed to emit vdpi://status event");
         }
     }
+    crate::wake_status_poller(app);
 
-    Ok(Box::new((*snapshot).clone()))
+    Ok(Box::new((*final_snapshot).clone()))
 }
 
 fn resolve_toggle_target(app: &AppHandle, connect: Option<bool>) -> Result<bool, ActionResultDto> {
@@ -227,28 +346,20 @@ fn resolve_toggle_target(app: &AppHandle, connect: Option<bool>) -> Result<bool,
 }
 
 /// Serialized handler invoked when the user toggles protection from the native
-/// system tray menu. Takes ownership of the synchronously adopted busy guard,
-/// tries to acquire `action_lock` (single-flight), runs the toggle action,
-/// refreshes status while keeping the tray toggle busy, and emits
-/// `vdpi://tray-action-result` to the main window so the UI can surface errors
-/// or UAC/auth cancellations.
-pub async fn handle_tray_toggle_protection(app: AppHandle, busy_guard: TrayToggleBusyGuard) {
+/// system tray menu. Takes ownership of the `action_lock` guard acquired
+/// synchronously on the tray click plus the visual `TrayToggleBusyGuard`, runs
+/// the toggle action, refreshes status, and emits `vdpi://tray-action-result`.
+pub async fn handle_tray_toggle_protection(
+    app: AppHandle,
+    _action_guard: tokio::sync::OwnedMutexGuard<()>,
+    busy_guard: TrayToggleBusyGuard,
+) {
     let Some(state) = app.try_state::<DesktopAppState>() else {
-        return;
-    };
-    if state.is_quitting() {
-        return;
-    }
-
-    let Ok(_guard) = state.action_lock.try_lock() else {
-        let busy = busy_result(state.active_operation());
         drop(busy_guard);
-        if let Err(err) = app.emit_to(tray::MAIN_WINDOW_LABEL, TRAY_ACTION_RESULT_EVENT, &busy) {
-            debug!(error = %err, "failed to emit busy vdpi://tray-action-result event");
-        }
         return;
     };
     if state.is_quitting() {
+        drop(busy_guard);
         return;
     }
 
@@ -258,14 +369,15 @@ pub async fn handle_tray_toggle_protection(app: AppHandle, busy_guard: TrayToggl
 
     let mut action_result = match target {
         Ok(Ok(should_connect)) => {
-            let op_guard = ServiceOperationGuard::set(
+            let op_guard = ServiceOperationGuard::acquire(
                 &app,
                 if should_connect {
                     ServiceOperationDto::Resuming
                 } else {
                     ServiceOperationDto::Pausing
                 },
-            );
+            )
+            .await;
             let mut result = match tokio::task::spawn_blocking(move || {
                 actions::toggle_protection(should_connect)
             })
@@ -284,11 +396,13 @@ pub async fn handle_tray_toggle_protection(app: AppHandle, busy_guard: TrayToggl
                     }
                 }
             };
-            drop(op_guard);
-            let wait_for_live =
-                should_connect && result.ok && result.needs_restart != Some(true);
+            let wait = if should_connect && result.ok && result.needs_restart != Some(true) {
+                ReadinessWait::Live
+            } else {
+                ReadinessWait::None
+            };
             result.snapshot =
-                refresh_and_broadcast_status_with_readiness(&app, wait_for_live)
+                refresh_and_broadcast_status_with_readiness(&app, Some(op_guard), wait)
                     .await
                     .ok();
             result
@@ -308,10 +422,12 @@ pub async fn handle_tray_toggle_protection(app: AppHandle, busy_guard: TrayToggl
     };
 
     if action_result.snapshot.is_none() {
-        action_result.snapshot = refresh_and_broadcast_status_with_readiness(&app, false)
-            .await
-            .ok();
+        action_result.snapshot =
+            refresh_and_broadcast_status_with_readiness(&app, None, ReadinessWait::None)
+                .await
+                .ok();
     }
+    // Always release visual busy state before `_action_guard` drops.
     drop(busy_guard);
 
     if !action_result.ok {
@@ -340,6 +456,9 @@ pub async fn get_status(
     let app_clone = app.clone();
     let snapshot = tokio::task::spawn_blocking(move || {
         let state = app_clone.state::<DesktopAppState>();
+        if force_refresh && !state.is_mutating_install_operation_active() {
+            state.invalidate_static_cache();
+        }
         status::collect_status_snapshot(&state, force_refresh)
     })
     .await
@@ -363,7 +482,13 @@ pub async fn save_gui_preferences(
     prefs: GuiPreferencesDto,
 ) -> Result<ActionResultDto, String> {
     let state = app.state::<DesktopAppState>();
+    if state.is_quitting() {
+        return Ok(shutting_down_result());
+    }
     let _guard = state.prefs_lock.lock().await;
+    if state.is_quitting() {
+        return Ok(shutting_down_result());
+    }
 
     let prefs_to_save = prefs.clone();
     let save_result =
@@ -383,6 +508,9 @@ pub async fn save_gui_preferences(
     }
 
     state.set_preferences(prefs.clone());
+    if state.is_quitting() {
+        return Ok(shutting_down_result());
+    }
     let snapshot = state.last_snapshot();
     let tray_language = prefs.language;
 
@@ -440,15 +568,13 @@ pub async fn toggle_protection(
     }
 
     let Ok(_guard) = state.action_lock.try_lock() else {
-        return Ok(busy_result(state.active_operation()));
+        return Ok(busy_result_for_operation(state.active_operation()));
     };
     if state.is_quitting() {
         return Ok(shutting_down_result());
     }
 
-    let Some(busy_guard) = TrayToggleBusyGuard::try_claim(&app) else {
-        return Ok(busy_result(state.active_operation()));
-    };
+    let busy_guard = TrayToggleBusyGuard::acquire(&app);
 
     let app_for_target = app.clone();
     let target = tokio::task::spawn_blocking(move || resolve_toggle_target(&app_for_target, connect))
@@ -463,22 +589,26 @@ pub async fn toggle_protection(
         }
     };
 
-    let op_guard = ServiceOperationGuard::set(
+    let op_guard = ServiceOperationGuard::acquire(
         &app,
         if should_connect {
             ServiceOperationDto::Resuming
         } else {
             ServiceOperationDto::Pausing
         },
-    );
+    )
+    .await;
 
     let mut result = tokio::task::spawn_blocking(move || actions::toggle_protection(should_connect))
         .await
         .map_err(|err| format!("Failed to toggle protection: {err}"))?;
 
-    drop(op_guard);
-    let wait_for_live = should_connect && result.ok && result.needs_restart != Some(true);
-    result.snapshot = refresh_and_broadcast_status_with_readiness(&app, wait_for_live)
+    let wait = if should_connect && result.ok && result.needs_restart != Some(true) {
+        ReadinessWait::Live
+    } else {
+        ReadinessWait::None
+    };
+    result.snapshot = refresh_and_broadcast_status_with_readiness(&app, Some(op_guard), wait)
         .await
         .ok();
     drop(busy_guard);
@@ -495,21 +625,24 @@ pub async fn switch_engine(
         return Ok(shutting_down_result());
     }
     let Ok(_guard) = state.action_lock.try_lock() else {
-        return Ok(busy_result(state.active_operation()));
+        return Ok(busy_result_for_operation(state.active_operation()));
     };
     if state.is_quitting() {
         return Ok(shutting_down_result());
     }
 
-    let op_guard = ServiceOperationGuard::set(&app, ServiceOperationDto::SwitchingEngine);
+    let op_guard = ServiceOperationGuard::acquire(&app, ServiceOperationDto::SwitchingEngine).await;
     let mut result = tokio::task::spawn_blocking(move || actions::switch_engine(engine))
         .await
         .map_err(|err| format!("Failed to switch engine: {err}"))?;
 
-    drop(op_guard);
-    let wait_for_live =
-        result.ok && result.needs_restart != Some(true) && result.message.contains("restarted");
-    result.snapshot = refresh_and_broadcast_status_with_readiness(&app, wait_for_live)
+    let wait = if result.ok && result.needs_restart != Some(true) && result.message.contains("restarted")
+    {
+        ReadinessWait::Live
+    } else {
+        ReadinessWait::None
+    };
+    result.snapshot = refresh_and_broadcast_status_with_readiness(&app, Some(op_guard), wait)
         .await
         .ok();
     Ok(result)
@@ -525,21 +658,24 @@ pub async fn save_dns_rules(
         return Ok(shutting_down_result());
     }
     let Ok(_guard) = state.action_lock.try_lock() else {
-        return Ok(busy_result(state.active_operation()));
+        return Ok(busy_result_for_operation(state.active_operation()));
     };
     if state.is_quitting() {
         return Ok(shutting_down_result());
     }
 
-    let op_guard = ServiceOperationGuard::set(&app, ServiceOperationDto::SavingConfig);
+    let op_guard = ServiceOperationGuard::acquire(&app, ServiceOperationDto::SavingConfig).await;
     let mut result = tokio::task::spawn_blocking(move || actions::save_dns_and_rules(update))
         .await
         .map_err(|err| format!("Failed to save DNS and routing rules: {err}"))?;
 
-    drop(op_guard);
-    let wait_for_live =
-        result.ok && result.needs_restart != Some(true) && result.message.contains("restarted");
-    result.snapshot = refresh_and_broadcast_status_with_readiness(&app, wait_for_live)
+    let wait = if result.ok && result.needs_restart != Some(true) && result.message.contains("restarted")
+    {
+        ReadinessWait::Live
+    } else {
+        ReadinessWait::None
+    };
+    result.snapshot = refresh_and_broadcast_status_with_readiness(&app, Some(op_guard), wait)
         .await
         .ok();
     Ok(result)
@@ -562,21 +698,24 @@ pub async fn save_split_tunnel(
         return Ok(shutting_down_result());
     }
     let Ok(_guard) = state.action_lock.try_lock() else {
-        return Ok(busy_result(state.active_operation()));
+        return Ok(busy_result_for_operation(state.active_operation()));
     };
     if state.is_quitting() {
         return Ok(shutting_down_result());
     }
 
-    let op_guard = ServiceOperationGuard::set(&app, ServiceOperationDto::SavingConfig);
+    let op_guard = ServiceOperationGuard::acquire(&app, ServiceOperationDto::SavingConfig).await;
     let mut result = tokio::task::spawn_blocking(move || split::save_split_tunnel_config(request))
         .await
         .map_err(|err| format!("Failed to save split-tunnel configuration: {err}"))?;
 
-    drop(op_guard);
-    let wait_for_live =
-        result.ok && result.needs_restart != Some(true) && result.message.contains("restarted");
-    result.snapshot = refresh_and_broadcast_status_with_readiness(&app, wait_for_live)
+    let wait = if result.ok && result.needs_restart != Some(true) && result.message.contains("restarted")
+    {
+        ReadinessWait::Live
+    } else {
+        ReadinessWait::None
+    };
+    result.snapshot = refresh_and_broadcast_status_with_readiness(&app, Some(op_guard), wait)
         .await
         .ok();
     Ok(result)
@@ -593,13 +732,28 @@ pub async fn get_app_icons(
 
 #[tauri::command]
 pub async fn run_diagnostics(app: AppHandle) -> Result<DiagnosticsReportDto, String> {
+    let state = app.state::<DesktopAppState>();
+    if state.is_quitting() {
+        return Err("Application is shutting down.".to_string());
+    }
+    if state.is_mutating_install_operation_active() {
+        return Err(busy_result_for_operation(state.active_operation()).message);
+    }
+
     let app_clone = app.clone();
     let snapshot = tokio::task::spawn_blocking(move || {
         let state = app_clone.state::<DesktopAppState>();
-        status::collect_status_snapshot(&state, true)
+        if state.is_mutating_install_operation_active() {
+            return Err(busy_result_for_operation(state.active_operation()).message);
+        }
+        let snapshot = status::collect_status_snapshot(&state, true);
+        if crate::state::is_mutating_install_operation(snapshot.pending_operation) {
+            return Err(busy_result_for_operation(snapshot.pending_operation).message);
+        }
+        Ok(snapshot)
     })
     .await
-    .map_err(|err| format!("Failed to collect status snapshot for diagnostics: {err}"))?;
+    .map_err(|err| format!("Failed to collect status snapshot for diagnostics: {err}"))??;
 
     tray::update_tray_visuals(&app, &snapshot);
     Ok(diagnostics::run_desktop_diagnostics(&snapshot).await)
@@ -615,21 +769,24 @@ pub async fn install_service(
         return Ok(shutting_down_result());
     }
     let Ok(_guard) = state.action_lock.try_lock() else {
-        return Ok(busy_result(state.active_operation()));
+        return Ok(busy_result_for_operation(state.active_operation()));
     };
     if state.is_quitting() {
         return Ok(shutting_down_result());
     }
 
-    let op_guard = ServiceOperationGuard::set(&app, ServiceOperationDto::Installing);
+    let op_guard = ServiceOperationGuard::acquire(&app, ServiceOperationDto::Installing).await;
     let mut result =
         tokio::task::spawn_blocking(move || actions::install_background_service(engine))
             .await
             .map_err(|err| format!("Failed to install background service: {err}"))?;
 
-    drop(op_guard);
-    let wait_for_live = result.ok && result.needs_restart != Some(true);
-    result.snapshot = refresh_and_broadcast_status_with_readiness(&app, wait_for_live)
+    let wait = if result.ok && result.needs_restart != Some(true) {
+        ReadinessWait::Live
+    } else {
+        ReadinessWait::None
+    };
+    result.snapshot = refresh_and_broadcast_status_with_readiness(&app, Some(op_guard), wait)
         .await
         .ok();
     Ok(result)
@@ -642,22 +799,26 @@ pub async fn upgrade_service(app: AppHandle) -> Result<ActionResultDto, String> 
         return Ok(shutting_down_result());
     }
     let Ok(_guard) = state.action_lock.try_lock() else {
-        return Ok(busy_result(state.active_operation()));
+        return Ok(busy_result_for_operation(state.active_operation()));
     };
     if state.is_quitting() {
         return Ok(shutting_down_result());
     }
 
-    let op_guard = ServiceOperationGuard::set(&app, ServiceOperationDto::Upgrading);
+    let op_guard = ServiceOperationGuard::acquire(&app, ServiceOperationDto::Upgrading).await;
     let mut result = tokio::task::spawn_blocking(actions::upgrade_background_service)
         .await
         .map_err(|err| format!("Failed to upgrade background service: {err}"))?;
 
-    drop(op_guard);
-    let wait_for_live = result.ok
+    let wait = if result.ok
         && result.needs_restart != Some(true)
-        && result.code != Some(ActionErrorCodeDto::AlreadyUpToDate);
-    result.snapshot = refresh_and_broadcast_status_with_readiness(&app, wait_for_live)
+        && result.code != Some(ActionErrorCodeDto::AlreadyUpToDate)
+    {
+        ReadinessWait::LiveFreshVersion
+    } else {
+        ReadinessWait::None
+    };
+    result.snapshot = refresh_and_broadcast_status_with_readiness(&app, Some(op_guard), wait)
         .await
         .ok();
     Ok(result)
@@ -673,21 +834,24 @@ pub async fn repair_service(
         return Ok(shutting_down_result());
     }
     let Ok(_guard) = state.action_lock.try_lock() else {
-        return Ok(busy_result(state.active_operation()));
+        return Ok(busy_result_for_operation(state.active_operation()));
     };
     if state.is_quitting() {
         return Ok(shutting_down_result());
     }
 
-    let op_guard = ServiceOperationGuard::set(&app, ServiceOperationDto::Repairing);
+    let op_guard = ServiceOperationGuard::acquire(&app, ServiceOperationDto::Repairing).await;
     let mut result =
         tokio::task::spawn_blocking(move || actions::repair_background_service(engine))
             .await
             .map_err(|err| format!("Failed to repair background service: {err}"))?;
 
-    drop(op_guard);
-    let wait_for_live = result.ok && result.needs_restart != Some(true);
-    result.snapshot = refresh_and_broadcast_status_with_readiness(&app, wait_for_live)
+    let wait = if result.ok && result.needs_restart != Some(true) {
+        ReadinessWait::LiveFreshVersion
+    } else {
+        ReadinessWait::None
+    };
+    result.snapshot = refresh_and_broadcast_status_with_readiness(&app, Some(op_guard), wait)
         .await
         .ok();
     Ok(result)
@@ -700,27 +864,27 @@ pub async fn uninstall_service(app: AppHandle) -> Result<ActionResultDto, String
         return Ok(shutting_down_result());
     }
     let Ok(_guard) = state.action_lock.try_lock() else {
-        return Ok(busy_result(state.active_operation()));
+        return Ok(busy_result_for_operation(state.active_operation()));
     };
     if state.is_quitting() {
         return Ok(shutting_down_result());
     }
 
-    let op_guard = ServiceOperationGuard::set(&app, ServiceOperationDto::Uninstalling);
+    let op_guard = ServiceOperationGuard::acquire(&app, ServiceOperationDto::Uninstalling).await;
     let mut result = tokio::task::spawn_blocking(actions::uninstall_background_service)
         .await
         .map_err(|err| format!("Failed to uninstall background service: {err}"))?;
 
-    drop(op_guard);
-    result.snapshot = refresh_and_broadcast_status_with_readiness(&app, false)
-        .await
-        .ok();
+    result.snapshot =
+        refresh_and_broadcast_status_with_readiness(&app, Some(op_guard), ReadinessWait::None)
+            .await
+            .ok();
     Ok(result)
 }
 
 #[tauri::command]
-pub async fn check_updates() -> Result<UpdateCheckPayloadDto, String> {
-    actions::check_for_updates().await
+pub async fn check_updates(force: Option<bool>) -> Result<UpdateCheckPayloadDto, String> {
+    actions::check_for_updates_with_force(force.unwrap_or(false)).await
 }
 
 #[tauri::command]
@@ -847,6 +1011,137 @@ mod tests {
                 format_tray_sync_error("boom"),
                 "GUI preferences saved, but failed to synchronize system tray: boom"
             );
+        }
+    }
+
+    #[test]
+    fn readiness_predicate_checks_fresh_version_not_installed_short_circuit_and_vpn_yield() {
+        use crate::models::{
+            CliVersionRelationDto, LiveTelemetryDto, SplitTunnelModeDto, WintunStatusDto,
+        };
+
+        let sample_live = LiveTelemetryDto {
+            running: true,
+            engine: EngineModeDto::Tun,
+            addr: "127.0.0.1".to_string(),
+            port: 8080,
+            socks_port: None,
+            tun_interface: Some("vdpi0".to_string()),
+            physical_nic: None,
+            vpn_conflict: None,
+            version: Some("0.6.0".to_string()),
+            mode: Some("auto".to_string()),
+            doh_enabled: true,
+            dns_display: "1.1.1.1".to_string(),
+            block_quic: true,
+            active_connections: 0,
+            total_connections: 0,
+            learned_hosts: 0,
+            isp_stage: None,
+            udp_flows_active: 0,
+            quic_blocked: 0,
+            dns_queries: 0,
+            rss_kb: None,
+            bytes_rx: 0,
+            bytes_tx: 0,
+            rx_rate_bps: 0,
+            tx_rate_bps: 0,
+            tls_handshakes: 0,
+            auto_heal_escalations: 0,
+        };
+
+        let mut snap = DesktopStatusSnapshotDto {
+            snapshot_seq: 1,
+            app_version: "0.6.1".to_string(),
+            platform: "windows".to_string(),
+            service_state: ServiceStateDto::Running,
+            installed_version: Some("0.6.1".to_string()),
+            configured_engine: EngineModeDto::Tun,
+            live: Some(sample_live),
+            vpn_conflict: None,
+            wintun: WintunStatusDto {
+                required: true,
+                ready: true,
+                message: None,
+            },
+            split_tunnel_mode: SplitTunnelModeDto::All,
+            split_tunnel_count: 0,
+            config_path: String::new(),
+            logs_dir: String::new(),
+            tray_supported: true,
+            config_warning: None,
+            bundled_engine_version: Some("0.6.1".to_string()),
+            cli_version_relation: CliVersionRelationDto::UpToDate,
+            can_install_from_bundle: true,
+            live_version_stale: true,
+            pending_operation: Some(ServiceOperationDto::Upgrading),
+            running_from_readonly_dmg: false,
+        };
+
+        // LiveFreshVersion keeps waiting while live daemon is still on old version.
+        assert!(is_readiness_snapshot_ready(ReadinessWait::None, &snap, false));
+        assert!(is_readiness_snapshot_ready(ReadinessWait::Live, &snap, false));
+        assert!(!is_readiness_snapshot_ready(
+            ReadinessWait::LiveFreshVersion,
+            &snap,
+            false
+        ));
+
+        // Once live daemon reports the upgraded version, LiveFreshVersion exits ready.
+        snap.live_version_stale = false;
+        assert!(is_readiness_snapshot_ready(
+            ReadinessWait::LiveFreshVersion,
+            &snap,
+            false
+        ));
+
+        // Offline service keeps waiting until live telemetry appears...
+        snap.live = None;
+        assert!(!is_readiness_snapshot_ready(ReadinessWait::Live, &snap, false));
+        assert!(!is_readiness_snapshot_ready(
+            ReadinessWait::LiveFreshVersion,
+            &snap,
+            false
+        ));
+        // ...unless quitting, VPN-yielded while running, or NotInstalled (short-circuit).
+        assert!(is_readiness_snapshot_ready(
+            ReadinessWait::LiveFreshVersion,
+            &snap,
+            true
+        ));
+        snap.vpn_conflict = Some("WireGuard".to_string());
+        assert!(is_readiness_snapshot_ready(
+            ReadinessWait::LiveFreshVersion,
+            &snap,
+            false
+        ));
+        snap.vpn_conflict = None;
+        snap.service_state = ServiceStateDto::NotInstalled;
+        assert!(is_readiness_snapshot_ready(ReadinessWait::Live, &snap, false));
+        assert!(is_readiness_snapshot_ready(
+            ReadinessWait::LiveFreshVersion,
+            &snap,
+            false
+        ));
+    }
+
+    #[test]
+    fn busy_result_for_operation_sets_busy_code_for_all_operations() {
+        for op in [
+            None,
+            Some(ServiceOperationDto::Installing),
+            Some(ServiceOperationDto::Upgrading),
+            Some(ServiceOperationDto::Repairing),
+            Some(ServiceOperationDto::Uninstalling),
+            Some(ServiceOperationDto::Resuming),
+            Some(ServiceOperationDto::Pausing),
+            Some(ServiceOperationDto::SwitchingEngine),
+            Some(ServiceOperationDto::SavingConfig),
+        ] {
+            let res = busy_result_for_operation(op);
+            assert!(!res.ok);
+            assert_eq!(res.code, Some(ActionErrorCodeDto::Busy));
+            assert!(!res.message.is_empty());
         }
     }
 }

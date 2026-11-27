@@ -999,7 +999,7 @@ fn format_engine_summary(engine: &DashboardEngine) -> String {
                 out.push_str(&format!(" · socks {sa}"));
             }
             if !*system_proxy {
-                out.push_str(" · manual proxy");
+                out.push_str(tr(" · manual proxy", " · manuel proxy"));
             }
             out
         }
@@ -1381,21 +1381,21 @@ impl AttachedActivityTracker {
                         Level::INFO,
                         format!(
                             "{}: {old} -> {new}",
-                            tr("ISP stage changed", "ISS aşaması değişti")
+                            tr("ISP stage changed", "İSS aşaması değişti")
                         ),
                     );
                 }
                 (None, Some(new)) => {
                     self.push(
                         Level::INFO,
-                        format!("{}: {new}", tr("ISP stage active", "ISS aşaması etkin")),
+                        format!("{}: {new}", tr("ISP stage active", "İSS aşaması etkin")),
                     );
                 }
                 (Some(old), None) => {
                     self.push(
                         Level::INFO,
                         if is_tr {
-                            format!("ISS aşaması temizlendi (önceki: {old})")
+                            format!("İSS aşaması temizlendi (önceki: {old})")
                         } else {
                             format!("ISP stage cleared (was {old})")
                         },
@@ -1960,10 +1960,14 @@ where
                             KeyAction::Quit => break Ok(()),
                             KeyAction::ClearCache => {
                                 let clear_ctx = ctx.clone();
+                                let cleared_log = tr(
+                                    "adaptive strategy and DNS caches cleared",
+                                    "uyarlanabilir strateji ve DNS önbellekleri temizlendi",
+                                );
                                 tokio::spawn(async move {
                                     clear_ctx.clear_adaptive_cache().await;
                                     clear_ctx.dns.clear_cache().await;
-                                    info!("adaptive strategy and DNS caches cleared");
+                                    info!("{cleared_log}");
                                 });
                                 state.set_notice(
                                     tr("Cache cleared", "Önbellek temizlendi"),
@@ -2719,7 +2723,7 @@ fn format_isp_stage_bottom_title(
     p: Palette,
 ) -> Option<Line<'static>> {
     let stage = isp_stage.map(str::trim).filter(|s| !s.is_empty())?;
-    let full_prefix = tr(" ISP Stage ", " ISS Aşaması ");
+    let full_prefix = tr(" ISP Stage ", " İSS Aşaması ");
     let short_prefix = tr(" Stage ", " Aşama ");
     let full_prefix_len = full_prefix.chars().count();
     let short_prefix_len = short_prefix.chars().count();
@@ -6130,7 +6134,7 @@ mod tests {
             "missing TR Activity Log:\n{screen}"
         );
         assert!(
-            screen.contains("ISS Aşaması Balanced"),
+            screen.contains("İSS Aşaması Balanced"),
             "missing TR ISP stage:\n{screen}"
         );
         assert!(

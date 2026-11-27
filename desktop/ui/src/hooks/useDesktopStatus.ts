@@ -362,7 +362,7 @@ export function useDesktopStatus(): UseDesktopStatusResult {
       try {
         const nextSettings: DesktopSettingsPayload = await getSettings();
         if (!mountedRef.current || seq < settingsSeqRef.current) {
-          return nextSettings;
+          return null;
         }
         settingsRef.current = nextSettings;
         settingsErrorRef.current = null;
@@ -416,6 +416,8 @@ export function useDesktopStatus(): UseDesktopStatusResult {
         }
         lastSeqRef.current = seq;
       }
+
+      statusSeqRef.current += 1;
 
       const nowMs = Date.now();
       const hadStatusError = statusErrorRef.current !== null;
@@ -821,9 +823,7 @@ export function useDesktopStatus(): UseDesktopStatusResult {
             receivedPush = true;
             fallbackPollingWanted = false;
             stopPolling();
-            if (applySnapshot(snapshot)) {
-              statusSeqRef.current += 1;
-            }
+            applySnapshot(snapshot);
           }),
         );
 

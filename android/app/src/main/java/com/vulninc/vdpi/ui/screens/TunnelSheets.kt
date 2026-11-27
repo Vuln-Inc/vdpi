@@ -410,13 +410,14 @@ private fun DoctorCheckRow(
 ) {
     val palette = VdpiThemeTokens.palette
     val strings = LocalVdpiStrings.current
+    val displayName = strings.doctorCheckName(check.name)
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .heightIn(min = if (isLandscape) 44.dp else 50.dp)
             .semantics(mergeDescendants = true) {
                 contentDescription =
-                    "${check.name}, ${if (check.passed) strings.statusPassed else strings.statusFailed}, ${check.latencyMs} ms, ${check.detail}"
+                    "$displayName, ${if (check.passed) strings.statusPassed else strings.statusFailed}, ${check.latencyMs} ms, ${check.detail}"
             }
             .padding(
                 horizontal = 16.dp,
@@ -434,7 +435,7 @@ private fun DoctorCheckRow(
 
         Column(modifier = Modifier.weight(1f)) {
             Text(
-                text = check.name,
+                text = displayName,
                 style = VdpiTextStyles.rowTitle,
                 color = palette.inkPrimary,
                 maxLines = 1,

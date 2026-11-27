@@ -24,7 +24,7 @@ use vdpi::platform::unix_foreground as foreground;
 use vdpi::platform::windows::foreground;
 use vdpi::server::{bind_listeners, serve_until_shutdown};
 use vdpi::service::{
-    clear_runtime_state, install_service_quiet, install_service_with_options,
+    clear_runtime_state, install_service_quiet, install_service_with_engine_override,
     print_status_with_options_and_config, run_doctor, switch_service_engine,
     switch_service_engine_quiet, uninstall_service_quiet, uninstall_service_with_options,
     write_runtime_state, ServiceState,
@@ -121,7 +121,22 @@ fn run_main() -> Result<()> {
         }
         Err(err) => return Err(err),
     };
+    let user_lang_cfg = if cli.config_path.is_none() {
+        load_file_config(Some(&user_config_path()), false)
+            .ok()
+            .and_then(|(found, cfg)| found.map(|_| cfg))
+    } else {
+        None
+    };
+    seed_i18n_language_pref(&file_cfg, user_lang_cfg.as_ref(), cli.config_path.is_some());
     let explicit_config_path = cli.config_path.clone();
+    let explicit_engine = if cli.tun {
+        Some(EngineMode::Tun)
+    } else if cli.proxy {
+        Some(EngineMode::Proxy)
+    } else {
+        None
+    };
     let mut command = cli.command.clone();
     let mut cfg = cli.resolve_runtime_config(&file_cfg, &raw_args);
 
@@ -186,15 +201,21 @@ fn run_main() -> Result<()> {
                     {
                         if cfg.engine == EngineMode::Tun {
                             notice = Some(
-                                "Background service is already running. Pause it first before starting foreground TUN mode."
-                                    .to_string(),
+                                launcher::tr(
+                                    "Background service is already running. Pause it first before starting foreground TUN mode.",
+                                    "Arka plan servisi zaten çalışıyor. Ön plan TUN modunu başlatmadan önce duraklatın.",
+                                )
+                                .to_string(),
                             );
                             explicit_launcher = true;
                             continue;
                         } else if cfg.system_proxy {
                             notice = Some(
-                                "Background service is already running. Pause it first or run with --no-system-proxy."
-                                    .to_string(),
+                                launcher::tr(
+                                    "Background service is already running. Pause it first or run with --no-system-proxy.",
+                                    "Arka plan servisi zaten çalışıyor. Önce duraklatın veya --no-system-proxy ile çalıştırın.",
+                                )
+                                .to_string(),
                             );
                             explicit_launcher = true;
                             continue;
@@ -218,8 +239,10 @@ fn run_main() -> Result<()> {
                         ]) {
                             Ok(()) => return Ok(()),
                             Err(err) => {
-                                notice =
-                                    Some(sanitize_notice(&format!("TUN start failed: {err:#}")));
+                                notice = Some(sanitize_notice(&format!(
+                                    "{}: {err:#}",
+                                    launcher::tr("TUN start failed", "TUN başlatma başarısız")
+                                )));
                                 explicit_launcher = true;
                                 continue;
                             }
@@ -233,8 +256,10 @@ fn run_main() -> Result<()> {
                         ) {
                             Ok(()) => return Ok(()),
                             Err(err) => {
-                                notice =
-                                    Some(sanitize_notice(&format!("TUN start failed: {err:#}")));
+                                notice = Some(sanitize_notice(&format!(
+                                    "{}: {err:#}",
+                                    launcher::tr("TUN start failed", "TUN başlatma başarısız")
+                                )));
                                 explicit_launcher = true;
                                 continue;
                             }
@@ -269,16 +294,29 @@ fn run_main() -> Result<()> {
                             session_engine_override = None;
                             wait_for_live_engine(&cfg, cfg.engine);
                             notice = Some(if installed_before.is_some() {
-                                format!(
-                                    "Updated vdpi background service to v{}.",
-                                    env!("CARGO_PKG_VERSION")
-                                )
+                                match launcher::active_lang() {
+                                    vdpi::i18n::Lang::En => format!(
+                                        "Updated vdpi background service to v{}.",
+                                        env!("CARGO_PKG_VERSION")
+                                    ),
+                                    vdpi::i18n::Lang::Tr => format!(
+                                        "vdpi arka plan servisi v{} sürümüne güncellendi.",
+                                        env!("CARGO_PKG_VERSION")
+                                    ),
+                                }
                             } else {
-                                "vdpi installed and running in background.".to_string()
+                                launcher::tr(
+                                    "vdpi installed and running in background.",
+                                    "vdpi kuruldu ve arka planda çalışıyor.",
+                                )
+                                .to_string()
                             });
                         }
                         Err(err) => {
-                            notice = Some(sanitize_notice(&format!("Install failed: {err:#}")));
+                            notice = Some(sanitize_notice(&format!(
+                                "{}: {err:#}",
+                                launcher::tr("Install failed", "Kurulum başarısız")
+                            )));
                         }
                     }
                     explicit_launcher = true;
@@ -298,7 +336,10 @@ fn run_main() -> Result<()> {
                                 notice = None;
                             }
                             Err(err) => {
-                                notice = Some(sanitize_notice(&format!("Update failed: {err:#}")));
+                                notice = Some(sanitize_notice(&format!(
+                                    "{}: {err:#}",
+                                    launcher::tr("Update failed", "Güncelleme başarısız")
+                                )));
                             }
                         }
                     }
@@ -310,10 +351,19 @@ fn run_main() -> Result<()> {
                         match result {
                             Ok(()) => {
                                 launcher::clear_preference();
-                                notice = Some("Update check complete.".to_string());
+                                notice = Some(
+                                    launcher::tr(
+                                        "Update check complete.",
+                                        "Güncelleme denetimi tamamlandı.",
+                                    )
+                                    .to_string(),
+                                );
                             }
                             Err(err) => {
-                                notice = Some(sanitize_notice(&format!("Update failed: {err:#}")));
+                                notice = Some(sanitize_notice(&format!(
+                                    "{}: {err:#}",
+                                    launcher::tr("Update failed", "Güncelleme başarısız")
+                                )));
                             }
                         }
                     }
@@ -323,10 +373,19 @@ fn run_main() -> Result<()> {
                 launcher::Choice::PauseService => {
                     match vdpi::service::pause_service_quiet() {
                         Ok(()) => {
-                            notice = Some("Service paused - system proxies restored.".to_string());
+                            notice = Some(
+                                launcher::tr(
+                                    "Service paused - system proxies restored.",
+                                    "Servis duraklatıldı - sistem proxy ayarları geri yüklendi.",
+                                )
+                                .to_string(),
+                            );
                         }
                         Err(err) => {
-                            notice = Some(sanitize_notice(&format!("Pause failed: {err:#}")));
+                            notice = Some(sanitize_notice(&format!(
+                                "{}: {err:#}",
+                                launcher::tr("Pause failed", "Duraklatma başarısız")
+                            )));
                         }
                     }
                     explicit_launcher = true;
@@ -343,10 +402,19 @@ fn run_main() -> Result<()> {
                     match vdpi::service::resume_service_quiet() {
                         Ok(()) => {
                             wait_for_live_engine(&cfg, status.configured_engine);
-                            notice = Some("Service resumed - anti-DPI active.".to_string());
+                            notice = Some(
+                                launcher::tr(
+                                    "Service resumed - anti-DPI active.",
+                                    "Servis sürdürüldü - anti-DPI etkin.",
+                                )
+                                .to_string(),
+                            );
                         }
                         Err(err) => {
-                            notice = Some(sanitize_notice(&format!("Resume failed: {err:#}")));
+                            notice = Some(sanitize_notice(&format!(
+                                "{}: {err:#}",
+                                launcher::tr("Resume failed", "Sürdürme başarısız")
+                            )));
                         }
                     }
                     explicit_launcher = true;
@@ -371,14 +439,24 @@ fn run_main() -> Result<()> {
                                     wait_for_live_engine(&cfg, target);
                                 }
                                 let msg = match target {
-                                    EngineMode::Tun => "Switched to TUN mode.",
-                                    EngineMode::Proxy => "Switched to Proxy mode.",
+                                    EngineMode::Tun => launcher::tr(
+                                        "Switched to TUN mode.",
+                                        "TUN moduna geçildi.",
+                                    ),
+                                    EngineMode::Proxy => launcher::tr(
+                                        "Switched to Proxy mode.",
+                                        "Proxy moduna geçildi.",
+                                    ),
                                 };
                                 notice = Some(msg.to_string());
                             }
                             Err(err) => {
                                 notice = Some(sanitize_notice(&format!(
-                                    "Engine switch failed: {err:#}"
+                                    "{}: {err:#}",
+                                    launcher::tr(
+                                        "Engine switch failed",
+                                        "Motor değiştirme başarısız"
+                                    )
                                 )));
                             }
                         }
@@ -393,14 +471,25 @@ fn run_main() -> Result<()> {
                                 save_config_with_ownership(&user_path, &fc)
                             });
                         let base_msg = match target {
-                            EngineMode::Tun => "Engine set to TUN mode.",
-                            EngineMode::Proxy => "Engine set to Proxy mode.",
+                            EngineMode::Tun => launcher::tr(
+                                "Engine set to TUN mode.",
+                                "Motor TUN moduna ayarlandı.",
+                            ),
+                            EngineMode::Proxy => launcher::tr(
+                                "Engine set to Proxy mode.",
+                                "Motor Proxy moduna ayarlandı.",
+                            ),
                         };
                         notice = Some(match save_res {
                             Ok(()) => base_msg.to_string(),
-                            Err(err) => sanitize_notice(&format!(
-                                "{base_msg} (warning: failed to save config: {err:#})"
-                            )),
+                            Err(err) => sanitize_notice(&match launcher::active_lang() {
+                                vdpi::i18n::Lang::En => {
+                                    format!("{base_msg} (warning: failed to save config: {err:#})")
+                                }
+                                vdpi::i18n::Lang::Tr => {
+                                    format!("{base_msg} (uyarı: yapılandırma kaydedilemedi: {err:#})")
+                                }
+                            }),
                         });
                     }
                     explicit_launcher = true;
@@ -429,14 +518,26 @@ fn run_main() -> Result<()> {
                             if was_running {
                                 wait_for_live_engine(&cfg, target_engine);
                             }
-                            notice = Some(if was_installed {
-                                format!("DNS server set to {label}.")
-                            } else {
-                                format!("DNS server set to {label} (saved).")
+                            notice = Some(match (launcher::active_lang(), was_installed) {
+                                (vdpi::i18n::Lang::En, true) => {
+                                    format!("DNS server set to {label}.")
+                                }
+                                (vdpi::i18n::Lang::En, false) => {
+                                    format!("DNS server set to {label} (saved).")
+                                }
+                                (vdpi::i18n::Lang::Tr, true) => {
+                                    format!("DNS sunucusu {label} olarak ayarlandı.")
+                                }
+                                (vdpi::i18n::Lang::Tr, false) => {
+                                    format!("DNS sunucusu {label} olarak ayarlandı (kaydedildi).")
+                                }
                             });
                         }
                         Err(err) => {
-                            notice = Some(sanitize_notice(&format!("DNS change failed: {err:#}")));
+                            notice = Some(sanitize_notice(&format!(
+                                "{}: {err:#}",
+                                launcher::tr("DNS change failed", "DNS değiştirme başarısız")
+                            )));
                         }
                     }
                     explicit_launcher = true;
@@ -454,16 +555,24 @@ fn run_main() -> Result<()> {
                             Ok(Some(new_cfg)) => {
                                 match vdpi::service::set_service_split_tunnel(&new_cfg) {
                                     Ok(msg) => {
+                                        let restarted =
+                                            was_running || msg.contains("service restarted");
+                                        let saved_notice =
+                                            format_split_tunnel_saved_notice(&new_cfg, restarted);
                                         cfg.split_tunnel = new_cfg.clone();
                                         session_split_override = Some(new_cfg);
                                         if was_running {
                                             wait_for_live_engine(&cfg, target_engine);
                                         }
-                                        notice = Some(sanitize_notice(&msg));
+                                        notice = Some(sanitize_notice(&saved_notice));
                                     }
                                     Err(err) => {
                                         notice = Some(sanitize_notice(&format!(
-                                            "Split tunnel save failed: {err:#}"
+                                            "{}: {err:#}",
+                                            launcher::tr(
+                                                "Split tunnel save failed",
+                                                "Bölünmüş tünel kaydetme başarısız"
+                                            )
                                         )));
                                     }
                                 }
@@ -473,7 +582,11 @@ fn run_main() -> Result<()> {
                             }
                             Err(err) => {
                                 notice = Some(sanitize_notice(&format!(
-                                    "Split tunnel picker failed: {err:#}"
+                                    "{}: {err:#}",
+                                    launcher::tr(
+                                        "Split tunnel picker failed",
+                                        "Bölünmüş tünel seçici başarısız"
+                                    )
                                 )));
                             }
                         }
@@ -481,7 +594,11 @@ fn run_main() -> Result<()> {
                     #[cfg(any(target_os = "android", target_os = "ios"))]
                     {
                         notice = Some(
-                            "Split tunnel picker is not supported on this platform.".to_string(),
+                            launcher::tr(
+                                "Split tunnel picker is not supported on this platform.",
+                                "Bölünmüş tünel seçici bu platformda desteklenmiyor.",
+                            )
+                            .to_string(),
                         );
                     }
                     explicit_launcher = true;
@@ -498,18 +615,31 @@ fn run_main() -> Result<()> {
                                 notice = None;
                             }
                             Ok(false) => {
-                                notice = Some("No running vdpi service detected.".to_string());
+                                notice = Some(
+                                    launcher::tr(
+                                        "No running vdpi service detected.",
+                                        "Çalışan vdpi servisi bulunamadı.",
+                                    )
+                                    .to_string(),
+                                );
                             }
                             Err(err) => {
-                                notice =
-                                    Some(sanitize_notice(&format!("Dashboard error: {err:#}")));
+                                notice = Some(sanitize_notice(&format!(
+                                    "{}: {err:#}",
+                                    launcher::tr("Dashboard error", "Panel hatası")
+                                )));
                             }
                         }
                     }
                     #[cfg(any(target_os = "android", target_os = "ios"))]
                     {
-                        notice =
-                            Some("Live dashboard is not supported on this platform.".to_string());
+                        notice = Some(
+                            launcher::tr(
+                                "Live dashboard is not supported on this platform.",
+                                "Canlı panel bu platformda desteklenmiyor.",
+                            )
+                            .to_string(),
+                        );
                     }
                     explicit_launcher = true;
                     continue;
@@ -525,8 +655,10 @@ fn run_main() -> Result<()> {
                                 notice = Some(sanitize_notice(&summary));
                             }
                             Err(err) => {
-                                notice =
-                                    Some(sanitize_notice(&format!("Diagnostics failed: {err:#}")));
+                                notice = Some(sanitize_notice(&format!(
+                                    "{}: {err:#}",
+                                    launcher::tr("Diagnostics failed", "Tanılama başarısız")
+                                )));
                             }
                         }
                     }
@@ -536,11 +668,16 @@ fn run_main() -> Result<()> {
                             .and_then(|rt| rt.block_on(run_doctor(cfg.clone())));
                         match result {
                             Ok(()) => {
-                                notice = Some("Diagnostics complete.".to_string());
+                                notice = Some(
+                                    launcher::tr("Diagnostics complete.", "Tanılama tamamlandı.")
+                                        .to_string(),
+                                );
                             }
                             Err(err) => {
-                                notice =
-                                    Some(sanitize_notice(&format!("Diagnostics failed: {err:#}")));
+                                notice = Some(sanitize_notice(&format!(
+                                    "{}: {err:#}",
+                                    launcher::tr("Diagnostics failed", "Tanılama başarısız")
+                                )));
                             }
                         }
                     }
@@ -554,10 +691,19 @@ fn run_main() -> Result<()> {
                             session_engine_override = None;
                             session_dns_override = None;
                             session_split_override = None;
-                            notice = Some("vdpi background service uninstalled.".to_string());
+                            notice = Some(
+                                launcher::tr(
+                                    "vdpi background service uninstalled.",
+                                    "vdpi arka plan servisi kaldırıldı.",
+                                )
+                                .to_string(),
+                            );
                         }
                         Err(err) => {
-                            notice = Some(sanitize_notice(&format!("Uninstall failed: {err:#}")));
+                            notice = Some(sanitize_notice(&format!(
+                                "{}: {err:#}",
+                                launcher::tr("Uninstall failed", "Kaldırma başarısız")
+                            )));
                         }
                     }
                     explicit_launcher = true;
@@ -571,7 +717,7 @@ fn run_main() -> Result<()> {
     match command {
         Some(Command::Install { upgrade }) => {
             init_tracing(&cfg);
-            install_service_with_options(&cfg, upgrade)?;
+            install_service_with_engine_override(&cfg, upgrade, explicit_engine)?;
             launcher::clear_preference();
             Ok(())
         }
@@ -714,6 +860,36 @@ fn run_internal_macos_tun_guard() -> Result<()> {
     }
 }
 
+#[cfg(any(not(any(target_os = "android", target_os = "ios")), test))]
+fn format_localized_split_summary(split: &SplitTunnelConfig) -> String {
+    match launcher::active_lang() {
+        vdpi::i18n::Lang::En => split.summary_label(),
+        vdpi::i18n::Lang::Tr => {
+            let count = split.apps.len();
+            match split.mode {
+                SplitTunnelMode::All => "Tüm uygulamalar".to_string(),
+                SplitTunnelMode::Exclude => format!("Hariç tut ({count} uygulama)"),
+                SplitTunnelMode::Include => format!("Dahil et ({count} uygulama)"),
+            }
+        }
+    }
+}
+
+#[cfg(any(not(any(target_os = "android", target_os = "ios")), test))]
+fn format_split_tunnel_saved_notice(split: &SplitTunnelConfig, service_restarted: bool) -> String {
+    let summary = format_localized_split_summary(split);
+    match (launcher::active_lang(), service_restarted) {
+        (vdpi::i18n::Lang::En, true) => {
+            format!("Split tunneling saved: {summary} (service restarted)")
+        }
+        (vdpi::i18n::Lang::En, false) => format!("Split tunneling saved: {summary}"),
+        (vdpi::i18n::Lang::Tr, true) => {
+            format!("Bölünmüş tünel kaydedildi: {summary} (servis yeniden başlatıldı)")
+        }
+        (vdpi::i18n::Lang::Tr, false) => format!("Bölünmüş tünel kaydedildi: {summary}"),
+    }
+}
+
 #[cfg(any(target_os = "windows", test))]
 fn format_wintun_preflight_notice(err_chain: &str) -> String {
     let lower = err_chain.to_ascii_lowercase();
@@ -723,10 +899,17 @@ fn format_wintun_preflight_notice(err_chain: &str) -> String {
         || lower.contains("verification failed")
         || lower.contains("corrupt")
     {
-        "wintun.dll is corrupted or mismatched - extract all files from the zip (keep wintun.dll beside vdpi.exe)"
-            .to_string()
+        launcher::tr(
+            "wintun.dll is corrupted or mismatched - extract all files from the zip (keep wintun.dll beside vdpi.exe)",
+            "wintun.dll bozuk veya eşleşmiyor - zip içindeki tüm dosyaları çıkarın (wintun.dll, vdpi.exe yanında olmalı)",
+        )
+        .to_string()
     } else {
-        "wintun.dll not found next to vdpi.exe - extract all files from the zip".to_string()
+        launcher::tr(
+            "wintun.dll not found next to vdpi.exe - extract all files from the zip",
+            "vdpi.exe yanında wintun.dll bulunamadı - zip içindeki tüm dosyaları çıkarın",
+        )
+        .to_string()
     }
 }
 
@@ -886,6 +1069,50 @@ fn resolve_writable_config_path(
     Ok(WritableConfigPath::Ready(usr))
 }
 
+fn resolve_i18n_language_pref(
+    file_cfg: &FileConfig,
+    explicit_config: bool,
+) -> Option<Option<vdpi::i18n::Lang>> {
+    if let Some(ref raw) = file_cfg.language {
+        if raw.trim().eq_ignore_ascii_case("auto") {
+            Some(None)
+        } else {
+            vdpi::i18n::Lang::parse(raw).map(Some)
+        }
+    } else if explicit_config {
+        Some(None)
+    } else {
+        None
+    }
+}
+
+fn resolve_startup_i18n_language_pref(
+    file_cfg: &FileConfig,
+    user_file_cfg: Option<&FileConfig>,
+    explicit_config: bool,
+) -> Option<Option<vdpi::i18n::Lang>> {
+    if !explicit_config {
+        if let Some(user_cfg) = user_file_cfg {
+            if let Some(pref) = resolve_i18n_language_pref(user_cfg, false) {
+                return Some(pref);
+            }
+        }
+    }
+    resolve_i18n_language_pref(file_cfg, explicit_config)
+}
+
+fn seed_i18n_language_pref(
+    file_cfg: &FileConfig,
+    user_file_cfg: Option<&FileConfig>,
+    explicit_config: bool,
+) {
+    if let Some(pref) =
+        resolve_startup_i18n_language_pref(file_cfg, user_file_cfg, explicit_config)
+    {
+        vdpi::i18n::set_language_pref(pref);
+    }
+}
+
 fn runtime_to_file_config(cfg: &RuntimeConfig) -> FileConfig {
     FileConfig {
         schema_version: Some(CONFIG_SCHEMA_VERSION),
@@ -953,14 +1180,12 @@ fn sanitize_unix_username(raw: Option<&str>) -> Option<&str> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-#[allow(clippy::too_many_arguments)]
 fn resolve_elevated_invoking_user_with<FByUid, FByName>(
     sudo_uid: Option<&str>,
-    sudo_gid: Option<&str>,
     sudo_user: Option<&str>,
     pkexec_uid: Option<&str>,
     doas_user: Option<&str>,
-    home_env: Option<&str>,
+    real_uid: u32,
     lookup_by_uid: FByUid,
     lookup_by_name: FByName,
 ) -> Option<ElevatedUserInfo>
@@ -968,18 +1193,9 @@ where
     FByUid: Fn(u32) -> Option<ElevatedUserInfo>,
     FByName: Fn(&str) -> Option<ElevatedUserInfo>,
 {
-    let fallback_home = home_env
-        .map(str::trim)
-        .filter(|h| !h.is_empty() && *h != "/root" && *h != "/var/root")
-        .map(PathBuf::from);
-
     if let Some(uid) = parse_nonzero_unix_id(sudo_uid) {
         if let Some(user) = lookup_by_uid(uid).filter(|u| u.uid != 0) {
             return Some(user);
-        }
-        if let Some(home_dir) = fallback_home.clone() {
-            let gid = parse_nonzero_unix_id(sudo_gid).unwrap_or(uid);
-            return Some(ElevatedUserInfo { uid, gid, home_dir });
         }
     }
     if let Some(user_name) = sanitize_unix_username(sudo_user) {
@@ -991,16 +1207,17 @@ where
         if let Some(user) = lookup_by_uid(uid).filter(|u| u.uid != 0) {
             return Some(user);
         }
-        if let Some(home_dir) = fallback_home {
-            return Some(ElevatedUserInfo {
-                uid,
-                gid: uid,
-                home_dir,
-            });
-        }
     }
     if let Some(user_name) = sanitize_unix_username(doas_user) {
         if let Some(user) = lookup_by_name(user_name).filter(|u| u.uid != 0) {
+            return Some(user);
+        }
+    }
+    // Fallback for macOS `osascript ... with administrator privileges` (and setuid
+    // elevation paths) where euid == 0 and SUDO_*/PKEXEC_*/DOAS_* are absent while
+    // `getuid()` still identifies the invoking non-root user.
+    if real_uid != 0 {
+        if let Some(user) = lookup_by_uid(real_uid).filter(|u| u.uid != 0) {
             return Some(user);
         }
     }
@@ -1091,50 +1308,20 @@ fn resolve_elevated_invoking_user() -> Option<ElevatedUserInfo> {
         return None;
     }
     let sudo_uid = std::env::var("SUDO_UID").ok();
-    let sudo_gid = std::env::var("SUDO_GID").ok();
     let sudo_user = std::env::var("SUDO_USER").ok();
     let pkexec_uid = std::env::var("PKEXEC_UID").ok();
     let doas_user = std::env::var("DOAS_USER").ok();
-    let home_env = std::env::var("HOME").ok();
-    if let Some(user) = resolve_elevated_invoking_user_with(
+    // SAFETY: `getuid(2)` is always safe to call and never fails.
+    let real_uid = unsafe { libc::getuid() };
+    resolve_elevated_invoking_user_with(
         sudo_uid.as_deref(),
-        sudo_gid.as_deref(),
         sudo_user.as_deref(),
         pkexec_uid.as_deref(),
         doas_user.as_deref(),
-        home_env.as_deref(),
+        real_uid,
         lookup_unix_passwd_by_uid,
         lookup_unix_passwd_by_name,
-    ) {
-        return Some(user);
-    }
-
-    // Fallback for macOS `osascript ... with administrator privileges` (and setuid
-    // elevation paths) where euid == 0 and SUDO_*/PKEXEC_*/DOAS_* are absent while
-    // `getuid()` still identifies the invoking non-root user.
-    // SAFETY: `getuid(2)` is always safe to call and never fails.
-    let ruid = unsafe { libc::getuid() };
-    if ruid != 0 {
-        if let Some(user) = lookup_unix_passwd_by_uid(ruid).filter(|u| u.uid != 0) {
-            return Some(user);
-        }
-        if let Some(home_dir) = home_env
-            .as_deref()
-            .map(str::trim)
-            .filter(|h| !h.is_empty() && *h != "/root" && *h != "/var/root")
-            .map(PathBuf::from)
-        {
-            // SAFETY: `getgid(2)` is always safe to call and never fails.
-            let rgid = unsafe { libc::getgid() };
-            let gid = if rgid != 0 { rgid } else { ruid };
-            return Some(ElevatedUserInfo {
-                uid: ruid,
-                gid,
-                home_dir,
-            });
-        }
-    }
-    None
+    )
 }
 
 /// Refuses to create directories, write files, or `lchown` through any symlink
@@ -1802,6 +1989,44 @@ fn maybe_print_service_restart_note(explicit_path: Option<&Path>, target: &Path)
     }
 }
 
+fn build_config_show_file_config(cfg: &RuntimeConfig, file_cfg: &FileConfig) -> FileConfig {
+    let mut show_cfg = runtime_to_file_config(cfg);
+    show_cfg.language.clone_from(&file_cfg.language);
+    show_cfg
+}
+
+fn build_config_show_json(
+    loaded_path: Option<&Path>,
+    cfg: &RuntimeConfig,
+    file_cfg: &FileConfig,
+) -> serde_json::Value {
+    serde_json::json!({
+        "config_path": loaded_path.map(|p| p.display().to_string()),
+        "engine": cfg.engine.as_str(),
+        "mode": cfg.mode,
+        "chunk_size": cfg.chunk_size,
+        "doh": cfg.enable_doh,
+        "block_quic": cfg.block_quic,
+        "dns_addr": cfg.dns_addr,
+        "dns_port": cfg.dns_port,
+        "ipv4_only": cfg.dns_ipv4_only,
+        "bind": cfg.addr.to_string(),
+        "port": cfg.port,
+        "socks_port": cfg.socks_port,
+        "timeout_ms": u64::try_from(cfg.connect_timeout.as_millis()).unwrap_or(u64::MAX),
+        "bypass_domains": cfg.bypass_domains,
+        "include_domains": cfg.patterns,
+        "split_tunnel_mode": cfg.split_tunnel.mode.as_str(),
+        "split_tunnel_apps": cfg.split_tunnel.apps,
+        "system_proxy": cfg.system_proxy,
+        "socks_system_proxy": cfg.socks_system_proxy,
+        "env_proxy": cfg.env_proxy,
+        "vpn_coexistence": cfg.vpn_coexistence.as_str(),
+        "tun_ipv6": cfg.tun_ipv6,
+        "language": file_cfg.language,
+    })
+}
+
 fn handle_config_command(
     action: Option<ConfigCommand>,
     cli: CliArgs,
@@ -1818,30 +2043,7 @@ fn handle_config_command(
                 load_file_config(explicit_path.as_deref(), effective_service_mode)?;
             let cfg = cli.resolve_runtime_config(&file_cfg, raw_args);
             if json {
-                let payload = serde_json::json!({
-                    "config_path": loaded_path.as_ref().map(|p| p.display().to_string()),
-                    "engine": cfg.engine.as_str(),
-                    "mode": cfg.mode,
-                    "chunk_size": cfg.chunk_size,
-                    "doh": cfg.enable_doh,
-                    "block_quic": cfg.block_quic,
-                    "dns_addr": cfg.dns_addr,
-                    "dns_port": cfg.dns_port,
-                    "ipv4_only": cfg.dns_ipv4_only,
-                    "bind": cfg.addr.to_string(),
-                    "port": cfg.port,
-                    "socks_port": cfg.socks_port,
-                    "timeout_ms": u64::try_from(cfg.connect_timeout.as_millis()).unwrap_or(u64::MAX),
-                    "bypass_domains": cfg.bypass_domains,
-                    "include_domains": cfg.patterns,
-                    "split_tunnel_mode": cfg.split_tunnel.mode.as_str(),
-                    "split_tunnel_apps": cfg.split_tunnel.apps,
-                    "system_proxy": cfg.system_proxy,
-                    "socks_system_proxy": cfg.socks_system_proxy,
-                    "env_proxy": cfg.env_proxy,
-                    "vpn_coexistence": cfg.vpn_coexistence.as_str(),
-                    "tun_ipv6": cfg.tun_ipv6,
-                });
+                let payload = build_config_show_json(loaded_path.as_deref(), &cfg, &file_cfg);
                 println!("{}", serde_json::to_string_pretty(&payload)?);
             } else {
                 match loaded_path {
@@ -1852,7 +2054,10 @@ fn handle_config_command(
                             .display()
                     ),
                 }
-                print!("{}", render_config_toml(&runtime_to_file_config(&cfg)));
+                print!(
+                    "{}",
+                    render_config_toml(&build_config_show_file_config(&cfg, &file_cfg))
+                );
             }
             Ok(())
         }
@@ -2207,28 +2412,29 @@ fn remove_split_tunnel_apps(
     Ok((remaining, removed))
 }
 
-fn load_effective_split_tunnel(
+fn load_effective_split_tunnel_with_file_config(
     config_path: Option<&Path>,
     cli_split_mode: Option<SplitTunnelMode>,
     cli_split_apps: &[String],
     allow_missing_explicit: bool,
-) -> Result<SplitTunnelConfig> {
-    let mut cfg = if let Some(path) = config_path {
+) -> Result<(SplitTunnelConfig, Option<FileConfig>)> {
+    let (mut cfg, explicit_file_cfg) = if let Some(path) = config_path {
         let (_, file_cfg) = if allow_missing_explicit {
             load_file_config_or_default(Some(path), false)?
         } else {
             load_file_config(Some(path), false)?
         };
-        SplitTunnelConfig {
+        let split_cfg = SplitTunnelConfig {
             mode: file_cfg.split_tunnel_mode.unwrap_or_default(),
             apps: file_cfg
                 .split_tunnel_apps
                 .as_deref()
                 .map(vdpi::config_file::sanitize_split_tunnel_apps)
                 .unwrap_or_default(),
-        }
+        };
+        (split_cfg, Some(file_cfg))
     } else {
-        vdpi::service::load_configured_split_tunnel()
+        (vdpi::service::load_configured_split_tunnel(), None)
     };
     if let Some(mode) = cli_split_mode {
         cfg.mode = mode;
@@ -2236,7 +2442,22 @@ fn load_effective_split_tunnel(
     if !cli_split_apps.is_empty() {
         cfg.apps = vdpi::config_file::sanitize_split_tunnel_apps(cli_split_apps);
     }
-    Ok(cfg)
+    Ok((cfg, explicit_file_cfg))
+}
+
+fn load_effective_split_tunnel(
+    config_path: Option<&Path>,
+    cli_split_mode: Option<SplitTunnelMode>,
+    cli_split_apps: &[String],
+    allow_missing_explicit: bool,
+) -> Result<SplitTunnelConfig> {
+    load_effective_split_tunnel_with_file_config(
+        config_path,
+        cli_split_mode,
+        cli_split_apps,
+        allow_missing_explicit,
+    )
+    .map(|(cfg, _)| cfg)
 }
 
 fn save_split_tunnel_target(
@@ -2289,8 +2510,15 @@ fn handle_split_command(
                         "interactive split-tunnel picker requires an interactive terminal (use 'vdpi split status|list|mode|add|remove|clear')"
                     );
                 }
-                let current =
-                    load_effective_split_tunnel(config_path, cli_split_mode, cli_split_apps, true)?;
+                let (current, explicit_file_cfg) = load_effective_split_tunnel_with_file_config(
+                    config_path,
+                    cli_split_mode,
+                    cli_split_apps,
+                    true,
+                )?;
+                if let Some(ref file_cfg) = explicit_file_cfg {
+                    seed_i18n_language_pref(file_cfg, None, true);
+                }
                 if let Some(new_cfg) = vdpi::split_tunnel::tui::run_split_tunnel_picker(current)? {
                     let msg = save_split_tunnel_target(config_path, &new_cfg)?;
                     println!("{msg}");
@@ -5862,33 +6090,39 @@ mod tests {
             resolve_elevated_invoking_user_with(
                 None,
                 None,
-                None,
                 Some("1000"),
                 None,
-                None,
+                0,
                 by_uid,
                 by_name,
             ),
             Some(alice.clone())
         );
 
-        // PKEXEC_UID falls back to non-root HOME when passwd lookup misses.
+        // Unknown PKEXEC_UID and SUDO_UID return None instead of trusting $HOME.
         assert_eq!(
             resolve_elevated_invoking_user_with(
                 None,
                 None,
-                None,
                 Some("2000"),
                 None,
-                Some("/home/charlie"),
+                0,
                 by_uid,
                 by_name,
             ),
-            Some(ElevatedUserInfo {
-                uid: 2000,
-                gid: 2000,
-                home_dir: PathBuf::from("/home/charlie"),
-            })
+            None
+        );
+        assert_eq!(
+            resolve_elevated_invoking_user_with(
+                Some("2000"),
+                None,
+                None,
+                None,
+                0,
+                by_uid,
+                by_name,
+            ),
+            None
         );
 
         // DOAS_USER resolves invoking user via name lookup.
@@ -5897,9 +6131,50 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
                 Some("bob"),
+                0,
+                by_uid,
+                by_name,
+            ),
+            Some(bob.clone())
+        );
+
+        // Non-zero real_uid resolves via passwd lookup (macOS osascript / setuid path).
+        assert_eq!(
+            resolve_elevated_invoking_user_with(
                 None,
+                None,
+                None,
+                None,
+                1000,
+                by_uid,
+                by_name,
+            ),
+            Some(alice.clone())
+        );
+
+        // Unknown real_uid returns None when passwd lookup misses.
+        assert_eq!(
+            resolve_elevated_invoking_user_with(
+                None,
+                None,
+                None,
+                None,
+                2000,
+                by_uid,
+                by_name,
+            ),
+            None
+        );
+
+        // SUDO_UID takes precedence over real_uid.
+        assert_eq!(
+            resolve_elevated_invoking_user_with(
+                Some("1001"),
+                None,
+                None,
+                None,
+                1000,
                 by_uid,
                 by_name,
             ),
@@ -5910,11 +6185,10 @@ mod tests {
         assert_eq!(
             resolve_elevated_invoking_user_with(
                 Some("0"),
-                Some("0"),
                 Some("root"),
                 Some("0"),
                 Some("root"),
-                Some("/root"),
+                0,
                 by_uid,
                 by_name,
             ),
@@ -5925,9 +6199,8 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
                 Some("../alice"),
-                None,
+                0,
                 by_uid,
                 by_name,
             ),
@@ -6620,5 +6893,128 @@ split_tunnel_apps = ["discord.exe"]
         assert_eq!(EXIT_CODE_APPLY_RESTART_FAILED, 2);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_show_includes_language_in_toml_and_json_and_resolves_i18n_pref() {
+        let cfg = RuntimeConfig::default();
+        let file_cfg_tr = FileConfig {
+            language: Some("tr".to_string()),
+            ..FileConfig::default()
+        };
+
+        let show_toml = render_config_toml(&build_config_show_file_config(&cfg, &file_cfg_tr));
+        assert!(show_toml.contains("language = \"tr\""));
+        let show_json = build_config_show_json(Some(Path::new("config.toml")), &cfg, &file_cfg_tr);
+        assert_eq!(show_json["language"].as_str(), Some("tr"));
+
+        let file_cfg_none = FileConfig::default();
+        let show_toml_none =
+            render_config_toml(&build_config_show_file_config(&cfg, &file_cfg_none));
+        assert!(!show_toml_none.contains("language ="));
+        let show_json_none = build_config_show_json(None, &cfg, &file_cfg_none);
+        assert!(show_json_none["language"].is_null());
+
+        assert_eq!(
+            resolve_i18n_language_pref(&file_cfg_tr, false),
+            Some(Some(vdpi::i18n::Lang::Tr))
+        );
+        let file_cfg_en = FileConfig {
+            language: Some("en".to_string()),
+            ..FileConfig::default()
+        };
+        assert_eq!(
+            resolve_i18n_language_pref(&file_cfg_en, false),
+            Some(Some(vdpi::i18n::Lang::En))
+        );
+        let file_cfg_auto = FileConfig {
+            language: Some("auto".to_string()),
+            ..FileConfig::default()
+        };
+        assert_eq!(resolve_i18n_language_pref(&file_cfg_auto, false), Some(None));
+        assert_eq!(resolve_i18n_language_pref(&file_cfg_none, false), None);
+        assert_eq!(resolve_i18n_language_pref(&file_cfg_none, true), Some(None));
+    }
+
+    #[test]
+    fn startup_i18n_prefers_user_config_language_over_system_config_when_no_explicit_path() {
+        let sys_cfg_en = FileConfig {
+            language: Some("en".to_string()),
+            ..FileConfig::default()
+        };
+        let sys_cfg_tr = FileConfig {
+            language: Some("tr".to_string()),
+            ..FileConfig::default()
+        };
+        let user_cfg_tr = FileConfig {
+            language: Some("tr".to_string()),
+            ..FileConfig::default()
+        };
+        let user_cfg_auto = FileConfig {
+            language: Some("auto".to_string()),
+            ..FileConfig::default()
+        };
+        let user_cfg_none = FileConfig::default();
+
+        // When cli.config_path.is_none(), user_config language overrides system_config language.
+        assert_eq!(
+            resolve_startup_i18n_language_pref(&sys_cfg_en, Some(&user_cfg_tr), false),
+            Some(Some(vdpi::i18n::Lang::Tr))
+        );
+        // Explicit "auto" in user_config overrides pinned language in system_config.
+        assert_eq!(
+            resolve_startup_i18n_language_pref(&sys_cfg_tr, Some(&user_cfg_auto), false),
+            Some(None)
+        );
+        // Missing language in user_config falls back to system_config language.
+        assert_eq!(
+            resolve_startup_i18n_language_pref(&sys_cfg_tr, Some(&user_cfg_none), false),
+            Some(Some(vdpi::i18n::Lang::Tr))
+        );
+        // Explicit --config path ignores user_config language.
+        assert_eq!(
+            resolve_startup_i18n_language_pref(&sys_cfg_en, Some(&user_cfg_tr), true),
+            Some(Some(vdpi::i18n::Lang::En))
+        );
+        assert_eq!(
+            resolve_startup_i18n_language_pref(&user_cfg_none, Some(&user_cfg_tr), true),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn localized_control_center_notices_render_in_turkish_and_english() {
+        let split = SplitTunnelConfig {
+            mode: SplitTunnelMode::Exclude,
+            apps: vec!["discord.exe".to_string(), "chrome.exe".to_string()],
+        };
+        {
+            let _guard = vdpi::i18n::push_thread_lang(Some(vdpi::i18n::Lang::En));
+            assert_eq!(
+                format_split_tunnel_saved_notice(&split, true),
+                "Split tunneling saved: Exclude (2 apps) (service restarted)"
+            );
+            assert_eq!(
+                format_split_tunnel_saved_notice(&split, false),
+                "Split tunneling saved: Exclude (2 apps)"
+            );
+        }
+        {
+            let _guard = vdpi::i18n::push_thread_lang(Some(vdpi::i18n::Lang::Tr));
+            assert_eq!(
+                format_split_tunnel_saved_notice(&split, true),
+                "Bölünmüş tünel kaydedildi: Hariç tut (2 uygulama) (servis yeniden başlatıldı)"
+            );
+            assert_eq!(
+                format_split_tunnel_saved_notice(&split, false),
+                "Bölünmüş tünel kaydedildi: Hariç tut (2 uygulama)"
+            );
+            let corrupt = format_wintun_preflight_notice("SHA-256 verification failed");
+            assert!(corrupt.contains("wintun.dll"));
+            assert!(corrupt.contains("bozuk"));
+            let missing = format_wintun_preflight_notice("wintun.dll not found");
+            assert!(missing.contains("wintun.dll"));
+            assert!(missing.contains("bulunamadı"));
+        }
     }
 }

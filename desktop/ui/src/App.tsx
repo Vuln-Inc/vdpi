@@ -13,6 +13,7 @@ import {
 import { createPortal } from "react-dom";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ConfirmDialog } from "./components/ConfirmDialog";
+import { IconExternal } from "./components/Icons";
 import { InlineBanner } from "./components/InlineBanner";
 import { Sidebar } from "./components/Sidebar";
 import {
@@ -36,6 +37,7 @@ import {
   tShell,
 } from "./i18n/shell";
 import { formatClockTime, scrubUrlsInText } from "./lib/format";
+import { acquireModalLock } from "./lib/modalLock";
 import {
   checkUpdates,
   installService,
@@ -50,6 +52,7 @@ import {
   type AppFolderTarget,
 } from "./lib/ipc";
 import type {
+  ActionErrorCode,
   ActionResult,
   ActivityEvent,
   DesktopSettingsPayload,
@@ -224,6 +227,15 @@ function getErrorMessage(err: unknown, fallback: string): string {
   return fallback;
 }
 
+function getLocalizedErrorMessage(
+  lang: ResolvedLanguage,
+  err: unknown,
+  fallback: string,
+): string {
+  const raw = getErrorMessage(err, "");
+  return raw ? localizeActionMessage(lang, raw) : fallback;
+}
+
 function safeActionMessage(
   lang: ResolvedLanguage,
   message: string | null | undefined,
@@ -235,10 +247,17 @@ function safeActionMessage(
     : fallback;
 }
 
+export type InstallErrorOperation = "install" | "upgrade" | "repair";
+
 export interface InstallErrorState {
   message: string;
   kind: "cancelled" | "wintun" | "antivirus" | "generic";
   attemptedEngine?: EngineMode;
+  operation?: InstallErrorOperation;
+}
+
+function isCalmTransientCode(code: ActionErrorCode | undefined): boolean {
+  return code === "busy" || code === "shutting_down";
 }
 
 function formatVersionTag(version: string | null | undefined): string | null {
@@ -266,6 +285,8 @@ function resolveActionResultMessage(
       return tShell(lang, "upgradeVersionUnknown");
     case "bundled_cli_missing":
       return tShell(lang, "upgradeBundledMissing");
+    case "wintun_invalid":
+      return tShell(lang, "installWintunInvalid");
     case "wintun_missing":
       return tShell(lang, "installWintunMissing");
     case "already_up_to_date":
@@ -279,11 +300,13 @@ function classifyInstallError(
   message: string,
   options?: {
     cancelled?: boolean;
-    code?: ActionResult["code"];
+    code?: ActionErrorCode;
     attemptedEngine?: EngineMode;
+    operation?: InstallErrorOperation;
   },
 ): InstallErrorState {
   const normalized = message.trim();
+  const code = options?.code;
   let kind: InstallErrorState["kind"] = "generic";
   if (
     options?.cancelled ||
@@ -293,12 +316,14 @@ function classifyInstallError(
   ) {
     kind = "cancelled";
   } else if (
-    options?.code === "wintun_missing" ||
+    code === "wintun_missing" ||
+    code === "wintun_invalid" ||
     /wintun|wintun\.dll|tun driver|adapter driver|sürücü/i.test(normalized)
   ) {
     kind = "wintun";
   } else if (
-    /antivirus|defender|quarantin|virus|smartscreen|blocked by|winerror\s*225|error\s*225|\b577\b|security software|karantina/i.test(
+    code === "bundled_cli_missing" ||
+    /antivirus|antivirüs|defender|quarantin|virus|virüs|smartscreen|blocked by|winerror\s*225|error\s*225|\b577\b|security software|güvenlik yazılımı|karantina/i.test(
       normalized,
     )
   ) {
@@ -309,19 +334,76 @@ function classifyInstallError(
     message: normalized,
     kind,
     attemptedEngine: options?.attemptedEngine,
+    operation: options?.operation,
   };
 }
 
 const DIALOG_FOCUSABLE_SELECTOR =
   'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
+const UPDATE_PROMPT_DIALOG_TESTID = "update-prompt-dialog";
+
+function hasForeignAriaModal(): boolean {
+  if (typeof document === "undefined") {
+    return false;
+  }
+  const modals = document.querySelectorAll('[aria-modal="true"]');
+  for (const modal of modals) {
+    if (modal.getAttribute("data-testid") === UPDATE_PROMPT_DIALOG_TESTID) {
+      continue;
+    }
+    return true;
+  }
+  return false;
+}
+
+function stripLeadingBullet(line: string): string {
+  return line.replace(/^\s*(?:[-*\u2022]\s+)+/, "").trim();
+}
+
+function getNavTabTitle(lang: ResolvedLanguage, tab: NavTab): string {
+  switch (tab) {
+    case "overview":
+      return tShell(lang, "navOverview");
+    case "split":
+      return tShell(lang, "navSplit");
+    case "dns":
+      return tShell(lang, "navDns");
+    case "diagnostics":
+      return tShell(lang, "navDiagnostics");
+    case "installation":
+      return tShell(lang, "navInstallation");
+    case "settings":
+      return tShell(lang, "navSettings");
+  }
+}
+
+function guiPrefsEqual(a: GuiPreferences, b: GuiPreferences): boolean {
+  return (
+    a.theme === b.theme &&
+    (a.language ?? "system") === (b.language ?? "system") &&
+    a.keepInTrayOnClose === b.keepInTrayOnClose &&
+    a.minimizeToTray === b.minimizeToTray &&
+    a.startMinimizedToTray === b.startMinimizedToTray &&
+    a.showTaskbarIconWhenMinimized === b.showTaskbarIconWhenMinimized
+  );
+}
+
+type UpdatePromptKind = "engine" | "app";
+
+interface UpdatePromptFeedback {
+  tone: "info" | "error";
+  message: string;
+}
+
 interface UpdatePromptDialogProps {
   open: boolean;
-  kind: "engine" | "app";
+  kind: UpdatePromptKind;
   fromVersion: string | null;
   toVersion: string | null;
   releaseNotes: readonly string[];
   busy: boolean;
+  feedback?: UpdatePromptFeedback | null;
   onUpdateNow: () => void;
   onViewInstallation: () => void;
   onDismiss: () => void;
@@ -334,6 +416,7 @@ function UpdatePromptDialog({
   toVersion,
   releaseNotes,
   busy,
+  feedback,
   onUpdateNow,
   onViewInstallation,
   onDismiss,
@@ -359,22 +442,7 @@ function UpdatePromptDialog({
         ? document.activeElement
         : null;
 
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-
-    const appRoot = document.getElementById("root") as
-      | (HTMLElement & { inert?: boolean })
-      | null;
-    const shouldSetInert = Boolean(
-      appRoot &&
-        !appRoot.contains(dialogRef.current) &&
-        !appRoot.hasAttribute("inert") &&
-        !appRoot.inert,
-    );
-    if (appRoot && shouldSetInert) {
-      appRoot.inert = true;
-      appRoot.setAttribute("inert", "");
-    }
+    const releaseModalLock = acquireModalLock();
 
     if (primaryBtnRef.current && !primaryBtnRef.current.disabled) {
       primaryBtnRef.current.focus();
@@ -386,6 +454,7 @@ function UpdatePromptDialog({
       if (event.key === "Escape") {
         event.preventDefault();
         event.stopPropagation();
+        event.stopImmediatePropagation();
         if (!busyRef.current) {
           onDismissRef.current();
         }
@@ -423,16 +492,31 @@ function UpdatePromptDialog({
 
     return () => {
       document.removeEventListener("keydown", handleKeyDown);
-      document.body.style.overflow = previousOverflow;
-      if (appRoot && shouldSetInert) {
-        appRoot.inert = false;
-        appRoot.removeAttribute("inert");
-      }
+      releaseModalLock();
       if (previouslyFocused && previouslyFocused.isConnected) {
         previouslyFocused.focus();
       }
     };
   }, [open]);
+
+  useEffect(() => {
+    if (!open || !busy || typeof document === "undefined") {
+      return;
+    }
+    const dialogEl = dialogRef.current;
+    if (!dialogEl) {
+      return;
+    }
+    const active = document.activeElement;
+    if (
+      !active ||
+      active === document.body ||
+      !dialogEl.contains(active) ||
+      (active instanceof HTMLButtonElement && active.disabled)
+    ) {
+      dialogEl.focus();
+    }
+  }, [open, busy]);
 
   if (!open) {
     return null;
@@ -455,7 +539,7 @@ function UpdatePromptDialog({
   const sanitizedNotes =
     kind === "app"
       ? releaseNotes
-          .map((line) => scrubUrlsInText(line.trim()))
+          .map((line) => scrubUrlsInText(stripLeadingBullet(line)))
           .filter((line) => line.length > 0)
           .slice(0, 4)
       : [tShell(lang, "updatePromptEngineSummary")];
@@ -467,6 +551,12 @@ function UpdatePromptDialog({
           to: toVersion,
         })
       : toVersion ?? undefined;
+
+  const primaryLabel = busy
+    ? tShell(lang, "updatePromptUpdating")
+    : kind === "app"
+      ? tShell(lang, "updatePromptDownloadLatest")
+      : tShell(lang, "updatePromptUpdateNow");
 
   const modal = (
     <div
@@ -482,7 +572,7 @@ function UpdatePromptDialog({
         aria-labelledby={titleId}
         aria-describedby={descId}
         aria-busy={busy || undefined}
-        data-testid="update-prompt-dialog"
+        data-testid={UPDATE_PROMPT_DIALOG_TESTID}
         tabIndex={-1}
       >
         <div className="update-prompt-header">
@@ -490,13 +580,13 @@ function UpdatePromptDialog({
             {title}
           </h2>
           {toVersion ? (
-            <span
-              className="badge badge-accent update-prompt-version-badge"
-              aria-label={versionAria}
-            >
+            <span className="badge badge-accent update-prompt-version-badge">
+              {versionAria ? (
+                <span className="sr-only">{versionAria}</span>
+              ) : null}
               {fromVersion ? (
                 <>
-                  <span>{fromVersion}</span>
+                  <span aria-hidden="true">{fromVersion}</span>
                   <span
                     className="update-prompt-version-arrow"
                     aria-hidden="true"
@@ -505,7 +595,7 @@ function UpdatePromptDialog({
                   </span>
                 </>
               ) : null}
-              <span>{toVersion}</span>
+              <span aria-hidden="true">{toVersion}</span>
             </span>
           ) : null}
         </div>
@@ -525,6 +615,10 @@ function UpdatePromptDialog({
               ))}
             </ul>
           </div>
+        ) : null}
+
+        {feedback ? (
+          <InlineBanner tone={feedback.tone} title={feedback.message} />
         ) : null}
 
         <div className="update-prompt-actions">
@@ -554,11 +648,8 @@ function UpdatePromptDialog({
               onClick={onUpdateNow}
             >
               {busy ? <span className="spinner" aria-hidden="true" /> : null}
-              <span>
-                {busy
-                  ? tShell(lang, "updatePromptUpdating")
-                  : tShell(lang, "updatePromptUpdateNow")}
-              </span>
+              <span>{primaryLabel}</span>
+              {!busy && kind === "app" ? <IconExternal size={14} /> : null}
             </button>
           </div>
         </div>
@@ -659,6 +750,14 @@ function AppShellContent({
   const [updateInfo, setUpdateInfo] = useState<UpdateCheckPayload | null>(null);
   const [checkingUpdates, setCheckingUpdates] = useState(false);
   const [updatePromptDismissed, setUpdatePromptDismissed] = useState(false);
+  const [updatePromptUpgrading, setUpdatePromptUpgrading] = useState(false);
+  const [updatePromptFeedback, setUpdatePromptFeedback] =
+    useState<UpdatePromptFeedback | null>(null);
+  const [foreignModalOpen, setForeignModalOpen] = useState(false);
+  const [dismissedUpgradeKey, setDismissedUpgradeKey] = useState<string | null>(
+    null,
+  );
+  const [navAnnouncement, setNavAnnouncement] = useState("");
   const [installError, setInstallError] = useState<InstallErrorState | null>(
     null,
   );
@@ -672,6 +771,14 @@ function AppShellContent({
     undefined,
   );
   const langRef = useRef<ResolvedLanguage>(lang);
+  const prevLangRef = useRef<ResolvedLanguage>(lang);
+  const activeTabRef = useRef<NavTab>(activeTab);
+  const splitDirtyRef = useRef(splitDirty);
+  const dnsDirtyRef = useRef(dnsDirty);
+  const prevStatusRef = useRef<DesktopStatusSnapshot | null>(null);
+  const pendingMainFocusRef = useRef(false);
+  const pendingTabFocusMainRef = useRef(false);
+  const hasMountedTabRef = useRef(false);
 
   const {
     status,
@@ -689,6 +796,12 @@ function AppShellContent({
     resumeToastTimer,
     clearActivity,
   } = desktop;
+
+  const toastsRef = useRef(toasts);
+  toastsRef.current = toasts;
+  activeTabRef.current = activeTab;
+  splitDirtyRef.current = splitDirty;
+  dnsDirtyRef.current = dnsDirty;
 
   const ingestActionSnapshot = useCallback(
     (snapshot: DesktopStatusSnapshot | undefined): boolean => {
@@ -710,6 +823,76 @@ function AppShellContent({
       mountedRef.current = false;
     };
   }, []);
+
+  // Clear stale transient toasts and live announcements when language changes
+  // so Turkish screens never display leftover English messages.
+  useEffect(() => {
+    if (prevLangRef.current === lang) {
+      return;
+    }
+    prevLangRef.current = lang;
+    for (const toast of toastsRef.current) {
+      dismissToast(toast.id);
+    }
+    setNavAnnouncement("");
+    setUpdatePromptFeedback(null);
+  }, [dismissToast, lang]);
+
+  // Clear installError when the underlying lifecycle issue is resolved by a
+  // status transition (install completed, upgrade applied, repair finished,
+  // wintun restored, or bundled binary restored).
+  useEffect(() => {
+    const prev = prevStatusRef.current;
+    prevStatusRef.current = status;
+    if (!prev || !status) {
+      return;
+    }
+
+    const becameInstalled =
+      prev.serviceState === "not_installed" &&
+      status.serviceState !== "not_installed";
+    const becameRunning =
+      prev.serviceState !== "running" && status.serviceState === "running";
+    const becameUninstalled =
+      prev.serviceState !== "not_installed" &&
+      status.serviceState === "not_installed";
+    const upgradeResolved =
+      prev.cliVersionRelation === "upgrade_available" &&
+      (status.cliVersionRelation === "up_to_date" ||
+        status.cliVersionRelation === "newer_installed");
+    const repairResolved =
+      prev.cliVersionRelation === "repair_needed" &&
+      status.cliVersionRelation === "up_to_date";
+    const staleResolved =
+      prev.liveVersionStale === true && status.liveVersionStale === false;
+    const wintunRestored = !prev.wintun.ready && status.wintun.ready;
+    const bundleRestored =
+      prev.canInstallFromBundle === false &&
+      status.canInstallFromBundle === true;
+
+    if (
+      becameInstalled ||
+      becameRunning ||
+      becameUninstalled ||
+      upgradeResolved ||
+      repairResolved ||
+      staleResolved
+    ) {
+      setInstallError(null);
+      return;
+    }
+
+    if (wintunRestored) {
+      setInstallError((current) =>
+        current?.kind === "wintun" ? null : current,
+      );
+    }
+    if (bundleRestored) {
+      setInstallError((current) =>
+        current?.kind === "antivirus" ? null : current,
+      );
+    }
+  }, [status]);
 
   useEffect(() => {
     if (!isTauriRuntime()) {
@@ -742,6 +925,15 @@ function AppShellContent({
             tShell(currentLang, "trayActionCancelled", {
               surface: surfaceLabel,
             }),
+          ),
+        );
+      } else if (!payload.ok && isCalmTransientCode(payload.code)) {
+        pushToast(
+          "info",
+          resolveActionResultMessage(
+            currentLang,
+            payload,
+            tShell(currentLang, "actionBusy"),
           ),
         );
       } else if (!payload.ok) {
@@ -786,6 +978,7 @@ function AppShellContent({
     };
   }, [ingestActionSnapshot, pushToast]);
 
+  const effectiveBusyAction = busyAction ?? status?.pendingOperation ?? null;
   const activeEngine: EngineMode =
     status?.live?.engine ??
     effectiveSettings?.engine ??
@@ -795,16 +988,58 @@ function AppShellContent({
   const hasAppUpdate = Boolean(updateInfo?.hasUpdate);
   const hasEngineUpgrade =
     status?.cliVersionRelation === "upgrade_available";
-  const updatePromptKind: "engine" | "app" | null = hasEngineUpgrade
+  const updatePromptKind: UpdatePromptKind | null = updatePromptUpgrading
     ? "engine"
-    : hasAppUpdate
-      ? "app"
-      : null;
+    : hasEngineUpgrade
+      ? "engine"
+      : hasAppUpdate
+        ? "app"
+        : null;
+
+  useEffect(() => {
+    if (
+      typeof document === "undefined" ||
+      updatePromptDismissed ||
+      (updatePromptKind === null && !checkingUpdates)
+    ) {
+      setForeignModalOpen(false);
+      return;
+    }
+
+    const syncForeignModal = () => {
+      const next = hasForeignAriaModal();
+      setForeignModalOpen((prev) => (prev === next ? prev : next));
+    };
+
+    syncForeignModal();
+
+    if (typeof MutationObserver === "undefined") {
+      return;
+    }
+
+    const observer = new MutationObserver(syncForeignModal);
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["aria-modal"],
+    });
+
+    return () => {
+      observer.disconnect();
+    };
+  }, [checkingUpdates, updatePromptDismissed, updatePromptKind]);
+
   const updatePromptOpen =
     updatePromptKind !== null &&
     !updatePromptDismissed &&
+    !loading &&
+    status !== null &&
     pendingTab === null &&
-    !confirmSwitchToTunOpen;
+    !confirmSwitchToTunOpen &&
+    !foreignModalOpen &&
+    !hasForeignAriaModal() &&
+    (updatePromptUpgrading || effectiveBusyAction === null);
 
   useEffect(() => {
     if (
@@ -815,48 +1050,94 @@ function AppShellContent({
     }
   }, [activeEngine, confirmSwitchToTunOpen, isProtectionActive]);
 
-  const navigateToTab = useCallback((tab: NavTab) => {
-    setActiveTab(tab);
-    setPendingTab(null);
-    setConfirmSwitchToTunOpen(false);
-    if (tab === "installation") {
-      setUpdatePromptDismissed(true);
-    }
-    if (tab !== "split") {
-      setSplitDirty(false);
-    }
-    if (tab !== "dns") {
-      setDnsDirty(false);
-    }
-    if (mainContentRef.current) {
-      mainContentRef.current.scrollTop = 0;
-    }
-  }, []);
+  const navigateToTab = useCallback(
+    (tab: NavTab, options?: { focusMain?: boolean }) => {
+      if (options?.focusMain) {
+        pendingMainFocusRef.current = true;
+      }
+      setActiveTab(tab);
+      setPendingTab(null);
+      setConfirmSwitchToTunOpen(false);
+      if (tab === "installation") {
+        setUpdatePromptDismissed(true);
+        setUpdatePromptFeedback(null);
+      } else {
+        setInstallError(null);
+      }
+      if (tab !== "split") {
+        setSplitDirty(false);
+      }
+      if (tab !== "dns") {
+        setDnsDirty(false);
+      }
+      if (mainContentRef.current) {
+        mainContentRef.current.scrollTop = 0;
+      }
+    },
+    [],
+  );
 
-  const handleSelectTab = useCallback(
-    (tab: NavTab) => {
+  useEffect(() => {
+    if (!hasMountedTabRef.current) {
+      hasMountedTabRef.current = true;
+      return;
+    }
+    const currentLang = langRef.current;
+    const viewTitle = getNavTabTitle(currentLang, activeTab);
+    setNavAnnouncement(
+      tShell(currentLang, "navAnnouncement", { view: viewTitle }),
+    );
+    if (pendingMainFocusRef.current) {
+      pendingMainFocusRef.current = false;
+      mainContentRef.current?.focus({ preventScroll: true });
+    }
+  }, [activeTab]);
+
+  const requestTabNavigation = useCallback(
+    (tab: NavTab, focusMain: boolean) => {
       if (tab === activeTab) {
+        if (focusMain) {
+          mainContentRef.current?.focus({ preventScroll: true });
+        }
         return;
       }
       if (
         (activeTab === "split" && splitDirty) ||
         (activeTab === "dns" && dnsDirty)
       ) {
+        pendingTabFocusMainRef.current = focusMain;
         setPendingTab(tab);
         return;
       }
-      navigateToTab(tab);
+      navigateToTab(tab, { focusMain });
     },
     [activeTab, dnsDirty, navigateToTab, splitDirty],
   );
 
+  const handleSelectTab = useCallback(
+    (tab: NavTab) => {
+      requestTabNavigation(tab, false);
+    },
+    [requestTabNavigation],
+  );
+
+  const handleProgrammaticNavigate = useCallback(
+    (tab: NavTab) => {
+      requestTabNavigation(tab, true);
+    },
+    [requestTabNavigation],
+  );
+
   const handleCancelLeaveDirty = useCallback(() => {
+    pendingTabFocusMainRef.current = false;
     setPendingTab(null);
   }, []);
 
   const handleConfirmLeaveDirty = useCallback(() => {
     if (pendingTab) {
-      navigateToTab(pendingTab);
+      const shouldFocusMain = pendingTabFocusMainRef.current;
+      pendingTabFocusMainRef.current = false;
+      navigateToTab(pendingTab, { focusMain: shouldFocusMain });
     }
   }, [navigateToTab, pendingTab]);
 
@@ -865,7 +1146,15 @@ function AppShellContent({
   }, []);
 
   const handleDismissUpdatePrompt = useCallback(() => {
+    if (updatePromptUpgrading) {
+      return;
+    }
+    setUpdatePromptFeedback(null);
     setUpdatePromptDismissed(true);
+  }, [updatePromptUpgrading]);
+
+  const handleDismissUpgrade = useCallback((key: string) => {
+    setDismissedUpgradeKey(key);
   }, []);
 
   const handleCloseModal = useCallback(() => {
@@ -874,16 +1163,28 @@ function AppShellContent({
       return;
     }
     if (pendingTab !== null) {
+      pendingTabFocusMainRef.current = false;
       setPendingTab(null);
       return;
     }
-    if (updatePromptOpen) {
+    if (
+      updatePromptOpen &&
+      !updatePromptUpgrading &&
+      effectiveBusyAction === null
+    ) {
+      setUpdatePromptFeedback(null);
       setUpdatePromptDismissed(true);
     }
-  }, [confirmSwitchToTunOpen, pendingTab, updatePromptOpen]);
+  }, [
+    confirmSwitchToTunOpen,
+    effectiveBusyAction,
+    pendingTab,
+    updatePromptOpen,
+    updatePromptUpgrading,
+  ]);
 
   useKeyboardShortcuts({
-    onSelectTab: handleSelectTab,
+    onSelectTab: handleProgrammaticNavigate,
     hasOpenModal:
       pendingTab !== null || confirmSwitchToTunOpen || updatePromptOpen,
     onCloseModal: handleCloseModal,
@@ -901,9 +1202,9 @@ function AppShellContent({
       toasts.map((toast) => ({
         id: toast.id,
         tone: toast.kind,
-        message: toast.text,
+        message: localizeActionMessage(lang, toast.text),
       })),
-    [toasts],
+    [lang, toasts],
   );
 
   const setBusy = useCallback((next: string | null) => {
@@ -916,7 +1217,7 @@ function AppShellContent({
   const syncAfterServiceMutation = useCallback(
     async (snapshot: DesktopStatusSnapshot | undefined) => {
       const appliedDirect = ingestActionSnapshot(snapshot);
-      if (isTauriRuntime() || appliedDirect) {
+      if (appliedDirect) {
         await onRefreshSettings();
         return;
       }
@@ -936,7 +1237,7 @@ function AppShellContent({
       }
 
       try {
-        const payload = await checkUpdates();
+        const payload = await checkUpdates(Boolean(manual));
         if (!mountedRef.current) {
           return;
         }
@@ -969,7 +1270,11 @@ function AppShellContent({
         if (manual && mountedRef.current) {
           pushToast(
             "error",
-            getErrorMessage(err, tShell(langRef.current, "checkUpdatesFailed")),
+            getLocalizedErrorMessage(
+              langRef.current,
+              err,
+              tShell(langRef.current, "checkUpdatesFailed"),
+            ),
           );
         }
       } finally {
@@ -1020,7 +1325,11 @@ function AppShellContent({
         if (mountedRef.current) {
           pushToast(
             "error",
-            getErrorMessage(err, tShell(currentLang, "openReleaseFailed")),
+            getLocalizedErrorMessage(
+              currentLang,
+              err,
+              tShell(currentLang, "openReleaseFailed"),
+            ),
           );
         }
       }
@@ -1030,6 +1339,19 @@ function AppShellContent({
 
   const handleClearInstallError = useCallback(() => {
     setInstallError(null);
+  }, []);
+
+  const canAutoRouteToInstallation = useCallback((): boolean => {
+    if (activeTabRef.current === "installation") {
+      return false;
+    }
+    if (
+      (activeTabRef.current === "split" && splitDirtyRef.current) ||
+      (activeTabRef.current === "dns" && dnsDirtyRef.current)
+    ) {
+      return false;
+    }
+    return true;
   }, []);
 
   const handleToggleProtection = useCallback(
@@ -1052,8 +1374,7 @@ function AppShellContent({
         }
 
         const appliedDirect = ingestActionSnapshot(result.snapshot);
-        // In Tauri runtime, toggle_protection broadcasts vdpi://status directly.
-        if (!isTauriRuntime() && !appliedDirect) {
+        if (!appliedDirect) {
           await refreshStatus();
           if (!mountedRef.current) {
             return;
@@ -1070,6 +1391,15 @@ function AppShellContent({
               tShell(currentLang, "protectionCancelled"),
             ),
           );
+        } else if (!result.ok && isCalmTransientCode(result.code)) {
+          pushToast(
+            "info",
+            resolveActionResultMessage(
+              currentLang,
+              result,
+              tShell(currentLang, "actionBusy"),
+            ),
+          );
         } else if (!result.ok) {
           pushToast(
             "error",
@@ -1080,6 +1410,7 @@ function AppShellContent({
             ),
           );
         } else if (result.needsRestart) {
+          setInstallError(null);
           pushToast(
             "warn",
             safeActionMessage(
@@ -1088,20 +1419,27 @@ function AppShellContent({
               tShell(currentLang, "protectionNeedsRestart"),
             ),
           );
-        } else if (result.message?.trim()) {
-          pushToast(
-            "success",
-            localizeActionMessage(
-              currentLang,
-              scrubUrlsInText(result.message.trim()),
-            ),
-          );
+        } else {
+          setInstallError(null);
+          if (result.message?.trim()) {
+            pushToast(
+              "success",
+              localizeActionMessage(
+                currentLang,
+                scrubUrlsInText(result.message.trim()),
+              ),
+            );
+          }
         }
       } catch (err) {
         if (mountedRef.current) {
           pushToast(
             "error",
-            getErrorMessage(err, tShell(langRef.current, "protectionToggleFailed")),
+            getLocalizedErrorMessage(
+              langRef.current,
+              err,
+              tShell(langRef.current, "protectionToggleFailed"),
+            ),
           );
         }
       } finally {
@@ -1156,6 +1494,15 @@ function AppShellContent({
               tShell(currentLang, "engineSwitchCancelled", { engine: label }),
             ),
           );
+        } else if (!result.ok && isCalmTransientCode(result.code)) {
+          pushToast(
+            "info",
+            resolveActionResultMessage(
+              currentLang,
+              result,
+              tShell(currentLang, "actionBusy"),
+            ),
+          );
         } else if (!result.ok) {
           pushToast(
             "error",
@@ -1166,6 +1513,7 @@ function AppShellContent({
             ),
           );
         } else if (result.needsRestart) {
+          setInstallError(null);
           pushToast(
             "warn",
             safeActionMessage(
@@ -1177,6 +1525,7 @@ function AppShellContent({
             ),
           );
         } else {
+          setInstallError(null);
           pushToast(
             "success",
             safeActionMessage(
@@ -1190,7 +1539,8 @@ function AppShellContent({
         if (mountedRef.current) {
           pushToast(
             "error",
-            getErrorMessage(
+            getLocalizedErrorMessage(
+              langRef.current,
               err,
               tShell(langRef.current, "engineSwitchGenericFailed"),
             ),
@@ -1254,9 +1604,22 @@ function AppShellContent({
               cancelled: true,
               code: result.code,
               attemptedEngine,
+              operation: "install",
             }),
           );
           pushToast("info", message);
+          if (canAutoRouteToInstallation()) {
+            navigateToTab("installation", { focusMain: true });
+          }
+        } else if (!result.ok && isCalmTransientCode(result.code)) {
+          pushToast(
+            "info",
+            resolveActionResultMessage(
+              currentLang,
+              result,
+              tShell(currentLang, "actionBusy"),
+            ),
+          );
         } else if (!result.ok) {
           const message = resolveActionResultMessage(
             currentLang,
@@ -1267,9 +1630,13 @@ function AppShellContent({
             classifyInstallError(message, {
               code: result.code,
               attemptedEngine,
+              operation: "install",
             }),
           );
           pushToast("error", message);
+          if (canAutoRouteToInstallation()) {
+            navigateToTab("installation", { focusMain: true });
+          }
         } else if (result.needsRestart) {
           setInstallError(null);
           pushToast(
@@ -1293,90 +1660,141 @@ function AppShellContent({
         }
       } catch (err) {
         if (mountedRef.current) {
-          const message = getErrorMessage(
+          const message = getLocalizedErrorMessage(
+            langRef.current,
             err,
             tShell(langRef.current, "installFailed"),
           );
           setInstallError(
-            classifyInstallError(message, { attemptedEngine }),
+            classifyInstallError(message, {
+              attemptedEngine,
+              operation: "install",
+            }),
           );
           pushToast("error", message);
+          if (canAutoRouteToInstallation()) {
+            navigateToTab("installation", { focusMain: true });
+          }
         }
       } finally {
         setBusy(null);
       }
     },
-    [activeEngine, pushToast, setBusy, syncAfterServiceMutation],
+    [
+      activeEngine,
+      canAutoRouteToInstallation,
+      navigateToTab,
+      pushToast,
+      setBusy,
+      syncAfterServiceMutation,
+    ],
   );
 
-  const handleUpgradeService = useCallback(async () => {
-    if (busyActionRef.current !== null) {
-      return;
-    }
-
-    setInstallError(null);
-    setBusy("upgrade-service");
-    try {
-      const result = await upgradeService();
-      if (!mountedRef.current) {
-        return;
+  const runUpgradeService = useCallback(
+    async (
+      fromPrompt = false,
+    ): Promise<{
+      outcome:
+        | "succeeded"
+        | "already_up_to_date"
+        | "downgrade_blocked"
+        | "busy"
+        | "cancelled"
+        | "failed";
+      message?: string;
+    }> => {
+      if (busyActionRef.current !== null) {
+        return { outcome: "busy" };
       }
 
-      await syncAfterServiceMutation(result.snapshot);
-      if (!mountedRef.current) {
-        return;
-      }
+      setInstallError(null);
+      setBusy("upgrade-service");
+      try {
+        const result = await upgradeService();
+        if (!mountedRef.current) {
+          return { outcome: "busy" };
+        }
 
-      const currentLang = langRef.current;
-      if (result.cancelled) {
-        const message = safeActionMessage(
-          currentLang,
-          result.message,
-          tShell(currentLang, "upgradeCancelled"),
-        );
-        setInstallError(
-          classifyInstallError(message, {
-            cancelled: true,
-            code: result.code,
-            attemptedEngine: activeEngine,
-          }),
-        );
-        pushToast("info", message);
-      } else if (!result.ok) {
-        const message = resolveActionResultMessage(
-          currentLang,
-          result,
-          tShell(currentLang, "upgradeFailed"),
-        );
-        if (result.code === "downgrade_blocked") {
-          setUpdatePromptDismissed(true);
-          pushToast("warn", message);
-        } else {
+        await syncAfterServiceMutation(result.snapshot);
+        if (!mountedRef.current) {
+          return { outcome: "busy" };
+        }
+
+        const currentLang = langRef.current;
+        if (result.cancelled) {
+          const message = safeActionMessage(
+            currentLang,
+            result.message,
+            tShell(currentLang, "upgradeCancelled"),
+          );
+          setInstallError(
+            classifyInstallError(message, {
+              cancelled: true,
+              code: result.code,
+              attemptedEngine: activeEngine,
+              operation: "upgrade",
+            }),
+          );
+          pushToast("info", message);
+          return { outcome: "cancelled", message };
+        }
+        if (!result.ok && isCalmTransientCode(result.code)) {
+          const message = resolveActionResultMessage(
+            currentLang,
+            result,
+            tShell(currentLang, "actionBusy"),
+          );
+          pushToast("info", message);
+          return { outcome: "busy", message };
+        }
+        if (!result.ok) {
+          const message = resolveActionResultMessage(
+            currentLang,
+            result,
+            tShell(currentLang, "upgradeFailed"),
+          );
+          if (result.code === "downgrade_blocked") {
+            setUpdatePromptFeedback(null);
+            setUpdatePromptDismissed(true);
+            pushToast("warn", message);
+            return { outcome: "downgrade_blocked", message };
+          }
           setInstallError(
             classifyInstallError(message, {
               code: result.code,
               attemptedEngine: activeEngine,
+              operation: "upgrade",
             }),
           );
           pushToast("error", message);
+          if (!fromPrompt && canAutoRouteToInstallation()) {
+            navigateToTab("installation", { focusMain: true });
+          }
+          return { outcome: "failed", message };
         }
-      } else if (result.code === "already_up_to_date") {
+        if (result.code === "already_up_to_date") {
+          setInstallError(null);
+          setUpdatePromptFeedback(null);
+          setUpdatePromptDismissed(true);
+          pushToast("info", tShell(currentLang, "upgradeAlreadyUpToDate"));
+          return { outcome: "already_up_to_date" };
+        }
+        if (result.needsRestart) {
+          setInstallError(null);
+          setUpdatePromptFeedback(null);
+          setUpdatePromptDismissed(true);
+          pushToast(
+            "warn",
+            safeActionMessage(
+              currentLang,
+              result.message,
+              tShell(currentLang, "upgradeNeedsRestart"),
+            ),
+          );
+          return { outcome: "succeeded" };
+        }
         setInstallError(null);
-        setUpdatePromptDismissed(true);
-        pushToast("info", tShell(currentLang, "upgradeAlreadyUpToDate"));
-      } else if (result.needsRestart) {
-        setInstallError(null);
-        setUpdatePromptDismissed(true);
-        pushToast(
-          "warn",
-          safeActionMessage(
-            currentLang,
-            result.message,
-            tShell(currentLang, "upgradeNeedsRestart"),
-          ),
-        );
-      } else {
-        setInstallError(null);
+        setUpdatePromptFeedback(null);
         setUpdatePromptDismissed(true);
         pushToast(
           "success",
@@ -1386,22 +1804,44 @@ function AppShellContent({
             tShell(currentLang, "upgradeSuccess"),
           ),
         );
+        return { outcome: "succeeded" };
+      } catch (err) {
+        if (mountedRef.current) {
+          const message = getLocalizedErrorMessage(
+            langRef.current,
+            err,
+            tShell(langRef.current, "upgradeFailed"),
+          );
+          setInstallError(
+            classifyInstallError(message, {
+              attemptedEngine: activeEngine,
+              operation: "upgrade",
+            }),
+          );
+          pushToast("error", message);
+          if (!fromPrompt && canAutoRouteToInstallation()) {
+            navigateToTab("installation", { focusMain: true });
+          }
+          return { outcome: "failed", message };
+        }
+        return { outcome: "failed" };
+      } finally {
+        setBusy(null);
       }
-    } catch (err) {
-      if (mountedRef.current) {
-        const message = getErrorMessage(
-          err,
-          tShell(langRef.current, "upgradeFailed"),
-        );
-        setInstallError(
-          classifyInstallError(message, { attemptedEngine: activeEngine }),
-        );
-        pushToast("error", message);
-      }
-    } finally {
-      setBusy(null);
-    }
-  }, [activeEngine, pushToast, setBusy, syncAfterServiceMutation]);
+    },
+    [
+      activeEngine,
+      canAutoRouteToInstallation,
+      navigateToTab,
+      pushToast,
+      setBusy,
+      syncAfterServiceMutation,
+    ],
+  );
+
+  const handleUpgradeService = useCallback(async () => {
+    await runUpgradeService(false);
+  }, [runUpgradeService]);
 
   const handleRepairService = useCallback(
     async (engine?: EngineMode) => {
@@ -1435,9 +1875,19 @@ function AppShellContent({
               cancelled: true,
               code: result.code,
               attemptedEngine,
+              operation: "repair",
             }),
           );
           pushToast("info", message);
+        } else if (!result.ok && isCalmTransientCode(result.code)) {
+          pushToast(
+            "info",
+            resolveActionResultMessage(
+              currentLang,
+              result,
+              tShell(currentLang, "actionBusy"),
+            ),
+          );
         } else if (!result.ok) {
           const message = resolveActionResultMessage(
             currentLang,
@@ -1448,6 +1898,7 @@ function AppShellContent({
             classifyInstallError(message, {
               code: result.code,
               attemptedEngine,
+              operation: "repair",
             }),
           );
           pushToast("error", message);
@@ -1474,12 +1925,16 @@ function AppShellContent({
         }
       } catch (err) {
         if (mountedRef.current) {
-          const message = getErrorMessage(
+          const message = getLocalizedErrorMessage(
+            langRef.current,
             err,
             tShell(langRef.current, "repairFailed"),
           );
           setInstallError(
-            classifyInstallError(message, { attemptedEngine }),
+            classifyInstallError(message, {
+              attemptedEngine,
+              operation: "repair",
+            }),
           );
           pushToast("error", message);
         }
@@ -1518,6 +1973,15 @@ function AppShellContent({
             tShell(currentLang, "uninstallCancelled"),
           ),
         );
+      } else if (!result.ok && isCalmTransientCode(result.code)) {
+        pushToast(
+          "info",
+          resolveActionResultMessage(
+            currentLang,
+            result,
+            tShell(currentLang, "actionBusy"),
+          ),
+        );
       } else if (!result.ok) {
         pushToast(
           "error",
@@ -1541,7 +2005,11 @@ function AppShellContent({
       if (mountedRef.current) {
         pushToast(
           "error",
-          getErrorMessage(err, tShell(langRef.current, "uninstallFailed")),
+          getLocalizedErrorMessage(
+            langRef.current,
+            err,
+            tShell(langRef.current, "uninstallFailed"),
+          ),
         );
       }
     } finally {
@@ -1550,29 +2018,72 @@ function AppShellContent({
   }, [pushToast, setBusy, syncAfterServiceMutation]);
 
   const handleUpdatePromptAction = useCallback(() => {
-    setUpdatePromptDismissed(true);
     if (updatePromptKind === "engine") {
-      void handleUpgradeService();
+      if (updatePromptUpgrading || busyActionRef.current !== null) {
+        return;
+      }
+      setUpdatePromptFeedback(null);
+      setUpdatePromptUpgrading(true);
+      void runUpgradeService(true)
+        .then((res) => {
+          if (!mountedRef.current) {
+            return;
+          }
+          if (res.outcome === "cancelled") {
+            setUpdatePromptFeedback({
+              tone: "info",
+              message:
+                res.message ?? tShell(langRef.current, "upgradeCancelled"),
+            });
+          } else if (res.outcome === "failed") {
+            if (canAutoRouteToInstallation()) {
+              setUpdatePromptFeedback(null);
+              setUpdatePromptDismissed(true);
+              navigateToTab("installation", { focusMain: true });
+            } else {
+              setUpdatePromptFeedback({
+                tone: "error",
+                message:
+                  res.message ?? tShell(langRef.current, "upgradeFailed"),
+              });
+            }
+          }
+        })
+        .finally(() => {
+          if (mountedRef.current) {
+            setUpdatePromptUpgrading(false);
+          }
+        });
       return;
     }
+
+    setUpdatePromptFeedback(null);
+    setUpdatePromptDismissed(true);
     const releaseUrl = updateInfo?.releaseUrl?.trim();
     if (releaseUrl) {
       void handleOpenReleaseUrl(releaseUrl);
       return;
     }
-    handleSelectTab("installation");
+    handleProgrammaticNavigate("installation");
   }, [
+    canAutoRouteToInstallation,
     handleOpenReleaseUrl,
-    handleSelectTab,
-    handleUpgradeService,
+    handleProgrammaticNavigate,
+    navigateToTab,
+    runUpgradeService,
     updateInfo?.releaseUrl,
     updatePromptKind,
+    updatePromptUpgrading,
   ]);
 
   const handleViewUpdateInInstallation = useCallback(() => {
+    if (updatePromptUpgrading) {
+      return;
+    }
+    setUpdatePromptFeedback(null);
     setUpdatePromptDismissed(true);
-    handleSelectTab("installation");
-  }, [handleSelectTab]);
+    handleProgrammaticNavigate("installation");
+  }, [handleProgrammaticNavigate, updatePromptUpgrading]);
 
   const handleOpenAppFolder = useCallback(
     async (kind: AppFolderTarget = "app") => {
@@ -1610,7 +2121,8 @@ function AppShellContent({
         if (mountedRef.current) {
           pushToast(
             "error",
-            getErrorMessage(
+            getLocalizedErrorMessage(
+              currentLang,
               err,
               tShell(currentLang, "openFolderFailed", { kind: folderLabel }),
             ),
@@ -1634,17 +2146,24 @@ function AppShellContent({
     return next;
   }, [refreshStatus]);
 
-  const handleRefreshInstallationStatus = useCallback(async () => {
-    await refreshStatus(true);
+  const handleRefreshInstallationStatus = useCallback(async (): Promise<void> => {
+    const next = await refreshStatus(true);
+    if (!next) {
+      throw new Error(tShell(langRef.current, "refreshStatusFailed"));
+    }
   }, [refreshStatus]);
 
-  const handleSyncAll = useCallback(async () => {
-    if (isTauriRuntime()) {
-      await onRefreshSettings();
-      return;
-    }
-    await Promise.all([refreshStatus(), onRefreshSettings()]);
-  }, [onRefreshSettings, refreshStatus]);
+  const handleSyncAll = useCallback(
+    async (snapshot?: DesktopStatusSnapshot) => {
+      const appliedDirect = ingestActionSnapshot(snapshot);
+      if (appliedDirect) {
+        await onRefreshSettings();
+        return;
+      }
+      await Promise.all([refreshStatus(), onRefreshSettings()]);
+    },
+    [ingestActionSnapshot, onRefreshSettings, refreshStatus],
+  );
 
   const handleRetrySync = useCallback(async () => {
     await Promise.all([refreshStatus(true), onRefreshSettings()]);
@@ -1682,7 +2201,11 @@ function AppShellContent({
       if (mountedRef.current) {
         pushToast(
           "error",
-          getErrorMessage(err, tShell(currentLang, "activityCopyFailed")),
+          getLocalizedErrorMessage(
+            currentLang,
+            err,
+            tShell(currentLang, "activityCopyFailed"),
+          ),
         );
       }
       return false;
@@ -1717,6 +2240,16 @@ function AppShellContent({
         {tShell(lang, "skipToMain")}
       </a>
 
+      <div
+        className="sr-only"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        data-testid="route-announcer"
+      >
+        {navAnnouncement}
+      </div>
+
       <Sidebar
         activeTab={activeTab}
         onSelectTab={handleSelectTab}
@@ -1744,7 +2277,7 @@ function AppShellContent({
                   ? tShell(lang, "backendUnreachableTitle")
                   : tShell(lang, "settingsLoadErrorTitle")
               }
-              description={scrubUrlsInText(error)}
+              description={localizeActionMessage(lang, scrubUrlsInText(error))}
               actionLabel={tShell(lang, "retryAction")}
               onAction={() => {
                 void handleRetrySync();
@@ -1760,6 +2293,14 @@ function AppShellContent({
             />
           ) : null}
 
+          {status?.runningFromReadonlyDmg && activeTab !== "installation" ? (
+            <InlineBanner
+              tone="warn"
+              title={tShell(lang, "readonlyDmgTitle")}
+              description={tShell(lang, "readonlyDmgDesc")}
+            />
+          ) : null}
+
           <AppErrorBoundary
             resetKey={activeTab}
             compact
@@ -1772,7 +2313,9 @@ function AppShellContent({
                 settings={effectiveSettings}
                 history={history}
                 activity={activity}
-                busyAction={busyAction}
+                busyAction={effectiveBusyAction}
+                dismissedUpgradeKey={dismissedUpgradeKey}
+                onDismissUpgrade={handleDismissUpgrade}
                 onToggleProtection={handleToggleProtection}
                 onSwitchEngine={handleSwitchEngine}
                 onInstallService={handleInstallService}
@@ -1780,7 +2323,7 @@ function AppShellContent({
                 onOpenAppFolder={handleOpenOverviewAppFolder}
                 onRefreshStatus={handleRefreshStatus}
                 onPushToast={handlePushToast}
-                onNavigate={handleSelectTab}
+                onNavigate={handleProgrammaticNavigate}
                 onClearActivity={clearActivity}
                 onCopyActivity={handleCopyActivity}
               />
@@ -1791,12 +2334,13 @@ function AppShellContent({
                 activeEngine={activeEngine}
                 platform={status?.platform}
                 serviceState={status?.serviceState}
-                busyAction={busyAction}
+                wintunReady={status?.wintun.ready}
+                busyAction={effectiveBusyAction}
                 onSaved={handleSyncAll}
                 onPushToast={handlePushToast}
                 onDirtyChange={setSplitDirty}
                 onSwitchToTun={handleSwitchToTun}
-                onNavigate={handleSelectTab}
+                onNavigate={handleProgrammaticNavigate}
               />
             ) : null}
 
@@ -1805,11 +2349,11 @@ function AppShellContent({
                 settings={effectiveSettings}
                 status={status}
                 serviceState={status?.serviceState}
-                busyAction={busyAction}
+                busyAction={effectiveBusyAction}
                 onSaved={handleSyncAll}
                 onPushToast={handlePushToast}
                 onDirtyChange={setDnsDirty}
-                onNavigate={handleSelectTab}
+                onNavigate={handleProgrammaticNavigate}
               />
             ) : null}
 
@@ -1817,9 +2361,9 @@ function AppShellContent({
               <DiagnosticsView
                 status={status}
                 serviceState={status?.serviceState}
-                busyAction={busyAction}
+                busyAction={effectiveBusyAction}
                 onPushToast={handlePushToast}
-                onNavigate={handleSelectTab}
+                onNavigate={handleProgrammaticNavigate}
                 onSwitchEngine={handleSwitchEngine}
                 onStartProtection={handleStartProtection}
                 onInstallService={handleInstallService}
@@ -1833,7 +2377,7 @@ function AppShellContent({
                 settings={effectiveSettings}
                 updateInfo={updateInfo}
                 checkingUpdates={checkingUpdates}
-                busyAction={busyAction}
+                busyAction={effectiveBusyAction}
                 installError={installError}
                 onInstallService={handleInstallService}
                 onSwitchEngine={handleSwitchEngine}
@@ -1845,7 +2389,7 @@ function AppShellContent({
                 onOpenAppFolder={handleOpenAppFolder}
                 onRefreshStatus={handleRefreshInstallationStatus}
                 onClearInstallError={handleClearInstallError}
-                onNavigate={handleSelectTab}
+                onNavigate={handleProgrammaticNavigate}
               />
             ) : null}
 
@@ -1853,7 +2397,9 @@ function AppShellContent({
               <SettingsView
                 status={status}
                 settings={effectiveSettings}
-                busyAction={busyAction}
+                updateInfo={updateInfo}
+                checkingUpdates={checkingUpdates}
+                busyAction={effectiveBusyAction}
                 onPreferencesPreview={onPreferencesPreview}
                 onPreferencesChanged={onPreferencesChanged}
                 onRefreshSettings={onRefreshSettings}
@@ -1861,7 +2407,9 @@ function AppShellContent({
                 onInstallService={handleInstallService}
                 onUpgradeService={handleUpgradeService}
                 onUninstallService={handleUninstallService}
-                onNavigate={handleSelectTab}
+                onCheckUpdates={handleCheckUpdates}
+                onOpenReleaseUrl={handleOpenReleaseUrl}
+                onNavigate={handleProgrammaticNavigate}
                 onPushToast={handlePushToast}
               />
             ) : null}
@@ -1875,7 +2423,8 @@ function AppShellContent({
         fromVersion={updatePromptFromVersion}
         toVersion={updatePromptToVersion}
         releaseNotes={updateInfo?.releaseNotes ?? []}
-        busy={busyAction === "upgrade-service"}
+        busy={updatePromptUpgrading || effectiveBusyAction !== null}
+        feedback={updatePromptFeedback}
         onUpdateNow={handleUpdatePromptAction}
         onViewInstallation={handleViewUpdateInInstallation}
         onDismiss={handleDismissUpdatePrompt}
@@ -1922,6 +2471,8 @@ function AppShellContent({
   );
 }
 
+const PREFS_OVERRIDE_GUARD_MS = 15_000;
+
 function AppShell() {
   const desktop = useDesktopStatus();
   const { settings, refreshSettings } = desktop;
@@ -1932,16 +2483,30 @@ function AppShell() {
     LanguagePreference | undefined
   >(() => readStoredLanguage());
   const mountedRef = useRef(true);
+  const settingsRef = useRef<DesktopSettingsPayload | null>(settings);
+  const prefsSavePendingRef = useRef(false);
+  const prefsPreviewSeqRef = useRef(0);
+  const prefsGuardTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  settingsRef.current = settings;
+
+  const clearPrefsGuardTimer = useCallback(() => {
+    if (prefsGuardTimerRef.current !== null) {
+      clearTimeout(prefsGuardTimerRef.current);
+      prefsGuardTimerRef.current = null;
+    }
+  }, []);
 
   useEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      clearPrefsGuardTimer();
     };
-  }, []);
+  }, [clearPrefsGuardTimer]);
 
   useEffect(() => {
-    if (settings !== null) {
+    if (settings !== null && !prefsSavePendingRef.current) {
       setGuiPrefsOverride(null);
       if (settings.gui.language !== undefined) {
         setStoredLanguage(settings.gui.language);
@@ -1987,31 +2552,83 @@ function AppShell() {
   useTheme(themePreference);
 
   const handleRefreshSettings = useCallback(async () => {
+    const seqAtStart = prefsPreviewSeqRef.current;
     const refreshed = await refreshSettings();
-    if (mountedRef.current && refreshed) {
+    if (
+      mountedRef.current &&
+      refreshed &&
+      !prefsSavePendingRef.current &&
+      seqAtStart === prefsPreviewSeqRef.current
+    ) {
       setGuiPrefsOverride(null);
     }
     return refreshed;
   }, [refreshSettings]);
 
-  const handlePreferencesPreview = useCallback((nextPrefs: GuiPreferences) => {
-    setGuiPrefsOverride(nextPrefs);
-    if (nextPrefs.language) {
-      setStoredLanguage(nextPrefs.language);
-      writeStoredLanguage(nextPrefs.language);
-    }
-  }, []);
-
-  const handlePreferencesChanged = useCallback(
-    async (nextPrefs: GuiPreferences) => {
+  const handlePreferencesPreview = useCallback(
+    (nextPrefs: GuiPreferences) => {
+      const seq = ++prefsPreviewSeqRef.current;
       setGuiPrefsOverride(nextPrefs);
       if (nextPrefs.language) {
         setStoredLanguage(nextPrefs.language);
         writeStoredLanguage(nextPrefs.language);
       }
-      await handleRefreshSettings();
+      clearPrefsGuardTimer();
+      const persisted = settingsRef.current?.gui;
+      if (persisted && guiPrefsEqual(nextPrefs, persisted)) {
+        prefsSavePendingRef.current = false;
+        return;
+      }
+      prefsSavePendingRef.current = true;
+      prefsGuardTimerRef.current = setTimeout(() => {
+        prefsGuardTimerRef.current = null;
+        if (prefsPreviewSeqRef.current === seq) {
+          prefsSavePendingRef.current = false;
+          if (mountedRef.current) {
+            setGuiPrefsOverride(null);
+            const persistedLang = settingsRef.current?.gui?.language;
+            if (persistedLang !== undefined) {
+              setStoredLanguage(persistedLang);
+              writeStoredLanguage(persistedLang);
+            }
+            void refreshSettings();
+          }
+        }
+      }, PREFS_OVERRIDE_GUARD_MS);
     },
-    [handleRefreshSettings],
+    [clearPrefsGuardTimer, refreshSettings],
+  );
+
+  const handlePreferencesChanged = useCallback(
+    async (nextPrefs: GuiPreferences) => {
+      const seq = ++prefsPreviewSeqRef.current;
+      clearPrefsGuardTimer();
+      prefsSavePendingRef.current = true;
+      setGuiPrefsOverride(nextPrefs);
+      if (nextPrefs.language) {
+        setStoredLanguage(nextPrefs.language);
+        writeStoredLanguage(nextPrefs.language);
+      }
+      try {
+        const refreshed = await refreshSettings();
+        if (mountedRef.current && seq === prefsPreviewSeqRef.current) {
+          prefsSavePendingRef.current = false;
+          if (refreshed) {
+            setGuiPrefsOverride(null);
+            const nextLang = refreshed.gui.language ?? nextPrefs.language;
+            if (nextLang !== undefined) {
+              setStoredLanguage(nextLang);
+              writeStoredLanguage(nextLang);
+            }
+          }
+        }
+      } finally {
+        if (seq === prefsPreviewSeqRef.current) {
+          prefsSavePendingRef.current = false;
+        }
+      }
+    },
+    [clearPrefsGuardTimer, refreshSettings],
   );
 
   return (

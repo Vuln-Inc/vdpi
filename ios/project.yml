@@ -5,6 +5,8 @@ options:
     iOS: "16.0"
   xcodeVersion: "16.0"
   createIntermediateGroups: true
+  developmentLanguage: en
+  useBaseInternationalization: false
 
 settings:
   base:
@@ -25,6 +27,10 @@ targets:
         excludes:
           - Info.plist
           - "*.entitlements"
+          - Resources
+          - "Resources/**"
+      - path: VdpiApp/Resources
+        buildPhase: resources
       - path: Shared
     settings:
       base:
@@ -53,6 +59,10 @@ targets:
         excludes:
           - Info.plist
           - "*.entitlements"
+          - Resources
+          - "Resources/**"
+      - path: PacketTunnel/Resources
+        buildPhase: resources
       - path: Shared
     settings:
       base:

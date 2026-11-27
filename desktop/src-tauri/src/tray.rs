@@ -12,7 +12,7 @@ use std::time::Instant;
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, Wry};
+use tauri::{AppHandle, Emitter, Manager, Wry};
 use tracing::{debug, error, warn};
 
 use crate::models::{
@@ -124,6 +124,31 @@ pub fn parse_locale_tag(tag: &str) -> Option<EffectiveLanguage> {
     None
 }
 
+#[cfg(any(windows, test))]
+const fn effective_language_from_windows_lang_id(lang_id: u16) -> EffectiveLanguage {
+    const PRIMARY_LANG_MASK: u16 = 0x03FF;
+    const PRIMARY_LANG_TURKISH: u16 = 0x1F;
+
+    if (lang_id & PRIMARY_LANG_MASK) == PRIMARY_LANG_TURKISH {
+        EffectiveLanguage::Tr
+    } else {
+        EffectiveLanguage::En
+    }
+}
+
+#[cfg(any(not(windows), test))]
+fn effective_language_from_posix_env<F>(get_var: F) -> EffectiveLanguage
+where
+    F: Fn(&str) -> Option<String>,
+{
+    for var in ["VDPI_LANG", "LC_ALL", "LC_MESSAGES", "LANG", "LANGUAGE"] {
+        if let Some(lang) = get_var(var).as_deref().and_then(parse_locale_tag) {
+            return lang;
+        }
+    }
+    EffectiveLanguage::En
+}
+
 #[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -132,31 +157,15 @@ unsafe extern "system" {
 
 #[cfg(windows)]
 fn detect_system_language() -> EffectiveLanguage {
-    const PRIMARY_LANG_MASK: u16 = 0x03FF;
-    const PRIMARY_LANG_TURKISH: u16 = 0x1F;
-
     // SAFETY: `GetUserDefaultUILanguage` takes no arguments, has no preconditions,
     // and returns the current user's Win32 UI LANGID value.
     let lang_id = unsafe { GetUserDefaultUILanguage() };
-    if (lang_id & PRIMARY_LANG_MASK) == PRIMARY_LANG_TURKISH {
-        EffectiveLanguage::Tr
-    } else {
-        EffectiveLanguage::En
-    }
+    effective_language_from_windows_lang_id(lang_id)
 }
 
 #[cfg(not(windows))]
 fn detect_system_language() -> EffectiveLanguage {
-    for var in ["VDPI_LANG", "LC_ALL", "LC_MESSAGES", "LANG", "LANGUAGE"] {
-        if let Some(lang) = std::env::var(var)
-            .ok()
-            .as_deref()
-            .and_then(parse_locale_tag)
-        {
-            return lang;
-        }
-    }
-    EffectiveLanguage::En
+    effective_language_from_posix_env(|var| std::env::var(var).ok())
 }
 
 /// Resolves the active tray UI language from the user's persisted preference.
@@ -380,7 +389,7 @@ impl TrayVisualSpec {
                     ),
                     (EngineModeDto::Tun, EffectiveLanguage::Tr) => (
                         "Durum: Sorunlu (TUN)",
-                        "vdpi - Hizmet başlatılıyor veya sorunlu (TUN)",
+                        "vdpi - Servis başlatılıyor veya sorunlu (TUN)",
                     ),
                     (EngineModeDto::Proxy, EffectiveLanguage::En) => (
                         "Status: Degraded (Proxy)",
@@ -388,7 +397,7 @@ impl TrayVisualSpec {
                     ),
                     (EngineModeDto::Proxy, EffectiveLanguage::Tr) => (
                         "Durum: Sorunlu (Proxy)",
-                        "vdpi - Hizmet başlatılıyor veya sorunlu (Proxy)",
+                        "vdpi - Servis başlatılıyor veya sorunlu (Proxy)",
                     ),
                 };
                 Self {
@@ -434,7 +443,7 @@ impl TrayVisualSpec {
                         ("Status: Not Installed", "vdpi - Service not installed")
                     }
                     EffectiveLanguage::Tr => {
-                        ("Durum: Kurulu Değil", "vdpi - Hizmet kurulu değil")
+                        ("Durum: Kurulu Değil", "vdpi - Servis kurulu değil")
                     }
                 };
                 Self {
@@ -455,8 +464,8 @@ impl TrayVisualSpec {
                         "vdpi - VPN active, protection yielded",
                     ),
                     EffectiveLanguage::Tr => (
-                        "Durum: VPN Aktif - Beklemede",
-                        "vdpi - VPN aktif, koruma beklemede",
+                        "Durum: VPN Etkin - Beklemede",
+                        "vdpi - VPN etkin, koruma beklemede",
                     ),
                 };
                 Self {
@@ -1457,19 +1466,30 @@ fn handle_tray_menu_event(app: &AppHandle, event: MenuEvent) {
             show_main_window(app);
         }
         MENU_TOGGLE_PROTECTION_ID => {
-            if app
-                .try_state::<DesktopAppState>()
-                .is_some_and(|state| state.is_quitting())
-            {
+            let Some(state) = app.try_state::<DesktopAppState>() else {
+                return;
+            };
+            if state.is_quitting() {
                 return;
             }
-            if !try_claim_tray_toggle_busy(app) {
-                debug!("ignoring tray protection toggle click while action is already in flight");
+            let Ok(action_guard) = std::sync::Arc::clone(&state.action_lock).try_lock_owned()
+            else {
+                debug!("ignoring tray protection toggle click while action_lock is held");
+                let busy = crate::commands::busy_result_for_operation(state.active_operation());
+                if let Err(err) =
+                    app.emit_to(MAIN_WINDOW_LABEL, crate::TRAY_ACTION_RESULT_EVENT, &busy)
+                {
+                    debug!(
+                        error = %err,
+                        "failed to emit busy vdpi://tray-action-result event"
+                    );
+                }
                 return;
-            }
-            let busy_guard = crate::commands::TrayToggleBusyGuard::adopt(app);
+            };
+            let busy_guard = crate::commands::TrayToggleBusyGuard::acquire(app);
             tauri::async_runtime::spawn(crate::commands::handle_tray_toggle_protection(
                 app.clone(),
+                action_guard,
                 busy_guard,
             ));
         }
@@ -1687,23 +1707,97 @@ mod tests {
 
     #[test]
     fn tray_enabled_matches_gui_preferences() {
-        let mut prefs = GuiPreferencesDto::default();
-        assert!(!tray_enabled(&prefs));
+        for keep in [false, true] {
+            for minimize in [false, true] {
+                for start_min in [false, true] {
+                    for show_taskbar in [false, true] {
+                        let prefs = GuiPreferencesDto {
+                            keep_in_tray_on_close: keep,
+                            minimize_to_tray: minimize,
+                            start_minimized_to_tray: start_min,
+                            show_taskbar_icon_when_minimized: show_taskbar,
+                            ..GuiPreferencesDto::default()
+                        };
+                        let expected = keep || minimize || start_min;
+                        assert_eq!(
+                            tray_enabled(&prefs),
+                            expected,
+                            "unexpected tray_enabled for keep={keep} minimize={minimize} start_min={start_min} show_taskbar={show_taskbar}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
-        prefs.keep_in_tray_on_close = true;
-        assert!(tray_enabled(&prefs));
+    #[test]
+    fn detect_system_language_helpers_handle_windows_lang_id_and_posix_env_priority() {
+        // Windows Win32 LANGID primary language extraction (0x03FF mask, 0x1F = Turkish).
+        assert_eq!(
+            effective_language_from_windows_lang_id(0x041F),
+            EffectiveLanguage::Tr
+        );
+        assert_eq!(
+            effective_language_from_windows_lang_id(0x001F),
+            EffectiveLanguage::Tr
+        );
+        assert_eq!(
+            effective_language_from_windows_lang_id(0x0409),
+            EffectiveLanguage::En
+        );
+        assert_eq!(
+            effective_language_from_windows_lang_id(0x0407),
+            EffectiveLanguage::En
+        );
 
-        prefs = GuiPreferencesDto {
-            minimize_to_tray: true,
-            ..GuiPreferencesDto::default()
-        };
-        assert!(tray_enabled(&prefs));
+        // POSIX locale env priority: VDPI_LANG > LC_ALL > LC_MESSAGES > LANG > LANGUAGE > En.
+        assert_eq!(
+            effective_language_from_posix_env(|var| match var {
+                "VDPI_LANG" => Some("tr".to_string()),
+                "LC_ALL" => Some("en_US.UTF-8".to_string()),
+                _ => None,
+            }),
+            EffectiveLanguage::Tr
+        );
+        assert_eq!(
+            effective_language_from_posix_env(|var| match var {
+                "VDPI_LANG" => Some("de_DE.UTF-8".to_string()), // unsupported -> falls through
+                "LC_ALL" => Some("tr_TR.UTF-8".to_string()),
+                "LANG" => Some("en_US.UTF-8".to_string()),
+                _ => None,
+            }),
+            EffectiveLanguage::Tr
+        );
+        assert_eq!(
+            effective_language_from_posix_env(|var| match var {
+                "LC_MESSAGES" => Some("en_GB.UTF-8".to_string()),
+                "LANG" => Some("tr_TR.UTF-8".to_string()),
+                _ => None,
+            }),
+            EffectiveLanguage::En
+        );
+        assert_eq!(
+            effective_language_from_posix_env(|var| match var {
+                "LANGUAGE" => Some("fr_FR:tr_TR".to_string()),
+                _ => None,
+            }),
+            EffectiveLanguage::Tr
+        );
+        assert_eq!(
+            effective_language_from_posix_env(|_| None),
+            EffectiveLanguage::En
+        );
+        assert_eq!(
+            effective_language_from_posix_env(|_| Some("C.UTF-8".to_string())),
+            EffectiveLanguage::En
+        );
 
-        prefs = GuiPreferencesDto {
-            start_minimized_to_tray: true,
-            ..GuiPreferencesDto::default()
-        };
-        assert!(tray_enabled(&prefs));
+        // Smoke-check live detect_system_language() returns a supported variant.
+        let detected = detect_system_language();
+        assert!(matches!(
+            detected,
+            EffectiveLanguage::En | EffectiveLanguage::Tr
+        ));
     }
 
     #[test]
@@ -1923,15 +2017,35 @@ mod tests {
             EffectiveLanguage::Tr,
         );
         assert_eq!(not_installed_tr.status_label, "Durum: Kurulu Değil");
-        assert_eq!(not_installed_tr.tooltip, "vdpi - Hizmet kurulu değil");
+        assert_eq!(not_installed_tr.tooltip, "vdpi - Servis kurulu değil");
+
+        let degraded_tun_tr = TrayVisualSpec::from_snapshot(
+            &sample_snapshot(ServiceStateDto::Running, EngineModeDto::Tun, None),
+            EffectiveLanguage::Tr,
+        );
+        assert_eq!(degraded_tun_tr.status_label, "Durum: Sorunlu (TUN)");
+        assert_eq!(
+            degraded_tun_tr.tooltip,
+            "vdpi - Servis başlatılıyor veya sorunlu (TUN)"
+        );
+
+        let degraded_proxy_tr = TrayVisualSpec::from_snapshot(
+            &sample_snapshot(ServiceStateDto::Running, EngineModeDto::Proxy, None),
+            EffectiveLanguage::Tr,
+        );
+        assert_eq!(degraded_proxy_tr.status_label, "Durum: Sorunlu (Proxy)");
+        assert_eq!(
+            degraded_proxy_tr.tooltip,
+            "vdpi - Servis başlatılıyor veya sorunlu (Proxy)"
+        );
 
         let mut vpn_yielded = sample_snapshot(ServiceStateDto::Stopped, EngineModeDto::Tun, None);
         vpn_yielded.vpn_conflict = Some("WireGuard".to_string());
         let vpn_yielded_tr = TrayVisualSpec::from_snapshot(&vpn_yielded, EffectiveLanguage::Tr);
-        assert_eq!(vpn_yielded_tr.status_label, "Durum: VPN Aktif - Beklemede");
+        assert_eq!(vpn_yielded_tr.status_label, "Durum: VPN Etkin - Beklemede");
         assert_eq!(
             vpn_yielded_tr.tooltip,
-            "vdpi - VPN aktif, koruma beklemede"
+            "vdpi - VPN etkin, koruma beklemede"
         );
 
         let mut wintun_missing = sample_snapshot(ServiceStateDto::Running, EngineModeDto::Tun, None);

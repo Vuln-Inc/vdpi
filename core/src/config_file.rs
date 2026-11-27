@@ -3,10 +3,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt::Write as _;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write as _};
 use std::net::IpAddr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::warn;
@@ -190,7 +190,8 @@ impl FileConfig {
 pub fn system_config_path() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
-        windows_system_config_path(std::env::var_os("ProgramData").as_deref())
+        let program_data = crate::platform::windows::known_program_data_dir();
+        windows_system_config_path(Some(program_data.as_os_str()))
     }
     #[cfg(target_os = "macos")]
     {
@@ -227,12 +228,10 @@ pub fn user_config_path() -> PathBuf {
 #[cfg(any(target_os = "windows", test))]
 fn is_windows_abs(v: &OsStr) -> bool {
     let bytes = v.as_encoded_bytes();
-    (bytes.len() >= 3
+    bytes.len() >= 3
         && bytes[0].is_ascii_alphabetic()
         && bytes[1] == b':'
-        && matches!(bytes[2], b'\\' | b'/'))
-        || bytes.starts_with(br"\\")
-        || bytes.starts_with(b"//")
+        && matches!(bytes[2], b'\\' | b'/')
 }
 
 #[cfg(any(not(target_os = "windows"), test))]
@@ -444,8 +443,161 @@ pub fn load_file_config_or_default(
     Ok((None, FileConfig::default()))
 }
 
+fn is_unc_device_or_verbatim_path(path: &Path) -> bool {
+    let raw = path.as_os_str().as_encoded_bytes();
+    if raw.len() >= 2 && matches!(raw[0], b'\\' | b'/') && matches!(raw[1], b'\\' | b'/') {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::path::Prefix;
+        if let Some(Component::Prefix(prefix)) = path.components().next() {
+            return !matches!(prefix.kind(), Prefix::Disk(_));
+        }
+    }
+    false
+}
+
+fn validate_config_path_syntax(path: &Path) -> Result<()> {
+    let raw = path.as_os_str().as_encoded_bytes();
+    if raw.is_empty() {
+        bail!("config file path is empty");
+    }
+    if raw.contains(&0) {
+        bail!("config file path contains NUL byte: {}", path.display());
+    }
+    if is_unc_device_or_verbatim_path(path) {
+        bail!(
+            "refusing to read config file from UNC, device, or verbatim path: {}",
+            path.display()
+        );
+    }
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        bail!(
+            "refusing to traverse parent component '..' in config file path {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 fn read_bounded_config_file(path: &Path) -> Result<Option<String>> {
-    let file = match File::open(path) {
+    validate_config_path_syntax(path)?;
+
+    let abs_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("failed to resolve current working directory for config file path")?
+            .join(path)
+    };
+    if is_unc_device_or_verbatim_path(&abs_path) {
+        bail!(
+            "refusing to read config file from UNC, device, or verbatim path: {}",
+            path.display()
+        );
+    }
+
+    let mut cur = PathBuf::new();
+    let mut has_normal_component = false;
+    let mut target_meta = None;
+    for comp in abs_path.components() {
+        match comp {
+            Component::Prefix(_) | Component::RootDir => {
+                cur.push(comp.as_os_str());
+                continue;
+            }
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                bail!(
+                    "refusing to traverse parent component '..' in config file path {}",
+                    path.display()
+                );
+            }
+            Component::Normal(part) => {
+                has_normal_component = true;
+                cur.push(part);
+            }
+        }
+
+        let meta = match fs::symlink_metadata(&cur) {
+            Ok(m) => m,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to inspect config path component {}", cur.display())
+                });
+            }
+        };
+        if meta.file_type().is_symlink() {
+            #[cfg(target_os = "macos")]
+            if cur != abs_path {
+                use std::os::unix::fs::MetadataExt as _;
+                let is_macos_system_link =
+                    meta.uid() == 0 && matches!(cur.to_str(), Some("/var" | "/tmp" | "/etc"));
+                if is_macos_system_link {
+                    target_meta = Some(meta);
+                    continue;
+                }
+            }
+            #[cfg(target_os = "linux")]
+            if cur != abs_path {
+                use std::os::unix::fs::MetadataExt as _;
+                let is_linux_ostree_link = meta.uid() == 0
+                    && matches!(
+                        cur.to_str(),
+                        Some("/home" | "/usr/local" | "/var" | "/tmp" | "/etc")
+                    );
+                if is_linux_ostree_link {
+                    target_meta = Some(meta);
+                    continue;
+                }
+            }
+            bail!(
+                "refusing to read config file through symlink {}",
+                cur.display()
+            );
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt as _;
+            if (meta.file_attributes() & windows_fs::FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                bail!(
+                    "refusing to read config file through reparse point {}",
+                    cur.display()
+                );
+            }
+        }
+        target_meta = Some(meta);
+    }
+
+    let Some(meta) = target_meta.filter(|_| has_normal_component) else {
+        bail!("config file path is not a regular file: {}", path.display());
+    };
+    if !meta.file_type().is_file() {
+        bail!("config file path is not a regular file: {}", path.display());
+    }
+    if meta.len() > MAX_CONFIG_FILE_BYTES {
+        bail!(
+            "config file {} exceeds maximum allowed size of {} bytes",
+            path.display(),
+            MAX_CONFIG_FILE_BYTES
+        );
+    }
+
+    let mut open_opts = OpenOptions::new();
+    open_opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        open_opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        open_opts.custom_flags(windows_fs::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = match open_opts.open(&abs_path) {
         Ok(f) => f,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
         Err(err) => {
@@ -453,6 +605,26 @@ fn read_bounded_config_file(path: &Path) -> Result<Option<String>> {
                 .with_context(|| format!("failed to open config file {}", path.display()));
         }
     };
+
+    let opened_meta = file
+        .metadata()
+        .with_context(|| format!("failed to stat opened config file {}", path.display()))?;
+    if opened_meta.file_type().is_symlink() {
+        bail!("refusing to read symlink config file {}", path.display());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        if (opened_meta.file_attributes() & windows_fs::FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            bail!(
+                "refusing to read reparse-point config file {}",
+                path.display()
+            );
+        }
+    }
+    if !opened_meta.file_type().is_file() {
+        bail!("config file path is not a regular file: {}", path.display());
+    }
 
     let mut buf = Vec::new();
     file.take(MAX_CONFIG_FILE_BYTES + 1)
@@ -502,7 +674,8 @@ pub fn save_file_config_atomic(path: &Path, cfg: &FileConfig) -> Result<()> {
         } else {
             path
         };
-        windows_programdata_target_dir(check_path, std::env::var_os("ProgramData").as_deref())
+        let program_data = crate::platform::windows::known_program_data_dir();
+        windows_programdata_target_dir(check_path, Some(program_data.as_os_str()))
     };
 
     #[cfg(windows)]
@@ -3817,5 +3990,184 @@ split_tunnel_apps = [
             assert!(err.to_string().contains("line 1:"));
         }
         assert!(parse_config_toml("language = true\n").is_err());
+    }
+
+    #[test]
+    fn is_windows_abs_accepts_local_drives_and_rejects_unc_and_relative() {
+        for valid in [
+            r"C:\ProgramData",
+            r"c:\ProgramData",
+            "D:/ProgramData",
+            r"Z:\Users\alice\AppData\Local",
+        ] {
+            assert!(
+                is_windows_abs(OsStr::new(valid)),
+                "expected local drive path to be accepted: {valid:?}"
+            );
+        }
+
+        for invalid in [
+            "",
+            "relative",
+            r"relative\path",
+            "C:",
+            "C:ProgramData",
+            r"\ProgramData",
+            "/ProgramData",
+            r"1:\ProgramData",
+            r"\\attacker\share",
+            r"\\attacker\ProgramData",
+            "//attacker/share",
+            "//attacker/ProgramData",
+            r"\\?\C:\ProgramData",
+            r"\\?\UNC\attacker\share",
+            r"\\.\C:\ProgramData",
+            r"\\.\pipe\vdpi",
+        ] {
+            assert!(
+                !is_windows_abs(OsStr::new(invalid)),
+                "expected UNC/device/relative path to be rejected: {invalid:?}"
+            );
+        }
+
+        assert_eq!(
+            windows_system_config_path(Some(OsStr::new(r"\\attacker\ProgramData"))),
+            PathBuf::from(r"C:\ProgramData")
+                .join("vdpi")
+                .join("config.toml")
+        );
+        assert_eq!(
+            windows_system_config_path(Some(OsStr::new("//attacker/ProgramData"))),
+            PathBuf::from(r"C:\ProgramData")
+                .join("vdpi")
+                .join("config.toml")
+        );
+        assert_eq!(
+            windows_user_config_path(
+                Some(OsStr::new(r"\\attacker\AppData")),
+                Some(OsStr::new("//attacker/home")),
+            ),
+            PathBuf::from(r"C:\ProgramData")
+                .join("vdpi")
+                .join("config.toml")
+        );
+    }
+
+    #[test]
+    fn read_bounded_config_file_rejects_unc_device_verbatim_and_parent_traversal() {
+        let dir = TestTempDir::new("bounded-read-syntax");
+        let valid_file = dir.path().join("config.toml");
+        fs::write(&valid_file, "schema_version = 1\n").expect("write valid config");
+
+        assert_eq!(
+            read_bounded_config_file(&valid_file)
+                .expect("valid regular config file must load")
+                .as_deref(),
+            Some("schema_version = 1\n")
+        );
+
+        let missing_nested = dir.path().join("does-not-exist").join("config.toml");
+        assert_eq!(
+            read_bounded_config_file(&missing_nested)
+                .expect("missing file with absent ancestor must return Ok(None)"),
+            None
+        );
+
+        // Directories must be rejected as non-regular files.
+        assert!(
+            read_bounded_config_file(dir.path()).is_err(),
+            "directory path must be rejected by read_bounded_config_file"
+        );
+
+        let parent_traversal = dir.path().join("sub").join("..").join("config.toml");
+        for bad in [
+            Path::new(""),
+            Path::new(r"\\attacker\share\config.toml"),
+            Path::new("//attacker/share/config.toml"),
+            Path::new(r"\\?\C:\ProgramData\vdpi\config.toml"),
+            Path::new(r"\\?\UNC\attacker\share\config.toml"),
+            Path::new(r"\\.\pipe\vdpi"),
+            Path::new("//./pipe/vdpi"),
+            Path::new(r"\/attacker\share\config.toml"),
+            Path::new("subdir/../config.toml"),
+            parent_traversal.as_path(),
+        ] {
+            assert!(
+                read_bounded_config_file(bad).is_err(),
+                "expected unsafe config path to be rejected: {}",
+                bad.display()
+            );
+        }
+    }
+
+    #[test]
+    fn read_bounded_config_file_rejects_symlink_and_reparse_point_paths() {
+        let dir = TestTempDir::new("bounded-read-symlink");
+        let target_dir = dir.path().join("real");
+        fs::create_dir_all(&target_dir).expect("create target dir");
+        let target_file = target_dir.join("config.toml");
+        fs::write(&target_file, "schema_version = 1\n").expect("write target config");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let file_link = dir.path().join("link.toml");
+            symlink(&target_file, &file_link).expect("create file symlink");
+            assert!(
+                read_bounded_config_file(&file_link).is_err(),
+                "file symlink must be rejected"
+            );
+
+            let dir_link = dir.path().join("dir-link");
+            symlink(&target_dir, &dir_link).expect("create dir symlink");
+            assert!(
+                read_bounded_config_file(&dir_link.join("config.toml")).is_err(),
+                "symlink ancestor directory must be rejected"
+            );
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            use std::process::Command;
+
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+            let cmd_exe = std::env::var_os("SystemRoot")
+                .or_else(|| std::env::var_os("WINDIR"))
+                .filter(|v| !v.is_empty())
+                .map(|root| PathBuf::from(root).join("System32").join("cmd.exe"))
+                .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\cmd.exe"));
+            let junction_dir = dir.path().join("dir-junction");
+            let status = Command::new(cmd_exe)
+                .creation_flags(CREATE_NO_WINDOW)
+                .args([
+                    OsStr::new("/C"),
+                    OsStr::new("mklink"),
+                    OsStr::new("/J"),
+                    junction_dir.as_os_str(),
+                    target_dir.as_os_str(),
+                ])
+                .status()
+                .expect("spawn cmd.exe mklink /J");
+            assert!(
+                status.success(),
+                "mklink /J must create NTFS directory junction"
+            );
+
+            assert!(
+                read_bounded_config_file(&junction_dir.join("config.toml")).is_err(),
+                "NTFS junction ancestor must be rejected"
+            );
+
+            let file_link = dir.path().join("file-link.toml");
+            if std::os::windows::fs::symlink_file(&target_file, &file_link).is_ok() {
+                assert!(
+                    read_bounded_config_file(&file_link).is_err(),
+                    "file symlink must be rejected"
+                );
+            }
+        }
     }
 }

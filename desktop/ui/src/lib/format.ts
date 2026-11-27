@@ -1018,7 +1018,7 @@ export function validateCustomDnsClient(
       kind: "invalid",
       normalized: trimmed,
       error: tr
-        ? "DNS sunucusu denetim karakteri veya yeni satır içeremez."
+        ? "DNS sunucusu kontrol karakteri veya yeni satır içeremez."
         : "DNS server cannot contain control characters or newlines.",
     };
   }
@@ -1065,7 +1065,7 @@ export function validateCustomDnsClient(
         kind: "invalid",
         normalized: trimmed,
         error: tr
-          ? "https:// sonrasında bir ana bilgisayar adı veya IP girin (ör. https://dns.nextdns.io/profil)."
+          ? "https:// sonrasında bir alan adı veya IP girin (örn. https://dns.nextdns.io/profil)."
           : "Enter a hostname or IP after https:// (e.g. https://dns.nextdns.io/profile).",
       };
     }
@@ -1100,7 +1100,7 @@ export function validateCustomDnsClient(
         kind: "invalid",
         normalized: trimmed,
         error: tr
-          ? "DoH URL'sinde yoldan önce ana bilgisayar adı veya IP eksik."
+          ? "DoH URL'sinde yoldan önce alan adı veya IP eksik."
           : "DoH URL is missing a hostname or IP before the path.",
       };
     }
@@ -1126,7 +1126,7 @@ export function validateCustomDnsClient(
           kind: "invalid",
           normalized: trimmed,
           error: tr
-            ? "DoH URL'sinde kapatılmamış IPv6 köşeli ayracı."
+            ? "DoH URL'sinde kapatılmamış IPv6 köşeli parantezi."
             : "Unclosed IPv6 bracket in DoH URL.",
         };
       }
@@ -1138,7 +1138,7 @@ export function validateCustomDnsClient(
           kind: "invalid",
           normalized: trimmed,
           error: tr
-            ? "DoH URL'sinde geçersiz IPv6 ana bilgisayarı."
+            ? "DoH URL'sinde geçersiz IPv6 adresi."
             : "Invalid IPv6 host inside DoH URL.",
         };
       }
@@ -1173,7 +1173,7 @@ export function validateCustomDnsClient(
           kind: "invalid",
           normalized: trimmed,
           error: tr
-            ? "DoH URL yetkisinde hatalı köşeli ayraçlar."
+            ? "DoH URL adres kısmında hatalı köşeli parantezler."
             : "Malformed brackets in DoH URL authority.",
         };
       }
@@ -1184,7 +1184,7 @@ export function validateCustomDnsClient(
           kind: "invalid",
           normalized: trimmed,
           error: tr
-            ? "DoH URL'lerindeki IPv6 adreslerini köşeli ayraç içine alın (ör. https://[2606:4700:4700::1111]/dns-query)."
+            ? "DoH URL'lerindeki IPv6 adreslerini köşeli parantez içine alın (örn. https://[2606:4700:4700::1111]/dns-query)."
             : "Wrap IPv6 addresses in brackets inside DoH URLs (e.g. https://[2606:4700:4700::1111]/dns-query).",
         };
       }
@@ -1209,7 +1209,7 @@ export function validateCustomDnsClient(
           kind: "invalid",
           normalized: trimmed,
           error: tr
-            ? "DoH URL'sinde ana bilgisayar adı veya IP eksik."
+            ? "DoH URL'sinde alan adı veya IP eksik."
             : "DoH URL is missing a hostname or IP.",
         };
       }
@@ -1236,7 +1236,7 @@ export function validateCustomDnsClient(
           kind: "invalid",
           normalized: trimmed,
           error: tr
-            ? "https:// DoH URL'sinde geçerli bir ana bilgisayar adı veya IP adresi girin."
+            ? "https:// DoH URL'sinde geçerli bir alan adı veya IP adresi girin."
             : "Enter a valid hostname or IP address in the https:// DoH URL.",
         };
       }
@@ -1278,7 +1278,7 @@ export function validateCustomDnsClient(
         valid: false,
         kind: "invalid",
         normalized: trimmed,
-        error: tr ? "Eşleşmeyen IPv6 köşeli ayraçları." : "Unmatched IPv6 brackets.",
+        error: tr ? "Eşleşmeyen IPv6 köşeli parantezleri." : "Unmatched IPv6 brackets.",
       };
     }
     const inner = trimmed.slice(1, -1);
@@ -1289,7 +1289,7 @@ export function validateCustomDnsClient(
         kind: "invalid",
         normalized: trimmed,
         error: tr
-          ? "Köşeli ayraç içinde geçerli bir IPv6 adresi girin."
+          ? "Köşeli parantez içinde geçerli bir IPv6 adresi girin."
           : "Enter a valid IPv6 address inside brackets.",
       };
     }
@@ -1358,7 +1358,7 @@ export function validateCustomDnsClient(
       kind: "invalid",
       normalized: trimmed,
       error: tr
-        ? "DoH ana bilgisayar adı için https:// önekini ekleyin (ör. https://dns.nextdns.io/profil-id)."
+        ? "DoH alan adı için https:// önekini ekleyin (örn. https://dns.nextdns.io/profil-id)."
         : "For a DoH hostname, include the https:// prefix (e.g. https://dns.nextdns.io/profile-id).",
     };
   }
@@ -1368,7 +1368,7 @@ export function validateCustomDnsClient(
     kind: "invalid",
     normalized: trimmed,
     error: tr
-      ? "Geçerli bir IPv4 adresi (ör. 1.1.1.1), IPv6 adresi veya https://.../dns-query URL'si girin."
+      ? "Geçerli bir IPv4 adresi (örn. 1.1.1.1), IPv6 adresi veya https://.../dns-query URL'si girin."
       : "Enter a valid IPv4 address (e.g. 1.1.1.1), IPv6 address, or https://.../dns-query URL.",
   };
 }
@@ -1461,7 +1461,7 @@ export function validateDomainRule(
   const tr = lang === "tr";
   if (CONTROL_CHAR_RE.test(raw)) {
     return tr
-      ? "Alan adı kuralı denetim karakteri veya yeni satır içeremez."
+      ? "Alan adı kuralı kontrol karakteri veya yeni satır içeremez."
       : "Domain rule cannot contain control characters or newlines.";
   }
 
@@ -1478,7 +1478,7 @@ export function validateDomainRule(
 
   if (trimmed.includes("://")) {
     return tr
-      ? "URL şeması olmadan bir alan adı girin (ör. example.com veya *.example.com)."
+      ? "URL şeması olmadan bir alan adı girin (örn. example.com veya *.example.com)."
       : "Enter a domain name without a URL scheme (e.g. example.com or *.example.com).";
   }
 
@@ -1505,7 +1505,7 @@ export function validateDomainRule(
 
   if (host.includes("*")) {
     return tr
-      ? "Joker karakterler yalnızca başta '*.' öneki olarak desteklenir (ör. *.example.com)."
+      ? "Joker karakterler yalnızca başta '*.' öneki olarak desteklenir (örn. *.example.com)."
       : "Wildcards are only supported as a leading '*.' prefix (e.g. *.example.com).";
   }
 
@@ -1532,12 +1532,12 @@ export function validateDomainRule(
   if (isWildcard && labels.length < 2) {
     if (!LOCAL_WILDCARD_TLDS.has(lowerHost)) {
       return tr
-        ? "Joker kurallar tek başına bir üst düzey alan adını hedefleyemez (ör. *.example.com kullanın)."
+        ? "Joker kurallar tek başına bir üst düzey alan adını hedefleyemez (örn. *.example.com kullanın)."
         : "Wildcard rules cannot target a bare top-level domain (e.g. use *.example.com).";
     }
   } else if (!isWildcard && labels.length < 2 && lowerHost !== "localhost") {
     return tr
-      ? "Tam bir alan adı girin (ör. example.com veya *.example.com)."
+      ? "Tam bir alan adı girin (örn. example.com veya *.example.com)."
       : "Enter a full domain name (e.g. example.com or *.example.com).";
   }
 

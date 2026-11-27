@@ -12,6 +12,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.content.res.Configuration
 import android.net.ConnectivityManager
 import android.net.IpPrefix
 import android.net.LinkProperties
@@ -987,6 +988,11 @@ class VdpiVpnService : VpnService() {
         } else {
             stopSelf()
         }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        refreshLocalizedSurfaces(this)
     }
 
     override fun onRevoke() {

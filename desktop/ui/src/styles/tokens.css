@@ -169,7 +169,7 @@
   --border-subtle: rgba(255, 255, 255, 0.10);
   --border-default: rgba(255, 255, 255, 0.14);
   --border-strong: rgba(255, 255, 255, 0.22);
-  --border-control: #5E687B;
+  --border-control: #6C778C;
 
   /* Ink hierarchy */
   --ink-primary: #F3F4F6;
@@ -286,7 +286,7 @@
   --accent: #0066CC;
   --accent-hover: #0055B3;
   --accent-active: #004499;
-  --accent-fg: #0066CC;
+  --accent-fg: #0052A3;
   --accent-subtle: rgba(0, 102, 204, 0.10);
   --accent-subtle-hover: rgba(0, 102, 204, 0.16);
   --accent-border: rgba(0, 102, 204, 0.28);
@@ -306,7 +306,7 @@
 
   /* Semantic status - Crimson (error / fail / danger) */
   --status-crimson: #C82320;
-  --status-crimson-fg: #C82320;
+  --status-crimson-fg: #B41D1A;
   --status-crimson-solid: #DC2626;
   --status-crimson-solid-hover: #B91C1C;
   --status-crimson-bg: rgba(255, 69, 58, 0.11);
@@ -386,7 +386,7 @@
     --accent: #0066CC;
     --accent-hover: #0055B3;
     --accent-active: #004499;
-    --accent-fg: #0066CC;
+    --accent-fg: #0052A3;
     --accent-subtle: rgba(0, 102, 204, 0.10);
     --accent-subtle-hover: rgba(0, 102, 204, 0.16);
     --accent-border: rgba(0, 102, 204, 0.28);
@@ -406,7 +406,7 @@
 
     /* Semantic status - Crimson (error / fail / danger) */
     --status-crimson: #C82320;
-    --status-crimson-fg: #C82320;
+    --status-crimson-fg: #B41D1A;
     --status-crimson-solid: #DC2626;
     --status-crimson-solid-hover: #B91C1C;
     --status-crimson-bg: rgba(255, 69, 58, 0.11);

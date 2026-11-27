@@ -1,0 +1,7 @@
+/* App Intents */
+"Connect vdpi" = "Connect vdpi";
+"Starts the local vdpi anti-DPI tunnel." = "Starts the local vdpi anti-DPI tunnel.";
+"Disconnect vdpi" = "Disconnect vdpi";
+"Stops the local vdpi anti-DPI tunnel." = "Stops the local vdpi anti-DPI tunnel.";
+"Toggle vdpi" = "Toggle vdpi";
+"Turns the local vdpi anti-DPI tunnel on or off." = "Turns the local vdpi anti-DPI tunnel on or off.";

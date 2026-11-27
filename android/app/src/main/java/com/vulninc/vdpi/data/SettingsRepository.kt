@@ -1,6 +1,8 @@
 package com.vulninc.vdpi.data
 
+import android.app.LocaleManager
 import android.content.Context
+import android.os.Build
 import androidx.datastore.core.DataStore
 import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
 import androidx.datastore.preferences.core.Preferences
@@ -24,6 +26,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -143,6 +146,28 @@ private val KNOWN_BACKUP_KEYS = setOf(
     "theme",
     "language",
 )
+
+sealed class SettingsImportException(
+    message: String,
+    cause: Throwable? = null,
+) : IllegalArgumentException(message, cause) {
+    class Empty : SettingsImportException("Settings JSON is empty")
+    class TooLarge : SettingsImportException("Settings JSON exceeds maximum size")
+    class InvalidJson(cause: Throwable? = null) : SettingsImportException("Invalid settings JSON", cause)
+    class UnrecognizedFormat : SettingsImportException("Unrecognized settings backup format")
+    class UnsupportedSchema(val version: Int? = null) : SettingsImportException(
+        if (version != null) {
+            "Unsupported backup schema version: $version"
+        } else {
+            "Invalid backup schema version"
+        },
+    )
+    class InvalidDesyncMode(val value: String) : SettingsImportException("Unsupported desync mode: $value")
+    class InvalidDns(val redactedValue: String) : SettingsImportException("Invalid DNS address: $redactedValue")
+    class InvalidSplitMode(val value: String) : SettingsImportException("Unsupported split tunnel mode: $value")
+    class InvalidTheme(val value: String) : SettingsImportException("Unsupported theme preference: $value")
+    class InvalidLanguage(val value: String) : SettingsImportException("Unsupported language preference: $value")
+}
 
 class SettingsRepository(private val context: Context) {
     private object Keys {
@@ -374,11 +399,31 @@ class SettingsRepository(private val context: Context) {
         }
 
         fun resolveStrings(context: Context): VdpiStrings {
-            val locale = context.resources?.configuration?.locales
-                ?.takeIf { !it.isEmpty }
-                ?.get(0)
+            val language = readLanguageSync(context)
+            if (language != AppLanguage.SYSTEM) {
+                return VdpiStrings.resolve(language)
+            }
+            val systemLocale = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                runCatching {
+                    val appContext = context.applicationContext ?: context
+                    val localeManager = appContext.getSystemService(LocaleManager::class.java)
+                    if (localeManager != null && localeManager.applicationLocales.isEmpty) {
+                        localeManager.systemLocales
+                            .takeIf { !it.isEmpty }
+                            ?.get(0)
+                    } else {
+                        null
+                    }
+                }.getOrNull()
+            } else {
+                null
+            }
+            val locale = systemLocale
+                ?: context.resources?.configuration?.locales
+                    ?.takeIf { !it.isEmpty }
+                    ?.get(0)
                 ?: Locale.getDefault()
-            return VdpiStrings.resolve(readLanguageSync(context), locale)
+            return VdpiStrings.resolve(language, locale)
         }
 
         private val backupJson = Json {
@@ -447,34 +492,48 @@ class SettingsRepository(private val context: Context) {
 
         fun parseSettingsJson(raw: String): Result<VdpiSettings> = runCatching {
             val trimmed = raw.trim()
-            require(trimmed.isNotEmpty()) { "Settings JSON is empty" }
-            require(trimmed.length <= MAX_BACKUP_JSON_CHARS) { "Settings JSON exceeds maximum size" }
+            if (trimmed.isEmpty()) throw SettingsImportException.Empty()
+            if (trimmed.length > MAX_BACKUP_JSON_CHARS) throw SettingsImportException.TooLarge()
 
-            val element = backupJson.parseToJsonElement(trimmed)
+            val element = try {
+                backupJson.parseToJsonElement(trimmed)
+            } catch (e: SerializationException) {
+                throw SettingsImportException.InvalidJson(e)
+            } catch (e: IllegalArgumentException) {
+                throw SettingsImportException.InvalidJson(e)
+            }
             val obj = element as? JsonObject
-                ?: throw IllegalArgumentException("Settings JSON must be a JSON object")
+                ?: throw SettingsImportException.InvalidJson()
 
             val hasKnownKey = obj.keys.any { it in KNOWN_BACKUP_KEYS }
-            require(hasKnownKey) { "Unrecognized settings backup format" }
+            if (!hasKnownKey) throw SettingsImportException.UnrecognizedFormat()
 
             obj["version"]?.let { versionElem ->
                 val ver = (versionElem as? JsonPrimitive)?.takeIf { !it.isString }?.intOrNull
-                    ?: throw IllegalArgumentException("Invalid backup schema version")
-                require(ver in 1..BACKUP_SCHEMA_VERSION) {
-                    "Unsupported backup schema version: $ver"
+                    ?: throw SettingsImportException.UnsupportedSchema(version = null)
+                if (ver !in 1..BACKUP_SCHEMA_VERSION) {
+                    throw SettingsImportException.UnsupportedSchema(version = ver)
                 }
             }
 
-            val payload = backupJson.decodeFromJsonElement(SettingsBackupPayload.serializer(), obj)
+            val payload = try {
+                backupJson.decodeFromJsonElement(SettingsBackupPayload.serializer(), obj)
+            } catch (e: SerializationException) {
+                throw SettingsImportException.InvalidJson(e)
+            } catch (e: IllegalArgumentException) {
+                throw SettingsImportException.InvalidJson(e)
+            }
 
             val modeKey = payload.desyncMode.trim()
             val desyncMode = DesyncMode.entries.firstOrNull {
                 it.wireName.equals(modeKey, ignoreCase = true) ||
                     it.name.equals(modeKey, ignoreCase = true)
-            } ?: throw IllegalArgumentException("Unsupported desync mode: $modeKey")
+            } ?: throw SettingsImportException.InvalidDesyncMode(modeKey)
 
             val dns = payload.dnsAddr.trim()
-            require(isValidDnsInput(dns)) { "Invalid DNS address: ${redactDnsInputForError(payload.dnsAddr)}" }
+            if (!isValidDnsInput(dns)) {
+                throw SettingsImportException.InvalidDns(redactDnsInputForError(payload.dnsAddr))
+            }
             val normalizedEnableDoh = payload.enableDoh ||
                 dns.startsWith("https://", ignoreCase = true)
 
@@ -482,7 +541,7 @@ class SettingsRepository(private val context: Context) {
             val splitMode = SplitTunnelMode.entries.firstOrNull {
                 it.wireName.equals(splitModeKey, ignoreCase = true) ||
                     it.name.equals(splitModeKey, ignoreCase = true)
-            } ?: throw IllegalArgumentException("Unsupported split tunnel mode: $splitModeKey")
+            } ?: throw SettingsImportException.InvalidSplitMode(splitModeKey)
 
             val sanitizedDomains = payload.bypassDomains
                 .map { sanitizeDomainInput(it) }
@@ -499,13 +558,13 @@ class SettingsRepository(private val context: Context) {
             val theme = ThemePreference.entries.firstOrNull {
                 it.wireName.equals(themeKey, ignoreCase = true) ||
                     it.name.equals(themeKey, ignoreCase = true)
-            } ?: throw IllegalArgumentException("Unsupported theme preference: $themeKey")
+            } ?: throw SettingsImportException.InvalidTheme(themeKey)
 
             val langKey = payload.language.trim()
             val language = AppLanguage.entries.firstOrNull {
                 it.code.equals(langKey, ignoreCase = true) ||
                     it.name.equals(langKey, ignoreCase = true)
-            } ?: throw IllegalArgumentException("Unsupported language preference: $langKey")
+            } ?: throw SettingsImportException.InvalidLanguage(langKey)
 
             VdpiSettings(
                 desyncMode = desyncMode,

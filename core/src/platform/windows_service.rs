@@ -9,8 +9,8 @@ use crate::health::{
 use crate::platform::vpn::{detect_active_vpn, VpnScope};
 use crate::platform::vpn_guard::{GuardAction, VpnGuard};
 use crate::platform::windows::{
-    clear_all_windows_proxies, flush_dns_resolver_cache, notify_wininet_refresh,
-    set_running_as_service, WindowsProxySession,
+    clear_all_windows_proxies, flush_dns_resolver_cache, known_program_data_dir,
+    notify_wininet_refresh, set_running_as_service, WindowsProxySession,
 };
 use crate::platform::windows_tun::{
     cleanup_orphan_wintun_adapter, find_verified_wintun_dll, WindowsTunSession, VDPI_TUN_NAME,
@@ -118,6 +118,14 @@ const STATUS_CONTROL_C_EXIT: Dword = 0xC000_013A;
 const DBG_TERMINATE_PROCESS: Dword = 0x4001_0004;
 
 const SEE_MASK_NOCLOSEPROCESS: Dword = 0x0000_0040;
+const SEE_MASK_NOASYNC: Dword = 0x0000_0100;
+const SEE_MASK_FLAG_NO_UI: Dword = 0x0000_0400;
+const ELEVATED_SHELL_EXECUTE_MASK: Dword =
+    SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
+const COINIT_APARTMENTTHREADED: Dword = 0x0000_0002;
+const COINIT_DISABLE_OLE1DDE: Dword = 0x0000_0004;
+const S_OK: i32 = 0;
+const S_FALSE: i32 = 1;
 const SW_SHOWNORMAL: i32 = 1;
 const INFINITE: Dword = 0xFFFF_FFFF;
 const WAIT_OBJECT_0: Dword = 0;
@@ -214,6 +222,7 @@ struct QueryServiceConfigW {
 #[link(name = "kernel32")]
 extern "system" {
     fn GetLastError() -> Dword;
+    fn GetSystemDirectoryW(lp_buffer: *mut u16, u_size: Dword) -> Dword;
     fn WaitForSingleObject(h_handle: *mut c_void, dw_milliseconds: Dword) -> Dword;
     fn GetExitCodeProcess(h_process: *mut c_void, lp_exit_code: *mut Dword) -> Bool;
     fn CloseHandle(h_object: *mut c_void) -> Bool;
@@ -222,6 +231,12 @@ extern "system" {
 #[link(name = "shell32")]
 extern "system" {
     fn ShellExecuteExW(p_exec_info: *mut ShellExecuteInfoW) -> Bool;
+}
+
+#[link(name = "ole32")]
+extern "system" {
+    fn CoInitializeEx(pv_reserved: *mut c_void, dw_co_init: Dword) -> i32;
+    fn CoUninitialize();
 }
 
 #[link(name = "advapi32")]
@@ -384,6 +399,71 @@ fn classify_elevated_child_exit(exit_code: Dword) -> Result<()> {
     }
 }
 
+/// Resolves the Windows System32 directory via `GetSystemDirectoryW()` for use as the
+/// elevated child's working directory (`lp_directory`), avoiding user-writable `%TEMP%`
+/// and preventing DLL search-order hijacking during UAC relaunch.
+fn elevated_relaunch_working_dir() -> PathBuf {
+    let mut buf = vec![0u16; 260];
+    loop {
+        // SAFETY: `buf` is a valid writable UTF-16 buffer of length `buf.len()`.
+        let len = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as Dword) };
+        if len == 0 {
+            break;
+        }
+        let len_usize = len as usize;
+        if len_usize < buf.len() {
+            let dir = String::from_utf16_lossy(&buf[..len_usize]);
+            let trimmed = dir.trim();
+            if !trimmed.is_empty() {
+                return crate::update::strip_windows_verbatim_prefix(std::path::Path::new(trimmed));
+            }
+            break;
+        }
+        buf.resize(len_usize + 1, 0);
+    }
+    let fallback = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("WINDIR"))
+        .filter(|v| !v.is_empty())
+        .map(|root| PathBuf::from(root).join("System32"))
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32"));
+    crate::update::strip_windows_verbatim_prefix(&fallback)
+}
+
+fn com_init_requires_uninitialize(hr: i32) -> bool {
+    hr == S_OK || hr == S_FALSE
+}
+
+struct ComStaGuard {
+    should_uninitialize: bool,
+}
+
+impl ComStaGuard {
+    fn init() -> Self {
+        // SAFETY: Initializes COM STA (without OLE1 DDE) on the current thread for
+        // `ShellExecuteExW`. Only `S_OK` / `S_FALSE` must be balanced by `CoUninitialize`.
+        let hr = unsafe {
+            CoInitializeEx(
+                ptr::null_mut(),
+                COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
+            )
+        };
+        Self {
+            should_uninitialize: com_init_requires_uninitialize(hr),
+        }
+    }
+}
+
+impl Drop for ComStaGuard {
+    fn drop(&mut self) {
+        if self.should_uninitialize {
+            // SAFETY: Balances the matching `S_OK` / `S_FALSE` `CoInitializeEx` on this thread.
+            unsafe {
+                CoUninitialize();
+            }
+        }
+    }
+}
+
 /// Relaunches the current `vdpi.exe` with explicit CLI arguments under UAC elevation (`runas`)
 /// and waits for the elevated process to finish.
 pub fn relaunch_elevated_and_wait(args: &[String]) -> Result<()> {
@@ -404,15 +484,15 @@ pub fn relaunch_elevated_and_wait(args: &[String]) -> Result<()> {
         .collect::<Vec<_>>()
         .join(" ");
 
-    let temp_dir = crate::update::strip_windows_verbatim_prefix(&std::env::temp_dir());
+    let system32_dir = elevated_relaunch_working_dir();
     let verb_wide = to_wide_null("runas");
     let file_wide = to_wide_null(&current_exe.display().to_string());
     let params_wide = to_wide_null(&params);
-    let dir_wide = to_wide_null(&temp_dir.display().to_string());
+    let dir_wide = to_wide_null(&system32_dir.display().to_string());
 
     let mut info = ShellExecuteInfoW {
         cb_size: std::mem::size_of::<ShellExecuteInfoW>() as Dword,
-        f_mask: SEE_MASK_NOCLOSEPROCESS,
+        f_mask: ELEVATED_SHELL_EXECUTE_MASK,
         hwnd: ptr::null_mut(),
         lp_verb: verb_wide.as_ptr(),
         lp_file: file_wide.as_ptr(),
@@ -432,6 +512,7 @@ pub fn relaunch_elevated_and_wait(args: &[String]) -> Result<()> {
         h_process: ptr::null_mut(),
     };
 
+    let _com_guard = ComStaGuard::init();
     let ok = unsafe { ShellExecuteExW(&mut info) };
     if ok == 0 {
         let err = unsafe { GetLastError() };
@@ -679,11 +760,9 @@ impl TunSlot {
 }
 
 fn windows_service_cache_path() -> PathBuf {
-    let base = std::env::var_os("ProgramData")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-    base.join("vdpi").join("adaptive-cache.json")
+    known_program_data_dir()
+        .join("vdpi")
+        .join("adaptive-cache.json")
 }
 
 fn unix_now_secs() -> u64 {
@@ -2743,5 +2822,41 @@ mod tests {
             TunStartErrorLogAction::LogOfflineStandby
         );
         assert!(logged);
+    }
+
+    #[test]
+    fn elevated_relaunch_working_dir_resolves_system32_instead_of_temp() {
+        let dir = elevated_relaunch_working_dir();
+        assert!(dir.is_absolute(), "System32 path must be absolute: {dir:?}");
+        assert!(
+            dir.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case("System32")),
+            "expected System32 directory, got {dir:?}"
+        );
+        assert!(dir.is_dir(), "resolved System32 directory must exist: {dir:?}");
+        assert_ne!(
+            dir,
+            crate::update::strip_windows_verbatim_prefix(&std::env::temp_dir()),
+            "elevated relaunch working dir must not be user-writable %TEMP%"
+        );
+    }
+
+    #[test]
+    fn elevated_shell_execute_uses_noasync_no_ui_and_com_uninit_rules() {
+        assert_eq!(
+            ELEVATED_SHELL_EXECUTE_MASK,
+            SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI
+        );
+        assert!(com_init_requires_uninitialize(S_OK));
+        assert!(com_init_requires_uninitialize(S_FALSE));
+        assert!(!com_init_requires_uninitialize(0x8001_0106_u32 as i32));
+        assert!(!com_init_requires_uninitialize(-1));
+        assert_eq!(
+            windows_service_cache_path(),
+            known_program_data_dir()
+                .join("vdpi")
+                .join("adaptive-cache.json")
+        );
     }
 }

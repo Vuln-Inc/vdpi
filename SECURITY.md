@@ -6,8 +6,8 @@ Only the current minor release line receives security fixes.
 
 | Version | Supported |
 | :--- | :--- |
-| `0.5.x` | Yes |
-| `< 0.5.0` | No |
+| `0.6.x` | Yes |
+| `< 0.6.0` | No |
 
 ## Reporting a Vulnerability
 
@@ -25,7 +25,7 @@ Include:
 
 ## Binary Verification
 
-Every GitHub Release publishes a `SHA256SUMS.txt` manifest covering all desktop and mobile release assets (`vdpi-windows-x86_64.zip`, `vdpi-macos-universal.tar.gz`, `vdpi-linux-x86_64.tar.gz`, `vdpi-linux-arm64.tar.gz`, `vdpi-android-universal.apk`, `vdpi-ios-unsigned.ipa`).
+Every GitHub Release publishes a `SHA256SUMS.txt` manifest covering all Desktop GUI, CLI, and mobile release assets (`vdpi-desktop-windows-x86_64-portable.zip`, `vdpi-desktop-macos-universal.dmg`, `vdpi-desktop-linux-x86_64.deb`, `vdpi-desktop-linux-x86_64.AppImage`, `vdpi-windows-x86_64.zip`, `vdpi-macos-universal.tar.gz`, `vdpi-linux-x86_64.tar.gz`, `vdpi-linux-arm64.tar.gz`, `vdpi-android-universal.apk`, `vdpi-ios-unsigned.ipa`), plus the pinned SHA-256 entry for the bundled WHQL-signed `wintun.dll` (`0.14.1`) used by `vdpi update` on Windows.
 
 ### Manual Verification
 

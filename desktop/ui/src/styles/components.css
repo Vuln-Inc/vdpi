@@ -10,17 +10,6 @@
   }
 }
 
-@keyframes vdpi-toast-in {
-  from {
-    opacity: 0;
-    transform: translateY(-6px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
 @keyframes vdpi-modal-in {
   from {
     opacity: 0;
@@ -550,6 +539,7 @@
   align-items: center;
   justify-content: center;
   gap: 5px;
+  flex-shrink: 0;
   height: 20px;
   padding: 0 7px;
   border-radius: var(--radius-pill, 9999px);
@@ -1146,127 +1136,7 @@
 }
 
 /* --------------------------------------------------------------------------
-   10. App List & App Rows
-   -------------------------------------------------------------------------- */
-
-.app-list {
-  display: flex;
-  flex-direction: column;
-  border-radius: var(--radius-lg, 10px);
-  border: 1px solid var(--border-subtle);
-  background: var(--bg-surface);
-  overflow: hidden;
-  min-width: 0;
-}
-
-.app-list-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-2, 8px);
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--border-hairline);
-  background: var(--bg-surface-subtle);
-  font-size: var(--text-sm, 12px);
-  color: var(--ink-secondary);
-  font-variant-numeric: tabular-nums;
-}
-
-.app-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  min-height: 44px;
-  padding: 6px 12px;
-  border-bottom: 1px solid var(--border-hairline);
-  background: transparent;
-  color: var(--ink-primary);
-  cursor: pointer;
-  user-select: none;
-  transition: var(--transition-colors);
-}
-
-.app-row:last-child {
-  border-bottom: 0;
-}
-
-.app-row:hover:not(.is-disabled):not([data-disabled="true"]) {
-  background: var(--bg-surface-hover);
-}
-
-.app-row.is-selected:not(.is-disabled),
-.app-row[data-selected="true"]:not([data-disabled="true"]) {
-  background: var(--accent-subtle);
-}
-
-.app-row.is-disabled,
-.app-row[data-disabled="true"] {
-  opacity: 0.5;
-  cursor: default;
-}
-
-.app-row-identity {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-width: 0;
-  flex: 1 1 auto;
-}
-
-.app-row-monogram {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  border-radius: 7px;
-  border: 1px solid var(--border-subtle);
-  background: var(--bg-surface-subtle);
-  color: var(--ink-secondary);
-  font-size: var(--text-xs, 11px);
-  font-weight: var(--weight-semibold, 600);
-  letter-spacing: 0.03em;
-  flex-shrink: 0;
-}
-
-.app-row-names {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  min-width: 0;
-  flex: 1 1 auto;
-}
-
-.app-row-name {
-  font-size: var(--text-base, 13px);
-  font-weight: var(--weight-medium, 500);
-  line-height: 1.25;
-  color: var(--ink-primary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.app-row-exe {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs, 11px);
-  line-height: 1.2;
-  color: var(--ink-tertiary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.app-row-meta {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-shrink: 0;
-}
-
-/* --------------------------------------------------------------------------
-   11. Sticky Save Bar
+   10. Sticky Save Bar
    -------------------------------------------------------------------------- */
 
 .sticky-save-bar {
@@ -1829,97 +1699,22 @@
 }
 
 /* --------------------------------------------------------------------------
-   17. Toast Stack & Toast Items
+   17. Toast Stack
    -------------------------------------------------------------------------- */
 
 .toast-stack {
   position: fixed;
-  top: 16px;
-  right: 18px;
-  bottom: auto;
+  top: auto;
+  right: 16px;
+  bottom: 16px;
   z-index: var(--z-toast, 1100);
   display: flex;
   flex-direction: column;
   align-items: flex-end;
   gap: var(--space-2, 8px);
   max-width: 320px;
-  width: min(320px, calc(100vw - 36px));
+  width: min(320px, calc(100vw - 240px));
   pointer-events: none;
-}
-
-.toast-item {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  width: 100%;
-  padding: 10px 10px 10px 12px;
-  border-radius: var(--radius-md, 8px);
-  border: 1px solid var(--border-default);
-  border-left: 3px solid var(--accent);
-  background: var(--bg-surface-elevated);
-  color: var(--ink-primary);
-  box-shadow: var(--shadow-md);
-  pointer-events: auto;
-  animation: vdpi-toast-in var(--duration-slow, 180ms) var(--ease-standard, cubic-bezier(0.2, 0, 0, 1));
-}
-
-.toast-item-info,
-.toast-item[data-tone="info"] {
-  border-left-color: var(--accent);
-}
-
-.toast-item-success,
-.toast-item[data-tone="success"] {
-  border-left-color: var(--status-green);
-}
-
-.toast-item-warn,
-.toast-item[data-tone="warn"] {
-  border-left-color: var(--status-amber);
-}
-
-.toast-item-error,
-.toast-item[data-tone="error"] {
-  border-left-color: var(--status-crimson);
-}
-
-.toast-item-body {
-  flex: 1 1 auto;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.toast-item-title {
-  font-size: var(--text-base, 13px);
-  font-weight: var(--weight-semibold, 600);
-  line-height: 1.35;
-  color: var(--ink-primary);
-}
-
-.toast-item-message {
-  font-size: var(--text-sm, 12px);
-  line-height: 1.4;
-  color: var(--ink-secondary);
-  word-break: break-word;
-}
-
-.toast-item-dismiss {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 22px;
-  height: 22px;
-  border-radius: var(--radius-sm, 6px);
-  color: var(--ink-tertiary);
-  flex-shrink: 0;
-  transition: var(--transition-colors);
-}
-
-.toast-item-dismiss:hover {
-  background: var(--bg-surface-hover);
-  color: var(--ink-primary);
 }
 
 /* --------------------------------------------------------------------------
@@ -2147,6 +1942,16 @@
   display: block;
 }
 
+.sidebar-install-dot {
+  display: block;
+  width: 7px;
+  height: 7px;
+  border-radius: var(--radius-pill, 9999px);
+  background: var(--status-warning, var(--status-amber, #c96a00));
+  box-shadow: none;
+  filter: none;
+}
+
 .update-prompt-dialog {
   max-width: 460px;
   display: flex;
@@ -2233,7 +2038,6 @@
 
 @media (prefers-reduced-motion: reduce) {
   .spinner,
-  .toast-item,
   .modal-card {
     animation: none;
   }
@@ -2246,7 +2050,6 @@
   .segmented > button,
   .preset-chip,
   .filter-pill,
-  .app-row,
   .radio-card,
   .activity-chevron {
     transition: none;

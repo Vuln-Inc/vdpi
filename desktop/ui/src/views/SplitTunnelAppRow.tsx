@@ -13,6 +13,7 @@ export interface SplitTunnelAppRowProps {
   iconSrc?: string;
   disabled?: boolean;
   onToggle: (normalizedKey: string) => void;
+  onIconError?: (normalizedKey: string, failedSrc: string) => void;
   className?: string;
 }
 
@@ -24,6 +25,7 @@ const FALLBACK_STYLES = `
   --_row-surface: transparent;
   --_row-hover: var(--bg-surface-hover, var(--surface-raised, rgba(255, 255, 255, 0.045)));
   --_row-selected: rgba(59, 130, 246, 0.08);
+  --_row-selected-hover: rgba(59, 130, 246, 0.14);
   --_row-border: var(--border-hairline, var(--border, rgba(255, 255, 255, 0.08)));
   --_row-ink: var(--ink-primary, var(--text-primary, #f3f4f6));
   --_row-secondary: var(--ink-secondary, var(--text-secondary, #a1a6b0));
@@ -55,7 +57,7 @@ const FALLBACK_STYLES = `
   justify-content: space-between;
   gap: 10px;
   min-height: 44px;
-  padding: 0 12px;
+  padding: 6px 12px;
   width: 100%;
   box-sizing: border-box;
 }
@@ -72,6 +74,10 @@ const FALLBACK_STYLES = `
   background: var(--_row-selected);
 }
 
+:where(.split-app-row[data-selected="true"]:hover:not([data-disabled="true"])) {
+  background: var(--_row-selected-hover);
+}
+
 :where(.split-app-row[data-disabled="true"]) {
   cursor: default;
   opacity: 0.56;
@@ -80,6 +86,7 @@ const FALLBACK_STYLES = `
 :where([data-theme="light"] .split-app-row) {
   --_row-hover: var(--bg-surface-hover, var(--surface-raised, rgba(0, 0, 0, 0.035)));
   --_row-selected: rgba(0, 102, 204, 0.06);
+  --_row-selected-hover: rgba(0, 102, 204, 0.11);
   --_row-border: var(--border-hairline, var(--border, rgba(0, 0, 0, 0.08)));
   --_row-ink: var(--ink-primary, var(--text-primary, #111317));
   --_row-secondary: var(--ink-secondary, var(--text-secondary, #4e5460));
@@ -98,6 +105,7 @@ const FALLBACK_STYLES = `
   :where(:root:not([data-theme="dark"]) .split-app-row) {
     --_row-hover: var(--bg-surface-hover, var(--surface-raised, rgba(0, 0, 0, 0.035)));
     --_row-selected: rgba(0, 102, 204, 0.06);
+    --_row-selected-hover: rgba(0, 102, 204, 0.11);
     --_row-border: var(--border-hairline, var(--border, rgba(0, 0, 0, 0.08)));
     --_row-ink: var(--ink-primary, var(--text-primary, #111317));
     --_row-secondary: var(--ink-secondary, var(--text-secondary, #4e5460));
@@ -128,16 +136,19 @@ const FALLBACK_STYLES = `
   flex-shrink: 0;
   width: 28px;
   height: 28px;
-  border-radius: 6px;
+  padding: 2px;
+  border-radius: 7px;
+  background: var(--bg-surface-subtle);
+  border: 1px solid var(--border-hairline);
   overflow: hidden;
   box-sizing: border-box;
 }
 
 :where(.split-app-row__icon) {
   display: block;
-  width: 28px;
-  height: 28px;
-  border-radius: 6px;
+  width: 100%;
+  height: 100%;
+  border-radius: 5px;
   object-fit: contain;
   user-select: none;
   pointer-events: none;
@@ -418,6 +429,7 @@ export const SplitTunnelAppRow = memo(function SplitTunnelAppRow({
   iconSrc,
   disabled = false,
   onToggle,
+  onIconError,
   className,
 }: SplitTunnelAppRowProps) {
   const { lang } = useLang();
@@ -504,12 +516,17 @@ export const SplitTunnelAppRow = memo(function SplitTunnelAppRow({
                 className="split-app-row__icon"
                 src={iconSrc}
                 alt=""
-                width={28}
-                height={28}
+                width={24}
+                height={24}
                 loading="lazy"
                 decoding="async"
                 draggable={false}
-                onError={() => setFailedIconSrc(iconSrc ?? null)}
+                onError={() => {
+                  setFailedIconSrc(iconSrc ?? null);
+                  if (iconSrc) {
+                    onIconError?.(app.normalizedKey, iconSrc);
+                  }
+                }}
               />
             </span>
           ) : (
@@ -554,7 +571,7 @@ export const SplitTunnelAppRow = memo(function SplitTunnelAppRow({
               type="button"
               className="split-app-row__pill split-app-row__pill--companions"
               aria-expanded={companionsOpen}
-              aria-controls={companionsPanelId}
+              aria-controls={companionsOpen ? companionsPanelId : undefined}
               aria-label={companionsAriaLabel}
               title={companionsTitle}
               onClick={handleCompanionsClick}

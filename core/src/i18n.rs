@@ -239,33 +239,44 @@ fn detect_lang_from_locale_vars<F>(mut get_var: F) -> Lang
 where
     F: FnMut(&str) -> Option<String>,
 {
-    for key in ["LC_ALL", "LC_MESSAGES", "LANG", "LANGUAGE"] {
-        let Some(raw) = get_var(key) else {
-            continue;
-        };
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if key == "LANGUAGE" {
-            for entry in trimmed.split(':') {
-                let item = entry.trim();
-                if item.is_empty() {
-                    continue;
-                }
-                if is_posix_c_locale(item) {
-                    return Lang::En;
-                }
-                return parse_lang_tag(item).unwrap_or(Lang::En);
-            }
-            continue;
-        }
-        if is_posix_c_locale(trimmed) {
-            return Lang::En;
-        }
-        return parse_lang_tag(trimmed).unwrap_or(Lang::En);
+    let get_non_empty = |lookup: &mut F, key: &str| -> Option<String> {
+        lookup(key)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+
+    let lc_all = get_non_empty(&mut get_var, "LC_ALL");
+    let lc_messages = get_non_empty(&mut get_var, "LC_MESSAGES");
+    let lang = get_non_empty(&mut get_var, "LANG");
+
+    // Effective POSIX message locale (`LC_ALL` > `LC_MESSAGES` > `LANG`).
+    // Per GNU gettext, `C`/`POSIX` disables `LANGUAGE` fallback lists.
+    let effective_posix = lc_all
+        .as_deref()
+        .or(lc_messages.as_deref())
+        .or(lang.as_deref());
+    if effective_posix.is_some_and(is_posix_c_locale) {
+        return Lang::En;
     }
-    Lang::En
+
+    if let Some(language) = get_non_empty(&mut get_var, "LANGUAGE") {
+        for entry in language.split(':') {
+            let item = entry.trim();
+            if item.is_empty() {
+                continue;
+            }
+            if is_posix_c_locale(item) {
+                return Lang::En;
+            }
+            if let Some(parsed) = parse_lang_tag(item) {
+                return parsed;
+            }
+        }
+    }
+
+    effective_posix
+        .and_then(parse_lang_tag)
+        .unwrap_or(Lang::En)
 }
 
 #[cfg(any(not(windows), test))]
@@ -465,6 +476,40 @@ mod tests {
         assert_eq!(
             lookup(&[("LC_ALL", ""), ("LC_MESSAGES", "   "), ("LANG", "tr_TR")]),
             Lang::Tr
+        );
+        // LANGUAGE overrides LANG when effective POSIX locale is not C/POSIX
+        assert_eq!(
+            lookup(&[("LANG", "en_US.UTF-8"), ("LANGUAGE", "tr:en")]),
+            Lang::Tr
+        );
+        // Colon-separated LANGUAGE list continues past unsupported entries
+        assert_eq!(
+            lookup(&[("LANG", "en_US.UTF-8"), ("LANGUAGE", "az:tr:en")]),
+            Lang::Tr
+        );
+        assert_eq!(lookup(&[("LANGUAGE", "az:fr:en:tr")]), Lang::En);
+        assert_eq!(lookup(&[("LANGUAGE", "az:C:tr")]), Lang::En);
+        // Falls back to LANG when LANGUAGE contains only unsupported tags
+        assert_eq!(
+            lookup(&[("LANG", "tr_TR.UTF-8"), ("LANGUAGE", "az:de")]),
+            Lang::Tr
+        );
+        // LC_ALL=C / POSIX and LANG=C / POSIX disable LANGUAGE fallback lists
+        assert_eq!(
+            lookup(&[("LC_ALL", "C"), ("LANGUAGE", "tr:en")]),
+            Lang::En
+        );
+        assert_eq!(
+            lookup(&[("LC_ALL", "POSIX"), ("LANGUAGE", "tr:en")]),
+            Lang::En
+        );
+        assert_eq!(
+            lookup(&[("LANG", "C.UTF-8"), ("LANGUAGE", "tr:en")]),
+            Lang::En
+        );
+        assert_eq!(
+            lookup(&[("LANG", "POSIX"), ("LANGUAGE", "tr:en")]),
+            Lang::En
         );
         // Non-Turkish locales default to English
         assert_eq!(lookup(&[("LANG", "de_DE.UTF-8")]), Lang::En);

@@ -3,6 +3,7 @@ import type { MouseEvent, ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { useLang } from "../i18n/context";
 import { tShell } from "../i18n/shell";
+import { acquireModalLock } from "../lib/modalLock";
 
 export interface ConfirmDialogProps {
   open?: boolean;
@@ -247,22 +248,7 @@ export function ConfirmDialog({
         ? document.activeElement
         : null;
 
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-
-    const appRoot = document.getElementById("root") as
-      | (HTMLElement & { inert?: boolean })
-      | null;
-    const shouldSetInert = Boolean(
-      appRoot &&
-        !appRoot.contains(dialogRef.current) &&
-        !appRoot.hasAttribute("inert") &&
-        !appRoot.inert,
-    );
-    if (appRoot && shouldSetInert) {
-      appRoot.inert = true;
-      appRoot.setAttribute("inert", "");
-    }
+    const releaseModalLock = acquireModalLock();
 
     const initialTarget = dangerRef.current
       ? cancelBtnRef.current
@@ -277,6 +263,7 @@ export function ConfirmDialog({
       if (event.key === "Escape") {
         event.preventDefault();
         event.stopPropagation();
+        event.stopImmediatePropagation();
         if (!busyRef.current) {
           onCancelRef.current();
         }
@@ -312,11 +299,7 @@ export function ConfirmDialog({
 
     return () => {
       document.removeEventListener("keydown", handleKeyDown);
-      document.body.style.overflow = previousOverflow;
-      if (appRoot && shouldSetInert) {
-        appRoot.inert = false;
-        appRoot.removeAttribute("inert");
-      }
+      releaseModalLock();
       if (previouslyFocused && previouslyFocused.isConnected) {
         previouslyFocused.focus();
       }

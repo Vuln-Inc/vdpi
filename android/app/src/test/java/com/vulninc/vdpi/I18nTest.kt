@@ -1,11 +1,16 @@
 package com.vulninc.vdpi
 
 import com.vulninc.vdpi.data.AppLanguage
+import com.vulninc.vdpi.data.SettingsImportException
 import com.vulninc.vdpi.data.SettingsRepository
 import com.vulninc.vdpi.data.SplitTunnelMode
 import com.vulninc.vdpi.data.ThemePreference
 import com.vulninc.vdpi.data.VdpiSettings
 import com.vulninc.vdpi.engine.DesyncMode
+import com.vulninc.vdpi.engine.DoctorCheck
+import com.vulninc.vdpi.engine.DoctorReport
+import com.vulninc.vdpi.engine.TelemetrySnapshot
+import com.vulninc.vdpi.ui.buildDiagnosticsReport
 import com.vulninc.vdpi.ui.computeSettingsChangeSummary
 import com.vulninc.vdpi.ui.i18n.EnglishStrings
 import com.vulninc.vdpi.ui.i18n.TurkishStrings
@@ -13,6 +18,8 @@ import com.vulninc.vdpi.ui.i18n.VdpiStrings
 import com.vulninc.vdpi.ui.screens.splitSummary
 import com.vulninc.vdpi.util.formatStageLabel
 import com.vulninc.vdpi.util.formatStageShort
+import com.vulninc.vdpi.vpn.TunnelPhase
+import com.vulninc.vdpi.vpn.TunnelRuntimeSnapshot
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
@@ -166,5 +173,200 @@ class I18nTest {
         )
         assertEquals("2 Routed", splitSummary(splitSettings, EnglishStrings))
         assertEquals("2 Tünelde", splitSummary(splitSettings, TurkishStrings))
+
+        assertEquals("Bölme", TurkishStrings.desyncModeLabel(DesyncMode.SPLIT))
+        assertEquals("İnce Parçalama", formatStageLabel("FineFragment", TurkishStrings))
+        assertEquals("Doğrudan Geçiş", formatStageLabel("DirectPassthrough", TurkishStrings))
+        assertEquals("Yedekle ve Geri Yükle", TurkishStrings.sectionBackupRestore)
+    }
+
+    @Test
+    fun importErrorReasonLocalizesAllSettingsImportExceptionsInEnglishAndTurkish() {
+        val cases: List<Triple<SettingsImportException, String, String>> = listOf(
+            Triple(
+                SettingsImportException.Empty(),
+                "Settings JSON is empty",
+                "Ayar JSON dosyası boş",
+            ),
+            Triple(
+                SettingsImportException.TooLarge(),
+                "Settings JSON exceeds maximum size",
+                "Ayar JSON dosyası en büyük boyutu aşıyor",
+            ),
+            Triple(
+                SettingsImportException.InvalidJson(),
+                "Invalid settings JSON",
+                "Geçersiz ayar JSON dosyası",
+            ),
+            Triple(
+                SettingsImportException.UnrecognizedFormat(),
+                "Unrecognized settings backup format",
+                "Tanınmayan ayar yedeği biçimi",
+            ),
+            Triple(
+                SettingsImportException.UnsupportedSchema(version = null),
+                "Invalid backup schema version",
+                "Geçersiz yedek şema sürümü",
+            ),
+            Triple(
+                SettingsImportException.UnsupportedSchema(version = 99),
+                "Unsupported backup schema version: 99",
+                "Desteklenmeyen yedek şema sürümü: 99",
+            ),
+            Triple(
+                SettingsImportException.InvalidDesyncMode("bogus"),
+                "Unsupported desync mode: bogus",
+                "Desteklenmeyen desync modu: bogus",
+            ),
+            Triple(
+                SettingsImportException.InvalidDns("https://dns.example/<redacted>"),
+                "Invalid DNS address: https://dns.example/<redacted>",
+                "Geçersiz DNS adresi: https://dns.example/<redacted>",
+            ),
+            Triple(
+                SettingsImportException.InvalidSplitMode("weird"),
+                "Unsupported split tunnel mode: weird",
+                "Desteklenmeyen bölünmüş tünel modu: weird",
+            ),
+            Triple(
+                SettingsImportException.InvalidTheme("neon"),
+                "Unsupported theme preference: neon",
+                "Desteklenmeyen tema tercihi: neon",
+            ),
+            Triple(
+                SettingsImportException.InvalidLanguage("fr"),
+                "Unsupported language preference: fr",
+                "Desteklenmeyen dil tercihi: fr",
+            ),
+        )
+
+        for ((error, expectedEn, expectedTr) in cases) {
+            assertEquals(expectedEn, EnglishStrings.importErrorReason(error))
+            assertEquals(expectedTr, TurkishStrings.importErrorReason(error))
+        }
+
+        val parsedInvalidDns = SettingsRepository.parseSettingsJson(
+            """{"desync_mode":"combo","dns_addr":"https://dns.example:99999/secret-token"}""",
+        )
+        assertTrue(parsedInvalidDns.isFailure)
+        val dnsError = parsedInvalidDns.exceptionOrNull() as SettingsImportException.InvalidDns
+        assertEquals(
+            "Invalid DNS address: https://dns.example/<redacted>",
+            EnglishStrings.importErrorReason(dnsError),
+        )
+        assertEquals(
+            "Geçersiz DNS adresi: https://dns.example/<redacted>",
+            TurkishStrings.importErrorReason(dnsError),
+        )
+        assertFalse(TurkishStrings.importErrorReason(dnsError).contains("secret-token"))
+    }
+
+    @Test
+    fun doctorCheckNameMapsKnownChecksInTurkishAndPassesThroughUnknown() {
+        assertEquals("Engine Init", EnglishStrings.doctorCheckName("Engine Init"))
+        assertEquals("DNS Ring", EnglishStrings.doctorCheckName("DNS Ring"))
+        assertEquals("Native Library", EnglishStrings.doctorCheckName("Native Library"))
+        assertEquals("DoH", EnglishStrings.doctorCheckName("DoH"))
+        assertEquals("Custom Probe", EnglishStrings.doctorCheckName("Custom Probe"))
+
+        assertEquals("Motor Başlatma", TurkishStrings.doctorCheckName("Engine Init"))
+        assertEquals("DNS Halkası", TurkishStrings.doctorCheckName("DNS Ring"))
+        assertEquals("Yerel Kütüphane", TurkishStrings.doctorCheckName("Native Library"))
+        assertEquals("DoH", TurkishStrings.doctorCheckName("DoH"))
+        assertEquals("Custom Probe", TurkishStrings.doctorCheckName("Custom Probe"))
+    }
+
+    @Test
+    fun buildDiagnosticsReportInTurkishLocalizesHeadersAndChecksWithoutEnglishLeaks() {
+        val settings = VdpiSettings(
+            desyncMode = DesyncMode.SPLIT,
+            chunkSize = 12,
+            dnsAddr = "https://dns.custom.example/secret-token-123",
+            enableDoh = true,
+            ipv4Only = true,
+            blockQuic = true,
+            bypassDomains = listOf("private-bank.example", "secret.internal.org"),
+            splitTunnelMode = SplitTunnelMode.BYPASS_SELECTED,
+            splitPackages = setOf("com.secret.wallet"),
+            language = AppLanguage.TR,
+        )
+        val runtime = TunnelRuntimeSnapshot(
+            phase = TunnelPhase.CONNECTED,
+            telemetry = TelemetrySnapshot(
+                running = true,
+                uptimeSecs = 95,
+                stageNumber = 4,
+                stageLabel = "FineFragment",
+                dnsAddr = settings.dnsAddr,
+                dohEnabled = settings.enableDoh,
+            ),
+        )
+        val report = DoctorReport(
+            ok = false,
+            checks = listOf(
+                DoctorCheck(
+                    name = "Engine Init",
+                    target = "native",
+                    passed = true,
+                    latencyMs = 5L,
+                    detail = "ok",
+                ),
+                DoctorCheck(
+                    name = "DNS Ring",
+                    target = "1.1.1.1",
+                    passed = true,
+                    latencyMs = 19L,
+                    detail = "UDP/DoH OK",
+                ),
+                DoctorCheck(
+                    name = "Native Library",
+                    target = "libvdpi_android.so",
+                    passed = false,
+                    latencyMs = 0L,
+                    detail = "missing",
+                ),
+                DoctorCheck(
+                    name = "DoH",
+                    target = "https://dns.custom.example/secret-token-123",
+                    passed = true,
+                    latencyMs = 28L,
+                    detail = "HTTP/2 OK",
+                ),
+            ),
+        )
+
+        val text = buildDiagnosticsReport(
+            appVersion = "0.6.1",
+            engineVersion = "0.6.1",
+            settings = settings,
+            runtime = runtime,
+            doctorReport = report,
+            androidRelease = "15",
+            androidSdk = 35,
+            strings = TurkishStrings,
+        )
+
+        assertTrue(text.contains("vdpi Android Tanılama Raporu"))
+        assertTrue(text.contains("Uygulama Sürümü: v0.6.1 (Motor: v0.6.1)"))
+        assertTrue(text.contains("Tünel Durumu: Bağlı"))
+        assertTrue(text.contains("Etkin Aşama: Aşama 4 (İnce Parçalama)"))
+        assertTrue(text.contains("Desync Modu: Bölme (split), parça=12"))
+        assertTrue(text.contains("DNS: https://dns.custom.example/<redacted> (DoH: etkin, Yalnızca IPv4: evet)"))
+        assertTrue(text.contains("QUIC Engelleme: etkin"))
+        assertTrue(text.contains("İstisna Alan Adları: 2 yapılandırıldı (gizlendi)"))
+        assertTrue(text.contains("Bölünmüş Tünel: Seçilileri Atla (1 uygulama, gizlendi)"))
+        assertTrue(text.contains("Tanılama Testleri: BAŞARISIZ (4 kontrol)"))
+        assertTrue(text.contains("- [BAŞARILI] Motor Başlatma (native): 5 ms - ok"))
+        assertTrue(text.contains("- [BAŞARILI] DNS Halkası (1.1.1.1): 19 ms - UDP/DoH OK"))
+        assertTrue(text.contains("- [BAŞARISIZ] Yerel Kütüphane (libvdpi_android.so): 0 ms - missing"))
+        assertTrue(text.contains("- [BAŞARILI] DoH (https://dns.custom.example/<redacted>): 28 ms - HTTP/2 OK"))
+
+        assertFalse(text.contains("Engine Init"))
+        assertFalse(text.contains("DNS Ring"))
+        assertFalse(text.contains("Native Library"))
+        assertFalse(text.contains("vdpi Android Diagnostics Report"))
+        assertFalse(text.contains("Diagnostic Probes"))
+        assertFalse(text.contains("secret-token-123"))
+        assertFalse(text.contains('\u2014'))
     }
 }

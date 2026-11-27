@@ -55,11 +55,13 @@ const en = {
   serviceStateStopped: "Stopped",
   serviceStateNotInstalled: "Not Installed",
   serviceStateChecking: "Checking...",
+  badgeRepairNeeded: "Repair Needed",
   serviceRowLabel: "vdpi system service",
   serviceBinaryPrefix: "Binary:",
   serviceVersionNotInstalled: "Not installed",
   serviceVersionUnknown: "Unknown",
   btnOpenInstallation: "Open Installation",
+  btnRepairInInstallation: "Repair in Installation",
   btnUpdateEngine: "Update Engine",
   btnUpdatingEngine: "Updating...",
   btnInstalling: "Installing...",
@@ -68,6 +70,10 @@ const en = {
   btnUninstallService: "Uninstall Service",
   serviceWintunMissingNote:
     "wintun.dll is required for Full-PC (TUN) mode on Windows. Add wintun.dll or switch to Proxy mode in Installation.",
+  serviceRepairNeededNote:
+    "The background service registration or binary looks incomplete. Open Installation to repair or reinstall without losing your configuration.",
+  serviceBundleMissingNote:
+    "The bundled vdpi engine binary is missing from the application folder. Re-extract the full release archive or check your antivirus quarantine.",
 
   // Appearance card
   appearanceHeading: "Appearance",
@@ -186,7 +192,7 @@ const tr: SettingsDict = {
   showTaskbarDescDefault:
     "Sistem tepsisine küçültülmüşken pencere düğmesini görev çubuğunda görünür tutun.",
   trayFooterNote:
-    "Arayüzü kapatmak veya çıkmak, kuruluysa arka plandaki vdpi servisini durdurmaz.",
+    "Arayüzü kapatmak veya arayüzden çıkmak, kuruluysa arka plandaki vdpi servisini durdurmaz.",
 
   // Background Service card
   serviceHeading: "Arka Plan Servisi",
@@ -194,11 +200,13 @@ const tr: SettingsDict = {
   serviceStateStopped: "Durduruldu",
   serviceStateNotInstalled: "Kurulu Değil",
   serviceStateChecking: "Kontrol ediliyor...",
+  badgeRepairNeeded: "Onarım Gerekli",
   serviceRowLabel: "vdpi sistem servisi",
   serviceBinaryPrefix: "İkili dosya:",
   serviceVersionNotInstalled: "Kurulu değil",
   serviceVersionUnknown: "Bilinmiyor",
   btnOpenInstallation: "Kuruluma Git",
+  btnRepairInInstallation: "Kurulumda Onar",
   btnUpdateEngine: "Motoru Güncelle",
   btnUpdatingEngine: "Güncelleniyor...",
   btnInstalling: "Kuruluyor...",
@@ -207,6 +215,10 @@ const tr: SettingsDict = {
   btnUninstallService: "Servisi Kaldır",
   serviceWintunMissingNote:
     "Windows'ta Tam PC (TUN) modu için wintun.dll gerekir. Kurulum sekmesinden wintun.dll ekleyin veya Proxy moduna geçin.",
+  serviceRepairNeededNote:
+    "Arka plan servis kaydı veya ikili dosya eksik görünüyor. Yapılandırmanızı kaybetmeden onarmak veya yeniden kurmak için Kurulum sekmesini açın.",
+  serviceBundleMissingNote:
+    "Paketli vdpi motor ikili dosyası uygulama klasöründe bulunamadı. Sürüm arşivini eksiksiz çıkarın veya antivirüs karantinasını kontrol edin.",
 
   // Appearance card
   appearanceHeading: "Görünüm",

@@ -13,7 +13,8 @@ use tracing::debug;
 
 const GITHUB_LATEST_RELEASE_URL: &str =
     "https://api.github.com/repos/Vuln-Inc/vdpi/releases/latest";
-const API_TIMEOUT: Duration = Duration::from_secs(20);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const API_TIMEOUT: Duration = Duration::from_secs(12);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_API_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SUMS_BODY_BYTES: usize = 256 * 1024;
@@ -474,7 +475,10 @@ pub fn parse_semver(raw: &str) -> Option<(u64, u64, u64)> {
 }
 
 fn parse_numeric_component(part: &str) -> Option<u64> {
-    if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+    if part.is_empty()
+        || (part.len() > 1 && part.starts_with('0'))
+        || !part.bytes().all(|b| b.is_ascii_digit())
+    {
         return None;
     }
     part.parse::<u64>().ok()
@@ -2445,6 +2449,7 @@ fn build_updater_client(target: RedirectTargetPolicy) -> Result<Client> {
         .user_agent(&user_agent)
         .https_only(true)
         .redirect(build_redirect_policy(target))
+        .connect_timeout(CONNECT_TIMEOUT)
         .timeout(API_TIMEOUT)
         .build()
         .context("failed to build HTTP client for updater")
@@ -2455,7 +2460,13 @@ fn extract_release_notes(body: Option<&str>) -> Vec<String> {
         notes
             .lines()
             .map(str::trim)
-            .filter(|line| line.starts_with("- ") || line.starts_with("* "))
+            .filter_map(|line| {
+                line.strip_prefix("- ")
+                    .or_else(|| line.strip_prefix("* "))
+                    .or_else(|| line.strip_prefix("• "))
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+            })
             .take(8)
             .map(str::to_string)
             .collect()
@@ -2463,9 +2474,11 @@ fn extract_release_notes(body: Option<&str>) -> Vec<String> {
     .unwrap_or_default()
 }
 
-/// Queries GitHub Releases for the latest `vdpi` release and compares it against
-/// the installed (or currently running) version without printing to stdout.
-pub async fn check_latest_release() -> Result<ReleaseCheckResult> {
+/// Queries GitHub Releases for the latest `vdpi` release and compares it strictly
+/// against `current_version` without invoking blocking service/binary detection.
+pub async fn check_latest_release_for_version(
+    current_version: &str,
+) -> Result<ReleaseCheckResult> {
     let client = build_updater_client(RedirectTargetPolicy::GitHubApi)?;
 
     debug!(
@@ -2492,13 +2505,8 @@ pub async fn check_latest_release() -> Result<ReleaseCheckResult> {
     let release: GitHubRelease = serde_json::from_str(&body_text)
         .context("failed to parse GitHub Releases API JSON response")?;
 
-    let installed = crate::service::detect_installed_info();
-    let baseline_raw = installed
-        .as_ref()
-        .and_then(|info| info.installed_version.as_deref())
-        .unwrap_or(env!("CARGO_PKG_VERSION"));
-    let current_version = format_display_version(baseline_raw);
-    let relation = compare_versions(&release.tag_name, baseline_raw);
+    let display_version = format_display_version(current_version);
+    let relation = compare_versions(&release.tag_name, current_version);
     let release_notes = extract_release_notes(release.body.as_deref());
 
     let asset_name = platform_asset_name().map(str::to_string);
@@ -2516,7 +2524,7 @@ pub async fn check_latest_release() -> Result<ReleaseCheckResult> {
         .map(|a| a.browser_download_url.clone());
 
     Ok(ReleaseCheckResult {
-        current_version,
+        current_version: display_version,
         latest_version: release.tag_name,
         release_url: release.html_url,
         release_notes,
@@ -2524,8 +2532,21 @@ pub async fn check_latest_release() -> Result<ReleaseCheckResult> {
         asset_name,
         asset_url,
         sums_url,
-        installed_service_path: installed.map(|info| info.binary_path),
+        installed_service_path: None,
     })
+}
+
+/// Queries GitHub Releases for the latest `vdpi` release and compares it against
+/// the installed (or currently running) version without printing to stdout.
+pub async fn check_latest_release() -> Result<ReleaseCheckResult> {
+    let installed = crate::service::detect_installed_info();
+    let baseline_raw = installed
+        .as_ref()
+        .and_then(|info| info.installed_version.as_deref())
+        .unwrap_or(env!("CARGO_PKG_VERSION"));
+    let mut result = check_latest_release_for_version(baseline_raw).await?;
+    result.installed_service_path = installed.map(|info| info.binary_path);
+    Ok(result)
 }
 
 /// Downloads, SHA-256 verifies, extracts, and installs the release described by `check`.
@@ -2653,7 +2674,7 @@ pub async fn run_update(check_only: bool, force: bool, _cfg: &RuntimeConfig) -> 
     if !check.release_notes.is_empty() {
         println!("Release notes   :");
         for bullet in &check.release_notes {
-            println!("  {bullet}");
+            println!("  - {bullet}");
         }
     }
 
@@ -2739,6 +2760,13 @@ mod tests {
         assert_eq!(parse_semver("0.3.x"), None);
         assert_eq!(parse_semver("garbage"), None);
         assert_eq!(parse_semver("0.3.4 trailing"), None);
+        // Reject multi-digit leading zeros (matching desktop parseSemverTuple)
+        assert_eq!(parse_semver("01.2.3"), None);
+        assert_eq!(parse_semver("0.03.4"), None);
+        assert_eq!(parse_semver("0.3.04"), None);
+        assert_eq!(parse_semver("v00.1.2"), None);
+        // Single-digit zero components remain valid
+        assert_eq!(parse_semver("0.0.0"), Some((0, 0, 0)));
     }
 
     #[test]
@@ -3389,8 +3417,9 @@ vdpi-windows-x86_64/WINTUN-LICENSE.txt
 ## Highlights
 - Item 1
 * Item 2
-  - Item 3
+  • Item 3
 Plain paragraph ignored
+-   
 - Item 4
 - Item 5
 - Item 6
@@ -3400,10 +3429,10 @@ Plain paragraph ignored
 ";
         let notes = extract_release_notes(Some(body));
         assert_eq!(notes.len(), 8);
-        assert_eq!(notes[0], "- Item 1");
-        assert_eq!(notes[1], "* Item 2");
-        assert_eq!(notes[2], "- Item 3");
-        assert_eq!(notes[7], "- Item 8");
+        assert_eq!(notes[0], "Item 1");
+        assert_eq!(notes[1], "Item 2");
+        assert_eq!(notes[2], "Item 3");
+        assert_eq!(notes[7], "Item 8");
         assert!(extract_release_notes(None).is_empty());
     }
 

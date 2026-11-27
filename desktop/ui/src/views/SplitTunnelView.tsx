@@ -12,8 +12,13 @@ import { IconPlus, IconRefresh, IconSearch } from "../components/Icons";
 import { InlineBanner } from "../components/InlineBanner";
 import type { ToastTone } from "../components/ToastStack";
 import { useLang, type ResolvedLanguage } from "../i18n/context";
+import { localizeActionMessage, tShell } from "../i18n/shell";
 import { localizePresetLabel, tSplit } from "../i18n/split";
-import { extractExecutableName, foldTurkish } from "../lib/format";
+import {
+  extractExecutableName,
+  foldTurkish,
+  scrubUrlsInText,
+} from "../lib/format";
 import {
   getAppIcons,
   getSplitTunnel,
@@ -24,6 +29,7 @@ import type {
   ActionResult,
   AppCategory,
   AppIconRequest,
+  DesktopStatusSnapshot,
   DiscoveredAppItem,
   EngineMode,
   NavTab,
@@ -39,8 +45,9 @@ export interface SplitTunnelViewProps {
   activeEngine?: EngineMode;
   platform?: "windows" | "macos" | "linux";
   serviceState?: ServiceState;
+  wintunReady?: boolean;
   busyAction?: string | null;
-  onSaved?: () => void | Promise<void>;
+  onSaved?: (snapshot?: DesktopStatusSnapshot) => void | Promise<void>;
   onPushToast?: (tone: ToastTone, message: string) => void;
   onDirtyChange?: (dirty: boolean) => void;
   onSwitchToTun?: () => void | Promise<void>;
@@ -63,13 +70,34 @@ interface ModeOption {
 }
 
 const MAX_SPLIT_TUNNEL_APPS = 256;
+const ICON_BATCH_SIZE = 32;
+const MAX_ICON_CACHE_ENTRIES = 512;
 
 const appIconCache = new Map<string, string>();
 const appIconAttempted = new Map<string, string>();
+const inFlightIconKeys = new Map<string, string>();
+
+function setBoundedMapEntry<K, V>(
+  map: Map<K, V>,
+  key: K,
+  value: V,
+  maxEntries: number,
+): void {
+  if (map.has(key)) {
+    map.delete(key);
+  }
+  map.set(key, value);
+  while (map.size > maxEntries) {
+    const oldestKey = map.keys().next().value;
+    if (oldestKey === undefined) break;
+    map.delete(oldestKey);
+  }
+}
 
 export function clearAppIconCache(): void {
   appIconCache.clear();
   appIconAttempted.clear();
+  inFlightIconKeys.clear();
 }
 
 const APP_NAME_COLLATOR = new Intl.Collator(undefined, {
@@ -966,6 +994,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
   activeEngine,
   platform,
   serviceState,
+  wintunReady,
   busyAction = null,
   onSaved,
   onPushToast,
@@ -1037,6 +1066,15 @@ export const SplitTunnelView = memo(function SplitTunnelView({
   const isNotInstalled = serviceState === "not_installed";
   const isNotInstalledRef = useRef(isNotInstalled);
   isNotInstalledRef.current = isNotInstalled;
+  const normalizedBusy = busyAction?.trim().toLowerCase() ?? null;
+  const isAnyBusy = normalizedBusy !== null;
+  const isAnyBusyRef = useRef(isAnyBusy);
+  isAnyBusyRef.current = isAnyBusy;
+  const isSwitchingToTun =
+    normalizedBusy === "switch-engine:tun" ||
+    normalizedBusy === "switching_engine" ||
+    (normalizedBusy !== null && normalizedBusy.startsWith("switch-engine"));
+  const tunBlockedByWintun = isWindows && wintunReady === false;
 
   useEffect(() => {
     ensureStyles();
@@ -1221,90 +1259,20 @@ export const SplitTunnelView = memo(function SplitTunnelView({
   );
   appByKeyRef.current = allIndexedApps.byKey;
 
-  useEffect(() => {
-    if (allIndexedApps.items.length === 0) return;
-
-    const missingRequests: AppIconRequest[] = [];
-    const requestSignatures = new Map<string, string>();
-    const cachedAdditions: Record<string, string> = {};
-    let hasCachedAdditions = false;
-
-    for (const { app } of allIndexedApps.items) {
-      const key = app.normalizedKey;
-      if (!key) continue;
-      const cached = appIconCache.get(key);
-      if (cached) {
-        cachedAdditions[key] = cached;
-        hasCachedAdditions = true;
-        continue;
+  const handleIconError = useCallback(
+    (normalizedKey: string, failedSrc: string) => {
+      if (appIconCache.get(normalizedKey) === failedSrc) {
+        appIconCache.delete(normalizedKey);
       }
-      const signature = `${app.path ?? ""}\0${app.exeName}`;
-      if (appIconAttempted.get(key) === signature) {
-        continue;
-      }
-      requestSignatures.set(key, signature);
-      missingRequests.push({
-        key,
-        path: app.path,
-        exeName: app.exeName,
-      });
-    }
-
-    if (hasCachedAdditions) {
       setIconsByKey((prev) => {
-        let changed = false;
-        for (const [k, v] of Object.entries(cachedAdditions)) {
-          if (prev[k] !== v) {
-            changed = true;
-            break;
-          }
-        }
-        return changed ? { ...prev, ...cachedAdditions } : prev;
+        if (prev[normalizedKey] !== failedSrc) return prev;
+        const next = { ...prev };
+        delete next[normalizedKey];
+        return next;
       });
-    }
-
-    if (missingRequests.length === 0 || typeof getAppIcons !== "function") {
-      return;
-    }
-
-    let cancelled = false;
-    void getAppIcons(missingRequests)
-      .then((fetched) => {
-        if (!fetched || typeof fetched !== "object") return;
-        for (const [key, signature] of requestSignatures.entries()) {
-          appIconAttempted.set(key, signature);
-        }
-        const updates: Record<string, string> = {};
-        let hasUpdates = false;
-        for (const [key, uri] of Object.entries(fetched)) {
-          if (typeof uri === "string" && uri.length > 0) {
-            appIconCache.set(key, uri);
-            updates[key] = uri;
-            hasUpdates = true;
-          }
-        }
-        if (cancelled || !mountedRef.current || !hasUpdates) {
-          return;
-        }
-        setIconsByKey((prev) => {
-          let changed = false;
-          for (const [k, v] of Object.entries(updates)) {
-            if (prev[k] !== v) {
-              changed = true;
-              break;
-            }
-          }
-          return changed ? { ...prev, ...updates } : prev;
-        });
-      })
-      .catch(() => {
-        // Icons are progressive enhancement; fall back silently to monograms.
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [allIndexedApps.items]);
+    },
+    [],
+  );
 
   const draftSelectedKeys = useMemo(
     () => new Set<string>(draftSelected.keys()),
@@ -1475,6 +1443,160 @@ export const SplitTunnelView = memo(function SplitTunnelView({
     selectedFilterKeys,
     sortVersion,
   ]);
+
+  useEffect(() => {
+    if (allIndexedApps.items.length === 0) return;
+
+    const prioritizedApps: DiscoveredAppItem[] = [];
+    const seenKeys = new Set<string>();
+    for (const app of visibleApps) {
+      if (app.normalizedKey && !seenKeys.has(app.normalizedKey)) {
+        seenKeys.add(app.normalizedKey);
+        prioritizedApps.push(app);
+      }
+    }
+    for (const { app } of allIndexedApps.items) {
+      if (app.normalizedKey && !seenKeys.has(app.normalizedKey)) {
+        seenKeys.add(app.normalizedKey);
+        prioritizedApps.push(app);
+      }
+    }
+
+    const missingRequests: AppIconRequest[] = [];
+    const requestSignatures = new Map<string, string>();
+    const cachedAdditions: Record<string, string> = {};
+    let hasCachedAdditions = false;
+
+    for (const app of prioritizedApps) {
+      const key = app.normalizedKey;
+      if (!key) continue;
+      const cached = appIconCache.get(key);
+      if (cached) {
+        cachedAdditions[key] = cached;
+        hasCachedAdditions = true;
+        continue;
+      }
+      const signature = `${app.path ?? ""}\0${app.exeName}`;
+      if (
+        appIconAttempted.get(key) === signature ||
+        inFlightIconKeys.get(key) === signature
+      ) {
+        continue;
+      }
+      requestSignatures.set(key, signature);
+      missingRequests.push({
+        key,
+        path: app.path,
+        exeName: app.exeName,
+      });
+    }
+
+    if (hasCachedAdditions) {
+      setIconsByKey((prev) => {
+        let changed = false;
+        for (const [k, v] of Object.entries(cachedAdditions)) {
+          if (prev[k] !== v) {
+            changed = true;
+            break;
+          }
+        }
+        return changed ? { ...prev, ...cachedAdditions } : prev;
+      });
+    }
+
+    if (missingRequests.length === 0 || typeof getAppIcons !== "function") {
+      return;
+    }
+
+    let cancelled = false;
+    const runBatches = async () => {
+      for (
+        let offset = 0;
+        offset < missingRequests.length;
+        offset += ICON_BATCH_SIZE
+      ) {
+        if (cancelled || !mountedRef.current) {
+          break;
+        }
+        const chunk = missingRequests.slice(offset, offset + ICON_BATCH_SIZE);
+        const chunkEntries: Array<{ key: string; signature: string }> = [];
+        const chunkToFetch: AppIconRequest[] = [];
+
+        for (const req of chunk) {
+          const sig = requestSignatures.get(req.key);
+          if (!sig) continue;
+          if (
+            appIconCache.has(req.key) ||
+            appIconAttempted.get(req.key) === sig ||
+            inFlightIconKeys.get(req.key) === sig
+          ) {
+            continue;
+          }
+          inFlightIconKeys.set(req.key, sig);
+          chunkEntries.push({ key: req.key, signature: sig });
+          chunkToFetch.push(req);
+        }
+
+        if (chunkToFetch.length === 0) {
+          continue;
+        }
+
+        try {
+          const fetched = await getAppIcons(chunkToFetch);
+          if (fetched && typeof fetched === "object") {
+            for (const { key, signature } of chunkEntries) {
+              setBoundedMapEntry(
+                appIconAttempted,
+                key,
+                signature,
+                MAX_ICON_CACHE_ENTRIES,
+              );
+            }
+            const updates: Record<string, string> = {};
+            let hasUpdates = false;
+            for (const [key, uri] of Object.entries(fetched)) {
+              if (typeof uri === "string" && uri.length > 0) {
+                setBoundedMapEntry(
+                  appIconCache,
+                  key,
+                  uri,
+                  MAX_ICON_CACHE_ENTRIES,
+                );
+                updates[key] = uri;
+                hasUpdates = true;
+              }
+            }
+            if (mountedRef.current && hasUpdates) {
+              setIconsByKey((prev) => {
+                let changed = false;
+                for (const [k, v] of Object.entries(updates)) {
+                  if (prev[k] !== v) {
+                    changed = true;
+                    break;
+                  }
+                }
+                return changed ? { ...prev, ...updates } : prev;
+              });
+            }
+          }
+        } catch {
+          // Leave failed or timed-out batches unattempted so they can be retried.
+        } finally {
+          for (const { key, signature } of chunkEntries) {
+            if (inFlightIconKeys.get(key) === signature) {
+              inFlightIconKeys.delete(key);
+            }
+          }
+        }
+      }
+    };
+
+    void runBatches();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [allIndexedApps.items, visibleApps]);
 
   const diff = useMemo(() => {
     const modeChanged = draftMode !== savedMode;
@@ -1825,7 +1947,8 @@ export const SplitTunnelView = memo(function SplitTunnelView({
   };
 
   const handleSave = useCallback(async () => {
-    if (savingRef.current || !diffHasChangesRef.current) return;
+    if (savingRef.current || isAnyBusyRef.current || !diffHasChangesRef.current)
+      return;
 
     const currentMode = draftModeRef.current;
     const currentSelected = draftSelectedRef.current;
@@ -1856,19 +1979,64 @@ export const SplitTunnelView = memo(function SplitTunnelView({
       });
       if (!mountedRef.current) return;
 
+      const localizedResultMessage = result.message?.trim()
+        ? localizeActionMessage(
+            langRef.current,
+            scrubUrlsInText(result.message.trim()),
+          )
+        : null;
+
       if (result.cancelled) {
         onPushToast?.(
           "info",
-          result.message || tSplit(langRef.current, "saveCancelled"),
+          localizedResultMessage || tSplit(langRef.current, "saveCancelled"),
         );
+        if (result.snapshot) {
+          try {
+            await onSaved?.(result.snapshot);
+          } catch {
+            // Parent refresh errors are handled upstream.
+          }
+        }
+        return;
+      }
+
+      if (
+        !result.ok &&
+        (result.code === "busy" || result.code === "shutting_down")
+      ) {
+        setErrorBanner(null);
+        onPushToast?.(
+          "info",
+          tShell(
+            langRef.current,
+            result.code === "shutting_down"
+              ? "actionShuttingDown"
+              : "actionBusy",
+          ),
+        );
+        if (result.snapshot) {
+          try {
+            await onSaved?.(result.snapshot);
+          } catch {
+            // Parent refresh errors are handled upstream.
+          }
+        }
         return;
       }
 
       if (!result.ok) {
         const message =
-          result.message || tSplit(langRef.current, "saveFailed");
+          localizedResultMessage || tSplit(langRef.current, "saveFailed");
         setErrorBanner(message);
         onPushToast?.("error", message);
+        if (result.snapshot) {
+          try {
+            await onSaved?.(result.snapshot);
+          } catch {
+            // Parent refresh errors are handled upstream.
+          }
+        }
         return;
       }
 
@@ -1890,7 +2058,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
         );
       } else {
         const successMessage =
-          result.message ||
+          localizedResultMessage ||
           tSplit(
             langRef.current,
             result.needsRestart ? "saveSuccessRestart" : "saveSuccess",
@@ -1910,15 +2078,17 @@ export const SplitTunnelView = memo(function SplitTunnelView({
       }
 
       try {
-        await onSaved?.();
+        await onSaved?.(result.snapshot);
       } catch {
         // Parent refresh errors are handled upstream; keep local saved state intact.
       }
     } catch (error) {
       if (!mountedRef.current) return;
-      const message = getErrorMessage(
-        error,
-        tSplit(langRef.current, "saveFailed"),
+      const message = localizeActionMessage(
+        langRef.current,
+        scrubUrlsInText(
+          getErrorMessage(error, tSplit(langRef.current, "saveFailed")),
+        ),
       );
       setErrorBanner(message);
       onPushToast?.("error", message);
@@ -1953,7 +2123,11 @@ export const SplitTunnelView = memo(function SplitTunnelView({
       const isSaveKey =
         event.key.toLowerCase() === "s" || event.code === "KeyS";
       if ((event.ctrlKey || event.metaKey) && isSaveKey) {
-        if (!diffHasChangesRef.current || savingRef.current) {
+        if (
+          !diffHasChangesRef.current ||
+          savingRef.current ||
+          isAnyBusyRef.current
+        ) {
           return;
         }
         event.preventDefault();
@@ -2031,11 +2205,6 @@ export const SplitTunnelView = memo(function SplitTunnelView({
   const showIncludeEmptyWarning =
     draftMode === "include" && draftSelectedKeys.size === 0;
 
-  const normalizedBusy = busyAction?.trim().toLowerCase() ?? null;
-  const isAnyBusy = normalizedBusy !== null;
-  const isSwitchingToTun =
-    normalizedBusy === "switch-engine:tun" ||
-    (normalizedBusy !== null && normalizedBusy.startsWith("switch-engine"));
   const atAppLimit =
     draftMode !== "all" && counts.selected >= MAX_SPLIT_TUNNEL_APPS;
 
@@ -2072,16 +2241,26 @@ export const SplitTunnelView = memo(function SplitTunnelView({
         <InlineBanner
           tone="warn"
           title={tSplit(lang, "proxyBannerTitle")}
-          description={tSplit(lang, "proxyBannerDesc")}
+          description={tSplit(
+            lang,
+            tunBlockedByWintun
+              ? "proxyBannerDescWintunMissing"
+              : "proxyBannerDesc",
+          )}
           action={
             onSwitchToTun ? (
               <button
                 type="button"
                 className="inline-banner__action"
-                disabled={isAnyBusy || saving}
+                disabled={isAnyBusy || saving || tunBlockedByWintun}
+                title={
+                  tunBlockedByWintun
+                    ? tSplit(lang, "proxyBannerWintunMissingTitle")
+                    : undefined
+                }
                 aria-busy={isSwitchingToTun ? true : undefined}
                 onClick={() => {
-                  if (!isAnyBusy && !saving) {
+                  if (!isAnyBusy && !saving && !tunBlockedByWintun) {
                     void onSwitchToTun();
                   }
                 }}
@@ -2235,7 +2414,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
               type="button"
               className="split-btn"
               aria-expanded={showCustomForm}
-              aria-controls="split-custom-app-form"
+              aria-controls={showCustomForm ? "split-custom-app-form" : undefined}
               disabled={saving}
               onClick={() => {
                 setShowCustomForm((prev) => {
@@ -2286,6 +2465,10 @@ export const SplitTunnelView = memo(function SplitTunnelView({
                   type="text"
                   className="split-custom-row__input"
                   aria-label={tSplit(lang, "ariaCustomAppInput")}
+                  aria-invalid={Boolean(customError)}
+                  aria-describedby={
+                    customError ? "split-custom-app-error" : undefined
+                  }
                   placeholder={customPlaceholder}
                   value={customInput}
                   disabled={saving}
@@ -2311,7 +2494,11 @@ export const SplitTunnelView = memo(function SplitTunnelView({
                 </button>
               </div>
               {customError ? (
-                <p className="split-custom-error" role="alert">
+                <p
+                  id="split-custom-app-error"
+                  className="split-custom-error"
+                  role="alert"
+                >
                   {customError}
                 </p>
               ) : null}
@@ -2440,6 +2627,7 @@ export const SplitTunnelView = memo(function SplitTunnelView({
                   iconSrc={iconsByKey[app.normalizedKey]}
                   disabled={saving}
                   onToggle={handleToggleApp}
+                  onIconError={handleIconError}
                 />
               ))}
             </div>
@@ -2495,7 +2683,8 @@ export const SplitTunnelView = memo(function SplitTunnelView({
             <button
               type="button"
               className="split-btn split-btn--primary"
-              disabled={saving}
+              disabled={saving || isAnyBusy}
+              aria-busy={saving || undefined}
               onClick={() => void handleSave()}
             >
               {saving ? (

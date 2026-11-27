@@ -19,11 +19,66 @@ jobs:
     name: Test (${{ matrix.os }})
     if: ${{ github.event_name != 'workflow_dispatch' || !inputs.ios_only }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
     strategy:
       matrix:
         os: [macos-latest, ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
+      - name: Verify Manifest Version Parity
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          import sys
+          import tomllib
+
+          cargo = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))
+          desktop_cargo = tomllib.loads(pathlib.Path("desktop/src-tauri/Cargo.toml").read_text(encoding="utf-8"))
+          tauri_conf = json.loads(pathlib.Path("desktop/src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
+          ui_pkg = json.loads(pathlib.Path("desktop/ui/package.json").read_text(encoding="utf-8"))
+          ios_yml = pathlib.Path("ios/project.yml").read_text(encoding="utf-8")
+          changelog = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+
+          ios_match = re.search(r'^\s*MARKETING_VERSION:\s*"?([^"\s#]+)"?\s*$', ios_yml, re.M)
+          if not ios_match:
+              sys.exit("ERROR: Could not read MARKETING_VERSION from ios/project.yml")
+
+          changelog_match = re.search(r'^## \[([0-9]+\.[0-9]+\.[0-9]+[^\]]*)\]', changelog, re.M)
+          if not changelog_match:
+              sys.exit("ERROR: Could not find latest version heading in CHANGELOG.md")
+
+          versions = {
+              "Cargo.toml": cargo["workspace"]["package"]["version"],
+              "desktop/src-tauri/Cargo.toml": desktop_cargo["package"]["version"],
+              "desktop/src-tauri/tauri.conf.json": tauri_conf["version"],
+              "desktop/ui/package.json": ui_pkg["version"],
+              "ios/project.yml": ios_match.group(1),
+              "CHANGELOG.md": changelog_match.group(1),
+          }
+
+          tag = os.environ.get("RELEASE_TAG", "").strip()
+          if tag:
+              if not tag.startswith("v"):
+                  sys.exit(f"ERROR: Release tag '{tag}' must start with 'v'")
+              versions[f"tag ({tag})"] = tag[1:]
+
+          for name, ver in versions.items():
+              print(f"  {name}: {ver}")
+
+          unique = set(versions.values())
+          if len(unique) != 1:
+              sys.exit(f"ERROR: Version mismatch across manifests: {versions}")
+
+          print(f"Verified manifest version parity: {next(iter(unique))}")
+          PY
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -63,6 +118,7 @@ jobs:
     name: Build & Verify Android APK
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -78,11 +134,17 @@ jobs:
         with:
           packages: "platforms;android-35 build-tools;35.0.0 ndk;27.2.12479018"
       - name: Configure Android NDK Path
-        run: echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/27.2.12479018" >> "$GITHUB_ENV"
+        run: |
+          set -euo pipefail
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/27.2.12479018" >> "$GITHUB_ENV"
       - name: Install cargo-ndk
-        run: cargo install cargo-ndk --version 4.1.2 --locked
+        run: |
+          set -euo pipefail
+          cargo install cargo-ndk --version 4.1.2 --locked
       - name: Build Native Rust JNI Libraries
-        run: ./android/scripts/build-native.sh
+        run: |
+          set -euo pipefail
+          ./android/scripts/build-native.sh
       - name: Decode Optional Release Keystore
         env:
           IS_TAG_RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') }}
@@ -115,9 +177,12 @@ jobs:
           VDPI_KEYSTORE_PASSWORD: ${{ secrets.VDPI_KEYSTORE_PASSWORD }}
           VDPI_KEY_ALIAS: ${{ secrets.VDPI_KEY_ALIAS }}
           VDPI_KEY_PASSWORD: ${{ secrets.VDPI_KEY_PASSWORD }}
-        run: ./gradlew testDebugUnitTest lintRelease assembleRelease --no-daemon
+        run: |
+          set -euo pipefail
+          ./gradlew testDebugUnitTest lintRelease assembleRelease --no-daemon
       - name: Verify APK Native ABIs & Package Artifact
         run: |
+          set -euo pipefail
           APK="android/app/build/outputs/apk/release/app-release.apk"
           for abi in arm64-v8a armeabi-v7a x86_64; do
             unzip -l "$APK" | grep -q "lib/${abi}/libvdpi_android.so" || {
@@ -137,6 +202,7 @@ jobs:
     needs: test
     if: ${{ !cancelled() && (needs.test.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.ios_only)) }}
     runs-on: macos-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -223,6 +289,7 @@ jobs:
           ls -lh ../dist/ios/vdpi-ios-unsigned.ipa
       - name: Package VdpiCore.xcframework Artifact
         run: |
+          set -euo pipefail
           mkdir -p dist/ios
           ditto -c -k --sequesterRsrc --keepParent ios/Frameworks/VdpiCore.xcframework dist/ios/VdpiCore.xcframework.zip
       - uses: actions/upload-artifact@v4
@@ -239,6 +306,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: test
     runs-on: windows-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -318,6 +386,9 @@ jobs:
             throw "VDPI_EMBED_WINTUN_DLL must not be set for official Windows release builds"
           }
           cargo build --locked --release --target x86_64-pc-windows-msvc --bin vdpi
+          if ($LASTEXITCODE -ne 0) {
+            throw "cargo build vdpi.exe failed with exit code $LASTEXITCODE"
+          }
       - name: Package Windows Zip
         shell: pwsh
         run: |
@@ -369,6 +440,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: test
     runs-on: macos-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -376,6 +448,7 @@ jobs:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - name: Build Universal macOS Binary
         run: |
+          set -euo pipefail
           cargo build --locked --release --target aarch64-apple-darwin
           cargo build --locked --release --target x86_64-apple-darwin
           mkdir -p dist/mac
@@ -396,6 +469,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -403,10 +477,12 @@ jobs:
           targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
       - name: Install Cross Toolchains
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
       - name: Build & Package Static Linux Binaries
         run: |
+          set -euo pipefail
           cargo build --locked --release --target x86_64-unknown-linux-musl
           CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc \
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
@@ -433,6 +509,7 @@ jobs:
     name: Test Desktop GUI (${{ matrix.os }})
     if: ${{ github.event_name != 'workflow_dispatch' || !inputs.ios_only }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
     strategy:
       matrix:
         os: [ubuntu-22.04, windows-latest, macos-latest]
@@ -486,6 +563,7 @@ jobs:
     name: Build Desktop GUI (Windows x86_64)
     needs: [test, test-desktop]
     runs-on: windows-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -591,11 +669,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "tauri --version failed with exit code $LASTEXITCODE"
           }
-      - name: Stage Bundled Engine & Wintun Resources for NSIS
+      - name: Verify Desktop & CLI Version Parity
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $expectedDllSha256 = 'e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce'
           $cliBin = 'target/x86_64-pc-windows-msvc/release/vdpi.exe'
           if (-not (Test-Path -LiteralPath $cliBin)) {
             throw "Missing built CLI binary at $cliBin"
@@ -641,20 +718,6 @@ jobs:
             throw "CLI version mismatch: '$cliVersionOut' does not contain expected version '$expectedVersion'"
           }
           Write-Host "Verified vdpi.exe --version ('$cliVersionOut') matches tauri.conf.json ($expectedVersion), Cargo.toml ($workspaceCargoVersion), and desktop/src-tauri/Cargo.toml ($desktopCargoVersion)"
-
-          $resourcesDir = 'desktop/src-tauri/resources'
-          Remove-Item -LiteralPath $resourcesDir -Recurse -Force -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force -Path $resourcesDir | Out-Null
-
-          Copy-Item -LiteralPath $cliBin -Destination (Join-Path $resourcesDir 'vdpi.exe')
-          Copy-Item -LiteralPath $env:WINTUN_DLL_PATH -Destination (Join-Path $resourcesDir 'wintun.dll')
-          Copy-Item -LiteralPath $env:WINTUN_LICENSE_PATH -Destination (Join-Path $resourcesDir 'WINTUN-LICENSE.txt')
-
-          $stagedDllSha256 = (Get-FileHash -LiteralPath (Join-Path $resourcesDir 'wintun.dll') -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($stagedDllSha256 -ne $expectedDllSha256) {
-            throw "Staged wintun.dll SHA-256 mismatch: expected $expectedDllSha256, got $stagedDllSha256"
-          }
-          Write-Host "Staged vdpi.exe, SHA-256-verified wintun.dll, and WINTUN-LICENSE.txt into $resourcesDir"
       - name: Build Tauri Desktop App (Windows Portable)
         shell: pwsh
         run: |
@@ -750,6 +813,7 @@ jobs:
     name: Build Desktop GUI (macOS Universal)
     needs: [test, test-desktop]
     runs-on: macos-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -911,6 +975,7 @@ jobs:
     name: Build Desktop GUI (Linux x86_64)
     needs: [test, test-desktop]
     runs-on: ubuntu-22.04
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -1071,10 +1136,63 @@ jobs:
     permissions:
       contents: write
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Verify Tag & Manifest Version Parity
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          import sys
+          import tomllib
+
+          tag = os.environ.get("RELEASE_TAG", "").strip()
+          if not tag.startswith("v"):
+              sys.exit(f"ERROR: Release tag '{tag}' must start with 'v'")
+          expected = tag[1:]
+
+          cargo = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))
+          desktop_cargo = tomllib.loads(pathlib.Path("desktop/src-tauri/Cargo.toml").read_text(encoding="utf-8"))
+          tauri_conf = json.loads(pathlib.Path("desktop/src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
+          ui_pkg = json.loads(pathlib.Path("desktop/ui/package.json").read_text(encoding="utf-8"))
+          ios_yml = pathlib.Path("ios/project.yml").read_text(encoding="utf-8")
+          changelog = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+
+          ios_match = re.search(r'^\s*MARKETING_VERSION:\s*"?([^"\s#]+)"?\s*$', ios_yml, re.M)
+          if not ios_match:
+              sys.exit("ERROR: Could not read MARKETING_VERSION from ios/project.yml")
+
+          changelog_match = re.search(r'^## \[([0-9]+\.[0-9]+\.[0-9]+[^\]]*)\]', changelog, re.M)
+          if not changelog_match:
+              sys.exit("ERROR: Could not find latest version heading in CHANGELOG.md")
+
+          versions = {
+              f"tag ({tag})": expected,
+              "Cargo.toml": cargo["workspace"]["package"]["version"],
+              "desktop/src-tauri/Cargo.toml": desktop_cargo["package"]["version"],
+              "desktop/src-tauri/tauri.conf.json": tauri_conf["version"],
+              "desktop/ui/package.json": ui_pkg["version"],
+              "ios/project.yml": ios_match.group(1),
+              "CHANGELOG.md": changelog_match.group(1),
+          }
+
+          for name, ver in versions.items():
+              print(f"  {name}: {ver}")
+
+          mismatches = {k: v for k, v in versions.items() if v != expected}
+          if mismatches:
+              sys.exit(f"ERROR: Release tag '{tag}' does not match manifests: {mismatches}")
+
+          print(f"Verified release tag {tag} matches all manifests ({expected})")
+          PY
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*
@@ -1146,6 +1264,29 @@ jobs:
           } > release-notes.md
 
           cd release-assets
+          FORBIDDEN_ASSETS="$(find . -type f \( -iname '*.exe' -o -iname '*setup*' -o -iname '*nsis*' -o -iname '*.msi' \) | sort)"
+          if [ -n "$FORBIDDEN_ASSETS" ]; then
+            echo "ERROR: Forbidden Windows installer/executable artifact(s) found in release-assets:" >&2
+            printf '%s\n' "$FORBIDDEN_ASSETS" >&2
+            exit 1
+          fi
+
+          EXPECTED_WINTUN_SHA256="e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce"
+          WINTUN_VERIFY_DIR="$(mktemp -d "${RUNNER_TEMP:-/tmp}/vdpi-wintun-verify.XXXXXX")"
+          trap 'rm -rf "$WINTUN_VERIFY_DIR"' EXIT
+          for win_zip in vdpi-windows-x86_64.zip vdpi-desktop-windows-x86_64-portable.zip; do
+            zip_tmp="${WINTUN_VERIFY_DIR}/${win_zip%.zip}"
+            mkdir -p "$zip_tmp"
+            unzip -q -o "$win_zip" wintun.dll -d "$zip_tmp"
+            test -s "${zip_tmp}/wintun.dll"
+            actual_wintun_sha="$(sha256sum "${zip_tmp}/wintun.dll" | awk '{print $1}')"
+            if [ "$actual_wintun_sha" != "$EXPECTED_WINTUN_SHA256" ]; then
+              echo "ERROR: ${win_zip} wintun.dll SHA-256 mismatch: expected ${EXPECTED_WINTUN_SHA256}, got ${actual_wintun_sha}" >&2
+              exit 1
+            fi
+            echo "Verified ${win_zip} wintun.dll SHA-256 (${actual_wintun_sha})"
+          done
+
           ASSETS=(
             vdpi-windows-x86_64.zip
             vdpi-macos-universal.tar.gz
@@ -1159,6 +1300,11 @@ jobs:
             vdpi-desktop-linux-x86_64.AppImage
           )
           sha256sum "${ASSETS[@]}" > SHA256SUMS.txt
+          printf '%s  wintun.dll\n' "$EXPECTED_WINTUN_SHA256" >> SHA256SUMS.txt
+          test ! -e wintun.dll
+          grep -Fx "${EXPECTED_WINTUN_SHA256}  wintun.dll" SHA256SUMS.txt >/dev/null
+          sha256sum --ignore-missing -c SHA256SUMS.txt
+
           PRERELEASE_FLAG=""
           if [[ "$TAG" == *-* ]]; then
             PRERELEASE_FLAG="--prerelease"

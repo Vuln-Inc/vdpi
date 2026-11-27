@@ -3,9 +3,11 @@ package com.vulninc.vdpi.ui.i18n
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.staticCompositionLocalOf
 import com.vulninc.vdpi.data.AppLanguage
+import com.vulninc.vdpi.data.SettingsImportException
 import com.vulninc.vdpi.data.SplitTunnelMode
 import com.vulninc.vdpi.data.ThemePreference
 import com.vulninc.vdpi.engine.DesyncMode
+import com.vulninc.vdpi.vpn.TunnelPhase
 import java.util.Locale
 
 @Immutable
@@ -113,6 +115,25 @@ data class VdpiStrings(
     val logsEmptySubtitle: String,
     val logsClipboardLabel: String,
 
+    // ── Diagnostics Report ──
+    val reportHeader: String,
+    val reportAppVersionLabel: String,
+    val reportEngineLabel: String,
+    val reportTunnelStateLabel: String,
+    val reportActiveStageLabel: String,
+    val reportDesyncModeLabel: String,
+    val reportChunkParam: String,
+    val reportIpv4OnlyLabel: String,
+    val reportStateEnabled: String,
+    val reportStateDisabled: String,
+    val reportYes: String,
+    val reportNo: String,
+    val reportBypassDomainsLabel: String,
+    val reportProbesLabel: String,
+    val reportProbesNotRun: String,
+    val reportBadgePass: String,
+    val reportBadgeFail: String,
+
     // ── Apps (Split Tunneling) ──
     val appsTitle: String,
     val splitModeBypassSelected: String,
@@ -215,7 +236,17 @@ data class VdpiStrings(
     val feedbackSystemVpnUnavailable: String,
     val feedbackCacheCleared: String,
     val feedbackCacheClearFailed: String,
+    val importEmpty: String,
+    val importTooLarge: String,
     val importInvalidJson: String,
+    val importUnrecognizedFormat: String,
+    val importInvalidSchema: String,
+    val importUnsupportedSchemaPrefix: String,
+    val importInvalidDesyncModePrefix: String,
+    val importInvalidDnsPrefix: String,
+    val importInvalidSplitModePrefix: String,
+    val importInvalidThemePrefix: String,
+    val importInvalidLanguagePrefix: String,
     val importSuccess: String,
     val importSuccessReconnect: String,
 
@@ -389,6 +420,76 @@ data class VdpiStrings(
     fun importFailed(reason: String): String =
         if (isTurkish) "İçe aktarma başarısız: $reason" else "Import failed: $reason"
 
+    fun importErrorReason(error: SettingsImportException): String = when (error) {
+        is SettingsImportException.Empty -> importEmpty
+        is SettingsImportException.TooLarge -> importTooLarge
+        is SettingsImportException.InvalidJson -> importInvalidJson
+        is SettingsImportException.UnrecognizedFormat -> importUnrecognizedFormat
+        is SettingsImportException.UnsupportedSchema -> {
+            if (error.version != null) {
+                "$importUnsupportedSchemaPrefix: ${error.version}"
+            } else {
+                importInvalidSchema
+            }
+        }
+        is SettingsImportException.InvalidDesyncMode ->
+            withOptionalDetail(importInvalidDesyncModePrefix, error.value)
+        is SettingsImportException.InvalidDns ->
+            withOptionalDetail(importInvalidDnsPrefix, error.redactedValue)
+        is SettingsImportException.InvalidSplitMode ->
+            withOptionalDetail(importInvalidSplitModePrefix, error.value)
+        is SettingsImportException.InvalidTheme ->
+            withOptionalDetail(importInvalidThemePrefix, error.value)
+        is SettingsImportException.InvalidLanguage ->
+            withOptionalDetail(importInvalidLanguagePrefix, error.value)
+    }
+
+    private fun withOptionalDetail(prefix: String, detail: String): String =
+        if (detail.isNotBlank()) "$prefix: $detail" else prefix
+
+    fun doctorCheckName(rawName: String): String {
+        if (!isTurkish) return rawName
+        return when (rawName) {
+            "Engine Init" -> "Motor Başlatma"
+            "DNS Ring" -> "DNS Halkası"
+            "Native Library" -> "Yerel Kütüphane"
+            else -> rawName
+        }
+    }
+
+    fun reportTunnelPhase(phase: TunnelPhase): String = if (isTurkish) {
+        when (phase) {
+            TunnelPhase.CONNECTED -> statusConnected
+            TunnelPhase.CONNECTING -> statusConnecting
+            TunnelPhase.DISCONNECTED -> statusNotConnected
+            TunnelPhase.ERROR -> statusTunnelError
+        }
+    } else {
+        phase.name
+    }
+
+    fun reportBypassDomainsValue(count: Int): String =
+        if (isTurkish) "$count yapılandırıldı (gizlendi)" else "$count configured (redacted)"
+
+    fun reportSplitTunnelMode(mode: SplitTunnelMode): String =
+        if (isTurkish) splitTunnelModeLabel(mode) else mode.label
+
+    fun reportSplitTunnelValue(mode: SplitTunnelMode, appCount: Int): String =
+        if (isTurkish) {
+            "${reportSplitTunnelMode(mode)} ($appCount uygulama, gizlendi)"
+        } else {
+            "${reportSplitTunnelMode(mode)} ($appCount apps, redacted)"
+        }
+
+    fun reportProbesSummary(ok: Boolean, checkCount: Int): String {
+        val badge = if (ok) reportBadgePass else reportBadgeFail
+        return if (isTurkish) {
+            "$reportProbesLabel: $badge ($checkCount kontrol)"
+        } else {
+            "$reportProbesLabel: $badge ($checkCount checks)"
+        }
+    }
+
     companion object {
         fun resolve(
             language: AppLanguage,
@@ -506,6 +607,24 @@ val EnglishStrings = VdpiStrings(
     logsEmptySubtitle = "Connect the tunnel to record activity.",
     logsClipboardLabel = "vdpi engine logs",
 
+    reportHeader = "vdpi Android Diagnostics Report",
+    reportAppVersionLabel = "App Version",
+    reportEngineLabel = "Engine",
+    reportTunnelStateLabel = "Tunnel State",
+    reportActiveStageLabel = "Active Stage",
+    reportDesyncModeLabel = "Desync Mode",
+    reportChunkParam = "chunk",
+    reportIpv4OnlyLabel = "IPv4-only",
+    reportStateEnabled = "enabled",
+    reportStateDisabled = "disabled",
+    reportYes = "yes",
+    reportNo = "no",
+    reportBypassDomainsLabel = "Bypass Domains",
+    reportProbesLabel = "Diagnostic Probes",
+    reportProbesNotRun = "not run yet",
+    reportBadgePass = "PASS",
+    reportBadgeFail = "FAIL",
+
     appsTitle = "Apps",
     splitModeBypassSelected = "Bypass Selected",
     splitModeOnlySelected = "Only Selected",
@@ -605,7 +724,17 @@ val EnglishStrings = VdpiStrings(
     feedbackSystemVpnUnavailable = "System VPN settings unavailable on this device",
     feedbackCacheCleared = "Adaptive cache cleared",
     feedbackCacheClearFailed = "Failed to clear adaptive cache",
+    importEmpty = "Settings JSON is empty",
+    importTooLarge = "Settings JSON exceeds maximum size",
     importInvalidJson = "Invalid settings JSON",
+    importUnrecognizedFormat = "Unrecognized settings backup format",
+    importInvalidSchema = "Invalid backup schema version",
+    importUnsupportedSchemaPrefix = "Unsupported backup schema version",
+    importInvalidDesyncModePrefix = "Unsupported desync mode",
+    importInvalidDnsPrefix = "Invalid DNS address",
+    importInvalidSplitModePrefix = "Unsupported split tunnel mode",
+    importInvalidThemePrefix = "Unsupported theme preference",
+    importInvalidLanguagePrefix = "Unsupported language preference",
     importSuccess = "Settings imported",
     importSuccessReconnect = "Settings imported \u00B7 reconnect to apply",
 
@@ -654,11 +783,11 @@ val TurkishStrings = VdpiStrings(
     actionDownload = "İndir",
     actionCopy = "Kopyala",
     actionCopied = "Kopyalandı",
-    actionRerun = "Tekrarla",
+    actionRerun = "Tekrar Çalıştır",
     actionClearSearch = "Aramayı Temizle",
     valueEnabled = "Açık",
     valueOff = "Kapalı",
-    valueAllowed = "İzinli",
+    valueAllowed = "İzin Verildi",
     valueAllApps = "Tüm Uygulamalar",
     customDohLabel = "özel DoH",
 
@@ -714,23 +843,41 @@ val TurkishStrings = VdpiStrings(
     stageCombo = "Kombo",
     stageOobSni = "OOB SNI",
     stageMultiOob = "Çoklu + OOB",
-    stageFineFragment = "İnce Parça",
+    stageFineFragment = "İnce Parçalama",
     stageDeepStorm = "Derin Fırtına",
     stageSlowSni = "Yavaş SNI",
-    stagePassthrough = "Doğrudan",
+    stagePassthrough = "Doğrudan Geçiş",
 
     diagnosticsTitle = "Tanılama",
     diagnosticsChecksHeader = "Kontroller",
     diagnosticsRunning = "DNS, DoH ve TLS bağlantısı doğrulanıyor...",
-    diagnosticsEmptyReturned = "Tanılama sonucu alınamadı. Yeniden denemek için Tekrarla'ya dokunun.",
-    diagnosticsTapToRun = "DNS, DoH ve TLS uç noktalarını doğrulamak için Tekrarla'ya dokunun.",
+    diagnosticsEmptyReturned = "Tanılama sonucu alınamadı. Yeniden denemek için Tekrar Çalıştır'a dokunun.",
+    diagnosticsTapToRun = "DNS, DoH ve TLS uç noktalarını doğrulamak için Tekrar Çalıştır'a dokunun.",
     diagnosticsShareSubject = "vdpi Tanılama Raporu",
     diagnosticsShareChooser = "Tanılamayı Paylaş",
     cdShareDiagnostics = "Tanılama raporunu paylaş",
-    logsTitle = "Motor Günlüğü",
+    logsTitle = "Motor Günlükleri",
     logsEmptyTitle = "Henüz Motor Günlüğü Yok",
     logsEmptySubtitle = "Etkinliği kaydetmek için tüneli bağlayın.",
-    logsClipboardLabel = "vdpi motor günlüğü",
+    logsClipboardLabel = "vdpi motor günlükleri",
+
+    reportHeader = "vdpi Android Tanılama Raporu",
+    reportAppVersionLabel = "Uygulama Sürümü",
+    reportEngineLabel = "Motor",
+    reportTunnelStateLabel = "Tünel Durumu",
+    reportActiveStageLabel = "Etkin Aşama",
+    reportDesyncModeLabel = "Desync Modu",
+    reportChunkParam = "parça",
+    reportIpv4OnlyLabel = "Yalnızca IPv4",
+    reportStateEnabled = "etkin",
+    reportStateDisabled = "devre dışı",
+    reportYes = "evet",
+    reportNo = "hayır",
+    reportBypassDomainsLabel = "İstisna Alan Adları",
+    reportProbesLabel = "Tanılama Testleri",
+    reportProbesNotRun = "henüz çalıştırılmadı",
+    reportBadgePass = "BAŞARILI",
+    reportBadgeFail = "BAŞARISIZ",
 
     appsTitle = "Uygulamalar",
     splitModeBypassSelected = "Seçilileri Atla",
@@ -760,7 +907,7 @@ val TurkishStrings = VdpiStrings(
     desyncTlsRecordSummary = "ClientHello paketini iki RFC TLS kaydına böler",
     desyncFragmentLabel = "Parçalama",
     desyncFragmentSummary = "Tek dış TLS kaydını SNI sınırlarından dilimler",
-    desyncSplitLabel = "TCP Bölme",
+    desyncSplitLabel = "Bölme",
     desyncSplitSummary = "İlk pakette bayt düzeyinde TCP bölme uygular",
     labelChunkSize = "Parça Boyutu",
     cdDecreaseChunkSize = "Parça boyutunu azalt",
@@ -770,7 +917,7 @@ val TurkishStrings = VdpiStrings(
     sectionDnsPrivacy = "DNS ve Gizlilik",
     placeholderCustomDns = "Özel DNS (IP veya https://...)",
     errorInvalidDns = "Geçerli bir IPv4, IPv6 veya https:// DoH adresi girin",
-    labelDoh = "DNS over HTTPS",
+    labelDoh = "HTTPS Üzerinden DNS",
     subtitleDohRequired = "HTTPS DoH adresi için zorunlu",
     subtitleDohDefault = "DNS sorgularını otomatik yedeklemeyle şifreler",
     labelBlockQuic = "QUIC Engelle",
@@ -779,7 +926,7 @@ val TurkishStrings = VdpiStrings(
     subtitleIpv4Only = "AAAA sorgularını ve IPv6 tünel rotalarını atlar",
     footerDnsPrivacy = "QUIC engelleme, HTTP/3 trafiğini DPI desync uygulanan TCP'ye yönlendirir.",
 
-    sectionBypassDomains = "Hariç Tutulan Alan Adları",
+    sectionBypassDomains = "İstisna Alan Adları",
     placeholderAddDomain = "Alan adı ekle (örn. example.com)",
     errorInvalidDomain = "Geçerli bir alan adı girin (örn. example.com veya *.example.com)",
     footerBypassDomains = "Eşleşen alan adları ve alt alan adları DPI desync olmadan doğrudan bağlanır. Yerel ağlar otomatik olarak hariç tutulur.",
@@ -800,7 +947,7 @@ val TurkishStrings = VdpiStrings(
     labelSystemVpn = "Sistem VPN Ayarları",
     subtitleSystemVpn = "Android ayarlarında Her Zaman Açık VPN'i yapılandırın",
 
-    sectionBackupRestore = "Yedekleme ve Geri Yükleme",
+    sectionBackupRestore = "Yedekle ve Geri Yükle",
     labelExportSettings = "Ayarları Dışa Aktar",
     subtitleExportSettings = "Yapılandırmayı JSON olarak kaydet",
     labelImportSettings = "Ayarları İçe Aktar",
@@ -831,7 +978,17 @@ val TurkishStrings = VdpiStrings(
     feedbackSystemVpnUnavailable = "Bu cihazda sistem VPN ayarları kullanılamıyor",
     feedbackCacheCleared = "Uyarlamalı önbellek temizlendi",
     feedbackCacheClearFailed = "Uyarlamalı önbellek temizlenemedi",
+    importEmpty = "Ayar JSON dosyası boş",
+    importTooLarge = "Ayar JSON dosyası en büyük boyutu aşıyor",
     importInvalidJson = "Geçersiz ayar JSON dosyası",
+    importUnrecognizedFormat = "Tanınmayan ayar yedeği biçimi",
+    importInvalidSchema = "Geçersiz yedek şema sürümü",
+    importUnsupportedSchemaPrefix = "Desteklenmeyen yedek şema sürümü",
+    importInvalidDesyncModePrefix = "Desteklenmeyen desync modu",
+    importInvalidDnsPrefix = "Geçersiz DNS adresi",
+    importInvalidSplitModePrefix = "Desteklenmeyen bölünmüş tünel modu",
+    importInvalidThemePrefix = "Desteklenmeyen tema tercihi",
+    importInvalidLanguagePrefix = "Desteklenmeyen dil tercihi",
     importSuccess = "Ayarlar içe aktarıldı",
     importSuccessReconnect = "Ayarlar içe aktarıldı \u00B7 uygulamak için yeniden bağlanın",
 

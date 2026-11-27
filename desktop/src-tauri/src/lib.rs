@@ -304,12 +304,19 @@ fn spawn_status_poller(app: AppHandle, wake: StatusPollerWake) {
 
             match snapshot_result {
                 Ok(Some(snapshot)) => {
-                    tray::update_tray_visuals(&app, &snapshot);
-                    if is_main_window_actively_visible(&app) {
-                        if let Err(err) =
-                            app.emit_to(tray::MAIN_WINDOW_LABEL, STATUS_EVENT_NAME, &snapshot)
-                        {
-                            debug!(error = %err, "failed to emit vdpi://status event");
+                    let is_current = app.try_state::<DesktopAppState>().is_some_and(|s| {
+                        !s.is_quitting()
+                            && s.last_snapshot()
+                                .is_none_or(|last| snapshot.snapshot_seq >= last.snapshot_seq)
+                    });
+                    if is_current {
+                        tray::update_tray_visuals(&app, &snapshot);
+                        if is_main_window_actively_visible(&app) {
+                            if let Err(err) =
+                                app.emit_to(tray::MAIN_WINDOW_LABEL, STATUS_EVENT_NAME, &snapshot)
+                            {
+                                debug!(error = %err, "failed to emit vdpi://status event");
+                            }
                         }
                     }
                 }

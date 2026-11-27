@@ -1,0 +1,6 @@
+/* App Shortcuts */
+"Turn on ${applicationName}" = "Turn on ${applicationName}";
+"Connect ${applicationName}" = "Connect ${applicationName}";
+"Turn off ${applicationName}" = "Turn off ${applicationName}";
+"Disconnect ${applicationName}" = "Disconnect ${applicationName}";
+"Toggle ${applicationName}" = "Toggle ${applicationName}";

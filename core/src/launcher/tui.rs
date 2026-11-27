@@ -1,7 +1,8 @@
 use super::{
     active_lang, build_menu_with_options, custom_dns_hint, dns_preset_hint, dns_preset_index,
-    format_dns_label, is_custom_dns, shorten_custom_dns, toggle_and_persist_language, tr, Choice,
-    LauncherMenu, MenuItem, StatusRow, StatusTone, DNS_PRESETS,
+    format_dns_label, is_custom_dns, localize_custom_dns_error, shorten_custom_dns,
+    toggle_and_persist_language, tr, Choice, LauncherMenu, MenuItem, StatusRow, StatusTone,
+    DNS_PRESETS,
 };
 #[cfg(test)]
 use super::CUSTOM_DNS_HINT;
@@ -927,7 +928,8 @@ fn handle_custom_dns_key(state: &mut UiState, key: KeyEvent) -> Action {
             match vdpi_core::dns::validate_custom_dns_input(&state.custom_dns_input) {
                 Ok(normalized) => Action::Finish(Choice::SetDns(normalized)),
                 Err(err) => {
-                    state.custom_dns_error = Some(sanitize_inline(&err).into_owned());
+                    let localized = localize_custom_dns_error(&err);
+                    state.custom_dns_error = Some(sanitize_inline(&localized).into_owned());
                     Action::Redraw
                 }
             }
@@ -1405,7 +1407,7 @@ fn render(frame: &mut Frame<'_>, state: &UiState, color: bool) {
         let row = |row_y: u16| Rect::new(inner.x, row_y, inner.width, 1);
 
         if y < bottom {
-            render_header(frame, row(y), ctx);
+            render_header(frame, row(y), ctx, false);
             y = y.saturating_add(1);
         }
 
@@ -1493,7 +1495,7 @@ fn render(frame: &mut Frame<'_>, state: &UiState, color: bool) {
     let row = |row_y: u16| Rect::new(inner.x, row_y, inner.width, 1);
 
     if y < bottom {
-        render_header(frame, row(y), ctx);
+        render_header(frame, row(y), ctx, true);
         y = y.saturating_add(1);
     }
 
@@ -1571,14 +1573,16 @@ fn render(frame: &mut Frame<'_>, state: &UiState, color: bool) {
     }
 }
 
-fn render_header(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx) {
+fn render_header(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx, show_lang_hotkey: bool) {
     if area.is_empty() {
         return;
     }
     let pad = if ctx.inset { " " } else { "" };
-    let lang_badge = match active_lang() {
-        Lang::En => "[g: EN]",
-        Lang::Tr => "[g: TR]",
+    let lang_badge = match (show_lang_hotkey, active_lang()) {
+        (true, Lang::En) => "[g: EN]",
+        (true, Lang::Tr) => "[g: TR]",
+        (false, Lang::En) => "[EN]",
+        (false, Lang::Tr) => "[TR]",
     };
     let repo = repo_display();
     let width = usize::from(area.width);
@@ -1757,7 +1761,7 @@ fn render_status_row(frame: &mut Frame<'_>, area: Rect, row: &StatusRow, ctx: Re
 }
 
 fn is_warning_notice(text: &str) -> bool {
-    let lower = text.to_lowercase();
+    let lower = text.to_lowercase().replace('\u{0307}', "");
     [
         "wintun.dll",
         "missing",
@@ -1953,67 +1957,79 @@ fn render_uninstall_confirm(
     if y < max_y {
         let prompt_area = Rect::new(area.x, y, area.width, 1);
         let width = usize::from(area.width);
+        let is_tr = active_lang() == Lang::Tr;
+        let yes_key = if is_tr { "[e]" } else { "[y]" };
+        let no_esc_full = if is_tr { "[h / Esc]" } else { "[n / Esc]" };
+        let no_esc_compact = if is_tr { "[h/Esc]" } else { "[n/Esc]" };
+        let no_key = if is_tr { "[h]" } else { "[n]" };
+        let tiny_pair = if is_tr { "[e]/[h]" } else { "[y]/[n]" };
         let full_action = tr("Uninstall vdpi", "vdpi'yi kaldır");
         let short_action = tr("Uninstall", "Kaldır");
         let cancel_label = tr("Cancel", "İptal");
         let yes_label = tr("Yes", "Evet");
         let no_label = tr("No", "Hayır");
         let full_prompt_cols = body_indent.len()
-            + "[y] ".len()
+            + yes_key.len()
+            + 1
             + full_action.chars().count()
             + "   ·   ".chars().count()
-            + "[n / Esc] ".len()
+            + no_esc_full.len()
+            + 1
             + cancel_label.chars().count()
             + right_margin;
         let compact_prompt_cols = body_indent.len()
-            + "[y] ".len()
+            + yes_key.len()
+            + 1
             + short_action.chars().count()
             + " · ".chars().count()
-            + "[n/Esc] ".len()
+            + no_esc_compact.len()
+            + 1
             + cancel_label.chars().count()
             + right_margin;
         let tiny_prompt_cols = pad.len()
-            + "[y] ".len()
+            + yes_key.len()
+            + 1
             + yes_label.chars().count()
             + " · ".chars().count()
-            + "[n] ".len()
+            + no_key.len()
+            + 1
             + no_label.chars().count()
             + right_margin;
         let line = if width >= full_prompt_cols {
             Line::from(vec![
                 Span::raw(body_indent),
-                Span::styled("[y]", ctx.palette.danger_bold),
+                Span::styled(yes_key, ctx.palette.danger_bold),
                 Span::raw(" "),
                 Span::styled(full_action, ctx.palette.active_title),
                 Span::styled("   ·   ", ctx.palette.footer_text),
-                Span::styled("[n / Esc]", ctx.palette.footer_key),
+                Span::styled(no_esc_full, ctx.palette.footer_key),
                 Span::raw(" "),
                 Span::styled(cancel_label, ctx.palette.inactive_title),
             ])
         } else if width >= compact_prompt_cols {
             Line::from(vec![
                 Span::raw(body_indent),
-                Span::styled("[y]", ctx.palette.danger_bold),
+                Span::styled(yes_key, ctx.palette.danger_bold),
                 Span::raw(" "),
                 Span::styled(short_action, ctx.palette.active_title),
                 Span::styled(" · ", ctx.palette.footer_text),
-                Span::styled("[n/Esc]", ctx.palette.footer_key),
+                Span::styled(no_esc_compact, ctx.palette.footer_key),
                 Span::raw(" "),
                 Span::styled(cancel_label, ctx.palette.inactive_title),
             ])
         } else if width >= tiny_prompt_cols {
             Line::from(vec![
                 Span::raw(pad),
-                Span::styled("[y]", ctx.palette.danger_bold),
+                Span::styled(yes_key, ctx.palette.danger_bold),
                 Span::raw(" "),
                 Span::styled(yes_label, ctx.palette.active_title),
                 Span::styled(" · ", ctx.palette.footer_text),
-                Span::styled("[n]", ctx.palette.footer_key),
+                Span::styled(no_key, ctx.palette.footer_key),
                 Span::raw(" "),
                 Span::styled(no_label, ctx.palette.inactive_title),
             ])
         } else {
-            let short = truncate_text("[y]/[n]", width.saturating_sub(pad.len() + right_margin));
+            let short = truncate_text(tiny_pair, width.saturating_sub(pad.len() + right_margin));
             Line::from(vec![
                 Span::raw(pad),
                 Span::styled(short, ctx.palette.danger_bold),
@@ -2198,7 +2214,7 @@ fn render_custom_dns_editor_card(
     let show_bot_divider = inner.height >= essential_rows.saturating_add(3);
 
     if y < bottom {
-        render_header(frame, row(y), ctx);
+        render_header(frame, row(y), ctx, false);
         y = y.saturating_add(1);
     }
     if show_top_divider && y < bottom {
@@ -2393,7 +2409,7 @@ fn render_dns_picker_card(
     let row = |row_y: u16| Rect::new(inner.x, row_y, inner.width, 1);
 
     if y < bottom {
-        render_header(frame, row(y), ctx);
+        render_header(frame, row(y), ctx, false);
         y = y.saturating_add(1);
     }
     if y + 2 < bottom {
@@ -2721,7 +2737,7 @@ fn render_dns_footer(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx) {
     let range = range_label(DNS_PICKER_ITEM_COUNT);
     let is_tr = active_lang() == Lang::Tr;
 
-    let line = if is_tr && width >= pad.len() * 2 + 38 + range.len() {
+    let line = if is_tr && width >= pad.len() * 2 + 39 + range.len() {
         Line::from(vec![
             Span::raw(pad),
             Span::styled("↑↓", key),
@@ -2780,9 +2796,9 @@ fn render_confirm_footer(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx) {
     let line = if is_tr && width >= pad.len() * 2 + 26 {
         Line::from(vec![
             Span::raw(pad),
-            Span::styled("y", ctx.palette.danger_bold),
+            Span::styled("e", ctx.palette.danger_bold),
             Span::styled(" kaldır  ·  ", text),
-            Span::styled("n / esc", key),
+            Span::styled("h / esc", key),
             Span::styled(" iptal", text),
         ])
     } else if !is_tr && width >= pad.len() * 2 + 30 {
@@ -2792,6 +2808,13 @@ fn render_confirm_footer(frame: &mut Frame<'_>, area: Rect, ctx: RenderCtx) {
             Span::styled(" uninstall  ·  ", text),
             Span::styled("n / esc", key),
             Span::styled(" cancel", text),
+        ])
+    } else if is_tr {
+        Line::from(vec![
+            Span::raw(pad),
+            Span::styled("e", ctx.palette.danger_bold),
+            Span::styled(" · ", text),
+            Span::styled("h/esc", key),
         ])
     } else {
         Line::from(vec![
@@ -3196,7 +3219,7 @@ fn render_minimal(
     if state.confirming_uninstall {
         if area.height >= 2 {
             let prompt = truncate_text(
-                tr("Uninstall? [y/n]", "Kaldırılsın mı? [y/n]"),
+                tr("Uninstall? [y/n]", "Kaldırılsın mı? [e/h]"),
                 usize::from(area.width),
             );
             frame.render_widget(
@@ -5620,9 +5643,13 @@ mod tests {
         assert!(text.contains("Canlı paneli aç"), "missing TR dashboard item:\n{text}");
         assert!(text.contains("Arka plan servisini duraklat"), "missing TR pause item:\n{text}");
         assert!(text.contains("DNS sunucusu seç"), "missing TR DNS item:\n{text}");
-        assert!(text.contains("Bölünmüş tünelleme"), "missing TR split item:\n{text}");
+        assert!(text.contains("Bölünmüş tünel"), "missing TR split item:\n{text}");
         assert!(text.contains("✓ Durum yenilendi."), "missing TR notice:\n{text}");
         assert!(text.contains("q çık"), "missing TR footer:\n{text}");
+
+        // Turkish capital 'İ' (U+0130) case-folding still classifies warnings cleanly.
+        assert!(is_warning_notice("İptal edildi"));
+        assert!(is_warning_notice("İşlem iptal edildi."));
 
         // Pressing 'g' requests language toggle cleanly.
         assert_eq!(
@@ -5630,25 +5657,55 @@ mod tests {
             Action::ToggleLanguage
         );
 
-        // DNS picker in Turkish
+        // DNS picker in Turkish hides the `g:` hotkey prefix in the header.
         state.open_dns_picker();
         let dns_buf = render_state(80, 24, &state, true);
         let dns_text = buffer_text(&dns_buf);
+        assert!(dns_text.contains("[TR]") && !dns_text.contains("[g: TR]"));
         assert!(dns_text.contains("DNS sunucusu seç · Cloudflare (1.1.1.1)"));
         assert!(dns_text.contains("[Etkin]"));
         assert!(dns_text.contains("Özel DNS"));
         assert!(dns_text.contains("enter uygula"));
 
-        // Confirm uninstall in Turkish
+        // Custom DNS editor hides `g:` hotkey prefix and localizes validation errors.
+        state.open_custom_dns_editor();
+        state.custom_dns_input.clear();
+        assert_eq!(
+            handle_key(&mut state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::Redraw
+        );
+        let custom_buf = render_state(80, 24, &state, true);
+        let custom_text = buffer_text(&custom_buf);
+        assert!(custom_text.contains("[TR]") && !custom_text.contains("[g: TR]"));
+        assert!(
+            custom_text.contains("DNS sunucusu boş olamaz"),
+            "missing TR custom DNS validation error:\n{custom_text}"
+        );
+
+        // Confirm uninstall in Turkish renders [e] / [h / Esc] and hides `g:` prefix,
+        // while still accepting both Turkish (e/h) and English (y/n) keys.
+        state.editing_custom_dns = false;
         state.selecting_dns = false;
         state.confirming_uninstall = true;
         let conf_buf = render_state(80, 24, &state, true);
         let conf_text = buffer_text(&conf_buf);
+        assert!(conf_text.contains("[TR]") && !conf_text.contains("[g: TR]"));
         assert!(conf_text.contains("Kaldırmayı onayla"));
-        assert!(conf_text.contains("vdpi'yi kaldır"));
-        assert!(conf_text.contains("İptal"));
+        assert!(conf_text.contains("[e] vdpi'yi kaldır   ·   [h / Esc] İptal"));
+        assert!(conf_text.contains("e kaldır  ·  h / esc iptal"));
+
+        let min_conf_buf = render_state(26, 4, &state, true);
+        let min_conf_text = buffer_text(&min_conf_buf);
+        assert!(
+            min_conf_text.contains("Kaldırılsın mı? [e/h]"),
+            "missing TR minimal confirm prompt:\n{min_conf_text}"
+        );
         assert_eq!(
             handle_key(&mut state, KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)),
+            Action::Finish(Choice::Uninstall)
+        );
+        assert_eq!(
+            handle_key(&mut state, KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
             Action::Finish(Choice::Uninstall)
         );
     }

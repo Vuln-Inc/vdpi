@@ -5,6 +5,7 @@ import {
   localizeActivityMessage,
   tOverview,
 } from "../i18n/overview";
+import { localizeActionMessage } from "../i18n/shell";
 import type {
   ActivityEvent,
   DesktopSettingsPayload,
@@ -15,7 +16,10 @@ import type {
   ThroughputPoint,
 } from "../types";
 import { ThroughputChart } from "../components/ThroughputChart";
-import { SegmentedControl } from "../components/SegmentedControl";
+import {
+  SegmentedControl,
+  type SegmentedOption,
+} from "../components/SegmentedControl";
 import { InlineBanner } from "../components/InlineBanner";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import {
@@ -33,6 +37,8 @@ export interface OverviewViewProps {
   history: ThroughputPoint[];
   activity: ActivityEvent[];
   busyAction: string | null;
+  dismissedUpgradeKey?: string | null;
+  onDismissUpgrade?: (key: string) => void;
   onToggleProtection: (connect?: boolean) => void | Promise<void>;
   onSwitchEngine: (engine: EngineMode) => void | Promise<void>;
   onInstallService?: (engine?: EngineMode) => void | Promise<void>;
@@ -101,6 +107,8 @@ export function OverviewView({
   history,
   activity,
   busyAction,
+  dismissedUpgradeKey,
+  onDismissUpgrade,
   onToggleProtection,
   onSwitchEngine,
   onInstallService,
@@ -114,15 +122,6 @@ export function OverviewView({
 }: OverviewViewProps) {
   const { lang } = useLang();
   const engineLabelId = useId();
-  const engineOptions = useMemo<
-    ReadonlyArray<{ value: EngineMode; label: string }>
-  >(
-    () => [
-      { value: "tun", label: tOverview(lang, "engineTun") },
-      { value: "proxy", label: tOverview(lang, "engineProxy") },
-    ],
-    [lang],
-  );
   const [activityOpen, setActivityOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const [pendingEngine, setPendingEngine] = useState<EngineMode | null>(null);
@@ -131,9 +130,9 @@ export function OverviewView({
     string | null
   >(null);
   const [wintunRecheckDoneSeq, setWintunRecheckDoneSeq] = useState(0);
-  const [dismissedUpgradeKey, setDismissedUpgradeKey] = useState<string | null>(
-    null,
-  );
+  const [localDismissedUpgradeKey, setLocalDismissedUpgradeKey] = useState<
+    string | null
+  >(null);
   const copyTimerRef = useRef<number | null>(null);
   const wintunFeedbackTimerRef = useRef<number | null>(null);
   const mountedRef = useRef(true);
@@ -156,6 +155,12 @@ export function OverviewView({
   const live = status?.live ?? null;
   const serviceState = status?.serviceState ?? null;
   const isNotInstalled = serviceState === "not_installed";
+  const bundleMissing = status?.canInstallFromBundle === false;
+  const isRepairNeeded = Boolean(
+    status !== null &&
+      !isNotInstalled &&
+      status.cliVersionRelation === "repair_needed",
+  );
   const activeEngine: EngineMode =
     live?.engine ?? settings?.engine ?? status?.configuredEngine ?? "tun";
   const vpnConflict =
@@ -174,7 +179,8 @@ export function OverviewView({
   const isRunning = Boolean(live?.running);
 
   const normalizedBusy = busyAction?.trim().toLowerCase() ?? null;
-  const isAnyBusy = normalizedBusy !== null;
+  const pendingOp = status?.pendingOperation ?? null;
+  const isAnyBusy = normalizedBusy !== null || pendingOp !== null;
   const switchTargetEngine: EngineMode | null =
     normalizedBusy === "switch-engine:tun"
       ? "tun"
@@ -183,15 +189,19 @@ export function OverviewView({
         : null;
   const isSwitchingEngine =
     switchTargetEngine !== null ||
-    (normalizedBusy !== null && normalizedBusy.startsWith("switch-engine"));
-  const isConnecting = normalizedBusy === "connecting";
-  const isPausing = normalizedBusy === "pausing";
+    (normalizedBusy !== null && normalizedBusy.startsWith("switch-engine")) ||
+    pendingOp === "switching_engine";
+  const isConnecting =
+    normalizedBusy === "connecting" || pendingOp === "resuming";
+  const isPausing = normalizedBusy === "pausing" || pendingOp === "pausing";
   const isInstallingService =
-    normalizedBusy === "install-service" ||
-    status?.pendingOperation === "installing";
+    normalizedBusy === "install-service" || pendingOp === "installing";
   const isUpgradingService =
-    normalizedBusy === "upgrade-service" ||
-    status?.pendingOperation === "upgrading";
+    normalizedBusy === "upgrade-service" || pendingOp === "upgrading";
+  const isRepairingService =
+    normalizedBusy === "repair-service" || pendingOp === "repairing";
+  const isUninstallingService =
+    normalizedBusy === "uninstall-service" || pendingOp === "uninstalling";
   const isPrimaryBusy = isAnyBusy && !isSwitchingEngine;
 
   useEffect(() => {
@@ -209,12 +219,41 @@ export function OverviewView({
     }
   }, [activeEngine, isRunning, pendingEngine]);
 
-  const wintunMissing = Boolean(
-    status?.platform === "windows" &&
-      activeEngine === "tun" &&
-      status.wintun.required &&
-      !status.wintun.ready,
+  const wintunNotReady = Boolean(
+    status?.platform === "windows" && !status.wintun.ready,
   );
+  const wintunMissing = Boolean(wintunNotReady && activeEngine === "tun");
+  const tunSwitchBlockedByWintun = Boolean(
+    wintunNotReady && activeEngine !== "tun",
+  );
+
+  const engineOptions = useMemo<readonly SegmentedOption<EngineMode>[]>(
+    () => [
+      {
+        value: "tun",
+        label: tOverview(lang, "engineTun"),
+        disabled: tunSwitchBlockedByWintun,
+        title: tunSwitchBlockedByWintun
+          ? tOverview(lang, "engineTunDisabledWintun")
+          : undefined,
+      },
+      { value: "proxy", label: tOverview(lang, "engineProxy") },
+    ],
+    [lang, tunSwitchBlockedByWintun],
+  );
+
+  const effectiveDismissedUpgradeKey =
+    dismissedUpgradeKey !== undefined
+      ? dismissedUpgradeKey
+      : localDismissedUpgradeKey;
+
+  const handleDismissUpgrade = (key: string) => {
+    if (onDismissUpgrade) {
+      onDismissUpgrade(key);
+    } else {
+      setLocalDismissedUpgradeKey(key);
+    }
+  };
 
   const { headline, statusTone } = useMemo<{
     headline: string;
@@ -262,13 +301,21 @@ export function OverviewView({
     }
 
     const versionTag = formatVersion(
-      live?.version ?? status.installedVersion ?? status.appVersion,
+      live?.version ?? status.installedVersion,
     );
 
     if (isNotInstalled) {
+      const elevationNote =
+        status.platform === "windows"
+          ? tOverview(lang, "subtitleAdminPrompt")
+          : activeEngine === "proxy"
+            ? tOverview(lang, "subtitleUserServiceNoAdmin")
+            : status.platform === "macos"
+              ? tOverview(lang, "subtitleMacAdminPrompt")
+              : tOverview(lang, "subtitleLinuxAuthPrompt");
       const parts = [
         tOverview(lang, "subtitleServiceRequired"),
-        tOverview(lang, "subtitleAdminPrompt"),
+        elevationNote,
       ];
       if (versionTag) parts.push(versionTag);
       return parts.join(" · ");
@@ -344,6 +391,12 @@ export function OverviewView({
     if (isInstallingService) {
       return tOverview(lang, "btnSettingUp");
     }
+    if (isRepairingService) {
+      return tOverview(lang, "btnRepairing");
+    }
+    if (isUninstallingService) {
+      return tOverview(lang, "btnUninstalling");
+    }
     if (isConnecting) {
       return tOverview(lang, "btnConnecting");
     }
@@ -375,8 +428,10 @@ export function OverviewView({
     isNotInstalled,
     isPausing,
     isPrimaryBusy,
+    isRepairingService,
     isRunning,
     isStarting,
+    isUninstallingService,
     isYielded,
     lang,
   ]);
@@ -404,7 +459,10 @@ export function OverviewView({
   ]);
 
   const primaryDisabled =
-    !status || isAnyBusy || (wintunMissing && !isRunning);
+    !status ||
+    isAnyBusy ||
+    (wintunMissing && !isRunning) ||
+    (isNotInstalled && bundleMissing);
 
   const rxRateBps = live?.rxRateBps ?? 0;
   const txRateBps = live?.txRateBps ?? 0;
@@ -475,6 +533,7 @@ export function OverviewView({
 
   const handleEngineChange = (next: EngineMode) => {
     if (next === activeEngine || isAnyBusy) return;
+    if (next === "tun" && tunSwitchBlockedByWintun) return;
     if (isRunning) {
       setPendingEngine(next);
       return;
@@ -520,9 +579,13 @@ export function OverviewView({
     }
   }, [wintunMissing, wintunRecheckFeedback]);
 
-  const wintunDetail = status?.wintun.message?.trim();
+  const wintunRawDetail = status?.wintun.message?.trim();
+  const wintunDetail = wintunRawDetail
+    ? localizeActionMessage(lang, wintunRawDetail).trim()
+    : undefined;
   const wintunInvalid = Boolean(
-    wintunDetail && /(?:sha-?256|\bhash\b|\bcorrupt(?:ed)?\b)/i.test(wintunDetail),
+    wintunRawDetail &&
+      /(?:sha-?256|\bhash\b|\bcorrupt(?:ed)?\b)/i.test(wintunRawDetail),
   );
   const wintunBannerTitle = wintunInvalid
     ? tOverview(lang, "wintunInvalidTitle")
@@ -557,7 +620,6 @@ export function OverviewView({
         const stillMissing = Boolean(
           refreshed.platform === "windows" &&
             refreshedEngine === "tun" &&
-            refreshed.wintun.required &&
             !refreshed.wintun.ready,
         );
         if (stillMissing) {
@@ -644,7 +706,7 @@ export function OverviewView({
     status !== null &&
       !isNotInstalled &&
       status.cliVersionRelation === "upgrade_available" &&
-      dismissedUpgradeKey !== upgradeVersionKey,
+      effectiveDismissedUpgradeKey !== upgradeVersionKey,
   );
   const upgradeBannerDesc =
     bundledVersionTag && installedVersionTag
@@ -653,6 +715,12 @@ export function OverviewView({
           installed: installedVersionTag,
         })
       : tOverview(lang, "upgradeAvailableDesc");
+
+  const isUnixProxySetup = Boolean(
+    status &&
+      (status.platform === "macos" || status.platform === "linux") &&
+      activeEngine === "proxy",
+  );
 
   const engineHintText = isSwitchingEngine
     ? switchTargetEngine
@@ -665,7 +733,9 @@ export function OverviewView({
       : tOverview(lang, "engineSwitching")
     : activeEngine === "tun"
       ? tOverview(lang, "engineDescTun")
-      : tOverview(lang, "engineDescProxy");
+      : tunSwitchBlockedByWintun
+        ? tOverview(lang, "engineDescProxyWintunMissing")
+        : tOverview(lang, "engineDescProxy");
 
   return (
     <div className="view-stack view-overview">
@@ -790,11 +860,35 @@ export function OverviewView({
         />
       )}
 
-      {isNotInstalled && !wintunMissing && (
+      {isNotInstalled && bundleMissing && (
+        <InlineBanner
+          tone="warn"
+          title={tOverview(lang, "bundleMissingTitle")}
+          description={tOverview(lang, "bundleMissingDesc")}
+          actionLabel={tOverview(lang, "btnOpenInstallation")}
+          onAction={() => onNavigate("installation")}
+        />
+      )}
+
+      {isNotInstalled && !wintunMissing && !bundleMissing && (
         <InlineBanner
           tone="info"
           title={tOverview(lang, "setupRequiredTitle")}
-          description={tOverview(lang, "setupRequiredDesc")}
+          description={
+            isUnixProxySetup
+              ? tOverview(lang, "setupRequiredDescNoAdmin")
+              : tOverview(lang, "setupRequiredDesc")
+          }
+          actionLabel={tOverview(lang, "btnOpenInstallation")}
+          onAction={() => onNavigate("installation")}
+        />
+      )}
+
+      {isRepairNeeded && (
+        <InlineBanner
+          tone="warn"
+          title={tOverview(lang, "repairNeededTitle")}
+          description={tOverview(lang, "repairNeededDesc")}
           actionLabel={tOverview(lang, "btnOpenInstallation")}
           onAction={() => onNavigate("installation")}
         />
@@ -826,7 +920,7 @@ export function OverviewView({
                 type="button"
                 className="inline-banner__action"
                 disabled={isUpgradingService}
-                onClick={() => setDismissedUpgradeKey(upgradeVersionKey)}
+                onClick={() => handleDismissUpgrade(upgradeVersionKey)}
               >
                 {tOverview(lang, "btnLater")}
               </button>
@@ -942,7 +1036,7 @@ export function OverviewView({
             type="button"
             className="activity-toggle"
             aria-expanded={activityOpen}
-            aria-controls="overview-activity-panel"
+            aria-controls={activityOpen ? "overview-activity-panel" : undefined}
             onClick={() => setActivityOpen((open) => !open)}
           >
             <IconChevron

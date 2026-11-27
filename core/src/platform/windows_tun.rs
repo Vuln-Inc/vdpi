@@ -1029,12 +1029,16 @@ pub fn find_verified_wintun_dll() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("failed to determine current executable path")?;
     let canonical = std::fs::canonicalize(&exe).ok();
 
-    let program_files = cfg!(target_os = "windows")
-        .then(|| env_non_empty_path("ProgramFiles"))
-        .flatten();
-    let program_data = cfg!(target_os = "windows")
-        .then(|| env_non_empty_path("ProgramData"))
-        .flatten();
+    #[cfg(target_os = "windows")]
+    let program_files = Some(crate::platform::windows::known_program_files_dir());
+    #[cfg(not(target_os = "windows"))]
+    let program_files: Option<PathBuf> = None;
+
+    #[cfg(target_os = "windows")]
+    let program_data = Some(crate::platform::windows::known_program_data_dir());
+    #[cfg(not(target_os = "windows"))]
+    let program_data: Option<PathBuf> = None;
+
     let local_app_data = cfg!(target_os = "windows")
         .then(|| env_non_empty_path("LOCALAPPDATA"))
         .flatten();

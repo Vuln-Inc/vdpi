@@ -1,0 +1,6 @@
+/* App Shortcuts */
+"Turn on ${applicationName}" = "${applicationName} aç";
+"Connect ${applicationName}" = "${applicationName} bağlan";
+"Turn off ${applicationName}" = "${applicationName} kapat";
+"Disconnect ${applicationName}" = "${applicationName} bağlantısını kes";
+"Toggle ${applicationName}" = "${applicationName} aç kapat";

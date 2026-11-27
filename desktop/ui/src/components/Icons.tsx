@@ -282,7 +282,7 @@ export function IconTrash(props: IconProps) {
 
 export function IconInstall(props: IconProps) {
   return (
-    <StrokeIcon strokeWidth={1.5} {...props}>
+    <StrokeIcon {...props}>
       <path d="M12 3.5v11" />
       <path d="m7.75 10.5 4.25 4.25 4.25-4.25" />
       <path d="M4.5 16.5v2a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-2" />
@@ -292,7 +292,7 @@ export function IconInstall(props: IconProps) {
 
 export function IconUpdateBadge(props: IconProps) {
   return (
-    <StrokeIcon strokeWidth={1.5} {...props}>
+    <StrokeIcon {...props}>
       <circle cx="12" cy="12" r="8.5" />
       <path d="M12 15.5v-7" />
       <path d="m8.75 11.5 3.25-3.25 3.25 3.25" />

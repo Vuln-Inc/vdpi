@@ -1,25 +1,56 @@
-import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  render,
+  screen,
+  fireEvent,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import { resetMockIpcState } from "../lib/ipc";
-import type { DesktopStatusSnapshot } from "../types";
+import type {
+  ActionResult,
+  DesktopStatusSnapshot,
+  UpdateCheckPayload,
+} from "../types";
 
-let statusSnapshotOverride: Partial<DesktopStatusSnapshot> | null = null;
+type StatusSnapshotOverride =
+  | Partial<DesktopStatusSnapshot>
+  | ((snapshot: DesktopStatusSnapshot) => DesktopStatusSnapshot);
+
+let statusSnapshotOverride: StatusSnapshotOverride | null = null;
+let checkUpdatesOverride:
+  | ((force?: boolean) => Promise<UpdateCheckPayload>)
+  | null = null;
+let upgradeServiceOverride: (() => Promise<ActionResult>) | null = null;
 
 vi.mock("../lib/ipc", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/ipc")>();
   const applyOverride = (
     snapshot: DesktopStatusSnapshot,
-  ): DesktopStatusSnapshot =>
-    statusSnapshotOverride
-      ? { ...snapshot, ...statusSnapshotOverride }
-      : snapshot;
+  ): DesktopStatusSnapshot => {
+    if (!statusSnapshotOverride) {
+      return snapshot;
+    }
+    return typeof statusSnapshotOverride === "function"
+      ? statusSnapshotOverride(snapshot)
+      : { ...snapshot, ...statusSnapshotOverride };
+  };
   return {
     ...actual,
     getStatus: async (force?: boolean) =>
       applyOverride(await actual.getStatus(force)),
     subscribeStatus: async (cb: (snapshot: DesktopStatusSnapshot) => void) =>
       actual.subscribeStatus((snapshot) => cb(applyOverride(snapshot))),
+    checkUpdates: async (force?: boolean) =>
+      checkUpdatesOverride
+        ? checkUpdatesOverride(force)
+        : actual.checkUpdates(force),
+    upgradeService: async () =>
+      upgradeServiceOverride
+        ? upgradeServiceOverride()
+        : actual.upgradeService(),
   };
 });
 
@@ -30,13 +61,21 @@ function getNavButton(name: RegExp | string) {
 
 describe("App", () => {
   beforeEach(() => {
+    window.localStorage.clear();
+    document.body.style.overflow = "";
     statusSnapshotOverride = null;
+    checkUpdatesOverride = null;
+    upgradeServiceOverride = null;
     resetMockIpcState();
     vi.clearAllMocks();
   });
 
   afterEach(() => {
+    window.localStorage.clear();
+    document.body.style.overflow = "";
     statusSnapshotOverride = null;
+    checkUpdatesOverride = null;
+    upgradeServiceOverride = null;
     resetMockIpcState();
   });
 
@@ -72,7 +111,7 @@ describe("App", () => {
     expect(screen.getByText("Window only")).toBeInTheDocument();
   });
 
-  it("switches across all 5 navigation tabs cleanly", async () => {
+  it("switches across all 6 navigation tabs cleanly", async () => {
     render(<App />);
 
     await screen.findByRole("heading", { name: "Protected" });
@@ -112,6 +151,16 @@ describe("App", () => {
       screen.getByRole("heading", { name: "Background Service" }),
     ).toBeInTheDocument();
     expect(getNavButton("Settings")).toHaveAttribute("aria-current", "page");
+
+    // 6. Installation
+    fireEvent.click(getNavButton("Installation"));
+    expect(
+      await screen.findByRole("heading", { name: "Installation" }),
+    ).toBeInTheDocument();
+    expect(getNavButton("Installation")).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
 
     // Back to Overview
     fireEvent.click(getNavButton("Overview"));
@@ -350,9 +399,15 @@ describe("App", () => {
     expect(
       within(resultsCard).getByText("Encrypted DNS (DoH)"),
     ).toBeInTheDocument();
-    expect(within(resultsCard).getByText("Discord")).toBeInTheDocument();
-    expect(within(resultsCard).getByText("Roblox")).toBeInTheDocument();
-    expect(within(resultsCard).getByText("Runtime hygiene")).toBeInTheDocument();
+    expect(
+      within(resultsCard).getByText("Discord Web & Gateway"),
+    ).toBeInTheDocument();
+    expect(
+      within(resultsCard).getByText("Roblox ClientSettings"),
+    ).toBeInTheDocument();
+    expect(
+      within(resultsCard).getByText("Service & Runtime Hygiene"),
+    ).toBeInTheDocument();
 
     expect(copyBtn).toBeEnabled();
     fireEvent.click(copyBtn);
@@ -534,14 +589,20 @@ describe("App", () => {
       await screen.findByRole("heading", { name: "Installation" }),
     ).toBeInTheDocument();
 
-    const engineGroup = screen.getByRole("group", { name: "Switch engine mode" });
-    const proxyBtn = within(engineGroup).getByRole("button", { name: "Proxy" });
-    const tunBtn = within(engineGroup).getByRole("button", { name: "TUN" });
-    expect(tunBtn).toHaveAttribute("aria-pressed", "true");
+    const engineGroup = screen.getByRole("radiogroup", {
+      name: "Engine Mode",
+    });
+    const proxyBtn = within(engineGroup).getByRole("radio", { name: "Proxy" });
+    const tunBtn = within(engineGroup).getByRole("radio", { name: "TUN" });
+    expect(tunBtn).toHaveAttribute("aria-checked", "true");
 
     fireEvent.click(proxyBtn);
+    const switchDialog = await screen.findByRole("dialog");
+    fireEvent.click(
+      within(switchDialog).getByRole("button", { name: /Switch/i }),
+    );
     await waitFor(() => {
-      expect(proxyBtn).toHaveAttribute("aria-pressed", "true");
+      expect(proxyBtn).toHaveAttribute("aria-checked", "true");
     });
 
     // Uninstall -> transitions to first-run setup UI
@@ -593,5 +654,257 @@ describe("App", () => {
     expect(
       within(sidebar).getByRole("button", { name: /Installation/i }),
     ).toBeInTheDocument();
+  });
+
+  it("blocks Repair when newer_installed, surfaces readonly DMG banner, and switches live to Türkçe in Settings", async () => {
+    statusSnapshotOverride = {
+      platform: "macos",
+      installedVersion: "0.7.0",
+      bundledEngineVersion: "0.6.1",
+      cliVersionRelation: "newer_installed",
+      runningFromReadonlyDmg: true,
+    };
+
+    render(<App />);
+    await screen.findByRole("heading", { name: "Protected" });
+
+    // Top-level read-only DMG guidance is visible even on Overview
+    expect(
+      screen.getByText(/Applications folder/i),
+    ).toBeInTheDocument();
+
+    // Installation disables Repair so vdpi never downgrades v0.7.0 -> v0.6.1
+    fireEvent.click(getNavButton("Installation"));
+    expect(
+      await screen.findByRole("heading", { name: "Installation" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /Repair \/ Reinstall/i }),
+    ).toBeDisabled();
+
+    // Live language switch to Türkçe in Settings updates the sidebar & view immediately
+    fireEvent.click(getNavButton("Settings"));
+    const trBtn = await screen.findByRole("radio", { name: "Türkçe" });
+    fireEvent.click(trBtn);
+    await waitFor(() => {
+      const trNav = screen.getByRole("navigation", { name: "Ana gezinme" });
+      expect(
+        within(trNav).getByRole("button", { name: /Kurulum/i }),
+      ).toBeInTheDocument();
+    });
+  });
+
+  it("releases #root inert and body scroll lock after UpdatePromptDialog -> ConfirmDialog same-commit handoff", async () => {
+    let resolveCheckUpdates: ((payload: UpdateCheckPayload) => void) | null =
+      null;
+    checkUpdatesOverride = () =>
+      new Promise<UpdateCheckPayload>((resolve) => {
+        resolveCheckUpdates = resolve;
+      });
+
+    const rootEl = document.createElement("div");
+    rootEl.id = "root";
+    document.body.appendChild(rootEl);
+
+    const view = render(<App />, { container: rootEl });
+    try {
+      await screen.findByRole("heading", { name: "Protected" });
+
+      // Dirty the DNS & Rules tab before the launch update check resolves
+      fireEvent.click(getNavButton("DNS & Rules"));
+      await screen.findByRole("heading", { name: "DNS & Rules" });
+      fireEvent.click(screen.getByRole("radio", { name: /Quad9/i }));
+      expect(
+        screen.getByRole("region", { name: "Unsaved DNS and rule changes" }),
+      ).toBeInTheDocument();
+
+      await waitFor(() => {
+        expect(resolveCheckUpdates).not.toBeNull();
+      });
+
+      await act(async () => {
+        resolveCheckUpdates!({
+          currentVersion: "0.6.1",
+          latestVersion: "0.7.0",
+          hasUpdate: true,
+          releaseUrl: "https://github.com/Vuln-Inc/vdpi/releases/tag/v0.7.0",
+          releaseNotes: ["Stability improvements"],
+        });
+      });
+
+      const updateDialog = await screen.findByRole("dialog", {
+        name: "Update available",
+      });
+      expect(rootEl.hasAttribute("inert")).toBe(true);
+      expect(document.body.style.overflow).toBe("hidden");
+
+      // Same-commit handoff: closes UpdatePromptDialog and opens dirty-tab ConfirmDialog
+      fireEvent.click(
+        within(updateDialog).getByRole("button", {
+          name: "View in Installation",
+        }),
+      );
+
+      const confirmDialog = await screen.findByRole("alertdialog", {
+        name: "Discard unsaved DNS & Rules changes?",
+      });
+      expect(
+        screen.queryByRole("dialog", { name: "Update available" }),
+      ).not.toBeInTheDocument();
+      expect(rootEl.hasAttribute("inert")).toBe(true);
+      expect(document.body.style.overflow).toBe("hidden");
+
+      // Cancel ConfirmDialog -> both modal locks must be cleanly released
+      fireEvent.click(within(confirmDialog).getByRole("button", { name: "Stay" }));
+      await waitFor(() => {
+        expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+      });
+
+      expect(rootEl.hasAttribute("inert")).toBe(false);
+      expect(
+        (rootEl as HTMLElement & { inert?: boolean }).inert,
+      ).not.toBe(true);
+      expect(document.body.style.overflow).not.toBe("hidden");
+    } finally {
+      view.unmount();
+      rootEl.remove();
+      document.body.style.overflow = "";
+    }
+  });
+
+  it("disables TUN segment and shows Wintun hint in Overview on Windows Proxy mode when wintun is not ready", async () => {
+    statusSnapshotOverride = (snapshot) => ({
+      ...snapshot,
+      platform: "windows",
+      configuredEngine: "proxy",
+      wintun: {
+        required: false,
+        ready: false,
+        message: null,
+      },
+      live: snapshot.live
+        ? {
+            ...snapshot.live,
+            engine: "proxy",
+            mode: "proxy-adaptive",
+            socksPort: 11080,
+            tunInterface: null,
+            physicalNic: null,
+          }
+        : null,
+    });
+
+    render(<App />);
+    await screen.findByRole("heading", { name: "Protected" });
+
+    const engineGroup = screen.getByRole("radiogroup");
+    const proxyRadio = within(engineGroup).getByRole("radio", {
+      name: "Proxy",
+    });
+    const tunRadio = within(engineGroup).getByRole("radio", { name: "TUN" });
+
+    expect(proxyRadio).toHaveAttribute("aria-checked", "true");
+    expect(tunRadio).toHaveAttribute("aria-checked", "false");
+    expect(tunRadio).toBeDisabled();
+    expect(
+      screen.getByText(
+        /Add wintun\.dll to the app folder to enable Full-PC \(TUN\) mode/i,
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("renders Update cancelled instead of Installation cancelled when an engine upgrade is cancelled", async () => {
+    statusSnapshotOverride = {
+      installedVersion: "0.5.6",
+      bundledEngineVersion: "0.6.1",
+      cliVersionRelation: "upgrade_available",
+    };
+    upgradeServiceOverride = async () => ({
+      ok: false,
+      cancelled: true,
+      message: "Administrator prompt cancelled.",
+    });
+
+    render(<App />);
+    const prompt = await screen.findByRole("dialog", {
+      name: /Engine update ready/i,
+    });
+
+    fireEvent.click(
+      within(prompt).getByRole("button", { name: "View in Installation" }),
+    );
+    expect(
+      await screen.findByRole("heading", { name: "Installation" }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /Update Engine to v0\.6\.1/i }),
+    );
+
+    expect(await screen.findByText("Update cancelled")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Installation cancelled"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("translates Diagnostics check summaries and details in Turkish mode without raw English leaks", async () => {
+    render(<App />);
+    await screen.findByRole("heading", { name: "Protected" });
+
+    fireEvent.click(getNavButton("Settings"));
+    const trBtn = await screen.findByRole("radio", { name: "Türkçe" });
+    fireEvent.click(trBtn);
+
+    const trNav = await screen.findByRole("navigation", {
+      name: "Ana gezinme",
+    });
+    fireEvent.click(within(trNav).getByRole("button", { name: "Tanılama" }));
+    await screen.findByRole("heading", { name: "Tanılama" });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Tanılamayı Çalıştır" }),
+    );
+    expect(
+      await screen.findByText(/Tüm denetimler geçti \(6\/6\)/i),
+    ).toBeInTheDocument();
+
+    const resultsCard = screen.getByLabelText("Tanılama denetim sonuçları");
+    expect(
+      within(resultsCard).getByText("VPN uyumluluğu"),
+    ).toBeInTheDocument();
+    expect(
+      within(resultsCard).getByText("Wintun sürücüsü"),
+    ).toBeInTheDocument();
+    expect(
+      within(resultsCard).getByText("Şifreli DNS (DoH)"),
+    ).toBeInTheDocument();
+    expect(
+      within(resultsCard).getByText("Çalışma durumu"),
+    ).toBeInTheDocument();
+
+    const summaryNodes = resultsCard.querySelectorAll(".diag-check-summary");
+    const detailNodes = resultsCard.querySelectorAll(".diag-check-detail");
+    expect(summaryNodes.length).toBe(6);
+    expect(detailNodes.length).toBeGreaterThanOrEqual(4);
+    for (const node of Array.from(summaryNodes)) {
+      expect(node.textContent?.trim().length).toBeGreaterThan(0);
+    }
+
+    const resultsText = resultsCard.textContent ?? "";
+    for (const rawEnglishLeak of [
+      "No VPN conflict",
+      "Exclude (2 apps)",
+      "verified and ready for TUN adapter",
+      "Resolved via DoH",
+      "QUIC blocking:",
+      "TLS 1.3 handshake succeeded",
+      "TCP flows",
+      "VPN coexistence:",
+      "adaptive stage",
+      "Engine: TUN",
+      "Adapter vdpi-tun0 via",
+    ]) {
+      expect(resultsText).not.toContain(rawEnglishLeak);
+    }
   });
 });

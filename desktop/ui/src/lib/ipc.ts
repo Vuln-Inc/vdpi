@@ -40,6 +40,8 @@ export type AppFolderTarget = "config" | "logs" | "app";
 const APP_VERSION = "0.6.1";
 const READ_IPC_TIMEOUT_MS = 15_000;
 const APP_ICONS_TIMEOUT_MS = 10_000;
+const UPDATE_IPC_TIMEOUT_MS = 25_000;
+const DIAGNOSTICS_IPC_TIMEOUT_MS = 30_000;
 const SERVICE_ACTION_TIMEOUT_MS = 180_000;
 const MAX_DOMAIN_ENTRIES = 512;
 const MAX_SPLIT_TUNNEL_APPS = 256;
@@ -580,7 +582,7 @@ function computeMockCliVersionRelation(store: MockStore): CliVersionRelation {
 
 function cloneSnapshot(store: MockStore): DesktopStatusSnapshot {
   store.snapshotSeq += 1;
-  return {
+  const snapshot: DesktopStatusSnapshot = {
     snapshotSeq: store.snapshotSeq,
     appVersion: APP_VERSION,
     platform: "windows",
@@ -599,14 +601,19 @@ function cloneSnapshot(store: MockStore): DesktopStatusSnapshot {
     configPath: MOCK_CONFIG_PATH,
     logsDir: MOCK_LOGS_DIR,
     traySupported: store.traySupported,
-    configWarning: store.configWarning,
     bundledEngineVersion: store.bundledEngineVersion,
     cliVersionRelation: computeMockCliVersionRelation(store),
     canInstallFromBundle: store.canInstallFromBundle,
     liveVersionStale: store.liveVersionStale,
-    pendingOperation: store.pendingOperation,
     runningFromReadonlyDmg: store.runningFromReadonlyDmg,
   };
+  if (store.configWarning !== null) {
+    snapshot.configWarning = store.configWarning;
+  }
+  if (store.pendingOperation !== null) {
+    snapshot.pendingOperation = store.pendingOperation;
+  }
+  return snapshot;
 }
 
 function cloneSettings(store: MockStore): DesktopSettingsPayload {
@@ -805,7 +812,7 @@ function buildMockDiagnosticsReport(store: MockStore): DiagnosticsReport {
 
   const vpnCheck: DiagnosticCheckItem = store.vpnConflict
     ? {
-        id: "vpn",
+        id: "vpn_coexistence",
         name: "VPN coexistence",
         target: store.vpnConflict,
         status: "warn",
@@ -815,7 +822,7 @@ function buildMockDiagnosticsReport(store: MockStore): DiagnosticsReport {
       }
     : emptyInclude
       ? {
-          id: "vpn",
+          id: "vpn_coexistence",
           name: "VPN coexistence",
           target: "Routing & split rules",
           status: "warn",
@@ -824,7 +831,7 @@ function buildMockDiagnosticsReport(store: MockStore): DiagnosticsReport {
           detail: EMPTY_INCLUDE_WARNING,
         }
       : {
-          id: "vpn",
+          id: "vpn_coexistence",
           name: "VPN coexistence",
           target: "Routing & split rules",
           status: "pass",
@@ -835,7 +842,7 @@ function buildMockDiagnosticsReport(store: MockStore): DiagnosticsReport {
 
   const wintunCheck: DiagnosticCheckItem = store.wintun.ready
     ? {
-        id: "wintun",
+        id: "wintun_driver",
         name: "Wintun driver",
         target: "wintun.dll",
         status: "pass",
@@ -847,7 +854,7 @@ function buildMockDiagnosticsReport(store: MockStore): DiagnosticsReport {
         detail: null,
       }
     : {
-        id: "wintun",
+        id: "wintun_driver",
         name: "Wintun driver",
         target: "wintun.dll",
         status: store.settings.engine === "tun" ? "fail" : "warn",
@@ -859,10 +866,10 @@ function buildMockDiagnosticsReport(store: MockStore): DiagnosticsReport {
       };
 
   const dnsCheck: DiagnosticCheckItem = {
-    id: "dns",
+    id: "dns_resolution",
     name: store.settings.effectiveDoh
       ? "Encrypted DNS (DoH)"
-      : "Upstream DNS (UDP)",
+      : "DNS Resolution (UDP)",
     target: store.settings.dnsDisplay,
     status: isNotInstalled ? "warn" : "pass",
     latencyMs: store.settings.effectiveDoh ? 14 : 9,
@@ -874,8 +881,8 @@ function buildMockDiagnosticsReport(store: MockStore): DiagnosticsReport {
 
   const discordCheck: DiagnosticCheckItem = isRunning
     ? {
-        id: "discord",
-        name: "Discord",
+        id: "discord_gateway",
+        name: "Discord Web & Gateway",
         target: "discord.com:443",
         status: "pass",
         latencyMs: 31,
@@ -883,8 +890,8 @@ function buildMockDiagnosticsReport(store: MockStore): DiagnosticsReport {
         detail: `Engine: ${engineLabel} · stage ComboMultiRecord`,
       }
     : {
-        id: "discord",
-        name: "Discord",
+        id: "discord_gateway",
+        name: "Discord Web & Gateway",
         target: "discord.com:443",
         status: isNotInstalled ? "fail" : "warn",
         latencyMs: isNotInstalled ? null : 58,
@@ -896,8 +903,8 @@ function buildMockDiagnosticsReport(store: MockStore): DiagnosticsReport {
 
   const robloxCheck: DiagnosticCheckItem = isRunning
     ? {
-        id: "roblox",
-        name: "Roblox",
+        id: "roblox_clientsettings",
+        name: "Roblox ClientSettings",
         target: "roblox.com:443",
         status: "pass",
         latencyMs: 42,
@@ -905,8 +912,8 @@ function buildMockDiagnosticsReport(store: MockStore): DiagnosticsReport {
         detail: `Engine: ${engineLabel} · stage ComboMultiRecord`,
       }
     : {
-        id: "roblox",
-        name: "Roblox",
+        id: "roblox_clientsettings",
+        name: "Roblox ClientSettings",
         target: "roblox.com:443",
         status: isNotInstalled ? "fail" : "warn",
         latencyMs: isNotInstalled ? null : 64,
@@ -918,8 +925,8 @@ function buildMockDiagnosticsReport(store: MockStore): DiagnosticsReport {
 
   const runtimeCheck: DiagnosticCheckItem = isNotInstalled
     ? {
-        id: "runtime",
-        name: "Runtime hygiene",
+        id: "service_hygiene",
+        name: "Service & Runtime Hygiene",
         target: `${engineLabel} service`,
         status: "fail",
         latencyMs: null,
@@ -929,8 +936,8 @@ function buildMockDiagnosticsReport(store: MockStore): DiagnosticsReport {
       }
     : isRunning && store.live
       ? {
-          id: "runtime",
-          name: "Runtime hygiene",
+          id: "service_hygiene",
+          name: "Service & Runtime Hygiene",
           target:
             store.settings.engine === "tun"
               ? (store.live.tunInterface ?? "vdpi-tun0")
@@ -944,8 +951,8 @@ function buildMockDiagnosticsReport(store: MockStore): DiagnosticsReport {
               : `HTTP ${store.live.addr}:${store.live.port} · SOCKS5 :${store.live.socksPort ?? 11080}`,
         }
       : {
-          id: "runtime",
-          name: "Runtime hygiene",
+          id: "service_hygiene",
+          name: "Service & Runtime Hygiene",
           target: `${engineLabel} service`,
           status: "warn",
           latencyMs: 1,
@@ -1348,25 +1355,21 @@ export async function getAppIcons(
   }
 
   if (isTauriRuntime()) {
-    try {
-      const raw = await invokeWithTimeout<Record<string, string>>(
-        "get_app_icons",
-        APP_ICONS_TIMEOUT_MS,
-        { apps },
-      );
-      if (!raw || typeof raw !== "object") {
-        return {};
-      }
-      const sanitized: Record<string, string> = {};
-      for (const [key, value] of Object.entries(raw)) {
-        if (typeof value === "string" && value.length > 0) {
-          sanitized[key] = value;
-        }
-      }
-      return sanitized;
-    } catch {
+    const raw = await invokeWithTimeout<Record<string, string>>(
+      "get_app_icons",
+      APP_ICONS_TIMEOUT_MS,
+      { apps },
+    );
+    if (!raw || typeof raw !== "object") {
       return {};
     }
+    const sanitized: Record<string, string> = {};
+    for (const [key, value] of Object.entries(raw)) {
+      if (typeof value === "string" && value.length > 0) {
+        sanitized[key] = value;
+      }
+    }
+    return sanitized;
   }
 
   const icons: Record<string, string> = {};
@@ -1496,7 +1499,7 @@ export async function runDiagnostics(): Promise<DiagnosticsReport> {
   if (isTauriRuntime()) {
     return invokeWithTimeout<DiagnosticsReport>(
       "run_diagnostics",
-      READ_IPC_TIMEOUT_MS,
+      DIAGNOSTICS_IPC_TIMEOUT_MS,
     );
   }
   return buildMockDiagnosticsReport(mockStore);
@@ -1752,11 +1755,14 @@ export async function uninstallService(): Promise<ActionResult> {
   };
 }
 
-export async function checkUpdates(): Promise<UpdateCheckPayload> {
+export async function checkUpdates(
+  force?: boolean,
+): Promise<UpdateCheckPayload> {
   if (isTauriRuntime()) {
     return invokeWithTimeout<UpdateCheckPayload>(
       "check_updates",
-      READ_IPC_TIMEOUT_MS,
+      UPDATE_IPC_TIMEOUT_MS,
+      force !== undefined ? { force: Boolean(force) } : undefined,
     );
   }
 

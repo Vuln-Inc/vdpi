@@ -2,13 +2,15 @@
 //! external dependencies.
 //!
 //! Resolves per-application icons as validated `data:image/png;base64,...` URIs across
-//! Windows (`SHGetFileInfoW` + `GetIconInfo` + `GetDIBits`), macOS (`.app` bundle ->
-//! `.icns` embedded PNG parser), and Linux (`.desktop` entry -> `Icon=` PNG resolver).
+//! Windows (`PrivateExtractIconsW` / `SHGetFileInfoW` + `GetIconInfo` + `GetDIBits`),
+//! macOS (allowlisted `.app` bundle -> `.icns` embedded PNG parser), and Linux
+//! (`.desktop` entry -> `Icon=` PNG resolver).
 
-use std::collections::HashMap;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-use std::path::Path;
+use std::collections::{HashMap, VecDeque};
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::models::AppIconRequestDto;
 
@@ -17,6 +19,15 @@ const MAX_BATCH_APPS: usize = 256;
 
 /// Maximum number of cached entries retained in the global in-memory icon cache.
 const MAX_ICON_CACHE_ENTRIES: usize = 512;
+
+/// Time-to-live for cached negative (`None`) icon lookups so newly installed/updated
+/// apps are retried without restarting the desktop app.
+const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Maximum IPC string lengths accepted on `AppIconRequestDto` before cache keying.
+const MAX_REQUEST_KEY_LEN: usize = 256;
+const MAX_REQUEST_EXE_LEN: usize = 256;
+const MAX_REQUEST_PATH_LEN: usize = 4096;
 
 /// Maximum raw PNG payload size accepted (128 KiB).
 const MAX_RAW_PNG_BYTES: usize = 128 * 1024;
@@ -30,32 +41,107 @@ const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
 /// Data URI prefix for validated PNG icon payloads.
 const DATA_URI_PREFIX: &str = "data:image/png;base64,";
 
-/// Global bounded icon cache keyed by normalized `(path, exe_name)`.
-static ICON_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
-
-fn icon_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
-    ICON_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+#[derive(Clone)]
+struct CacheEntry {
+    uri: Option<String>,
+    inserted_at: Instant,
 }
 
-/// Resolves native OS application icons for a batch of applications (capped at 256 items).
-///
-/// Returns a map from `app.key` to a validated `"data:image/png;base64,..."` URI for each
-/// application whose icon could be safely extracted. Results (including negative lookups)
-/// are cached in a bounded global in-memory map so repeated tab opens are instant.
-pub fn resolve_app_icons(apps: &[AppIconRequestDto]) -> HashMap<String, String> {
+/// Bounded FIFO in-memory icon cache with TTL expiration for negative (`None`) entries.
+struct IconCache {
+    entries: HashMap<String, CacheEntry>,
+    order: VecDeque<String>,
+    max_entries: usize,
+}
+
+impl IconCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            max_entries: max_entries.max(1),
+        }
+    }
+
+    /// Returns `Some(Some(uri))` on positive hit, `Some(None)` on unexpired negative hit,
+    /// or `None` on miss / expired negative entry.
+    fn get(&mut self, key: &str, now: Instant) -> Option<Option<String>> {
+        let expired = match self.entries.get(key) {
+            Some(entry) => {
+                entry.uri.is_none()
+                    && now.saturating_duration_since(entry.inserted_at) >= NEGATIVE_CACHE_TTL
+            }
+            None => return None,
+        };
+        if expired {
+            self.entries.remove(key);
+            if let Some(pos) = self.order.iter().position(|k| k == key) {
+                self.order.remove(pos);
+            }
+            return None;
+        }
+        self.entries.get(key).map(|e| e.uri.clone())
+    }
+
+    fn insert(&mut self, key: String, uri: Option<String>, now: Instant) {
+        if !self.entries.contains_key(&key) {
+            while self.entries.len() >= self.max_entries {
+                let Some(oldest_key) = self.order.pop_front() else {
+                    break;
+                };
+                self.entries.remove(&oldest_key);
+            }
+            self.order.push_back(key.clone());
+        }
+        self.entries.insert(
+            key,
+            CacheEntry {
+                uri,
+                inserted_at: now,
+            },
+        );
+    }
+}
+
+/// Global bounded icon cache keyed by normalized `(path, exe_name)`.
+static ICON_CACHE: OnceLock<Mutex<IconCache>> = OnceLock::new();
+
+fn icon_cache() -> &'static Mutex<IconCache> {
+    ICON_CACHE.get_or_init(|| Mutex::new(IconCache::new(MAX_ICON_CACHE_ENTRIES)))
+}
+
+fn is_within_request_length_limits(app: &AppIconRequestDto) -> bool {
+    !app.key.trim().is_empty()
+        && app.key.len() <= MAX_REQUEST_KEY_LEN
+        && app.exe_name.len() <= MAX_REQUEST_EXE_LEN
+        && app
+            .path
+            .as_deref()
+            .is_none_or(|p| p.len() <= MAX_REQUEST_PATH_LEN)
+}
+
+fn resolve_app_icons_with<F>(
+    apps: &[AppIconRequestDto],
+    cache: &Mutex<IconCache>,
+    now: Instant,
+    mut extractor: F,
+) -> HashMap<String, String>
+where
+    F: FnMut(&AppIconRequestDto) -> Option<String>,
+{
     let mut results = HashMap::new();
 
     for app in apps.iter().take(MAX_BATCH_APPS) {
-        if app.key.trim().is_empty() || results.contains_key(&app.key) {
+        if !is_within_request_length_limits(app) || results.contains_key(&app.key) {
             continue;
         }
 
         let cache_key = cache_key_for(app);
         let cached = {
-            let guard = icon_cache()
+            let mut guard = cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard.get(&cache_key).cloned()
+            guard.get(&cache_key, now)
         };
 
         if let Some(cached_uri) = cached {
@@ -65,16 +151,13 @@ pub fn resolve_app_icons(apps: &[AppIconRequestDto]) -> HashMap<String, String> 
             continue;
         }
 
-        let resolved = extract_icon_data_uri(app);
+        let resolved = extractor(app);
 
         {
-            let mut guard = icon_cache()
+            let mut guard = cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if guard.len() >= MAX_ICON_CACHE_ENTRIES && !guard.contains_key(&cache_key) {
-                guard.clear();
-            }
-            guard.insert(cache_key, resolved.clone());
+            guard.insert(cache_key, resolved.clone(), now);
         }
 
         if let Some(uri) = resolved {
@@ -83,6 +166,18 @@ pub fn resolve_app_icons(apps: &[AppIconRequestDto]) -> HashMap<String, String> 
     }
 
     results
+}
+
+/// Resolves native OS application icons for a batch of applications (capped at 256 items).
+///
+/// Returns a map from `app.key` to a validated `"data:image/png;base64,..."` URI for each
+/// application whose icon could be safely extracted. Results (including 60s TTL negative
+/// lookups) are cached in a bounded global FIFO map so repeated tab opens are instant.
+pub fn resolve_app_icons(apps: &[AppIconRequestDto]) -> HashMap<String, String> {
+    #[cfg(target_os = "windows")]
+    let _com_guard = windows_icons::ComGuard::init();
+
+    resolve_app_icons_with(apps, icon_cache(), Instant::now(), extract_icon_data_uri)
 }
 
 fn cache_key_for(app: &AppIconRequestDto) -> String {
@@ -100,9 +195,9 @@ fn cache_key_for(app: &AppIconRequestDto) -> String {
     format!("{norm_path}\x1f{norm_exe}")
 }
 
-/// Returns `true` for empty, NUL-containing, UNC, network, URI, or Windows device paths
-/// (`\\...`, `//...`, `\\?\`, `\\.\`, `\/...`, `/\...`, `*://*`) so icon lookups never
-/// trigger SMB authentication or stall on offline network shares.
+/// Returns `true` for empty, NUL-containing, UNC, network, URI, or Windows device/NT paths
+/// (`\\...`, `//...`, `\\?\`, `\\.\`, `\??\`, `\/...`, `/\...`, `*://*`) so icon lookups
+/// never trigger SMB authentication or stall on offline network shares.
 fn is_unsafe_or_network_path(raw: &str) -> bool {
     let trimmed = raw.trim();
     trimmed.is_empty()
@@ -111,6 +206,10 @@ fn is_unsafe_or_network_path(raw: &str) -> bool {
         || trimmed.starts_with("//")
         || trimmed.starts_with(r"\/")
         || trimmed.starts_with(r"/\")
+        || trimmed.starts_with(r"\??\")
+        || trimmed.starts_with("/??/")
+        || trimmed.starts_with(r"\??/")
+        || trimmed.starts_with(r"/??\")
         || trimmed.contains("://")
 }
 
@@ -221,11 +320,28 @@ fn encode_base64(input: &[u8]) -> String {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn read_file_bounded(path: &Path, max_bytes: usize) -> Option<Vec<u8>> {
+    use std::fs::OpenOptions;
     use std::io::Read;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 
-    let file = std::fs::File::open(path).ok()?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    // `File::metadata()` calls `fstat(2)` on the opened descriptor; reject non-regular files
+    // (symlinks, FIFOs, sockets, device nodes) and oversized files before reading.
     let meta = file.metadata().ok()?;
-    if !meta.is_file() || meta.len() > max_bytes as u64 {
+    let ft = meta.file_type();
+    if !ft.is_file()
+        || ft.is_symlink()
+        || ft.is_fifo()
+        || ft.is_socket()
+        || ft.is_block_device()
+        || ft.is_char_device()
+        || (meta.mode() & 0o170_000) != 0o100_000
+        || meta.len() > max_bytes as u64
+    {
         return None;
     }
 
@@ -239,13 +355,31 @@ fn read_file_bounded(path: &Path, max_bytes: usize) -> Option<Vec<u8>> {
 }
 
 #[cfg(any(target_os = "windows", test))]
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut c = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            if (c & 1) != 0 {
+                c = (c >> 1) ^ 0xedb8_8320;
+            } else {
+                c >>= 1;
+            }
+            bit += 1;
+        }
+        table[i] = c;
+        i += 1;
+    }
+    table
+};
+
+#[cfg(any(target_os = "windows", test))]
 fn crc32_update(mut crc: u32, bytes: &[u8]) -> u32 {
     for &b in bytes {
-        crc ^= u32::from(b);
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-        }
+        let idx = ((crc ^ u32::from(b)) & 0xff) as usize;
+        crc = (crc >> 8) ^ CRC32_TABLE[idx];
     }
     crc
 }
@@ -429,13 +563,44 @@ fn downscale_rgba_if_needed(
     (dst_w, dst_h, out)
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn is_safe_windows_exe_path_syntax(raw: &str) -> bool {
+    if is_unsafe_or_network_path(raw) {
+        return false;
+    }
+    let bytes = raw.as_bytes();
+    if bytes.len() < 7
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || !matches!(bytes[2], b'\\' | b'/')
+    {
+        return false;
+    }
+    // Reject NTFS Alternate Data Streams (any `:` after the drive letter).
+    if raw[2..].contains(':') {
+        return false;
+    }
+    // Reject parent directory traversal segments.
+    if raw.split(['\\', '/']).any(|seg| seg == "..") {
+        return false;
+    }
+    // Only extract icons from `.exe` targets with a non-empty filename stem.
+    let last_seg = raw.rsplit(['\\', '/']).next().unwrap_or("");
+    last_seg.len() > 4 && last_seg.to_ascii_lowercase().ends_with(".exe")
+}
+
 #[cfg(target_os = "windows")]
 mod windows_icons {
     use core::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
-    use std::path::{Path, PathBuf};
+    use std::path::{Component, Path, PathBuf};
 
-    use super::{downscale_rgba_if_needed, encode_rgba_png};
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileAttributesW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        INVALID_FILE_ATTRIBUTES,
+    };
+
+    use super::{downscale_rgba_if_needed, encode_rgba_png, is_safe_windows_exe_path_syntax};
 
     type Handle = *mut c_void;
     type HIcon = Handle;
@@ -450,6 +615,13 @@ mod windows_icons {
     const DIB_RGB_COLORS: u32 = 0;
     const MAX_ICON_DIMENSION: u32 = 64;
     const MAX_SOURCE_DIMENSION: i32 = 512;
+    const COINIT_APARTMENTTHREADED: u32 = 0x2;
+    const COINIT_DISABLE_OLE1DDE: u32 = 0x4;
+    const S_OK: i32 = 0;
+    const S_FALSE: i32 = 1;
+    const DRIVE_UNKNOWN: u32 = 0;
+    const DRIVE_NO_ROOT_DIR: u32 = 1;
+    const DRIVE_REMOTE: u32 = 4;
 
     #[repr(C)]
     #[allow(dead_code)]
@@ -515,6 +687,17 @@ mod windows_icons {
         bmi_colors: [RgbQuad; 1],
     }
 
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoInitializeEx(pv_reserved: *const c_void, dw_co_init: u32) -> i32;
+        fn CoUninitialize();
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetDriveTypeW(lp_root_path_name: *const u16) -> u32;
+    }
+
     #[link(name = "shell32")]
     extern "system" {
         fn SHGetFileInfoW(
@@ -530,6 +713,16 @@ mod windows_icons {
     extern "system" {
         fn GetIconInfo(h_icon: HIcon, piconinfo: *mut IconInfo) -> i32;
         fn DestroyIcon(h_icon: HIcon) -> i32;
+        fn PrivateExtractIconsW(
+            sz_file_name: *const u16,
+            n_icon_index: i32,
+            cx_icon: i32,
+            cy_icon: i32,
+            phicon: *mut HIcon,
+            piconid: *mut u32,
+            n_icons: u32,
+            flags: u32,
+        ) -> u32;
     }
 
     #[link(name = "gdi32")]
@@ -549,12 +742,43 @@ mod windows_icons {
         fn DeleteObject(ho: HGDIObj) -> i32;
     }
 
+    pub(super) struct ComGuard {
+        should_uninit: bool,
+    }
+
+    impl ComGuard {
+        pub(super) fn init() -> Self {
+            // SAFETY: `CoInitializeEx` with NULL reserved pointer and STA flags is safe to call
+            // on the blocking worker thread; `CoUninitialize` is invoked iff S_OK or S_FALSE.
+            let hr = unsafe {
+                CoInitializeEx(
+                    std::ptr::null(),
+                    COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
+                )
+            };
+            Self {
+                should_uninit: hr == S_OK || hr == S_FALSE,
+            }
+        }
+    }
+
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            if self.should_uninit {
+                // SAFETY: Matches a preceding successful `CoInitializeEx` (S_OK or S_FALSE) on this thread.
+                unsafe {
+                    CoUninitialize();
+                }
+            }
+        }
+    }
+
     struct OwnedHIcon(HIcon);
 
     impl Drop for OwnedHIcon {
         fn drop(&mut self) {
             if !self.0.is_null() {
-                // SAFETY: `self.0` is an owned HICON returned by `SHGetFileInfoW`.
+                // SAFETY: `self.0` is an owned HICON returned by `PrivateExtractIconsW` or `SHGetFileInfoW`.
                 unsafe {
                     DestroyIcon(self.0);
                 }
@@ -586,6 +810,74 @@ mod windows_icons {
                 }
             }
         }
+    }
+
+    fn is_remote_or_invalid_drive(path: &Path) -> bool {
+        let Some(raw) = path.to_str() else {
+            return true;
+        };
+        let bytes = raw.as_bytes();
+        if bytes.len() < 2 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' {
+            return true;
+        }
+        let drive = (bytes[0] as char).to_ascii_uppercase();
+        let root_wide: [u16; 4] = [drive as u16, u16::from(b':'), u16::from(b'\\'), 0];
+        // SAFETY: `root_wide` is a valid NUL-terminated UTF-16 drive root string (`X:\`).
+        let drive_type = unsafe { GetDriveTypeW(root_wide.as_ptr()) };
+        matches!(drive_type, DRIVE_REMOTE | DRIVE_UNKNOWN | DRIVE_NO_ROOT_DIR)
+    }
+
+    fn verify_no_reparse_points_and_regular_file(path: &Path) -> bool {
+        let components: Vec<Component<'_>> = path.components().collect();
+        let Some(last_normal_idx) = components
+            .iter()
+            .rposition(|c| matches!(c, Component::Normal(_)))
+        else {
+            return false;
+        };
+
+        let mut current = PathBuf::new();
+        for (idx, comp) in components.iter().enumerate() {
+            match comp {
+                Component::Prefix(p) => current.push(p.as_os_str()),
+                Component::RootDir => current.push(comp.as_os_str()),
+                Component::CurDir => continue,
+                Component::ParentDir => return false,
+                Component::Normal(seg) => {
+                    current.push(seg);
+                    let wide: Vec<u16> = current
+                        .as_os_str()
+                        .encode_wide()
+                        .chain(std::iter::once(0))
+                        .collect();
+                    // SAFETY: `wide` is a valid NUL-terminated UTF-16 path buffer.
+                    let attrs = unsafe { GetFileAttributesW(wide.as_ptr()) };
+                    if attrs == INVALID_FILE_ATTRIBUTES
+                        || (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+                    {
+                        return false;
+                    }
+                    let is_dir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                    if idx == last_normal_idx {
+                        if is_dir {
+                            return false;
+                        }
+                    } else if !is_dir {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn validate_windows_exe_target(path: &Path) -> bool {
+        let Some(raw) = path.to_str() else {
+            return false;
+        };
+        is_safe_windows_exe_path_syntax(raw)
+            && !is_remote_or_invalid_drive(path)
+            && verify_no_reparse_points_and_regular_file(path)
     }
 
     fn make_top_down_32bit_bmi(width: i32, height: i32) -> BitmapInfo {
@@ -662,9 +954,11 @@ mod windows_icons {
     fn resolve_target_path(clean_path: Option<&str>, exe_name: &str) -> Option<PathBuf> {
         if let Some(p) = clean_path {
             let candidate = PathBuf::from(p);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
+            return if validate_windows_exe_target(&candidate) {
+                Some(candidate)
+            } else {
+                None
+            };
         }
 
         let exe = exe_name.trim();
@@ -675,25 +969,48 @@ mod windows_icons {
         let sys_root = std::env::var_os("SystemRoot").or_else(|| std::env::var_os("WINDIR"))?;
         let system32 = PathBuf::from(sys_root).join("System32");
         let direct = system32.join(exe);
-        if direct.is_file() {
+        if validate_windows_exe_target(&direct) {
             return Some(direct);
         }
         if !exe.to_ascii_lowercase().ends_with(".exe") {
             let with_exe = system32.join(format!("{exe}.exe"));
-            if with_exe.is_file() {
+            if validate_windows_exe_target(&with_exe) {
                 return Some(with_exe);
             }
         }
         None
     }
 
-    fn extract_icon_from_path(path: &Path) -> Option<Vec<u8>> {
-        let wide: Vec<u16> = path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
+    fn extract_hicon_from_path(wide: &[u16]) -> Option<OwnedHIcon> {
+        // Prefer HiDPI 64x64 / 48x48 extraction directly from the PE icon resource.
+        for size in [64i32, 48i32] {
+            let mut h_icon: HIcon = std::ptr::null_mut();
+            let mut icon_id: u32 = 0;
+            // SAFETY: `wide` is NUL-terminated UTF-16; `h_icon` and `icon_id` are valid out-pointers.
+            let count = unsafe {
+                PrivateExtractIconsW(
+                    wide.as_ptr(),
+                    0,
+                    size,
+                    size,
+                    &mut h_icon,
+                    &mut icon_id,
+                    1,
+                    0,
+                )
+            };
+            if count > 0 && count != u32::MAX && !h_icon.is_null() {
+                return Some(OwnedHIcon(h_icon));
+            }
+            if !h_icon.is_null() {
+                // SAFETY: Clean up any stray handle returned alongside an unexpected count.
+                unsafe {
+                    DestroyIcon(h_icon);
+                }
+            }
+        }
 
+        // Fallback to Shell large icon (e.g. console executables with no embedded icon resource).
         // SAFETY: `ShFileInfoW` is a plain C struct where zero-initialization is valid.
         let mut shfi: ShFileInfoW = unsafe { std::mem::zeroed() };
         // SAFETY: `wide` is NUL-terminated UTF-16 and `shfi` matches `sizeof(SHFILEINFOW)`.
@@ -709,7 +1026,17 @@ mod windows_icons {
         if ok == 0 || shfi.h_icon.is_null() {
             return None;
         }
-        let icon = OwnedHIcon(shfi.h_icon);
+        Some(OwnedHIcon(shfi.h_icon))
+    }
+
+    fn extract_icon_from_path(path: &Path) -> Option<Vec<u8>> {
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let icon = extract_hicon_from_path(&wide)?;
 
         // SAFETY: `IconInfo` is a plain C struct where zero-initialization is valid.
         let mut info: IconInfo = unsafe { std::mem::zeroed() };
@@ -831,19 +1158,20 @@ fn parse_cf_bundle_icon_file(plist_xml: &str) -> Option<String> {
 #[cfg(any(target_os = "macos", test))]
 fn icns_chunk_priority(chunk_type: &[u8; 4]) -> usize {
     match chunk_type {
-        b"icp5" => 0, // 32x32
-        b"icp6" => 1, // 64x64
-        b"ic11" => 2, // 32x32@2x (64x64)
-        b"ic07" => 3, // 128x128
-        b"ic12" => 4, // 64x64@2x (128x128)
-        b"ic08" => 5, // 256x256
-        b"ic13" => 6, // 128x128@2x (256x256)
+        b"icp6" => 0, // 64x64
+        b"ic11" => 1, // 32x32@2x (64x64)
+        b"ic07" => 2, // 128x128
+        b"ic12" => 3, // 64x64@2x (128x128)
+        b"ic08" => 4, // 256x256
+        b"ic13" => 5, // 128x128@2x (256x256)
+        b"icp5" => 6, // 32x32
         _ => 7,
     }
 }
 
 /// Parses an Apple `.icns` container in pure Rust and returns the best embedded PNG chunk
-/// within [`MAX_RAW_PNG_BYTES`], preferring `icp5`, `icp6`, `ic11`, `ic07`, `ic12`, `ic08`, `ic13`.
+/// within [`MAX_RAW_PNG_BYTES`], preferring HiDPI chunks (`icp6`, `ic11`, `ic07`, `ic12`,
+/// `ic08`, `ic13`) ahead of 32px (`icp5`).
 #[cfg(any(target_os = "macos", test))]
 fn extract_png_from_icns(data: &[u8]) -> Option<Vec<u8>> {
     if data.len() < 8 || &data[0..4] != b"icns" {
@@ -889,14 +1217,47 @@ fn extract_png_from_icns(data: &[u8]) -> Option<Vec<u8>> {
     best.map(|(_, bytes)| bytes.to_vec())
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn is_path_under_any_root(path: &Path, roots: &[PathBuf]) -> bool {
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    roots
+        .iter()
+        .any(|root| path.starts_with(root) && path != root)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_allowed_app_roots(home: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = vec![
+        PathBuf::from("/Applications"),
+        PathBuf::from("/System/Applications"),
+        PathBuf::from("/System/Library/CoreServices"),
+    ];
+    if let Some(h) = home.filter(|p| !p.as_os_str().is_empty() && p.has_root()) {
+        let user_apps = h.join("Applications");
+        if !roots.contains(&user_apps) {
+            roots.push(user_apps);
+        }
+    }
+    roots
+}
+
 #[cfg(target_os = "macos")]
 mod macos_icons {
     use std::path::{Path, PathBuf};
 
-    use super::{extract_png_from_icns, parse_cf_bundle_icon_file, read_file_bounded};
+    use super::{
+        extract_png_from_icns, is_path_under_any_root, macos_allowed_app_roots,
+        parse_cf_bundle_icon_file, read_file_bounded,
+    };
 
     const MAX_PLIST_BYTES: usize = 512 * 1024;
     const MAX_ICNS_BYTES: usize = 8 * 1024 * 1024;
+    const MAX_ICNS_SCAN_FILES: usize = 16;
 
     fn is_app_bundle(path: &Path) -> bool {
         path.extension()
@@ -905,13 +1266,50 @@ mod macos_icons {
             && path.is_dir()
     }
 
+    fn canonical_allowed_roots() -> Vec<PathBuf> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let mut canon = Vec::new();
+        for root in macos_allowed_app_roots(home.as_deref()) {
+            if let Ok(c) = std::fs::canonicalize(&root) {
+                if !canon.contains(&c) {
+                    canon.push(c);
+                }
+            }
+        }
+        canon
+    }
+
+    fn push_verified_bundle(bundles: &mut Vec<PathBuf>, candidate: &Path, canon_roots: &[PathBuf]) {
+        if !is_app_bundle(candidate) {
+            return;
+        }
+        let Ok(canon_bundle) = std::fs::canonicalize(candidate) else {
+            return;
+        };
+        if is_app_bundle(&canon_bundle)
+            && is_path_under_any_root(&canon_bundle, canon_roots)
+            && !bundles.contains(&canon_bundle)
+        {
+            bundles.push(canon_bundle);
+        }
+    }
+
     fn candidate_bundles(clean_path: Option<&str>, exe_name: &str, key: &str) -> Vec<PathBuf> {
+        let canon_roots = canonical_allowed_roots();
+        if canon_roots.is_empty() {
+            return Vec::new();
+        }
+
         let mut bundles = Vec::new();
 
         if let Some(raw_path) = clean_path {
-            for ancestor in Path::new(raw_path).ancestors() {
-                if is_app_bundle(ancestor) {
-                    bundles.push(ancestor.to_path_buf());
+            let p = Path::new(raw_path);
+            if !p
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                for ancestor in p.ancestors() {
+                    push_verified_bundle(&mut bundles, ancestor, &canon_roots);
                 }
             }
         }
@@ -929,31 +1327,39 @@ mod macos_icons {
                 .unwrap_or(name);
             let bundle_name = format!("{stem}.app");
 
-            let mut roots = vec![
-                PathBuf::from("/Applications"),
-                PathBuf::from("/System/Applications"),
-            ];
-            if let Some(home) = std::env::var_os("HOME") {
-                roots.push(PathBuf::from(home).join("Applications"));
-            }
-
-            for root in roots {
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            for root in macos_allowed_app_roots(home.as_deref()) {
                 let candidate = root.join(&bundle_name);
-                if candidate.is_dir() && !bundles.contains(&candidate) {
-                    bundles.push(candidate);
-                }
+                push_verified_bundle(&mut bundles, &candidate, &canon_roots);
             }
         }
 
         bundles
     }
 
+    fn is_non_symlink_dir(path: &Path) -> bool {
+        std::fs::symlink_metadata(path)
+            .is_ok_and(|meta| !meta.file_type().is_symlink() && meta.is_dir())
+    }
+
     fn extract_png_from_bundle(bundle: &Path) -> Option<Vec<u8>> {
         let contents = bundle.join("Contents");
         let resources = contents.join("Resources");
-        if !resources.is_dir() {
+        if !is_non_symlink_dir(&contents) || !is_non_symlink_dir(&resources) {
             return None;
         }
+
+        let mut tried: Vec<PathBuf> = Vec::new();
+        let mut try_icns = |path: PathBuf| -> Option<Vec<u8>> {
+            if tried.contains(&path) {
+                return None;
+            }
+            let png = read_file_bounded(&path, MAX_ICNS_BYTES)
+                .as_deref()
+                .and_then(extract_png_from_icns);
+            tried.push(path);
+            png
+        };
 
         // 1. Try Info.plist `CFBundleIconFile` (or `CFBundleIconName`).
         let plist_icon = read_file_bounded(&contents.join("Info.plist"), MAX_PLIST_BYTES)
@@ -965,16 +1371,28 @@ mod macos_icons {
             } else {
                 format!("{icon_file}.icns")
             };
-            if let Some(png) = read_file_bounded(&resources.join(filename), MAX_ICNS_BYTES)
-                .as_deref()
-                .and_then(extract_png_from_icns)
-            {
+            if let Some(png) = try_icns(resources.join(filename)) {
                 return Some(png);
             }
         }
 
-        // 2. Fallback: scan Contents/Resources for `*.icns` files in deterministic order.
-        let mut icns_files: Vec<PathBuf> = std::fs::read_dir(resources)
+        // 2. Prioritize standard `AppIcon.icns` and `<bundle_stem>.icns` before scanning.
+        if let Some(png) = try_icns(resources.join("AppIcon.icns")) {
+            return Some(png);
+        }
+        if let Some(stem) = bundle
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str)
+            .filter(|s| !s.is_empty() && !s.contains(['/', '\\', '\0']) && !s.contains(".."))
+        {
+            if let Some(png) = try_icns(resources.join(format!("{stem}.icns"))) {
+                return Some(png);
+            }
+        }
+
+        // 3. Fallback: scan Contents/Resources for `*.icns` files in deterministic order,
+        //    capped at `MAX_ICNS_SCAN_FILES`.
+        let mut icns_files: Vec<PathBuf> = std::fs::read_dir(&resources)
             .ok()?
             .flatten()
             .map(|entry| entry.path())
@@ -986,11 +1404,8 @@ mod macos_icons {
             .collect();
         icns_files.sort();
 
-        for icns_path in icns_files {
-            if let Some(png) = read_file_bounded(&icns_path, MAX_ICNS_BYTES)
-                .as_deref()
-                .and_then(extract_png_from_icns)
-            {
+        for icns_path in icns_files.into_iter().take(MAX_ICNS_SCAN_FILES) {
+            if let Some(png) = try_icns(icns_path) {
                 return Some(png);
             }
         }
@@ -1010,6 +1425,85 @@ mod macos_icons {
         }
         None
     }
+}
+
+#[cfg(any(target_os = "linux", test))]
+const LINUX_ICON_SIZES: &[&str] = &["64x64", "128x128", "48x48", "256x256", "32x32"];
+
+#[cfg(any(target_os = "linux", test))]
+fn is_safe_linux_lookup_key(key: &str) -> bool {
+    let trimmed = key.trim();
+    !trimmed.is_empty() && !trimmed.contains(['/', '\\', '\0']) && !trimmed.contains("..")
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn xdg_data_dirs_from(
+    home: Option<&Path>,
+    xdg_data_home: Option<&str>,
+    xdg_data_dirs: Option<&str>,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut push_unique = |p: PathBuf| {
+        if p.has_root()
+            && !p
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            && !dirs.contains(&p)
+        {
+            dirs.push(p);
+        }
+    };
+
+    if let Some(data_home) = xdg_data_home.map(str::trim).filter(|s| !s.is_empty()) {
+        push_unique(PathBuf::from(data_home));
+    } else if let Some(h) = home.filter(|p| p.has_root()) {
+        push_unique(h.join(".local/share"));
+    }
+
+    if let Some(h) = home.filter(|p| p.has_root()) {
+        push_unique(h.join(".local/share/flatpak/exports/share"));
+    }
+
+    let raw_data_dirs = xdg_data_dirs
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("/usr/local/share:/usr/share");
+    for entry in raw_data_dirs.split(':') {
+        let trimmed = entry.trim();
+        if !trimmed.is_empty() {
+            push_unique(PathBuf::from(trimmed));
+        }
+    }
+
+    push_unique(PathBuf::from("/usr/local/share"));
+    push_unique(PathBuf::from("/usr/share"));
+    push_unique(PathBuf::from("/var/lib/flatpak/exports/share"));
+
+    dirs
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn allowed_linux_icon_roots_from(
+    home: Option<&Path>,
+    xdg_data_home: Option<&str>,
+    xdg_data_dirs: Option<&str>,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut push_unique = |p: PathBuf| {
+        if p.has_root() && !roots.contains(&p) {
+            roots.push(p);
+        }
+    };
+
+    for base in xdg_data_dirs_from(home, xdg_data_home, xdg_data_dirs) {
+        push_unique(base.join("icons"));
+        push_unique(base.join("pixmaps"));
+    }
+    push_unique(PathBuf::from("/var/lib/snapd/desktop/icons"));
+    push_unique(PathBuf::from("/snap"));
+    push_unique(PathBuf::from("/var/lib/snapd/snap"));
+
+    roots
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1144,45 +1638,117 @@ mod linux_icons {
     use std::sync::OnceLock;
 
     use super::{
-        is_unsafe_or_network_path, parse_desktop_entry, read_file_bounded, MAX_RAW_PNG_BYTES,
-        PNG_MAGIC,
+        allowed_linux_icon_roots_from, is_path_under_any_root, is_safe_linux_lookup_key,
+        is_unsafe_or_network_path, parse_desktop_entry, read_file_bounded, xdg_data_dirs_from,
+        LINUX_ICON_SIZES, MAX_RAW_PNG_BYTES, PNG_MAGIC,
     };
 
     const MAX_DESKTOP_FILE_BYTES: usize = 64 * 1024;
+    const MAX_DESKTOP_FILES_PER_DIR: usize = 4096;
 
     static DESKTOP_ICON_INDEX: OnceLock<HashMap<String, String>> = OnceLock::new();
+    static ALLOWED_ICON_ROOTS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+
+    fn current_xdg_data_dirs() -> Vec<PathBuf> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let xdg_data_home = std::env::var("XDG_DATA_HOME").ok();
+        let xdg_data_dirs = std::env::var("XDG_DATA_DIRS").ok();
+        xdg_data_dirs_from(
+            home.as_deref(),
+            xdg_data_home.as_deref(),
+            xdg_data_dirs.as_deref(),
+        )
+    }
+
+    fn canonical_allowed_icon_roots() -> &'static [PathBuf] {
+        ALLOWED_ICON_ROOTS
+            .get_or_init(|| {
+                let home = std::env::var_os("HOME").map(PathBuf::from);
+                let xdg_data_home = std::env::var("XDG_DATA_HOME").ok();
+                let xdg_data_dirs = std::env::var("XDG_DATA_DIRS").ok();
+                let mut canon = Vec::new();
+                for root in allowed_linux_icon_roots_from(
+                    home.as_deref(),
+                    xdg_data_home.as_deref(),
+                    xdg_data_dirs.as_deref(),
+                ) {
+                    if let Ok(c) = std::fs::canonicalize(&root) {
+                        if !canon.contains(&c) {
+                            canon.push(c);
+                        }
+                    }
+                }
+                canon
+            })
+            .as_slice()
+    }
 
     fn desktop_dirs() -> Vec<PathBuf> {
-        let mut dirs = Vec::new();
-        if let Some(home) = std::env::var_os("HOME") {
-            let home_path = PathBuf::from(home);
-            dirs.push(home_path.join(".local/share/applications"));
-            dirs.push(home_path.join(".local/share/flatpak/exports/share/applications"));
+        let mut dirs: Vec<PathBuf> = current_xdg_data_dirs()
+            .into_iter()
+            .map(|base| base.join("applications"))
+            .collect();
+        let snap_desktop = PathBuf::from("/var/lib/snapd/desktop/applications");
+        if !dirs.contains(&snap_desktop) {
+            dirs.push(snap_desktop);
         }
-        dirs.push(PathBuf::from("/usr/local/share/applications"));
-        dirs.push(PathBuf::from("/usr/share/applications"));
-        dirs.push(PathBuf::from("/var/lib/flatpak/exports/share/applications"));
-        dirs.push(PathBuf::from("/var/lib/snapd/desktop/applications"));
         dirs
+    }
+
+    fn is_desktop_file(path: &Path) -> bool {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("desktop"))
+    }
+
+    fn collect_desktop_files_depth2(dir: &Path) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut top_paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        top_paths.sort();
+
+        let mut files = Vec::new();
+        for path in top_paths {
+            if files.len() >= MAX_DESKTOP_FILES_PER_DIR {
+                break;
+            }
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_file() {
+                if is_desktop_file(&path) {
+                    files.push(path);
+                }
+            } else if meta.is_dir() {
+                let Ok(sub_entries) = std::fs::read_dir(&path) else {
+                    continue;
+                };
+                let mut sub_paths: Vec<PathBuf> = sub_entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| is_desktop_file(p))
+                    .collect();
+                sub_paths.sort();
+                for sub in sub_paths {
+                    if files.len() >= MAX_DESKTOP_FILES_PER_DIR {
+                        break;
+                    }
+                    files.push(sub);
+                }
+            }
+        }
+        files
     }
 
     fn build_desktop_icon_index() -> HashMap<String, String> {
         let mut index = HashMap::new();
 
         for dir in desktop_dirs() {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("desktop"))
-                {
-                    continue;
-                }
-
+            for path in collect_desktop_files_depth2(&dir) {
                 let Some(bytes) = read_file_bounded(&path, MAX_DESKTOP_FILE_BYTES) else {
                     continue;
                 };
@@ -1195,12 +1761,14 @@ mod linux_icons {
 
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                     let norm_stem = stem.trim().to_ascii_lowercase();
-                    if !norm_stem.is_empty() {
+                    if is_safe_linux_lookup_key(&norm_stem) {
                         index.entry(norm_stem).or_insert_with(|| icon.clone());
                     }
                 }
                 for key in exec_keys {
-                    index.entry(key).or_insert_with(|| icon.clone());
+                    if is_safe_linux_lookup_key(&key) {
+                        index.entry(key).or_insert_with(|| icon.clone());
+                    }
                 }
             }
         }
@@ -1213,14 +1781,24 @@ mod linux_icons {
     }
 
     fn read_validated_png(path: &Path) -> Option<Vec<u8>> {
-        if !path
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return None;
+        }
+        let canon = std::fs::canonicalize(path).ok()?;
+        if !canon
             .extension()
             .and_then(|ext| ext.to_str())
             .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
         {
             return None;
         }
-        let bytes = read_file_bounded(path, MAX_RAW_PNG_BYTES)?;
+        if !is_path_under_any_root(&canon, canonical_allowed_icon_roots()) {
+            return None;
+        }
+        let bytes = read_file_bounded(&canon, MAX_RAW_PNG_BYTES)?;
         if bytes.starts_with(&PNG_MAGIC) {
             Some(bytes)
         } else {
@@ -1228,17 +1806,21 @@ mod linux_icons {
         }
     }
 
-    fn resolve_icon_png(icon_value: &str) -> Option<Vec<u8>> {
+    fn resolve_icon_png(icon_value: &str, allow_absolute: bool) -> Option<Vec<u8>> {
         let trimmed = icon_value.trim();
         if is_unsafe_or_network_path(trimmed) {
             return None;
         }
 
         if trimmed.starts_with('/') {
-            return read_validated_png(Path::new(trimmed));
+            return if allow_absolute {
+                read_validated_png(Path::new(trimmed))
+            } else {
+                None
+            };
         }
 
-        if trimmed.contains(['/', '\\', '\0']) || trimmed.contains("..") {
+        if !is_safe_linux_lookup_key(trimmed) {
             return None;
         }
 
@@ -1251,17 +1833,13 @@ mod linux_icons {
         }
         let filename = format!("{stem}.png");
 
-        let mut hicolor_roots = Vec::new();
-        if let Some(home) = std::env::var_os("HOME") {
-            let home_path = PathBuf::from(home);
-            hicolor_roots.push(home_path.join(".local/share/icons/hicolor"));
-            hicolor_roots.push(home_path.join(".local/share/flatpak/exports/share/icons/hicolor"));
-        }
-        hicolor_roots.push(PathBuf::from("/usr/local/share/icons/hicolor"));
-        hicolor_roots.push(PathBuf::from("/usr/share/icons/hicolor"));
-        hicolor_roots.push(PathBuf::from("/var/lib/flatpak/exports/share/icons/hicolor"));
+        let data_dirs = current_xdg_data_dirs();
+        let hicolor_roots: Vec<PathBuf> = data_dirs
+            .iter()
+            .map(|base| base.join("icons/hicolor"))
+            .collect();
 
-        for size in ["48x48", "64x64", "32x32", "128x128"] {
+        for size in LINUX_ICON_SIZES {
             for root in &hicolor_roots {
                 let candidate = root.join(size).join("apps").join(&filename);
                 if let Some(png) = read_validated_png(&candidate) {
@@ -1270,8 +1848,8 @@ mod linux_icons {
             }
         }
 
-        for pixmap_dir in ["/usr/local/share/pixmaps", "/usr/share/pixmaps"] {
-            let candidate = Path::new(pixmap_dir).join(&filename);
+        for base in &data_dirs {
+            let candidate = base.join("pixmaps").join(&filename);
             if let Some(png) = read_validated_png(&candidate) {
                 return Some(png);
             }
@@ -1288,7 +1866,7 @@ mod linux_icons {
         let mut lookup_keys = Vec::new();
         for raw in [exe_name, key] {
             let norm = raw.trim().to_ascii_lowercase();
-            if !norm.is_empty() && !lookup_keys.contains(&norm) {
+            if is_safe_linux_lookup_key(&norm) && !lookup_keys.contains(&norm) {
                 lookup_keys.push(norm);
             }
         }
@@ -1297,7 +1875,7 @@ mod linux_icons {
             .and_then(std::ffi::OsStr::to_str)
         {
             let norm = name.trim().to_ascii_lowercase();
-            if !norm.is_empty() && !lookup_keys.contains(&norm) {
+            if is_safe_linux_lookup_key(&norm) && !lookup_keys.contains(&norm) {
                 lookup_keys.push(norm);
             }
         }
@@ -1307,15 +1885,15 @@ mod linux_icons {
             if let Some(png) = index
                 .get(candidate_key)
                 .map(String::as_str)
-                .and_then(resolve_icon_png)
+                .and_then(|icon| resolve_icon_png(icon, true))
             {
                 return Some(png);
             }
         }
 
-        // Direct theme fallback when no `.desktop` entry matched.
+        // Direct theme fallback when no `.desktop` entry matched (never absolute paths from IPC).
         for candidate_key in &lookup_keys {
-            if let Some(png) = resolve_icon_png(candidate_key) {
+            if let Some(png) = resolve_icon_png(candidate_key, false) {
                 return Some(png);
             }
         }
@@ -1446,27 +2024,47 @@ mod tests {
     #[test]
     fn icns_parser_extracts_preferred_embedded_png_and_skips_non_png() {
         let png_32 = encode_rgba_png(2, 2, &[10u8; 16]).expect("encode icp5 png");
+        let png_64 = encode_rgba_png(2, 2, &[15u8; 16]).expect("encode icp6 png");
+        let png_64_retina = encode_rgba_png(2, 2, &[16u8; 16]).expect("encode ic11 png");
         let png_128 = encode_rgba_png(3, 3, &[20u8; 36]).expect("encode ic07 png");
         let png_256 = encode_rgba_png(4, 4, &[30u8; 64]).expect("encode ic08 png");
 
-        // Preferred icp5 beats ic07, ic08, and non-PNG ic09 chunks.
-        let icns_with_icp5 = build_synthetic_icns(&[
+        // HiDPI icp6 (64x64) beats ic11, ic07, ic08, icp5 (32x32), and non-PNG ic09 chunks.
+        let icns_with_icp6 = build_synthetic_icns(&[
             (b"ic09", b"\x00\x00\x00\x0cjP  not-a-png"),
+            (b"icp5", &png_32),
             (b"ic08", &png_256),
             (b"ic07", &png_128),
-            (b"icp5", &png_32),
+            (b"ic11", &png_64_retina),
+            (b"icp6", &png_64),
         ]);
-        assert_eq!(extract_png_from_icns(&icns_with_icp5), Some(png_32));
+        assert_eq!(extract_png_from_icns(&icns_with_icp6), Some(png_64));
 
-        // Without icp5/icp6/ic11, ic07 beats ic08.
-        let icns_without_small = build_synthetic_icns(&[(b"ic08", &png_256), (b"ic07", &png_128)]);
-        assert_eq!(extract_png_from_icns(&icns_without_small), Some(png_128));
+        // Without icp6, ic11 (32x32@2x) beats ic07 and icp5.
+        let icns_with_ic11 = build_synthetic_icns(&[
+            (b"icp5", &png_32),
+            (b"ic07", &png_128),
+            (b"ic11", &png_64_retina),
+        ]);
+        assert_eq!(extract_png_from_icns(&icns_with_ic11), Some(png_64_retina));
+
+        // Without icp6/ic11, ic07 (128x128) beats ic08 (256x256) and icp5 (32x32).
+        let icns_without_64 = build_synthetic_icns(&[
+            (b"icp5", &png_32),
+            (b"ic08", &png_256),
+            (b"ic07", &png_128),
+        ]);
+        assert_eq!(extract_png_from_icns(&icns_without_64), Some(png_128));
+
+        // icp5 (32x32) still works as fallback when no HiDPI chunk is present.
+        let icns_only_32 = build_synthetic_icns(&[(b"icp5", &png_32)]);
+        assert_eq!(extract_png_from_icns(&icns_only_32), Some(png_32));
 
         // Malformed, non-PNG, and zero-length chunks return None safely without looping.
         assert!(extract_png_from_icns(b"not-icns").is_none());
         let non_png_only = build_synthetic_icns(&[(b"ic08", b"<svg/>")]);
         assert!(extract_png_from_icns(&non_png_only).is_none());
-        let zero_len_chunk = b"icns\x00\x00\x00\x10icp5\x00\x00\x00\x00";
+        let zero_len_chunk = b"icns\x00\x00\x00\x10icp6\x00\x00\x00\x00";
         assert!(extract_png_from_icns(zero_len_chunk).is_none());
 
         // Info.plist parser extracts CFBundleIconFile and blocks traversal.
@@ -1515,6 +2113,8 @@ Icon=com.discordapp.Discord
             "//fileserver/share/app.exe",
             r"\\?\C:\Windows\System32\cmd.exe",
             r"\\.\PhysicalDrive0",
+            r"\??\C:\Windows\System32\cmd.exe",
+            "/??/C:/Windows/System32/cmd.exe",
             r"\/server/share/app.exe",
             r"/\server\share\app.exe",
             "smb://server/share/app",
@@ -1554,8 +2154,349 @@ Icon=com.discordapp.Discord
                 path: Some(r"\\?\C:\Windows\System32\cmd.exe".to_string()),
                 exe_name: "cmd.exe".to_string(),
             },
+            AppIconRequestDto {
+                key: "nt-obj-test".to_string(),
+                path: Some(r"\??\C:\Windows\System32\cmd.exe".to_string()),
+                exe_name: "cmd.exe".to_string(),
+            },
         ]);
         assert!(rejected.is_empty());
+    }
+
+    #[test]
+    fn crc32_lut_and_multi_block_png_encoding_are_valid() {
+        // IEEE 802.3 CRC-32 standard check value for ASCII "123456789".
+        assert_eq!(crc32_chunks(b"123456789", &[]), 0xcbf4_3926);
+        assert_eq!(crc32_chunks(b"IEND", &[]), 0xae42_6082);
+
+        // 130x130 RGBA image -> 130 * (1 + 520) = 67,730 raw scanline bytes (> 65,535),
+        // exercising multi-block zlib stored framing.
+        let rgba = vec![0x5au8; 130 * 130 * 4];
+        let png = encode_rgba_png(130, 130, &rgba).expect("encode 130x130 multi-block PNG");
+        assert!(png.starts_with(&PNG_MAGIC));
+
+        let mut offset = 8usize;
+        let mut saw_idat = false;
+        while offset < png.len() {
+            let len = u32::from_be_bytes([
+                png[offset],
+                png[offset + 1],
+                png[offset + 2],
+                png[offset + 3],
+            ]) as usize;
+            let ctype = &png[offset + 4..offset + 8];
+            let data = &png[offset + 8..offset + 8 + len];
+            let crc_offset = offset + 8 + len;
+            let stored_crc = u32::from_be_bytes([
+                png[crc_offset],
+                png[crc_offset + 1],
+                png[crc_offset + 2],
+                png[crc_offset + 3],
+            ]);
+            assert_eq!(stored_crc, crc32_chunks(ctype, data));
+
+            if ctype == b"IDAT" {
+                saw_idat = true;
+                assert_eq!(&data[0..2], &[0x78, 0x01]);
+                let mut pos = 2usize;
+                let mut block_count = 0usize;
+                let mut reconstructed = Vec::new();
+                loop {
+                    let bfinal = data[pos];
+                    let blen = u16::from_le_bytes([data[pos + 1], data[pos + 2]]);
+                    let bnlen = u16::from_le_bytes([data[pos + 3], data[pos + 4]]);
+                    assert_eq!(bnlen, !blen);
+                    pos += 5;
+                    reconstructed.extend_from_slice(&data[pos..pos + blen as usize]);
+                    pos += blen as usize;
+                    block_count += 1;
+                    if bfinal == 0x01 {
+                        break;
+                    }
+                    assert_eq!(bfinal, 0x00);
+                }
+                assert_eq!(block_count, 2, "expected 2 stored zlib blocks");
+                assert_eq!(reconstructed.len(), 130 * (1 + 130 * 4));
+                assert_eq!(pos + 4, data.len());
+                let stored_adler = u32::from_be_bytes([
+                    data[pos],
+                    data[pos + 1],
+                    data[pos + 2],
+                    data[pos + 3],
+                ]);
+                assert_eq!(stored_adler, adler32(&reconstructed));
+            }
+            offset = crc_offset + 4;
+        }
+        assert!(saw_idat);
+    }
+
+    #[test]
+    fn downscale_preserves_aspect_ratio_and_premultiplied_alpha() {
+        // Wide non-square image: 128x32 -> 64x16.
+        let wide = vec![100u8; 128 * 32 * 4];
+        let (w1, h1, out1) = downscale_rgba_if_needed(128, 32, wide, 64);
+        assert_eq!((w1, h1), (64, 16));
+        assert_eq!(out1.len(), 64 * 16 * 4);
+
+        // Tall non-square image: 32x128 -> 16x64.
+        let tall = vec![150u8; 32 * 128 * 4];
+        let (w2, h2, out2) = downscale_rgba_if_needed(32, 128, tall, 64);
+        assert_eq!((w2, h2), (16, 64));
+        assert_eq!(out2.len(), 16 * 64 * 4);
+
+        // Premultiplied alpha: transparent red/blue pixels must NOT bleed into opaque green.
+        let mixed = vec![
+            255, 0, 0, 0, 0, 0, 255, 0, // row 0: transparent red, transparent blue
+            0, 200, 0, 255, 0, 200, 0, 255, // row 1: opaque green, opaque green
+        ];
+        let (mw, mh, mout) = downscale_rgba_if_needed(2, 2, mixed, 1);
+        assert_eq!((mw, mh), (1, 1));
+        assert_eq!(mout, vec![0, 200, 0, 128]);
+
+        // Fully transparent block yields [0, 0, 0, 0] without division by zero.
+        let all_transparent = vec![
+            255, 128, 64, 0, 10, 20, 30, 0, 40, 50, 60, 0, 70, 80, 90, 0,
+        ];
+        let (tw, th, tout) = downscale_rgba_if_needed(2, 2, all_transparent, 1);
+        assert_eq!((tw, th), (1, 1));
+        assert_eq!(tout, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn batch_cap_dedupe_length_limits_negative_ttl_and_fifo_eviction() {
+        let cache = Mutex::new(IconCache::new(MAX_ICON_CACHE_ENTRIES));
+        let t0 = Instant::now();
+
+        // 1. Batch cap (MAX_BATCH_APPS) + in-batch dedupe.
+        let mut apps = Vec::with_capacity(MAX_BATCH_APPS + 12);
+        for i in 0..(MAX_BATCH_APPS + 10) {
+            apps.push(AppIconRequestDto {
+                key: format!("app-{i}"),
+                path: None,
+                exe_name: format!("app-{i}.exe"),
+            });
+        }
+        // Duplicate key inside the first MAX_BATCH_APPS entries.
+        apps.insert(
+            1,
+            AppIconRequestDto {
+                key: "app-0".to_string(),
+                path: None,
+                exe_name: "app-0.exe".to_string(),
+            },
+        );
+
+        let mut calls = 0usize;
+        let res = resolve_app_icons_with(&apps, &cache, t0, |app| {
+            calls += 1;
+            Some(format!("{DATA_URI_PREFIX}{}", app.key))
+        });
+        // `MAX_BATCH_APPS` items taken from slice, 1 of which is a duplicate key => MAX_BATCH_APPS - 1 unique calls.
+        assert_eq!(calls, MAX_BATCH_APPS - 1);
+        assert_eq!(res.len(), MAX_BATCH_APPS - 1);
+        assert!(!res.contains_key(&format!("app-{}", MAX_BATCH_APPS + 5)));
+
+        // 2. Oversized request fields are rejected before hitting the extractor or cache.
+        let oversized_cache = Mutex::new(IconCache::new(8));
+        let mut oversized_calls = 0usize;
+        let oversized = vec![
+            AppIconRequestDto {
+                key: "k".repeat(MAX_REQUEST_KEY_LEN + 1),
+                path: None,
+                exe_name: "ok.exe".to_string(),
+            },
+            AppIconRequestDto {
+                key: "ok-exe-too-long".to_string(),
+                path: None,
+                exe_name: "e".repeat(MAX_REQUEST_EXE_LEN + 1),
+            },
+            AppIconRequestDto {
+                key: "ok-path-too-long".to_string(),
+                path: Some("p".repeat(MAX_REQUEST_PATH_LEN + 1)),
+                exe_name: "ok.exe".to_string(),
+            },
+        ];
+        let oversized_res = resolve_app_icons_with(&oversized, &oversized_cache, t0, |_| {
+            oversized_calls += 1;
+            Some(format!("{DATA_URI_PREFIX}x"))
+        });
+        assert_eq!(oversized_calls, 0);
+        assert!(oversized_res.is_empty());
+        assert!(oversized_cache.lock().unwrap().entries.is_empty());
+
+        // 3. Negative cache entries expire after 60s TTL; positive entries do not.
+        let ttl_cache = Mutex::new(IconCache::new(8));
+        let req = vec![AppIconRequestDto {
+            key: "missing-app".to_string(),
+            path: None,
+            exe_name: "missing.exe".to_string(),
+        }];
+        let mut ttl_calls = 0usize;
+        let first = resolve_app_icons_with(&req, &ttl_cache, t0, |_| {
+            ttl_calls += 1;
+            None
+        });
+        assert!(first.is_empty());
+        assert_eq!(ttl_calls, 1);
+
+        // At +59s, negative entry is still valid (extractor not called).
+        let before_expiry =
+            resolve_app_icons_with(&req, &ttl_cache, t0 + Duration::from_secs(59), |_| {
+                ttl_calls += 1;
+                Some(format!("{DATA_URI_PREFIX}late"))
+            });
+        assert!(before_expiry.is_empty());
+        assert_eq!(ttl_calls, 1);
+
+        // At +60s, negative entry expires and extractor runs again.
+        let after_expiry =
+            resolve_app_icons_with(&req, &ttl_cache, t0 + NEGATIVE_CACHE_TTL, |_| {
+                ttl_calls += 1;
+                Some(format!("{DATA_URI_PREFIX}installed"))
+            });
+        assert_eq!(
+            after_expiry.get("missing-app").map(String::as_str),
+            Some("data:image/png;base64,installed")
+        );
+        assert_eq!(ttl_calls, 2);
+
+        // Positive entry stays cached beyond 60s.
+        let positive_hit = resolve_app_icons_with(
+            &req,
+            &ttl_cache,
+            t0 + Duration::from_secs(300),
+            |_| {
+                ttl_calls += 1;
+                None
+            },
+        );
+        assert_eq!(
+            positive_hit.get("missing-app").map(String::as_str),
+            Some("data:image/png;base64,installed")
+        );
+        assert_eq!(ttl_calls, 2);
+
+        // 4. FIFO eviction drops oldest entries instead of clearing the entire cache.
+        let mut fifo = IconCache::new(3);
+        fifo.insert("k1".to_string(), Some("u1".to_string()), t0);
+        fifo.insert("k2".to_string(), Some("u2".to_string()), t0);
+        fifo.insert("k3".to_string(), Some("u3".to_string()), t0);
+        fifo.insert("k4".to_string(), Some("u4".to_string()), t0);
+        assert_eq!(fifo.get("k1", t0), None);
+        assert_eq!(fifo.get("k2", t0), Some(Some("u2".to_string())));
+        assert_eq!(fifo.get("k3", t0), Some(Some("u3".to_string())));
+        assert_eq!(fifo.get("k4", t0), Some(Some("u4".to_string())));
+    }
+
+    #[test]
+    fn platform_traversal_and_root_guards_reject_unsafe_targets() {
+        // Windows target syntax guard: rejects `\??\`, `..`, ADS `:`, non-`.exe`, UNC.
+        assert!(is_safe_windows_exe_path_syntax(
+            r"C:\Windows\System32\notepad.exe"
+        ));
+        assert!(is_safe_windows_exe_path_syntax("D:/Games/App/game.EXE"));
+        for bad in [
+            r"\??\C:\Windows\System32\cmd.exe",
+            "/??/C:/Windows/System32/cmd.exe",
+            r"C:\Windows\..\Windows\System32\cmd.exe",
+            r"C:\Windows\System32\notepad.exe:stream",
+            r"C:\Windows\System32\notepad.lnk",
+            r"C:\Windows\System32\shell32.dll",
+            r"C:\.exe",
+            r"\\server\share\app.exe",
+            "notepad.exe",
+        ] {
+            assert!(
+                !is_safe_windows_exe_path_syntax(bad),
+                "Windows exe guard must reject {bad:?}"
+            );
+        }
+
+        // macOS allowlisted `.app` bundle roots.
+        let mac_roots = macos_allowed_app_roots(Some(Path::new("/Users/alice")));
+        for allowed in [
+            "/Applications/Discord.app",
+            "/System/Applications/Safari.app",
+            "/System/Library/CoreServices/Finder.app",
+            "/Users/alice/Applications/Custom.app",
+        ] {
+            assert!(
+                is_path_under_any_root(Path::new(allowed), &mac_roots),
+                "macOS roots must allow {allowed}"
+            );
+        }
+        for rejected in [
+            "/tmp/Evil.app",
+            "/Users/alice/Downloads/Evil.app",
+            "/Applications/../tmp/Evil.app",
+            "/Applications",
+        ] {
+            assert!(
+                !is_path_under_any_root(Path::new(rejected), &mac_roots),
+                "macOS roots must reject {rejected}"
+            );
+        }
+
+        // Linux IPC lookup key traversal guard, XDG data dir resolution, icon roots, and size ranking.
+        assert!(is_safe_linux_lookup_key("discord"));
+        assert!(is_safe_linux_lookup_key("com.discordapp.discord"));
+        for bad_key in [
+            "",
+            "   ",
+            "/etc/passwd",
+            "../secret",
+            "dir/app",
+            r"dir\app",
+            "bad\0key",
+        ] {
+            assert!(
+                !is_safe_linux_lookup_key(bad_key),
+                "Linux lookup key guard must reject {bad_key:?}"
+            );
+        }
+
+        let xdg_dirs = xdg_data_dirs_from(
+            Some(Path::new("/home/alice")),
+            Some("/home/alice/custom-share"),
+            Some("/opt/extra/share:relative/ignored:/bad/../dir:/usr/share"),
+        );
+        assert_eq!(xdg_dirs[0], PathBuf::from("/home/alice/custom-share"));
+        assert!(xdg_dirs.contains(&PathBuf::from("/opt/extra/share")));
+        assert!(xdg_dirs.contains(&PathBuf::from("/usr/share")));
+        assert!(xdg_dirs.contains(&PathBuf::from("/var/lib/flatpak/exports/share")));
+        assert!(!xdg_dirs.iter().any(|p| p == Path::new("relative/ignored")));
+        assert!(!xdg_dirs.iter().any(|p| p == Path::new("/bad/../dir")));
+
+        let linux_icon_roots = allowed_linux_icon_roots_from(
+            Some(Path::new("/home/alice")),
+            None,
+            None,
+        );
+        assert!(is_path_under_any_root(
+            Path::new("/usr/share/icons/hicolor/64x64/apps/discord.png"),
+            &linux_icon_roots
+        ));
+        assert!(is_path_under_any_root(
+            Path::new("/usr/share/pixmaps/discord.png"),
+            &linux_icon_roots
+        ));
+        assert!(is_path_under_any_root(
+            Path::new("/snap/discord/current/meta/gui/icon.png"),
+            &linux_icon_roots
+        ));
+        assert!(!is_path_under_any_root(
+            Path::new("/home/alice/secret.png"),
+            &linux_icon_roots
+        ));
+        assert!(!is_path_under_any_root(
+            Path::new("/usr/share/icons/../../etc/secret.png"),
+            &linux_icon_roots
+        ));
+        assert_eq!(
+            LINUX_ICON_SIZES,
+            &["64x64", "128x128", "48x48", "256x256", "32x32"]
+        );
     }
 
     #[cfg(target_os = "windows")]

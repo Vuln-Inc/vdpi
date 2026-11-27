@@ -1,7 +1,7 @@
 import { memo, useEffect } from "react";
 import type { ComponentType } from "react";
 import { useLang, type ResolvedLanguage } from "../i18n/context";
-import { tShell } from "../i18n/shell";
+import { localizeActionMessage, tShell } from "../i18n/shell";
 import type {
   DesktopStatusSnapshot,
   NavTab,
@@ -41,15 +41,16 @@ interface NavItemConfig {
     | "navDns"
     | "navDiagnostics"
     | "navSettings";
+  shortcut: string;
   Icon: ComponentType<{ size?: number; className?: string }>;
 }
 
 const NAV_ITEMS: ReadonlyArray<NavItemConfig> = [
-  { id: "overview", labelKey: "navOverview", Icon: IconOverview },
-  { id: "split", labelKey: "navSplit", Icon: IconSplitTunnel },
-  { id: "dns", labelKey: "navDns", Icon: IconDns },
-  { id: "diagnostics", labelKey: "navDiagnostics", Icon: IconDiagnostics },
-  { id: "settings", labelKey: "navSettings", Icon: IconSettings },
+  { id: "overview", labelKey: "navOverview", shortcut: "Control+1", Icon: IconOverview },
+  { id: "split", labelKey: "navSplit", shortcut: "Control+2", Icon: IconSplitTunnel },
+  { id: "dns", labelKey: "navDns", shortcut: "Control+3", Icon: IconDns },
+  { id: "diagnostics", labelKey: "navDiagnostics", shortcut: "Control+4", Icon: IconDiagnostics },
+  { id: "settings", labelKey: "navSettings", shortcut: "Control+5", Icon: IconSettings },
 ];
 
 const STYLE_ID = "vdpi-sidebar-styles";
@@ -80,6 +81,7 @@ const FALLBACK_STYLES = `
   min-width: 208px;
   flex: 0 0 208px;
   height: 100%;
+  overflow: hidden;
   background: var(--_sb-bg);
   border-right: 1px solid var(--_sb-border);
   color: var(--_sb-ink);
@@ -243,6 +245,16 @@ const FALLBACK_STYLES = `
   display: block;
 }
 
+:where(.sidebar-install-dot) {
+  display: block;
+  width: 7px;
+  height: 7px;
+  border-radius: 9999px;
+  background: var(--status-warning, var(--status-amber, #c96a00));
+  box-shadow: none;
+  filter: none;
+}
+
 :where(.sidebar-nav-item) {
   display: flex;
   align-items: center;
@@ -355,6 +367,15 @@ const FALLBACK_STYLES = `
   min-width: 0;
 }
 
+:where(.sidebar-status-dot-wrap) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+}
+
 :where(.sidebar-status-dot) {
   width: 7px;
   height: 7px;
@@ -369,7 +390,7 @@ const FALLBACK_STYLES = `
 }
 
 :where(.sidebar-status-dot.sidebar-status-dot--warn) {
-  background: var(--_sb-dot-warn);
+  background: var(--status-warning, var(--status-amber, #c96a00));
 }
 
 :where(.sidebar-status-dot.sidebar-status-dot--paused) {
@@ -390,8 +411,7 @@ const FALLBACK_STYLES = `
 :where(.sidebar-tray-row) {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding-left: 1px;
+  gap: 8px;
   color: var(--ink-tertiary, var(--_sb-tertiary));
   font-size: 11px;
   font-weight: 400;
@@ -445,8 +465,9 @@ function ensureStyles(): void {
 
 function formatVersionPill(version: string | undefined | null): string {
   const trimmed = version?.trim();
-  const base = trimmed && trimmed.length > 0 ? trimmed : "0.6.1";
-  return base.startsWith("v") ? base : `v${base}`;
+  const normalized = trimmed ? trimmed.replace(/^[vV]/, "") : "";
+  const base = normalized.length > 0 ? normalized : "0.6.1";
+  return `v${base}`;
 }
 
 interface FooterStatusPresentation {
@@ -490,7 +511,9 @@ function deriveFooterStatus(
     return {
       tone: "warn",
       label: tShell(lang, "statusDriverMissing"),
-      title: status.wintun.message ?? tShell(lang, "statusWintunMissingTitle"),
+      title: status.wintun.message
+        ? localizeActionMessage(lang, status.wintun.message)
+        : tShell(lang, "statusWintunMissingTitle"),
     };
   }
 
@@ -664,11 +687,10 @@ function SidebarComponent({
 
       <nav
         className="sidebar-nav"
-        role="navigation"
         aria-label={tShell(lang, "navPrimaryAria")}
       >
         <div className="sidebar-nav-primary">
-          {NAV_ITEMS.map(({ id, labelKey, Icon }) => {
+          {NAV_ITEMS.map(({ id, labelKey, shortcut, Icon }) => {
             const isActive = activeTab === id;
             const isSplit = id === "split";
             const label = tShell(lang, labelKey);
@@ -685,6 +707,7 @@ function SidebarComponent({
                 type="button"
                 className={itemClasses}
                 aria-current={isActive ? "page" : undefined}
+                aria-keyshortcuts={shortcut}
                 data-tab={id}
                 data-active={isActive ? "true" : undefined}
                 onClick={() => onSelectTab(id)}
@@ -716,6 +739,7 @@ function SidebarComponent({
             type="button"
             className={installItemClasses}
             aria-current={isInstallActive ? "page" : undefined}
+            aria-keyshortcuts="Control+6"
             data-tab="installation"
             data-active={isInstallActive ? "true" : undefined}
             title={installBadgeTitle ?? undefined}
@@ -726,19 +750,24 @@ function SidebarComponent({
             </span>
             <span className="sidebar-nav-label">{installLabel}</span>
             {showInstallBadge && installBadgeTone && installBadgeTitle ? (
-              <span
-                className={`sidebar-nav-update-badge sidebar-nav-update-badge--${installBadgeTone}`}
-                role="img"
-                aria-label={installBadgeTitle}
-                title={installBadgeTitle}
-                data-testid="sidebar-install-badge"
-                data-tone={installBadgeTone}
-              >
-                <IconUpdateBadge
-                  size={15}
-                  className="sidebar-nav-update-icon"
-                />
-              </span>
+              <>
+                <span
+                  className={`sidebar-nav-update-badge sidebar-nav-update-badge--${installBadgeTone}`}
+                  aria-hidden="true"
+                  data-testid="sidebar-install-badge"
+                  data-tone={installBadgeTone}
+                >
+                  {hasUpdateAvailable ? (
+                    <IconUpdateBadge
+                      size={15}
+                      className="sidebar-nav-update-icon"
+                    />
+                  ) : (
+                    <span className="sidebar-install-dot" />
+                  )}
+                </span>
+                <span className="sr-only"> ({installBadgeTitle})</span>
+              </>
             ) : null}
           </button>
         </div>
@@ -750,13 +779,19 @@ function SidebarComponent({
           data-status-tone={footerStatus.tone}
           title={footerStatus.title}
         >
-          <span
-            className={`sidebar-status-dot sidebar-status-dot--${footerStatus.tone}`}
-            aria-hidden="true"
-          />
+          <span className="sidebar-status-dot-wrap" aria-hidden="true">
+            <span
+              className={`sidebar-status-dot sidebar-status-dot--${footerStatus.tone}`}
+            />
+          </span>
           <span className="sidebar-status-label tabular-nums">
             {footerStatus.label}
           </span>
+          {footerStatus.tone === "warn" &&
+          footerStatus.title &&
+          footerStatus.title !== footerStatus.label ? (
+            <span className="sr-only"> ({footerStatus.title})</span>
+          ) : null}
         </div>
 
         <div

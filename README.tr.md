@@ -17,7 +17,7 @@ Yerel Masaüstü Arayüzü (GUI), etkileşimli Kontrol Merkezi TUI ve root gerek
 
 <p align="center">
   <img src="docs/screenshots/desktop-gui-overview.png" alt="vdpi Masaüstü GUI Genel Bakış ekranı: canlı aktarım grafiği, TUN/Proxy geçişi, DNS durumu ve etkin bağlantılar" width="49%">
-  <img src="docs/screenshots/desktop-gui-split.png" alt="vdpi Masaüstü GUI Bölünmüş Tünelleme ekranı: yönlendirme modları, hızlı şablonlar ve eşlikçi uygulama algılama" width="49%">
+  <img src="docs/screenshots/desktop-gui-split.png" alt="vdpi Masaüstü GUI Bölünmüş Tünel ekranı: yönlendirme modları, hızlı şablonlar ve eşlikçi uygulama algılama" width="49%">
 </p>
 
 <p align="center">
@@ -37,7 +37,7 @@ Yerel Masaüstü Arayüzü (GUI), etkileşimli Kontrol Merkezi TUI ve root gerek
   <tr>
     <td valign="top" width="50%">
       <strong>Yerel Masaüstü Uygulaması (GUI)</strong><br>
-      Windows, macOS ve Linux için hafif yerel uygulama: canlı 60 saniyelik aktarım hızı grafiği, tek tıkla TUN/Proxy geçişi, görsel uygulama bazlı Bölünmüş Tünelleme (Discord, Roblox, Valorant &amp; Riot, Steam, tarayıcılar ve OBS için hızlı şablonlar + eşlikçi süreç gruplama), DNS ve alan adı kuralları, Tanılama ve sistem tepsisi / menü çubuğu denetimleri.
+      Windows, macOS ve Linux için hafif yerel uygulama: canlı 60 saniyelik aktarım hızı grafiği, tek tıkla TUN/Proxy geçişi, görsel uygulama bazlı Bölünmüş Tünel (Discord, Roblox, Valorant &amp; Riot, Steam, tarayıcılar ve OBS için hızlı şablonlar + eşlikçi süreç gruplama), DNS ve alan adı kuralları, Tanılama ve sistem tepsisi / menü çubuğu denetimleri.
     </td>
     <td valign="top" width="50%">
       <strong>İki masaüstü motoru (TUN + Proxy)</strong><br>
@@ -67,7 +67,7 @@ Yerel Masaüstü Arayüzü (GUI), etkileşimli Kontrol Merkezi TUI ve root gerek
   <tr>
     <td valign="top" width="50%">
       <strong>Kontrol Merkezi TUI</strong><br>
-      Etkileşimli <code>ratatui</code> arayüzü: <strong>Canlı gösterge paneli</strong> (<code>l</code>, yeniden başlatmadan canlı bağlan), <strong>DNS sunucusu seç</strong> (<code>d</code>, hazır sunucular + <code>[7] Özel DNS</code> IP/DoH seçici), uygulama bazlı <strong>Bölünmüş tünelleme</strong> seçicisi (<code>s</code>, bulanık arama + Dahil Et/Hariç Tut), SHA-256 doğrulamalı güncelleyici (<code>vdpi update</code>) ve <code>config.toml</code> kalıcılığı.
+      Etkileşimli <code>ratatui</code> arayüzü: <strong>Canlı gösterge paneli</strong> (<code>l</code>, yeniden başlatmadan canlı bağlan), <strong>DNS sunucusu seç</strong> (<code>d</code>, hazır sunucular + <code>[7] Özel DNS</code> IP/DoH seçici), uygulama bazlı <strong>Bölünmüş tünel</strong> seçicisi (<code>s</code>, bulanık arama + Dahil Et/Hariç Tut), SHA-256 doğrulamalı güncelleyici (<code>vdpi update</code>) ve <code>config.toml</code> kalıcılığı.
     </td>
     <td valign="top" width="50%">
       <strong>Tamamen yerel ve doğrulanabilir</strong><br>
@@ -86,7 +86,7 @@ Yerel Masaüstü Arayüzü (GUI), etkileşimli Kontrol Merkezi TUI ve root gerek
 - **macOS (Evrensel, Apple Silicon ve Intel):** [DMG (`.dmg`)](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-macos-universal.dmg)
 - **Linux (`x86_64`):** [Debian/Ubuntu (`.deb`)](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.deb) · [AppImage (`.AppImage`)](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.AppImage)
 
-> **Not:** Masaüstü GUI paketleri `vdpi` motor dosyasını (Windows üzerinde ayrıca değiştirilmemiş WHQL imzalı `wintun.dll` `0.14.1` sürücüsünü) içinde barındırır, sistem tepsisi / menü çubuğu ile bütünleşir ve CLI ile aynı `config.toml` yapılandırmasını ve arka plan hizmetini paylaşır.
+> **Not:** Masaüstü GUI paketleri `vdpi` motor dosyasını (Windows üzerinde ayrıca değiştirilmemiş WHQL imzalı `wintun.dll` `0.14.1` sürücüsünü) içinde barındırır, sistem tepsisi / menü çubuğu ile bütünleşir ve CLI ile aynı `config.toml` yapılandırmasını ve arka plan servisini paylaşır.
 
 ### CLI / Komut Satırı - Windows (`x86_64`, Windows 10 ve 11)
 
@@ -138,7 +138,7 @@ Doğrudan indirmeler: [`vdpi-macos-universal.tar.gz`](https://github.com/Vuln-In
 
 ## Motor Modları (Proxy ve TUN)
 
-- **Proxy modu (varsayılan):** Taşınabilir ve ön plan çalıştırmalarında yönetici izni gerektirmez (macOS/Linux üzerinde arka plan hizmeti de yetkisiz çalışır; yalnızca Windows Hizmeti kurulumu Yönetici izni ister). Sanal bağdaştırıcı, yönlendirme tablosu veya DNS değişikliği yapmaz; tarayıcılar, Discord, Telegram ve sistem proxy ayarını kullanan uygulamalar için varsayılan olarak en kararlı seçenektir.
+- **Proxy modu (varsayılan):** Taşınabilir ve ön plan çalıştırmalarında yönetici izni gerektirmez (macOS/Linux üzerinde arka plan servisi de yetkisiz çalışır; yalnızca Windows Servisi kurulumu Yönetici izni ister). Sanal bağdaştırıcı, yönlendirme tablosu veya DNS değişikliği yapmaz; tarayıcılar, Discord, Telegram ve sistem proxy ayarını kullanan uygulamalar için varsayılan olarak en kararlı seçenektir.
 - **TUN modu (sistem geneli):** Oyunlar (Roblox, Valorant vb.) ve sistem proxy ayarını yok sayan uygulamalar dahil tüm TCP ve UDP trafiğini yakalar.
 - **Nasıl geçiş yapılır:** Masaüstü GUI Genel Bakış ekranında **TUN / Proxy** anahtarını kullanın, `vdpi` Kontrol Merkezi'ni (`vdpi` argümansız) açıp **TUN moduna geç** / **Proxy moduna geç** seçeneğini seçin (Windows'ta UAC, macOS ve Linux'ta `sudo` / Touch ID / `pkexec` yetki istemini otomatik açar - önceden root olarak başlatmanız gerekmez) veya `vdpi install --tun` / `vdpi --tun` komutunu çalıştırın.
 
@@ -147,12 +147,12 @@ Doğrudan indirmeler: [`vdpi-macos-universal.tar.gz`](https://github.com/Vuln-In
 | **Trafik yakalama** | Yerel `127.0.0.1:8080` (HTTP/HTTPS/SOCKS5/4a) + `:1080` (SOCKS5 TCP/UDP) | Katman 3 sanal ağ kartı (`Wintun` / `utun` / `/dev/net/tun`) + kullanıcı alanı yığını |
 | **Uygulama kapsamı** | Tarayıcılar, Discord, Telegram ve işletim sistemi açık-kalma PAC (`/vdpi.pac`) ya da yerel proxy dinleyicilerini kullanan uygulamalar | Sistem geneli TCP ve UDP: oyunlar (Roblox, Valorant vb.), Discord sesli sohbet, CLI ve tüm uygulamalar |
 | **İşletim sistemi bütünleşmesi** | Açık-kalma `/vdpi.pac` otomatik yapılandırma (Windows `AutoConfigURL` ve macOS `AutoProxyURL`, ortam değişkeni olmadan; Linux GNOME/KDE PAC ve isteğe bağlı `systemd --user` ortam değişkenleri, `--no-env-proxy` ile kapatılabilir); sanal bağdaştırıcı, yönlendirme veya DNS değişikliği yok | Proxy düzenlemesi yok; tarayıcıyı yeniden başlatmak gerekmez |
-| **Yetkiler ve bellek** | Taşınabilir/ön plan için yönetici izni gerekmez (macOS/Linux hizmeti yetkisiz; yalnızca Windows Hizmeti kurulumu Yönetici ister); ~8-14 MB RAM | Windows'ta UAC, macOS ve Linux'ta `sudo` / Touch ID / `pkexec` ister; ~16-22 MB RAM |
+| **Yetkiler ve bellek** | Taşınabilir/ön plan için yönetici izni gerekmez (macOS/Linux servisi yetkisiz; yalnızca Windows Servisi kurulumu Yönetici ister); ~8-14 MB RAM | Windows'ta UAC, macOS ve Linux'ta `sudo` / Touch ID / `pkexec` ister; ~16-22 MB RAM |
 | **VPN ve anti-cheat** | Saf loopback proxy; sanal bağdaştırıcı yok; `VpnGuard` otomatik duraklatma | `VpnGuard` 0ms otomatik duraklatma; WHQL imzalı Wintun (anti-cheat uyumlu) |
 
 ### Modlar Arasında Geçiş
 
-Etkin motor modu (`Proxy` veya `TUN`), Masaüstü GUI Genel Bakış ve kenar çubuğunda, `vdpi` Kontrol Merkezi'nin `Engine` satırında ve Canlı Gösterge Paneli durum çubuğunda her zaman görünür.
+Etkin motor modu (`Proxy` veya `TUN`), Masaüstü GUI Genel Bakış ve kenar çubuğunda, `vdpi` Kontrol Merkezi'nin `Motor` satırında ve Canlı Gösterge Paneli durum çubuğunda her zaman görünür.
 
 - **Masaüstü GUI:** Motoru anında değiştirmek için Genel Bakış üst bilgisindeki **TUN** veya **Proxy** düğmesine tıklayın.
 - **Etkileşimli TUI:** Argümansız `vdpi` çalıştırın ve **TUN moduna geç** / **Proxy moduna geç** seçeneğini seçin - `vdpi` yetki yükseltmeyi otomatik ister (Windows'ta UAC, macOS ve Linux'ta `sudo` / Touch ID).
@@ -161,13 +161,13 @@ Etkin motor modu (`Proxy` veya `TUN`), Masaüstü GUI Genel Bakış ve kenar çu
   vdpi engine         # Etkin motor modunu göster (Proxy veya TUN)
   vdpi engine tun     # Şeffaf sistem geneli TUN moduna geç
   vdpi engine proxy   # Varsayılan yerel HTTP/SOCKS5 proxy moduna dön
-  vdpi install --tun  # Arka plan hizmetini doğrudan TUN modunda kur
+  vdpi install --tun  # Arka plan servisini doğrudan TUN modunda kur
   vdpi --tun          # TUN modunda başlat veya çalıştır
   vdpi --tun start    # Tek seferlik ön plan TUN oturumu başlat
   vdpi --proxy start  # Tek seferlik ön plan Proxy oturumu başlat
   ```
 
-Anti-DPI paketleme modları (7 aşamalı kendini uyarlayan varsayılan `--mode combo`, `tls-record`, `fragment`, `split`) için [Engine Modes](docs/engines.md) ve [CLI Reference](docs/cli.md) belgelerine bakın.
+Anti-DPI paketleme modları (7 aşamalı kendini uyarlayan varsayılan `--mode combo`, `tls-record`, `fragment`, `split`) için [Motor Modları](docs/engines.md) (İngilizce) ve [CLI Başvuru Kılavuzu](docs/cli.md) (İngilizce) belgelerine bakın.
 
 ---
 
@@ -176,7 +176,7 @@ Anti-DPI paketleme modları (7 aşamalı kendini uyarlayan varsayılan `--mode c
 `vdpi`, Masaüstü GUI, Kontrol Merkezi TUI, Android ve iOS genelinde **Türkçe** ve **İngilizce** dillerini destekler.
 
 - **Otomatik algılama:** Varsayılan olarak işletim sistemi dilini izler; sistem diliniz Türkçe ise Türkçe, aksi durumda İngilizce açılır.
-- **Elle seçim:** Dili istediğiniz zaman **Ayarlar** (Masaüstü GUI, Android ve iOS), Kontrol Merkezi TUI veya `config.toml` içindeki `language` anahtarı (`"system"`, `"tr"` veya `"en"`) üzerinden değiştirebilirsiniz.
+- **Elle seçim:** Dili istediğiniz zaman **Ayarlar** (Masaüstü GUI, Android ve iOS), Kontrol Merkezi TUI veya `config.toml` içindeki `language` anahtarı (`"auto"`, `"en"` veya `"tr"`) üzerinden değiştirebilirsiniz.
 
 ---
 
@@ -185,17 +185,17 @@ Anti-DPI paketleme modları (7 aşamalı kendini uyarlayan varsayılan `--mode c
 Grafik arayüz için **vdpi Desktop** uygulamasını açın veya doğrudan CLI ve Kontrol Merkezi TUI komutlarını kullanın:
 
 ```bash
-vdpi              # Kontrol Merkezi TUI'yi aç (`l` canlı panel, `d` DNS seçici, `s` Bölünmüş tünelleme, motor geçişi)
-vdpi dashboard    # Çalışan arka plan hizmetine canlı hız ve telemetri panelini bağla
+vdpi              # Kontrol Merkezi TUI'yi aç (`l` canlı panel, `d` DNS seçici, `s` Bölünmüş tünel, motor geçişi)
+vdpi dashboard    # Çalışan arka plan servisine canlı hız ve telemetri panelini bağla
 vdpi dns          # Üst DNS / DoH sunucusunu göster veya değiştir (ör. `vdpi dns cloudflare`, `vdpi dns 94.140.14.14`)
-vdpi split        # Uygulama bazlı Bölünmüş tünelleme seçicisini aç (takma ad `vdpi apps`; `--split-mode`, `--split-app`)
+vdpi split        # Uygulama bazlı Bölünmüş tünel seçicisini aç (takma ad `vdpi apps`; `--split-mode`, `--split-app`)
 vdpi engine tun   # Masaüstü motorunu TUN moduna geçir (veya `vdpi engine proxy`)
-vdpi pause        # Arka plan hizmetini geçici olarak duraklat (yeniden etkinleştirmek için `vdpi resume`)
+vdpi pause        # Arka plan servisini geçici olarak duraklat (yeniden etkinleştirmek için `vdpi resume`)
 vdpi doctor       # Uçtan uca canlı DPI atlatma ve DoH tanılama testlerini çalıştır
 vdpi update       # Yeni sürümü denetle, SHA-256 doğrula ve yerinde güncelle
 ```
 
-Otomatik arka plan başlatma kaydı için `vdpi install` (Windows Hizmeti, macOS `LaunchDaemon` / `LaunchAgent` veya Linux `systemd`), canlı aktarım grafiğiyle ön plan oturumu için `vdpi start`, tüm dosyaları kaldırıp işletim sistemi ağ ayarlarını geri yüklemek için `vdpi uninstall` komutunu kullanın.
+Otomatik arka plan başlatma kaydı için `vdpi install` (Windows Servisi, macOS `LaunchDaemon` / `LaunchAgent` veya Linux `systemd`), canlı aktarım grafiğiyle ön plan oturumu için `vdpi start`, tüm dosyaları kaldırıp işletim sistemi ağ ayarlarını geri yüklemek için `vdpi uninstall` komutunu kullanın.
 
 ---
 
@@ -203,11 +203,11 @@ Otomatik arka plan başlatma kaydı için `vdpi install` (Windows Hizmeti, macOS
 
 | Rehber | İçerik |
 | :--- | :--- |
-| [Engine Modes (TUN vs Proxy)](docs/engines.md) | Platform TUN mimarisi, Proxy OS bütünleşmesi, 7 aşamalı uyarlanabilir TLS motoru |
-| [VPN Coexistence & Custom Bypass](docs/vpn-and-bypass.md) | `VpnGuard` otomatik duraklatma, Tailscale/Docker/LAN güvenliği, `--bypass` ve `--include` kuralları |
-| [CLI & config.toml Reference](docs/cli.md) | Tüm komutlar, genel bayraklar, öncelik kuralları ve tam `config.toml` şeması |
-| [Diagnostics & Troubleshooting](docs/diagnostics.md) | `vdpi status`, `vdpi doctor`, Defender/antivirüs notları ve kurtarma adımları |
-| [Building from Source](docs/building.md) | Çalışma alanı paket yapısı ve Masaüstü, Android APK ile iOS IPA derleme adımları |
+| [Motor Modları (TUN ve Proxy)](docs/engines.md) (İngilizce) | Platform TUN mimarisi, Proxy OS bütünleşmesi, 7 aşamalı uyarlanabilir TLS motoru |
+| [VPN Uyumluluğu ve Özel Atlatma](docs/vpn-and-bypass.md) (İngilizce) | `VpnGuard` otomatik duraklatma, Tailscale/Docker/LAN güvenliği, `--bypass` ve `--include` kuralları |
+| [CLI ve config.toml Başvuru Kılavuzu](docs/cli.md) (İngilizce) | Tüm komutlar, genel bayraklar, öncelik kuralları ve tam `config.toml` şeması |
+| [Tanılama ve Sorun Giderme](docs/diagnostics.md) (İngilizce) | `vdpi status`, `vdpi doctor`, Defender/antivirüs notları ve kurtarma adımları |
+| [Kaynaktan Derleme](docs/building.md) (İngilizce) | Çalışma alanı paket yapısı ve Masaüstü, Android APK ile iOS IPA derleme adımları |
 
 ---
 

@@ -4,6 +4,7 @@ import {
   IconChevron,
   IconCopy,
   IconDiagnostics,
+  IconDns,
   IconFolder,
   IconOverview,
   IconSettings,
@@ -13,10 +14,14 @@ import { InlineBanner } from "../components/InlineBanner";
 import type { ToastTone } from "../components/ToastStack";
 import { useLang, type ResolvedLanguage } from "../i18n/context";
 import {
+  localizeCheckDetail,
   localizeCheckName,
+  localizeCheckSummary,
+  localizeCheckTarget,
   tDiagnostics,
   type DiagnosticsStringKey,
 } from "../i18n/diagnostics";
+import { tOverview } from "../i18n/overview";
 import { formatClockTime, formatLatency, scrubUrlsInText } from "../lib/format";
 import { runDiagnostics, type AppFolderTarget } from "../lib/ipc";
 import type {
@@ -958,10 +963,12 @@ function summarizeReport(
 }
 
 function renderCheckRow(check: DiagnosticCheckItem, lang: ResolvedLanguage) {
-  const summaryText = check.summary.trim();
-  const detailText = check.detail?.trim() ?? "";
+  const summaryText = localizeCheckSummary(lang, check).trim();
+  const detailText = check.detail
+    ? localizeCheckDetail(lang, { id: check.id, detail: check.detail }).trim()
+    : "";
   const showDetail = detailText.length > 0 && detailText !== summaryText;
-  const targetText = check.target.trim() || "--";
+  const targetText = localizeCheckTarget(lang, check.target) || "--";
 
   return (
     <tr key={check.id} data-check-id={check.id} data-status={check.status}>
@@ -1010,7 +1017,7 @@ function renderCheckRow(check: DiagnosticCheckItem, lang: ResolvedLanguage) {
 interface RecoveryAction {
   id: string;
   label: string;
-  icon: "settings" | "proxy" | "folder" | "logs" | "shield" | "overview";
+  icon: "settings" | "proxy" | "folder" | "logs" | "shield" | "overview" | "dns";
   busy?: boolean;
   disabled?: boolean;
   onClick: () => void;
@@ -1035,7 +1042,11 @@ function DiagnosticsViewComponent({
   const [reportStatusSnap, setReportStatusSnap] = useState<{
     ranAtMs: number;
     serviceState: DesktopStatusSnapshot["serviceState"] | null;
+    configuredEngine: EngineMode | null;
     liveEngine: EngineMode | null;
+    liveRunning: boolean;
+    wintunReady: boolean | null;
+    cliVersionRelation: DesktopStatusSnapshot["cliVersionRelation"] | null;
   } | null>(null);
   const [running, setRunning] = useState(false);
   const [runError, setRunError] = useState<string | null>(null);
@@ -1085,13 +1096,47 @@ function DiagnosticsViewComponent({
 
   const activeEngine: EngineMode =
     status?.live?.engine ?? status?.configuredEngine ?? "tun";
+  const isRepairNeeded = Boolean(
+    !isNotInstalled && status?.cliVersionRelation === "repair_needed",
+  );
 
-  const isBusy = busyAction !== null;
-  const isSwitchingProxy = busyAction === "switch-engine:proxy";
-  const isStartingProtection = busyAction === "connecting";
+  const normalizedBusy = busyAction?.trim().toLowerCase() ?? null;
+  const pendingOp = status?.pendingOperation ?? null;
+  const normalizedPendingOp = pendingOp?.trim().toLowerCase() ?? null;
+  const isBusy = normalizedBusy !== null || pendingOp !== null;
+  const isMutatingServiceBusy = Boolean(
+    (normalizedBusy !== null &&
+      (normalizedBusy === "install" ||
+        normalizedBusy === "install-service" ||
+        normalizedBusy === "installing" ||
+        normalizedBusy === "upgrade" ||
+        normalizedBusy === "upgrade-service" ||
+        normalizedBusy === "upgrading" ||
+        normalizedBusy === "repair" ||
+        normalizedBusy === "repair-service" ||
+        normalizedBusy === "repairing" ||
+        normalizedBusy === "uninstall" ||
+        normalizedBusy === "uninstall-service" ||
+        normalizedBusy === "uninstalling")) ||
+      (normalizedPendingOp !== null &&
+        (normalizedPendingOp === "install" ||
+          normalizedPendingOp === "installing" ||
+          normalizedPendingOp === "upgrade" ||
+          normalizedPendingOp === "upgrading" ||
+          normalizedPendingOp === "repair" ||
+          normalizedPendingOp === "repairing" ||
+          normalizedPendingOp === "uninstall" ||
+          normalizedPendingOp === "uninstalling")),
+  );
+  const isMutatingServiceBusyRef = useRef(isMutatingServiceBusy);
+  isMutatingServiceBusyRef.current = isMutatingServiceBusy;
+  const isSwitchingProxy =
+    normalizedBusy === "switch-engine:proxy" ||
+    pendingOp === "switching_engine";
+  const isStartingProtection =
+    normalizedBusy === "connecting" || pendingOp === "resuming";
   const isInstallingService =
-    busyAction === "install-service" ||
-    status?.pendingOperation === "installing";
+    normalizedBusy === "install-service" || pendingOp === "installing";
 
   const recoveryActions = useMemo<RecoveryAction[]>(() => {
     if (!report || !summary || summary.allPassed) {
@@ -1112,6 +1157,10 @@ function DiagnosticsViewComponent({
       const id = check.id.toLowerCase();
       return id.includes("service") || id.includes("runtime");
     });
+    const hasDnsOrVpnIssue = problemChecks.some((check) => {
+      const id = check.id.toLowerCase();
+      return id.includes("dns") || id.includes("vpn");
+    });
     const hasNetworkIssue = problemChecks.some((check) => {
       const id = check.id.toLowerCase();
       return (
@@ -1131,7 +1180,18 @@ function DiagnosticsViewComponent({
 
     const actions: RecoveryAction[] = [];
 
-    if (
+    if (isRepairNeeded) {
+      if (onNavigate) {
+        actions.push({
+          id: "open-installation-repair",
+          label: tDiagnostics(lang, "actionRepairInInstallation"),
+          icon: "shield",
+          onClick: () => {
+            onNavigate("installation");
+          },
+        });
+      }
+    } else if (
       effectiveServiceState === "stopped" &&
       !status?.live?.running &&
       !wintunBlocked
@@ -1214,17 +1274,24 @@ function DiagnosticsViewComponent({
       });
     }
 
-    if (
-      onNavigate &&
-      !isNotInstalled &&
-      (hasServiceIssue || hasNetworkIssue)
-    ) {
+    if (onNavigate && hasDnsOrVpnIssue) {
       actions.push({
-        id: "open-settings",
-        label: tDiagnostics(lang, "actionOpenSettings"),
+        id: "open-dns-rules",
+        label: tDiagnostics(lang, "actionOpenDnsRules"),
+        icon: "dns",
+        onClick: () => {
+          onNavigate("dns");
+        },
+      });
+    }
+
+    if (onNavigate && !isNotInstalled && !isRepairNeeded && hasServiceIssue) {
+      actions.push({
+        id: "open-installation",
+        label: tDiagnostics(lang, "actionOpenInstallation"),
         icon: "settings",
         onClick: () => {
-          onNavigate("settings");
+          onNavigate("installation");
         },
       });
     }
@@ -1258,6 +1325,7 @@ function DiagnosticsViewComponent({
     isBusy,
     isInstallingService,
     isNotInstalled,
+    isRepairNeeded,
     isStartingProtection,
     isSwitchingProxy,
     lang,
@@ -1277,7 +1345,7 @@ function DiagnosticsViewComponent({
   ]);
 
   const handleRunDiagnostics = useCallback(async () => {
-    if (inFlightRef.current) return;
+    if (inFlightRef.current || isMutatingServiceBusyRef.current) return;
     inFlightRef.current = true;
     setRunning(true);
     setRunError(null);
@@ -1290,7 +1358,11 @@ function DiagnosticsViewComponent({
       setReportStatusSnap({
         ranAtMs: nextReport.ranAtMs,
         serviceState: latestStatus?.serviceState ?? null,
+        configuredEngine: latestStatus?.configuredEngine ?? null,
         liveEngine: latestStatus?.live?.engine ?? null,
+        liveRunning: Boolean(latestStatus?.live?.running),
+        wintunReady: latestStatus ? latestStatus.wintun.ready : null,
+        cliVersionRelation: latestStatus?.cliVersionRelation ?? null,
       });
       setCopied(false);
     } catch (error) {
@@ -1345,14 +1417,22 @@ function DiagnosticsViewComponent({
 
   const ranAtClock = report ? formatClockTime(report.ranAtMs) : null;
   const currentServiceState = status?.serviceState ?? null;
+  const currentConfiguredEngine = status?.configuredEngine ?? null;
   const currentLiveEngine = status?.live?.engine ?? null;
+  const currentLiveRunning = Boolean(status?.live?.running);
+  const currentWintunReady = status ? status.wintun.ready : null;
+  const currentCliVersionRelation = status?.cliVersionRelation ?? null;
   const statusChangedSinceRun = Boolean(
     report &&
       !running &&
       reportStatusSnap &&
       reportStatusSnap.ranAtMs === report.ranAtMs &&
       (reportStatusSnap.serviceState !== currentServiceState ||
-        reportStatusSnap.liveEngine !== currentLiveEngine),
+        reportStatusSnap.configuredEngine !== currentConfiguredEngine ||
+        reportStatusSnap.liveEngine !== currentLiveEngine ||
+        reportStatusSnap.liveRunning !== currentLiveRunning ||
+        reportStatusSnap.wintunReady !== currentWintunReady ||
+        reportStatusSnap.cliVersionRelation !== currentCliVersionRelation),
   );
 
   return (
@@ -1383,7 +1463,7 @@ function DiagnosticsViewComponent({
           <button
             type="button"
             className="btn btn-primary diag-btn diag-btn--primary"
-            disabled={running}
+            disabled={running || isMutatingServiceBusy}
             aria-busy={running}
             onClick={() => {
               void handleRunDiagnostics();
@@ -1414,15 +1494,37 @@ function DiagnosticsViewComponent({
         />
       ) : null}
 
+      {isRepairNeeded ? (
+        <InlineBanner
+          tone="warn"
+          title={tOverview(lang, "repairNeededTitle")}
+          description={tOverview(lang, "repairNeededDesc")}
+          actionLabel={
+            onNavigate
+              ? tDiagnostics(lang, "actionRepairInInstallation")
+              : undefined
+          }
+          onAction={onNavigate ? () => onNavigate("installation") : undefined}
+        />
+      ) : null}
+
       {runError ? (
         <InlineBanner
           tone="error"
           title={tDiagnostics(lang, "runErrorTitle")}
           description={runError}
-          actionLabel={tDiagnostics(lang, "retry")}
-          onAction={() => {
-            void handleRunDiagnostics();
-          }}
+          action={
+            <button
+              type="button"
+              className="inline-banner__action"
+              disabled={running || isMutatingServiceBusy}
+              onClick={() => {
+                void handleRunDiagnostics();
+              }}
+            >
+              {tDiagnostics(lang, "retry")}
+            </button>
+          }
         />
       ) : null}
 
@@ -1500,6 +1602,8 @@ function DiagnosticsViewComponent({
                   <span className="spinner diag-spinner" aria-hidden="true" />
                 ) : action.icon === "settings" ? (
                   <IconSettings size={13} />
+                ) : action.icon === "dns" ? (
+                  <IconDns size={13} />
                 ) : action.icon === "overview" ? (
                   <IconOverview size={13} />
                 ) : action.icon === "folder" || action.icon === "logs" ? (
@@ -1596,7 +1700,7 @@ function DiagnosticsViewComponent({
                 type="button"
                 className="diag-preview__toggle"
                 aria-expanded={previewOpen}
-                aria-controls={previewPanelId}
+                aria-controls={previewOpen ? previewPanelId : undefined}
                 onClick={() => setPreviewOpen((open) => !open)}
               >
                 <span className="diag-preview__label">
@@ -1713,6 +1817,7 @@ function areDiagnosticsPropsEqual(
     prevStatus.serviceState === nextStatus.serviceState &&
     prevStatus.configuredEngine === nextStatus.configuredEngine &&
     prevStatus.vpnConflict === nextStatus.vpnConflict &&
+    prevStatus.cliVersionRelation === nextStatus.cliVersionRelation &&
     prevStatus.canInstallFromBundle === nextStatus.canInstallFromBundle &&
     prevStatus.pendingOperation === nextStatus.pendingOperation &&
     prevStatus.wintun.required === nextStatus.wintun.required &&

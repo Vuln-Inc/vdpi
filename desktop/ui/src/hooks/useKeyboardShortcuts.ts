@@ -31,6 +31,7 @@ const TAB_BY_CODE: Record<string, NavTab> = {
 
 const SEARCH_SHORTCUT_SELECTOR = '[data-shortcut="search"]';
 const ARIA_MODAL_SELECTOR = '[aria-modal="true"]';
+const MAIN_CONTENT_SELECTOR = "#main-content";
 
 function hasActiveAriaModal(): boolean {
   if (typeof document === "undefined") {
@@ -85,6 +86,38 @@ function isSearchElement(element: Element | null): element is HTMLElement {
     element.matches(SEARCH_SHORTCUT_SELECTOR) ||
     Boolean(element.closest(SEARCH_SHORTCUT_SELECTOR))
   );
+}
+
+function isEmptySearchElement(element: HTMLElement): boolean {
+  if (
+    element instanceof HTMLInputElement ||
+    element instanceof HTMLTextAreaElement
+  ) {
+    return element.value.length === 0;
+  }
+  const inner = element.querySelector<HTMLInputElement | HTMLTextAreaElement>(
+    "input, textarea",
+  );
+  if (inner) {
+    return inner.value.length === 0;
+  }
+  return true;
+}
+
+function moveFocusToMainContent(fallbackEl: HTMLElement): void {
+  if (typeof document !== "undefined") {
+    const mainContent = document.querySelector<HTMLElement>(
+      MAIN_CONTENT_SELECTOR,
+    );
+    if (mainContent) {
+      if (!mainContent.hasAttribute("tabindex")) {
+        mainContent.tabIndex = -1;
+      }
+      mainContent.focus();
+      return;
+    }
+  }
+  fallbackEl.blur();
 }
 
 function findSearchTarget(): HTMLElement | null {
@@ -152,8 +185,10 @@ export function useKeyboardShortcuts(
         const modalOpen = hasOpenModalRef.current;
 
         if (activeIsSearch && !modalOpen) {
-          event.preventDefault();
-          active.blur();
+          if (isEmptySearchElement(active)) {
+            event.preventDefault();
+            moveFocusToMainContent(active);
+          }
           return;
         }
 
@@ -170,9 +205,9 @@ export function useKeyboardShortcuts(
           }
         }
 
-        if (activeIsSearch) {
+        if (activeIsSearch && isEmptySearchElement(active)) {
           event.preventDefault();
-          active.blur();
+          moveFocusToMainContent(active);
         }
         return;
       }
@@ -186,6 +221,25 @@ export function useKeyboardShortcuts(
         !event.altKey &&
         !event.shiftKey
       ) {
+        if (
+          event.key === "k" ||
+          event.key === "K" ||
+          event.code === "KeyK"
+        ) {
+          const searchTarget = findSearchTarget();
+          if (searchTarget) {
+            event.preventDefault();
+            searchTarget.focus();
+            if (
+              searchTarget instanceof HTMLInputElement ||
+              searchTarget instanceof HTMLTextAreaElement
+            ) {
+              searchTarget.select();
+            }
+          }
+          return;
+        }
+
         const tab = resolveTabShortcut(event);
         if (tab && onSelectTabRef.current) {
           event.preventDefault();

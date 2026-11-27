@@ -4,6 +4,8 @@ use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use vdpi::config_file::{
     load_file_config_or_default, save_file_config_atomic, system_config_path, user_config_path,
@@ -13,8 +15,8 @@ use vdpi::service::{
     detect_installed_info, detect_service_state, installed_binary_path, vdpi_root_dir, ServiceState,
 };
 use vdpi::update::{
-    check_latest_release, compare_versions, strip_windows_verbatim_prefix, ReleaseCheckResult,
-    VersionRelation,
+    check_latest_release_for_version, compare_versions, strip_windows_verbatim_prefix,
+    ReleaseCheckResult, VersionRelation,
 };
 use vdpi_core::bypass::{BypassPolicy, IpNet};
 use vdpi_core::config::{EngineMode, RuntimeConfig, VpnCoexistence};
@@ -27,6 +29,7 @@ use crate::models::{
     VpnCoexistenceDto,
 };
 use crate::sidecar::{self, SidecarOutcome};
+use crate::status::BundledVersionProbe;
 
 const MAX_DOMAIN_ENTRY_LEN: usize = 255;
 const MAX_DOMAIN_ENTRIES: usize = 512;
@@ -40,6 +43,14 @@ const SIDECAR_TOGGLE_USER_TIMEOUT_SECS: u64 = 60;
 const SIDECAR_ENGINE_TIMEOUT_SECS: u64 = 90;
 const SIDECAR_INSTALL_TIMEOUT_SECS: u64 = 120;
 const SIDECAR_UNINSTALL_TIMEOUT_SECS: u64 = 90;
+const UPDATE_CHECK_CACHE_TTL: Duration = Duration::from_secs(30);
+
+type UpdateCheckCacheSlot = tokio::sync::Mutex<Option<(Instant, UpdateCheckPayloadDto)>>;
+static UPDATE_CHECK_CACHE: OnceLock<UpdateCheckCacheSlot> = OnceLock::new();
+
+fn update_check_cache() -> &'static UpdateCheckCacheSlot {
+    UPDATE_CHECK_CACHE.get_or_init(|| tokio::sync::Mutex::new(None))
+}
 
 const DISALLOWED_SCHEME_PREFIXES: &[&str] = &[
     "http",
@@ -233,23 +244,44 @@ fn is_system_service_installed() -> bool {
     }
 }
 
-fn service_control_needs_elevation() -> bool {
-    #[cfg(target_os = "windows")]
+fn unix_system_bin_exists() -> bool {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        true
+        path_entry_exists(Path::new(vdpi::service::UNIX_SYSTEM_BIN_PATH))
     }
-    #[cfg(target_os = "macos")]
-    {
-        vdpi::service::launch_daemon_plist_path().exists()
-    }
-    #[cfg(target_os = "linux")]
-    {
-        vdpi::service::systemd_system_unit_path().exists()
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         false
     }
+}
+
+fn service_control_needs_elevation_for_os(
+    os: &str,
+    connect: bool,
+    system_service_installed: bool,
+    has_orphan_linux_tun: bool,
+) -> bool {
+    match os {
+        "windows" => true,
+        "macos" => system_service_installed,
+        "linux" => system_service_installed || (!connect && has_orphan_linux_tun),
+        _ => false,
+    }
+}
+
+fn service_control_needs_elevation(connect: bool) -> bool {
+    let system_installed = is_system_service_installed();
+    #[cfg(target_os = "linux")]
+    let has_orphan_linux_tun = vdpi::service::has_orphan_linux_tun_artifacts();
+    #[cfg(not(target_os = "linux"))]
+    let has_orphan_linux_tun = false;
+
+    service_control_needs_elevation_for_os(
+        std::env::consts::OS,
+        connect,
+        system_installed,
+        has_orphan_linux_tun,
+    )
 }
 
 fn engine_switch_needs_elevation(target: EngineMode) -> bool {
@@ -273,16 +305,24 @@ fn install_needs_elevation_for_os(
     os: &str,
     target: EngineMode,
     system_service_installed: bool,
+    unix_system_bin_exists: bool,
 ) -> bool {
     match os {
         "windows" => true,
-        "macos" | "linux" => target == EngineMode::Tun || system_service_installed,
+        "macos" | "linux" => {
+            target == EngineMode::Tun || system_service_installed || unix_system_bin_exists
+        }
         _ => false,
     }
 }
 
 fn install_needs_elevation(target: EngineMode, system_service_installed: bool) -> bool {
-    install_needs_elevation_for_os(std::env::consts::OS, target, system_service_installed)
+    install_needs_elevation_for_os(
+        std::env::consts::OS,
+        target,
+        system_service_installed,
+        unix_system_bin_exists(),
+    )
 }
 
 fn upgrade_needs_elevation_for_os(
@@ -301,16 +341,11 @@ fn upgrade_needs_elevation_for_os(
 }
 
 fn upgrade_needs_elevation(engine: EngineMode, system_service_installed: bool) -> bool {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let unix_system_bin_exists = path_entry_exists(Path::new(vdpi::service::UNIX_SYSTEM_BIN_PATH));
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let unix_system_bin_exists = false;
-
     upgrade_needs_elevation_for_os(
         std::env::consts::OS,
         engine,
         system_service_installed,
-        unix_system_bin_exists,
+        unix_system_bin_exists(),
     )
 }
 
@@ -326,6 +361,21 @@ fn uninstall_needs_elevation_for_paths(paths: &[&Path]) -> bool {
     paths.iter().any(|path| path_entry_exists(path))
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn uninstall_needs_elevation_for_os(
+    os: &str,
+    system_service_installed: bool,
+    privileged_path_exists: bool,
+    has_orphan_linux_tun: bool,
+) -> bool {
+    match os {
+        "windows" => true,
+        "macos" => system_service_installed || privileged_path_exists,
+        "linux" => system_service_installed || privileged_path_exists || has_orphan_linux_tun,
+        _ => false,
+    }
+}
+
 fn uninstall_needs_elevation() -> bool {
     #[cfg(target_os = "windows")]
     {
@@ -334,22 +384,31 @@ fn uninstall_needs_elevation() -> bool {
     #[cfg(target_os = "macos")]
     {
         let daemon_plist = vdpi::service::launch_daemon_plist_path();
-        is_system_service_installed()
-            || uninstall_needs_elevation_for_paths(&[
-                Path::new("/usr/local/bin/vdpi"),
-                daemon_plist.as_path(),
-                Path::new("/Library/LaunchDaemons/com.vulninc.vdpi.plist"),
-            ])
+        let privileged_path_exists = uninstall_needs_elevation_for_paths(&[
+            Path::new(vdpi::service::UNIX_SYSTEM_BIN_PATH),
+            daemon_plist.as_path(),
+        ]);
+        uninstall_needs_elevation_for_os(
+            "macos",
+            is_system_service_installed(),
+            privileged_path_exists,
+            false,
+        )
     }
     #[cfg(target_os = "linux")]
     {
         let systemd_unit = vdpi::service::systemd_system_unit_path();
-        is_system_service_installed()
-            || uninstall_needs_elevation_for_paths(&[
-                Path::new("/usr/local/bin/vdpi"),
-                systemd_unit.as_path(),
-                Path::new("/etc/systemd/system/vdpi.service"),
-            ])
+        let privileged_path_exists = uninstall_needs_elevation_for_paths(&[
+            Path::new(vdpi::service::UNIX_SYSTEM_BIN_PATH),
+            systemd_unit.as_path(),
+            Path::new("/etc/systemd/system/vdpi.service"),
+        ]);
+        uninstall_needs_elevation_for_os(
+            "linux",
+            is_system_service_installed(),
+            privileged_path_exists,
+            vdpi::service::has_orphan_linux_tun_artifacts(),
+        )
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
@@ -509,9 +568,10 @@ where
 
 /// Enables (`connect = true`) or pauses (`connect = false`) the background `vdpi`
 /// service by invoking the `vdpi` CLI sidecar (`resume` or `pause`), elevating
-/// only when controlling a system-scoped service.
+/// only when controlling a system-scoped service or cleaning up orphaned Linux
+/// TUN artifacts on pause.
 pub fn toggle_protection(connect: bool) -> ActionResultDto {
-    let elevated = service_control_needs_elevation();
+    let elevated = service_control_needs_elevation(connect);
     let timeout = if elevated {
         SIDECAR_TOGGLE_ELEVATED_TIMEOUT_SECS
     } else {
@@ -522,24 +582,32 @@ pub fn toggle_protection(connect: bool) -> ActionResultDto {
     })
 }
 
-fn switch_engine_with<FDetect, FRun>(
+#[allow(clippy::too_many_arguments)]
+fn switch_engine_with<FDetect, FWintun, FRun>(
     engine: EngineModeDto,
     user_cfg_path: &Path,
     fallback_cfg_path: Option<&Path>,
     needs_elevation: bool,
     detect_service: FDetect,
+    check_wintun: FWintun,
     run_cli: FRun,
 ) -> ActionResultDto
 where
     FDetect: FnOnce() -> ServiceState,
+    FWintun: FnOnce(EngineMode, bool) -> Result<(), (ActionErrorCodeDto, String)>,
     FRun: FnOnce(&[&str], bool) -> SidecarOutcome,
 {
     let target = engine_mode_from_dto(engine);
     let label = engine_display_name(target);
     let cli_mode = engine_cli_arg(target);
     let service_state = detect_service();
+    let service_installed = service_state != ServiceState::NotInstalled;
 
-    if service_state != ServiceState::NotInstalled {
+    if let Err((code, err)) = check_wintun(target, service_installed) {
+        return action_err_with_code(redact_message(&err), code);
+    }
+
+    if service_installed {
         return match run_cli(&["engine", cli_mode], needs_elevation) {
             SidecarOutcome::Ok(_) => {
                 let message = if service_state == ServiceState::Running {
@@ -606,8 +674,10 @@ where
 
 /// Switches the active transport engine (`TUN` or `Proxy`).
 ///
-/// When the background service is installed, delegates to the `vdpi` CLI sidecar
-/// (`engine tun|proxy`). Otherwise persists atomically to `config.toml`.
+/// When the target is `TUN` on Windows, verifies `wintun.dll` integrity before
+/// elevating or persisting. When the background service is installed, delegates
+/// to the `vdpi` CLI sidecar (`engine tun|proxy`). Otherwise persists atomically
+/// to `config.toml`.
 pub fn switch_engine(engine: EngineModeDto) -> ActionResultDto {
     let target = engine_mode_from_dto(engine);
     let user_cfg_path = user_config_path();
@@ -620,6 +690,7 @@ pub fn switch_engine(engine: EngineModeDto) -> ActionResultDto {
         fallback,
         elevated,
         detect_service_state,
+        check_windows_tun_wintun_preflight,
         |args, need_elev| run_sidecar_cli(args, need_elev, SIDECAR_ENGINE_TIMEOUT_SECS),
     )
 }
@@ -941,31 +1012,105 @@ fn installed_binary_exists_on_disk() -> bool {
     }
 }
 
-fn check_windows_tun_wintun_preflight(engine: EngineMode) -> Result<(), String> {
+fn check_windows_tun_wintun_preflight(
+    engine: EngineMode,
+    service_installed_runtime: bool,
+) -> Result<(), (ActionErrorCodeDto, String)> {
     #[cfg(target_os = "windows")]
     if engine == EngineMode::Tun {
-        let status = crate::status::probe_wintun_status(EngineMode::Tun);
-        if !status.ready {
-            return Err(status.message.unwrap_or_else(|| {
-                "wintun.dll is missing — reinstall vdpi Desktop, extract all files from the zip, or check Windows Defender quarantine.".to_string()
-            }));
-        }
+        return match crate::status::probe_wintun_preflight(service_installed_runtime) {
+            crate::status::WintunPreflightResult::Ready => Ok(()),
+            crate::status::WintunPreflightResult::Missing(msg) => {
+                Err((ActionErrorCodeDto::WintunMissing, msg))
+            }
+            crate::status::WintunPreflightResult::Invalid(msg) => {
+                Err((ActionErrorCodeDto::WintunInvalid, msg))
+            }
+        };
     }
     #[cfg(not(target_os = "windows"))]
-    let _ = engine;
+    let _ = (engine, service_installed_runtime);
     Ok(())
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn resolve_verified_user_config_for_fresh_install_in(
+    user_cfg_path: &Path,
+    validate_windows_syntax: bool,
+) -> Option<String> {
+    let clean = strip_windows_verbatim_prefix(user_cfg_path);
+    let raw = clean.to_str()?;
+    if raw.is_empty() || raw.chars().any(char::is_control) {
+        return None;
+    }
+    if validate_windows_syntax && validate_windows_path_syntax(raw).is_err() {
+        return None;
+    }
+    verify_no_symlinks_in_path(&clean, false).ok()?;
+    let meta = fs::symlink_metadata(&clean).ok()?;
+    if is_symlink_or_reparse(&meta) || !meta.is_file() {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_windows_fresh_install_seed_config(service_state: ServiceState) -> Option<String> {
+    if service_state != ServiceState::NotInstalled {
+        return None;
+    }
+    let user_cfg = user_config_path();
+    resolve_verified_user_config_for_fresh_install_in(&user_cfg, true)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn resolve_windows_fresh_install_seed_config(_service_state: ServiceState) -> Option<String> {
+    None
+}
+
+fn probe_bundled_cli_for_action() -> (Result<(), String>, Result<Option<String>, String>) {
+    match sidecar::resolve_bundled_vdpi_cli_binary() {
+        Ok(path) => match crate::status::probe_bundled_cli_version_detailed(&path) {
+            BundledVersionProbe::Version(ver) => (Ok(()), Ok(Some(ver))),
+            BundledVersionProbe::Unparseable => (Ok(()), Ok(None)),
+            BundledVersionProbe::LaunchFailed(err) => (Ok(()), Err(err)),
+        },
+        Err(err) => (Err(err), Ok(None)),
+    }
+}
+
+fn effective_installed_version_for_guard<FLive>(
+    service_state: ServiceState,
+    disk_installed_version: Option<String>,
+    probe_live_version: FLive,
+) -> Option<String>
+where
+    FLive: FnOnce() -> Option<String>,
+{
+    if disk_installed_version.is_some() {
+        return disk_installed_version;
+    }
+    if service_state == ServiceState::Running {
+        return probe_live_version();
+    }
+    None
 }
 
 fn install_background_service_with<FRun>(
     engine: EngineMode,
     needs_elevation: bool,
+    seed_config_path: Option<&str>,
     run_cli: FRun,
 ) -> ActionResultDto
 where
     FRun: FnOnce(&[&str], bool) -> SidecarOutcome,
 {
     let flag = engine_install_flag(engine);
-    match run_cli(&["install", flag], needs_elevation) {
+    let outcome = match seed_config_path {
+        Some(cfg_path) => run_cli(&["--config", cfg_path, "install", flag], needs_elevation),
+        None => run_cli(&["install", flag], needs_elevation),
+    };
+    match outcome {
         SidecarOutcome::Ok(_) => action_ok(
             format!(
                 "Installed and started vdpi background service ({} mode).",
@@ -1003,12 +1148,13 @@ where
 fn install_background_service_checked_with<FRun>(
     engine: EngineMode,
     needs_elevation: bool,
+    seed_config_path: Option<&str>,
     bundled_cli_result: Result<(), String>,
-    wintun_preflight: Result<(), String>,
+    bundled_version_probe: Result<Option<&str>, &str>,
+    wintun_preflight: Result<(), (ActionErrorCodeDto, String)>,
     service_installed: bool,
     installed_binary_present: bool,
     installed_version: Option<&str>,
-    bundled_version: Option<&str>,
     run_cli: FRun,
 ) -> ActionResultDto
 where
@@ -1017,8 +1163,12 @@ where
     if let Err(err) = bundled_cli_result {
         return action_err_with_code(redact_message(&err), ActionErrorCodeDto::BundledCliMissing);
     }
-    if let Err(err) = wintun_preflight {
-        return action_err_with_code(redact_message(&err), ActionErrorCodeDto::WintunMissing);
+    let bundled_version = match bundled_version_probe {
+        Ok(ver) => ver,
+        Err(launch_err) => return action_err(redact_message(launch_err), None),
+    };
+    if let Err((code, err)) = wintun_preflight {
+        return action_err_with_code(redact_message(&err), code);
     }
     if let Some(blocked) = check_version_guard(
         VersionGuardMode::Install,
@@ -1029,42 +1179,50 @@ where
     ) {
         return blocked;
     }
-    install_background_service_with(engine, needs_elevation, run_cli)
+    install_background_service_with(engine, needs_elevation, seed_config_path, run_cli)
 }
 
 /// Installs and starts the OS background `vdpi` service via ONLY the bundled
 /// `vdpi` CLI sidecar (`install --tun` or `install --proxy`) so SCM/launchd/systemd
 /// always registers the `vdpi` engine binary rather than `vdpi-desktop`.
 ///
-/// Pre-checks bundled sidecar presence, Wintun availability on Windows for TUN
-/// mode, and strict semver downgrade prevention before requesting elevation.
+/// Pre-checks bundled sidecar presence, AV/Win32 launch health, Wintun availability
+/// and integrity on Windows for TUN mode, and strict semver downgrade prevention
+/// (falling back to live daemon version when running) before requesting elevation.
+/// On Windows fresh installs, passes `--config <user_config_path>` when verified so
+/// over-the-shoulder UAC preserves pre-install user config without secrets on argv.
 pub fn install_background_service(engine: Option<EngineModeDto>) -> ActionResultDto {
-    let bundled_bin = sidecar::resolve_bundled_vdpi_cli_binary();
-    let bundled_version = bundled_bin
-        .as_ref()
-        .ok()
-        .and_then(|path| crate::status::probe_bundled_cli_version(path));
-    let bundled_cli_result = bundled_bin.map(|_| ());
+    let (bundled_cli_result, bundled_version_probe) = probe_bundled_cli_for_action();
 
     let service_state = detect_service_state();
     let service_installed = service_state != ServiceState::NotInstalled;
     let use_system = is_system_service_installed();
     let cfg = load_effective_runtime_config(use_system);
     let target_engine = engine.map(engine_mode_from_dto).unwrap_or(cfg.engine);
-    let wintun_preflight = check_windows_tun_wintun_preflight(target_engine);
+    let wintun_preflight = check_windows_tun_wintun_preflight(target_engine, false);
     let installed_binary_present = installed_binary_exists_on_disk();
-    let installed_version = detect_installed_info().and_then(|info| info.installed_version);
+    let disk_installed_version = detect_installed_info().and_then(|info| info.installed_version);
+    let installed_version = effective_installed_version_for_guard(
+        service_state,
+        disk_installed_version,
+        || crate::status::probe_live_version_quick(&cfg),
+    );
+    let seed_config_path = resolve_windows_fresh_install_seed_config(service_state);
     let elevated = install_needs_elevation(target_engine, use_system);
 
     install_background_service_checked_with(
         target_engine,
         elevated,
+        seed_config_path.as_deref(),
         bundled_cli_result,
+        bundled_version_probe
+            .as_ref()
+            .map(|opt| opt.as_deref())
+            .map_err(String::as_str),
         wintun_preflight,
         service_installed,
         installed_binary_present,
         installed_version.as_deref(),
-        bundled_version.as_deref(),
         |args, need_elev| {
             sidecar::run_bundled_vdpi_cli(args, need_elev, SIDECAR_INSTALL_TIMEOUT_SECS)
         },
@@ -1075,10 +1233,11 @@ pub fn install_background_service(engine: Option<EngineModeDto>) -> ActionResult
 fn upgrade_background_service_with<FRun>(
     needs_elevation: bool,
     bundled_cli_result: Result<(), String>,
+    bundled_version_probe: Result<Option<&str>, &str>,
+    wintun_preflight: Result<(), (ActionErrorCodeDto, String)>,
     service_installed: bool,
     installed_binary_present: bool,
     installed_version: Option<&str>,
-    bundled_version: Option<&str>,
     run_cli: FRun,
 ) -> ActionResultDto
 where
@@ -1087,6 +1246,10 @@ where
     if let Err(err) = bundled_cli_result {
         return action_err_with_code(redact_message(&err), ActionErrorCodeDto::BundledCliMissing);
     }
+    let bundled_version = match bundled_version_probe {
+        Ok(ver) => ver,
+        Err(launch_err) => return action_err(redact_message(launch_err), None),
+    };
     if let Some(blocked) = check_version_guard(
         VersionGuardMode::Upgrade,
         service_installed,
@@ -1095,6 +1258,9 @@ where
         bundled_version,
     ) {
         return blocked;
+    }
+    if let Err((code, err)) = wintun_preflight {
+        return action_err_with_code(redact_message(&err), code);
     }
 
     let target_ver_suffix = bundled_version
@@ -1133,31 +1299,37 @@ where
 /// Upgrades an already-installed `vdpi` background service in-place using ONLY
 /// the bundled `vdpi` CLI (`install --upgrade`), preserving existing `config.toml`.
 ///
-/// Refuses downgrades when the installed version is newer than the bundled version
-/// (`DowngradeBlocked`) and no-ops (`AlreadyUpToDate`) when versions match.
+/// Refuses downgrades when the installed/running version is newer than the bundled
+/// version (`DowngradeBlocked`), verifies Windows Wintun integrity when configured
+/// for TUN, and no-ops (`AlreadyUpToDate`) when versions match.
 pub fn upgrade_background_service() -> ActionResultDto {
-    let bundled_bin = sidecar::resolve_bundled_vdpi_cli_binary();
-    let bundled_version = bundled_bin
-        .as_ref()
-        .ok()
-        .and_then(|path| crate::status::probe_bundled_cli_version(path));
-    let bundled_cli_result = bundled_bin.map(|_| ());
+    let (bundled_cli_result, bundled_version_probe) = probe_bundled_cli_for_action();
 
     let service_state = detect_service_state();
     let service_installed = service_state != ServiceState::NotInstalled;
     let use_system = is_system_service_installed();
     let cfg = load_effective_runtime_config(use_system);
+    let wintun_preflight = check_windows_tun_wintun_preflight(cfg.engine, false);
     let installed_binary_present = installed_binary_exists_on_disk();
-    let installed_version = detect_installed_info().and_then(|info| info.installed_version);
+    let disk_installed_version = detect_installed_info().and_then(|info| info.installed_version);
+    let installed_version = effective_installed_version_for_guard(
+        service_state,
+        disk_installed_version,
+        || crate::status::probe_live_version_quick(&cfg),
+    );
     let elevated = upgrade_needs_elevation(cfg.engine, use_system);
 
     upgrade_background_service_with(
         elevated,
         bundled_cli_result,
+        bundled_version_probe
+            .as_ref()
+            .map(|opt| opt.as_deref())
+            .map_err(String::as_str),
+        wintun_preflight,
         service_installed,
         installed_binary_present,
         installed_version.as_deref(),
-        bundled_version.as_deref(),
         |args, need_elev| {
             sidecar::run_bundled_vdpi_cli(args, need_elev, SIDECAR_INSTALL_TIMEOUT_SECS)
         },
@@ -1170,11 +1342,12 @@ fn repair_background_service_with<FRun>(
     explicit_engine: Option<EngineMode>,
     effective_engine: EngineMode,
     needs_elevation: bool,
+    seed_config_path: Option<&str>,
     bundled_cli_result: Result<(), String>,
-    wintun_preflight: Result<(), String>,
+    bundled_version_probe: Result<Option<&str>, &str>,
+    wintun_preflight: Result<(), (ActionErrorCodeDto, String)>,
     installed_binary_present: bool,
     installed_version: Option<&str>,
-    bundled_version: Option<&str>,
     run_cli: FRun,
 ) -> ActionResultDto
 where
@@ -1183,8 +1356,12 @@ where
     if let Err(err) = bundled_cli_result {
         return action_err_with_code(redact_message(&err), ActionErrorCodeDto::BundledCliMissing);
     }
-    if let Err(err) = wintun_preflight {
-        return action_err_with_code(redact_message(&err), ActionErrorCodeDto::WintunMissing);
+    let bundled_version = match bundled_version_probe {
+        Ok(ver) => ver,
+        Err(launch_err) => return action_err(redact_message(launch_err), None),
+    };
+    if let Err((code, err)) = wintun_preflight {
+        return action_err_with_code(redact_message(&err), code);
     }
     let service_installed = service_state != ServiceState::NotInstalled;
     if let Some(blocked) = check_version_guard(
@@ -1199,7 +1376,10 @@ where
 
     let flag = engine_install_flag(effective_engine);
     let outcome = if !service_installed {
-        run_cli(&["install", flag], needs_elevation)
+        match seed_config_path {
+            Some(cfg_path) => run_cli(&["--config", cfg_path, "install", flag], needs_elevation),
+            None => run_cli(&["install", flag], needs_elevation),
+        }
     } else if explicit_engine.is_some() {
         run_cli(&["install", "--upgrade", flag], needs_elevation)
     } else {
@@ -1242,23 +1422,25 @@ where
 
 /// Repairs or reinstalls the `vdpi` background service using ONLY the bundled
 /// `vdpi` CLI (`install --upgrade`, or fresh `install --tun|--proxy` if not yet
-/// installed), refusing downgrades when the installed version is newer than bundled.
+/// installed), refusing downgrades when the installed or running daemon version
+/// is newer than bundled.
 pub fn repair_background_service(engine: Option<EngineModeDto>) -> ActionResultDto {
-    let bundled_bin = sidecar::resolve_bundled_vdpi_cli_binary();
-    let bundled_version = bundled_bin
-        .as_ref()
-        .ok()
-        .and_then(|path| crate::status::probe_bundled_cli_version(path));
-    let bundled_cli_result = bundled_bin.map(|_| ());
+    let (bundled_cli_result, bundled_version_probe) = probe_bundled_cli_for_action();
 
     let service_state = detect_service_state();
     let use_system = is_system_service_installed();
     let cfg = load_effective_runtime_config(use_system);
     let explicit_engine = engine.map(engine_mode_from_dto);
     let effective_engine = explicit_engine.unwrap_or(cfg.engine);
-    let wintun_preflight = check_windows_tun_wintun_preflight(effective_engine);
+    let wintun_preflight = check_windows_tun_wintun_preflight(effective_engine, false);
     let installed_binary_present = installed_binary_exists_on_disk();
-    let installed_version = detect_installed_info().and_then(|info| info.installed_version);
+    let disk_installed_version = detect_installed_info().and_then(|info| info.installed_version);
+    let installed_version = effective_installed_version_for_guard(
+        service_state,
+        disk_installed_version,
+        || crate::status::probe_live_version_quick(&cfg),
+    );
+    let seed_config_path = resolve_windows_fresh_install_seed_config(service_state);
     let elevated = upgrade_needs_elevation(effective_engine, use_system);
 
     repair_background_service_with(
@@ -1266,11 +1448,15 @@ pub fn repair_background_service(engine: Option<EngineModeDto>) -> ActionResultD
         explicit_engine,
         effective_engine,
         elevated,
+        seed_config_path.as_deref(),
         bundled_cli_result,
+        bundled_version_probe
+            .as_ref()
+            .map(|opt| opt.as_deref())
+            .map_err(String::as_str),
         wintun_preflight,
         installed_binary_present,
         installed_version.as_deref(),
-        bundled_version.as_deref(),
         |args, need_elev| {
             sidecar::run_bundled_vdpi_cli(args, need_elev, SIDECAR_INSTALL_TIMEOUT_SECS)
         },
@@ -1392,13 +1578,50 @@ fn release_check_to_dto(res: ReleaseCheckResult) -> UpdateCheckPayloadDto {
     }
 }
 
-/// Queries GitHub Releases for the latest `vdpi` version and returns a
-/// frontend-ready update payload with a validated release URL.
+async fn check_for_updates_cached_with<F, Fut>(
+    cache: &UpdateCheckCacheSlot,
+    force: bool,
+    now: Instant,
+    fetch: F,
+) -> Result<UpdateCheckPayloadDto, String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<UpdateCheckPayloadDto, String>>,
+{
+    let mut guard = cache.lock().await;
+    if !force {
+        if let Some((cached_at, payload)) = guard.as_ref() {
+            if now
+                .checked_duration_since(*cached_at)
+                .is_some_and(|age| age < UPDATE_CHECK_CACHE_TTL)
+            {
+                return Ok(payload.clone());
+            }
+        }
+    }
+
+    let result = fetch().await?;
+    *guard = Some((now, result.clone()));
+    Ok(result)
+}
+
+/// Queries GitHub Releases for the latest `vdpi` Desktop version (always comparing
+/// against `env!("CARGO_PKG_VERSION")`, never the installed CLI version) with a
+/// 30-second deduplicated cache unless `force` is `true`.
+pub async fn check_for_updates_with_force(force: bool) -> Result<UpdateCheckPayloadDto, String> {
+    check_for_updates_cached_with(update_check_cache(), force, Instant::now(), || async {
+        check_latest_release_for_version(env!("CARGO_PKG_VERSION"))
+            .await
+            .map(release_check_to_dto)
+            .map_err(|err| redact_error(&err))
+    })
+    .await
+}
+
+/// Queries GitHub Releases for the latest `vdpi` Desktop version using the
+/// 30-second deduplicated cache and returns a frontend-ready update payload.
 pub async fn check_for_updates() -> Result<UpdateCheckPayloadDto, String> {
-    check_latest_release()
-        .await
-        .map(release_check_to_dto)
-        .map_err(|err| redact_error(&err))
+    check_for_updates_with_force(false).await
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
@@ -2302,6 +2525,11 @@ mod tests {
             Some(&sys_cfg_path),
             true,
             || ServiceState::NotInstalled,
+            |target, installed| {
+                assert_eq!(target, EngineMode::Tun);
+                assert!(!installed);
+                Ok(())
+            },
             |_, _| unreachable!("service not installed"),
         );
         assert!(
@@ -2325,6 +2553,49 @@ mod tests {
         assert_eq!(reloaded.dns_addr.as_deref(), Some("9.9.9.9"));
         assert_eq!(reloaded.block_quic, Some(false));
 
+        // Switching to TUN fails closed BEFORE elevation when Wintun is missing or invalid.
+        let res_wintun_missing = switch_engine_with(
+            EngineModeDto::Tun,
+            &user_cfg_path,
+            Some(&sys_cfg_path),
+            true,
+            || ServiceState::Running,
+            |target, installed| {
+                assert_eq!(target, EngineMode::Tun);
+                assert!(installed);
+                Err((
+                    ActionErrorCodeDto::WintunMissing,
+                    "wintun.dll is missing".to_string(),
+                ))
+            },
+            |_, _| unreachable!("must not elevate when Wintun is missing"),
+        );
+        assert!(!res_wintun_missing.ok);
+        assert_eq!(
+            res_wintun_missing.code,
+            Some(ActionErrorCodeDto::WintunMissing)
+        );
+
+        let res_wintun_invalid = switch_engine_with(
+            EngineModeDto::Tun,
+            &user_cfg_path,
+            Some(&sys_cfg_path),
+            true,
+            || ServiceState::Running,
+            |_, _| {
+                Err((
+                    ActionErrorCodeDto::WintunInvalid,
+                    "wintun.dll failed SHA-256 hash verification".to_string(),
+                ))
+            },
+            |_, _| unreachable!("must not elevate when Wintun is corrupted"),
+        );
+        assert!(!res_wintun_invalid.ok);
+        assert_eq!(
+            res_wintun_invalid.code,
+            Some(ActionErrorCodeDto::WintunInvalid)
+        );
+
         // Installed & running -> delegates to sidecar `engine proxy`.
         let called = Cell::new(false);
         let res_running = switch_engine_with(
@@ -2333,6 +2604,7 @@ mod tests {
             Some(&sys_cfg_path),
             true,
             || ServiceState::Running,
+            |_, _| Ok(()),
             |args, elevated| {
                 called.set(true);
                 assert_eq!(args, &["engine", "proxy"]);
@@ -2352,6 +2624,7 @@ mod tests {
             None,
             true,
             || ServiceState::Running,
+            |_, _| Ok(()),
             |_, _| SidecarOutcome::Cancelled,
         );
         assert!(!res_cancelled.ok);
@@ -2365,6 +2638,7 @@ mod tests {
             None,
             true,
             || ServiceState::Stopped,
+            |_, _| Ok(()),
             |_, _| {
                 SidecarOutcome::Err(
                     "failed against https://user:pw@dns.example.com/secretpath".to_string(),
@@ -2658,17 +2932,38 @@ mod tests {
 
     #[test]
     fn install_and_uninstall_use_sidecar_handle_cancel_and_redact_errors() {
-        let ok_install_tun = install_background_service_with(EngineMode::Tun, true, |args, elev| {
-            assert_eq!(args, &["install", "--tun"]);
-            assert!(elev);
-            SidecarOutcome::Ok(String::new())
-        });
+        let ok_install_tun =
+            install_background_service_with(EngineMode::Tun, true, None, |args, elev| {
+                assert_eq!(args, &["install", "--tun"]);
+                assert!(elev);
+                SidecarOutcome::Ok(String::new())
+            });
         assert!(ok_install_tun.ok);
         assert!(ok_install_tun.message.contains("TUN"));
         assert_eq!(ok_install_tun.needs_restart, Some(false));
 
+        let ok_install_with_seed = install_background_service_with(
+            EngineMode::Tun,
+            true,
+            Some(r"C:\Users\Standard\AppData\Roaming\vdpi\config.toml"),
+            |args, elev| {
+                assert_eq!(
+                    args,
+                    &[
+                        "--config",
+                        r"C:\Users\Standard\AppData\Roaming\vdpi\config.toml",
+                        "install",
+                        "--tun"
+                    ]
+                );
+                assert!(elev);
+                SidecarOutcome::Ok(String::new())
+            },
+        );
+        assert!(ok_install_with_seed.ok);
+
         let ok_install_proxy =
-            install_background_service_with(EngineMode::Proxy, false, |args, elev| {
+            install_background_service_with(EngineMode::Proxy, false, None, |args, elev| {
                 assert_eq!(args, &["install", "--proxy"]);
                 assert!(!elev);
                 SidecarOutcome::Ok(String::new())
@@ -2676,13 +2971,14 @@ mod tests {
         assert!(ok_install_proxy.ok);
         assert!(ok_install_proxy.message.contains("Proxy"));
 
-        let cancel_install =
-            install_background_service_with(EngineMode::Tun, true, |_, _| SidecarOutcome::Cancelled);
+        let cancel_install = install_background_service_with(EngineMode::Tun, true, None, |_, _| {
+            SidecarOutcome::Cancelled
+        });
         assert!(!cancel_install.ok);
         assert_eq!(cancel_install.message, "Elevation was cancelled.");
         assert_eq!(cancel_install.cancelled, Some(true));
 
-        let err_install = install_background_service_with(EngineMode::Tun, true, |_, _| {
+        let err_install = install_background_service_with(EngineMode::Tun, true, None, |_, _| {
             SidecarOutcome::Err("install error https://tok:sec@example.com/private".to_string())
         });
         assert!(!err_install.ok);
@@ -3248,21 +3544,59 @@ mod tests {
 
     #[test]
     fn cross_os_install_and_upgrade_elevation_rules() {
-        // Windows always elevates install and upgrade regardless of engine or service mode.
-        assert!(install_needs_elevation_for_os("windows", EngineMode::Proxy, false));
-        assert!(install_needs_elevation_for_os("windows", EngineMode::Tun, false));
+        // Windows always elevates install, upgrade, pause/resume, and uninstall.
+        assert!(install_needs_elevation_for_os(
+            "windows",
+            EngineMode::Proxy,
+            false,
+            false
+        ));
+        assert!(install_needs_elevation_for_os(
+            "windows",
+            EngineMode::Tun,
+            false,
+            false
+        ));
         assert!(upgrade_needs_elevation_for_os(
             "windows",
             EngineMode::Proxy,
             false,
             false
         ));
+        assert!(service_control_needs_elevation_for_os(
+            "windows", false, false, false
+        ));
+        assert!(uninstall_needs_elevation_for_os(
+            "windows", false, false, false
+        ));
 
-        // macOS and Linux: Proxy user-scoped install does not elevate; TUN or system service does.
+        // macOS and Linux: Proxy user-scoped install does not elevate unless system
+        // service or privileged `/usr/local/bin/vdpi` already exists; TUN always elevates.
         for os in ["macos", "linux"] {
-            assert!(!install_needs_elevation_for_os(os, EngineMode::Proxy, false));
-            assert!(install_needs_elevation_for_os(os, EngineMode::Tun, false));
-            assert!(install_needs_elevation_for_os(os, EngineMode::Proxy, true));
+            assert!(!install_needs_elevation_for_os(
+                os,
+                EngineMode::Proxy,
+                false,
+                false
+            ));
+            assert!(install_needs_elevation_for_os(
+                os,
+                EngineMode::Tun,
+                false,
+                false
+            ));
+            assert!(install_needs_elevation_for_os(
+                os,
+                EngineMode::Proxy,
+                true,
+                false
+            ));
+            assert!(install_needs_elevation_for_os(
+                os,
+                EngineMode::Proxy,
+                false,
+                true
+            ));
 
             assert!(!upgrade_needs_elevation_for_os(
                 os,
@@ -3289,47 +3623,115 @@ mod tests {
                 true
             ));
         }
+
+        // Linux pause and uninstall elevate when orphan TUN artifacts exist, while
+        // resume in user mode does not need elevation for orphan cleanup.
+        assert!(!service_control_needs_elevation_for_os(
+            "linux", false, false, false
+        ));
+        assert!(service_control_needs_elevation_for_os(
+            "linux", false, false, true
+        ));
+        assert!(!service_control_needs_elevation_for_os(
+            "linux", true, false, true
+        ));
+        assert!(service_control_needs_elevation_for_os(
+            "linux", true, true, false
+        ));
+        assert!(!uninstall_needs_elevation_for_os(
+            "linux", false, false, false
+        ));
+        assert!(uninstall_needs_elevation_for_os(
+            "linux", false, false, true
+        ));
+        assert!(!uninstall_needs_elevation_for_os(
+            "macos", false, false, true
+        ));
     }
 
     #[test]
-    fn install_preflight_blocks_missing_bundle_wintun_and_downgrade_before_elevation() {
+    fn install_preflight_blocks_missing_bundle_wintun_av_and_downgrade_before_elevation() {
         let missing_bundle = install_background_service_checked_with(
             EngineMode::Tun,
             true,
+            None,
             Err("Bundled vdpi missing".to_string()),
+            Ok(None),
             Ok(()),
             false,
             false,
-            None,
             None,
             |_, _| unreachable!("must not elevate when bundled CLI is missing"),
         );
         assert!(!missing_bundle.ok);
-        assert_eq!(missing_bundle.code, Some(ActionErrorCodeDto::BundledCliMissing));
+        assert_eq!(
+            missing_bundle.code,
+            Some(ActionErrorCodeDto::BundledCliMissing)
+        );
+
+        // AV / Win32 launch failure from bundled `--version` surfaces directly (NOT VersionUnknown).
+        let av_blocked = install_background_service_checked_with(
+            EngineMode::Tun,
+            true,
+            None,
+            Ok(()),
+            Err("Windows Defender blocked launching vdpi.exe (Win32 error 225)."),
+            Ok(()),
+            false,
+            false,
+            None,
+            |_, _| unreachable!("must not elevate when AV blocks bundled CLI"),
+        );
+        assert!(!av_blocked.ok);
+        assert_eq!(av_blocked.code, None);
+        assert!(av_blocked.message.contains("Win32 error 225"));
 
         let missing_wintun = install_background_service_checked_with(
             EngineMode::Tun,
             true,
+            None,
             Ok(()),
-            Err("wintun.dll is missing".to_string()),
+            Ok(Some("0.6.1")),
+            Err((
+                ActionErrorCodeDto::WintunMissing,
+                "wintun.dll is missing".to_string(),
+            )),
             false,
             false,
             None,
-            Some("0.6.1"),
             |_, _| unreachable!("must not elevate when Wintun is missing for TUN"),
         );
         assert!(!missing_wintun.ok);
         assert_eq!(missing_wintun.code, Some(ActionErrorCodeDto::WintunMissing));
 
+        let invalid_wintun = install_background_service_checked_with(
+            EngineMode::Tun,
+            true,
+            None,
+            Ok(()),
+            Ok(Some("0.6.1")),
+            Err((
+                ActionErrorCodeDto::WintunInvalid,
+                "wintun.dll failed SHA-256 hash verification".to_string(),
+            )),
+            false,
+            false,
+            None,
+            |_, _| unreachable!("must not elevate when Wintun hash is invalid"),
+        );
+        assert!(!invalid_wintun.ok);
+        assert_eq!(invalid_wintun.code, Some(ActionErrorCodeDto::WintunInvalid));
+
         let downgrade = install_background_service_checked_with(
             EngineMode::Tun,
             true,
+            None,
             Ok(()),
+            Ok(Some("0.6.1")),
             Ok(()),
             true,
             true,
             Some("0.7.0"),
-            Some("0.6.1"),
             |_, _| unreachable!("must not elevate on semver downgrade"),
         );
         assert!(!downgrade.ok);
@@ -3338,12 +3740,13 @@ mod tests {
         let unknown = install_background_service_checked_with(
             EngineMode::Tun,
             true,
+            None,
             Ok(()),
+            Ok(None),
             Ok(()),
             true,
             true,
             Some("0.6.0"),
-            None,
             |_, _| unreachable!("must not elevate when bundled version is unknown"),
         );
         assert!(!unknown.ok);
@@ -3352,12 +3755,13 @@ mod tests {
         let fresh_proxy = install_background_service_checked_with(
             EngineMode::Proxy,
             false,
+            None,
             Ok(()),
+            Ok(Some("0.6.1")),
             Ok(()),
             false,
             false,
             None,
-            Some("0.6.1"),
             |args, elev| {
                 assert_eq!(args, &["install", "--proxy"]);
                 assert!(!elev);
@@ -3369,15 +3773,16 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_and_repair_enforce_semver_guards_and_cli_arguments() {
+    fn upgrade_and_repair_enforce_semver_guards_wintun_av_seed_config_and_cli_arguments() {
         // Upgrade succeeds when bundled > installed and passes `install --upgrade`.
         let upgraded = upgrade_background_service_with(
             true,
             Ok(()),
+            Ok(Some("0.6.1")),
+            Ok(()),
             true,
             true,
             Some("0.6.0"),
-            Some("0.6.1"),
             |args, elev| {
                 assert_eq!(args, &["install", "--upgrade"]);
                 assert!(elev);
@@ -3388,13 +3793,49 @@ mod tests {
         assert_eq!(upgraded.code, None);
         assert!(upgraded.message.contains("v0.6.1"));
 
+        // Upgrade surfaces AV launch error directly instead of VersionUnknown.
+        let upgrade_av = upgrade_background_service_with(
+            true,
+            Ok(()),
+            Err("Windows Defender blocked launching vdpi.exe (Win32 error 225)."),
+            Ok(()),
+            true,
+            true,
+            Some("0.6.0"),
+            |_, _| unreachable!("must not elevate when AV blocks bundled CLI"),
+        );
+        assert!(!upgrade_av.ok);
+        assert_eq!(upgrade_av.code, None);
+        assert!(upgrade_av.message.contains("Win32 error 225"));
+
+        // Upgrade enforces Wintun preflight (both Missing and Invalid) before elevation.
+        let upgrade_wintun_invalid = upgrade_background_service_with(
+            true,
+            Ok(()),
+            Ok(Some("0.6.1")),
+            Err((
+                ActionErrorCodeDto::WintunInvalid,
+                "wintun.dll failed SHA-256 hash verification".to_string(),
+            )),
+            true,
+            true,
+            Some("0.6.0"),
+            |_, _| unreachable!("must not elevate upgrade when Wintun is invalid"),
+        );
+        assert!(!upgrade_wintun_invalid.ok);
+        assert_eq!(
+            upgrade_wintun_invalid.code,
+            Some(ActionErrorCodeDto::WintunInvalid)
+        );
+
         // Upgrade no-ops with AlreadyUpToDate when versions match.
         let same = upgrade_background_service_with(
             true,
             Ok(()),
+            Ok(Some("0.6.1")),
+            Ok(()),
             true,
             true,
-            Some("0.6.1"),
             Some("0.6.1"),
             |_, _| unreachable!("must not invoke sidecar when already up to date"),
         );
@@ -3405,10 +3846,11 @@ mod tests {
         let downgrade = upgrade_background_service_with(
             true,
             Ok(()),
+            Ok(Some("0.6.1")),
+            Ok(()),
             true,
             true,
             Some("0.7.0"),
-            Some("0.6.1"),
             |_, _| unreachable!("must not downgrade during upgrade"),
         );
         assert!(!downgrade.ok);
@@ -3418,33 +3860,83 @@ mod tests {
         let unknown = upgrade_background_service_with(
             true,
             Ok(()),
+            Ok(Some("0.6.1")),
+            Ok(()),
             true,
             true,
             None,
-            Some("0.6.1"),
             |_, _| unreachable!("must not upgrade with unknown installed version"),
         );
         assert!(!unknown.ok);
         assert_eq!(unknown.code, Some(ActionErrorCodeDto::VersionUnknown));
 
-        // Repair when NotInstalled runs fresh install with explicit engine flag.
+        // Repair when NotInstalled runs fresh install with explicit engine flag and optional seed config.
         let repair_fresh = repair_background_service_with(
             ServiceState::NotInstalled,
             Some(EngineMode::Proxy),
             EngineMode::Proxy,
             false,
+            Some(r"C:\Users\Alice\AppData\Roaming\vdpi\config.toml"),
             Ok(()),
+            Ok(Some("0.6.1")),
             Ok(()),
             false,
             None,
-            Some("0.6.1"),
             |args, elev| {
-                assert_eq!(args, &["install", "--proxy"]);
+                assert_eq!(
+                    args,
+                    &[
+                        "--config",
+                        r"C:\Users\Alice\AppData\Roaming\vdpi\config.toml",
+                        "install",
+                        "--proxy"
+                    ]
+                );
                 assert!(!elev);
                 SidecarOutcome::Ok(String::new())
             },
         );
         assert!(repair_fresh.ok);
+
+        // Repair distinguishes WintunInvalid vs WintunMissing and surfaces AV launch errors.
+        let repair_wintun_invalid = repair_background_service_with(
+            ServiceState::Stopped,
+            None,
+            EngineMode::Tun,
+            true,
+            None,
+            Ok(()),
+            Ok(Some("0.6.1")),
+            Err((
+                ActionErrorCodeDto::WintunInvalid,
+                "wintun.dll failed SHA-256 hash verification".to_string(),
+            )),
+            false,
+            None,
+            |_, _| unreachable!("must not elevate repair when Wintun is invalid"),
+        );
+        assert!(!repair_wintun_invalid.ok);
+        assert_eq!(
+            repair_wintun_invalid.code,
+            Some(ActionErrorCodeDto::WintunInvalid)
+        );
+
+        let repair_av = repair_background_service_with(
+            ServiceState::Stopped,
+            None,
+            EngineMode::Tun,
+            true,
+            None,
+            Ok(()),
+            Err("Windows Defender quarantined vdpi.exe (Win32 error 226)."),
+            Ok(()),
+            false,
+            None,
+            |_, _| unreachable!("must not elevate repair when AV blocks bundled CLI"),
+        );
+        assert!(!repair_av.ok);
+        assert_eq!(repair_av.code, None);
+        assert!(repair_av.message.contains("Win32 error 226"));
 
         // Repair when installed binary is missing/corrupted (`installed_version == None`) is allowed.
         let repair_corrupt = repair_background_service_with(
@@ -3452,11 +3944,12 @@ mod tests {
             None,
             EngineMode::Tun,
             true,
+            None,
             Ok(()),
+            Ok(Some("0.6.1")),
             Ok(()),
             false,
             None,
-            Some("0.6.1"),
             |args, elev| {
                 assert_eq!(args, &["install", "--upgrade"]);
                 assert!(elev);
@@ -3471,10 +3964,11 @@ mod tests {
             Some(EngineMode::Proxy),
             EngineMode::Proxy,
             true,
+            None,
             Ok(()),
+            Ok(Some("0.6.1")),
             Ok(()),
             true,
-            Some("0.6.1"),
             Some("0.6.1"),
             |args, elev| {
                 assert_eq!(args, &["install", "--upgrade", "--proxy"]);
@@ -3484,23 +3978,158 @@ mod tests {
         );
         assert!(repair_explicit.ok);
 
-        // Repair blocks downgrade when installed > bundled.
+        // Repair blocks downgrade when installed > bundled (including via live version fallback).
+        let live_fallback = effective_installed_version_for_guard(
+            ServiceState::Running,
+            None,
+            || Some("0.7.0".to_string()),
+        );
+        assert_eq!(live_fallback.as_deref(), Some("0.7.0"));
+
         let repair_downgrade = repair_background_service_with(
             ServiceState::Running,
             None,
             EngineMode::Tun,
             true,
+            None,
             Ok(()),
+            Ok(Some("0.6.1")),
             Ok(()),
-            true,
-            Some("0.7.0"),
-            Some("0.6.1"),
-            |_, _| unreachable!("must not downgrade during repair"),
+            false,
+            live_fallback.as_deref(),
+            |_, _| unreachable!("must not downgrade running newer daemon during repair"),
         );
         assert!(!repair_downgrade.ok);
         assert_eq!(
             repair_downgrade.code,
             Some(ActionErrorCodeDto::DowngradeBlocked)
         );
+
+        // Stopped service does NOT query live daemon when disk version is None.
+        let stopped_fallback = effective_installed_version_for_guard(
+            ServiceState::Stopped,
+            None,
+            || unreachable!("stopped service must not probe live daemon"),
+        );
+        assert!(stopped_fallback.is_none());
+    }
+
+    #[test]
+    fn verified_user_config_for_fresh_install_accepts_regular_file_and_rejects_dir_missing_and_symlink(
+    ) {
+        let dir = TempDirGuard::new("seed-cfg");
+        let cfg_file = dir.config_path();
+        let sub_dir = dir.path().join("subdir");
+        fs::create_dir_all(&sub_dir).expect("create subdir");
+
+        // Missing file returns None.
+        assert!(
+            resolve_verified_user_config_for_fresh_install_in(&cfg_file, cfg!(target_os = "windows"))
+                .is_none()
+        );
+        // Directory returns None.
+        assert!(
+            resolve_verified_user_config_for_fresh_install_in(&sub_dir, cfg!(target_os = "windows"))
+                .is_none()
+        );
+
+        // Regular file succeeds.
+        fs::write(&cfg_file, "engine = \"tun\"\n").expect("write config.toml");
+        let resolved = resolve_verified_user_config_for_fresh_install_in(
+            &cfg_file,
+            cfg!(target_os = "windows"),
+        );
+        assert_eq!(resolved.as_deref(), cfg_file.to_str());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let link_cfg = dir.path().join("link-config.toml");
+            symlink(&cfg_file, &link_cfg).expect("create symlink config");
+            assert!(
+                resolve_verified_user_config_for_fresh_install_in(&link_cfg, false).is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn check_for_updates_caches_for_30s_allows_force_and_does_not_cache_errors() {
+        let cache = tokio::sync::Mutex::new(None);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let t0 = Instant::now();
+
+        let sample_payload = |latest: &str| UpdateCheckPayloadDto {
+            current_version: env!("CARGO_PKG_VERSION").to_string(),
+            latest_version: latest.to_string(),
+            has_update: true,
+            release_url: REPO_RELEASES_URL.to_string(),
+            release_notes: vec![],
+        };
+
+        // First call populates cache.
+        let r1 = check_for_updates_cached_with(&cache, false, t0, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(sample_payload("v0.7.0"))
+        })
+        .await
+        .expect("first update check succeeds");
+        assert_eq!(r1.latest_version, "v0.7.0");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Call within 30s TTL returns cached payload without hitting network.
+        let r2 = check_for_updates_cached_with(
+            &cache,
+            false,
+            t0 + Duration::from_secs(29),
+            || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(sample_payload("v0.8.0"))
+            },
+        )
+        .await
+        .expect("cached update check succeeds");
+        assert_eq!(r2.latest_version, "v0.7.0");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Explicit `force = true` bypasses cache and updates it.
+        let r3 = check_for_updates_cached_with(
+            &cache,
+            true,
+            t0 + Duration::from_secs(5),
+            || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(sample_payload("v0.8.0"))
+            },
+        )
+        .await
+        .expect("forced update check succeeds");
+        assert_eq!(r3.latest_version, "v0.8.0");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        // Expired TTL (>= 30s) fetches fresh result; errors are never cached.
+        let t_exp = t0 + Duration::from_secs(5) + UPDATE_CHECK_CACHE_TTL;
+        let err = check_for_updates_cached_with(&cache, false, t_exp, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err("network timeout".to_string())
+        })
+        .await
+        .expect_err("network error must propagate");
+        assert_eq!(err, "network timeout");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        // Subsequent call after error retries immediately.
+        let r4 = check_for_updates_cached_with(
+            &cache,
+            false,
+            t_exp + Duration::from_secs(1),
+            || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(sample_payload("v0.9.0"))
+            },
+        )
+        .await
+        .expect("retry after error succeeds");
+        assert_eq!(r4.latest_version, "v0.9.0");
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
     }
 }

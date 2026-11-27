@@ -1884,8 +1884,8 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, state: &PickerState, palette
     };
 
     const BRAND: &str = "vdpi";
-    let subtitle = tr(" Split Tunneling", " Bölünmüş Tünelleme");
-    let full_title = tr("vdpi Split Tunneling", "vdpi Bölünmüş Tünelleme");
+    let subtitle = tr(" Split Tunneling", " Bölünmüş Tünel");
+    let full_title = tr("vdpi Split Tunneling", "vdpi Bölünmüş Tünel");
     let full_left_len = display_width(BRAND) + display_width(subtitle);
 
     let line = if width >= full_left_len + 2 + pill_len {
@@ -1938,14 +1938,14 @@ fn render_mode_bar(frame: &mut Frame<'_>, area: Rect, active: SplitTunnelMode, p
             }
         }
         Lang::Tr => {
-            if width >= 66 {
+            if width >= 71 {
                 (
                     "1 Tüm uygulamalar",
                     "2 Yalnızca seçililer",
                     "3 Seçilileri hariç tut",
                     "  ",
                 )
-            } else if width >= 46 {
+            } else if width >= 49 {
                 ("1 Tümü", "2 Yalnızca seçililer", "3 Hariç tut", "  ")
             } else {
                 ("1 Tümü", "2 Dahil", "3 Hariç", " ")
@@ -2169,15 +2169,16 @@ fn render_app_list(frame: &mut Frame<'_>, area: Rect, state: &mut PickerState, p
             } else {
                 tr("Press 'a' to add custom.", "Özel eklemek için 'a' basın.")
             };
-            let overhead = 18 + display_width(suffix);
+            let (prefix, mid) = match i18n::active_lang() {
+                Lang::En => ("No matches for \"", "\". "),
+                Lang::Tr => ("\"", "\" için eşleşme yok. "),
+            };
+            let overhead = display_width(prefix) + display_width(mid) + display_width(suffix);
             let q = truncate_text(
                 &sanitized_q,
                 usize::from(area.width).saturating_sub(overhead).max(4),
             );
-            match i18n::active_lang() {
-                Lang::En => format!("No matches for \"{q}\". {suffix}"),
-                Lang::Tr => format!("\"{q}\" için eşleşme yok. {suffix}"),
-            }
+            format!("{prefix}{q}{mid}{suffix}")
         };
         let line = Line::from(Span::styled(
             truncate_text(&msg, usize::from(area.width)).into_owned(),
@@ -4007,7 +4008,7 @@ mod tests {
         let buf = render_to_buffer(&mut state, 80, 24, true);
         let text = buffer_text(&buf);
         assert!(
-            text.contains("vdpi Bölünmüş Tünelleme"),
+            text.contains("vdpi Bölünmüş Tünel"),
             "missing TR header:\n{text}"
         );
         assert!(text.contains("1 seçili"), "missing TR count pill:\n{text}");
@@ -4016,6 +4017,24 @@ mod tests {
                 && text.contains("2 Yalnızca seçililer")
                 && text.contains("3 Seçilileri hariç tut"),
             "missing TR mode tabs:\n{text}"
+        );
+        // Width 70 (inner 66 < 71) falls back to medium Turkish pills without clipping the 3rd pill.
+        let med_buf = render_to_buffer(&mut state, 70, 24, true);
+        let med_text = buffer_text(&med_buf);
+        assert!(
+            med_text.contains("1 Tümü")
+                && med_text.contains("2 Yalnızca seçililer")
+                && med_text.contains("3 Hariç tut"),
+            "medium TR mode pills should render unclipped at width 70:\n{med_text}"
+        );
+        // Width 50 (inner 46 < 49) falls back to compact Turkish pills without clipping the 3rd pill.
+        let compact_buf = render_to_buffer(&mut state, 50, 24, true);
+        let compact_text = buffer_text(&compact_buf);
+        assert!(
+            compact_text.contains("1 Tümü")
+                && compact_text.contains("2 Dahil")
+                && compact_text.contains("3 Hariç"),
+            "compact TR mode pills should render unclipped at width 50:\n{compact_text}"
         );
         assert!(text.contains("/ ara"), "missing TR search placeholder:\n{text}");
         assert!(text.contains("uygulama"), "missing TR app count:\n{text}");

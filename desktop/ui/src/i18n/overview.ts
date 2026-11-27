@@ -9,6 +9,10 @@ const en = {
     "Full-PC virtual adapter covering all apps, games, Discord voice (UDP), and DNS without proxy setup.",
   engineDescProxy:
     "Local HTTP/SOCKS5 proxy on 127.0.0.1 for web browsers and proxy-aware TCP apps (does not cover Discord voice or most games).",
+  engineDescProxyWintunMissing:
+    "Local HTTP/SOCKS5 proxy on 127.0.0.1 for web browsers and proxy-aware TCP apps. Add wintun.dll to the app folder to enable Full-PC (TUN) mode.",
+  engineTunDisabledWintun:
+    "Add wintun.dll to the app folder to enable Full-PC (TUN) mode",
   engineSwitchingTo: "Switching engine to {engine}...",
   engineSwitching: "Switching engine...",
 
@@ -24,6 +28,9 @@ const en = {
   subtitleReadingStatus: "Reading service status...",
   subtitleServiceRequired: "Background service required",
   subtitleAdminPrompt: "Admin prompt may appear",
+  subtitleMacAdminPrompt: "Admin password prompt may appear",
+  subtitleLinuxAuthPrompt: "Authentication prompt may appear",
+  subtitleUserServiceNoAdmin: "No admin password needed (Proxy)",
   subtitleActiveTunnel: "Active tunnel: {vpn}",
   subtitleAutoResumes: "Auto-resumes on VPN disconnect",
   subtitleTunAdapter: "TUN adapter",
@@ -38,6 +45,8 @@ const en = {
   btnConnecting: "Connecting...",
   btnPausing: "Pausing...",
   btnUpdating: "Updating...",
+  btnRepairing: "Repairing...",
+  btnUninstalling: "Uninstalling...",
   btnChecking: "Checking...",
   btnSetUpAndConnect: "Set Up & Connect",
   btnPause: "Pause",
@@ -76,6 +85,14 @@ const en = {
   setupRequiredTitle: "One-time setup required",
   setupRequiredDesc:
     "Click Set Up & Connect above to install the background service and start protection. An administrator prompt may appear to approve the setup.",
+  setupRequiredDescNoAdmin:
+    "Click Set Up & Connect above to install the user background service and start protection. No administrator password is required for Proxy mode.",
+  bundleMissingTitle: "Bundled engine binary not found",
+  bundleMissingDesc:
+    "Set Up & Connect is unavailable because the bundled vdpi binary is missing from the app folder. Open Installation for recovery steps.",
+  repairNeededTitle: "Service installation needs repair",
+  repairNeededDesc:
+    "The background service registration or binary looks incomplete. Open Installation to repair or reinstall without losing your configuration.",
   btnOpenSettings: "Open Settings",
   btnOpenInstallation: "Open Installation",
 
@@ -165,6 +182,10 @@ const tr: OverviewDict = {
     "Proxy ayarı gerektirmeden tüm uygulamaları, oyunları, Discord sesini (UDP) ve DNS'i kapsayan tam PC sanal bağdaştırıcısı.",
   engineDescProxy:
     "Web tarayıcıları ve proxy destekli TCP uygulamaları için 127.0.0.1 üzerinde yerel HTTP/SOCKS5 proxy (Discord sesini ve çoğu oyunu kapsamaz).",
+  engineDescProxyWintunMissing:
+    "Web tarayıcıları ve proxy destekli TCP uygulamaları için 127.0.0.1 üzerinde yerel HTTP/SOCKS5 proxy. Tam PC (TUN) modunu etkinleştirmek için uygulama klasörüne wintun.dll ekleyin.",
+  engineTunDisabledWintun:
+    "Tam PC (TUN) modunu etkinleştirmek için uygulama klasörüne wintun.dll ekleyin",
   engineSwitchingTo: "{engine} motoruna geçiliyor...",
   engineSwitching: "Motor değiştiriliyor...",
 
@@ -180,6 +201,9 @@ const tr: OverviewDict = {
   subtitleReadingStatus: "Servis durumu okunuyor...",
   subtitleServiceRequired: "Arka plan servisi gerekli",
   subtitleAdminPrompt: "Yönetici onayı istenebilir",
+  subtitleMacAdminPrompt: "Yönetici parolası istenebilir",
+  subtitleLinuxAuthPrompt: "Kimlik doğrulama istenebilir",
+  subtitleUserServiceNoAdmin: "Yönetici parolası gerekmez (Proxy)",
   subtitleActiveTunnel: "Etkin tünel: {vpn}",
   subtitleAutoResumes: "VPN kesilince otomatik devam eder",
   subtitleTunAdapter: "TUN bağdaştırıcısı",
@@ -194,6 +218,8 @@ const tr: OverviewDict = {
   btnConnecting: "Bağlanıyor...",
   btnPausing: "Duraklatılıyor...",
   btnUpdating: "Güncelleniyor...",
+  btnRepairing: "Onarılıyor...",
+  btnUninstalling: "Kaldırılıyor...",
   btnChecking: "Kontrol ediliyor...",
   btnSetUpAndConnect: "Kur ve Bağlan",
   btnPause: "Duraklat",
@@ -205,12 +231,12 @@ const tr: OverviewDict = {
   vpnYieldedDesc:
     "Etkin tam tünelli arayüz ({vpn}) algılandı. Yönlendirme çakışmalarını önlemek için koruma otomatik olarak duraklatıldı; VPN bağlantısı kesilince devam edecektir.",
   vpnWarnDesc:
-    "Birlikte çalışma ayarı uyarı modundayken etkin tam tünelli arayüz ({vpn}) algılandı. Trafik VPN tünelini atlayabilir veya çakışabilir.",
+    "VPN Uyumluluğu ayarı uyarı modundayken etkin tam tünelli arayüz ({vpn}) algılandı. Trafik VPN tünelini atlayabilir veya çakışabilir.",
   vpnRunningDesc:
     "Koruma çalışırken etkin tam tünelli arayüz ({vpn}) algılandı. Trafik VPN tünelini atlayabilir veya çakışabilir.",
   vpnIdleDesc:
     "Etkin tam tünelli arayüz ({vpn}) algılandı. Bu VPN etkinken bağlanılırsa koruma otomatik olarak öncelik verir.",
-  vpnAction: "VPN Uyumu",
+  vpnAction: "VPN Uyumluluğu",
 
   // Wintun banner
   wintunInvalidTitle: "Tam PC sürücüsü geçersiz (wintun.dll)",
@@ -232,6 +258,14 @@ const tr: OverviewDict = {
   setupRequiredTitle: "Tek seferlik kurulum gerekli",
   setupRequiredDesc:
     "Arka plan servisini kurmak ve korumayı başlatmak için yukarıdaki Kur ve Bağlan düğmesine tıklayın. Kurulumu onaylamak için yönetici istemi görünebilir.",
+  setupRequiredDescNoAdmin:
+    "Kullanıcı arka plan servisini kurmak ve korumayı başlatmak için yukarıdaki Kur ve Bağlan düğmesine tıklayın. Proxy modu için yönetici parolası gerekmez.",
+  bundleMissingTitle: "Paketli motor ikili dosyası bulunamadı",
+  bundleMissingDesc:
+    "Paketli vdpi ikili dosyası uygulama klasöründe eksik olduğu için Kur ve Bağlan kullanılamıyor. Kurtarma adımları için Kurulum sekmesini açın.",
+  repairNeededTitle: "Servis kurulumunun onarılması gerekiyor",
+  repairNeededDesc:
+    "Arka plan servis kaydı veya ikili dosya eksik görünüyor. Yapılandırmanızı kaybetmeden onarmak veya yeniden kurmak için Kurulum sekmesini açın.",
   btnOpenSettings: "Ayarları Aç",
   btnOpenInstallation: "Kuruluma Git",
 
@@ -258,11 +292,11 @@ const tr: OverviewDict = {
   connIdle: "Boşta",
   metricProtection: "Koruma",
   metricQuicBlocked: "{count} QUIC engellendi",
-  splitAll: "Tünel: Tüm uygulamalar",
-  splitExcludeOne: "Tünel: 1 hariç",
-  splitExcludeMany: "Tünel: {count} hariç",
-  splitIncludeOne: "Tünel: 1 dahil",
-  splitIncludeMany: "Tünel: {count} dahil",
+  splitAll: "Bölünmüş Tünel: Tüm uygulamalar",
+  splitExcludeOne: "Bölünmüş Tünel: 1 hariç",
+  splitExcludeMany: "Bölünmüş Tünel: {count} hariç",
+  splitIncludeOne: "Bölünmüş Tünel: 1 dahil",
+  splitIncludeMany: "Bölünmüş Tünel: {count} dahil",
 
   // Chart card
   chartAria: "Veri akışı geçmişi",
@@ -281,7 +315,7 @@ const tr: OverviewDict = {
   catEngine: "Motor",
   catDns: "DNS",
   catVpn: "VPN",
-  catSplit: "Tünel",
+  catSplit: "Bölünmüş Tünel",
   catSystem: "Sistem",
 
   // Adaptive stages
@@ -361,7 +395,7 @@ export function localizeActivityMessage(
     case "Protection paused":
       return "Koruma duraklatıldı";
     case "ISP bypass stage reset":
-      return "ISS aşma aşaması sıfırlandı";
+      return "İSS atlatma aşaması sıfırlandı";
     default:
       break;
   }
@@ -388,7 +422,7 @@ export function localizeActivityMessage(
 
   const stageMatch = /^ISP bypass stage: (.+)$/.exec(message);
   if (stageMatch) {
-    return `ISS aşma aşaması: ${formatStageLabelLocalized("tr", stageMatch[1])}`;
+    return `İSS atlatma aşaması: ${formatStageLabelLocalized("tr", stageMatch[1])}`;
   }
 
   return message;

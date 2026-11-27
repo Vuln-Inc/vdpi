@@ -12,7 +12,7 @@
     <string name="notification_settings_action">Ayarlar</string>
     <string name="widget_description">vdpi tünelini ana ekrandan açıp kapatın</string>
     <string name="widget_status_connected">Korunuyor</string>
-    <string name="widget_status_connecting">Bağlanıyor&#8230;</string>
+    <string name="widget_status_connecting">Bağlanıyor...</string>
     <string name="widget_status_off">Kapalı</string>
     <string name="widget_status_error">Dikkat gerekiyor</string>
     <string name="widget_action_connect">Bağlan</string>

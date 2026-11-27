@@ -1,10 +1,12 @@
 package com.vulninc.vdpi.ui
 
 import android.app.Application
+import android.app.LocaleManager
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.LocaleList
 import android.os.SystemClock
 import android.widget.Toast
 import androidx.compose.ui.graphics.ImageBitmap
@@ -15,6 +17,7 @@ import androidx.lifecycle.viewModelScope
 import com.vulninc.vdpi.BuildConfig
 import com.vulninc.vdpi.data.AppLanguage
 import com.vulninc.vdpi.data.ReleaseUpdateInfo
+import com.vulninc.vdpi.data.SettingsImportException
 import com.vulninc.vdpi.data.SettingsRepository
 import com.vulninc.vdpi.data.SplitTunnelMode
 import com.vulninc.vdpi.data.ThemePreference
@@ -23,6 +26,7 @@ import com.vulninc.vdpi.data.VdpiSettings
 import com.vulninc.vdpi.engine.DesyncMode
 import com.vulninc.vdpi.engine.DoctorReport
 import com.vulninc.vdpi.engine.NativeEngine
+import com.vulninc.vdpi.ui.i18n.EnglishStrings
 import com.vulninc.vdpi.ui.i18n.VdpiStrings
 import com.vulninc.vdpi.ui.screens.isEffectiveDohTarget
 import com.vulninc.vdpi.util.formatStageLabel
@@ -183,22 +187,29 @@ fun buildDiagnosticsReport(
     doctorReport: DoctorReport?,
     androidRelease: String = Build.VERSION.RELEASE ?: "unknown",
     androidSdk: Int = Build.VERSION.SDK_INT,
+    strings: VdpiStrings = EnglishStrings,
 ): String = buildString {
     val appVerLabel = if (appVersion.startsWith("v", ignoreCase = true)) appVersion else "v$appVersion"
     val engineVerLabel = if (engineVersion.startsWith("v", ignoreCase = true)) engineVersion else "v$engineVersion"
-    appendLine("vdpi Android Diagnostics Report")
-    appendLine("App Version: $appVerLabel (Engine: $engineVerLabel)")
+    appendLine(strings.reportHeader)
+    appendLine("${strings.reportAppVersionLabel}: $appVerLabel (${strings.reportEngineLabel}: $engineVerLabel)")
     appendLine("Android: $androidRelease (API $androidSdk)")
-    appendLine("Tunnel State: ${runtime.phase.name}")
+    appendLine("${strings.reportTunnelStateLabel}: ${strings.reportTunnelPhase(runtime.phase)}")
     if (runtime.phase == TunnelPhase.CONNECTED) {
         val snap = runtime.telemetry
-        appendLine("Active Stage: Stage ${snap.stageNumber.coerceAtLeast(1)} (${formatStageLabel(snap.stageLabel)})")
-        appendLine("Uptime: ${formatUptime(snap.uptimeSecs)}")
-        appendLine("Dropped Packets: ${snap.droppedPackets.coerceAtLeast(0L)}")
+        appendLine(
+            "${strings.reportActiveStageLabel}: ${strings.stageWord} ${snap.stageNumber.coerceAtLeast(1)} " +
+                "(${formatStageLabel(snap.stageLabel, strings)})",
+        )
+        appendLine("${strings.metricUptime}: ${formatUptime(snap.uptimeSecs)}")
+        appendLine("${strings.metricDroppedPackets}: ${snap.droppedPackets.coerceAtLeast(0L)}")
     } else if (runtime.telemetry.droppedPackets > 0L) {
-        appendLine("Dropped Packets: ${runtime.telemetry.droppedPackets}")
+        appendLine("${strings.metricDroppedPackets}: ${runtime.telemetry.droppedPackets}")
     }
-    appendLine("Desync Mode: ${settings.desyncMode.label} (${settings.desyncMode.wireName}), chunk=${settings.chunkSize.coerceIn(1, 64)}")
+    appendLine(
+        "${strings.reportDesyncModeLabel}: ${strings.desyncModeLabel(settings.desyncMode)} " +
+            "(${settings.desyncMode.wireName}), ${strings.reportChunkParam}=${settings.chunkSize.coerceIn(1, 64)}",
+    )
     val effectiveDnsAddr = if (runtime.phase == TunnelPhase.CONNECTED) {
         runtime.telemetry.dnsAddr.trim().ifBlank { settings.dnsAddr }
     } else {
@@ -210,27 +221,34 @@ fun buildDiagnosticsReport(
         isEffectiveDohTarget(effectiveDnsAddr, settings.enableDoh)
     }
     appendLine(
-        "DNS: ${redactDnsForReport(effectiveDnsAddr)} " +
-            "(DoH: ${if (effectiveDohEnabled) "enabled" else "disabled"}, " +
-            "IPv4-only: ${if (settings.ipv4Only) "yes" else "no"})",
+        "${strings.metricDns}: ${redactDnsForReport(effectiveDnsAddr)} " +
+            "(DoH: ${if (effectiveDohEnabled) strings.reportStateEnabled else strings.reportStateDisabled}, " +
+            "${strings.reportIpv4OnlyLabel}: ${if (settings.ipv4Only) strings.reportYes else strings.reportNo})",
     )
-    appendLine("QUIC Blocking: ${if (settings.blockQuic) "enabled" else "disabled"}")
-    appendLine("Bypass Domains: ${settings.bypassDomains.size} configured (redacted)")
-    appendLine("Split Tunnel: ${settings.splitTunnelMode.label} (${settings.splitPackages.size} apps, redacted)")
+    appendLine(
+        "${strings.metricQuicBlocking}: " +
+            if (settings.blockQuic) strings.reportStateEnabled else strings.reportStateDisabled,
+    )
+    appendLine("${strings.reportBypassDomainsLabel}: ${strings.reportBypassDomainsValue(settings.bypassDomains.size)}")
+    appendLine(
+        "${strings.metricSplitTunnel}: " +
+            strings.reportSplitTunnelValue(settings.splitTunnelMode, settings.splitPackages.size),
+    )
     appendLine()
     if (doctorReport == null) {
-        appendLine("Diagnostic Probes: not run yet")
+        appendLine("${strings.reportProbesLabel}: ${strings.reportProbesNotRun}")
     } else {
-        appendLine("Diagnostic Probes: ${if (doctorReport.ok) "PASS" else "FAIL"} (${doctorReport.checks.size} checks)")
+        appendLine(strings.reportProbesSummary(doctorReport.ok, doctorReport.checks.size))
         doctorReport.checks.forEach { check ->
-            val status = if (check.passed) "PASS" else "FAIL"
+            val status = if (check.passed) strings.reportBadgePass else strings.reportBadgeFail
+            val checkName = strings.doctorCheckName(check.name)
             val safeTarget = redactUrlsForReport(check.target)
             val detailSuffix = redactUrlsForReport(check.detail)
                 .trim()
                 .takeIf { it.isNotEmpty() }
                 ?.let { " - $it" }
                 .orEmpty()
-            appendLine("- [$status] ${check.name} ($safeTarget): ${check.latencyMs} ms$detailSuffix")
+            appendLine("- [$status] $checkName ($safeTarget): ${check.latencyMs} ms$detailSuffix")
         }
     }
 }.trimEnd()
@@ -261,7 +279,9 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
     val settings: StateFlow<VdpiSettings> = repo.settingsFlow.stateIn(
         scope = viewModelScope,
         started = SharingStarted.Eagerly,
-        initialValue = VdpiSettings(),
+        initialValue = VdpiSettings(
+            language = SettingsRepository.readLanguageSync(application),
+        ),
     )
 
     val tunnelState: StateFlow<TunnelRuntimeSnapshot> = TunnelRuntimeState.state
@@ -330,6 +350,10 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
     val userMessages: SharedFlow<String> = _userMessages.asSharedFlow()
 
     init {
+        val initialLanguage = SettingsRepository.readLanguageSync(application)
+        if (initialLanguage != AppLanguage.SYSTEM) {
+            syncApplicationLocales(initialLanguage)
+        }
         loadInstalledApps()
         observeThroughput()
         checkForUpdates(manual = false)
@@ -588,10 +612,11 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
             }
             if (parsed.isFailure) {
                 val strings = currentStrings()
-                val reason = parsed.exceptionOrNull()?.message
-                    ?.let(::redactUrlsForReport)
-                    ?.takeIf { it.isNotBlank() }
-                    ?: strings.importInvalidJson
+                val err = parsed.exceptionOrNull()
+                val reason = when (err) {
+                    is SettingsImportException -> strings.importErrorReason(err)
+                    else -> strings.importInvalidJson
+                }
                 emitStatusFeedback(strings.importFailed(reason))
                 return@launch
             }
@@ -625,6 +650,7 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             if (languageChanged) {
+                syncApplicationLocales(imported.language)
                 VdpiVpnService.refreshLocalizedSurfaces(getApplication())
             }
 
@@ -644,6 +670,7 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
         settings = settings.value,
         runtime = tunnelState.value,
         doctorReport = doctorState.value.report,
+        strings = currentStrings(),
     )
 
     private suspend fun emitStatusFeedback(message: String) {
@@ -850,7 +877,24 @@ class VdpiViewModel(application: Application) : AndroidViewModel(application) {
     fun setLanguage(language: AppLanguage) = viewModelScope.launch {
         if (repo.current().language == language) return@launch
         repo.setLanguage(language)
+        syncApplicationLocales(language)
         VdpiVpnService.refreshLocalizedSurfaces(getApplication())
+    }
+
+    private fun syncApplicationLocales(language: AppLanguage) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        runCatching {
+            val localeManager = getApplication<Application>().getSystemService(LocaleManager::class.java)
+                ?: return
+            val targetLocales = when (language) {
+                AppLanguage.SYSTEM -> LocaleList.getEmptyLocaleList()
+                AppLanguage.EN -> LocaleList.forLanguageTags("en")
+                AppLanguage.TR -> LocaleList.forLanguageTags("tr")
+            }
+            if (localeManager.applicationLocales != targetLocales) {
+                localeManager.applicationLocales = targetLocales
+            }
+        }
     }
 
     private fun currentStrings(): VdpiStrings =

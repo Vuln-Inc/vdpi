@@ -1,0 +1,7 @@
+/* App Intents */
+"Connect vdpi" = "vdpi Bağlan";
+"Starts the local vdpi anti-DPI tunnel." = "Yerel vdpi anti-DPI tünelini başlatır.";
+"Disconnect vdpi" = "vdpi Bağlantısını Kes";
+"Stops the local vdpi anti-DPI tunnel." = "Yerel vdpi anti-DPI tünelini durdurur.";
+"Toggle vdpi" = "vdpi Aç/Kapat";
+"Turns the local vdpi anti-DPI tunnel on or off." = "Yerel vdpi anti-DPI tünelini açar veya kapatır.";

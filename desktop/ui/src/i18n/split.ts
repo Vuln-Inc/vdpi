@@ -29,6 +29,10 @@ const en = {
       "Per-app split tunneling requires Full-PC (TUN) mode",
     proxyBannerDesc:
       "You are currently in Proxy mode. You can still edit your app list here, and rules will apply once you switch to Full-PC (TUN) mode.",
+    proxyBannerDescWintunMissing:
+      "You are currently in Proxy mode. You can still edit your app list here, but Full-PC (TUN) mode requires wintun.dll in the app folder on Windows.",
+    proxyBannerWintunMissingTitle:
+      "wintun.dll is required before switching to Full-PC (TUN) mode",
     proxyBannerSwitching: "Switching...",
     proxyBannerSwitch: "Switch to Full-PC (TUN)",
     notInstalledBannerTitle: "Service not installed yet",
@@ -148,6 +152,11 @@ const en = {
     presetValorantLabel: "Valorant & Riot",
     presetValorantDesc:
       "Valorant, Riot Client, Vanguard, and League of Legends",
+    presetLeagueLabel: "League of Legends",
+    presetLeagueDesc: "Riot Client and League of Legends on macOS",
+    presetLinuxGamingLabel: "Linux Gaming",
+    presetLinuxGamingDesc:
+      "Heroic Games Launcher, Lutris, and Prism Launcher (native and Flatpak)",
     presetSteamLabel: "Steam",
     presetSteamDesc: "Steam client, web helper, and in-game overlay",
     presetBrowsersLabel: "Web Browsers",
@@ -161,14 +170,10 @@ const en = {
     badgeRunning: "Running",
     companionBadgeOne: "+{count} companion",
     companionBadgeMany: "+{count} companions",
-    companionAriaHideOne:
-      "Hide {count} companion process matched with {name}",
-    companionAriaHideMany:
-      "Hide {count} companion processes matched with {name}",
-    companionAriaShowOne:
-      "Show {count} companion process matched with {name}",
-    companionAriaShowMany:
-      "Show {count} companion processes matched with {name}",
+    companionAriaHideOne: "+{count} companion for {name}, hide details",
+    companionAriaHideMany: "+{count} companions for {name}, hide details",
+    companionAriaShowOne: "+{count} companion for {name}, show details",
+    companionAriaShowMany: "+{count} companions for {name}, show details",
     companionRegionAria: "{name} companion processes",
     companionNote: "Matched together with {name}:",
 };
@@ -203,6 +208,10 @@ const tr: Record<SplitStringKey, string> = {
       "Uygulama bazlı bölünmüş tünel için Tam PC (TUN) modu gerekir",
     proxyBannerDesc:
       "Şu anda Proxy modundasınız. Uygulama listenizi buradan düzenleyebilirsiniz; kurallar Tam PC (TUN) moduna geçtiğinizde uygulanır.",
+    proxyBannerDescWintunMissing:
+      "Şu anda Proxy modundasınız. Uygulama listenizi buradan düzenleyebilirsiniz, ancak Windows'ta Tam PC (TUN) modu için uygulama klasöründe wintun.dll gerekir.",
+    proxyBannerWintunMissingTitle:
+      "Tam PC (TUN) moduna geçmek için önce wintun.dll gerekir",
     proxyBannerSwitching: "Geçiliyor...",
     proxyBannerSwitch: "Tam PC (TUN) Moduna Geç",
     notInstalledBannerTitle: "Servis henüz kurulmadı",
@@ -215,11 +224,11 @@ const tr: Record<SplitStringKey, string> = {
     saveFailed: "Bölünmüş tünel ayarları kaydedilemedi.",
     saveCancelled: "Kaydetme iptal edildi.",
     saveEmptyIncludeRestart:
-      "Yalnızca Seçilenler modu 0 uygulama ile kaydedildi - hiçbir uygulama korunmayacak (uygulamak için hizmeti yeniden başlatın).",
+      "Yalnızca Seçilenler modu 0 uygulama ile kaydedildi - hiçbir uygulama korunmayacak (uygulamak için servisi yeniden başlatın).",
     saveEmptyInclude:
       "Yalnızca Seçilenler modu 0 uygulama ile kaydedildi - en az bir uygulama ekleyene kadar hiçbir uygulama korunmayacak.",
     saveSuccessRestart:
-      "Bölünmüş tünel ayarları kaydedildi (uygulamak için hizmeti yeniden başlatın).",
+      "Bölünmüş tünel ayarları kaydedildi (uygulamak için servisi yeniden başlatın).",
     saveSuccess: "Bölünmüş tünel ayarları kaydedildi ve uygulandı.",
     sectionRoutingMode: "Yönlendirme Modu",
     ariaModeGroup: "Bölünmüş tünel modu",
@@ -323,6 +332,11 @@ const tr: Record<SplitStringKey, string> = {
     presetValorantLabel: "Valorant & Riot",
     presetValorantDesc:
       "Valorant, Riot Client, Vanguard ve League of Legends",
+    presetLeagueLabel: "League of Legends",
+    presetLeagueDesc: "macOS'ta Riot Client ve League of Legends",
+    presetLinuxGamingLabel: "Linux Oyunları",
+    presetLinuxGamingDesc:
+      "Heroic Games Launcher, Lutris ve Prism Launcher (yerel ve Flatpak)",
     presetSteamLabel: "Steam",
     presetSteamDesc: "Steam istemcisi, web yardımcısı ve oyun içi arayüz",
     presetBrowsersLabel: "Web Tarayıcıları",
@@ -335,14 +349,10 @@ const tr: Record<SplitStringKey, string> = {
     badgeRunning: "Çalışıyor",
     companionBadgeOne: "+{count} yardımcı",
     companionBadgeMany: "+{count} yardımcı",
-    companionAriaHideOne:
-      "{name} ile eşleşen {count} yardımcı işlemi gizle",
-    companionAriaHideMany:
-      "{name} ile eşleşen {count} yardımcı işlemi gizle",
-    companionAriaShowOne:
-      "{name} ile eşleşen {count} yardımcı işlemi göster",
-    companionAriaShowMany:
-      "{name} ile eşleşen {count} yardımcı işlemi göster",
+    companionAriaHideOne: "{name} için +{count} yardımcı, ayrıntıları gizle",
+    companionAriaHideMany: "{name} için +{count} yardımcı, ayrıntıları gizle",
+    companionAriaShowOne: "{name} için +{count} yardımcı, ayrıntıları göster",
+    companionAriaShowMany: "{name} için +{count} yardımcı, ayrıntıları göster",
     companionRegionAria: "{name} yardımcı işlemleri",
     companionNote: "{name} ile birlikte eşleşir:",
 };
@@ -361,6 +371,14 @@ const PRESET_KEY_MAP: Record<
   discord: { label: "presetDiscordLabel", desc: "presetDiscordDesc" },
   roblox: { label: "presetRobloxLabel", desc: "presetRobloxDesc" },
   "valorant-riot": { label: "presetValorantLabel", desc: "presetValorantDesc" },
+  "league-of-legends": {
+    label: "presetLeagueLabel",
+    desc: "presetLeagueDesc",
+  },
+  "linux-gaming": {
+    label: "presetLinuxGamingLabel",
+    desc: "presetLinuxGamingDesc",
+  },
   steam: { label: "presetSteamLabel", desc: "presetSteamDesc" },
   "web-browsers": { label: "presetBrowsersLabel", desc: "presetBrowsersDesc" },
   "obs-studio": { label: "presetObsLabel", desc: "presetObsDesc" },

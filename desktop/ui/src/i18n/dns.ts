@@ -166,7 +166,7 @@ const tr: Record<DnsStringKey, string> = {
     loading: "DNS ve kural ayarları yükleniyor...",
     subtitle:
       "Üst DNS çözümlemeyi, protokol korumalarını, VPN uyumluluğunu ve alan adı yönlendirme kurallarını yapılandırın.",
-    liveActive: "Aktif",
+    liveActive: "Etkin",
     liveConfigured: "Yapılandırıldı",
     errorBannerTitle: "DNS ve kural ayarları kaydedilemedi",
     notInstalledBannerTitle: "Servis henüz kurulmadı",
@@ -179,7 +179,7 @@ const tr: Record<DnsStringKey, string> = {
     saveCancelled: "DNS ve kural değişiklikleri iptal edildi.",
     saveFailed: "DNS ve kural ayarları kaydedilemedi.",
     saveSuccessRestart:
-      "DNS ve kural ayarları kaydedildi (uygulamak için hizmeti yeniden başlatın).",
+      "DNS ve kural ayarları kaydedildi (uygulamak için servisi yeniden başlatın).",
     saveSuccess: "DNS ve kural ayarları kaydedildi ve uygulandı.",
     dirtyDnsResolver: "DNS sunucusu",
     dirtyEncryptedDns: "Şifreli DNS",
@@ -239,7 +239,7 @@ const tr: Record<DnsStringKey, string> = {
     dohDescCustomUrlPrefix: "Özel bir ",
     dohDescCustomUrlSuffix:
       " DoH URL'si yapılandırıldığı için otomatik kilitli. Düz UDP DNS için yalın IP sunucusuna geçin.",
-    dohDescBareIpOnPart1: "Özel yalın IP'ler (örneğin ",
+    dohDescBareIpOnPart1: "Özel yalın IP'ler (örn. ",
     dohDescBareIpOnPart2: " veya ",
     dohDescBareIpOnPart3:
       ") IP-SAN DoH sertifikası sunmaz; bu nedenle anahtar açık olsa bile vdpi önce UDP üzerinden sorgular. Özel sağlayıcıyla şifreli DoH için yukarıya bir ",
@@ -295,7 +295,7 @@ const tr: Record<DnsStringKey, string> = {
     includeLabel: "Dahil Edilen Alan Adları",
     includeDesc:
       "İzin listesi filtresi: kayıt eklemek vdpi'yi yalnızca eşleşen alan adlarıyla sınırlar (.gov.tr gibi yerleşik hariç tutmaları geçersiz kılar); diğer tüm trafik doğrudan bağlanır. Hariç Tut kuralları yine önceliklidir.",
-    includePlaceholder: "örn. hizmet.gov.tr veya *.ornek.org",
+    includePlaceholder: "örn. servis.gov.tr veya *.ornek.org",
     includeEmpty: "İzin listesi için alan adı yapılandırılmadı.",
     ariaUnsavedRegion: "Kaydedilmemiş DNS ve kural değişiklikleri",
     unsavedTitle: "Kaydedilmemiş Değişiklikler",

@@ -103,6 +103,7 @@ pub enum ActionErrorCodeDto {
     VersionUnknown,
     BundledCliMissing,
     WintunMissing,
+    WintunInvalid,
     AlreadyUpToDate,
 }
 

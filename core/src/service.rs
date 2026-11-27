@@ -55,9 +55,7 @@ fn runtime_state_write_path() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         if crate::platform::windows::is_running_as_service() {
-            let base = std::env::var_os("ProgramData")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+            let base = crate::platform::windows::known_program_data_dir();
             return Some(base.join("vdpi").join("state.json"));
         }
         if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
@@ -85,9 +83,7 @@ fn runtime_state_read_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     #[cfg(target_os = "windows")]
     {
-        let pd = std::env::var_os("ProgramData")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+        let pd = crate::platform::windows::known_program_data_dir();
         paths.push(pd.join("vdpi").join("state.json"));
         if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
             paths.push(PathBuf::from(local_appdata).join("vdpi").join("state.json"));
@@ -1052,11 +1048,7 @@ mod win_fs_hardening {
     }
 
     pub(super) fn is_under_programdata_vdpi(dir: &Path) -> bool {
-        let pd = std::env::var_os("ProgramData")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-            .join("vdpi");
+        let pd = crate::platform::windows::known_program_data_dir().join("vdpi");
         is_path_under_dir_ascii_ci(dir, &pd)
     }
 }
@@ -1293,7 +1285,7 @@ fn parse_nonzero_sudo_uid(raw: Option<&std::ffi::OsStr>) -> Option<u32> {
         .filter(|&uid| uid != 0)
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UnixTargetUser {
     uid: u32,
@@ -1301,6 +1293,57 @@ struct UnixTargetUser {
     #[cfg(target_os = "linux")]
     username: Option<String>,
     home_dir: PathBuf,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn sanitize_sudo_username(raw: Option<&str>) -> Option<&str> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "root" && !s.contains('/') && !s.contains('\0'))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn resolve_sudo_invoking_user_with<FByUid, FByName>(
+    sudo_uid: Option<&std::ffi::OsStr>,
+    sudo_user: Option<&str>,
+    pkexec_uid: Option<&std::ffi::OsStr>,
+    doas_user: Option<&str>,
+    real_uid: u32,
+    lookup_by_uid: FByUid,
+    lookup_by_name: FByName,
+) -> Option<UnixTargetUser>
+where
+    FByUid: Fn(u32) -> Option<UnixTargetUser>,
+    FByName: Fn(&str) -> Option<UnixTargetUser>,
+{
+    if let Some(uid) = parse_nonzero_sudo_uid(sudo_uid) {
+        if let Some(user) = lookup_by_uid(uid).filter(|u| u.uid != 0) {
+            return Some(user);
+        }
+    }
+    if let Some(user_name) = sanitize_sudo_username(sudo_user) {
+        if let Some(user) = lookup_by_name(user_name).filter(|u| u.uid != 0) {
+            return Some(user);
+        }
+    }
+    if let Some(uid) = parse_nonzero_sudo_uid(pkexec_uid) {
+        if let Some(user) = lookup_by_uid(uid).filter(|u| u.uid != 0) {
+            return Some(user);
+        }
+    }
+    if let Some(user_name) = sanitize_sudo_username(doas_user) {
+        if let Some(user) = lookup_by_name(user_name).filter(|u| u.uid != 0) {
+            return Some(user);
+        }
+    }
+    // Fallback for macOS `osascript ... with administrator privileges` (and setuid
+    // elevation paths) where euid == 0 and SUDO_*/PKEXEC_*/DOAS_* are absent while
+    // `getuid()` still identifies the invoking non-root user.
+    if real_uid != 0 {
+        if let Some(user) = lookup_by_uid(real_uid).filter(|u| u.uid != 0) {
+            return Some(user);
+        }
+    }
+    None
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1414,95 +1457,21 @@ fn resolve_sudo_invoking_user() -> Option<UnixTargetUser> {
     if !is_unix_root() {
         return None;
     }
-    let fallback_home = std::env::var_os("HOME")
-        .filter(|v| {
-            !v.is_empty()
-                && Path::new(v) != Path::new("/root")
-                && Path::new(v) != Path::new("/var/root")
-        })
-        .map(PathBuf::from);
-    if let Some(sudo_uid) = parse_nonzero_sudo_uid(std::env::var_os("SUDO_UID").as_deref()) {
-        if let Some(user) = lookup_unix_user_by_uid(sudo_uid) {
-            return Some(user);
-        }
-        if let Some(home) = fallback_home.clone() {
-            let gid =
-                parse_nonzero_sudo_uid(std::env::var_os("SUDO_GID").as_deref()).unwrap_or(sudo_uid);
-            #[cfg(target_os = "linux")]
-            let username = std::env::var("SUDO_USER")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty() && s != "root" && !s.contains('/') && !s.contains('\0'));
-            return Some(UnixTargetUser {
-                uid: sudo_uid,
-                gid,
-                #[cfg(target_os = "linux")]
-                username,
-                home_dir: home,
-            });
-        }
-    }
-    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
-        let trimmed = sudo_user.trim();
-        if !trimmed.is_empty()
-            && trimmed != "root"
-            && !trimmed.contains('/')
-            && !trimmed.contains('\0')
-        {
-            if let Some(user) = lookup_unix_user_by_name(trimmed).filter(|u| u.uid != 0) {
-                return Some(user);
-            }
-        }
-    }
-    if let Some(pkexec_uid) = parse_nonzero_sudo_uid(std::env::var_os("PKEXEC_UID").as_deref()) {
-        if let Some(user) = lookup_unix_user_by_uid(pkexec_uid) {
-            return Some(user);
-        }
-        if let Some(home) = fallback_home.clone() {
-            return Some(UnixTargetUser {
-                uid: pkexec_uid,
-                gid: pkexec_uid,
-                #[cfg(target_os = "linux")]
-                username: None,
-                home_dir: home,
-            });
-        }
-    }
-    if let Ok(doas_user) = std::env::var("DOAS_USER") {
-        let trimmed = doas_user.trim();
-        if !trimmed.is_empty()
-            && trimmed != "root"
-            && !trimmed.contains('/')
-            && !trimmed.contains('\0')
-        {
-            if let Some(user) = lookup_unix_user_by_name(trimmed).filter(|u| u.uid != 0) {
-                return Some(user);
-            }
-        }
-    }
-    // Fallback for macOS `osascript ... with administrator privileges` (and setuid
-    // elevation paths) where euid == 0 and SUDO_*/PKEXEC_*/DOAS_* are absent while
-    // `getuid()` still identifies the invoking non-root user.
+    let sudo_uid = std::env::var_os("SUDO_UID");
+    let sudo_user = std::env::var("SUDO_USER").ok();
+    let pkexec_uid = std::env::var_os("PKEXEC_UID");
+    let doas_user = std::env::var("DOAS_USER").ok();
     // SAFETY: `getuid(2)` is always safe to call and never fails.
-    let ruid = unsafe { libc::getuid() };
-    if ruid != 0 {
-        if let Some(user) = lookup_unix_user_by_uid(ruid) {
-            return Some(user);
-        }
-        if let Some(home) = fallback_home {
-            // SAFETY: `getgid(2)` is always safe to call and never fails.
-            let rgid = unsafe { libc::getgid() };
-            let gid = if rgid != 0 { rgid } else { ruid };
-            return Some(UnixTargetUser {
-                uid: ruid,
-                gid,
-                #[cfg(target_os = "linux")]
-                username: None,
-                home_dir: home,
-            });
-        }
-    }
-    None
+    let real_uid = unsafe { libc::getuid() };
+    resolve_sudo_invoking_user_with(
+        sudo_uid.as_deref(),
+        sudo_user.as_deref(),
+        pkexec_uid.as_deref(),
+        doas_user.as_deref(),
+        real_uid,
+        lookup_unix_user_by_uid,
+        lookup_unix_user_by_name,
+    )
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1797,13 +1766,114 @@ pub fn home_dir() -> Result<PathBuf> {
     bail!("neither HOME nor USERPROFILE environment variable is set")
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn is_valid_windows_program_files_path_str(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.contains('\0')
+        || trimmed.starts_with(r"\\")
+        || trimmed.starts_with("//")
+    {
+        return false;
+    }
+    let bytes = trimmed.as_bytes();
+    if bytes.len() < 3
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || !matches!(bytes[2], b'\\' | b'/')
+    {
+        return false;
+    }
+    !trimmed.split(['\\', '/']).any(|seg| seg == "..")
+}
+
+#[cfg(target_os = "windows")]
+fn windows_program_files_dir() -> Result<PathBuf> {
+    use std::ffi::{c_void, OsString};
+    use std::os::windows::ffi::OsStringExt;
+
+    #[repr(C)]
+    struct KnownFolderGuid {
+        data1: u32,
+        data2: u16,
+        data3: u16,
+        data4: [u8; 8],
+    }
+
+    // FOLDERID_ProgramFiles = {905E63B6-C1BF-494E-B29C-65B732D3D21A}
+    const FOLDERID_PROGRAM_FILES: KnownFolderGuid = KnownFolderGuid {
+        data1: 0x905e_63b6,
+        data2: 0xc1bf,
+        data3: 0x494e,
+        data4: [0xb2, 0x9c, 0x65, 0xb7, 0x32, 0xd3, 0xd2, 0x1a],
+    };
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHGetKnownFolderPath(
+            rfid: *const KnownFolderGuid,
+            dw_flags: u32,
+            h_token: *mut c_void,
+            ppsz_path: *mut *mut u16,
+        ) -> i32;
+    }
+
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoTaskMemFree(pv: *mut c_void);
+    }
+
+    struct CoTaskMemGuard(*mut u16);
+
+    impl Drop for CoTaskMemGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` was allocated by `SHGetKnownFolderPath` and must be freed via `CoTaskMemFree`.
+                unsafe {
+                    CoTaskMemFree(self.0.cast::<c_void>());
+                }
+            }
+        }
+    }
+
+    let mut raw_ptr: *mut u16 = std::ptr::null_mut();
+    // SAFETY: `FOLDERID_PROGRAM_FILES` is a valid GUID and `raw_ptr` is a valid out-pointer.
+    let hr = unsafe {
+        SHGetKnownFolderPath(
+            &FOLDERID_PROGRAM_FILES,
+            0,
+            std::ptr::null_mut(),
+            &mut raw_ptr,
+        )
+    };
+    let _guard = CoTaskMemGuard(raw_ptr);
+    if hr == 0 && !raw_ptr.is_null() {
+        let wide_slice = unsafe {
+            let mut len = 0usize;
+            while *raw_ptr.add(len) != 0 {
+                len += 1;
+            }
+            std::slice::from_raw_parts(raw_ptr, len)
+        };
+        let candidate = PathBuf::from(OsString::from_wide(wide_slice));
+        if candidate
+            .to_str()
+            .is_some_and(is_valid_windows_program_files_path_str)
+            && !win_fs_hardening::is_reparse_point(&candidate)
+        {
+            return Ok(candidate);
+        }
+    }
+
+    let fallback = PathBuf::from(r"C:\Program Files");
+    win_fs_hardening::reject_reparse_point(&fallback)?;
+    Ok(fallback)
+}
+
 pub fn vdpi_root_dir() -> Result<PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        if let Some(program_files) = std::env::var_os("ProgramFiles") {
-            return Ok(PathBuf::from(program_files).join("vdpi"));
-        }
-        Ok(PathBuf::from(r"C:\Program Files").join("vdpi"))
+        Ok(windows_program_files_dir()?.join("vdpi"))
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -2515,17 +2585,31 @@ pub fn probe_binary_version(path: &Path) -> Option<String> {
         return None;
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        if win_fs_hardening::reject_reparse_point(path).is_err() || !path.is_file() {
+            return None;
+        }
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if win_fs_hardening::reject_reparse_point(parent).is_err() {
+                return None;
+            }
+        }
+    }
+
     let mut cmd = Command::new(path);
     cmd.arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
 
-    #[cfg(windows)]
+    #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
+        let sys32 = windows_system32_dir()?;
+        cmd.current_dir(sys32);
     }
 
     let mut child = cmd.spawn().ok()?;
@@ -2592,22 +2676,64 @@ pub fn launch_daemon_plist_path() -> PathBuf {
     PathBuf::from(LAUNCH_DAEMON_PLIST_PATH)
 }
 
+fn resolve_systemd_user_config_base(
+    home: &Path,
+    xdg_config_home: Option<&std::ffi::OsStr>,
+    sudo_invoker: bool,
+) -> PathBuf {
+    use std::path::Component;
+
+    let is_abs = |p: &Path| {
+        if cfg!(unix) {
+            p.is_absolute()
+        } else {
+            p.is_absolute() || p.has_root()
+        }
+    };
+
+    xdg_config_home
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| {
+            is_abs(p)
+                && !p.components().any(|c| matches!(c, Component::ParentDir))
+                && (!sudo_invoker
+                    || (p.starts_with(home)
+                        && p.strip_prefix(home).is_ok_and(|rel| {
+                            !rel.components().any(|c| matches!(c, Component::ParentDir))
+                        })))
+        })
+        .unwrap_or_else(|| home.join(".config"))
+}
+
 pub fn systemd_user_unit_path() -> Result<PathBuf> {
+    use std::path::Component;
+
     let home = home_dir().unwrap_or_else(|_| PathBuf::from("."));
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let sudo_invoker = resolve_sudo_invoking_user().is_some();
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let sudo_invoker = false;
 
-    let config_base = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .filter(|p| !sudo_invoker || p.starts_with(&home))
-        .unwrap_or_else(|| home.join(".config"));
-    Ok(config_base
+    let config_base = resolve_systemd_user_config_base(
+        &home,
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        sudo_invoker,
+    );
+    let unit_path = config_base
         .join("systemd")
         .join("user")
-        .join(SYSTEMD_UNIT_NAME))
+        .join(SYSTEMD_UNIT_NAME);
+    if unit_path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        bail!(
+            "refusing to use systemd user unit path containing '..': {}",
+            unit_path.display()
+        );
+    }
+    Ok(unit_path)
 }
 
 pub fn systemd_system_unit_path() -> PathBuf {
@@ -3329,17 +3455,56 @@ pub fn install_service(cfg: &RuntimeConfig) -> Result<()> {
 /// Quiet variant of [`install_service`] for interactive TUI callers that must not write
 /// status lines to stdout.
 pub fn install_service_quiet(cfg: &RuntimeConfig) -> Result<()> {
-    install_service_with_options_impl(cfg, false, false)
+    install_service_with_options_impl(cfg, false, None, false)
 }
 
 pub fn install_service_with_options(cfg: &RuntimeConfig, upgrade: bool) -> Result<()> {
-    install_service_with_options_impl(cfg, upgrade, true)
+    install_service_with_options_impl(cfg, upgrade, None, true)
+}
+
+/// Installs or upgrades the background service while preserving an explicit
+/// `--proxy` / `--tun` override passed on the CLI (including across `--upgrade`
+/// and UAC/sudo elevation).
+pub fn install_service_with_engine_override(
+    cfg: &RuntimeConfig,
+    upgrade: bool,
+    explicit_engine: Option<EngineMode>,
+) -> Result<()> {
+    install_service_with_options_impl(cfg, upgrade, explicit_engine, true)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
+fn preserve_existing_language(
+    target_cfg: &mut FileConfig,
+    primary_path: &Path,
+    primary_service_mode: bool,
+    fallback_user_path: Option<&Path>,
+) {
+    if target_cfg.language.is_some() {
+        return;
+    }
+    if let Some(lang) = config_file::load_file_config(Some(primary_path), primary_service_mode)
+        .ok()
+        .and_then(|(_, fc)| fc.language)
+    {
+        target_cfg.language = Some(lang);
+        return;
+    }
+    if let Some(user_path) = fallback_user_path.filter(|p| *p != primary_path) {
+        if let Some(lang) = config_file::load_file_config(Some(user_path), false)
+            .ok()
+            .and_then(|(_, fc)| fc.language)
+        {
+            target_cfg.language = Some(lang);
+        }
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn install_service_with_options_impl(
     _cfg: &RuntimeConfig,
     _upgrade: bool,
+    _explicit_engine: Option<EngineMode>,
     _verbose: bool,
 ) -> Result<()> {
     bail!(
@@ -3486,9 +3651,9 @@ fn is_retryable_windows_rename_error(err: &std::io::Error) -> bool {
 
 #[cfg(target_os = "windows")]
 fn rename_with_windows_retry(from: &Path, to: &Path) -> std::io::Result<()> {
-    // Up to 8 attempts with short exponential backoff (25ms..200ms) so transient
-    // Windows Defender / antivirus real-time scans never fail install/upgrade.
-    const BACKOFF_MS: [u64; 7] = [25, 40, 60, 90, 120, 160, 200];
+    // Up to 9 attempts (~3.55s total backoff) so transient Windows Defender /
+    // antivirus real-time scans never fail install/upgrade or rollback.
+    const BACKOFF_MS: [u64; 8] = [50, 100, 150, 250, 400, 600, 900, 1100];
 
     for delay_ms in BACKOFF_MS.into_iter().chain(std::iter::once(0)) {
         match fs::rename(from, to) {
@@ -3511,18 +3676,44 @@ struct ReplacedFileBackup {
 #[cfg(target_os = "windows")]
 impl ReplacedFileBackup {
     fn commit(self) {
-        let _ = fs::remove_file(self.backup);
+        if let Err(err) = fs::remove_file(&self.backup) {
+            tracing::warn!(
+                backup = %self.backup.display(),
+                error = %err,
+                "failed to remove obsolete upgrade backup file"
+            );
+        }
     }
 
-    fn rollback(self) {
-        if self.target.exists() && fs::remove_file(&self.target).is_err() {
-            let displaced = self
-                .target
-                .with_extension(format!("failed.{}", std::process::id()));
-            let _ = rename_with_windows_retry(&self.target, &displaced);
-            let _ = fs::remove_file(displaced);
+    fn rollback(self) -> std::io::Result<()> {
+        if self.target.exists() {
+            if let Err(remove_err) = fs::remove_file(&self.target) {
+                let displaced = self
+                    .target
+                    .with_extension(format!("failed.{}", std::process::id()));
+                if let Err(displace_err) = rename_with_windows_retry(&self.target, &displaced) {
+                    tracing::error!(
+                        target = %self.target.display(),
+                        backup = %self.backup.display(),
+                        remove_error = %remove_err,
+                        displace_error = %displace_err,
+                        "failed to remove or displace target file during upgrade rollback"
+                    );
+                } else {
+                    let _ = fs::remove_file(displaced);
+                }
+            }
         }
-        let _ = rename_with_windows_retry(&self.backup, &self.target);
+        if let Err(err) = rename_with_windows_retry(&self.backup, &self.target) {
+            tracing::error!(
+                target = %self.target.display(),
+                backup = %self.backup.display(),
+                error = %err,
+                "failed to restore backup file during upgrade rollback"
+            );
+            return Err(err);
+        }
+        Ok(())
     }
 }
 
@@ -3535,8 +3726,11 @@ fn copy_binary_atomically_with_backup(
     let bin_dir = target_bin
         .parent()
         .context("failed to determine target binary directory")?;
+    win_fs_hardening::reject_reparse_point(bin_dir)?;
     fs::create_dir_all(bin_dir)
         .with_context(|| format!("failed to create service directory {}", bin_dir.display()))?;
+    win_fs_hardening::reject_reparse_point(bin_dir)?;
+    win_fs_hardening::reject_reparse_point(target_bin)?;
 
     let same_binary = match (fs::canonicalize(current_exe), fs::canonicalize(target_bin)) {
         (Ok(a), Ok(b)) => a == b,
@@ -3548,6 +3742,7 @@ fn copy_binary_atomically_with_backup(
 
     let pid = std::process::id();
     let tmp_bin = bin_dir.join(format!("vdpi.tmp.{pid}.exe"));
+    win_fs_hardening::reject_reparse_point(&tmp_bin)?;
     if let Err(err) = fs::copy(current_exe, &tmp_bin)
         .with_context(|| format!("failed to copy {:?} to {:?}", current_exe, tmp_bin))
     {
@@ -3555,6 +3750,7 @@ fn copy_binary_atomically_with_backup(
         return Err(err);
     }
 
+    win_fs_hardening::reject_reparse_point(target_bin)?;
     let backup_path = if target_bin.exists() {
         let preferred = bin_dir.join("vdpi.old.exe");
         let backup = if preferred.exists() && fs::remove_file(&preferred).is_err() {
@@ -3580,7 +3776,14 @@ fn copy_binary_atomically_with_backup(
     if let Err(err) = rename_with_windows_retry(&tmp_bin, target_bin) {
         let _ = fs::remove_file(tmp_bin);
         if let Some(backup) = backup_path {
-            let _ = rename_with_windows_retry(&backup, target_bin);
+            if let Err(rb_err) = rename_with_windows_retry(&backup, target_bin) {
+                tracing::error!(
+                    target = %target_bin.display(),
+                    backup = %backup.display(),
+                    error = %rb_err,
+                    "failed to restore binary backup after install rename failure"
+                );
+            }
         }
         return Err(err)
             .with_context(|| format!("failed to install new binary to {}", target_bin.display()));
@@ -3649,7 +3852,7 @@ fn preflight_windows_tun_wintun_with_exe(
                 }
                 return Err(err).with_context(|| {
                     format!(
-                        "cannot {action}: {} (v{WINTUN_VERSION}) is corrupted or mismatched — \
+                        "cannot {action}: {} (v{WINTUN_VERSION}) is corrupted or mismatched - \
                          extract all files from the zip (keep wintun.dll beside vdpi.exe)",
                         target_wintun.display()
                     )
@@ -3678,13 +3881,87 @@ fn preflight_windows_tun_wintun(target_bin_dir: Option<&Path>, action: &str) -> 
 }
 
 #[cfg(target_os = "windows")]
-fn copy_verified_wintun_to_bin_dir_with_backup(
+static WINTUN_STAGE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(target_os = "windows")]
+fn read_verified_wintun_bytes(src_wintun: &Path, expected_sha256: &str) -> Result<Vec<u8>> {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const MAX_WINTUN_DLL_BYTES: u64 = 16 * 1024 * 1024;
+
+    win_fs_hardening::reject_reparse_point(src_wintun)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(src_wintun)
+        .with_context(|| format!("failed to open {}", src_wintun.display()))?;
+    let meta = file.metadata().with_context(|| {
+        format!(
+            "failed to inspect opened handle for {}",
+            src_wintun.display()
+        )
+    })?;
+    if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        bail!(
+            "refusing to read NTFS reparse point wintun.dll: {}",
+            src_wintun.display()
+        );
+    }
+    if !meta.file_type().is_file() {
+        bail!(
+            "wintun.dll path is not a regular file: {}",
+            src_wintun.display()
+        );
+    }
+    if meta.len() > MAX_WINTUN_DLL_BYTES {
+        bail!(
+            "wintun.dll {} exceeds maximum allowed size ({} bytes)",
+            src_wintun.display(),
+            MAX_WINTUN_DLL_BYTES
+        );
+    }
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    file.take(MAX_WINTUN_DLL_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {}", src_wintun.display()))?;
+    if (bytes.len() as u64) > MAX_WINTUN_DLL_BYTES {
+        bail!(
+            "wintun.dll {} exceeds maximum allowed size ({} bytes)",
+            src_wintun.display(),
+            MAX_WINTUN_DLL_BYTES
+        );
+    }
+    let actual = crate::update::sha256_hex(&bytes);
+    if !actual.eq_ignore_ascii_case(expected_sha256) {
+        bail!(
+            "wintun.dll SHA-256 verification failed for {}: expected {expected_sha256}, got {actual}",
+            src_wintun.display()
+        );
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_os = "windows")]
+fn copy_verified_wintun_to_bin_dir_with_expected_sha256(
     src_wintun: &Path,
     bin_dir: &Path,
+    expected_sha256: &str,
     retain_backup: bool,
 ) -> Result<(bool, Option<ReplacedFileBackup>)> {
-    let expected_sha256 = crate::platform::windows_tun::expected_wintun_dll_sha256()?;
-    crate::platform::windows_tun::verify_wintun_dll_sha256(src_wintun, expected_sha256)?;
+    use std::fs::OpenOptions;
+    use std::io::ErrorKind;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::sync::atomic::Ordering;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    win_fs_hardening::reject_reparse_point(bin_dir)?;
+    // Single-read verification over an opened non-reparse handle eliminates TOCTOU
+    // between SHA-256 verification and staging the DLL bytes into `bin_dir`.
+    let dll_bytes = read_verified_wintun_bytes(src_wintun, expected_sha256)?;
 
     let target_wintun = bin_dir.join("wintun.dll");
     win_fs_hardening::reject_reparse_point(&target_wintun)?;
@@ -3697,24 +3974,61 @@ fn copy_verified_wintun_to_bin_dir_with_backup(
     };
     let already_verified = !same_file
         && target_wintun.is_file()
+        && !win_fs_hardening::is_reparse_point(&target_wintun)
         && crate::platform::windows_tun::verify_wintun_dll_sha256(&target_wintun, expected_sha256)
             .is_ok();
     let skip_copy = same_file || already_verified;
 
     let retained_backup = if !skip_copy {
+        win_fs_hardening::reject_reparse_point(bin_dir)?;
         let pid = std::process::id();
-        let staged = bin_dir.join(format!("wintun.tmp.{pid}.dll"));
-        if let Err(err) = fs::copy(src_wintun, &staged).with_context(|| {
+        let mut created = None;
+        for _ in 0..16 {
+            let seq = WINTUN_STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+            let candidate = bin_dir.join(format!("wintun.tmp.{pid}.{seq}.dll"));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&candidate)
+            {
+                Ok(file) => {
+                    created = Some((candidate, file));
+                    break;
+                }
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("failed to create staged wintun file {}", candidate.display())
+                    });
+                }
+            }
+        }
+        let (staged, mut staged_file) = created.ok_or_else(|| {
+            anyhow::anyhow!(
+                "failed to allocate unique staged wintun.dll in {}",
+                bin_dir.display()
+            )
+        })?;
+        let write_res = (|| -> Result<()> {
+            staged_file.write_all(&dll_bytes)?;
+            staged_file.sync_all()?;
+            Ok(())
+        })()
+        .with_context(|| {
             format!(
-                "failed to copy {} to {}",
+                "failed to write verified wintun.dll bytes from {} to {}",
                 src_wintun.display(),
                 staged.display()
             )
-        }) {
+        });
+        drop(staged_file);
+        if let Err(err) = write_res {
             let _ = fs::remove_file(staged);
             return Err(err);
         }
 
+        win_fs_hardening::reject_reparse_point(&target_wintun)?;
         let backup_path = if target_wintun.exists() {
             let preferred = bin_dir.join("wintun.old.dll");
             let backup = if preferred.exists() && fs::remove_file(&preferred).is_err() {
@@ -3740,7 +4054,14 @@ fn copy_verified_wintun_to_bin_dir_with_backup(
         if let Err(err) = rename_with_windows_retry(&staged, &target_wintun) {
             let _ = fs::remove_file(staged);
             if let Some(backup) = backup_path {
-                let _ = rename_with_windows_retry(&backup, &target_wintun);
+                if let Err(rb_err) = rename_with_windows_retry(&backup, &target_wintun) {
+                    tracing::error!(
+                        target = %target_wintun.display(),
+                        backup = %backup.display(),
+                        error = %rb_err,
+                        "failed to restore wintun.dll backup after install rename failure"
+                    );
+                }
             }
             return Err(err).with_context(|| {
                 format!(
@@ -3784,6 +4105,21 @@ fn copy_verified_wintun_to_bin_dir_with_backup(
 }
 
 #[cfg(target_os = "windows")]
+fn copy_verified_wintun_to_bin_dir_with_backup(
+    src_wintun: &Path,
+    bin_dir: &Path,
+    retain_backup: bool,
+) -> Result<(bool, Option<ReplacedFileBackup>)> {
+    let expected_sha256 = crate::platform::windows_tun::expected_wintun_dll_sha256()?;
+    copy_verified_wintun_to_bin_dir_with_expected_sha256(
+        src_wintun,
+        bin_dir,
+        expected_sha256,
+        retain_backup,
+    )
+}
+
+#[cfg(target_os = "windows")]
 fn copy_verified_sibling_wintun_from_exe_with_backup(
     current_exe: &Path,
     bin_dir: &Path,
@@ -3816,12 +4152,54 @@ fn print_windows_stale_browser_hint(cfg: &RuntimeConfig) {
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn build_windows_install_elevated_args(
+    cfg: &RuntimeConfig,
+    upgrade: bool,
+    explicit_engine: Option<EngineMode>,
+) -> Vec<String> {
+    let mut args = vec!["install".to_string()];
+    if upgrade {
+        args.push("--upgrade".to_string());
+        if let Some(engine) = explicit_engine {
+            args.push(match engine {
+                EngineMode::Tun => "--tun".to_string(),
+                EngineMode::Proxy => "--proxy".to_string(),
+            });
+        }
+    } else {
+        // `build_service_cli_args` always emits explicit `--proxy` / `--tun`
+        // so system `config.toml` cannot flip caller intent across UAC.
+        args.extend(build_service_cli_args(cfg));
+    }
+    args
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn should_start_windows_service_after_install(
+    upgrade: bool,
+    prev_installed: bool,
+    prev_was_running: bool,
+) -> bool {
+    !upgrade || !prev_installed || prev_was_running
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-fn build_unix_install_sudo_args(effective_cfg: &RuntimeConfig, upgrade: bool) -> Vec<String> {
+fn build_unix_install_sudo_args(
+    effective_cfg: &RuntimeConfig,
+    upgrade: bool,
+    explicit_engine: Option<EngineMode>,
+    has_system_daemon: bool,
+) -> Vec<String> {
     if upgrade {
         let mut args = vec!["install".to_string(), "--upgrade".to_string()];
-        if effective_cfg.engine == EngineMode::Tun {
-            args.push("--tun".to_string());
+        match explicit_engine {
+            Some(EngineMode::Tun) => args.push("--tun".to_string()),
+            Some(EngineMode::Proxy) => args.push("--proxy".to_string()),
+            None if effective_cfg.engine == EngineMode::Tun && !has_system_daemon => {
+                args.push("--tun".to_string());
+            }
+            None => {}
         }
         return args;
     }
@@ -3830,10 +4208,77 @@ fn build_unix_install_sudo_args(effective_cfg: &RuntimeConfig, upgrade: bool) ->
     args
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn resolve_unix_upgrade_runtime_config(
+    has_system_daemon: bool,
+    loaded_cfg: Option<&FileConfig>,
+    explicit_engine: Option<EngineMode>,
+) -> RuntimeConfig {
+    let mut merged = match loaded_cfg {
+        Some(file_cfg) => {
+            let mut out = apply_file_config_to_runtime(&RuntimeConfig::default(), file_cfg);
+            if has_system_daemon && file_cfg.engine.is_none() {
+                // A root system daemon (macOS LaunchDaemon / Linux systemd system unit)
+                // runs in TUN mode; preserve TUN when `config.toml` leaves `engine` unset.
+                out.engine = EngineMode::Tun;
+            }
+            out
+        }
+        None => {
+            let mut fallback = RuntimeConfig::default();
+            if has_system_daemon {
+                // A root system daemon is only installed for TUN mode; preserve
+                // TUN intent if the system config is unreadable prior to sudo.
+                fallback.engine = EngineMode::Tun;
+            }
+            fallback
+        }
+    };
+    if let Some(engine) = explicit_engine {
+        merged.engine = engine;
+    }
+    merged
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn check_unix_system_bin_no_downgrade_with_version(
+    existing_version: Option<&str>,
+    current_version: &str,
+    target_bin: &Path,
+) -> Result<()> {
+    if let Some(existing) = existing_version {
+        if compare_versions(current_version, existing) == VersionRelation::Older {
+            bail!(
+                "refusing to downgrade {} from v{existing} to v{current_version}",
+                target_bin.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn check_unix_system_bin_no_downgrade(current_exe: &Path, target_bin: &Path) -> Result<()> {
+    let same_binary = match (fs::canonicalize(current_exe), fs::canonicalize(target_bin)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => current_exe == target_bin,
+    };
+    if same_binary || !target_bin.is_file() {
+        return Ok(());
+    }
+    let existing_version = probe_binary_version(target_bin);
+    check_unix_system_bin_no_downgrade_with_version(
+        existing_version.as_deref(),
+        env!("CARGO_PKG_VERSION"),
+        target_bin,
+    )
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn install_service_with_options_impl(
     cfg: &RuntimeConfig,
     upgrade: bool,
+    explicit_engine: Option<EngineMode>,
     verbose: bool,
 ) -> Result<()> {
     #[cfg(target_os = "windows")]
@@ -3847,7 +4292,9 @@ fn install_service_with_options_impl(
         let target_bin_dir = installed_binary_path()
             .ok()
             .and_then(|p| p.parent().map(Path::to_path_buf));
-        let preflight_tun = if upgrade {
+        let preflight_tun = if let Some(engine) = explicit_engine {
+            engine == EngineMode::Tun
+        } else if upgrade {
             load_configured_engine(cfg.engine) == EngineMode::Tun
         } else {
             cfg.engine == EngineMode::Tun
@@ -3869,21 +4316,27 @@ fn install_service_with_options_impl(
                     "Requesting Administrator privileges to install the vdpi Windows service..."
                 );
             }
-            let mut args = vec!["install".to_string()];
-            if upgrade {
-                args.push("--upgrade".to_string());
-            } else {
-                // `build_service_cli_args` always emits explicit `--proxy` / `--tun`
-                // so system `config.toml` cannot flip caller intent across UAC.
-                args.extend(build_service_cli_args(cfg));
-            }
+            let args = build_windows_install_elevated_args(cfg, upgrade, explicit_engine);
             relaunch_elevated_and_wait(&args)?;
             notify_wininet_refresh();
             broadcast_environment_change();
             if verbose {
-                println!(
-                    "Installed and started Windows service: {WINDOWS_SERVICE_NAME} (AUTO_START)"
+                let prev_was_running =
+                    prev_svc.installed && matches!(prev_svc.state, "RUNNING" | "START_PENDING");
+                let start_service = should_start_windows_service_after_install(
+                    upgrade,
+                    prev_svc.installed,
+                    prev_was_running,
                 );
+                if start_service {
+                    println!(
+                        "Installed and started Windows service: {WINDOWS_SERVICE_NAME} (AUTO_START)"
+                    );
+                } else {
+                    println!(
+                        "Updated Windows service: {WINDOWS_SERVICE_NAME} (AUTO_START, kept stopped)"
+                    );
+                }
                 if !upgrade {
                     print_windows_stale_browser_hint(cfg);
                 }
@@ -3892,15 +4345,19 @@ fn install_service_with_options_impl(
         }
 
         let config_path = config_file::system_config_path();
+        let user_config_path = config_file::user_config_path();
         let vdpi_root = vdpi_root_dir()?;
         let bin_dir = vdpi_root.join("bin");
         let log_dir = vdpi_root.join("logs");
 
-        let effective_cfg = if upgrade {
+        let (existing_file_cfg, mut effective_cfg) = if upgrade {
             if config_path.is_file() {
                 match config_file::load_file_config(Some(&config_path), true) {
-                    Ok((_, file_cfg)) => apply_file_config_to_runtime(cfg, &file_cfg),
-                    Err(_) => cfg.clone(),
+                    Ok((_, file_cfg)) => {
+                        let merged = apply_file_config_to_runtime(cfg, &file_cfg);
+                        (Some(file_cfg), merged)
+                    }
+                    Err(_) => (None, cfg.clone()),
                 }
             } else {
                 let migrated = prev_svc
@@ -3912,11 +4369,15 @@ fn install_service_with_options_impl(
                         fc.engine = Some(EngineMode::Proxy);
                         fc
                     });
-                apply_file_config_to_runtime(cfg, &migrated)
+                let merged = apply_file_config_to_runtime(cfg, &migrated);
+                (Some(migrated), merged)
             }
         } else {
-            cfg.clone()
+            (None, cfg.clone())
         };
+        if let Some(engine) = explicit_engine {
+            effective_cfg.engine = engine;
+        }
 
         let verified_tun_wintun = if effective_cfg.engine == EngineMode::Tun {
             Some(preflight_windows_tun_wintun(
@@ -3930,108 +4391,159 @@ fn install_service_with_options_impl(
         // Stop existing Windows service and any legacy vdpi.exe processes before replacing the binary.
         let prev_was_running =
             prev_svc.installed && matches!(prev_svc.state, "RUNNING" | "START_PENDING");
+        let start_service = should_start_windows_service_after_install(
+            upgrade,
+            prev_svc.installed,
+            prev_was_running,
+        );
         if upgrade {
             let _ = crate::platform::windows_service::stop_windows_service_for_upgrade()?;
         } else {
             let _ = crate::platform::windows_service::stop_windows_service_if_running()?;
         }
-        cleanup_legacy_windows_startup();
-        stop_windows_foreground_daemons();
-        let _ = crate::platform::windows_tun::cleanup_orphan_wintun_adapter();
 
-        if upgrade {
-            if !config_path.is_file() {
-                let migrated = prev_svc
-                    .binary_path
-                    .as_deref()
-                    .map(migrate_legacy_service_cmdline_to_file_config)
-                    .unwrap_or_else(|| {
-                        let mut fc = file_config_from_runtime(cfg);
-                        fc.engine = Some(EngineMode::Proxy);
+        let mut bin_backup: Option<ReplacedFileBackup> = None;
+        let mut wintun_backup: Option<ReplacedFileBackup> = None;
+        let mut service_touched = false;
+
+        let post_stop_res = (|| -> Result<bool> {
+            cleanup_legacy_windows_startup();
+            stop_windows_foreground_daemons();
+            let _ = crate::platform::windows_tun::cleanup_orphan_wintun_adapter();
+
+            if upgrade {
+                if !config_path.is_file() {
+                    let mut migrated = existing_file_cfg.unwrap_or_else(|| {
+                        let mut fc = file_config_from_runtime(&effective_cfg);
+                        fc.engine = Some(effective_cfg.engine);
                         fc
                     });
-                config_file::save_file_config_atomic(&config_path, &migrated)?;
+                    migrated.schema_version.get_or_insert(CONFIG_SCHEMA_VERSION);
+                    if let Some(engine) = explicit_engine {
+                        migrated.engine = Some(engine);
+                    }
+                    preserve_existing_language(
+                        &mut migrated,
+                        &config_path,
+                        true,
+                        Some(&user_config_path),
+                    );
+                    config_file::save_file_config_atomic(&config_path, &migrated)?;
+                } else if let Some(engine) = explicit_engine {
+                    let mut updated = existing_file_cfg
+                        .unwrap_or_else(|| file_config_from_runtime(&effective_cfg));
+                    updated.schema_version.get_or_insert(CONFIG_SCHEMA_VERSION);
+                    updated.engine = Some(engine);
+                    config_file::save_file_config_atomic(&config_path, &updated)?;
+                }
+            } else {
+                let mut file_cfg = file_config_from_runtime(&effective_cfg);
+                preserve_existing_language(
+                    &mut file_cfg,
+                    &config_path,
+                    true,
+                    Some(&user_config_path),
+                );
+                config_file::save_file_config_atomic(&config_path, &file_cfg)?;
             }
-        } else {
-            let file_cfg = file_config_from_runtime(cfg);
-            config_file::save_file_config_atomic(&config_path, &file_cfg)?;
-        }
 
-        fs::create_dir_all(&bin_dir)
-            .with_context(|| format!("failed to create service directory {}", bin_dir.display()))?;
-        fs::create_dir_all(&log_dir)
-            .with_context(|| format!("failed to create log directory {}", log_dir.display()))?;
+            fs::create_dir_all(&bin_dir).with_context(|| {
+                format!("failed to create service directory {}", bin_dir.display())
+            })?;
+            fs::create_dir_all(&log_dir).with_context(|| {
+                format!("failed to create log directory {}", log_dir.display())
+            })?;
 
-        let current_exe =
-            std::env::current_exe().context("failed to determine current executable")?;
-        let target_bin = installed_binary_path()?;
-        let bin_backup = copy_binary_atomically_with_backup(&current_exe, &target_bin, upgrade)?;
-        let (wintun_copied, wintun_backup) =
-            match copy_verified_sibling_wintun_with_backup(&bin_dir, upgrade) {
-                Ok((false, None)) => {
-                    if let Some(src_wintun) = verified_tun_wintun.as_deref() {
-                        match copy_verified_wintun_to_bin_dir_with_backup(
-                            src_wintun, &bin_dir, upgrade,
-                        ) {
-                            Ok(res) => res,
-                            Err(err) => {
-                                if let Some(backup) = bin_backup {
-                                    backup.rollback();
-                                }
-                                if upgrade && prev_was_running {
-                                    let _ =
-                                        crate::platform::windows_service::start_windows_service();
-                                }
-                                return Err(err);
-                            }
+            let current_exe =
+                std::env::current_exe().context("failed to determine current executable")?;
+            let target_bin = installed_binary_path()?;
+            bin_backup = copy_binary_atomically_with_backup(&current_exe, &target_bin, upgrade)?;
+
+            let (wintun_copied, next_wintun_backup) =
+                match copy_verified_sibling_wintun_with_backup(&bin_dir, upgrade) {
+                    Ok((false, None)) => {
+                        if let Some(src_wintun) = verified_tun_wintun.as_deref() {
+                            copy_verified_wintun_to_bin_dir_with_backup(
+                                src_wintun, &bin_dir, upgrade,
+                            )?
+                        } else {
+                            (false, None)
                         }
-                    } else {
+                    }
+                    Ok(res) => res,
+                    Err(err) if effective_cfg.engine == EngineMode::Proxy => {
+                        tracing::warn!(
+                            error = %err,
+                            "skipping sibling wintun.dll copy during Windows Proxy service install"
+                        );
+                        if verbose {
+                            eprintln!(
+                                "Warning: could not copy sibling wintun.dll ({err}); continuing Proxy service install."
+                            );
+                        }
                         (false, None)
                     }
+                    Err(err) => return Err(err),
+                };
+            wintun_backup = next_wintun_backup;
+
+            service_touched = true;
+            install_windows_native_service(&target_bin, &effective_cfg, start_service, verbose)?;
+            Ok(wintun_copied)
+        })();
+
+        let wintun_copied = match post_stop_res {
+            Ok(copied) => {
+                if let Some(backup) = wintun_backup {
+                    backup.commit();
                 }
-                Ok(res) => res,
-                Err(err) if effective_cfg.engine == EngineMode::Proxy => {
-                    tracing::warn!(
-                        error = %err,
-                        "skipping sibling wintun.dll copy during Windows Proxy service install"
-                    );
-                    if verbose {
-                        eprintln!(
-                            "Warning: could not copy sibling wintun.dll ({err}); continuing Proxy service install."
+                if let Some(backup) = bin_backup {
+                    backup.commit();
+                }
+                copied
+            }
+            Err(err) => {
+                if service_touched {
+                    // Stop any stuck/partially-started new service before rolling back files.
+                    let _ = crate::platform::windows_service::stop_windows_service_if_running();
+                    stop_windows_foreground_daemons();
+                }
+                let mut rollback_ok = true;
+                if let Some(backup) = wintun_backup {
+                    if let Err(rollback_err) = backup.rollback() {
+                        rollback_ok = false;
+                        tracing::error!(
+                            error = %rollback_err,
+                            "failed to roll back wintun.dll backup after upgrade failure"
                         );
                     }
-                    (false, None)
                 }
-                Err(err) => {
-                    if let Some(backup) = bin_backup {
-                        backup.rollback();
+                if let Some(backup) = bin_backup {
+                    if let Err(rollback_err) = backup.rollback() {
+                        rollback_ok = false;
+                        tracing::error!(
+                            error = %rollback_err,
+                            "failed to roll back vdpi binary backup after upgrade failure"
+                        );
                     }
-                    if upgrade && prev_was_running {
-                        let _ = crate::platform::windows_service::start_windows_service();
-                    }
-                    return Err(err);
                 }
-            };
-
-        if let Err(err) = install_windows_native_service(&target_bin, &effective_cfg, verbose) {
-            if let Some(backup) = wintun_backup {
-                backup.rollback();
+                if upgrade && prev_was_running && rollback_ok {
+                    if let Err(restart_err) =
+                        crate::platform::windows_service::start_windows_service()
+                    {
+                        tracing::error!(
+                            error = %restart_err,
+                            "failed to restart prior Windows service after upgrade failure"
+                        );
+                    }
+                } else if upgrade && prev_was_running {
+                    tracing::error!(
+                        "skipping Windows service restart after upgrade failure because file rollback was incomplete"
+                    );
+                }
+                return Err(err);
             }
-            if let Some(backup) = bin_backup {
-                backup.rollback();
-            }
-            if upgrade && prev_was_running {
-                let _ = crate::platform::windows_service::start_windows_service();
-            }
-            return Err(err);
-        }
-
-        if let Some(backup) = wintun_backup {
-            backup.commit();
-        }
-        if let Some(backup) = bin_backup {
-            backup.commit();
-        }
+        };
 
         if verbose {
             if wintun_copied {
@@ -4065,37 +4577,33 @@ fn install_service_with_options_impl(
             } else {
                 resolved_user_config_path()
             };
-            match config_file::load_file_config(Some(&preferred_path), has_system_daemon) {
-                Ok((Some(_), file_cfg)) => {
-                    let mut merged = apply_file_config_to_runtime(cfg, &file_cfg);
-                    if has_system_daemon && file_cfg.engine.is_none() {
-                        // A root system daemon (macOS LaunchDaemon / Linux systemd system unit)
-                        // runs in TUN mode; preserve TUN when `config.toml` leaves `engine` unset.
-                        merged.engine = EngineMode::Tun;
-                    }
-                    merged
-                }
-                _ => {
-                    if has_system_daemon {
-                        // A root system daemon is only installed for TUN mode; preserve
-                        // TUN intent if the system config is unreadable prior to sudo.
-                        let mut fallback = cfg.clone();
-                        fallback.engine = EngineMode::Tun;
-                        fallback
-                    } else {
-                        cfg.clone()
-                    }
-                }
-            }
+            let loaded_cfg =
+                config_file::load_file_config(Some(&preferred_path), has_system_daemon)
+                    .ok()
+                    .and_then(|(found, fc)| found.map(|_| fc));
+            resolve_unix_upgrade_runtime_config(
+                has_system_daemon,
+                loaded_cfg.as_ref(),
+                explicit_engine,
+            )
         } else {
-            cfg.clone()
+            let mut fresh = cfg.clone();
+            if let Some(engine) = explicit_engine {
+                fresh.engine = engine;
+            }
+            fresh
         };
 
         let needs_root = effective_cfg.engine == EngineMode::Tun
             || has_system_daemon
             || (upgrade && has_system_bin);
         if needs_root && !is_unix_root() {
-            let sudo_args = build_unix_install_sudo_args(&effective_cfg, upgrade);
+            let sudo_args = build_unix_install_sudo_args(
+                &effective_cfg,
+                upgrade,
+                explicit_engine,
+                has_system_daemon,
+            );
             let action = if upgrade {
                 "update the vdpi background service"
             } else {
@@ -4105,12 +4613,30 @@ fn install_service_with_options_impl(
         }
 
         if effective_cfg.engine == EngineMode::Tun {
+            let target_bin = PathBuf::from(UNIX_SYSTEM_BIN_PATH);
+            if upgrade {
+                check_unix_system_bin_no_downgrade(&current_exe, &target_bin)?;
+            }
             let sys_config_path = config_file::system_config_path();
             if !upgrade || !sys_config_path.is_file() {
-                let file_cfg = file_config_from_runtime(&effective_cfg);
+                let mut file_cfg = file_config_from_runtime(&effective_cfg);
+                let user_cfg_path = resolved_user_config_path();
+                preserve_existing_language(
+                    &mut file_cfg,
+                    &sys_config_path,
+                    true,
+                    Some(&user_cfg_path),
+                );
+                config_file::save_file_config_atomic(&sys_config_path, &file_cfg)?;
+            } else if let Some(engine) = explicit_engine {
+                let mut file_cfg = config_file::load_file_config(Some(&sys_config_path), true)
+                    .ok()
+                    .and_then(|(found, fc)| found.map(|_| fc))
+                    .unwrap_or_else(|| file_config_from_runtime(&effective_cfg));
+                file_cfg.schema_version.get_or_insert(CONFIG_SCHEMA_VERSION);
+                file_cfg.engine = Some(engine);
                 config_file::save_file_config_atomic(&sys_config_path, &file_cfg)?;
             }
-            let target_bin = PathBuf::from(UNIX_SYSTEM_BIN_PATH);
             copy_binary_atomically(&current_exe, &target_bin)?;
 
             #[cfg(target_os = "macos")]
@@ -4122,17 +4648,33 @@ fn install_service_with_options_impl(
             return Ok(());
         }
 
+        if upgrade && has_system_bin && !has_system_daemon && is_unix_root() {
+            let sys_bin = Path::new(UNIX_SYSTEM_BIN_PATH);
+            check_unix_system_bin_no_downgrade(&current_exe, sys_bin)?;
+        }
+
         let user_config_path = resolved_user_config_path();
         if !upgrade || !user_config_path.is_file() {
             ensure_no_symlink_under_user_home(&user_config_path)?;
             if let Some(parent) = user_config_path.parent() {
                 create_dir_all_for_unix_user(parent)?;
             }
-            let file_cfg = file_config_from_runtime(&effective_cfg);
+            let mut file_cfg = file_config_from_runtime(&effective_cfg);
+            preserve_existing_language(&mut file_cfg, &user_config_path, false, None);
             config_file::save_file_config_atomic(&user_config_path, &file_cfg)?;
             if let Some(parent) = user_config_path.parent() {
                 chown_to_sudo_user(parent);
             }
+            chown_to_sudo_user(&user_config_path);
+        } else if let Some(engine) = explicit_engine {
+            ensure_no_symlink_under_user_home(&user_config_path)?;
+            let mut file_cfg = config_file::load_file_config(Some(&user_config_path), false)
+                .ok()
+                .and_then(|(found, fc)| found.map(|_| fc))
+                .unwrap_or_else(|| file_config_from_runtime(&effective_cfg));
+            file_cfg.schema_version.get_or_insert(CONFIG_SCHEMA_VERSION);
+            file_cfg.engine = Some(engine);
+            config_file::save_file_config_atomic(&user_config_path, &file_cfg)?;
             chown_to_sudo_user(&user_config_path);
         }
 
@@ -4151,8 +4693,9 @@ fn install_service_with_options_impl(
         chown_to_sudo_user(&log_dir);
         chown_to_sudo_user(&target_bin);
 
-        if upgrade && has_system_bin && is_unix_root() {
-            copy_binary_atomically(&current_exe, Path::new(UNIX_SYSTEM_BIN_PATH))?;
+        if upgrade && has_system_bin && !has_system_daemon && is_unix_root() {
+            let sys_bin = Path::new(UNIX_SYSTEM_BIN_PATH);
+            copy_binary_atomically(&current_exe, sys_bin)?;
         }
 
         #[cfg(target_os = "macos")]
@@ -4160,6 +4703,13 @@ fn install_service_with_options_impl(
 
         #[cfg(target_os = "linux")]
         install_linux_systemd_service(&target_bin, &effective_cfg, verbose)?;
+
+        if has_system_daemon
+            && is_unix_root()
+            && fs::symlink_metadata(UNIX_SYSTEM_BIN_PATH).is_ok()
+        {
+            let _ = fs::remove_file(UNIX_SYSTEM_BIN_PATH);
+        }
 
         Ok(())
     }
@@ -4195,6 +4745,168 @@ fn wait_launchctl_unloaded(service_target: &str) {
 }
 
 #[cfg(target_os = "macos")]
+fn write_macos_launch_daemon_plist_atomically(path: &Path, content: &str) -> Result<()> {
+    use std::fs::OpenOptions;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::atomic::Ordering;
+
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .context("failed to determine parent directory for macOS LaunchDaemon plist")?;
+
+    match fs::symlink_metadata(parent) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                bail!(
+                    "refusing to write LaunchDaemon plist into symlink directory {}",
+                    parent.display()
+                );
+            }
+            if !meta.is_dir() {
+                bail!(
+                    "LaunchDaemon plist parent path is not a directory: {}",
+                    parent.display()
+                );
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+            let meta = fs::symlink_metadata(parent)
+                .with_context(|| format!("failed to verify {}", parent.display()))?;
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                bail!(
+                    "refusing to write LaunchDaemon plist into invalid parent directory {}",
+                    parent.display()
+                );
+            }
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to inspect {}", parent.display()));
+        }
+    }
+
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            bail!(
+                "refusing to replace symlink LaunchDaemon plist {}",
+                path.display()
+            );
+        }
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("com.vdpi.daemon.plist");
+    let pid = std::process::id();
+
+    let mut created = None;
+    for _ in 0..16 {
+        let seq = UNIX_SAFE_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".{file_name}.tmp.{pid}.{seq}"));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .mode(0o644)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                created = Some((candidate, file));
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to create temporary LaunchDaemon plist {}",
+                        candidate.display()
+                    )
+                });
+            }
+        }
+    }
+
+    let (tmp_path, mut file) = created.ok_or_else(|| {
+        anyhow::anyhow!(
+            "failed to allocate unique temporary LaunchDaemon plist in {}",
+            parent.display()
+        )
+    })?;
+
+    let write_res = (|| -> Result<()> {
+        file.write_all(content.as_bytes()).with_context(|| {
+            format!(
+                "failed to write temporary LaunchDaemon plist {}",
+                tmp_path.display()
+            )
+        })?;
+        let fd = file.as_raw_fd();
+        // SAFETY: `fd` is a valid open file descriptor owned by `file`.
+        if unsafe { libc::fchown(fd, 0, 0) } != 0 {
+            let err = std::io::Error::last_os_error();
+            let allow_test_eperm =
+                cfg!(test) && !is_unix_root() && err.raw_os_error() == Some(libc::EPERM);
+            if !allow_test_eperm {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to fchown root:wheel on temporary LaunchDaemon plist {}",
+                        tmp_path.display()
+                    )
+                });
+            }
+        }
+        // SAFETY: `fd` is a valid open file descriptor owned by `file`.
+        if unsafe { libc::fchmod(fd, 0o644) } != 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "failed to fchmod 0644 on temporary LaunchDaemon plist {}",
+                    tmp_path.display()
+                )
+            });
+        }
+        file.sync_all().with_context(|| {
+            format!(
+                "failed to sync temporary LaunchDaemon plist {}",
+                tmp_path.display()
+            )
+        })?;
+        Ok(())
+    })();
+    drop(file);
+
+    if let Err(err) = write_res {
+        let _ = fs::remove_file(tmp_path);
+        return Err(err);
+    }
+
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            let _ = fs::remove_file(tmp_path);
+            bail!(
+                "refusing to replace symlink LaunchDaemon plist {}",
+                path.display()
+            );
+        }
+    }
+
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(tmp_path);
+        return Err(err).with_context(|| {
+            format!(
+                "failed to atomically replace LaunchDaemon plist {}",
+                path.display()
+            )
+        });
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 fn start_macos_launch_agent(plist_path: &Path, allow_legacy_load_fallback: bool) -> Result<()> {
     let uid = current_uid();
     let domain_target = format!("gui/{uid}");
@@ -4206,11 +4918,34 @@ fn start_macos_launch_agent(plist_path: &Path, allow_legacy_load_fallback: bool)
         .stdin(Stdio::null())
         .output();
 
-    let boot = macos_launch_agent_launchctl_command()
+    let mut boot = macos_launch_agent_launchctl_command()
         .args(["bootstrap", &domain_target, &plist_str])
         .stdin(Stdio::null())
         .output()
         .context("failed to execute '/bin/launchctl bootstrap'")?;
+
+    if !boot.status.success() && launchctl_service_loaded(&service_target) {
+        let _ = macos_launch_agent_launchctl_command()
+            .args(["bootout", &service_target])
+            .stdin(Stdio::null())
+            .output();
+        if launchctl_service_loaded(&service_target) {
+            let _ = macos_launch_agent_launchctl_command()
+                .args(["bootout", &domain_target, &plist_str])
+                .stdin(Stdio::null())
+                .output();
+        }
+        wait_launchctl_unloaded(&service_target);
+        let _ = macos_launch_agent_launchctl_command()
+            .args(["enable", &service_target])
+            .stdin(Stdio::null())
+            .output();
+        boot = macos_launch_agent_launchctl_command()
+            .args(["bootstrap", &domain_target, &plist_str])
+            .stdin(Stdio::null())
+            .output()
+            .context("failed to execute '/bin/launchctl bootstrap' retry")?;
+    }
 
     if boot.status.success() {
         // `RunAtLoad=true` already spawns the agent; wait briefly before issuing
@@ -4239,26 +4974,7 @@ fn start_macos_launch_agent(plist_path: &Path, allow_legacy_load_fallback: bool)
         return Ok(());
     }
 
-    if launchctl_service_loaded(&service_target) {
-        let kick = macos_launch_agent_launchctl_command()
-            .args(["kickstart", "-k", &service_target])
-            .stdin(Stdio::null())
-            .output()
-            .context("failed to execute '/bin/launchctl kickstart'")?;
-        if !kick.status.success() && !launchctl_service_running(&service_target) {
-            let detail = String::from_utf8_lossy(&kick.stderr).trim().to_string();
-            if detail.is_empty() {
-                bail!(
-                    "failed to kickstart LaunchAgent '{LAUNCH_AGENT_LABEL}' (exit status: {})",
-                    kick.status
-                );
-            }
-            bail!("failed to kickstart LaunchAgent '{LAUNCH_AGENT_LABEL}': {detail}");
-        }
-        return Ok(());
-    }
-
-    if allow_legacy_load_fallback {
+    if allow_legacy_load_fallback && !launchctl_service_loaded(&service_target) {
         let fallback = macos_launch_agent_launchctl_command()
             .args(["load", "-w", &plist_str])
             .stdin(Stdio::null())
@@ -4351,12 +5067,36 @@ fn start_macos_launch_daemon(plist_path: &Path) -> Result<()> {
         .stdin(Stdio::null())
         .output();
 
-    let boot = Command::new("/bin/launchctl")
+    let mut boot = Command::new("/bin/launchctl")
         .args(["bootstrap", "system", &plist_str])
         .stdin(Stdio::null())
         .output()
         .context("failed to execute '/bin/launchctl bootstrap'")?;
-    if !boot.status.success() && !launchctl_service_loaded(&service_target) {
+
+    if !boot.status.success() && launchctl_service_loaded(&service_target) {
+        let _ = Command::new("/bin/launchctl")
+            .args(["bootout", &service_target])
+            .stdin(Stdio::null())
+            .output();
+        if launchctl_service_loaded(&service_target) {
+            let _ = Command::new("/bin/launchctl")
+                .args(["bootout", "system", &plist_str])
+                .stdin(Stdio::null())
+                .output();
+        }
+        wait_launchctl_unloaded(&service_target);
+        let _ = Command::new("/bin/launchctl")
+            .args(["enable", &service_target])
+            .stdin(Stdio::null())
+            .output();
+        boot = Command::new("/bin/launchctl")
+            .args(["bootstrap", "system", &plist_str])
+            .stdin(Stdio::null())
+            .output()
+            .context("failed to execute '/bin/launchctl bootstrap' retry")?;
+    }
+
+    if !boot.status.success() {
         let detail = String::from_utf8_lossy(&boot.stderr).trim().to_string();
         if detail.is_empty() {
             bail!(
@@ -4419,16 +5159,8 @@ fn install_macos_launch_daemon(
         wait_launchctl_unloaded(&service_target);
     }
 
-    if let Some(parent) = plist_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let plist_xml = generate_launch_daemon_plist(target_bin, cfg);
-    fs::write(&plist_path, plist_xml)
-        .with_context(|| format!("failed to write {}", plist_path.display()))?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&plist_path, fs::Permissions::from_mode(0o644));
-    }
+    write_macos_launch_daemon_plist_atomically(&plist_path, &plist_xml)?;
 
     start_macos_launch_daemon(&plist_path)?;
 
@@ -4566,7 +5298,7 @@ fn remove_linux_user_unit_if_present() {
 #[cfg(target_os = "linux")]
 fn remove_linux_system_unit_if_present() -> Result<bool> {
     let unit_path = systemd_system_unit_path();
-    if !unit_path.exists() {
+    if fs::symlink_metadata(&unit_path).is_err() {
         return Ok(false);
     }
     if !is_unix_root() {
@@ -4600,6 +5332,14 @@ fn write_linux_system_unit_atomically(unit_path: &Path, contents: &str) -> Resul
         .context("failed to determine parent directory for systemd system unit")?;
     fs::create_dir_all(parent)
         .with_context(|| format!("failed to create {}", parent.display()))?;
+    if let Ok(meta) = fs::symlink_metadata(unit_path) {
+        if meta.file_type().is_symlink() {
+            bail!(
+                "refusing to replace symlink systemd system unit {}",
+                unit_path.display()
+            );
+        }
+    }
 
     let file_name = unit_path
         .file_name()
@@ -4639,18 +5379,26 @@ fn write_linux_system_unit_atomically(unit_path: &Path, contents: &str) -> Resul
         )
     })?;
 
-    if let Err(err) = file
-        .write_all(contents.as_bytes())
-        .and_then(|()| file.sync_all())
-        .with_context(|| format!("failed to write temporary unit file {}", tmp_path.display()))
-    {
-        drop(file);
+    let write_res = (|| -> Result<()> {
+        file.write_all(contents.as_bytes())
+            .with_context(|| format!("failed to write temporary unit file {}", tmp_path.display()))?;
+        file.set_permissions(fs::Permissions::from_mode(0o644))
+            .with_context(|| {
+                format!(
+                    "failed to set 0644 permissions on temporary unit file {}",
+                    tmp_path.display()
+                )
+            })?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync temporary unit file {}", tmp_path.display()))?;
+        Ok(())
+    })();
+    drop(file);
+    if let Err(err) = write_res {
         let _ = fs::remove_file(tmp_path);
         return Err(err);
     }
-    drop(file);
 
-    let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o644));
     if let Err(err) = fs::rename(&tmp_path, unit_path) {
         let _ = fs::remove_file(tmp_path);
         return Err(err).with_context(|| {
@@ -4688,6 +5436,32 @@ fn run_systemctl_step(cmd: &mut Command, action_desc: &str, unit_path: &Path) ->
         let detail = format_systemctl_error(&out);
         bail!(
             "wrote systemd unit to {}, but '{action_desc}' failed: {detail}",
+            unit_path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn run_systemctl_step_for_resume(
+    cmd: &mut Command,
+    action_desc: &str,
+    unit_path: &Path,
+    unit_changed: bool,
+) -> Result<()> {
+    if unit_changed {
+        return run_systemctl_step(cmd, action_desc, unit_path);
+    }
+    let out = cmd.stdin(Stdio::null()).output().with_context(|| {
+        format!(
+            "failed to execute '{action_desc}' for systemd unit {}",
+            unit_path.display()
+        )
+    })?;
+    if !out.status.success() {
+        let detail = format_systemctl_error(&out);
+        bail!(
+            "'{action_desc}' failed for systemd unit {}: {detail}",
             unit_path.display()
         );
     }
@@ -4737,8 +5511,11 @@ fn install_linux_systemd_service(
     cfg: &RuntimeConfig,
     verbose: bool,
 ) -> Result<()> {
-    // Mutual exclusion: remove root system TUN unit if previously installed.
-    let _ = remove_linux_system_unit_if_present()?;
+    // Mutual exclusion: remove root system TUN unit and clean up TUN state if previously installed.
+    let removed_system = remove_linux_system_unit_if_present()?;
+    if (removed_system || has_orphan_linux_tun_artifacts()) && is_unix_root() {
+        let _ = crate::platform::linux_tun::cleanup_linux_tun_state();
+    }
 
     if let Ok(home) = home_dir() {
         let local_bin = home.join(".local").join("bin");
@@ -4916,29 +5693,41 @@ fn remove_unix_shell_path() -> bool {
 fn install_windows_native_service(
     target_bin: &Path,
     cfg: &RuntimeConfig,
+    start_service: bool,
     verbose: bool,
 ) -> Result<()> {
     use crate::platform::windows::{
         add_dir_to_windows_system_path, broadcast_environment_change, notify_wininet_refresh,
     };
-    use crate::platform::windows_service::install_or_update_windows_service;
+    use crate::platform::windows_service::install_or_update_windows_service_with_start;
 
     let bin_path_cmd = build_windows_service_bin_path(target_bin, cfg);
-    install_or_update_windows_service(&bin_path_cmd)?;
+    install_or_update_windows_service_with_start(&bin_path_cmd, start_service)?;
 
     let legacy_bin = legacy_windows_root_dir().map(|r| r.join("bin"));
-    let path_added = target_bin
-        .parent()
-        .and_then(|bin_dir| add_dir_to_windows_system_path(bin_dir, legacy_bin.as_deref()).ok())
-        .unwrap_or(false);
+    let path_added = match target_bin.parent() {
+        Some(bin_dir) => match add_dir_to_windows_system_path(bin_dir, legacy_bin.as_deref()) {
+            Ok(added) => added,
+            Err(err) => {
+                tracing::warn!(
+                    dir = %bin_dir.display(),
+                    error = %err,
+                    "failed to add vdpi bin directory to Windows system PATH"
+                );
+                false
+            }
+        },
+        None => false,
+    };
 
     // Refresh WinINET and environment directly in the interactive caller's session as well.
     notify_wininet_refresh();
     broadcast_environment_change();
 
     if verbose {
+        let state_label = if start_service { "RUNNING" } else { "STOPPED" };
         println!("Installed binary : {}", target_bin.display());
-        println!("Windows service  : {WINDOWS_SERVICE_NAME} (AUTO_START, RUNNING)");
+        println!("Windows service  : {WINDOWS_SERVICE_NAME} (AUTO_START, {state_label})");
         if path_added {
             if let Some(bin_dir) = target_bin.parent() {
                 println!("System PATH      : added {}", bin_dir.display());
@@ -5137,10 +5926,15 @@ fn schedule_delayed_windows_dir_cleanup(vdpi_root: &Path) {
 
 #[cfg(target_os = "windows")]
 fn cleanup_windows_install_files(purge: bool) {
-    use crate::platform::windows::{remove_dir_from_windows_path, WINDOWS_PROXY_STATE_FILENAME};
+    use crate::platform::windows::{
+        known_program_data_dir, remove_dir_from_windows_path, WINDOWS_PROXY_STATE_FILENAME,
+    };
 
-    // Release any directory handle held on `C:\Program Files\vdpi\bin` via CWD.
-    let _ = std::env::set_current_dir(std::env::temp_dir());
+    // Release any directory handle held on `C:\Program Files\vdpi\bin` via CWD
+    // without landing the elevated process in user-writable `%TEMP%`.
+    if let Some(sys32_dir) = windows_system32_dir() {
+        let _ = std::env::set_current_dir(sys32_dir);
+    }
 
     let Ok(vdpi_root) = vdpi_root_dir() else {
         return;
@@ -5179,10 +5973,7 @@ fn cleanup_windows_install_files(purge: bool) {
         }
     }
 
-    let pd_dir = std::env::var_os("ProgramData")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-        .join("vdpi");
+    let pd_dir = known_program_data_dir().join("vdpi");
     if pd_dir.exists() && !win_fs_hardening::is_reparse_point(&pd_dir) {
         if purge {
             let _ = win_fs_hardening::safe_remove_dir_all(&pd_dir);
@@ -5368,7 +6159,7 @@ fn switch_service_engine_impl(
                     verify_wintun_dll_sha256(&target_wintun, expected_sha256).with_context(
                         || {
                             format!(
-                                "cannot switch Windows service to TUN mode: {} (v{WINTUN_VERSION}) is corrupted or mismatched — \
+                                "cannot switch Windows service to TUN mode: {} (v{WINTUN_VERSION}) is corrupted or mismatched - \
                                  extract all files from the zip (keep wintun.dll beside vdpi.exe)",
                                 target_wintun.display()
                             )
@@ -5467,23 +6258,14 @@ fn switch_service_engine_impl(
                             .output();
                         wait_launchctl_unloaded(&service_target);
                     }
-                    if let Some(parent) = plist_path.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    fs::write(
-                        &plist_path,
-                        generate_launch_daemon_plist(&target_bin, &target_cfg),
-                    )?;
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = fs::set_permissions(&plist_path, fs::Permissions::from_mode(0o644));
-                    }
+                    let plist_xml = generate_launch_daemon_plist(&target_bin, &target_cfg);
+                    write_macos_launch_daemon_plist_atomically(&plist_path, &plist_xml)?;
                     if was_running {
                         start_macos_launch_daemon(&plist_path)?;
                     }
                 }
                 EngineMode::Proxy => {
-                    let _ = remove_macos_launch_daemon_if_present()?;
+                    let removed_daemon = remove_macos_launch_daemon_if_present()?;
                     let target_bin = installed_binary_path()?;
                     copy_binary_atomically(&current_exe, &target_bin)?;
                     chown_to_sudo_user(&target_bin);
@@ -5492,6 +6274,12 @@ fn switch_service_engine_impl(
                         if let Some(root) = bin_dir.parent() {
                             chown_to_sudo_user(root);
                         }
+                    }
+                    if (removed_daemon || daemon_exists)
+                        && is_unix_root()
+                        && fs::symlink_metadata(UNIX_SYSTEM_BIN_PATH).is_ok()
+                    {
+                        let _ = fs::remove_file(UNIX_SYSTEM_BIN_PATH);
                     }
                     let log_dir = vdpi_root_dir()?.join("logs");
                     create_dir_all_for_unix_user(&log_dir)?;
@@ -5590,36 +6378,30 @@ fn switch_service_engine_impl(
                     let unit_path = systemd_system_unit_path();
                     let unit_text = generate_systemd_system_unit(&target_bin, &target_cfg);
                     write_linux_system_unit_atomically(&unit_path, &unit_text)?;
-                    let _ = Command::new(resolve_systemctl_bin())
-                        .args(["daemon-reload"])
-                        .stdin(Stdio::null())
-                        .output();
-                    let _ = Command::new(resolve_systemctl_bin())
-                        .args(["enable", SYSTEMD_UNIT_NAME])
-                        .stdin(Stdio::null())
-                        .output();
+                    run_systemctl_step(
+                        Command::new(resolve_systemctl_bin()).args(["daemon-reload"]),
+                        "systemctl daemon-reload",
+                        &unit_path,
+                    )?;
+                    run_systemctl_step(
+                        Command::new(resolve_systemctl_bin()).args(["enable", SYSTEMD_UNIT_NAME]),
+                        &format!("systemctl enable {SYSTEMD_UNIT_NAME}"),
+                        &unit_path,
+                    )?;
                     if was_running {
-                        let out = Command::new(resolve_systemctl_bin())
-                            .args(["restart", SYSTEMD_UNIT_NAME])
-                            .stdin(Stdio::null())
-                            .output()
-                            .context("failed to execute 'systemctl restart'")?;
-                        if !out.status.success() {
-                            let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                            if detail.is_empty() {
-                                bail!(
-                                    "failed to restart systemd system unit '{SYSTEMD_UNIT_NAME}' (exit status: {})",
-                                    out.status
-                                );
-                            }
-                            bail!(
-                                "failed to restart systemd system unit '{SYSTEMD_UNIT_NAME}': {detail}"
-                            );
-                        }
+                        run_systemctl_step(
+                            Command::new(resolve_systemctl_bin())
+                                .args(["restart", SYSTEMD_UNIT_NAME]),
+                            &format!("systemctl restart {SYSTEMD_UNIT_NAME}"),
+                            &unit_path,
+                        )?;
                     }
                 }
                 EngineMode::Proxy => {
-                    let _ = remove_linux_system_unit_if_present()?;
+                    let removed_system = remove_linux_system_unit_if_present()?;
+                    if (removed_system || has_orphan_linux_tun_artifacts()) && is_unix_root() {
+                        let _ = crate::platform::linux_tun::cleanup_linux_tun_state();
+                    }
                     let target_bin = installed_binary_path()?;
                     copy_binary_atomically(&current_exe, &target_bin)?;
                     chown_to_sudo_user(&target_bin);
@@ -5629,6 +6411,12 @@ fn switch_service_engine_impl(
                             chown_to_sudo_user(root);
                         }
                     }
+                    if (removed_system || system_exists)
+                        && is_unix_root()
+                        && fs::symlink_metadata(UNIX_SYSTEM_BIN_PATH).is_ok()
+                    {
+                        let _ = fs::remove_file(UNIX_SYSTEM_BIN_PATH);
+                    }
                     let log_dir = vdpi_root_dir()?.join("logs");
                     create_dir_all_for_unix_user(&log_dir)?;
                     let unit_path = systemd_user_unit_path()?;
@@ -5637,32 +6425,22 @@ fn switch_service_engine_impl(
                     }
                     let unit_text = generate_systemd_unit(&target_bin, &target_cfg);
                     write_unix_user_file_safely(&unit_path, unit_text.as_bytes())?;
-                    let _ = linux_user_systemctl_command()
-                        .args(["daemon-reload"])
-                        .stdin(Stdio::null())
-                        .output();
-                    let _ = linux_user_systemctl_command()
-                        .args(["enable", SYSTEMD_UNIT_NAME])
-                        .stdin(Stdio::null())
-                        .output();
+                    run_systemctl_step(
+                        linux_user_systemctl_command().args(["daemon-reload"]),
+                        "systemctl --user daemon-reload",
+                        &unit_path,
+                    )?;
+                    run_systemctl_step(
+                        linux_user_systemctl_command().args(["enable", SYSTEMD_UNIT_NAME]),
+                        &format!("systemctl --user enable {SYSTEMD_UNIT_NAME}"),
+                        &unit_path,
+                    )?;
                     if was_running {
-                        let out = linux_user_systemctl_command()
-                            .args(["restart", SYSTEMD_UNIT_NAME])
-                            .stdin(Stdio::null())
-                            .output()
-                            .context("failed to execute 'systemctl --user restart'")?;
-                        if !out.status.success() {
-                            let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                            if detail.is_empty() {
-                                bail!(
-                                    "failed to restart systemd user unit '{SYSTEMD_UNIT_NAME}' (exit status: {})",
-                                    out.status
-                                );
-                            }
-                            bail!(
-                                "failed to restart systemd user unit '{SYSTEMD_UNIT_NAME}': {detail}"
-                            );
-                        }
+                        run_systemctl_step(
+                            linux_user_systemctl_command().args(["restart", SYSTEMD_UNIT_NAME]),
+                            &format!("systemctl --user restart {SYSTEMD_UNIT_NAME}"),
+                            &unit_path,
+                        )?;
                     }
                 }
             }
@@ -5824,14 +6602,8 @@ fn set_service_dns_impl(dns_addr: &str, cfg: &RuntimeConfig, verbose: bool) -> R
                     .output();
                 wait_launchctl_unloaded(&service_target);
             }
-            fs::write(
-                &plist_path,
-                generate_launch_daemon_plist(&target_bin, &target_cfg),
-            )?;
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(&plist_path, fs::Permissions::from_mode(0o644));
-            }
+            let plist_xml = generate_launch_daemon_plist(&target_bin, &target_cfg);
+            write_macos_launch_daemon_plist_atomically(&plist_path, &plist_xml)?;
             if was_running {
                 start_macos_launch_daemon(&plist_path)?;
             }
@@ -5919,40 +6691,34 @@ fn set_service_dns_impl(dns_addr: &str, cfg: &RuntimeConfig, verbose: bool) -> R
             let unit_path = systemd_system_unit_path();
             let unit_text = generate_systemd_system_unit(&target_bin, &target_cfg);
             write_linux_system_unit_atomically(&unit_path, &unit_text)?;
-            let _ = Command::new(resolve_systemctl_bin())
-                .args(["daemon-reload"])
-                .stdin(Stdio::null())
-                .output();
+            run_systemctl_step(
+                Command::new(resolve_systemctl_bin()).args(["daemon-reload"]),
+                "systemctl daemon-reload",
+                &unit_path,
+            )?;
             if was_running {
-                let out = Command::new(resolve_systemctl_bin())
-                    .args(["restart", SYSTEMD_UNIT_NAME])
-                    .stdin(Stdio::null())
-                    .output()
-                    .context("failed to execute 'systemctl restart'")?;
-                if !out.status.success() {
-                    let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                    bail!("failed to restart systemd system unit '{SYSTEMD_UNIT_NAME}': {detail}");
-                }
+                run_systemctl_step(
+                    Command::new(resolve_systemctl_bin()).args(["restart", SYSTEMD_UNIT_NAME]),
+                    &format!("systemctl restart {SYSTEMD_UNIT_NAME}"),
+                    &unit_path,
+                )?;
             }
         } else if user_exists {
             let target_bin = installed_binary_path()?;
             let unit_path = systemd_user_unit_path()?;
             let unit_text = generate_systemd_unit(&target_bin, &target_cfg);
             write_unix_user_file_safely(&unit_path, unit_text.as_bytes())?;
-            let _ = linux_user_systemctl_command()
-                .args(["daemon-reload"])
-                .stdin(Stdio::null())
-                .output();
+            run_systemctl_step(
+                linux_user_systemctl_command().args(["daemon-reload"]),
+                "systemctl --user daemon-reload",
+                &unit_path,
+            )?;
             if was_running {
-                let out = linux_user_systemctl_command()
-                    .args(["restart", SYSTEMD_UNIT_NAME])
-                    .stdin(Stdio::null())
-                    .output()
-                    .context("failed to execute 'systemctl --user restart'")?;
-                if !out.status.success() {
-                    let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                    bail!("failed to restart systemd user unit '{SYSTEMD_UNIT_NAME}': {detail}");
-                }
+                run_systemctl_step(
+                    linux_user_systemctl_command().args(["restart", SYSTEMD_UNIT_NAME]),
+                    &format!("systemctl --user restart {SYSTEMD_UNIT_NAME}"),
+                    &unit_path,
+                )?;
             }
         }
 
@@ -6015,17 +6781,151 @@ impl Drop for TempFileCleanupGuard {
     }
 }
 
+#[cfg(any(unix, test))]
+fn is_allowed_split_temp_file_owner(
+    file_uid: u32,
+    current_euid: u32,
+    invoking_uid: Option<u32>,
+) -> bool {
+    if file_uid == current_euid {
+        return true;
+    }
+    if current_euid == 0 {
+        if let Some(uid) = invoking_uid {
+            return file_uid == uid;
+        }
+    }
+    false
+}
+
+fn validate_split_apps_temp_path(path: &Path) -> Result<()> {
+    use std::path::Component;
+
+    let raw = path.to_string_lossy();
+    if raw.is_empty()
+        || raw.contains('\0')
+        || raw.starts_with(r"\\")
+        || raw.starts_with("//")
+        || raw.starts_with(r"\??\")
+    {
+        bail!("invalid temporary split-tunnel app list path");
+    }
+    #[cfg(windows)]
+    {
+        use std::path::Prefix;
+        if let Some(Component::Prefix(prefix)) = path.components().next() {
+            match prefix.kind() {
+                Prefix::Disk(_) => {}
+                Prefix::UNC(_, _)
+                | Prefix::VerbatimUNC(_, _)
+                | Prefix::DeviceNS(_)
+                | Prefix::Verbatim(_)
+                | Prefix::VerbatimDisk(_) => {
+                    bail!("refusing UNC or device path for temporary split-tunnel app list");
+                }
+            }
+        }
+    }
+    for comp in path.components() {
+        if matches!(comp, Component::ParentDir) {
+            bail!(
+                "refusing parent traversal ('..') in temporary split-tunnel app list path {}",
+                path.display()
+            );
+        }
+    }
+    let file_name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("");
+    if !file_name.starts_with("vdpi-split-apps-") || !file_name.ends_with(".txt") {
+        bail!("invalid temporary split-tunnel app list path");
+    }
+    Ok(())
+}
+
+fn verify_split_apps_temp_ancestors(path: &Path) -> Result<()> {
+    use std::path::Component;
+
+    let abs_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("failed to resolve current working directory for split-tunnel app list path")?
+            .join(path)
+    };
+
+    let mut cur = PathBuf::new();
+    let mut has_normal_component = false;
+    for comp in abs_path.components() {
+        match comp {
+            Component::Prefix(_) | Component::RootDir => {
+                cur.push(comp.as_os_str());
+                continue;
+            }
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                bail!(
+                    "refusing parent traversal ('..') in temporary split-tunnel app list path {}",
+                    path.display()
+                );
+            }
+            Component::Normal(part) => {
+                has_normal_component = true;
+                cur.push(part);
+            }
+        }
+
+        let meta = fs::symlink_metadata(&cur).with_context(|| {
+            format!(
+                "failed to inspect temporary split-tunnel app list path component {}",
+                cur.display()
+            )
+        })?;
+        if meta.file_type().is_symlink() {
+            #[cfg(target_os = "macos")]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                let is_macos_system_link =
+                    meta.uid() == 0 && matches!(cur.to_str(), Some("/var" | "/tmp" | "/etc"));
+                if is_macos_system_link {
+                    continue;
+                }
+            }
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                let is_linux_ostree_link = meta.uid() == 0
+                    && matches!(
+                        cur.to_str(),
+                        Some("/home" | "/usr/local" | "/var" | "/tmp" | "/etc")
+                    );
+                if is_linux_ostree_link {
+                    continue;
+                }
+            }
+            bail!(
+                "refusing to read temporary split-tunnel app list through symlink {}",
+                cur.display()
+            );
+        }
+        #[cfg(target_os = "windows")]
+        win_fs_hardening::reject_reparse_point(&cur)?;
+    }
+
+    if !has_normal_component {
+        bail!("invalid temporary split-tunnel app list path");
+    }
+    Ok(())
+}
+
 fn resolve_split_tunnel_apps_input(raw_apps: &[String]) -> Result<Vec<String>> {
     if raw_apps.len() == 1 {
         if let Some(raw_path) = raw_apps[0].strip_prefix(SPLIT_APPS_FILE_PREFIX) {
             let path = Path::new(raw_path);
-            let file_name = path
-                .file_name()
-                .and_then(std::ffi::OsStr::to_str)
-                .unwrap_or("");
-            if !file_name.starts_with("vdpi-split-apps-") || !file_name.ends_with(".txt") {
-                bail!("invalid temporary split-tunnel app list path");
-            }
+            validate_split_apps_temp_path(path)?;
+            verify_split_apps_temp_ancestors(path)?;
+
             let meta = fs::symlink_metadata(path).with_context(|| {
                 format!(
                     "failed to inspect temporary split-tunnel app list {}",
@@ -6038,6 +6938,8 @@ fn resolve_split_tunnel_apps_input(raw_apps: &[String]) -> Result<Vec<String>> {
                     path.display()
                 );
             }
+            #[cfg(target_os = "windows")]
+            win_fs_hardening::reject_reparse_point(path)?;
             if meta.len() > MAX_SPLIT_APPS_TEMP_FILE_BYTES {
                 bail!(
                     "temporary split-tunnel app list {} exceeds maximum size ({} bytes)",
@@ -6045,9 +6947,100 @@ fn resolve_split_tunnel_apps_input(raw_apps: &[String]) -> Result<Vec<String>> {
                     MAX_SPLIT_APPS_TEMP_FILE_BYTES
                 );
             }
-            let content = fs::read_to_string(path).with_context(|| {
+
+            let mut open_opts = fs::OpenOptions::new();
+            open_opts.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                open_opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            }
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::fs::OpenOptionsExt as _;
+                const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+                open_opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+            }
+            let file = open_opts.open(path).with_context(|| {
                 format!(
-                    "failed to read temporary split-tunnel app list {}",
+                    "failed to open temporary split-tunnel app list {}",
+                    path.display()
+                )
+            })?;
+
+            let opened_meta = file.metadata().with_context(|| {
+                format!(
+                    "failed to stat opened temporary split-tunnel app list {}",
+                    path.display()
+                )
+            })?;
+            if opened_meta.file_type().is_symlink() || !opened_meta.file_type().is_file() {
+                bail!(
+                    "temporary split-tunnel app list {} must be a regular non-symlink file",
+                    path.display()
+                );
+            }
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::fs::MetadataExt as _;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+                if (opened_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                    bail!(
+                        "refusing to read reparse-point temporary split-tunnel app list {}",
+                        path.display()
+                    );
+                }
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                let file_uid = opened_meta.uid();
+                // SAFETY: `geteuid(2)` and `getuid(2)` are always safe to call and never fail.
+                let current_euid = unsafe { libc::geteuid() };
+                let current_ruid = unsafe { libc::getuid() };
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                let invoking_uid = resolve_sudo_invoking_user()
+                    .map(|u| u.uid)
+                    .or_else(|| {
+                        (current_ruid != 0 && current_ruid != current_euid).then_some(current_ruid)
+                    });
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                let invoking_uid =
+                    (current_ruid != 0 && current_ruid != current_euid).then_some(current_ruid);
+                if !is_allowed_split_temp_file_owner(file_uid, current_euid, invoking_uid) {
+                    bail!(
+                        "refusing to read temporary split-tunnel app list {} owned by unexpected uid {file_uid}",
+                        path.display()
+                    );
+                }
+                if current_euid == 0 && (opened_meta.mode() & 0o022) != 0 {
+                    bail!(
+                        "refusing to read group- or world-writable temporary split-tunnel app list {} (mode {:04o})",
+                        path.display(),
+                        opened_meta.mode() & 0o7777
+                    );
+                }
+            }
+
+            let mut buf = Vec::new();
+            file.take(MAX_SPLIT_APPS_TEMP_FILE_BYTES + 1)
+                .read_to_end(&mut buf)
+                .with_context(|| {
+                    format!(
+                        "failed to read temporary split-tunnel app list {}",
+                        path.display()
+                    )
+                })?;
+            if (buf.len() as u64) > MAX_SPLIT_APPS_TEMP_FILE_BYTES {
+                bail!(
+                    "temporary split-tunnel app list {} exceeds maximum size ({} bytes)",
+                    path.display(),
+                    MAX_SPLIT_APPS_TEMP_FILE_BYTES
+                );
+            }
+            let content = String::from_utf8(buf).with_context(|| {
+                format!(
+                    "temporary split-tunnel app list {} is not valid UTF-8",
                     path.display()
                 )
             })?;
@@ -6096,6 +7089,12 @@ fn build_windows_split_apply_args_with_temp(
         {
             use std::os::unix::fs::OpenOptionsExt;
             opts.custom_flags(libc::O_NOFOLLOW).mode(0o600);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
         }
         match opts.open(&candidate) {
             Ok(file) => {
@@ -6294,14 +7293,8 @@ pub fn set_service_split_tunnel(
                     .output();
                 wait_launchctl_unloaded(&service_target);
             }
-            fs::write(
-                &plist_path,
-                generate_launch_daemon_plist(&target_bin, &target_cfg),
-            )?;
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(&plist_path, fs::Permissions::from_mode(0o644));
-            }
+            let plist_xml = generate_launch_daemon_plist(&target_bin, &target_cfg);
+            write_macos_launch_daemon_plist_atomically(&plist_path, &plist_xml)?;
             if was_running {
                 start_macos_launch_daemon(&plist_path)?;
                 return Ok(format_split_tunnel_saved_message(&summary, true));
@@ -6374,20 +7367,17 @@ pub fn set_service_split_tunnel(
             let unit_path = systemd_system_unit_path();
             let unit_text = generate_systemd_system_unit(&target_bin, &target_cfg);
             write_linux_system_unit_atomically(&unit_path, &unit_text)?;
-            let _ = Command::new(resolve_systemctl_bin())
-                .args(["daemon-reload"])
-                .stdin(Stdio::null())
-                .output();
+            run_systemctl_step(
+                Command::new(resolve_systemctl_bin()).args(["daemon-reload"]),
+                "systemctl daemon-reload",
+                &unit_path,
+            )?;
             if was_running {
-                let out = Command::new(resolve_systemctl_bin())
-                    .args(["restart", SYSTEMD_UNIT_NAME])
-                    .stdin(Stdio::null())
-                    .output()
-                    .context("failed to execute 'systemctl restart'")?;
-                if !out.status.success() {
-                    let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                    bail!("failed to restart systemd system unit '{SYSTEMD_UNIT_NAME}': {detail}");
-                }
+                run_systemctl_step(
+                    Command::new(resolve_systemctl_bin()).args(["restart", SYSTEMD_UNIT_NAME]),
+                    &format!("systemctl restart {SYSTEMD_UNIT_NAME}"),
+                    &unit_path,
+                )?;
                 return Ok(format_split_tunnel_saved_message(&summary, true));
             }
         } else if user_exists {
@@ -6395,20 +7385,17 @@ pub fn set_service_split_tunnel(
             let unit_path = systemd_user_unit_path()?;
             let unit_text = generate_systemd_unit(&target_bin, &target_cfg);
             write_unix_user_file_safely(&unit_path, unit_text.as_bytes())?;
-            let _ = linux_user_systemctl_command()
-                .args(["daemon-reload"])
-                .stdin(Stdio::null())
-                .output();
+            run_systemctl_step(
+                linux_user_systemctl_command().args(["daemon-reload"]),
+                "systemctl --user daemon-reload",
+                &unit_path,
+            )?;
             if was_running {
-                let out = linux_user_systemctl_command()
-                    .args(["restart", SYSTEMD_UNIT_NAME])
-                    .stdin(Stdio::null())
-                    .output()
-                    .context("failed to execute 'systemctl --user restart'")?;
-                if !out.status.success() {
-                    let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                    bail!("failed to restart systemd user unit '{SYSTEMD_UNIT_NAME}': {detail}");
-                }
+                run_systemctl_step(
+                    linux_user_systemctl_command().args(["restart", SYSTEMD_UNIT_NAME]),
+                    &format!("systemctl --user restart {SYSTEMD_UNIT_NAME}"),
+                    &unit_path,
+                )?;
                 return Ok(format_split_tunnel_saved_message(&summary, true));
             }
         }
@@ -6442,10 +7429,17 @@ fn has_linux_tun_artifacts_in(paths: &[&Path]) -> bool {
         .any(|p| p.exists() || fs::symlink_metadata(p).is_ok())
 }
 
-#[cfg(target_os = "linux")]
-fn has_orphan_linux_tun_artifacts() -> bool {
-    let refs: Vec<&Path> = LINUX_TUN_ARTIFACT_PATHS.iter().map(Path::new).collect();
-    has_linux_tun_artifacts_in(&refs)
+/// Returns `true` if any leftover Linux TUN crash-recovery artifacts exist on disk.
+pub fn has_orphan_linux_tun_artifacts() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let refs: Vec<&Path> = LINUX_TUN_ARTIFACT_PATHS.iter().map(Path::new).collect();
+        has_linux_tun_artifacts_in(&refs)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
@@ -6531,7 +7525,9 @@ fn uninstall_service_with_options_impl(purge: bool, verbose: bool) -> Result<()>
         let daemon_present = launch_daemon_plist_path().exists()
             || launchctl_service_loaded(&format!("system/{LAUNCH_DAEMON_LABEL}"))
             || fs::symlink_metadata(UNIX_SYSTEM_BIN_PATH).is_ok()
-            || (purge && config_file::system_config_path().exists());
+            || (purge
+                && (config_file::system_config_path().exists()
+                    || Path::new("/Library/Application Support/vdpi").exists()));
         if daemon_present && !is_unix_root() {
             let mut args = vec!["uninstall".to_string()];
             if purge {
@@ -6612,9 +7608,12 @@ fn uninstall_service_with_options_impl(purge: bool, verbose: bool) -> Result<()>
             let sys_cfg = config_file::system_config_path();
             if sys_cfg.is_file() {
                 let _ = fs::remove_file(&sys_cfg);
-                if let Some(parent) = sys_cfg.parent() {
-                    let _ = fs::remove_dir(parent);
-                }
+            }
+            let _ = fs::remove_file("/Library/Application Support/vdpi/macos-tun-state.json");
+            let _ = fs::remove_file("/Library/Application Support/vdpi/macos-proxy-state.json");
+            let _ = fs::remove_dir("/Library/Application Support/vdpi");
+            if let Some(parent) = sys_cfg.parent() {
+                let _ = fs::remove_dir(parent);
             }
             if ensure_no_symlink_under_user_home(&user_cfg).is_ok() && user_cfg.is_file() {
                 let _ = fs::remove_file(&user_cfg);
@@ -6631,7 +7630,8 @@ fn uninstall_service_with_options_impl(purge: bool, verbose: bool) -> Result<()>
 
     #[cfg(target_os = "linux")]
     {
-        let system_present = systemd_system_unit_path().exists()
+        let system_unit_path = systemd_system_unit_path();
+        let system_present = fs::symlink_metadata(&system_unit_path).is_ok()
             || fs::symlink_metadata(UNIX_SYSTEM_BIN_PATH).is_ok()
             || has_orphan_linux_tun_artifacts()
             || (purge
@@ -6679,17 +7679,15 @@ fn uninstall_service_with_options_impl(purge: bool, verbose: bool) -> Result<()>
             .args(["disable", "--now", SYSTEMD_UNIT_NAME])
             .stdin(Stdio::null())
             .output();
-        if fs::symlink_metadata(&unit_path).is_ok() || unit_path.exists() {
+        if fs::symlink_metadata(&unit_path).is_ok() {
             ensure_no_symlink_under_user_home(&unit_path)?;
-            if unit_path.exists() {
-                fs::remove_file(&unit_path)?;
-                let _ = linux_user_systemctl_command()
-                    .args(["daemon-reload"])
-                    .stdin(Stdio::null())
-                    .output();
-                if verbose {
-                    println!("Removed systemd user unit: {}", unit_path.display());
-                }
+            fs::remove_file(&unit_path)?;
+            let _ = linux_user_systemctl_command()
+                .args(["daemon-reload"])
+                .stdin(Stdio::null())
+                .output();
+            if verbose {
+                println!("Removed systemd user unit: {}", unit_path.display());
             }
         } else if verbose {
             println!("Systemd unit {} is not installed", unit_path.display());
@@ -7019,14 +8017,7 @@ fn pause_service_impl(verbose: bool) -> Result<()> {
             let not_loaded_and_stopped =
                 out.status.code() == Some(5) && detect_service_state() != ServiceState::Running;
             if !out.status.success() && !not_loaded_and_stopped {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let detail = stderr.trim();
-                if detail.is_empty() {
-                    bail!(
-                        "failed to pause systemd system unit '{SYSTEMD_UNIT_NAME}' (exit status: {})",
-                        out.status
-                    );
-                }
+                let detail = format_systemctl_error(&out);
                 bail!("failed to pause systemd system unit '{SYSTEMD_UNIT_NAME}': {detail}");
             }
             let _ = crate::platform::linux_tun::cleanup_linux_tun_state();
@@ -7070,14 +8061,7 @@ fn pause_service_impl(verbose: bool) -> Result<()> {
         let not_loaded_and_stopped =
             out.status.code() == Some(5) && detect_service_state() != ServiceState::Running;
         if !out.status.success() && !not_loaded_and_stopped {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let detail = stderr.trim();
-            if detail.is_empty() {
-                bail!(
-                    "failed to pause systemd user unit '{SYSTEMD_UNIT_NAME}' (exit status: {})",
-                    out.status
-                );
-            }
+            let detail = format_systemctl_error(&out);
             bail!("failed to pause systemd user unit '{SYSTEMD_UNIT_NAME}': {detail}");
         }
         if is_unix_root() {
@@ -7264,9 +8248,7 @@ fn resume_service_impl(verbose: bool) -> Result<()> {
                     generate_launch_daemon_plist(Path::new(UNIX_SYSTEM_BIN_PATH), &desired_cfg);
                 if fs::read_to_string(&daemon_path).ok().as_deref() != Some(desired_plist.as_str())
                 {
-                    fs::write(&daemon_path, &desired_plist)?;
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = fs::set_permissions(&daemon_path, fs::Permissions::from_mode(0o644));
+                    write_macos_launch_daemon_plist_atomically(&daemon_path, &desired_plist)?;
                     plist_changed = true;
                 }
             }
@@ -7370,10 +8352,12 @@ fn resume_service_impl(verbose: bool) -> Result<()> {
                     unit_changed = true;
                 }
             }
-            let _ = Command::new(resolve_systemctl_bin())
-                .args(["daemon-reload"])
-                .stdin(Stdio::null())
-                .output();
+            run_systemctl_step_for_resume(
+                Command::new(resolve_systemctl_bin()).args(["daemon-reload"]),
+                "systemctl daemon-reload",
+                &system_unit,
+                unit_changed,
+            )?;
             let action = linux_resume_systemctl_action(unit_changed);
             let out = Command::new(resolve_systemctl_bin())
                 .args([action, SYSTEMD_UNIT_NAME])
@@ -7381,14 +8365,7 @@ fn resume_service_impl(verbose: bool) -> Result<()> {
                 .output()
                 .with_context(|| format!("failed to execute 'systemctl {action}'"))?;
             if !out.status.success() {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let detail = stderr.trim();
-                if detail.is_empty() {
-                    bail!(
-                        "failed to resume systemd system unit '{SYSTEMD_UNIT_NAME}' (exit status: {})",
-                        out.status
-                    );
-                }
+                let detail = format_systemctl_error(&out);
                 bail!("failed to resume systemd system unit '{SYSTEMD_UNIT_NAME}': {detail}");
             }
             if verbose {
@@ -7423,10 +8400,12 @@ fn resume_service_impl(verbose: bool) -> Result<()> {
                 }
             }
         }
-        let _ = linux_user_systemctl_command()
-            .args(["daemon-reload"])
-            .stdin(Stdio::null())
-            .output();
+        run_systemctl_step_for_resume(
+            linux_user_systemctl_command().args(["daemon-reload"]),
+            "systemctl --user daemon-reload",
+            &unit_path,
+            unit_changed,
+        )?;
         let action = linux_resume_systemctl_action(unit_changed);
         let out = linux_user_systemctl_command()
             .args([action, SYSTEMD_UNIT_NAME])
@@ -7434,14 +8413,7 @@ fn resume_service_impl(verbose: bool) -> Result<()> {
             .output()
             .with_context(|| format!("failed to execute 'systemctl --user {action}'"))?;
         if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let detail = stderr.trim();
-            if detail.is_empty() {
-                bail!(
-                    "failed to resume systemd user unit '{SYSTEMD_UNIT_NAME}' (exit status: {})",
-                    out.status
-                );
-            }
+            let detail = format_systemctl_error(&out);
             bail!("failed to resume systemd user unit '{SYSTEMD_UNIT_NAME}': {detail}");
         }
 
@@ -10784,22 +11756,41 @@ mod tests {
 
         cfg.engine = EngineMode::Proxy;
         assert_eq!(
-            build_unix_install_sudo_args(&cfg, true),
+            build_unix_install_sudo_args(&cfg, true, None, false),
             vec!["install", "--upgrade"]
+        );
+        assert_eq!(
+            build_unix_install_sudo_args(&cfg, true, Some(EngineMode::Proxy), true),
+            vec!["install", "--upgrade", "--proxy"]
         );
 
         cfg.engine = EngineMode::Tun;
+        // Plain `vdpi install --upgrade` against an existing root TUN daemon must NOT
+        // synthesize `--tun` (otherwise the elevated process treats it as an explicit override).
         assert_eq!(
-            build_unix_install_sudo_args(&cfg, true),
+            build_unix_install_sudo_args(&cfg, true, None, true),
+            vec!["install", "--upgrade"]
+        );
+        // Without a root system daemon, preserve TUN intent across sudo when inferred from config.
+        assert_eq!(
+            build_unix_install_sudo_args(&cfg, true, None, false),
             vec!["install", "--upgrade", "--tun"]
         );
+        assert_eq!(
+            build_unix_install_sudo_args(&cfg, true, Some(EngineMode::Tun), true),
+            vec!["install", "--upgrade", "--tun"]
+        );
+        assert_eq!(
+            build_unix_install_sudo_args(&cfg, true, Some(EngineMode::Proxy), true),
+            vec!["install", "--upgrade", "--proxy"]
+        );
 
-        let fresh_tun = build_unix_install_sudo_args(&cfg, false);
+        let fresh_tun = build_unix_install_sudo_args(&cfg, false, None, false);
         assert!(fresh_tun.iter().any(|a| a == "--tun"));
         assert_eq!(fresh_tun.last().map(String::as_str), Some("install"));
 
         cfg.engine = EngineMode::Proxy;
-        let fresh_proxy = build_unix_install_sudo_args(&cfg, false);
+        let fresh_proxy = build_unix_install_sudo_args(&cfg, false, None, false);
         assert!(fresh_proxy.iter().any(|a| a == "--proxy"));
         assert_eq!(fresh_proxy.last().map(String::as_str), Some("install"));
     }
@@ -11926,7 +12917,7 @@ mod tests {
         .expect_err("corrupted installed wintun with no valid sibling must fail");
         let err_msg = err.to_string();
         assert!(err_msg.contains(
-            "corrupted or mismatched — extract all files from the zip (keep wintun.dll beside vdpi.exe)"
+            "corrupted or mismatched - extract all files from the zip (keep wintun.dll beside vdpi.exe)"
         ));
         assert!(!err_msg.contains("failed SHA-256 verification"));
 
@@ -12238,6 +13229,504 @@ mod tests {
 
         win_fs_hardening::apply_hardened_dir_dacl(&base)
             .expect("apply_hardened_dir_dacl must harden all direct non-reparse child files");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn va_r1_sudo_invoking_user_resolution_rejects_untrusted_home_and_supports_real_uid() {
+        use std::ffi::OsStr;
+
+        let alice = UnixTargetUser {
+            uid: 501,
+            gid: 20,
+            #[cfg(target_os = "linux")]
+            username: Some("alice".to_string()),
+            home_dir: PathBuf::from("/Users/alice"),
+        };
+        let bob = UnixTargetUser {
+            uid: 1001,
+            gid: 1001,
+            #[cfg(target_os = "linux")]
+            username: Some("bob".to_string()),
+            home_dir: PathBuf::from("/home/bob"),
+        };
+        let root_entry = UnixTargetUser {
+            uid: 0,
+            gid: 0,
+            #[cfg(target_os = "linux")]
+            username: Some("root".to_string()),
+            home_dir: PathBuf::from("/root"),
+        };
+        let by_uid = |uid: u32| match uid {
+            501 => Some(alice.clone()),
+            1001 => Some(bob.clone()),
+            9999 => Some(root_entry.clone()),
+            _ => None,
+        };
+        let by_name = |name: &str| match name {
+            "alice" => Some(alice.clone()),
+            "bob" => Some(bob.clone()),
+            "fake_root" => Some(root_entry.clone()),
+            _ => None,
+        };
+
+        // SUDO_UID resolves via passwd lookup.
+        assert_eq!(
+            resolve_sudo_invoking_user_with(
+                Some(OsStr::new("501")),
+                None,
+                None,
+                None,
+                0,
+                by_uid,
+                by_name,
+            ),
+            Some(alice.clone())
+        );
+
+        // Unknown SUDO_UID / PKEXEC_UID / real_uid must return None (never trust $HOME).
+        assert_eq!(
+            resolve_sudo_invoking_user_with(
+                Some(OsStr::new("2000")),
+                None,
+                Some(OsStr::new("2001")),
+                None,
+                2002,
+                by_uid,
+                by_name,
+            ),
+            None
+        );
+
+        // Non-zero real_uid resolves via passwd lookup when env vars are absent.
+        assert_eq!(
+            resolve_sudo_invoking_user_with(None, None, None, None, 501, by_uid, by_name),
+            Some(alice.clone())
+        );
+
+        // DOAS_USER resolves via username lookup; root/invalid names rejected.
+        assert_eq!(
+            resolve_sudo_invoking_user_with(
+                None,
+                None,
+                None,
+                Some("bob"),
+                0,
+                by_uid,
+                by_name,
+            ),
+            Some(bob.clone())
+        );
+        assert_eq!(
+            resolve_sudo_invoking_user_with(
+                Some(OsStr::new("0")),
+                Some("root"),
+                Some(OsStr::new("9999")),
+                Some("fake_root"),
+                0,
+                by_uid,
+                by_name,
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_sudo_invoking_user_with(
+                None,
+                Some("../alice"),
+                None,
+                None,
+                0,
+                by_uid,
+                by_name,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn va_r1_upgrade_config_isolation_downgrade_guard_windows_args_and_language_preservation() {
+        use std::ffi::OsStr;
+
+        // Unix upgrade builds from RuntimeConfig::default() (never contaminated system config).
+        let partial_user = FileConfig {
+            port: Some(9090),
+            ..FileConfig::default()
+        };
+        let upgraded_proxy =
+            resolve_unix_upgrade_runtime_config(false, Some(&partial_user), None);
+        assert_eq!(upgraded_proxy.engine, EngineMode::Proxy);
+        assert_eq!(upgraded_proxy.port, 9090);
+        assert_eq!(upgraded_proxy.dns_addr, RuntimeConfig::default().dns_addr);
+
+        let upgraded_override_tun = resolve_unix_upgrade_runtime_config(
+            false,
+            Some(&partial_user),
+            Some(EngineMode::Tun),
+        );
+        assert_eq!(upgraded_override_tun.engine, EngineMode::Tun);
+
+        let upgraded_override_proxy = resolve_unix_upgrade_runtime_config(
+            true,
+            Some(&partial_user),
+            Some(EngineMode::Proxy),
+        );
+        assert_eq!(upgraded_override_proxy.engine, EngineMode::Proxy);
+
+        let upgraded_sys_default = resolve_unix_upgrade_runtime_config(true, None, None);
+        assert_eq!(upgraded_sys_default.engine, EngineMode::Tun);
+
+        // /usr/local/bin/vdpi downgrade guard refuses older version, allows same/newer/unknown.
+        let sys_bin = Path::new(UNIX_SYSTEM_BIN_PATH);
+        assert!(check_unix_system_bin_no_downgrade_with_version(Some("0.7.0"), "0.6.1", sys_bin)
+            .is_err());
+        assert!(check_unix_system_bin_no_downgrade_with_version(Some("0.6.1"), "0.6.1", sys_bin)
+            .is_ok());
+        assert!(check_unix_system_bin_no_downgrade_with_version(Some("0.6.0"), "0.6.1", sys_bin)
+            .is_ok());
+        assert!(check_unix_system_bin_no_downgrade_with_version(None, "0.6.1", sys_bin).is_ok());
+
+        // systemd_user_unit_path config base rejects relative paths and `..` components.
+        let home = Path::new("/home/alice");
+        assert_eq!(
+            resolve_systemd_user_config_base(home, Some(OsStr::new("relative/.xdg")), false),
+            home.join(".config")
+        );
+        assert_eq!(
+            resolve_systemd_user_config_base(home, Some(OsStr::new(".config")), true),
+            home.join(".config")
+        );
+        assert_eq!(
+            resolve_systemd_user_config_base(home, Some(OsStr::new("/home/alice/../../etc")), true),
+            home.join(".config")
+        );
+        assert_eq!(
+            resolve_systemd_user_config_base(home, Some(OsStr::new("/tmp/../etc")), false),
+            home.join(".config")
+        );
+        assert_eq!(
+            resolve_systemd_user_config_base(home, Some(OsStr::new("/home/alice/.xdg")), true),
+            PathBuf::from("/home/alice/.xdg")
+        );
+
+        // Windows Program Files path validation rejects UNC/device/relative/traversal.
+        assert!(is_valid_windows_program_files_path_str(r"C:\Program Files"));
+        assert!(is_valid_windows_program_files_path_str(r"D:\Apps\Program Files"));
+        assert!(!is_valid_windows_program_files_path_str(""));
+        assert!(!is_valid_windows_program_files_path_str(r"\\attacker\share"));
+        assert!(!is_valid_windows_program_files_path_str(r"\\?\C:\Program Files"));
+        assert!(!is_valid_windows_program_files_path_str(r"C:\Program Files\..\Temp"));
+        assert!(!is_valid_windows_program_files_path_str("Program Files"));
+
+        // Windows upgrade elevated args preserve explicit engine override.
+        let default_cfg = RuntimeConfig::default();
+        assert_eq!(
+            build_windows_install_elevated_args(&default_cfg, true, None),
+            vec!["install", "--upgrade"]
+        );
+        assert_eq!(
+            build_windows_install_elevated_args(&default_cfg, true, Some(EngineMode::Tun)),
+            vec!["install", "--upgrade", "--tun"]
+        );
+        assert_eq!(
+            build_windows_install_elevated_args(&default_cfg, true, Some(EngineMode::Proxy)),
+            vec!["install", "--upgrade", "--proxy"]
+        );
+
+        // Windows service upgrade preserves stopped/paused state.
+        assert!(should_start_windows_service_after_install(false, false, false));
+        assert!(should_start_windows_service_after_install(false, true, false));
+        assert!(should_start_windows_service_after_install(true, false, false));
+        assert!(should_start_windows_service_after_install(true, true, true));
+        assert!(!should_start_windows_service_after_install(true, true, false));
+
+        // Fresh install preserves existing `language` from system or fallback user config.
+        let base = std::env::temp_dir().join(format!(
+            "vdpi-va-r1-lang-preserve-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("create temp dir");
+        let sys_cfg = base.join("sys.toml");
+        let usr_cfg = base.join("usr.toml");
+        fs::write(&usr_cfg, "schema_version = 1\nlanguage = \"tr\"\n").expect("write user cfg");
+
+        let mut fresh = file_config_from_runtime(&default_cfg);
+        assert_eq!(fresh.language, None);
+        preserve_existing_language(&mut fresh, &sys_cfg, true, Some(&usr_cfg));
+        assert_eq!(fresh.language.as_deref(), Some("tr"));
+
+        fs::write(&sys_cfg, "schema_version = 1\nlanguage = \"en\"\n").expect("write sys cfg");
+        let mut fresh2 = file_config_from_runtime(&default_cfg);
+        preserve_existing_language(&mut fresh2, &sys_cfg, true, Some(&usr_cfg));
+        assert_eq!(fresh2.language.as_deref(), Some("en"));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn va_r1_split_tunnel_temp_file_hardening() {
+        // UNC, device, traversal, and non-matching filenames are rejected.
+        for bad in [
+            r"\\server\share\vdpi-split-apps-1-0.txt",
+            r"\\.\pipe\vdpi-split-apps-1-0.txt",
+            r"\\?\C:\Temp\vdpi-split-apps-1-0.txt",
+            "//server/share/vdpi-split-apps-1-0.txt",
+            "/tmp/../etc/vdpi-split-apps-1-0.txt",
+            "/tmp/other.txt",
+        ] {
+            let arg = format!("{SPLIT_APPS_FILE_PREFIX}{bad}");
+            assert!(
+                resolve_split_tunnel_apps_input(&[arg]).is_err(),
+                "must reject untrusted split temp path: {bad}"
+            );
+        }
+
+        // Owner authorization helper checks.
+        assert!(is_allowed_split_temp_file_owner(1000, 1000, None));
+        assert!(is_allowed_split_temp_file_owner(0, 0, None));
+        assert!(is_allowed_split_temp_file_owner(1000, 0, Some(1000)));
+        assert!(!is_allowed_split_temp_file_owner(1001, 0, Some(1000)));
+        assert!(!is_allowed_split_temp_file_owner(1001, 1000, None));
+
+        // Oversized file exceeding MAX_SPLIT_APPS_TEMP_FILE_BYTES is rejected.
+        let base = std::env::temp_dir().join(format!(
+            "vdpi-va-r1-split-temp-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("create temp dir");
+        let oversized = base.join("vdpi-split-apps-oversized.txt");
+        fs::write(
+            &oversized,
+            vec![b'a'; (MAX_SPLIT_APPS_TEMP_FILE_BYTES + 16) as usize],
+        )
+        .expect("write oversized temp file");
+        let oversized_arg = format!("{SPLIT_APPS_FILE_PREFIX}{}", oversized.display());
+        assert!(resolve_split_tunnel_apps_input(&[oversized_arg]).is_err());
+
+        // Valid regular file is accepted.
+        let valid = base.join("vdpi-split-apps-ok.txt");
+        fs::write(&valid, "discord\nsteam\n").expect("write valid temp file");
+        let valid_arg = format!("{SPLIT_APPS_FILE_PREFIX}{}", valid.display());
+        assert_eq!(
+            resolve_split_tunnel_apps_input(&[valid_arg]).expect("valid temp file should load"),
+            vec!["discord".to_string(), "steam".to_string()]
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let symlink_file = base.join("vdpi-split-apps-link.txt");
+            symlink(&valid, &symlink_file).expect("create symlink file");
+            let sym_arg = format!("{SPLIT_APPS_FILE_PREFIX}{}", symlink_file.display());
+            assert!(resolve_split_tunnel_apps_input(&[sym_arg]).is_err());
+
+            let symlink_dir = base.join("linkdir");
+            symlink(&base, &symlink_dir).expect("create symlink dir");
+            let via_dir = symlink_dir.join("vdpi-split-apps-ok.txt");
+            let via_dir_arg = format!("{SPLIT_APPS_FILE_PREFIX}{}", via_dir.display());
+            assert!(resolve_split_tunnel_apps_input(&[via_dir_arg]).is_err());
+        }
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn va_r1_windows_backup_rollback_and_single_read_wintun_copy() {
+        let base = std::env::temp_dir().join(format!(
+            "vdpi-va-r1-win-backup-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let src_dir = base.join("src");
+        let bin_dir = base.join("bin");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+
+        // 1. copy_binary_atomically_with_backup + rollback restores original binary.
+        let target_bin = bin_dir.join("vdpi.exe");
+        let new_exe = src_dir.join("vdpi.exe");
+        fs::write(&target_bin, b"old-vdpi-binary").expect("write old binary");
+        fs::write(&new_exe, b"new-vdpi-binary").expect("write new binary");
+
+        let backup = copy_binary_atomically_with_backup(&new_exe, &target_bin, true)
+            .expect("atomic copy with backup")
+            .expect("must retain backup when replacing existing target");
+        assert_eq!(fs::read(&target_bin).expect("read new bin"), b"new-vdpi-binary");
+        assert!(backup.backup.is_file());
+        backup.rollback().expect("rollback must restore old binary");
+        assert_eq!(fs::read(&target_bin).expect("read restored bin"), b"old-vdpi-binary");
+
+        // 2. copy_binary_atomically_with_backup + commit removes backup and keeps new binary.
+        let backup2 = copy_binary_atomically_with_backup(&new_exe, &target_bin, true)
+            .expect("second atomic copy with backup")
+            .expect("must retain second backup");
+        let backup2_path = backup2.backup.clone();
+        backup2.commit();
+        assert!(!backup2_path.exists());
+        assert_eq!(fs::read(&target_bin).expect("read committed bin"), b"new-vdpi-binary");
+
+        // 3. Rollback returns Err when backup file is missing.
+        let broken_backup = ReplacedFileBackup {
+            target: target_bin.clone(),
+            backup: bin_dir.join("missing.old.exe"),
+        };
+        assert!(broken_backup.rollback().is_err());
+
+        // 4. Single-read copy_verified_wintun_to_bin_dir_with_expected_sha256 verifies & rolls back.
+        const ABC_SHA256: &str =
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let target_wintun = bin_dir.join("wintun.dll");
+        let src_wintun = src_dir.join("wintun.dll");
+        fs::write(&target_wintun, b"prior-wintun").expect("write prior wintun");
+        fs::write(&src_wintun, b"abc").expect("write verified wintun");
+
+        let (copied, wintun_backup) = copy_verified_wintun_to_bin_dir_with_expected_sha256(
+            &src_wintun,
+            &bin_dir,
+            ABC_SHA256,
+            true,
+        )
+        .expect("single-read verified wintun copy");
+        assert!(copied);
+        assert_eq!(fs::read(&target_wintun).expect("read installed wintun"), b"abc");
+        let wintun_backup = wintun_backup.expect("must retain wintun backup");
+        wintun_backup
+            .rollback()
+            .expect("wintun rollback must restore prior dll");
+        assert_eq!(
+            fs::read(&target_wintun).expect("read restored wintun"),
+            b"prior-wintun"
+        );
+
+        // Tampered source bytes must fail verification without overwriting existing target.
+        fs::write(&src_wintun, b"tampered").expect("write tampered wintun");
+        assert!(copy_verified_wintun_to_bin_dir_with_expected_sha256(
+            &src_wintun,
+            &bin_dir,
+            ABC_SHA256,
+            true,
+        )
+        .is_err());
+        assert_eq!(
+            fs::read(&target_wintun).expect("target wintun untouched"),
+            b"prior-wintun"
+        );
+
+        // 5. vdpi_root_dir resolves via SHGetKnownFolderPath to an absolute *\vdpi path.
+        let root = vdpi_root_dir().expect("resolve Windows vdpi_root_dir");
+        assert!(root.is_absolute());
+        assert_eq!(root.file_name().and_then(std::ffi::OsStr::to_str), Some("vdpi"));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn va_r1_linux_write_system_unit_atomically_sets_0644_and_rejects_symlink() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let base = std::env::temp_dir().join(format!(
+            "vdpi-va-r1-linux-unit-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("create temp dir");
+
+        let unit_path = base.join("vdpi.service");
+        write_linux_system_unit_atomically(&unit_path, "[Unit]\nDescription=test1\n")
+            .expect("write unit atomically");
+        let mode = fs::symlink_metadata(&unit_path)
+            .expect("stat unit")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o644);
+        assert_eq!(
+            fs::read_to_string(&unit_path).expect("read unit"),
+            "[Unit]\nDescription=test1\n"
+        );
+
+        write_linux_system_unit_atomically(&unit_path, "[Unit]\nDescription=test2\n")
+            .expect("overwrite unit atomically");
+        assert_eq!(
+            fs::read_to_string(&unit_path).expect("read updated unit"),
+            "[Unit]\nDescription=test2\n"
+        );
+        let leftover_tmps = fs::read_dir(&base)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .count();
+        assert_eq!(leftover_tmps, 0);
+
+        let sentinel = base.join("sentinel.txt");
+        fs::write(&sentinel, b"keep").expect("write sentinel");
+        let sym_unit = base.join("sym.service");
+        symlink(&sentinel, &sym_unit).expect("create symlink");
+        assert!(write_linux_system_unit_atomically(&sym_unit, "[Unit]\n").is_err());
+        assert_eq!(fs::read_to_string(&sentinel).expect("sentinel intact"), "keep");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn va_r1_macos_write_launch_daemon_plist_atomically_sets_0644_and_rejects_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let base = std::env::temp_dir().join(format!(
+            "vdpi-va-r1-macos-plist-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let real_dir = base.join("daemons");
+        fs::create_dir_all(&real_dir).expect("create temp dir");
+
+        let plist_path = real_dir.join("com.vdpi.daemon.plist");
+        write_macos_launch_daemon_plist_atomically(&plist_path, "<plist>v1</plist>")
+            .expect("write plist atomically");
+        let mode = fs::symlink_metadata(&plist_path)
+            .expect("stat plist")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o644);
+        assert_eq!(
+            fs::read_to_string(&plist_path).expect("read plist"),
+            "<plist>v1</plist>"
+        );
+
+        write_macos_launch_daemon_plist_atomically(&plist_path, "<plist>v2</plist>")
+            .expect("overwrite plist atomically");
+        assert_eq!(
+            fs::read_to_string(&plist_path).expect("read updated plist"),
+            "<plist>v2</plist>"
+        );
+        let leftover_tmps = fs::read_dir(&real_dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .count();
+        assert_eq!(leftover_tmps, 0);
+
+        let sentinel = base.join("sentinel.plist");
+        fs::write(&sentinel, "keep").expect("write sentinel");
+        let sym_plist = real_dir.join("sym.plist");
+        symlink(&sentinel, &sym_plist).expect("create symlink plist");
+        assert!(write_macos_launch_daemon_plist_atomically(&sym_plist, "<plist/>").is_err());
+        assert_eq!(fs::read_to_string(&sentinel).expect("sentinel intact"), "keep");
+
+        let sym_dir = base.join("sym_daemons");
+        symlink(&real_dir, &sym_dir).expect("create symlink dir");
+        assert!(write_macos_launch_daemon_plist_atomically(
+            &sym_dir.join("com.vdpi.daemon.plist"),
+            "<plist/>"
+        )
+        .is_err());
 
         let _ = fs::remove_dir_all(&base);
     }

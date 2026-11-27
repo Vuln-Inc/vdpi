@@ -29,7 +29,7 @@ const FALLBACK_STYLES = `
 @keyframes vdpi-toast-enter {
   from {
     opacity: 0;
-    transform: translateY(-6px);
+    transform: translateY(6px);
   }
   to {
     opacity: 1;
@@ -39,23 +39,24 @@ const FALLBACK_STYLES = `
 
 :where(.toast-stack) {
   position: fixed;
-  top: 16px;
+  top: auto;
   right: 16px;
-  bottom: auto;
+  bottom: 16px;
   z-index: 1100;
   display: flex;
   flex-direction: column;
   align-items: flex-end;
   gap: 8px;
-  width: min(340px, calc(100vw - 32px));
+  width: min(320px, calc(100vw - 240px));
   pointer-events: none;
   box-sizing: border-box;
 }
 
-.toast-stack[data-placement="top-right"] {
-  top: 16px;
+.toast-stack[data-placement="bottom-right"] {
+  top: auto;
   right: 16px;
-  bottom: auto;
+  bottom: 16px;
+  width: min(320px, calc(100vw - 240px));
 }
 
 :where(.toast) {
@@ -115,7 +116,7 @@ const FALLBACK_STYLES = `
 }
 
 :where([data-theme="light"] .toast.toast--error) {
-  --_toast-accent: var(--status-crimson-fg, var(--danger, #c82320));
+  --_toast-accent: var(--status-crimson-fg, var(--danger, #b41d1a));
 }
 
 @media (prefers-color-scheme: light) {
@@ -139,7 +140,7 @@ const FALLBACK_STYLES = `
   }
 
   :where(:root:not([data-theme="dark"]) .toast.toast--error) {
-    --_toast-accent: var(--status-crimson-fg, var(--danger, #c82320));
+    --_toast-accent: var(--status-crimson-fg, var(--danger, #b41d1a));
   }
 }
 
@@ -379,7 +380,7 @@ function ToastStackComponent({
       className={stackClasses}
       role="region"
       aria-label={tShell(lang, "notificationsAria")}
-      data-placement="top-right"
+      data-placement="bottom-right"
     >
       {visibleToasts.map((toast) => {
         const tone: ToastTone = toast.tone ?? "info";

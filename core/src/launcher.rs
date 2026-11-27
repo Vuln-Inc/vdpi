@@ -257,7 +257,7 @@ fn split_tunnel_item(split: &SplitTunnelConfig) -> MenuItem {
         Choice::SplitTunnel,
         format!(
             "{} · {}",
-            tr("Split tunneling", "Bölünmüş tünelleme"),
+            tr("Split tunneling", "Bölünmüş tünel"),
             format_split_summary(split)
         ),
         tr(
@@ -675,7 +675,7 @@ fn doctor_item() -> MenuItem {
         tr("Run diagnostics", "Tanılama çalıştır"),
         tr(
             "Tests DNS and bypass connectivity.",
-            "DNS ve bypass bağlantısını test eder.",
+            "DNS ve atlatma bağlantısını test eder.",
         ),
     )
 }
@@ -726,7 +726,7 @@ fn dashboard_item() -> MenuItem {
         tr("Open live dashboard", "Canlı paneli aç"),
         tr(
             "Real-time throughput, connections, ISP stage & diagnostics.",
-            "Gerçek zamanlı hız, bağlantılar, ISS aşaması ve tanılama.",
+            "Gerçek zamanlı hız, bağlantılar, İSS aşaması ve tanılama.",
         ),
     )
 }
@@ -1358,7 +1358,14 @@ pub fn clear_preference() {
     if let Some(path) = preference_path() {
         if let Err(e) = fs::remove_file(path) {
             if e.kind() != io::ErrorKind::NotFound {
-                eprintln!("vdpi could not clear the previous run-only choice: {e}");
+                match active_lang() {
+                    Lang::En => {
+                        eprintln!("vdpi could not clear the previous run-only choice: {e}");
+                    }
+                    Lang::Tr => {
+                        eprintln!("vdpi önceki yalnızca-çalıştır tercihini temizleyemedi: {e}");
+                    }
+                }
             }
         }
     }
@@ -1368,11 +1375,61 @@ fn preference_path() -> Option<PathBuf> {
     Some(env::current_exe().ok()?.parent()?.join("run-directly"))
 }
 
+pub(super) fn localize_custom_dns_error(err: &str) -> std::borrow::Cow<'_, str> {
+    if active_lang() != Lang::Tr {
+        return std::borrow::Cow::Borrowed(err);
+    }
+    let translated = match err {
+        "DNS server cannot be empty" => "DNS sunucusu boş olamaz",
+        "DNS server cannot contain control characters" => {
+            "DNS sunucusu kontrol karakterleri içeremez"
+        }
+        "DNS server cannot contain whitespace" => "DNS sunucusu boşluk içeremez",
+        "Enter a valid IPv4/IPv6 address or https:// DoH URL" => {
+            "Geçerli bir IPv4/IPv6 adresi veya https:// DoH adresi girin"
+        }
+        "DNS IP cannot be 0.0.0.0" => "DNS IP adresi 0.0.0.0 olamaz",
+        "DNS IP cannot be ::" => "DNS IP adresi :: olamaz",
+        "DNS IP cannot be a multicast address" => {
+            "DNS IP adresi çoklu yayın (multicast) adresi olamaz"
+        }
+        "DNS IP cannot be a broadcast address" => "DNS IP adresi yayın (broadcast) adresi olamaz",
+        "Invalid port in DoH URL (must be 1-65535)" => {
+            "DoH adresinde geçersiz port (1-65535 arasında olmalı)"
+        }
+        "Invalid hostname in DoH URL" => "DoH adresinde geçersiz alan adı",
+        "Invalid hostname or IPv4 address in DoH URL" => {
+            "DoH adresinde geçersiz alan adı veya IPv4 adresi"
+        }
+        "Invalid percent-encoding in DoH URL path" => "DoH adres yolunda geçersiz yüzde kodlaması",
+        "Invalid character in DoH URL path or query" => {
+            "DoH adres yolunda veya sorgusunda geçersiz karakter"
+        }
+        "DoH URL must start with https://" => "DoH adresi https:// ile başlamalıdır",
+        "DoH URL must use https:// (http:// is not supported)" => {
+            "DoH adresi https:// kullanmalıdır (http:// desteklenmez)"
+        }
+        "DoH URL cannot contain a '#' fragment" => "DoH adresi '#' bölümü içeremez",
+        "DoH URL is missing a hostname or IP" => "DoH adresinde alan adı veya IP eksik",
+        "DoH URL cannot contain userinfo (@)" => "DoH adresi kullanıcı bilgisi (@) içeremez",
+        "Unclosed '[' in IPv6 DoH URL" => "IPv6 DoH adresinde kapatılmamış '[' karakteri",
+        "Invalid IPv6 address in DoH URL" => "DoH adresinde geçersiz IPv6 adresi",
+        "Invalid characters after IPv6 address in DoH URL" => {
+            "DoH adresinde IPv6 adresinden sonra geçersiz karakterler"
+        }
+        "Invalid brackets in DoH URL host" => "DoH sunucu adında geçersiz köşeli parantezler",
+        "Wrap IPv6 DoH hosts in [...] brackets" => "IPv6 DoH sunucularını [...] içine alın",
+        _ => return std::borrow::Cow::Borrowed(err),
+    };
+    std::borrow::Cow::Borrowed(translated)
+}
+
 fn print_console_menu(output: &mut impl Write, menu: &LauncherMenu) -> io::Result<()> {
     writeln!(
         output,
-        "\n  vdpi v{}  |  {REPOSITORY_URL}",
-        env!("CARGO_PKG_VERSION")
+        "\n  vdpi v{}  [g: {}]  |  {REPOSITORY_URL}",
+        env!("CARGO_PKG_VERSION"),
+        active_lang().badge()
     )?;
     for row in &menu.status_rows {
         if let Some((badge, _)) = &row.badge {
@@ -1451,8 +1508,9 @@ fn read_custom_dns_input(
             Err(err) => {
                 writeln!(
                     output,
-                    "  {}: {err}",
-                    tr("Invalid DNS server", "Geçersiz DNS sunucusu")
+                    "  {}: {}",
+                    tr("Invalid DNS server", "Geçersiz DNS sunucusu"),
+                    localize_custom_dns_error(&err)
                 )?;
             }
         }
@@ -1573,6 +1631,7 @@ where
                 "d".to_string(),
                 "s".to_string(),
                 "r".to_string(),
+                "g".to_string(),
                 "q".to_string(),
             ])
             .collect();
@@ -2327,7 +2386,8 @@ mod tests {
         assert!(output.contains("Split tunneling · All apps"));
         assert!(output.contains("Run diagnostics"));
         assert!(output.contains("Enter a number from 1 to 7, r to refresh, or q to quit."));
-        assert!(output.contains("Choose [1 / 2 / 3 / 4 / 5 / 6 / 7 / d / s / r / q]: "));
+        assert!(output.contains("Choose [1 / 2 / 3 / 4 / 5 / 6 / 7 / d / s / r / g / q]: "));
+        assert!(output.contains("[g: EN]"));
         assert!(output.contains(REPOSITORY_URL));
         assert!(!output.contains('\x1b'));
 
@@ -3219,11 +3279,20 @@ mod tests {
         assert!(menu.items[3].title.contains("DNS sunucusu seç · Özel (dns.nextdns.io)"));
         assert_eq!(
             menu.items[4].title,
-            "Bölünmüş tünelleme · Hariç tut (1 uygulama)"
+            "Bölünmüş tünel · Hariç tut (1 uygulama)"
         );
         assert_eq!(menu.items[5].title, "Tanılama çalıştır");
+        assert_eq!(menu.items[5].hint, "DNS ve atlatma bağlantısını test eder.");
         assert_eq!(menu.items[6].title, "Çıkış");
         assert!(dns_preset_hint(&DNS_PRESETS[0]).contains("varsayılan"));
+        assert_eq!(
+            localize_custom_dns_error("DNS server cannot be empty"),
+            "DNS sunucusu boş olamaz"
+        );
+        assert_eq!(
+            localize_custom_dns_error("DoH URL must use https:// (http:// is not supported)"),
+            "DoH adresi https:// kullanmalıdır (http:// desteklenmez)"
+        );
     }
 
     #[test]

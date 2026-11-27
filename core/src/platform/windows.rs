@@ -1,14 +1,14 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::ffi::{c_void, OsStr};
+use std::ffi::{c_void, OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -192,6 +192,58 @@ extern "system" {
         u_timeout: u32,
         lpdw_result: *mut usize,
     ) -> isize;
+}
+
+#[repr(C)]
+struct KnownFolderGuid {
+    data1: u32,
+    data2: u16,
+    data3: u16,
+    data4: [u8; 8],
+}
+
+// FOLDERID_ProgramFiles = {905E63B6-C1BF-494E-B29C-65B732D3D21A}
+const FOLDERID_PROGRAM_FILES: KnownFolderGuid = KnownFolderGuid {
+    data1: 0x905e_63b6,
+    data2: 0xc1bf,
+    data3: 0x494e,
+    data4: [0xb2, 0x9c, 0x65, 0xb7, 0x32, 0xd3, 0xd2, 0x1a],
+};
+
+// FOLDERID_ProgramData = {62AB5D82-FDC1-4DC3-A9DD-070D1D495D97}
+const FOLDERID_PROGRAM_DATA: KnownFolderGuid = KnownFolderGuid {
+    data1: 0x62ab_5d82,
+    data2: 0xfdc1,
+    data3: 0x4dc3,
+    data4: [0xa9, 0xdd, 0x07, 0x0d, 0x1d, 0x49, 0x5d, 0x97],
+};
+
+#[link(name = "shell32")]
+extern "system" {
+    fn SHGetKnownFolderPath(
+        rfid: *const KnownFolderGuid,
+        dw_flags: u32,
+        h_token: *mut c_void,
+        ppsz_path: *mut *mut u16,
+    ) -> i32;
+}
+
+#[link(name = "ole32")]
+extern "system" {
+    fn CoTaskMemFree(pv: *mut c_void);
+}
+
+struct CoTaskMemGuard(*mut u16);
+
+impl Drop for CoTaskMemGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: `self.0` was allocated by `SHGetKnownFolderPath` and must be freed via `CoTaskMemFree`.
+            unsafe {
+                CoTaskMemFree(self.0.cast::<c_void>());
+            }
+        }
+    }
 }
 
 fn windows_system32_dir() -> PathBuf {
@@ -572,12 +624,118 @@ fn plan_wininet_restore(
     }
 }
 
+fn is_valid_windows_known_folder_path_str(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.contains('\0')
+        || trimmed.starts_with(r"\\")
+        || trimmed.starts_with("//")
+    {
+        return false;
+    }
+    let bytes = trimmed.as_bytes();
+    if bytes.len() < 3
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || !matches!(bytes[2], b'\\' | b'/')
+    {
+        return false;
+    }
+    if trimmed[3..].trim_matches(['\\', '/']).is_empty() {
+        return false;
+    }
+    !trimmed.split(['\\', '/']).any(|seg| seg == "..")
+}
+
+fn has_reparse_point_component(path: &Path) -> bool {
+    let mut cur = PathBuf::new();
+    let mut has_normal = false;
+    for comp in path.components() {
+        match comp {
+            Component::Prefix(_) | Component::RootDir => {
+                cur.push(comp.as_os_str());
+                continue;
+            }
+            Component::CurDir => continue,
+            Component::ParentDir => return true,
+            Component::Normal(part) => {
+                has_normal = true;
+                cur.push(part);
+            }
+        }
+        match path_attributes_no_follow(&cur) {
+            Ok(Some(attrs)) if is_reparse_point_attrs(attrs) => return true,
+            Ok(Some(_)) | Ok(None) => {}
+            Err(_) => return true,
+        }
+    }
+    !has_normal
+}
+
+fn validate_known_folder_candidate(candidate: Option<PathBuf>, fallback: &'static str) -> PathBuf {
+    if let Some(path) = candidate {
+        if path
+            .to_str()
+            .is_some_and(is_valid_windows_known_folder_path_str)
+            && !has_reparse_point_component(&path)
+        {
+            return path;
+        }
+        warn!(
+            path = %path.display(),
+            fallback,
+            "SHGetKnownFolderPath returned an invalid or reparse-point path; falling back"
+        );
+    }
+    let fallback_path = PathBuf::from(fallback);
+    debug_assert!(is_valid_windows_known_folder_path_str(fallback));
+    if has_reparse_point_component(&fallback_path) {
+        warn!(
+            path = %fallback_path.display(),
+            "fallback Windows known folder path is an NTFS reparse point or inaccessible"
+        );
+    }
+    fallback_path
+}
+
+fn resolve_known_folder_dir(folder_id: &KnownFolderGuid, fallback: &'static str) -> PathBuf {
+    let mut raw_ptr: *mut u16 = std::ptr::null_mut();
+    // SAFETY: `folder_id` is a valid KNOWNFOLDERID GUID and `raw_ptr` is a valid out-pointer.
+    let hr = unsafe { SHGetKnownFolderPath(folder_id, 0, std::ptr::null_mut(), &mut raw_ptr) };
+    let _guard = CoTaskMemGuard(raw_ptr);
+    let candidate = if hr == 0 && !raw_ptr.is_null() {
+        // SAFETY: `SHGetKnownFolderPath` succeeded and returned a NUL-terminated UTF-16 string
+        // owned by `_guard` for the duration of this scope.
+        let wide_slice = unsafe {
+            let mut len = 0usize;
+            while *raw_ptr.add(len) != 0 {
+                len += 1;
+            }
+            std::slice::from_raw_parts(raw_ptr, len)
+        };
+        Some(PathBuf::from(OsString::from_wide(wide_slice)))
+    } else {
+        None
+    };
+    validate_known_folder_candidate(candidate, fallback)
+}
+
+/// Resolves the Windows `Program Files` directory via Win32 `SHGetKnownFolderPath`
+/// (`FOLDERID_ProgramFiles`), validating local drive syntax and rejecting UNC paths,
+/// `..` traversal, and NTFS reparse points. Falls back strictly to `C:\Program Files`.
+pub fn known_program_files_dir() -> PathBuf {
+    resolve_known_folder_dir(&FOLDERID_PROGRAM_FILES, r"C:\Program Files")
+}
+
+/// Resolves the Windows `ProgramData` directory via Win32 `SHGetKnownFolderPath`
+/// (`FOLDERID_ProgramData`), validating local drive syntax and rejecting UNC paths,
+/// `..` traversal, and NTFS reparse points. Falls back strictly to `C:\ProgramData`.
+pub fn known_program_data_dir() -> PathBuf {
+    resolve_known_folder_dir(&FOLDERID_PROGRAM_DATA, r"C:\ProgramData")
+}
+
 fn programdata_vdpi_dir() -> PathBuf {
-    std::env::var_os("ProgramData")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-        .join("vdpi")
+    known_program_data_dir().join("vdpi")
 }
 
 fn encode_wide_nul(path: &Path) -> Vec<u16> {
@@ -1914,10 +2072,98 @@ pub fn broadcast_environment_change() {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegStringKind {
+    Sz,
+    ExpandSz,
+}
+
+impl RegStringKind {
+    fn from_win32(reg_type: u32) -> Option<Self> {
+        use windows_sys::Win32::System::Registry::{REG_EXPAND_SZ, REG_SZ};
+        match reg_type {
+            REG_SZ => Some(Self::Sz),
+            REG_EXPAND_SZ => Some(Self::ExpandSz),
+            _ => None,
+        }
+    }
+
+    fn to_win32(self) -> u32 {
+        use windows_sys::Win32::System::Registry::{REG_EXPAND_SZ, REG_SZ};
+        match self {
+            Self::Sz => REG_SZ,
+            Self::ExpandSz => REG_EXPAND_SZ,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegHive {
+    LocalMachine,
+    CurrentUser,
+    Users,
+}
+
+impl RegHive {
+    fn as_hkey(self) -> windows_sys::Win32::System::Registry::HKEY {
+        use windows_sys::Win32::System::Registry::{
+            HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, HKEY_USERS,
+        };
+        match self {
+            Self::LocalMachine => HKEY_LOCAL_MACHINE,
+            Self::CurrentUser => HKEY_CURRENT_USER,
+            Self::Users => HKEY_USERS,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::LocalMachine => "HKLM",
+            Self::CurrentUser => "HKCU",
+            Self::Users => "HKU",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RegQueryOutcome {
-    Value(String),
+    Value { value: String, kind: RegStringKind },
     NotFound,
+}
+
+struct RegKeyGuard(windows_sys::Win32::System::Registry::HKEY);
+
+impl Drop for RegKeyGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: `self.0` was opened by `RegOpenKeyExW` and is closed once on drop.
+            unsafe {
+                let _ = windows_sys::Win32::System::Registry::RegCloseKey(self.0);
+            }
+        }
+    }
+}
+
+fn split_reg_key_path(full_key: &str) -> Result<(RegHive, &str)> {
+    let trimmed = full_key.trim().trim_matches('\\');
+    let Some((root, subkey)) = trimmed.split_once('\\') else {
+        anyhow::bail!("registry key path missing subkey: {full_key}");
+    };
+    let subkey = subkey.trim_matches('\\');
+    if subkey.is_empty() {
+        anyhow::bail!("registry key path has empty subkey: {full_key}");
+    }
+    let hive = if root.eq_ignore_ascii_case("HKLM") || root.eq_ignore_ascii_case("HKEY_LOCAL_MACHINE")
+    {
+        RegHive::LocalMachine
+    } else if root.eq_ignore_ascii_case("HKCU") || root.eq_ignore_ascii_case("HKEY_CURRENT_USER") {
+        RegHive::CurrentUser
+    } else if root.eq_ignore_ascii_case("HKU") || root.eq_ignore_ascii_case("HKEY_USERS") {
+        RegHive::Users
+    } else {
+        anyhow::bail!("unsupported registry hive '{root}' in key path: {full_key}");
+    };
+    Ok((hive, subkey))
 }
 
 fn decode_reg_utf16_bytes(bytes: &[u8]) -> Result<String> {
@@ -1929,46 +2175,44 @@ fn decode_reg_utf16_bytes(bytes: &[u8]) -> Result<String> {
         .iter()
         .map(|&chunk| u16::from_le_bytes(chunk))
         .collect();
-    while wide.last() == Some(&0) {
-        wide.pop();
+    if let Some(pos) = wide.iter().position(|&c| c == 0) {
+        wide.truncate(pos);
     }
     Ok(String::from_utf16_lossy(&wide))
 }
 
-/// Queries a `REG_SZ` / `REG_EXPAND_SZ` value under `HKLM\<subkey>` using Win32 Advapi32,
-/// distinguishing an absent value (`RegQueryOutcome::NotFound`) from real query errors
-/// (such as access denied, key open failure, or unexpected value type).
-fn query_hklm_reg_sz_checked(subkey: &str, value_name: &str) -> Result<RegQueryOutcome> {
+fn encode_reg_utf16_bytes(value: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity((value.len() + 1) * 2);
+    for unit in value.encode_utf16().chain(std::iter::once(0)) {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
+}
+
+/// Queries a `REG_SZ` / `REG_EXPAND_SZ` value under `<hive>\<subkey>` using native Win32 Advapi32,
+/// preserving the original registry string type (`REG_SZ` vs `REG_EXPAND_SZ`) and distinguishing
+/// an absent value (`RegQueryOutcome::NotFound`) from real query errors (such as access denied,
+/// key open failure, odd UTF-16 byte length, or unexpected value type).
+fn query_reg_string_checked(
+    hive: RegHive,
+    subkey: &str,
+    value_name: &str,
+) -> Result<RegQueryOutcome> {
     use windows_sys::Win32::Foundation::{
         ERROR_FILE_NOT_FOUND as WIN32_ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA,
         ERROR_SUCCESS as WIN32_ERROR_SUCCESS,
     };
     use windows_sys::Win32::System::Registry::{
-        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE,
-        REG_EXPAND_SZ, REG_SZ, REG_VALUE_TYPE,
+        RegOpenKeyExW, RegQueryValueExW, HKEY, KEY_QUERY_VALUE, REG_VALUE_TYPE,
     };
 
-    struct RegKeyGuard(HKEY);
-    impl Drop for RegKeyGuard {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                // SAFETY: `self.0` was opened by `RegOpenKeyExW` and is closed once on drop.
-                unsafe {
-                    let _ = RegCloseKey(self.0);
-                }
-            }
-        }
-    }
-
-    let wide_subkey: Vec<u16> = OsStr::new(subkey)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
+    let hive_label = hive.label();
+    let wide_subkey: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
     let mut raw_hkey: HKEY = std::ptr::null_mut();
     // SAFETY: `wide_subkey` is NUL-terminated UTF-16 and `raw_hkey` is a valid out-pointer.
     let open_rc = unsafe {
         RegOpenKeyExW(
-            HKEY_LOCAL_MACHINE,
+            hive.as_hkey(),
             wide_subkey.as_ptr(),
             0,
             KEY_QUERY_VALUE,
@@ -1976,12 +2220,12 @@ fn query_hklm_reg_sz_checked(subkey: &str, value_name: &str) -> Result<RegQueryO
         )
     };
     if open_rc != WIN32_ERROR_SUCCESS {
-        anyhow::bail!("RegOpenKeyExW(HKLM\\{subkey}) failed with Win32 error {open_rc}");
+        anyhow::bail!("RegOpenKeyExW({hive_label}\\{subkey}) failed with Win32 error {open_rc}");
     }
     let key = RegKeyGuard(raw_hkey);
 
-    let wide_name: Vec<u16> = OsStr::new(value_name)
-        .encode_wide()
+    let wide_name: Vec<u16> = value_name
+        .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
     let mut reg_type: REG_VALUE_TYPE = 0;
@@ -2004,16 +2248,19 @@ fn query_hklm_reg_sz_checked(subkey: &str, value_name: &str) -> Result<RegQueryO
         }
         if size_rc != WIN32_ERROR_SUCCESS {
             anyhow::bail!(
-                "RegQueryValueExW(HKLM\\{subkey}\\{value_name}) size query failed with Win32 error {size_rc}"
+                "RegQueryValueExW({hive_label}\\{subkey}\\{value_name}) size query failed with Win32 error {size_rc}"
             );
         }
+        let Some(kind) = RegStringKind::from_win32(reg_type) else {
+            anyhow::bail!(
+                "unexpected registry type {reg_type} for {hive_label}\\{subkey}\\{value_name}"
+            );
+        };
         if cb_data == 0 {
-            if reg_type != REG_SZ && reg_type != REG_EXPAND_SZ {
-                anyhow::bail!(
-                    "unexpected registry type {reg_type} for HKLM\\{subkey}\\{value_name}"
-                );
-            }
-            return Ok(RegQueryOutcome::Value(String::new()));
+            return Ok(RegQueryOutcome::Value {
+                value: String::new(),
+                kind,
+            });
         }
 
         let mut data = vec![0u8; cb_data as usize];
@@ -2032,25 +2279,92 @@ fn query_hklm_reg_sz_checked(subkey: &str, value_name: &str) -> Result<RegQueryO
             WIN32_ERROR_FILE_NOT_FOUND => return Ok(RegQueryOutcome::NotFound),
             ERROR_MORE_DATA => continue,
             WIN32_ERROR_SUCCESS => {
-                if reg_type != REG_SZ && reg_type != REG_EXPAND_SZ {
+                let Some(kind) = RegStringKind::from_win32(reg_type) else {
                     anyhow::bail!(
-                        "unexpected registry type {reg_type} for HKLM\\{subkey}\\{value_name}"
+                        "unexpected registry type {reg_type} for {hive_label}\\{subkey}\\{value_name}"
                     );
-                }
+                };
                 data.truncate(cb_data as usize);
-                return decode_reg_utf16_bytes(&data).map(RegQueryOutcome::Value);
+                let value = decode_reg_utf16_bytes(&data)?;
+                return Ok(RegQueryOutcome::Value { value, kind });
             }
             other => {
                 anyhow::bail!(
-                    "RegQueryValueExW(HKLM\\{subkey}\\{value_name}) read failed with Win32 error {other}"
+                    "RegQueryValueExW({hive_label}\\{subkey}\\{value_name}) read failed with Win32 error {other}"
                 );
             }
         }
     }
 
     anyhow::bail!(
-        "RegQueryValueExW(HKLM\\{subkey}\\{value_name}) kept returning ERROR_MORE_DATA"
+        "RegQueryValueExW({hive_label}\\{subkey}\\{value_name}) kept returning ERROR_MORE_DATA"
     )
+}
+
+/// Writes a UTF-16LE `REG_SZ` / `REG_EXPAND_SZ` value under `<hive>\<subkey>` using native
+/// Win32 Advapi32 (`RegOpenKeyExW` + `RegSetValueExW`) so non-ASCII paths are never corrupted
+/// through `reg.exe` code-page translation.
+fn set_reg_string_value(
+    hive: RegHive,
+    subkey: &str,
+    value_name: &str,
+    value: &str,
+    kind: RegStringKind,
+) -> Result<()> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS as WIN32_ERROR_SUCCESS;
+    use windows_sys::Win32::System::Registry::{
+        RegOpenKeyExW, RegSetValueExW, HKEY, KEY_SET_VALUE,
+    };
+
+    let hive_label = hive.label();
+    let wide_subkey: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut raw_hkey: HKEY = std::ptr::null_mut();
+    // SAFETY: `wide_subkey` is NUL-terminated UTF-16 and `raw_hkey` is a valid out-pointer.
+    let open_rc = unsafe {
+        RegOpenKeyExW(
+            hive.as_hkey(),
+            wide_subkey.as_ptr(),
+            0,
+            KEY_SET_VALUE,
+            &mut raw_hkey,
+        )
+    };
+    if open_rc != WIN32_ERROR_SUCCESS {
+        anyhow::bail!(
+            "RegOpenKeyExW({hive_label}\\{subkey}, KEY_SET_VALUE) failed with Win32 error {open_rc}"
+        );
+    }
+    let key = RegKeyGuard(raw_hkey);
+
+    let wide_name: Vec<u16> = value_name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let bytes = encode_reg_utf16_bytes(value);
+    let cb_data = u32::try_from(bytes.len()).with_context(|| {
+        format!(
+            "registry string value {hive_label}\\{subkey}\\{value_name} exceeds u32 byte length"
+        )
+    })?;
+
+    // SAFETY: `key.0` is an open registry handle with `KEY_SET_VALUE`, `wide_name` is
+    // NUL-terminated UTF-16, and `bytes` is a NUL-terminated UTF-16LE buffer of length `cb_data`.
+    let set_rc = unsafe {
+        RegSetValueExW(
+            key.0,
+            wide_name.as_ptr(),
+            0,
+            kind.to_win32(),
+            bytes.as_ptr(),
+            cb_data,
+        )
+    };
+    if set_rc != WIN32_ERROR_SUCCESS {
+        anyhow::bail!(
+            "RegSetValueExW({hive_label}\\{subkey}\\{value_name}) failed with Win32 error {set_rc}"
+        );
+    }
+    Ok(())
 }
 
 fn add_dir_to_windows_system_path_with<FQuery, FWrite>(
@@ -2060,7 +2374,7 @@ fn add_dir_to_windows_system_path_with<FQuery, FWrite>(
 ) -> Result<bool>
 where
     FQuery: FnOnce() -> Result<RegQueryOutcome>,
-    FWrite: FnMut(&str) -> Result<()>,
+    FWrite: FnMut(&str, RegStringKind) -> Result<()>,
 {
     let target = dir.display().to_string();
     let target_norm = target.trim().trim_end_matches('\\');
@@ -2068,11 +2382,11 @@ where
         anyhow::bail!("refusing to add an empty directory to Windows System Path");
     }
 
-    let current = match query_path()
+    let (current, existing_kind) = match query_path()
         .context("refusing to modify Windows System Path because querying existing Path failed")?
     {
-        RegQueryOutcome::Value(val) => val,
-        RegQueryOutcome::NotFound => String::new(),
+        RegQueryOutcome::Value { value, kind } => (value, kind),
+        RegQueryOutcome::NotFound => (String::new(), RegStringKind::ExpandSz),
     };
 
     let mut parts: Vec<String> = current
@@ -2097,31 +2411,32 @@ where
                 current.len()
             );
         }
-        write_path(&new_path)?;
+        let write_kind = if existing_kind == RegStringKind::ExpandSz || new_path.contains('%') {
+            RegStringKind::ExpandSz
+        } else {
+            RegStringKind::Sz
+        };
+        write_path(&new_path, write_kind)?;
     }
 
     Ok(!already_present)
 }
 
-/// Adds `dir` to the Windows System `Path` (`REG_EXPAND_SZ`) and removes any legacy directory
-/// from the current user's `Path` so `vdpi` resolves cleanly from any terminal.
+/// Adds `dir` to the Windows System `Path` (`REG_EXPAND_SZ` / preserved `REG_SZ`) using native
+/// UTF-16 Advapi32 registry calls, and removes any legacy directory from the current user's `Path`
+/// so `vdpi` resolves cleanly from any terminal.
 pub fn add_dir_to_windows_system_path(dir: &Path, legacy_dir: Option<&Path>) -> Result<bool> {
     let added = add_dir_to_windows_system_path_with(
         dir,
-        || query_hklm_reg_sz_checked(SYSTEM_ENV_SUBKEY, "Path"),
-        |new_path| {
-            run_reg(&[
-                "add",
-                SYSTEM_ENV_KEY,
-                "/v",
+        || query_reg_string_checked(RegHive::LocalMachine, SYSTEM_ENV_SUBKEY, "Path"),
+        |new_path, kind| {
+            set_reg_string_value(
+                RegHive::LocalMachine,
+                SYSTEM_ENV_SUBKEY,
                 "Path",
-                "/t",
-                "REG_EXPAND_SZ",
-                "/d",
                 new_path,
-                "/f",
-            ])
-            .map(|_| ())
+                kind,
+            )
         },
     )?;
 
@@ -2157,15 +2472,34 @@ pub fn remove_dir_from_windows_path(dir: &Path, legacy_dir: Option<&Path>) {
     }
 }
 
-fn remove_from_env_path_key(env_key: &str, dirs: &[&Path]) -> bool {
-    let Some(current) = query_reg_sz(env_key, "Path") else {
-        return false;
-    };
-
+fn remove_from_env_path_key_with<FQuery, FWrite>(
+    dirs: &[&Path],
+    query_path: FQuery,
+    mut write_path: FWrite,
+) -> Result<bool>
+where
+    FQuery: FnOnce() -> Result<RegQueryOutcome>,
+    FWrite: FnMut(&str, RegStringKind) -> Result<()>,
+{
     let targets: Vec<String> = dirs
         .iter()
-        .map(|d| d.display().to_string().trim_end_matches('\\').to_string())
+        .map(|d| {
+            d.display()
+                .to_string()
+                .trim()
+                .trim_end_matches('\\')
+                .to_string()
+        })
+        .filter(|t| !t.is_empty())
         .collect();
+    if targets.is_empty() {
+        return Ok(false);
+    }
+
+    let (current, existing_kind) = match query_path()? {
+        RegQueryOutcome::Value { value, kind } => (value, kind),
+        RegQueryOutcome::NotFound => return Ok(false),
+    };
 
     let parts: Vec<&str> = current
         .split(';')
@@ -2183,20 +2517,44 @@ fn remove_from_env_path_key(env_key: &str, dirs: &[&Path]) -> bool {
         .collect();
 
     if filtered.len() == parts.len() {
-        return false;
+        return Ok(false);
     }
 
     let new_path = filtered.join(";");
-    let reg_type = if env_key == SYSTEM_ENV_KEY || new_path.contains('%') {
-        "REG_EXPAND_SZ"
+    let write_kind = if existing_kind == RegStringKind::ExpandSz || new_path.contains('%') {
+        RegStringKind::ExpandSz
     } else {
-        "REG_SZ"
+        RegStringKind::Sz
     };
 
-    run_reg(&[
-        "add", env_key, "/v", "Path", "/t", reg_type, "/d", &new_path, "/f",
-    ])
-    .is_ok()
+    write_path(&new_path, write_kind)?;
+    Ok(true)
+}
+
+fn remove_from_env_path_key(env_key: &str, dirs: &[&Path]) -> bool {
+    let Ok((hive, subkey)) = split_reg_key_path(env_key) else {
+        warn!(
+            key = %env_key,
+            "refusing to modify unsupported Windows Path registry key"
+        );
+        return false;
+    };
+
+    match remove_from_env_path_key_with(
+        dirs,
+        || query_reg_string_checked(hive, subkey, "Path"),
+        |new_path, kind| set_reg_string_value(hive, subkey, "Path", new_path, kind),
+    ) {
+        Ok(changed) => changed,
+        Err(err) => {
+            warn!(
+                key = %env_key,
+                error = %err,
+                "aborting Windows Path removal due to registry error"
+            );
+            false
+        }
+    }
 }
 
 pub fn build_windows_proxy_override(extra: &[String]) -> String {
@@ -3084,7 +3442,7 @@ mod tests {
         let res = add_dir_to_windows_system_path_with(
             Path::new(r"C:\Program Files\vdpi\bin"),
             || Err(anyhow::anyhow!("simulated Win32 ERROR_ACCESS_DENIED (5)")),
-            |_| {
+            |_, _| {
                 wrote = true;
                 Ok(())
             },
@@ -3101,21 +3459,54 @@ mod tests {
 
     #[test]
     fn add_dir_to_windows_system_path_appends_handles_not_found_and_guards_truncation() {
-        // Existing Path: appends cleanly and never drops existing entries.
+        // Existing REG_EXPAND_SZ Path: appends cleanly and preserves REG_EXPAND_SZ.
         let mut written = None;
         let added = add_dir_to_windows_system_path_with(
             Path::new(r"C:\Program Files\vdpi\bin\"),
-            || Ok(RegQueryOutcome::Value(r"C:\Windows\System32;C:\Windows".into())),
-            |new_path| {
-                written = Some(new_path.to_string());
+            || {
+                Ok(RegQueryOutcome::Value {
+                    value: r"C:\Windows\System32;C:\Windows".into(),
+                    kind: RegStringKind::ExpandSz,
+                })
+            },
+            |new_path, kind| {
+                written = Some((new_path.to_string(), kind));
                 Ok(())
             },
         )
         .expect("append to existing Path");
         assert!(added);
         assert_eq!(
-            written.as_deref(),
-            Some(r"C:\Windows\System32;C:\Windows;C:\Program Files\vdpi\bin")
+            written,
+            Some((
+                r"C:\Windows\System32;C:\Windows;C:\Program Files\vdpi\bin".to_string(),
+                RegStringKind::ExpandSz,
+            ))
+        );
+
+        // Existing REG_SZ Path without '%': preserves REG_SZ and non-ASCII entries.
+        let mut written_sz = None;
+        let added_sz = add_dir_to_windows_system_path_with(
+            Path::new(r"C:\Program Files\vdpi\bin"),
+            || {
+                Ok(RegQueryOutcome::Value {
+                    value: r"C:\Kullanıcılar\Ömer\Araçlar".into(),
+                    kind: RegStringKind::Sz,
+                })
+            },
+            |new_path, kind| {
+                written_sz = Some((new_path.to_string(), kind));
+                Ok(())
+            },
+        )
+        .expect("append to existing REG_SZ Path");
+        assert!(added_sz);
+        assert_eq!(
+            written_sz,
+            Some((
+                r"C:\Kullanıcılar\Ömer\Araçlar;C:\Program Files\vdpi\bin".to_string(),
+                RegStringKind::Sz,
+            ))
         );
 
         // Already present (case-insensitive): no-op without writing.
@@ -3123,11 +3514,12 @@ mod tests {
         let added_dup = add_dir_to_windows_system_path_with(
             Path::new(r"c:\program files\vdpi\bin"),
             || {
-                Ok(RegQueryOutcome::Value(
-                    r"C:\Windows\System32;C:\Program Files\vdpi\bin".into(),
-                ))
+                Ok(RegQueryOutcome::Value {
+                    value: r"C:\Windows\System32;C:\Program Files\vdpi\bin".into(),
+                    kind: RegStringKind::ExpandSz,
+                })
             },
-            |_| {
+            |_, _| {
                 wrote_duplicate = true;
                 Ok(())
             },
@@ -3136,26 +3528,37 @@ mod tests {
         assert!(!added_dup);
         assert!(!wrote_duplicate);
 
-        // Genuinely absent Path value (NotFound): initializes with target directory.
+        // Genuinely absent Path value (NotFound): initializes with target directory as REG_EXPAND_SZ.
         let mut written_new = None;
         let added_new = add_dir_to_windows_system_path_with(
             Path::new(r"C:\Program Files\vdpi\bin"),
             || Ok(RegQueryOutcome::NotFound),
-            |new_path| {
-                written_new = Some(new_path.to_string());
+            |new_path, kind| {
+                written_new = Some((new_path.to_string(), kind));
                 Ok(())
             },
         )
         .expect("initialize absent Path");
         assert!(added_new);
-        assert_eq!(written_new.as_deref(), Some(r"C:\Program Files\vdpi\bin"));
+        assert_eq!(
+            written_new,
+            Some((
+                r"C:\Program Files\vdpi\bin".to_string(),
+                RegStringKind::ExpandSz,
+            ))
+        );
 
         // Defensive sanity guard: refuse to write if computed Path is shorter than existing Path.
         let mut wrote_short = false;
         let short_res = add_dir_to_windows_system_path_with(
             Path::new(r"C:\a"),
-            || Ok(RegQueryOutcome::Value(r"C:\Windows;;;;;;;;;;;;;;;;;;;;".into())),
-            |_| {
+            || {
+                Ok(RegQueryOutcome::Value {
+                    value: r"C:\Windows;;;;;;;;;;;;;;;;;;;;".into(),
+                    kind: RegStringKind::ExpandSz,
+                })
+            },
+            |_, _| {
                 wrote_short = true;
                 Ok(())
             },
@@ -3165,5 +3568,327 @@ mod tests {
             "sanity guard must refuse to write a Path shorter than existing Path"
         );
         assert!(!wrote_short);
+    }
+
+    #[test]
+    fn add_dir_to_windows_system_path_rejects_empty_dir_and_propagates_write_errors() {
+        for empty in [Path::new(""), Path::new("   "), Path::new(r"\\\")] {
+            let mut queried = false;
+            let mut wrote = false;
+            let res = add_dir_to_windows_system_path_with(
+                empty,
+                || {
+                    queried = true;
+                    Ok(RegQueryOutcome::NotFound)
+                },
+                |_, _| {
+                    wrote = true;
+                    Ok(())
+                },
+            );
+            assert!(
+                res.is_err(),
+                "empty/whitespace/slash-only target dir {empty:?} must be rejected"
+            );
+            assert!(
+                !queried,
+                "query callback must not run for invalid empty dir {empty:?}"
+            );
+            assert!(
+                !wrote,
+                "write callback must not run for invalid empty dir {empty:?}"
+            );
+        }
+
+        let write_err = add_dir_to_windows_system_path_with(
+            Path::new(r"C:\Program Files\vdpi\bin"),
+            || {
+                Ok(RegQueryOutcome::Value {
+                    value: r"C:\Windows\System32".into(),
+                    kind: RegStringKind::ExpandSz,
+                })
+            },
+            |_, _| Err(anyhow::anyhow!("simulated RegSetValueExW access denied")),
+        );
+        assert!(
+            write_err.is_err(),
+            "write callback failure must propagate as Err"
+        );
+    }
+
+    #[test]
+    fn decode_reg_utf16_bytes_handles_odd_bytes_interior_and_trailing_nul_and_non_ascii() {
+        // Odd byte length is rejected.
+        assert!(decode_reg_utf16_bytes(&[0x41]).is_err());
+        assert!(decode_reg_utf16_bytes(&[0x41, 0x00, 0x42]).is_err());
+
+        // Empty buffer decodes to empty string.
+        assert_eq!(decode_reg_utf16_bytes(&[]).expect("empty buffer"), "");
+
+        // Trailing NULs (single and multiple) are stripped.
+        let trailing_nul: Vec<u8> = "C:\\Windows"
+            .encode_utf16()
+            .chain([0u16, 0u16])
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(
+            decode_reg_utf16_bytes(&trailing_nul).expect("trailing NUL"),
+            r"C:\Windows"
+        );
+
+        // Interior NUL truncates at the FIRST 0 code unit so trailing garbage never leaks through.
+        let interior_nul: Vec<u8> = "C:\\Windows"
+            .encode_utf16()
+            .chain([0u16])
+            .chain("GARBAGE\\TRAILING".encode_utf16())
+            .chain([0u16])
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(
+            decode_reg_utf16_bytes(&interior_nul).expect("interior NUL truncation"),
+            r"C:\Windows"
+        );
+
+        // Non-ASCII UTF-16LE (Turkish, CJK, and astral surrogate pair) round-trips losslessly.
+        let non_ascii = r"C:\Kullanıcılar\Ömer\İstanbul;D:\日本語\ツール;E:\🚀\bin";
+        let encoded = encode_reg_utf16_bytes(non_ascii);
+        assert_eq!(encoded.len(), (non_ascii.encode_utf16().count() + 1) * 2);
+        assert_eq!(&encoded[encoded.len() - 2..], &[0, 0]);
+        assert_eq!(
+            decode_reg_utf16_bytes(&encoded).expect("non-ASCII UTF-16LE"),
+            non_ascii
+        );
+    }
+
+    #[test]
+    fn split_reg_key_path_supports_hklm_hkcu_and_hku_sid_keys() {
+        assert_eq!(
+            split_reg_key_path(SYSTEM_ENV_KEY).expect("HKLM system env key"),
+            (RegHive::LocalMachine, SYSTEM_ENV_SUBKEY)
+        );
+        assert_eq!(
+            split_reg_key_path(r"HKEY_LOCAL_MACHINE\SYSTEM\Test").expect("HKEY_LOCAL_MACHINE"),
+            (RegHive::LocalMachine, r"SYSTEM\Test")
+        );
+        assert_eq!(
+            split_reg_key_path(r"HKCU\Environment").expect("HKCU env key"),
+            (RegHive::CurrentUser, "Environment")
+        );
+        assert_eq!(
+            split_reg_key_path(r"HKEY_CURRENT_USER\Environment").expect("HKEY_CURRENT_USER"),
+            (RegHive::CurrentUser, "Environment")
+        );
+        assert_eq!(
+            split_reg_key_path(r"HKU\S-1-5-21-123456-1001\Environment").expect("HKU SID env key"),
+            (RegHive::Users, r"S-1-5-21-123456-1001\Environment")
+        );
+        assert_eq!(
+            split_reg_key_path(r"HKEY_USERS\S-1-5-21-123456-1001\Environment")
+                .expect("HKEY_USERS SID env key"),
+            (RegHive::Users, r"S-1-5-21-123456-1001\Environment")
+        );
+        assert!(split_reg_key_path("HKCU").is_err());
+        assert!(split_reg_key_path(r"HKCU\").is_err());
+        assert!(split_reg_key_path(r"HKCR\Environment").is_err());
+    }
+
+    #[test]
+    fn remove_from_env_path_key_with_handles_case_backslash_expand_sz_and_absent() {
+        // Case-insensitive removal with trailing backslash, preserving REG_EXPAND_SZ even
+        // when the remaining Path contains no '%' characters, and preserving non-ASCII entries.
+        let mut written = None;
+        let removed = remove_from_env_path_key_with(
+            &[Path::new(r"C:\Program Files\VDPI\Bin\")],
+            || {
+                Ok(RegQueryOutcome::Value {
+                    value: r"C:\Kullanıcılar\Ömer\bin;c:\program files\vdpi\bin\;D:\Tools".into(),
+                    kind: RegStringKind::ExpandSz,
+                })
+            },
+            |new_path, kind| {
+                written = Some((new_path.to_string(), kind));
+                Ok(())
+            },
+        )
+        .expect("case-insensitive removal with trailing backslash");
+        assert!(removed);
+        assert_eq!(
+            written,
+            Some((
+                r"C:\Kullanıcılar\Ömer\bin;D:\Tools".to_string(),
+                RegStringKind::ExpandSz,
+            ))
+        );
+
+        // Preserves REG_SZ when original was REG_SZ and remaining Path has no '%'.
+        let mut written_sz = None;
+        let removed_sz = remove_from_env_path_key_with(
+            &[Path::new(r"C:\vdpi\bin")],
+            || {
+                Ok(RegQueryOutcome::Value {
+                    value: r"C:\Tools;C:\VDPI\BIN\".into(),
+                    kind: RegStringKind::Sz,
+                })
+            },
+            |new_path, kind| {
+                written_sz = Some((new_path.to_string(), kind));
+                Ok(())
+            },
+        )
+        .expect("removal preserving REG_SZ");
+        assert!(removed_sz);
+        assert_eq!(written_sz, Some((r"C:\Tools".to_string(), RegStringKind::Sz)));
+
+        // No-op when target directory is absent from Path.
+        let mut wrote_absent = false;
+        let removed_absent = remove_from_env_path_key_with(
+            &[Path::new(r"C:\Program Files\vdpi\bin")],
+            || {
+                Ok(RegQueryOutcome::Value {
+                    value: r"C:\Windows\System32;C:\Windows".into(),
+                    kind: RegStringKind::ExpandSz,
+                })
+            },
+            |_, _| {
+                wrote_absent = true;
+                Ok(())
+            },
+        )
+        .expect("no-op when dir absent");
+        assert!(!removed_absent);
+        assert!(!wrote_absent);
+
+        // No-op when Path registry value does not exist.
+        let mut wrote_not_found = false;
+        let removed_not_found = remove_from_env_path_key_with(
+            &[Path::new(r"C:\Program Files\vdpi\bin")],
+            || Ok(RegQueryOutcome::NotFound),
+            |_, _| {
+                wrote_not_found = true;
+                Ok(())
+            },
+        )
+        .expect("no-op when Path value NotFound");
+        assert!(!removed_not_found);
+        assert!(!wrote_not_found);
+
+        // Query error aborts without writing.
+        let mut wrote_on_err = false;
+        let err_res = remove_from_env_path_key_with(
+            &[Path::new(r"C:\Program Files\vdpi\bin")],
+            || Err(anyhow::anyhow!("simulated RegQueryValueExW access denied")),
+            |_, _| {
+                wrote_on_err = true;
+                Ok(())
+            },
+        );
+        assert!(err_res.is_err());
+        assert!(!wrote_on_err);
+    }
+
+    #[test]
+    fn known_folder_path_validation_accepts_local_drives_and_rejects_unc_traversal_and_reparse() {
+        for valid in [
+            r"C:\Program Files",
+            r"D:\ProgramData",
+            "E:/ProgramData",
+            r"c:\Program Files",
+        ] {
+            assert!(
+                is_valid_windows_known_folder_path_str(valid),
+                "expected valid local known folder path: {valid:?}"
+            );
+        }
+
+        for invalid in [
+            "",
+            "   ",
+            r"\\attacker\share",
+            "//attacker/share",
+            r"\\?\C:\ProgramData",
+            r"\\.\C:\ProgramData",
+            r"C:\ProgramData\..\Windows",
+            "C:/ProgramData/../Windows",
+            "ProgramData",
+            "C:",
+            "C:ProgramData",
+            r"C:\",
+            "C:\\Program\0Data",
+        ] {
+            assert!(
+                !is_valid_windows_known_folder_path_str(invalid),
+                "expected invalid known folder path to be rejected: {invalid:?}"
+            );
+        }
+
+        let root = TestTempDir::new("known-folder-reparse");
+        let target_dir = root.0.join("target");
+        fs::create_dir_all(&target_dir).expect("create target dir");
+
+        let junction_dir = root.0.join("junction");
+        let status = Command::new(system32_exe("cmd.exe"))
+            .creation_flags(CREATE_NO_WINDOW)
+            .args([
+                OsStr::new("/C"),
+                OsStr::new("mklink"),
+                OsStr::new("/J"),
+                junction_dir.as_os_str(),
+                target_dir.as_os_str(),
+            ])
+            .status()
+            .expect("spawn cmd.exe mklink /J");
+        assert!(
+            status.success(),
+            "mklink /J must create NTFS directory junction"
+        );
+
+        assert!(has_reparse_point_component(&junction_dir));
+        assert!(!has_reparse_point_component(&target_dir));
+        assert_eq!(
+            validate_known_folder_candidate(Some(junction_dir), r"C:\ProgramData"),
+            PathBuf::from(r"C:\ProgramData")
+        );
+        assert_eq!(
+            validate_known_folder_candidate(
+                Some(PathBuf::from(r"\\attacker\ProgramData")),
+                r"C:\ProgramData"
+            ),
+            PathBuf::from(r"C:\ProgramData")
+        );
+        assert_eq!(
+            validate_known_folder_candidate(None, r"C:\Program Files"),
+            PathBuf::from(r"C:\Program Files")
+        );
+        assert_eq!(
+            validate_known_folder_candidate(Some(target_dir.clone()), r"C:\ProgramData"),
+            target_dir
+        );
+    }
+
+    #[test]
+    fn known_program_files_and_program_data_dirs_resolve_valid_local_non_reparse_paths() {
+        let pf = known_program_files_dir();
+        let pd = known_program_data_dir();
+
+        for (label, dir) in [("ProgramFiles", &pf), ("ProgramData", &pd)] {
+            let text = dir
+                .to_str()
+                .unwrap_or_else(|| panic!("{label} path must be valid UTF-8: {dir:?}"));
+            assert!(
+                is_valid_windows_known_folder_path_str(text),
+                "{label} path must be a validated local drive path: {text:?}"
+            );
+            assert!(dir.is_absolute(), "{label} path must be absolute: {dir:?}");
+            assert!(
+                dir.is_dir(),
+                "{label} resolved directory must exist: {dir:?}"
+            );
+            assert!(
+                !has_reparse_point_component(dir),
+                "{label} resolved directory must not be or traverse a reparse point: {dir:?}"
+            );
+        }
+
+        assert_eq!(programdata_vdpi_dir(), pd.join("vdpi"));
     }
 }

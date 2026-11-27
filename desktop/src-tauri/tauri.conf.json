@@ -30,7 +30,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["app", "dmg", "deb", "appimage"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -41,12 +41,6 @@
     "publisher": "Vuln-Inc",
     "shortDescription": "Self-healing anti-DPI engine for desktop",
     "longDescription": "Zero-hassle transparent TUN and fail-open local proxy anti-DPI client with visual split tunneling and encrypted DNS.",
-    "windows": {
-      "nsis": {
-        "installMode": "currentUser",
-        "displayLanguageSelector": false
-      }
-    },
     "macOS": {
       "minimumSystemVersion": "12.0"
     },
