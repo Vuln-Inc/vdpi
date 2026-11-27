@@ -558,17 +558,18 @@ fn is_transient_udp_recv_error(err: &std::io::Error) -> bool {
 /// Returns `true` when an outbound UDP `send_to` error indicates an unreachable route/host
 /// (e.g. IPv6 socket bound on a host without an IPv6 default route).
 fn is_udp_unreachable_error(err: &std::io::Error) -> bool {
-    if matches!(
+    let kind_unreachable = matches!(
         err.kind(),
         ErrorKind::NetworkUnreachable | ErrorKind::HostUnreachable | ErrorKind::AddrNotAvailable
-    ) {
-        return true;
-    }
+    );
     #[cfg(windows)]
-    if matches!(err.raw_os_error(), Some(10049 | 10051 | 10065)) {
-        return true;
+    {
+        kind_unreachable || matches!(err.raw_os_error(), Some(10049 | 10051 | 10065))
     }
-    false
+    #[cfg(not(windows))]
+    {
+        kind_unreachable
+    }
 }
 
 fn select_udp_targets(

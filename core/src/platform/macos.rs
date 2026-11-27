@@ -2044,7 +2044,7 @@ fn merge_service_bypass_domains_with_include(
         push_unique(item);
     }
     for baseline in BASELINE_BYPASS_DOMAINS {
-        if !is_local_or_ip_baseline(baseline) && !kept_non_local.contains(&baseline) {
+        if !is_local_or_ip_baseline(baseline) && !kept_non_local.contains(baseline) {
             continue;
         }
         push_unique(baseline);

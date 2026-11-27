@@ -2808,6 +2808,7 @@ pub fn build_windows_service_bin_path(bin_path: &Path, cfg: &RuntimeConfig) -> S
     }
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) fn quote_windows_arg(arg: &str) -> String {
     if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
         return arg.to_string();

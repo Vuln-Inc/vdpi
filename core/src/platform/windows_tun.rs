@@ -879,7 +879,7 @@ fn parse_guid_braced(raw: &str) -> Option<(u32, u16, u16, [u8; 8])> {
     let data3 = u16::from_str_radix(p3, 16).ok()?;
     let mut data4 = [0u8; 8];
     let tail = format!("{p4}{p5}");
-    for (idx, chunk) in tail.as_bytes().chunks_exact(2).enumerate() {
+    for (idx, chunk) in tail.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let hex = std::str::from_utf8(chunk).ok()?;
         data4[idx] = u8::from_str_radix(hex, 16).ok()?;
     }

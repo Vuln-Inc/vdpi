@@ -3048,10 +3048,11 @@ where
 
     let extracted_bin = find_extracted_binary(&extract_dir, bin_name)?;
 
-    let effective_service_path: Option<PathBuf> =
-        if let Some(service_path) = check.installed_service_path.as_deref() {
-            Some(service_path.to_path_buf())
-        } else {
+    let effective_service_path: Option<PathBuf> = check
+        .installed_service_path
+        .as_deref()
+        .map(Path::to_path_buf)
+        .or_else(|| {
             #[cfg(target_os = "windows")]
             {
                 let scm = crate::platform::windows_service::query_windows_service_status();
@@ -3066,7 +3067,7 @@ where
             {
                 None
             }
-        };
+        });
 
     if let Some(service_path) = effective_service_path.as_deref() {
         on_progress(&format!(
