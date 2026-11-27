@@ -399,7 +399,7 @@ fn downscale_rgba_if_needed(
             for y in y0..y1 {
                 let row_start = y * src_w * 4;
                 let row_slice = &rgba[row_start + x0 * 4..row_start + x1 * 4];
-                for px in row_slice.chunks_exact(4) {
+                for px in row_slice.as_chunks::<4>().0 {
                     let a = u64::from(px[3]);
                     sum_a += a;
                     sum_r += u64::from(px[0]) * a;
@@ -732,7 +732,7 @@ mod windows_icons {
             let (width, height) = query_bitmap_dims(color_bmp.0)?;
             let mut bgra = read_bitmap_bgra(dc.0, color_bmp.0, width, height)?;
 
-            let has_alpha = bgra.chunks_exact(4).any(|px| px[3] != 0);
+            let has_alpha = bgra.as_chunks::<4>().0.iter().any(|px| px[3] != 0);
             if !has_alpha {
                 let mask_bgra = query_bitmap_dims(mask_bmp.0)
                     .filter(|&(mask_w, mask_h)| {
@@ -743,19 +743,24 @@ mod windows_icons {
                         read_bitmap_bgra(dc.0, mask_bmp.0, mask_w, mask_h)
                     });
                 if let Some(mask_bgra) = mask_bgra {
-                    for (px, mask_px) in bgra.chunks_exact_mut(4).zip(mask_bgra.chunks_exact(4)) {
+                    for (px, mask_px) in bgra
+                        .as_chunks_mut::<4>()
+                        .0
+                        .iter_mut()
+                        .zip(mask_bgra.as_chunks::<4>().0)
+                    {
                         // In Win32 AND masks, black (0) is opaque and white (0xFF) is transparent.
                         px[3] = if mask_px[0] == 0 { 255 } else { 0 };
                     }
                 } else {
-                    for px in bgra.chunks_exact_mut(4) {
+                    for px in bgra.as_chunks_mut::<4>().0 {
                         px[3] = 255;
                     }
                 }
             }
 
             // Convert BGRA -> RGBA in place.
-            for px in bgra.chunks_exact_mut(4) {
+            for px in bgra.as_chunks_mut::<4>().0 {
                 px.swap(0, 2);
             }
             (width, height, bgra)
@@ -771,7 +776,12 @@ mod windows_icons {
             let (and_half, xor_half) = mask_bgra.split_at(half_bytes);
 
             let mut rgba = Vec::with_capacity(half_bytes);
-            for (and_px, xor_px) in and_half.chunks_exact(4).zip(xor_half.chunks_exact(4)) {
+            for (and_px, xor_px) in and_half
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(xor_half.as_chunks::<4>().0)
+            {
                 let and_set = and_px[0] != 0;
                 let xor_set = xor_px[0] != 0;
                 match (and_set, xor_set) {

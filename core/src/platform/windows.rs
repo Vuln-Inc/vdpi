@@ -1921,12 +1921,13 @@ enum RegQueryOutcome {
 }
 
 fn decode_reg_utf16_bytes(bytes: &[u8]) -> Result<String> {
-    let chunks = bytes.chunks_exact(2);
-    if !chunks.remainder().is_empty() {
+    let (chunks, remainder) = bytes.as_chunks::<2>();
+    if !remainder.is_empty() {
         anyhow::bail!("registry string value has odd byte length ({})", bytes.len());
     }
     let mut wide: Vec<u16> = chunks
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .iter()
+        .map(|&chunk| u16::from_le_bytes(chunk))
         .collect();
     while wide.last() == Some(&0) {
         wide.pop();
