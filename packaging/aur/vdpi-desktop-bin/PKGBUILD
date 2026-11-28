@@ -1,0 +1,19 @@
+# Maintainer: Vuln-Inc <https://github.com/Vuln-Inc/vdpi>
+pkgname=vdpi-desktop-bin
+pkgver=0.6.3
+pkgrel=1
+pkgdesc="Native desktop GUI for the self-healing vdpi anti-DPI engine"
+arch=('x86_64')
+url="https://github.com/Vuln-Inc/vdpi"
+license=('MIT')
+depends=('webkit2gtk-4.1' 'gtk3' 'libayatana-appindicator' 'xdg-utils')
+optdepends=('polkit: elevated background TUN service management')
+provides=('vdpi-desktop')
+conflicts=('vdpi-desktop')
+options=('!strip')
+source=("${pkgname}-${pkgver}.deb::https://github.com/Vuln-Inc/vdpi/releases/download/v${pkgver}/vdpi-desktop-linux-x86_64.deb")
+sha256sums=('9feb11c10f4b77289d51a8dba875d75b718ecb861c7d3085c74858d7777dd2a4')
+
+package() {
+  bsdtar -xf "${srcdir}/data.tar.gz" -C "${pkgdir}/"
+}

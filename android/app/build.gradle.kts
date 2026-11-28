@@ -57,9 +57,17 @@ android {
         }
     }
 
+    dependenciesInfo {
+        includeInApk = false
+        includeInBundle = false
+    }
+
     signingConfigs {
         if (hasReleaseSigning) {
             create("release") {
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
                 storeFile = File(releaseKeystorePath!!)
                 storePassword = releaseKeystorePassword
                 keyAlias = releaseKeyAlias

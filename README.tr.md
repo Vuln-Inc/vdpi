@@ -94,9 +94,42 @@ Yerel Masaüstü Arayüzü (GUI), etkileşimli Kontrol Merkezi TUI ve root gerek
 
 ### Masaüstü Uygulaması (GUI) - Windows, macOS ve Linux
 
-- **Windows (`x86_64`, Windows 10 ve 11):** [`vdpi-desktop-windows-x86_64-portable.zip`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-windows-x86_64-portable.zip) (arşivi çıkarıp `vdpi-desktop.exe` dosyasını çalıştırın)
-- **macOS (Evrensel, Apple Silicon ve Intel):** [`vdpi-desktop-macos-universal.dmg`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-macos-universal.dmg) (DMG dosyasını açıp Uygulamalar klasörüne sürükleyin)
-- **Linux (`x86_64`):** [`vdpi-desktop-linux-x86_64.deb`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.deb) (Debian/Ubuntu) · [`vdpi-desktop-linux-x86_64.AppImage`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.AppImage) (tüm dağıtımlar)
+**Windows (`x86_64`, Windows 10 ve 11 - taşınabilir, kurulum sihirbazı yok):**
+
+```powershell
+# PowerShell tek satır kurulum (SHA-256 doğrulamalı taşınabilir kurulum + Başlat Menüsü kısayolu)
+irm https://vuln-inc.github.io/vdpi/install-desktop.ps1 | iex
+
+# Scoop (ek depo gerekmeden doğrudan bildirim)
+scoop install https://vuln-inc.github.io/vdpi/vdpi-desktop.json
+
+# WinGet (inceleme bekliyor: microsoft/winget-pkgs#491533)
+winget install Vuln-Inc.vdpi.Desktop
+```
+
+Doğrudan indirme: [`vdpi-desktop-windows-x86_64-portable.zip`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-windows-x86_64-portable.zip) (arşivi çıkarıp `vdpi-desktop.exe` dosyasını çalıştırın).
+
+**macOS (Evrensel, Apple Silicon ve Intel):**
+
+```bash
+# Homebrew Cask (ek depo gerekmeden doğrudan tap)
+brew tap vuln-inc/vdpi https://github.com/Vuln-Inc/vdpi
+brew install --cask vuln-inc/vdpi/vdpi-desktop
+```
+
+Doğrudan indirme: [`vdpi-desktop-macos-universal.dmg`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-macos-universal.dmg) (DMG dosyasını açıp Uygulamalar klasörüne sürükleyin).
+
+**Linux (`x86_64` - Debian/Ubuntu, Arch, AppImage, Flatpak):**
+
+```bash
+# Kabuk tek satır kurulum (Debian/Ubuntu üzerinde .deb, diğer dağıtımlarda AppImage - SHA-256 doğrulamalı)
+curl -fsSL https://vuln-inc.github.io/vdpi/install-desktop.sh | sh
+
+# Arch Linux (depo içi PKGBUILD)
+git clone --depth 1 https://github.com/Vuln-Inc/vdpi.git && cd vdpi/packaging/aur/vdpi-desktop-bin && makepkg -si
+```
+
+Doğrudan indirmeler: [`vdpi-desktop-linux-x86_64.deb`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.deb) (Debian/Ubuntu) · [`vdpi-desktop-linux-x86_64.AppImage`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.AppImage) (tüm dağıtımlar, [AppImageHub PR #12747](https://github.com/AppImage/appimage.github.io/pull/12747)) · [Flatpak bildirimi](./packaging/flatpak/README.md).
 
 > **Not:** Masaüstü GUI paketleri `vdpi` motor dosyasını (Windows üzerinde ayrıca değiştirilmemiş WHQL imzalı `wintun.dll` `0.14.1` sürücüsünü) içinde barındırır, sistem tepsisi / menü çubuğu ile bütünleşir ve Terminal / TUI sürümüyle aynı `config.toml` yapılandırmasını ve arka plan servisini paylaşır.
 
@@ -109,10 +142,11 @@ irm https://vuln-inc.github.io/vdpi/install.ps1 | iex
 # Scoop (ek depo gerekmeden doğrudan bildirim)
 scoop install https://vuln-inc.github.io/vdpi/vdpi.json
 
-# WinGet *(inceleme bekliyor: microsoft/winget-pkgs#489148)*
+# WinGet (inceleme bekliyor: microsoft/winget-pkgs#489148)
 winget install Vuln-Inc.vdpi
 
-# Cargo (https://crates.io/crates/vdpi)
+# Cargo / cargo-binstall (https://crates.io/crates/vdpi)
+cargo binstall vdpi
 cargo install vdpi
 ```
 
@@ -126,11 +160,23 @@ Doğrudan indirme: [`vdpi-windows-x86_64.zip`](https://github.com/Vuln-Inc/vdpi/
 # Kabuk tek satır kurulum (macOS ve Linux, SHA-256 doğrulamalı)
 curl -fsSL https://vuln-inc.github.io/vdpi/install.sh | sh
 
-# Cargo (https://crates.io/crates/vdpi)
+# Homebrew (macOS Evrensel ve Linux x86_64/arm64)
+brew tap vuln-inc/vdpi https://github.com/Vuln-Inc/vdpi
+brew install vuln-inc/vdpi/vdpi
+
+# Nix Flake (Linux ve macOS)
+nix run github:Vuln-Inc/vdpi
+nix profile install github:Vuln-Inc/vdpi
+
+# Arch Linux (depo içi PKGBUILD)
+git clone --depth 1 https://github.com/Vuln-Inc/vdpi.git && cd vdpi/packaging/aur/vdpi-bin && makepkg -si
+
+# Cargo / cargo-binstall (https://crates.io/crates/vdpi)
+cargo binstall vdpi
 cargo install vdpi
 ```
 
-Doğrudan indirmeler: [`vdpi-macos-universal.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-macos-universal.tar.gz) · [`vdpi-linux-x86_64.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-linux-x86_64.tar.gz) · [`vdpi-linux-arm64.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-linux-arm64.tar.gz) (statik `musl`).
+Doğrudan indirmeler: [`vdpi-macos-universal.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-macos-universal.tar.gz) · [`vdpi-linux-x86_64.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-linux-x86_64.tar.gz) · [`vdpi-linux-arm64.tar.gz`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-linux-arm64.tar.gz) (statik `musl`) · [İndirme portalı](https://vuln-inc.github.io/vdpi/).
 
 ### Android (`8.0+`, `arm64-v8a` / `armeabi-v7a` / `x86_64`)
 

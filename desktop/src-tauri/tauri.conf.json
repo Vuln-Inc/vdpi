@@ -39,6 +39,7 @@
       "icons/icon.ico"
     ],
     "publisher": "Vuln-Inc",
+    "category": "Network",
     "shortDescription": "Self-healing anti-DPI engine for desktop",
     "longDescription": "Zero-hassle transparent TUN and fail-open local proxy anti-DPI client with visual split tunneling and encrypted DNS.",
     "macOS": {
