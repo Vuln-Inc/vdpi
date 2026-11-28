@@ -1,1 +1,0 @@
-Rust ile yerel, kendi kendini uyarlayan anti-DPI ve DoH motoru

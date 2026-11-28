@@ -31,8 +31,18 @@ pub const MENU_STATUS_ID: &str = "tray-status";
 pub const MENU_TOGGLE_PROTECTION_ID: &str = "tray-toggle-protection";
 pub const MENU_QUIT_ID: &str = "tray-quit";
 
+#[cfg(target_os = "macos")]
+const ICON_PROTECTED_BYTES: &[u8] = include_bytes!("../icons/tray-macos-protected.png");
+#[cfg(target_os = "macos")]
+const ICON_WARNING_BYTES: &[u8] = include_bytes!("../icons/tray-macos-warning.png");
+#[cfg(target_os = "macos")]
+const ICON_PAUSED_BYTES: &[u8] = include_bytes!("../icons/tray-macos-paused.png");
+
+#[cfg(not(target_os = "macos"))]
 const ICON_PROTECTED_BYTES: &[u8] = include_bytes!("../icons/tray-protected.png");
+#[cfg(not(target_os = "macos"))]
 const ICON_WARNING_BYTES: &[u8] = include_bytes!("../icons/tray-warning.png");
+#[cfg(not(target_os = "macos"))]
 const ICON_PAUSED_BYTES: &[u8] = include_bytes!("../icons/tray-paused.png");
 
 const RESTORE_GUARD_WINDOW: Duration = Duration::from_millis(350);
@@ -738,7 +748,13 @@ impl TrayVisualSink for TauriTraySink<'_> {
             return false;
         };
         match self.tray.set_icon(Some(icon)) {
-            Ok(()) => true,
+            Ok(()) => {
+                #[cfg(target_os = "macos")]
+                if let Err(err) = self.tray.set_icon_as_template(true) {
+                    debug!(error = %err, "failed to mark macOS menu bar icon as template");
+                }
+                true
+            }
             Err(err) => {
                 warn!(error = %err, "failed to update tray icon");
                 false
@@ -1289,7 +1305,7 @@ fn setup_or_sync_tray_on_main_thread(
         });
 
     let has_icon = if let Some(icon) = cached_tray_icon(effective.icon) {
-        builder = builder.icon(icon);
+        builder = builder.icon(icon).icon_as_template(cfg!(target_os = "macos"));
         true
     } else {
         false
@@ -1924,6 +1940,36 @@ mod tests {
                 (first.width() as usize) * (first.height() as usize) * 4
             );
             assert_eq!(first.rgba().as_ptr(), second.rgba().as_ptr());
+        }
+    }
+
+    #[test]
+    fn macos_template_tray_icons_are_monochrome_44px_masks() {
+        for (name, bytes) in [
+            (
+                "tray-macos-protected.png",
+                include_bytes!("../icons/tray-macos-protected.png").as_slice(),
+            ),
+            (
+                "tray-macos-paused.png",
+                include_bytes!("../icons/tray-macos-paused.png").as_slice(),
+            ),
+            (
+                "tray-macos-warning.png",
+                include_bytes!("../icons/tray-macos-warning.png").as_slice(),
+            ),
+        ] {
+            let image = Image::from_bytes(bytes)
+                .unwrap_or_else(|err| panic!("{name} must decode: {err}"));
+            assert_eq!((image.width(), image.height()), (44, 44), "{name} size");
+            let mut has_opaque = false;
+            for px in image.rgba().chunks_exact(4) {
+                if px[3] > 0 {
+                    has_opaque = true;
+                    assert_eq!((px[0], px[1], px[2]), (0, 0, 0), "{name} must be pure black template mask");
+                }
+            }
+            assert!(has_opaque, "{name} must not be empty");
         }
     }
 

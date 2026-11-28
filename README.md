@@ -112,24 +112,20 @@ Direct download: [`vdpi-desktop-windows-x86_64-portable.zip`](https://github.com
 **macOS (Universal, Apple Silicon & Intel):**
 
 ```bash
-# Homebrew Cask (direct tap - zero extra repos)
-brew tap vuln-inc/vdpi https://github.com/Vuln-Inc/vdpi
-brew install --cask vuln-inc/vdpi/vdpi-desktop
+# Shell one-liner (SHA-256 verified DMG install to /Applications)
+curl -fsSL https://vuln-inc.github.io/vdpi/install-desktop.sh | sh
 ```
 
 Direct download: [`vdpi-desktop-macos-universal.dmg`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-macos-universal.dmg) (open DMG and drag to Applications).
 
-**Linux (`x86_64` - Debian/Ubuntu, Arch, AppImage, Flatpak):**
+**Linux (`x86_64` - Debian/Ubuntu & AppImage):**
 
 ```bash
 # Shell one-liner (auto-installs .deb on Debian/Ubuntu or AppImage on any distro, SHA-256 verified)
 curl -fsSL https://vuln-inc.github.io/vdpi/install-desktop.sh | sh
-
-# Arch Linux (PKGBUILD in repo)
-git clone --depth 1 https://github.com/Vuln-Inc/vdpi.git && cd vdpi/packaging/aur/vdpi-desktop-bin && makepkg -si
 ```
 
-Direct downloads: [`vdpi-desktop-linux-x86_64.deb`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.deb) (Debian/Ubuntu) · [`vdpi-desktop-linux-x86_64.AppImage`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.AppImage) (any distro, [AppImageHub PR #12747](https://github.com/AppImage/appimage.github.io/pull/12747)) · [Flatpak manifest](./packaging/flatpak/README.md).
+Direct downloads: [`vdpi-desktop-linux-x86_64.deb`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.deb) (Debian/Ubuntu) · [`vdpi-desktop-linux-x86_64.AppImage`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.AppImage) (any distro, [AppImageHub PR #12747](https://github.com/AppImage/appimage.github.io/pull/12747)).
 
 > **Note:** Desktop GUI packages bundle the `vdpi` engine binary (and the unmodified WHQL-signed `wintun.dll` `0.14.1` on Windows), integrate with the system tray / menu bar, and share the same `config.toml` and background service as the Terminal / TUI edition.
 
@@ -159,17 +155,6 @@ Direct download: [`vdpi-windows-x86_64.zip`](https://github.com/Vuln-Inc/vdpi/re
 ```bash
 # Shell one-liner (macOS & Linux, SHA-256 verified)
 curl -fsSL https://vuln-inc.github.io/vdpi/install.sh | sh
-
-# Homebrew (macOS Universal & Linux x86_64/arm64)
-brew tap vuln-inc/vdpi https://github.com/Vuln-Inc/vdpi
-brew install vuln-inc/vdpi/vdpi
-
-# Nix Flake (Linux & macOS)
-nix run github:Vuln-Inc/vdpi
-nix profile install github:Vuln-Inc/vdpi
-
-# Arch Linux (PKGBUILD in repo)
-git clone --depth 1 https://github.com/Vuln-Inc/vdpi.git && cd vdpi/packaging/aur/vdpi-bin && makepkg -si
 
 # Cargo / cargo-binstall (https://crates.io/crates/vdpi)
 cargo binstall vdpi

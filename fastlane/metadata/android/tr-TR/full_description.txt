@@ -1,9 +1,0 @@
-vdpi, Android VpnService üzerinden tamamen cihazınızda yerel olarak çalışan, Rust ile yazılmış kendi kendini uyarlayan bir anti-DPI motorudur - uzak VPN sunucusu, üçüncü taraf aktarıcı ve telemetri yoktur.
-
-Özellikler:
-- Kalıcı alan adı önbelleğiyle 7 aşamalı uyarlanabilir TLS ClientHello desync motoru
-- Cloudflare, Quad9, AdGuard, Google ve özel sunucu destekli şifreli DNS-over-HTTPS (DoH)
-- UDP/443 QUIC engelleme ve ses/oyunlar için düşük gecikmeli UDP geçişi
-- Uygulama bazlı bölünmüş tünel (Dahil Et veya Hariç Tut)
-- Dahili bağlantı tanılama ve canlı aktarım göstergesi
-- Tam Türkçe ve İngilizce arayüz

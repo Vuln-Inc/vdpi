@@ -1,1 +1,0 @@
-Self-healing local anti-DPI and encrypted DoH engine in Rust

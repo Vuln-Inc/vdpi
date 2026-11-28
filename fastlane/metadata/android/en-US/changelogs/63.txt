@@ -1,2 +1,0 @@
-- Hardened APK release signing (v1/v2/v3) and reproducible build metadata
-- Improved adaptive TLS desync stability and DoH resilience

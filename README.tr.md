@@ -112,24 +112,20 @@ Doğrudan indirme: [`vdpi-desktop-windows-x86_64-portable.zip`](https://github.c
 **macOS (Evrensel, Apple Silicon ve Intel):**
 
 ```bash
-# Homebrew Cask (ek depo gerekmeden doğrudan tap)
-brew tap vuln-inc/vdpi https://github.com/Vuln-Inc/vdpi
-brew install --cask vuln-inc/vdpi/vdpi-desktop
+# Kabuk tek satır kurulum (SHA-256 doğrulamalı DMG ile /Applications kurulumu)
+curl -fsSL https://vuln-inc.github.io/vdpi/install-desktop.sh | sh
 ```
 
 Doğrudan indirme: [`vdpi-desktop-macos-universal.dmg`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-macos-universal.dmg) (DMG dosyasını açıp Uygulamalar klasörüne sürükleyin).
 
-**Linux (`x86_64` - Debian/Ubuntu, Arch, AppImage, Flatpak):**
+**Linux (`x86_64` - Debian/Ubuntu ve AppImage):**
 
 ```bash
 # Kabuk tek satır kurulum (Debian/Ubuntu üzerinde .deb, diğer dağıtımlarda AppImage - SHA-256 doğrulamalı)
 curl -fsSL https://vuln-inc.github.io/vdpi/install-desktop.sh | sh
-
-# Arch Linux (depo içi PKGBUILD)
-git clone --depth 1 https://github.com/Vuln-Inc/vdpi.git && cd vdpi/packaging/aur/vdpi-desktop-bin && makepkg -si
 ```
 
-Doğrudan indirmeler: [`vdpi-desktop-linux-x86_64.deb`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.deb) (Debian/Ubuntu) · [`vdpi-desktop-linux-x86_64.AppImage`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.AppImage) (tüm dağıtımlar, [AppImageHub PR #12747](https://github.com/AppImage/appimage.github.io/pull/12747)) · [Flatpak bildirimi](./packaging/flatpak/README.md).
+Doğrudan indirmeler: [`vdpi-desktop-linux-x86_64.deb`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.deb) (Debian/Ubuntu) · [`vdpi-desktop-linux-x86_64.AppImage`](https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.AppImage) (tüm dağıtımlar, [AppImageHub PR #12747](https://github.com/AppImage/appimage.github.io/pull/12747)).
 
 > **Not:** Masaüstü GUI paketleri `vdpi` motor dosyasını (Windows üzerinde ayrıca değiştirilmemiş WHQL imzalı `wintun.dll` `0.14.1` sürücüsünü) içinde barındırır, sistem tepsisi / menü çubuğu ile bütünleşir ve Terminal / TUI sürümüyle aynı `config.toml` yapılandırmasını ve arka plan servisini paylaşır.
 
@@ -159,17 +155,6 @@ Doğrudan indirme: [`vdpi-windows-x86_64.zip`](https://github.com/Vuln-Inc/vdpi/
 ```bash
 # Kabuk tek satır kurulum (macOS ve Linux, SHA-256 doğrulamalı)
 curl -fsSL https://vuln-inc.github.io/vdpi/install.sh | sh
-
-# Homebrew (macOS Evrensel ve Linux x86_64/arm64)
-brew tap vuln-inc/vdpi https://github.com/Vuln-Inc/vdpi
-brew install vuln-inc/vdpi/vdpi
-
-# Nix Flake (Linux ve macOS)
-nix run github:Vuln-Inc/vdpi
-nix profile install github:Vuln-Inc/vdpi
-
-# Arch Linux (depo içi PKGBUILD)
-git clone --depth 1 https://github.com/Vuln-Inc/vdpi.git && cd vdpi/packaging/aur/vdpi-bin && makepkg -si
 
 # Cargo / cargo-binstall (https://crates.io/crates/vdpi)
 cargo binstall vdpi

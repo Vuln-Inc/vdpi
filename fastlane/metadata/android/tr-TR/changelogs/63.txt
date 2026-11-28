@@ -1,2 +1,0 @@
-- APK imzalama (v1/v2/v3) ve tekrarlanabilir derleme üst verileri iyileştirildi
-- Uyarlanabilir TLS desync kararlılığı ve DoH dayanıklılığı geliştirildi

@@ -1,9 +1,0 @@
-vdpi is a zero-hassle, self-healing anti-DPI engine written in Rust that runs 100% locally on your Android device via Android's VpnService - with zero remote VPN servers, zero third-party relays, and zero telemetry.
-
-Features:
-- 7-stage adaptive TLS ClientHello desynchronization with persistent per-host caching
-- Anti-poisoning encrypted DNS-over-HTTPS (DoH) with Cloudflare, Quad9, AdGuard, Google, and custom URL presets
-- UDP/443 QUIC blocking and zero-lag UDP passthrough for voice and games
-- Per-app split tunneling (Include or Exclude specific installed apps)
-- Built-in connection diagnostics and live throughput telemetry
-- Full English and Turkish localization
