@@ -1,81 +1,312 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>vdpi - On-device anti-DPI engine in Rust</title>
+  <title>vdpi - Self-healing anti-DPI engine in Rust</title>
+  <meta name="description" content="Download vdpi Desktop GUI, CLI/TUI, Android, and iOS. Zero remote servers, zero telemetry, MIT licensed.">
   <style>
-    :root { color-scheme: light dark; --bg: #f5f5f7; --card: #ffffff; --text: #1d1d1f; --muted: #6e6e73; --border: rgba(0,0,0,0.08); --accent: #0066cc; }
-    @media (prefers-color-scheme: dark) {
-      :root { --bg: #000000; --card: #1c1c1e; --text: #f5f5f7; --muted: #8e8e93; --border: rgba(255,255,255,0.09); --accent: #0a84ff; }
+    :root {
+      color-scheme: dark light;
+      --bg: #0b0d10;
+      --surface: #13171d;
+      --surface-2: #191f28;
+      --border: #252d3a;
+      --border-strong: #364152;
+      --text: #f3f5f8;
+      --muted: #98a2b3;
+      --accent: #38bdf8;
+      --accent-soft: rgba(56, 189, 248, 0.12);
+      --ok: #34d399;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f8fafc;
+        --surface: #ffffff;
+        --surface-2: #f1f5f9;
+        --border: #e2e8f0;
+        --border-strong: #cbd5e1;
+        --text: #0f172a;
+        --muted: #475569;
+        --accent: #0284c7;
+        --accent-soft: rgba(2, 132, 199, 0.09);
+        --ok: #059669;
+      }
     }
     * { box-sizing: border-box; }
-    body { margin: 0; font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); }
-    main { max-width: 720px; margin: 52px auto; padding: 0 20px; }
-    h1 { font-size: 32px; letter-spacing: -0.02em; margin: 0 0 8px; }
-    p.lead { color: var(--muted); margin: 0 0 28px; }
-    .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; overflow: hidden; margin-bottom: 18px; }
-    .row { display: flex; justify-content: space-between; align-items: center; padding: 16px 18px; border-top: 1px solid var(--border); gap: 16px; }
-    .row:first-child { border-top: 0; }
-    .info { min-width: 0; }
-    .label { font-weight: 500; }
-    .sub { font-size: 13px; color: var(--muted); margin-top: 4px; }
-    .sub-links a { font-weight: 400; }
-    .links { display: flex; gap: 14px; align-items: center; flex-shrink: 0; }
-    @media (max-width: 560px) {
-      .row { flex-wrap: wrap; }
-      .links { width: 100%; }
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
     }
-    a { color: var(--accent); text-decoration: none; font-weight: 500; white-space: nowrap; }
-    a:hover { text-decoration: underline; }
-    code { font: 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: rgba(127,127,127,0.12); padding: 2px 6px; border-radius: 6px; word-break: break-all; }
-    footer { margin-top: 28px; font-size: 13px; color: var(--muted); display: flex; gap: 16px; flex-wrap: wrap; }
+    main {
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 48px 20px 72px;
+    }
+    header {
+      margin-bottom: 36px;
+    }
+    .kicker {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--accent);
+      background: var(--accent-soft);
+      border: 1px solid var(--border);
+      padding: 4px 10px;
+      border-radius: 999px;
+      margin-bottom: 14px;
+    }
+    h1 {
+      margin: 0 0 10px;
+      font-size: 32px;
+      font-weight: 600;
+      letter-spacing: -0.025em;
+    }
+    .lead {
+      margin: 0;
+      color: var(--muted);
+      font-size: 15px;
+      max-width: 68ch;
+    }
+    h2 {
+      font-size: 13px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      margin: 34px 0 12px;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 16px 18px;
+      border-top: 1px solid var(--border);
+    }
+    .row:first-child { border-top: 0; }
+    .info { flex: 1 1 360px; min-width: 0; }
+    .label {
+      font-size: 15px;
+      font-weight: 600;
+      margin-bottom: 3px;
+    }
+    .sub {
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .cmd-group {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .cmd {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-family: var(--mono);
+      font-size: 12.5px;
+      overflow-x: auto;
+    }
+    .cmd code {
+      white-space: nowrap;
+      color: var(--text);
+    }
+    .tag {
+      font-size: 11px;
+      font-family: var(--sans);
+      font-weight: 600;
+      color: var(--muted);
+      margin-right: 6px;
+      user-select: none;
+    }
+    .copy-btn {
+      flex-shrink: 0;
+      font-family: var(--sans);
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text);
+      background: var(--surface);
+      border: 1px solid var(--border-strong);
+      border-radius: 6px;
+      padding: 4px 9px;
+      cursor: pointer;
+    }
+    .copy-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .copy-btn[data-copied="1"] { border-color: var(--ok); color: var(--ok); }
+    .links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    .btn {
+      display: inline-block;
+      font-size: 13px;
+      font-weight: 500;
+      text-decoration: none;
+      color: var(--text);
+      background: var(--surface-2);
+      border: 1px solid var(--border-strong);
+      border-radius: 8px;
+      padding: 7px 12px;
+      white-space: nowrap;
+    }
+    .btn:hover { border-color: var(--accent); color: var(--accent); }
+    .btn.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #04121b;
+      font-weight: 600;
+    }
+    .btn.primary:hover { opacity: 0.92; color: #04121b; }
+    .sub-links a { color: var(--accent); text-decoration: none; }
+    .sub-links a:hover { text-decoration: underline; }
+    footer {
+      margin-top: 40px;
+      padding-top: 18px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 18px;
+      font-size: 13px;
+    }
+    footer a { color: var(--muted); text-decoration: none; }
+    footer a:hover { color: var(--text); }
   </style>
 </head>
 <body>
   <main>
-    <h1>vdpi</h1>
-    <p class="lead">Zero-hassle, self-healing anti-DPI engine in Rust. Runs 100% locally across Windows, macOS, Linux, Android, and iOS.</p>
+    <header>
+      <div class="kicker">v0.6.3 - MIT - 100% On-Device</div>
+      <h1>vdpi</h1>
+      <p class="lead">Self-healing anti-DPI engine and encrypted DNS-over-HTTPS resolver in Rust. Native Desktop GUI, interactive Control Center TUI, and zero-root mobile apps - zero remote servers, zero telemetry.</p>
+    </header>
 
+    <h2>Desktop App (GUI) - Recommended</h2>
     <div class="card">
       <div class="row">
         <div class="info">
           <div class="label">Windows (x86_64)</div>
-          <div class="sub"><code>irm https://vuln-inc.github.io/vdpi/install.ps1 | iex</code></div>
-          <div class="sub">Scoop: <code>scoop install https://vuln-inc.github.io/vdpi/vdpi.json</code></div>
+          <div class="sub">Portable app - bundles vdpi.exe and WHQL-signed wintun.dll. No setup installer.</div>
+          <div class="cmd-group">
+            <div class="cmd"><span><span class="tag">PS1</span><code>irm https://vuln-inc.github.io/vdpi/install-desktop.ps1 | iex</code></span><button class="copy-btn" data-copy="irm https://vuln-inc.github.io/vdpi/install-desktop.ps1 | iex">Copy</button></div>
+            <div class="cmd"><span><span class="tag">Scoop</span><code>scoop install https://vuln-inc.github.io/vdpi/vdpi-desktop.json</code></span><button class="copy-btn" data-copy="scoop install https://vuln-inc.github.io/vdpi/vdpi-desktop.json">Copy</button></div>
+            <div class="cmd"><span><span class="tag">WinGet</span><code>winget install Vuln-Inc.vdpi.Desktop</code></span><button class="copy-btn" data-copy="winget install Vuln-Inc.vdpi.Desktop">Copy</button></div>
+          </div>
         </div>
         <div class="links">
-          <a href="https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-windows-x86_64.zip">Download .zip</a>
+          <a class="btn primary" href="https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-windows-x86_64-portable.zip">Portable .zip</a>
         </div>
       </div>
+
       <div class="row">
         <div class="info">
-          <div class="label">macOS &amp; Linux</div>
-          <div class="sub"><code>curl -fsSL https://vuln-inc.github.io/vdpi/install.sh | sh</code></div>
-          <div class="sub">Cargo: <code>cargo install vdpi</code></div>
+          <div class="label">macOS (Universal - Apple Silicon &amp; Intel)</div>
+          <div class="sub">macOS 12 Monterey or newer. Direct Homebrew Cask or drag-to-Applications DMG.</div>
+          <div class="cmd-group">
+            <div class="cmd"><span><span class="tag">Brew</span><code>brew tap vuln-inc/vdpi https://github.com/Vuln-Inc/vdpi &amp;&amp; brew install --cask vuln-inc/vdpi/vdpi-desktop</code></span><button class="copy-btn" data-copy="brew tap vuln-inc/vdpi https://github.com/Vuln-Inc/vdpi && brew install --cask vuln-inc/vdpi/vdpi-desktop">Copy</button></div>
+          </div>
         </div>
         <div class="links">
-          <a href="https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-macos-universal.tar.gz">macOS</a>
-          <a href="https://github.com/Vuln-Inc/vdpi/releases/latest">Linux</a>
+          <a class="btn primary" href="https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-macos-universal.dmg">Universal .dmg</a>
         </div>
       </div>
+
       <div class="row">
         <div class="info">
-          <div class="label">Android</div>
-          <div class="sub">Universal APK (arm64-v8a, armeabi-v7a, x86_64) &middot; Obtainium compatible</div>
+          <div class="label">Linux (x86_64)</div>
+          <div class="sub">Debian/Ubuntu .deb, universal AppImage, Arch PKGBUILD, and Flatpak manifest.</div>
+          <div class="cmd-group">
+            <div class="cmd"><span><span class="tag">Shell</span><code>curl -fsSL https://vuln-inc.github.io/vdpi/install-desktop.sh | sh</code></span><button class="copy-btn" data-copy="curl -fsSL https://vuln-inc.github.io/vdpi/install-desktop.sh | sh">Copy</button></div>
+            <div class="cmd"><span><span class="tag">Arch</span><code>git clone --depth 1 https://github.com/Vuln-Inc/vdpi.git &amp;&amp; cd vdpi/packaging/aur/vdpi-desktop-bin &amp;&amp; makepkg -si</code></span><button class="copy-btn" data-copy="git clone --depth 1 https://github.com/Vuln-Inc/vdpi.git && cd vdpi/packaging/aur/vdpi-desktop-bin && makepkg -si">Copy</button></div>
+          </div>
         </div>
         <div class="links">
-          <a href="https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-android-universal.apk">Download .apk</a>
+          <a class="btn primary" href="https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.deb">.deb</a>
+          <a class="btn" href="https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-desktop-linux-x86_64.AppImage">.AppImage</a>
+          <a class="btn" href="https://github.com/Vuln-Inc/vdpi/tree/main/packaging/flatpak">Flatpak</a>
         </div>
       </div>
+    </div>
+
+    <h2>Terminal / Control Center TUI (CLI)</h2>
+    <div class="card">
       <div class="row">
         <div class="info">
-          <div class="label">iOS / iPadOS</div>
+          <div class="label">Windows CLI / TUI</div>
+          <div class="cmd-group">
+            <div class="cmd"><span><span class="tag">PS1</span><code>irm https://vuln-inc.github.io/vdpi/install.ps1 | iex</code></span><button class="copy-btn" data-copy="irm https://vuln-inc.github.io/vdpi/install.ps1 | iex">Copy</button></div>
+            <div class="cmd"><span><span class="tag">Scoop</span><code>scoop install https://vuln-inc.github.io/vdpi/vdpi.json</code></span><button class="copy-btn" data-copy="scoop install https://vuln-inc.github.io/vdpi/vdpi.json">Copy</button></div>
+            <div class="cmd"><span><span class="tag">WinGet</span><code>winget install Vuln-Inc.vdpi</code></span><button class="copy-btn" data-copy="winget install Vuln-Inc.vdpi">Copy</button></div>
+          </div>
+        </div>
+        <div class="links">
+          <a class="btn" href="https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-windows-x86_64.zip">.zip</a>
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="info">
+          <div class="label">macOS &amp; Linux CLI / TUI (x86_64 &amp; arm64)</div>
+          <div class="cmd-group">
+            <div class="cmd"><span><span class="tag">Shell</span><code>curl -fsSL https://vuln-inc.github.io/vdpi/install.sh | sh</code></span><button class="copy-btn" data-copy="curl -fsSL https://vuln-inc.github.io/vdpi/install.sh | sh">Copy</button></div>
+            <div class="cmd"><span><span class="tag">Brew</span><code>brew tap vuln-inc/vdpi https://github.com/Vuln-Inc/vdpi &amp;&amp; brew install vuln-inc/vdpi/vdpi</code></span><button class="copy-btn" data-copy="brew tap vuln-inc/vdpi https://github.com/Vuln-Inc/vdpi && brew install vuln-inc/vdpi/vdpi">Copy</button></div>
+            <div class="cmd"><span><span class="tag">Nix</span><code>nix profile install github:Vuln-Inc/vdpi</code></span><button class="copy-btn" data-copy="nix profile install github:Vuln-Inc/vdpi">Copy</button></div>
+            <div class="cmd"><span><span class="tag">Cargo</span><code>cargo binstall vdpi</code></span><button class="copy-btn" data-copy="cargo binstall vdpi">Copy</button></div>
+          </div>
+        </div>
+        <div class="links">
+          <a class="btn" href="https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-macos-universal.tar.gz">macOS</a>
+          <a class="btn" href="https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-linux-x86_64.tar.gz">Linux x64</a>
+          <a class="btn" href="https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-linux-arm64.tar.gz">Linux arm64</a>
+        </div>
+      </div>
+    </div>
+
+    <h2>Mobile (Zero-Root Local VPN)</h2>
+    <div class="card">
+      <div class="row">
+        <div class="info">
+          <div class="label">Android (8.0+)</div>
+          <div class="sub">Signed universal APK (arm64-v8a, armeabi-v7a, x86_64) - track updates with <a href="https://github.com/ImranR98/Obtainium">Obtainium</a> using <code>https://github.com/Vuln-Inc/vdpi</code>.</div>
+        </div>
+        <div class="links">
+          <a class="btn primary" href="https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-android-universal.apk">Download .apk</a>
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="info">
+          <div class="label">iOS / iPadOS (16+)</div>
           <div class="sub">Source URL: <code>https://vuln-inc.github.io/vdpi/apps.json</code></div>
           <div class="sub sub-links">Stores: <a href="altstore://source?url=https://vuln-inc.github.io/vdpi/apps.json">AltStore</a> &middot; <a href="sidestore://source?url=https://vuln-inc.github.io/vdpi/apps.json">SideStore</a> &middot; <a href="feather://source/https://vuln-inc.github.io/vdpi/apps.json">Feather</a> &middot; <a href="./apps.json">apps.json</a></div>
         </div>
         <div class="links">
-          <a href="https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-ios-unsigned.ipa">Download .ipa</a>
+          <a class="btn" href="https://github.com/Vuln-Inc/vdpi/releases/latest/download/vdpi-ios-unsigned.ipa">Download .ipa</a>
         </div>
       </div>
     </div>
@@ -84,9 +315,26 @@
       <a href="https://github.com/Vuln-Inc/vdpi">GitHub</a>
       <a href="https://crates.io/crates/vdpi">crates.io</a>
       <a href="https://github.com/Vuln-Inc/vdpi/releases/latest">Latest Release</a>
+      <a href="https://github.com/Vuln-Inc/vdpi/releases/latest/download/SHA256SUMS.txt">SHA256SUMS.txt</a>
       <a href="https://github.com/Vuln-Inc/vdpi/blob/main/CHANGELOG.md">Changelog</a>
       <a href="https://github.com/Vuln-Inc/vdpi/blob/main/SECURITY.md">Security</a>
     </footer>
   </main>
+
+  <script>
+    document.querySelectorAll('.copy-btn').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        try {
+          await navigator.clipboard.writeText(btn.dataset.copy);
+          btn.dataset.copied = '1';
+          btn.textContent = 'Copied';
+          setTimeout(() => {
+            btn.dataset.copied = '0';
+            btn.textContent = 'Copy';
+          }, 1400);
+        } catch (_) {}
+      });
+    });
+  </script>
 </body>
 </html>

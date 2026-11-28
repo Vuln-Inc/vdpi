@@ -21,6 +21,15 @@
       "category": "utilities",
       "versions": [
         {
+          "version": "0.6.3",
+          "buildVersion": "14",
+          "date": "2026-11-27T19:08:27Z",
+          "localizedDescription": "- Aligned mobile releases with v0.6.3 (refreshed Desktop GUI, per-app split tunneling quick presets, DNS-over-HTTPS presets, and full English/Turkish localization)\n- Keeps all v0.5.3+ iOS utun/smoltcp/TLS/DoH/Sideloadly stability fixes",
+          "downloadURL": "https://github.com/Vuln-Inc/vdpi/releases/download/v0.6.3/vdpi-ios-unsigned.ipa",
+          "size": 8085429,
+          "minOSVersion": "16.0"
+        },
+        {
           "version": "0.5.4",
           "buildVersion": "11",
           "date": "2026-11-25T12:01:10Z",
@@ -100,11 +109,11 @@
         ],
         "privacy": {}
       },
-      "version": "0.5.4",
-      "versionDate": "2026-11-25T12:01:10Z",
-      "versionDescription": "Desktop TUI DNS server preset picker and vdpi dns CLI command (keeps all v0.5.3 iOS netstack/utun/TLS/DoH fixes).",
-      "downloadURL": "https://github.com/Vuln-Inc/vdpi/releases/download/v0.5.4/vdpi-ios-unsigned.ipa",
-      "size": 7641900
+      "version": "0.6.3",
+      "versionDate": "2026-11-27T19:08:27Z",
+      "versionDescription": "- Aligned mobile releases with v0.6.3 (refreshed Desktop GUI, per-app split tunneling quick presets, DNS-over-HTTPS presets, and full English/Turkish localization)\n- Keeps all v0.5.3+ iOS utun/smoltcp/TLS/DoH/Sideloadly stability fixes",
+      "downloadURL": "https://github.com/Vuln-Inc/vdpi/releases/download/v0.6.3/vdpi-ios-unsigned.ipa",
+      "size": 8085429
     }
   ],
   "news": []

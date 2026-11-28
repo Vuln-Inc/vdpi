@@ -1,0 +1,35 @@
+{
+    "version": "0.6.3",
+    "description": "Native desktop GUI for the self-healing vdpi anti-DPI engine",
+    "homepage": "https://vuln-inc.github.io/vdpi/",
+    "license": "MIT",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/Vuln-Inc/vdpi/releases/download/v0.6.3/vdpi-desktop-windows-x86_64-portable.zip",
+            "hash": "8923fc2cf542cf0399a7a422a2f0b3d0ac0e91f9b94f684ee759e4766e9fa330"
+        }
+    },
+    "bin": [
+        "vdpi-desktop.exe",
+        "vdpi.exe"
+    ],
+    "shortcuts": [
+        [
+            "vdpi-desktop.exe",
+            "vdpi Desktop"
+        ]
+    ],
+    "checkver": {
+        "github": "https://github.com/Vuln-Inc/vdpi"
+    },
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/Vuln-Inc/vdpi/releases/download/v$version/vdpi-desktop-windows-x86_64-portable.zip",
+                "hash": {
+                    "url": "$baseurl/SHA256SUMS.txt"
+                }
+            }
+        }
+    }
+}

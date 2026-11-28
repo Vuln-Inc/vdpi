@@ -1,24 +1,26 @@
 {
-    "version": "0.5.8",
-    "description": "Zero-hassle, self-healing anti-DPI engine in Rust",
+    "version": "0.6.3",
+    "description": "Zero-hassle, self-healing anti-DPI engine in Rust (CLI & Control Center TUI)",
     "homepage": "https://github.com/Vuln-Inc/vdpi",
     "license": "MIT",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/Vuln-Inc/vdpi/releases/download/v0.5.8/vdpi-windows-x86_64.zip",
-            "hash": "1d2cb42661cffb2e4209f3550a2c4773f001b901e9e4d2e58862ff4e6dfedd35"
+            "url": "https://github.com/Vuln-Inc/vdpi/releases/download/v0.6.3/vdpi-windows-x86_64.zip",
+            "hash": "bfc88e8e2f1a4fb1a0932658f5c42fe1567d364e162b9e504ae8832a33113609"
         }
     },
     "bin": "vdpi.exe",
-    "checkver": "github",
+    "checkver": {
+        "github": "https://github.com/Vuln-Inc/vdpi"
+    },
     "autoupdate": {
         "architecture": {
             "64bit": {
-                "url": "https://github.com/Vuln-Inc/vdpi/releases/download/v$version/vdpi-windows-x86_64.zip"
+                "url": "https://github.com/Vuln-Inc/vdpi/releases/download/v$version/vdpi-windows-x86_64.zip",
+                "hash": {
+                    "url": "$baseurl/SHA256SUMS.txt"
+                }
             }
-        },
-        "hash": {
-            "url": "$baseurl/SHA256SUMS.txt"
         }
     }
 }
